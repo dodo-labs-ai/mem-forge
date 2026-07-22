@@ -25,7 +25,6 @@ def _mem(
         visibility=visibility,
         owner_user_id=owner,
         project_key=project_key,
-        tags=[],
         status=status,
     )
 

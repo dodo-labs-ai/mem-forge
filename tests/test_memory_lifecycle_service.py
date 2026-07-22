@@ -88,7 +88,6 @@ def _memory(mem_id: str, content: str) -> Memory:
         content=content,
         content_hash=content_hash(content),
         confidence=0.91,
-        tags=["jira"],
         created_at=now,
         updated_at=now,
     )
@@ -125,7 +124,6 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
             "matched after using Status and FollowUpStepStatus."
         ),
         memory_type="fact",
-        tags=["dwc", "polling"],
         owner_user_id="andrew.sun01@sap.com",
         client="codex",
         repo_identifier="github.com/shno-labs/mem-forge",
@@ -144,7 +142,6 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
     assert stored.owner_user_id == "andrew.sun01@sap.com"
     assert stored.project_key == "UNSORTED"
     assert stored.repo_identifier == "github.com/shno-labs/mem-forge"
-    assert stored.tags == ["dwc", "polling"]
     assert [(source.doc_id, source.source_type) for source in sources] == [
         (f"user-memory-{result.memory_id}", "user_memory")
     ]
@@ -423,7 +420,6 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
                 "scope": "Claude Code CLI usage.",
             },
             memory_type="fact",
-            tags=["jira"],
             reason="Initial observed convention.",
             confidence=0.91,
         ),
@@ -517,7 +513,6 @@ async def test_create_memory_route_audits_request_principal_and_client(db: Datab
                 "content": "Use canonical payroll trigger status fields.",
                 "provenance": "User confirmed this after validating the payroll smoke flow.",
                 "memory_type": "fact",
-                "tags": ["payroll", "polling"],
                 "client": "codex",
                 "repo_identifier": "github.com/shno-labs/mem-forge",
             },

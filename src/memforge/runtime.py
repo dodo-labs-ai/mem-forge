@@ -29,7 +29,6 @@ from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthRe
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.store import MemoryStore
 from memforge.models import SourceSyncRun, SyncState
-from memforge.pipeline.enricher import Enricher
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.source_support_detector import SourceSupportDetector
 from memforge.pipeline.sync_memory import SyncMemoryObserver
@@ -40,7 +39,6 @@ from memforge.pipeline.sync import (
     SourceSyncMode,
     get_process_document_lifecycle_admission,
 )
-from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.retrieval.embeddings import get_chroma_collection
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
 from memforge.source_activity import (
@@ -136,12 +134,9 @@ class SyncRuntime:
     db: "Database"
     config: AppConfig
     doc_store: LocalDocumentStore
-    enricher: Enricher
     memory_extractor: MemoryExtractor
     memory_store: MemoryStore
     memory_engine: MemoryEngine
-    vector_store: Any
-    embed_cfg: dict[str, str]
     structured_llm_client: LiteLlmStructuredClient | None
     llm_model: str
     source_support_detector: SourceSupportDetector | None
@@ -163,12 +158,9 @@ class SyncRuntime:
         return GeneSyncOrchestrator(
             db=self.db,
             doc_store=self.doc_store,
-            enricher=self.enricher,
             memory_extractor=self.memory_extractor,
             memory_engine=self.memory_engine,
             memory_store=self.memory_store,
-            vector_store=self.vector_store,
-            embed_cfg=self.embed_cfg,
             source_support_detector=self.source_support_detector,
             max_concurrent=self.config.llm.enrichment_max_concurrent,
             extraction_pool=self.extraction_pool,
@@ -370,14 +362,9 @@ async def check_runtime_health(db: "Database", config: AppConfig) -> RuntimeHeal
                 config.storage.chroma_path,
                 name="memories",
             )
-            document_collection = get_chroma_collection(
-                config.storage.chroma_path,
-                name="documents",
-            )
             report = await MemoryIndexHealthChecker(
                 db=db,
                 memory_collection=memory_collection,
-                document_collection=document_collection,
             ).check()
             if report.ok:
                 index_consistency = RuntimeHealthComponent(
@@ -557,14 +544,6 @@ async def build_sync_runtime(
         )
     doc_store = LocalDocumentStore(config.storage.docs_path)
 
-    enricher = Enricher(
-        model=llm.enrichment_model,
-        base_url=llm.enrichment_base_url or None,
-        api_key=llm.enrichment_api_key or None,
-        max_tokens=config.llm.enrichment_max_tokens,
-        request_timeout_s=llm.request_timeout_s,
-        structured_llm_client=structured_llm_client,
-    )
     memory_extractor = MemoryExtractor(
         model=llm.enrichment_model,
         base_url=llm.enrichment_base_url or None,
@@ -574,10 +553,6 @@ async def build_sync_runtime(
         structured_llm_client=structured_llm_client,
     )
 
-    doc_collection = get_chroma_collection(
-        chroma_path=config.storage.chroma_path,
-        name="documents",
-    )
     memory_collection = get_chroma_collection(
         chroma_path=config.storage.chroma_path,
         name="memories",
@@ -598,7 +573,6 @@ async def build_sync_runtime(
         vector=adapters.vector,
         embed_cfg=embed_cfg,
         audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="sync")),
-        document_index=DocumentVectorIndex(doc_collection),
     )
     memory_engine = MemoryEngine(
         cross_document_candidates=CrossDocumentCandidateRetriever(
@@ -631,12 +605,9 @@ async def build_sync_runtime(
         db=db,
         config=config,
         doc_store=doc_store,
-        enricher=enricher,
         memory_extractor=memory_extractor,
         memory_store=memory_store,
         memory_engine=memory_engine,
-        vector_store=doc_collection,
-        embed_cfg=embed_cfg,
         structured_llm_client=structured_llm_client,
         llm_model=llm.enrichment_model,
         source_support_detector=source_support_detector,
@@ -1274,7 +1245,6 @@ class SyncService:
         checker = MemoryIndexHealthChecker(
             db=self.db,
             memory_collection=runtime.memory_store.collection,
-            document_collection=runtime.vector_store,
         )
         return await checker.check()
 

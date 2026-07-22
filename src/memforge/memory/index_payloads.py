@@ -5,10 +5,9 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 
-from memforge.models import DocumentMetadata, Memory, content_hash
+from memforge.models import Memory, content_hash
 
 __all__ = [
-    "document_embedding_text",
     "embedding_text_hash",
     "embedding_vector_hash",
     "memory_embedding_text",
@@ -26,16 +25,6 @@ def memory_embedding_text(memory: Memory, entity_names: list[str] | None = None)
     names = entity_names if entity_names is not None else memory.entity_refs
     entities = ", ".join(names) if names else ""
     return f"{prefix}: {memory.content}\nEntities: {entities}"
-
-
-def document_embedding_text(metadata: DocumentMetadata) -> str:
-    """Build the canonical text embedded for a document vector."""
-    return (
-        f"{metadata.summary}\n"
-        f"{' '.join(metadata.tags)}\n"
-        f"{metadata.doc_type}\n"
-        f"{metadata.complexity}"
-    )
 
 
 def embedding_text_hash(text: str) -> str:

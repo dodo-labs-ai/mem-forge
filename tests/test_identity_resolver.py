@@ -185,13 +185,14 @@ async def test_identity_resolver_batches_scope_and_reuses_only_equivalent_memory
         llm_model="test-model",
     )
 
-    results = await resolver.resolve(
+    batch = await resolver.resolve(
         (
             IdentityResolutionRequest(exact_challenger, "doc-a"),
             IdentityResolutionRequest(equivalent_challenger, "doc-b"),
             IdentityResolutionRequest(refining_challenger, "doc-c"),
         )
     )
+    results = batch.resolutions
 
     assert [result.target for result in results] == [
         exact_incumbent,
@@ -205,6 +206,9 @@ async def test_identity_resolver_batches_scope_and_reuses_only_equivalent_memory
     ]
     assert [decision.relation_type for decision in results[2].classified_pairs] == [MemoryRelationType.REFINES]
     assert len(classifier.calls) == 1
+    assert batch.metrics.pair_count == 3
+    assert batch.metrics.llm_calls == 1
+    assert batch.metrics.prompt_chars == 0
     assert [(pair.challenger.id, pair.candidate.id) for pair in classifier.calls[0]] == [
         (equivalent_challenger.id, refinement_candidate.id),
         (equivalent_challenger.id, equivalent_incumbent.id),
@@ -254,7 +258,8 @@ async def test_identity_resolver_fails_closed_for_incomplete_structured_pair_led
         llm_model="test-model",
     )
 
-    result = (await resolver.resolve((IdentityResolutionRequest(challenger, "doc-a"),)))[0]
+    batch = await resolver.resolve((IdentityResolutionRequest(challenger, "doc-a"),))
+    result = batch.resolutions[0]
 
     assert result.target is None
     assert result.equivalence_proof is None
@@ -266,6 +271,9 @@ async def test_identity_resolver_fails_closed_for_incomplete_structured_pair_led
         "duplicate_count=0, unexpected_count=0"
     )
     assert len(client.calls) == 1
+    assert batch.metrics.pair_count == 2
+    assert batch.metrics.llm_calls == 1
+    assert batch.metrics.prompt_chars > 0
 
 
 class _CompleteStructuredClient:
@@ -319,14 +327,18 @@ async def test_identity_resolver_preserves_pair_attribution_across_classifier_ba
         llm_model="test-model",
     )
 
-    results = await resolver.resolve(
+    batch = await resolver.resolve(
         (
             IdentityResolutionRequest(first_challenger, "doc-a"),
             IdentityResolutionRequest(second_challenger, "doc-b"),
         )
     )
+    results = batch.resolutions
 
     assert [result.target for result in results] == [equivalent, None]
+    assert batch.metrics.pair_count == 3
+    assert batch.metrics.llm_calls == 2
+    assert batch.metrics.prompt_chars > 0
     assert len(client.payloads) == 2
     assert [item["pair_index"] for payload in client.payloads for group in payload for item in group["candidates"]] == [
         0,

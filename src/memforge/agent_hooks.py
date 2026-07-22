@@ -219,7 +219,6 @@ async def _search_memories(
             "memory_type": row.memory_type,
             "content": row.summary,
             "confidence": row.confidence,
-            "tags": list(row.tags),
         })
     return rows
 

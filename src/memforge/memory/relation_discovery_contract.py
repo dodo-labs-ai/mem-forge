@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
 
+from memforge.memory.evidence import RelationDirection
+from memforge.memory.relation_classifier import MemoryRelationType
+
 
 CURRENT_RELATION_EVIDENCE_PREDICATE_SQL = """
 msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
@@ -23,6 +26,54 @@ class RelationDiscoveryWorkStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     OBSOLETE = "obsolete"
+
+
+@dataclass(frozen=True, slots=True)
+class PreclassifiedRelationDecision:
+    """Reusable pair decision fenced by content, current Evidence, and access."""
+
+    candidate_memory_id: str
+    expected_candidate_content_hash: str
+    expected_candidate_support_set_hash: str
+    expected_candidate_access_context_hash: str
+    expected_challenger_access_context_hash: str
+    relation_type: MemoryRelationType
+    direction: RelationDirection
+    reason: str
+    classifier_version: str
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "candidate_memory_id": self.candidate_memory_id,
+            "expected_candidate_content_hash": self.expected_candidate_content_hash,
+            "expected_candidate_support_set_hash": self.expected_candidate_support_set_hash,
+            "expected_candidate_access_context_hash": self.expected_candidate_access_context_hash,
+            "expected_challenger_access_context_hash": self.expected_challenger_access_context_hash,
+            "relation_type": self.relation_type.value,
+            "direction": self.direction.value,
+            "reason": self.reason,
+            "classifier_version": self.classifier_version,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> "PreclassifiedRelationDecision":
+        return cls(
+            candidate_memory_id=str(payload["candidate_memory_id"]),
+            expected_candidate_content_hash=str(payload["expected_candidate_content_hash"]),
+            expected_candidate_support_set_hash=str(
+                payload.get("expected_candidate_support_set_hash") or ""
+            ),
+            expected_candidate_access_context_hash=str(
+                payload.get("expected_candidate_access_context_hash") or ""
+            ),
+            expected_challenger_access_context_hash=str(
+                payload.get("expected_challenger_access_context_hash") or ""
+            ),
+            relation_type=MemoryRelationType(str(payload["relation_type"])),
+            direction=RelationDirection(str(payload["direction"])),
+            reason=str(payload["reason"]),
+            classifier_version=str(payload["classifier_version"]),
+        )
 
 
 def resolve_relation_discovery_actor_user_id(
@@ -53,6 +104,7 @@ class RelationDiscoveryRequest:
     doc_id: str
     actor_user_id: str | None
     entity_ids: tuple[int, ...] = ()
+    preclassified_decisions: tuple[PreclassifiedRelationDecision, ...] = ()
 
     def __post_init__(self) -> None:
         required = {
@@ -66,6 +118,9 @@ class RelationDiscoveryRequest:
         missing = sorted(name for name, value in required.items() if not value)
         if missing:
             raise ValueError("relation discovery request requires " + ", ".join(missing))
+        candidate_ids = [item.candidate_memory_id for item in self.preclassified_decisions]
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("duplicate preclassified relation candidate")
 
 
 @dataclass(frozen=True, slots=True)

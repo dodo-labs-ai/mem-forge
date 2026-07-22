@@ -461,7 +461,6 @@ class MemoryResponse(BaseModel):
     visibility: str
     owner_user_id: str | None = None
     project_key: str | None = None
-    tags: list[str] = []
     confidence: float
     corroboration_count: int
     contradiction_count: int
@@ -527,7 +526,6 @@ class MemoryCreateRequest(BaseModel):
     content: str = Field(min_length=1)
     provenance: str = Field(min_length=1)
     memory_type: Literal["fact", "decision", "convention", "procedure"] = "fact"
-    tags: list[str] = Field(default_factory=list)
     confidence: float = 0.95
     client: Literal["codex", "claude-code"] = "codex"
     repo_identifier: str | None = None
@@ -714,7 +712,6 @@ class EntityAliasResponse(BaseModel):
 class EntityResponse(BaseModel):
     id: int
     canonical_name: str
-    tags: list[str] = []
     display_name: str
     created_at: str | None = None
 
@@ -1231,7 +1228,6 @@ class MemoryReviewMemorySummary(BaseModel):
     confidence: float
     corroboration_count: int
     status: str
-    tags: list[str] = []
     entity_refs: list[str] = []
     sources: list[MemorySourceDetail] = []
     created_at: str | None = None
@@ -2132,7 +2128,6 @@ def _memory_to_response(
         visibility=mem.visibility,
         owner_user_id=mem.owner_user_id,
         project_key=mem.project_key,
-        tags=mem.tags,
         confidence=mem.confidence,
         corroboration_count=mem.corroboration_count,
         contradiction_count=mem.contradiction_count,
@@ -2214,7 +2209,6 @@ async def _build_memory_summary(
         confidence=memory.confidence,
         corroboration_count=memory.corroboration_count,
         status=memory.status,
-        tags=memory.tags,
         entity_refs=entity_names,
         sources=sources,
         created_at=_dt_iso(memory.created_at),
@@ -2236,7 +2230,6 @@ def _build_memory_review_list_summary(
         confidence=memory.confidence,
         corroboration_count=memory.corroboration_count,
         status=memory.status,
-        tags=memory.tags,
         created_at=_dt_iso(memory.created_at),
         updated_at=_dt_iso(memory.updated_at),
         origin_source_type=origin_source_type,
@@ -2253,7 +2246,6 @@ async def _build_memory_store(
     """Build a request-scoped memory store with effective embedding settings."""
 
     from memforge.memory.audit import MemoryAuditLogger
-    from memforge.retrieval.document_index import DocumentVectorIndex
     from memforge.retrieval.embeddings import get_chroma_collection
     from memforge.runtime import get_effective_llm_config
 
@@ -2261,10 +2253,6 @@ async def _build_memory_store(
     memory_collection = get_chroma_collection(
         chroma_path=config.storage.chroma_path,
         name="memories",
-    )
-    document_collection = get_chroma_collection(
-        chroma_path=config.storage.chroma_path,
-        name="documents",
     )
     embed_cfg = {
         "base_url": llm.embedding_base_url,
@@ -2285,7 +2273,6 @@ async def _build_memory_store(
         vector=adapters.vector,
         embed_cfg=embed_cfg,
         audit_logger=audit_logger,
-        document_index=DocumentVectorIndex(document_collection),
     )
 
 
@@ -3119,7 +3106,6 @@ def create_admin_app(
             visibility=mem.visibility,
             owner_user_id=mem.owner_user_id,
             project_key=mem.project_key,
-            tags=mem.tags,
             confidence=mem.confidence,
             corroboration_count=mem.corroboration_count,
             contradiction_count=mem.contradiction_count,
@@ -3163,7 +3149,6 @@ def create_admin_app(
                     memory_id,
                     new_content=req.content or memory.content,
                     new_confidence=req.confidence,
-                    new_tags=memory.tags,
                 )
             except ValueError as exc:
                 if "active source support" in str(exc):
@@ -3230,7 +3215,6 @@ def create_admin_app(
                 content=req.content,
                 provenance=req.provenance,
                 memory_type=req.memory_type,
-                tags=req.tags,
                 confidence=req.confidence,
                 owner_user_id=resolve_request_principal(request),
                 client=req.client,
@@ -3400,15 +3384,13 @@ def create_admin_app(
 
     @entity_router.get("", response_model=EntityListResponse)
     async def list_entities(
-        tag: str | None = None,
         search: str | None = None,
         limit: int = 100,
         offset: int = 0,
         db: Database = Depends(get_db),
     ):
-        """List entities with optional tag filter and search."""
+        """List entities with optional name search."""
         entity_rows, total = await db.list_entities(
-            tag=tag,
             search=search,
             limit=limit,
             offset=offset,
@@ -3417,7 +3399,6 @@ def create_admin_app(
             EntityResponse(
                 id=ent.id,
                 canonical_name=ent.canonical_name,
-                tags=ent.tags,
                 display_name=ent.display_name,
                 created_at=_dt_iso(ent.created_at),
             )
@@ -3449,7 +3430,6 @@ def create_admin_app(
         return EntityDetailResponse(
             id=ent.id,
             canonical_name=ent.canonical_name,
-            tags=ent.tags,
             display_name=ent.display_name,
             created_at=_dt_iso(ent.created_at),
             aliases=alias_responses,

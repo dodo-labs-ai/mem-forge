@@ -1181,7 +1181,6 @@ class SearchEngine:
                 summary=memory.content,
                 confidence=memory.confidence,
                 relevance_score=round(candidate.final_score, 4),
-                tags=memory.tags,
                 corroborated_by=memory.corroboration_count,
                 last_observed_at=(
                     memory.updated_at.isoformat()

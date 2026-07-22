@@ -25,7 +25,7 @@ from memforge.source_projection import (
     SourceUnitInventoryFilter,
     SourceUnitRevision,
 )
-from memforge.models import DocumentMetadata, DocumentRecord, Memory, MemorySource
+from memforge.models import DocumentRecord, Memory, MemorySource
 from memforge.storage.database import Database, MIGRATIONS
 
 
@@ -559,17 +559,6 @@ async def test_document_move_rebinds_legacy_support_without_cleaning_shared_arti
                 last_synced=now,
             )
         )
-    await db.upsert_metadata(
-        DocumentMetadata(
-            doc_id="new-path",
-            summary="Page summary",
-            tags=[],
-            entities=[],
-            doc_type="document",
-            complexity="low",
-            enriched_at=now,
-        )
-    )
     memory = Memory(
         id="mem-moved-page",
         memory_type="fact",

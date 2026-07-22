@@ -44,7 +44,6 @@ def _mem(mid: str, content: str, *, visibility=WORKSPACE, owner=None) -> Memory:
         visibility=visibility,
         owner_user_id=owner,
         project_key=SHARED_PROJECT_KEY,
-        tags=[],
         status="active",
     )
 

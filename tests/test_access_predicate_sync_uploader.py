@@ -23,11 +23,7 @@ import pytest
 from memforge.agent_sessions import submit_agent_session_document
 from memforge.config import AppConfig
 from memforge.genes.agent_session_gene import AgentSessionGene
-from memforge.models import (
-    EnrichmentResult,
-    MemoryExtractionResult,
-    RawMemory,
-)
+from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.database import Database
@@ -76,20 +72,6 @@ class _StubDocumentStore:
         return f"file:///tmp/{source_id}/{title}.md"
 
 
-class _StubEnricher:
-    """Returns an empty enrichment so the orchestrator advances to memory extraction."""
-
-    async def enrich_document(self, *, doc_id, content, source_type):
-        return EnrichmentResult(
-            summary="agent session summary",
-            tags=[],
-            entities=[],
-            relationships=[],
-            doc_type="agent_session_summary",
-            complexity="low",
-        )
-
-
 class _SingleMemoryExtractor:
     """Yields one RawMemory so the orchestrator reaches projected lifecycle."""
 
@@ -100,7 +82,6 @@ class _SingleMemoryExtractor:
                     memory_type="fact",
                     content="durable design fact",
                     entity_refs=[],
-                    tags=[],
                     confidence=0.9,
                 )
             ],
@@ -113,7 +94,6 @@ class _SingleMemoryExtractor:
                     memory_type="fact",
                     content="durable design fact",
                     entity_refs=[],
-                    tags=[],
                     confidence=0.9,
                 )
             ],
@@ -126,7 +106,6 @@ class _SingleMemoryExtractor:
                     memory_type="fact",
                     content="durable design fact",
                     entity_refs=[],
-                    tags=[],
                     confidence=0.9,
                 )
             ],
@@ -321,7 +300,6 @@ async def test_orchestrator_forwards_uploader_user_id_on_new_documents(database_
     orchestrator = GeneSyncOrchestrator(
         db=database,
         doc_store=_StubDocumentStore(),
-        enricher=_StubEnricher(),
         memory_extractor=_SingleMemoryExtractor(),
         memory_engine=spy,
         memory_store=None,
@@ -378,7 +356,6 @@ async def test_orchestrator_forwards_source_updated_at_on_new_documents(database
     orchestrator = GeneSyncOrchestrator(
         db=database,
         doc_store=_StubDocumentStore(),
-        enricher=_StubEnricher(),
         memory_extractor=_SingleMemoryExtractor(),
         memory_engine=spy,
         memory_store=None,
@@ -414,7 +391,6 @@ async def test_orchestrator_forwards_source_updated_at_to_projected_lifecycle(da
     orchestrator = GeneSyncOrchestrator(
         db=database,
         doc_store=_StubDocumentStore(),
-        enricher=_StubEnricher(),
         memory_extractor=_SingleMemoryExtractor(),
         memory_engine=spy,
         memory_store=None,
@@ -462,7 +438,6 @@ async def test_orchestrator_forwards_uploader_user_id_on_document_updates(databa
     initial_orchestrator = GeneSyncOrchestrator(
         db=database,
         doc_store=_StubDocumentStore(),
-        enricher=_StubEnricher(),
         memory_extractor=_SingleMemoryExtractor(),
         memory_engine=initial_spy,
         memory_store=None,
@@ -495,7 +470,6 @@ async def test_orchestrator_forwards_uploader_user_id_on_document_updates(databa
     update_orchestrator = GeneSyncOrchestrator(
         db=database,
         doc_store=_StubDocumentStore(),
-        enricher=_StubEnricher(),
         memory_extractor=_SingleMemoryExtractor(),
         memory_engine=update_spy,
         memory_store=None,
@@ -511,8 +485,7 @@ async def test_orchestrator_forwards_uploader_user_id_on_document_updates(databa
     assert update_state.last_sync_status == "success"
     # Existing document with changed content -> the same projected lifecycle seam.
     assert update_spy.projected_lifecycle_calls, (
-        "expected the orchestrator to invoke projected lifecycle "
-        "for an existing document with changed content"
+        "expected the orchestrator to invoke projected lifecycle for an existing document with changed content"
     )
     forwarded = update_spy.projected_lifecycle_calls[0]
     assert forwarded["doc_id"] == item_second.item_id
@@ -542,7 +515,6 @@ async def test_orchestrator_forwards_source_updated_at_on_document_updates(datab
     initial_orchestrator = GeneSyncOrchestrator(
         db=database,
         doc_store=_StubDocumentStore(),
-        enricher=_StubEnricher(),
         memory_extractor=_SingleMemoryExtractor(),
         memory_engine=initial_spy,
         memory_store=None,
@@ -573,7 +545,6 @@ async def test_orchestrator_forwards_source_updated_at_on_document_updates(datab
     update_orchestrator = GeneSyncOrchestrator(
         db=database,
         doc_store=_StubDocumentStore(),
-        enricher=_StubEnricher(),
         memory_extractor=_SingleMemoryExtractor(),
         memory_engine=update_spy,
         memory_store=None,

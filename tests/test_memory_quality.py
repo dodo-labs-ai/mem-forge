@@ -85,7 +85,6 @@ def _raw(content: str, context: str) -> RawMemory:
         memory_type="fact",
         confidence=0.9,
         entity_refs=[],
-        tags=["payroll"],
         extraction_context=context,
     )
 
@@ -144,7 +143,6 @@ async def _insert_memory(db: Database, *, mem_id: str, content: str) -> Memory:
         memory_type="fact",
         content=content,
         content_hash=content_hash(content),
-        tags=["payroll"],
         confidence=0.9,
         created_at=now,
         updated_at=now,
@@ -873,7 +871,6 @@ def test_sync_previous_content_read_does_not_bypass_document_store(tmp_path: Pat
     orchestrator = GeneSyncOrchestrator(
         db=object(),
         doc_store=RejectingDocumentStore(),
-        enricher=object(),
         memory_extractor=object(),
         memory_engine=object(),
         memory_store=object(),

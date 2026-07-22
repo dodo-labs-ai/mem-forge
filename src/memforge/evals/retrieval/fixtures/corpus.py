@@ -95,7 +95,6 @@ async def _seed_memories(db: Database, fixture: Mapping[str, Any]) -> None:
                 project_key=memory.get("project_key") if isinstance(memory, Mapping) else None,
                 repo_identifier=_value_or_default(memory, "repo_identifier", None) if isinstance(memory, Mapping) else None,
                 entity_refs=list(_value_or_default(memory, "entity_refs", ())) if isinstance(memory, Mapping) else [],
-                tags=list(_value_or_default(memory, "tags", ())) if isinstance(memory, Mapping) else [],
                 status=str(_value_or_default(memory, "status", "active")) if isinstance(memory, Mapping) else "active",
                 created_at=FIXED_NOW,
                 updated_at=FIXED_NOW,

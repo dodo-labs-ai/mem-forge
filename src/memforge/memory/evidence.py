@@ -414,6 +414,7 @@ class RelationOutcomeBundle:
     candidates: tuple[RelationCandidateRecord, ...] = ()
     relations: tuple[EvidenceRelationRecord, ...] = ()
     candidate_provenance: tuple[CandidateMemory, ...] = ()
+    expected_candidate_support_set_hashes: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

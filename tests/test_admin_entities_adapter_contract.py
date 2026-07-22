@@ -23,7 +23,6 @@ class AdapterOnlyEntityDb:
         self.entity = Entity(
             id=1,
             canonical_name="Payroll Area",
-            tags=["payroll"],
             display_name="Payroll Area",
             created_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
         )
@@ -43,7 +42,6 @@ class AdapterOnlyEntityDb:
             memory_type="fact",
             content="Payroll cutoff is the 25th.",
             content_hash=content_hash("Payroll cutoff is the 25th."),
-            tags=["payroll"],
             confidence=0.9,
             status="active",
             created_at=datetime(2026, 6, 10, tzinfo=timezone.utc),

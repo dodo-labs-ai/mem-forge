@@ -134,11 +134,10 @@ async def test_sqlite_fixture_preserves_visibility_repo_and_zero_confidence(tmp_
             "id": "mem-private-low-confidence",
             "content": "Private fixture memory.",
             "confidence": 0.0,
-            "visibility": "private",
-            "owner_user_id": "eval-user",
-            "repo_identifier": "repo/example",
-            "tags": ["fixture"],
-        }
+                "visibility": "private",
+                "owner_user_id": "eval-user",
+                "repo_identifier": "repo/example",
+            }
     )
 
     db = await seed_sqlite_fixture(
@@ -155,4 +154,3 @@ async def test_sqlite_fixture_preserves_visibility_repo_and_zero_confidence(tmp_
     assert memory.visibility == "private"
     assert memory.owner_user_id == "eval-user"
     assert memory.repo_identifier == "repo/example"
-    assert memory.tags == ["fixture"]

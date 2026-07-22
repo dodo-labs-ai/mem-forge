@@ -122,7 +122,6 @@ class ToolClient:
         content: str,
         provenance: str,
         memory_type: str = "fact",
-        tags: list[str] | tuple[str, ...] | None = None,
         confidence: float | None = None,
         client: str = "codex",
         repo_identifier: str | None = None,
@@ -131,7 +130,6 @@ class ToolClient:
         body: dict[str, Any] = {
             "content": content,
             "memory_type": memory_type,
-            "tags": list(tags or []),
             "client": client,
             "provenance": provenance,
         }

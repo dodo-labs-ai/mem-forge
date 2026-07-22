@@ -171,15 +171,13 @@ _chroma_lock = threading.Lock()
 
 def get_chroma_collection(
     chroma_path: str,
-    name: str = "documents",
+    name: str = "memories",
 ) -> Any:
-    """Open or create a ChromaDB collection with cosine similarity.
+    """Open the Memory vector collection with cosine similarity.
 
-    Supports multiple collections on the same PersistentClient path:
-    - "documents" for document-level embeddings
-    - "memories" for memory-level embeddings
-
-    Uses a thread-safe module-level singleton for each path to avoid lock contention.
+    ``name`` remains explicit for tests and future contracted collections; the
+    production default is Memory-only and never recreates the retired document
+    vector projection.
     """
     with _chroma_lock:
         if chroma_path not in _chroma_clients:

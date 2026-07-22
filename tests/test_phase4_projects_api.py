@@ -149,7 +149,6 @@ def test_delete_real_project_rebuckets_to_unsorted(tmp_path):
                     visibility=Visibility.WORKSPACE.value,
                     owner_user_id=None,
                     project_key="PAY",
-                    tags=[],
                 )
             )
 
@@ -414,7 +413,6 @@ def test_delete_orders_vector_before_relational_commit(tmp_path):
                 visibility=Visibility.WORKSPACE.value,
                 owner_user_id=None,
                 project_key="PAY",
-                tags=[],
             )
         )
 
@@ -512,7 +510,6 @@ def test_resolved_projects_endpoint_groups_memories_by_resolved_key(tmp_path):
                     visibility=Visibility.WORKSPACE.value,
                     owner_user_id=None,
                     project_key=key,
-                    tags=[],
                 )
             )
             await database.add_memory_source(

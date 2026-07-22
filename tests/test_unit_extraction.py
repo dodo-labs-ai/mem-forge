@@ -64,7 +64,6 @@ async def test_extract_unit_memories_trusts_unit_anchor_as_boundary_contract():
                     memory_type="fact",
                     confidence=0.9,
                     entity_refs=["UnifiedContextApi"],
-                    tags=["tracking"],
                     extraction_context="Tracking uses UnifiedContextApi for explicit API calls.",
                     evidence_quote="Tracking uses UnifiedContextApi for explicit API calls.",
                     evidence_anchor="unit",
@@ -74,7 +73,6 @@ async def test_extract_unit_memories_trusts_unit_anchor_as_boundary_contract():
                     memory_type="fact",
                     confidence=0.9,
                     entity_refs=["UnifiedContextApi"],
-                    tags=["tracking"],
                     extraction_context="Tracking uses UnifiedContextApi for explicit API calls.",
                     evidence_quote="Tracking uses UnifiedContextApi for explicit API calls.",
                     evidence_anchor="glossary",
@@ -89,14 +87,16 @@ async def test_extract_unit_memories_trusts_unit_anchor_as_boundary_contract():
     assert [memory.content for memory in result.memories] == ["Tracking uses UnifiedContextApi for explicit API calls."]
     assert result.memories[0].evidence_anchor == "unit"
     assert result.memories[0].extraction_context == "Tracking uses UnifiedContextApi for explicit API calls."
+    assert result.metadata["structured_llm_calls"] == 1
+    assert result.metadata["prompt_chars"] == len(client.calls[0]["prompt"])
     assert "glossary_appendix" in client.calls[0]["prompt"]
 
 
-def test_full_scope_extraction_prompts_treat_existing_memory_as_comparison_context():
+def test_full_scope_extraction_prompts_delegate_history_to_lifecycle():
     for prompt in (
         MEMORY_EXTRACTION_PROMPT,
         UNIT_MEMORY_EXTRACTION_PROMPT,
         PROJECTION_BATCH_EXTRACTION_PROMPT,
     ):
-        assert "Existing memories are comparison context, not a novelty filter." in prompt
-        assert "attach another Support Assertion" in prompt
+        assert "reconciliation" in prompt.lower()
+        assert "existing_memories" not in prompt

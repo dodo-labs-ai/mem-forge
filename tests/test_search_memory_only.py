@@ -1,7 +1,8 @@
 """Search returns memory results only.
 
-Document storage, document vectors, health, repair, and artifact retrieval still
-exist. The search API does not mix direct document hits into memory results.
+Document storage, health, repair, and artifact retrieval still exist. The search
+API and vector index contain Memories only; source artifacts remain available
+through Evidence-backed resource access.
 """
 
 from __future__ import annotations

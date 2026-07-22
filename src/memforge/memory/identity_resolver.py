@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import TYPE_CHECKING, Mapping
 
 from memforge.memory.relation_classifier import (
@@ -36,6 +37,20 @@ class IdentityResolution:
     failure_reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class IdentityResolutionMetrics:
+    pair_count: int
+    llm_calls: int
+    prompt_chars: int
+    elapsed_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityResolutionBatch:
+    resolutions: tuple[IdentityResolution, ...]
+    metrics: IdentityResolutionMetrics
+
+
 class IdentityResolver:
     """Resolve one reconciliation scope through exact and batched semantic proof."""
 
@@ -53,9 +68,10 @@ class IdentityResolver:
     async def resolve(
         self,
         requests: tuple[IdentityResolutionRequest, ...],
-    ) -> tuple[IdentityResolution, ...]:
+    ) -> IdentityResolutionBatch:
         """Resolve requests in order while coalescing all semantic pairs."""
 
+        started = perf_counter()
         pending: dict[int, tuple[MemoryPair, ...]] = {}
         resolved: dict[int, IdentityResolution] = {}
         all_pairs: list[MemoryPair] = []
@@ -122,6 +138,7 @@ class IdentityResolver:
             pending[index] = pairs
             all_pairs.extend(pairs)
 
+        llm_calls = prompt_chars = 0
         try:
             if all_pairs and self._pair_classifier is None:
                 raise MemoryPairClassificationError("semantic classifier unavailable")
@@ -130,8 +147,13 @@ class IdentityResolver:
                 if all_pairs and self._pair_classifier is not None
                 else None
             )
+            if classification is not None:
+                llm_calls = classification.llm_calls
+                prompt_chars = classification.prompt_chars
             decisions = classification.decisions if classification is not None else ()
         except MemoryPairClassificationError as error:
+            llm_calls = error.llm_calls
+            prompt_chars = error.prompt_chars
             for index, pairs in pending.items():
                 resolved[index] = IdentityResolution(
                     challenger=pairs[0].challenger,
@@ -171,4 +193,12 @@ class IdentityResolver:
                     classified_pairs=pair_decisions,
                 )
 
-        return tuple(resolved[index] for index in range(len(requests)))
+        return IdentityResolutionBatch(
+            resolutions=tuple(resolved[index] for index in range(len(requests))),
+            metrics=IdentityResolutionMetrics(
+                pair_count=len(all_pairs),
+                llm_calls=llm_calls,
+                prompt_chars=prompt_chars,
+                elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
+            ),
+        )

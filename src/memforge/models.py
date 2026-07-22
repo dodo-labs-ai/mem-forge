@@ -144,14 +144,8 @@ class ConfigFieldType(str, Enum):
 class Entity:
     id: int
     canonical_name: str
-    tags: list[str] = field(default_factory=list)  # optional soft tags: service, api, technology, etc.
     display_name: str = ""
     created_at: datetime | None = None
-
-    @property
-    def entity_type(self) -> str:
-        """Deprecated: returns first tag or 'unknown'. Use .tags instead."""
-        return self.tags[0] if self.tags else "unknown"
 
 
 @dataclass
@@ -160,6 +154,7 @@ class EntityAlias:
     alias_normalized: str
     canonical_id: int
     source: str  # "exact" | "fuzzy_auto" | "llm_extracted" | "admin_manual"
+    access_context_hash: str | None = None
     created_at: datetime | None = None
 
 
@@ -182,7 +177,6 @@ class Memory:
 
     # Entity linkage
     entity_refs: list[str] = field(default_factory=list)
-    tags: list[str] = field(default_factory=list)
 
     # Confidence and lifecycle
     confidence: float = 0.7
@@ -211,7 +205,6 @@ class RawMemory:
     memory_type: str
     confidence: float = 0.7
     entity_refs: list[str] = field(default_factory=list)
-    tags: list[str] = field(default_factory=list)
     valid_from: str | None = None
     valid_until: str | None = None
     extraction_context: str | None = None
@@ -323,60 +316,6 @@ class DocumentRecord:
     client: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
-
-
-@dataclass
-class DocumentMetadata:
-    """AI-enriched metadata for a document (Call 1 output)."""
-    doc_id: str
-    summary: str
-    tags: list[str]
-    entities: list[Entity]
-    doc_type: str
-    complexity: str
-    enriched_at: datetime | None = None
-
-
-@dataclass
-class Relationship:
-    target_doc_id: str | None
-    target_title: str
-    relation_type: str  # depends-on, extends, supersedes, references, related
-    confidence: float
-
-
-# ---------------------------------------------------------------------------
-# Enrichment / extraction results
-# ---------------------------------------------------------------------------
-
-@dataclass
-class RawEntityRef:
-    """Entity reference as returned by the LLM enrichment call."""
-    name: str
-    type: str = "unknown"
-    tags: list[str] = field(default_factory=list)
-    confidence: float = 1.0
-    aliases: list[str] = field(default_factory=list)  # other names the doc uses for this entity
-
-
-@dataclass
-class RawAliasGroup:
-    """Legacy alias group format. Kept for backward compatibility."""
-    canonical: str
-    aliases: list[str]
-    evidence: str = ""
-
-
-@dataclass
-class EnrichmentResult:
-    """Output of Call 1 (enrichment)."""
-    summary: str = ""
-    tags: list[str] = field(default_factory=list)
-    entities: list[RawEntityRef] = field(default_factory=list)
-    relationships: list[Relationship] = field(default_factory=list)
-    doc_type: str = "unknown"
-    complexity: str = "medium"
-    entity_aliases: list[RawAliasGroup] = field(default_factory=list)  # legacy format
 
 
 @dataclass
@@ -628,7 +567,6 @@ class SearchResult:
     summary: str
     confidence: float
     relevance_score: float
-    tags: list[str] = field(default_factory=list)
     # Metadata
     corroborated_by: int = 1
     last_observed_at: str | None = None

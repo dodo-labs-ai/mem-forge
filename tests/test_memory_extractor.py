@@ -35,7 +35,6 @@ async def test_memory_extractor_uses_structured_schema_client():
                     memory_type="fact",
                     confidence=0.9,
                     entity_refs=["Service A"],
-                    tags=["database"],
                     extraction_context="Service A uses PostgreSQL 16",
                 )
             ]
@@ -47,7 +46,6 @@ async def test_memory_extractor_uses_structured_schema_client():
         content="# Service A\n\nService A uses PostgreSQL 16.",
         source_type="github_pages",
         doc_type="reference",
-        entities=["Service A"],
     )
 
     assert result.error_type is None
@@ -57,6 +55,11 @@ async def test_memory_extractor_uses_structured_schema_client():
     assert client.calls[0]["max_tokens"] == 1234
     assert client.calls[0]["model"] == "claude-sonnet-4-20250514"
     assert "github_pages" in client.calls[0]["prompt"]
+    assert "existing_memories" not in client.calls[0]["prompt"]
+    assert '"tags"' not in client.calls[0]["prompt"]
+    assert result.metadata["structured_llm_calls"] == 1
+    assert result.metadata["prompt_chars"] == len(client.calls[0]["prompt"])
+    assert result.metadata["structured_llm_elapsed_ms"] >= 0
 
 
 @pytest.mark.asyncio
@@ -69,3 +72,4 @@ async def test_memory_extractor_reports_structured_output_failure():
     assert result.memories == []
     assert result.error_type == "structured_llm_error"
     assert result.error == "response_format unsupported"
+    assert result.metadata["structured_llm_calls"] == 1

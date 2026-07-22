@@ -12,6 +12,7 @@ Invariants covered:
 * visibility filtering on the workspace branch and the private-owner branch
 * lifecycle status filtering via ``AccessScope.allowed_statuses``
 * scope-mode hard narrowing (``project`` vs ``project-first``)
+* bounded entity exact/alias/candidate lookup with learned-alias access fencing
 * project lifecycle (create/list/update + project deletion that rebuckets
   named memories into UNSORTED in one transaction)
 
@@ -30,12 +31,17 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.models import (
+    EntityAlias,
     SHARED_PROJECT_KEY,
     UNSORTED_PROJECT_KEY,
     Visibility,
 )
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
-from memforge.storage.adapters.protocols import RelationalStore
+from memforge.storage.adapters.protocols import (
+    EntityResolutionScope,
+    EntityUpsert,
+    RelationalStore,
+)
 
 from tests.contracts._support import (
     AdaptersFactory,
@@ -81,6 +87,109 @@ class RelationalStoreContract:
 
     async def test_get_unknown_id_returns_none(self, adapters: ContractAdapters) -> None:
         assert await adapters.relational.get_memory("missing") is None
+
+    async def test_entity_resolution_batch_is_bounded_and_access_fenced(
+        self,
+        adapters: ContractAdapters,
+    ) -> None:
+        store = adapters.relational
+        resolved = await store.upsert_entities(
+            (
+                EntityUpsert("payroll control center", "Payroll Control Center"),
+                EntityUpsert("product release calendar", "Release Calendar"),
+                EntityUpsert("release checklist", "Release Checklist"),
+            )
+        )
+        await store.insert_aliases(
+            (
+                EntityAlias(
+                    alias="PCC",
+                    alias_normalized="pcc",
+                    canonical_id=resolved["payroll control center"],
+                    source="admin_manual",
+                ),
+                EntityAlias(
+                    alias="Private Calendar",
+                    alias_normalized="private calendar",
+                    canonical_id=resolved["product release calendar"],
+                    source="resolver_confirmed",
+                    access_context_hash="access-a",
+                ),
+                EntityAlias(
+                    alias="Private Calendar",
+                    alias_normalized="private calendar",
+                    canonical_id=resolved["product release calendar"],
+                    source="resolver_confirmed",
+                    access_context_hash="access-b",
+                ),
+            )
+        )
+
+        context = await store.load_entity_resolution_context(
+            ("payroll control center", "pcc", "private calendar", "release", "missing"),
+            candidate_limit=1,
+            scope=EntityResolutionScope(access_context_hash="access-a"),
+        )
+        other_scope = await store.load_entity_resolution_context(
+            ("private calendar",),
+            candidate_limit=1,
+            scope=EntityResolutionScope(access_context_hash="access-b"),
+        )
+
+        assert context.exact_matches["payroll control center"].id == resolved[
+            "payroll control center"
+        ]
+        assert context.alias_matches["pcc"].canonical_id == resolved[
+            "payroll control center"
+        ]
+        assert context.alias_matches["private calendar"].canonical_id == resolved[
+            "product release calendar"
+        ]
+        assert len(context.candidates["release"]) == 1
+        assert context.candidates["missing"] == ()
+        assert other_scope.alias_matches["private calendar"].canonical_id == resolved[
+            "product release calendar"
+        ]
+
+    async def test_entity_alias_conflicts_are_candidates_not_order_dependent_hits(
+        self,
+        adapters: ContractAdapters,
+    ) -> None:
+        store = adapters.relational
+        resolved = await store.upsert_entities(
+            (
+                EntityUpsert("payroll command center", "Payroll Command Center"),
+                EntityUpsert("policy control center", "Policy Control Center"),
+            )
+        )
+        await store.insert_aliases(
+            tuple(
+                EntityAlias(
+                    alias="PCC",
+                    alias_normalized="pcc",
+                    canonical_id=entity_id,
+                    source="resolver_confirmed",
+                    access_context_hash="access-a",
+                )
+                for entity_id in resolved.values()
+            )
+        )
+
+        conflicted = await store.load_entity_resolution_context(
+            ("pcc",),
+            candidate_limit=10,
+            scope=EntityResolutionScope(access_context_hash="access-a"),
+        )
+        unrelated_scope = await store.load_entity_resolution_context(
+            ("pcc",),
+            candidate_limit=10,
+            scope=EntityResolutionScope(access_context_hash="access-c"),
+        )
+
+        assert "pcc" not in conflicted.alias_matches
+        assert {entity.id for entity in conflicted.candidates["pcc"]} == set(resolved.values())
+        assert "pcc" not in unrelated_scope.alias_matches
+        assert unrelated_scope.candidates["pcc"] == ()
 
     async def test_active_exact_claim_candidate_is_access_scoped_and_excludable(
         self,

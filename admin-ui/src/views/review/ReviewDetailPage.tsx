@@ -522,7 +522,6 @@ export function ReviewDetailPage() {
   if (incumbent && challenger) {
     attributeRows.push(diffField("Confidence", incumbent.confidence, challenger.confidence));
     for (const row of [
-      diffField("Tags", incumbent.tags, challenger.tags),
       diffField("Entities", incumbent.entity_refs, challenger.entity_refs),
       diffField("Memory type", incumbent.memory_type, challenger.memory_type),
     ]) {

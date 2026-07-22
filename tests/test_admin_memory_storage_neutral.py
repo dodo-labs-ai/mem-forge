@@ -21,7 +21,6 @@ def _memory(memory_id: str) -> Memory:
         memory_type="fact",
         content="Storage-neutral admin memory row.",
         content_hash=content_hash(memory_id),
-        tags=["admin"],
         confidence=0.9,
         created_at=now,
         updated_at=now,

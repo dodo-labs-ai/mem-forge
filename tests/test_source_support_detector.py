@@ -40,7 +40,6 @@ def _memory(
         content=content,
         content_hash=content_hash(content),
         project_key=project_key,
-        tags=["payroll"],
         confidence=0.9,
         created_at=now,
         updated_at=now,
@@ -169,7 +168,7 @@ async def test_support_detection_requires_memory_store(db: Database):
 async def test_detect_and_persist_routes_corroborated_support_through_store(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
+    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle")
     memory = _memory("mem-route-support", "Period lifecycle assignment transitions to ASSIGNED.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
 
@@ -306,7 +305,7 @@ async def test_get_corroborated_sources_by_doc_maps_source_updated_at(db: Databa
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
     memory = _memory("mem-corroborated-observed", "Supported memory.")
-    entity_id = await db.upsert_entity("observed support", display_name="Observed Support", tags=["feature"])
+    entity_id = await db.upsert_entity("observed support", display_name="Observed Support")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     source_updated_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
 
@@ -328,7 +327,7 @@ async def test_get_corroborated_sources_by_doc_maps_source_updated_at(db: Databa
 async def test_sqlite_add_memory_source_overwrites_source_updated_at_with_unknown(db: Database):
     await _insert_doc(db, "doc-origin")
     memory = _memory("mem-source-updated-clear", "Source timestamp can become unknown.")
-    entity_id = await db.upsert_entity("observed clear", display_name="Observed Clear", tags=["feature"])
+    entity_id = await db.upsert_entity("observed clear", display_name="Observed Clear")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     source_updated_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
 
@@ -358,7 +357,7 @@ async def test_sqlite_corroborate_memory_overwrites_source_updated_at_with_unkno
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
     memory = _memory("mem-corroborate-observed-clear", "Corroborated timestamp can become unknown.")
-    entity_id = await db.upsert_entity("corroborate clear", display_name="Corroborate Clear", tags=["feature"])
+    entity_id = await db.upsert_entity("corroborate clear", display_name="Corroborate Clear")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     source_updated_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
 
@@ -396,7 +395,7 @@ async def test_source_support_candidates_exclude_disabled_private_sources(db: Da
         access_policy="private",
         owner_user_id="alice@example.com",
     )
-    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
+    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle")
     memory = _memory(
         "mem-disabled-source-support",
         "Period lifecycle assignment transitions to ASSIGNED.",
@@ -455,7 +454,7 @@ async def test_source_support_workspace_candidates_ignore_personal_disabled_sour
         access_policy="workspace",
         owner_user_id="alice@example.com",
     )
-    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
+    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle")
     memory = _memory("mem-workspace-source-support", "Period lifecycle assignment transitions to ASSIGNED.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     await db.set_source_subscription("src-ORIGIN", "alice@example.com", enabled=False)
@@ -499,7 +498,7 @@ async def test_source_support_workspace_candidates_ignore_personal_disabled_sour
 async def test_rejected_source_support_does_not_record_support_relation(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
+    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle")
     memory = _memory("mem-rejected-support", "Period lifecycle assignment transitions to ASSIGNED.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
 
@@ -561,7 +560,7 @@ async def test_rejected_source_support_does_not_record_support_relation(db: Data
 async def test_existing_support_refresh_routes_through_store(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("refresh support", display_name="Refresh Support", tags=["feature"])
+    entity_id = await db.upsert_entity("refresh support", display_name="Refresh Support")
     memory = _memory("mem-refresh-support", "Existing support refresh stays audited.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     await db.corroborate_memory(
@@ -646,7 +645,7 @@ async def test_existing_support_refresh_routes_through_store(db: Database):
 async def test_support_detection_adds_corroborated_source_with_validated_excerpt(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
+    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle")
     memory = _memory("mem-support1", "Period lifecycle assignment must transition to ASSIGNED.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
 
@@ -686,7 +685,7 @@ async def test_support_detection_adds_corroborated_source_with_validated_excerpt
 async def test_support_detection_audits_invalid_excerpt_rejection(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
+    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle")
     memory = _memory("mem-support-invalid", "Period lifecycle assignment must transition to ASSIGNED.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
 
@@ -722,7 +721,7 @@ async def test_support_detection_audits_invalid_excerpt_rejection(db: Database):
 async def test_existing_support_refresh_audits_unsupported_decision(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("refresh support", display_name="Refresh Support", tags=["feature"])
+    entity_id = await db.upsert_entity("refresh support", display_name="Refresh Support")
     memory = _memory("mem-refresh-malformed", "Existing support refresh stays audited.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     await db.corroborate_memory(
@@ -770,7 +769,7 @@ async def test_existing_support_refresh_audits_unsupported_decision(db: Database
 async def test_support_detection_audits_verified_support_with_model_and_reason(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle", tags=["feature"])
+    entity_id = await db.upsert_entity("period lifecycle", display_name="Period Lifecycle")
     memory = _memory("mem-support-verified", "Period lifecycle assignment must transition to ASSIGNED.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
 
@@ -810,7 +809,7 @@ async def test_support_detection_audits_verified_support_with_model_and_reason(d
 async def test_support_detection_audits_structured_llm_failure(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("llm support", display_name="LLM Support", tags=["feature"])
+    entity_id = await db.upsert_entity("llm support", display_name="LLM Support")
     memory = _memory("mem-support-llmfail", "LLM failures are auditable.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
 
@@ -841,7 +840,7 @@ async def test_support_detection_audits_structured_llm_failure(db: Database):
 async def test_support_detection_audits_missing_structured_client_and_writes_no_support(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("structured missing", display_name="Structured Missing", tags=["feature"])
+    entity_id = await db.upsert_entity("structured missing", display_name="Structured Missing")
     memory = _memory("mem-support-no-structured", "Structured verifier must be available.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
 
@@ -872,7 +871,7 @@ async def test_support_detection_audits_missing_structured_client_and_writes_no_
 async def test_support_detection_reprocessing_updates_better_excerpt_without_increment(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("payroll group", display_name="Payroll Group", tags=["feature"])
+    entity_id = await db.upsert_entity("payroll group", display_name="Payroll Group")
     memory = _memory("mem-support2", "Off-cycle payroll group creation checks cutoff state first.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     await db.corroborate_memory(
@@ -919,7 +918,7 @@ async def test_support_detection_reprocessing_updates_better_excerpt_without_inc
 async def test_support_detection_removes_stale_corroborated_support_on_document_update(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("adaptive scheduling", display_name="Project Payroll", tags=["feature"])
+    entity_id = await db.upsert_entity("adaptive scheduling", display_name="Project Payroll")
     memory = _memory("mem-support3", "Project Payroll supports on-demand correction groups.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     await db.corroborate_memory(
@@ -954,7 +953,7 @@ async def test_support_detection_removes_stale_corroborated_support_on_document_
 @pytest.mark.asyncio
 async def test_support_detection_cleans_indexes_when_last_support_is_removed(db: Database):
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("last support", display_name="Last Support", tags=["feature"])
+    entity_id = await db.upsert_entity("last support", display_name="Last Support")
     memory = _memory("mem-last-support", "Last support removal should hide the memory from search.")
     await _seed_memory(db, memory, doc_id="doc-support", entity_id=entity_id, support_kind="corroborated")
     collection = FakeCollection()
@@ -987,7 +986,7 @@ async def test_support_detection_cleans_indexes_when_last_support_is_removed(db:
 async def test_stale_support_removal_reuses_source_support_operation_context(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("adaptive scheduling", display_name="Project Payroll", tags=["feature"])
+    entity_id = await db.upsert_entity("adaptive scheduling", display_name="Project Payroll")
     memory = _memory("mem-support-context", "Project Payroll supports correction groups.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     await db.corroborate_memory(
@@ -1046,7 +1045,7 @@ async def test_stale_support_removal_reuses_source_support_operation_context(db:
 async def test_support_detection_removes_existing_support_when_verifier_says_unsupported(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("cutoff", display_name="Cutoff", tags=["feature"])
+    entity_id = await db.upsert_entity("cutoff", display_name="Cutoff")
     memory = _memory("mem-support-false", "Cutoff validation runs before payroll group creation.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     old_excerpt = "Cutoff validation runs before payroll group creation."
@@ -1098,7 +1097,7 @@ async def test_support_detection_removes_existing_support_when_verifier_says_uns
 async def test_existing_corroborated_support_is_revalidated_before_new_candidates(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("ranking", display_name="Ranking", tags=["feature"])
+    entity_id = await db.upsert_entity("ranking", display_name="Ranking")
     existing = _memory("mem-existing-support", "Ranking keeps existing corroborated rows in the verifier batch.")
     await _seed_memory(db, existing, doc_id="doc-origin", entity_id=entity_id)
     await db.corroborate_memory(
@@ -1154,7 +1153,7 @@ async def test_existing_corroborated_support_is_revalidated_before_new_candidate
 async def test_corroborated_support_does_not_participate_in_same_document_reconciliation(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("validation", display_name="Validation", tags=["feature"])
+    entity_id = await db.upsert_entity("validation", display_name="Validation")
     extracted = _memory("mem-extracted", "Validation A is mandatory.")
     corroborated = _memory("mem-corroborated", "Validation B is mandatory.")
     await _seed_memory(db, extracted, doc_id="doc-support", entity_id=entity_id, support_kind="extracted")
@@ -1177,7 +1176,7 @@ async def test_corroborated_support_does_not_participate_in_same_document_reconc
 async def test_support_detection_rejects_link_only_excerpt(db: Database):
     await _insert_doc(db, "doc-origin")
     await _insert_doc(db, "doc-support")
-    entity_id = await db.upsert_entity("sonarqube", display_name="SonarQube", tags=["technology"])
+    entity_id = await db.upsert_entity("sonarqube", display_name="SonarQube")
     memory = _memory("mem-support4", "SonarQube major issues were resolved.")
     await _seed_memory(db, memory, doc_id="doc-origin", entity_id=entity_id)
     excerpt = "https://sonar.example.test/project/issues?id=payroll-processing"

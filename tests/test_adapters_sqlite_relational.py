@@ -7,6 +7,12 @@ from datetime import datetime, timezone
 
 import pytest
 
+from memforge.memory.evidence import RelationDirection
+from memforge.memory.relation_classifier import MemoryRelationType
+from memforge.memory.relation_discovery_contract import (
+    PreclassifiedRelationDecision,
+    RelationDiscoveryRequest,
+)
 from memforge.models import (
     DocumentRecord,
     Memory,
@@ -22,6 +28,75 @@ from memforge.storage.adapters.sqlite.relational import SqliteRelationalStore
 from memforge.storage.admin_memory import MemoryAdminListFilters
 
 
+@pytest.mark.asyncio
+async def test_sqlite_relation_work_round_trips_preclassified_identity_decisions(
+    db: Database,
+) -> None:
+    await db.upsert_source(
+        id="src-confluence",
+        type="confluence",
+        name="Confluence",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id=LOCAL_DEV_USER_ID,
+    )
+    challenger = _memory("mem-challenger")
+    await db.insert_memory(challenger)
+    await db.db.execute(
+        """INSERT INTO lifecycle_plans (
+               id, reconciliation_scope_id, source_id, source_unit_id,
+               target_unit_revision_id, status, payload_json, payload_hash, created_at
+           ) VALUES (?, ?, ?, ?, ?, 'applied', '{}', ?, ?)""",
+        (
+            "plan-1",
+            "scope-1",
+            "src-confluence",
+            "unit-1",
+            "unitrev-1",
+            "plan-hash",
+            "2026-07-22T00:00:00+00:00",
+        ),
+    )
+    request = RelationDiscoveryRequest(
+        id="relation-work-preclassified",
+        memory_id="mem-challenger",
+        expected_content_hash=challenger.content_hash,
+        source_id="src-confluence",
+        source_unit_id="unit-1",
+        source_unit_revision_id="unitrev-1",
+        doc_id="doc-1",
+        actor_user_id=None,
+        preclassified_decisions=(
+            PreclassifiedRelationDecision(
+                candidate_memory_id="mem-candidate",
+                expected_candidate_content_hash="candidate-hash",
+                expected_candidate_support_set_hash="support-hash",
+                expected_candidate_access_context_hash="candidate-access",
+                expected_challenger_access_context_hash="challenger-access",
+                relation_type=MemoryRelationType.REFINES,
+                direction=RelationDirection.CANDIDATE_TO_CHALLENGER,
+                reason="identity stage checked this pair",
+                classifier_version="memory-relation-v1",
+            ),
+        ),
+    )
+
+    await db._enqueue_relation_discovery_work_unlocked(  # noqa: SLF001
+        "plan-1",
+        request,
+        now="2026-07-22T00:00:00+00:00",
+    )
+    await db.db.commit()
+    [work] = await db.lease_relation_discovery_work(
+        worker_id="relation-worker",
+        limit=1,
+        lease_seconds=60,
+        max_attempts=3,
+    )
+
+    assert work.request.preclassified_decisions == request.preclassified_decisions
+
+
 def _scope(statuses=("active",)) -> AccessScope:
     return AccessScope(
         user_id=LOCAL_DEV_USER_ID,
@@ -30,6 +105,97 @@ def _scope(statuses=("active",)) -> AccessScope:
         active_project=None,
         scope_mode="project-first",
     )
+
+
+@pytest.mark.asyncio
+async def test_sqlite_active_support_states_chunk_large_bind_sets(
+    db: Database,
+    monkeypatch,
+) -> None:
+    calls = 0
+    support_queries: list[str] = []
+    original = db.db.execute_fetchall
+
+    async def execute_fetchall(sql, parameters=None):
+        nonlocal calls
+        if "FROM memory_support_assertions msa" in sql:
+            calls += 1
+            support_queries.append(sql)
+        return await original(sql, parameters)
+
+    monkeypatch.setattr(db.db, "execute_fetchall", execute_fetchall)
+    memory_ids = tuple(f"mem-{index}" for index in range(501))
+
+    states = await db.get_active_memory_support_states(memory_ids)
+
+    assert calls == 2
+    assert all("LEFT JOIN evidence_references" in sql for sql in support_queries)
+    assert all("LEFT JOIN source_observations" in sql for sql in support_queries)
+    assert tuple(states) == memory_ids
+    assert all(state.reference_ids == () for state in states.values())
+    assert all(state.current_reference_ids == () for state in states.values())
+
+
+@pytest.mark.asyncio
+async def test_sqlite_active_memories_chunk_large_bind_sets(
+    db: Database,
+    monkeypatch,
+) -> None:
+    memory_ids = tuple(f"mem-active-{index}" for index in range(501))
+    now = datetime.now(timezone.utc).isoformat()
+    await db.db.executemany(
+        """INSERT INTO memories (
+               id, memory_type, content, content_hash, visibility,
+               confidence, status, created_at, updated_at
+           ) VALUES (?, 'fact', ?, ?, 'workspace', 0.9, 'active', ?, ?)""",
+        tuple(
+            (memory_id, f"content for {memory_id}", f"hash-{memory_id}", now, now)
+            for memory_id in memory_ids
+        ),
+    )
+    await db.db.commit()
+    calls = 0
+    original = db.db.execute
+
+    def execute(sql, parameters=None):
+        nonlocal calls
+        if "SELECT m.* FROM memories AS m" in sql:
+            calls += 1
+        return original(sql, parameters)
+
+    monkeypatch.setattr(db.db, "execute", execute)
+
+    memories = await SqliteRelationalStore(db).list_active_memories(memory_ids)
+
+    assert calls == 2
+    assert [memory.id for memory in memories] == list(memory_ids)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_active_support_evidence_chunks_and_preserves_empty_memory_ids(
+    db: Database,
+    monkeypatch,
+) -> None:
+    calls = 0
+    original = db.db.execute_fetchall
+
+    async def execute_fetchall(sql, parameters=None):
+        nonlocal calls
+        if "FROM memory_support_assertions msa" in sql and "JOIN evidence_units eu" in sql:
+            calls += 1
+        return await original(sql, parameters)
+
+    monkeypatch.setattr(db.db, "execute_fetchall", execute_fetchall)
+    memory_ids = tuple(f"mem-evidence-{index}" for index in range(501))
+
+    evidence = await SqliteRelationalStore(db).get_active_memory_support_evidence_many(
+        memory_ids,
+        source_id="src-1",
+    )
+
+    assert calls == 2
+    assert tuple(evidence) == memory_ids
+    assert all(items == () for items in evidence.values())
 
 
 def _memory(
@@ -187,7 +353,7 @@ async def test_graph_search_scores_direct_entity_links(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
     await store.insert_memory(_memory("m2"))
-    entity_id = await db.upsert_entity("argocd", "ArgoCD", ["tool"])
+    entity_id = await db.upsert_entity("argocd", "ArgoCD")
     await db.link_memory_entity("m1", entity_id)
     hits = await store.graph_search([entity_id], _scope(), None, limit=10)
     assert [mid for mid, _ in hits] == ["m1"]
@@ -197,7 +363,7 @@ async def test_graph_search_scores_direct_entity_links(db):
 async def test_graph_search_filters_retired_by_scope(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1", status="retired"))
-    entity_id = await db.upsert_entity("argocd", "ArgoCD", ["tool"])
+    entity_id = await db.upsert_entity("argocd", "ArgoCD")
     await db.link_memory_entity("m1", entity_id)
     assert await store.graph_search([entity_id], _scope(), None, limit=10) == []
 
@@ -231,7 +397,7 @@ async def test_graph_search_honors_source_filter_and_time_range(db):
         None,
         source_updated_at=datetime(2026, 5, 24, tzinfo=timezone.utc),
     )
-    entity_id = await db.upsert_entity("argocd", "ArgoCD", ["tool"])
+    entity_id = await db.upsert_entity("argocd", "ArgoCD")
     await db.link_memory_entity("m-target", entity_id)
     await db.link_memory_entity("m-other", entity_id)
 
@@ -255,7 +421,7 @@ async def test_graph_search_honors_source_filter_and_time_range(db):
 async def test_link_query_entities_resolves_explicit_aliases_and_reports_unmatched(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
-    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
     await db.insert_alias("PCC", "pcc", entity_id, "admin_manual")
     await db.link_memory_entity("m1", entity_id)
 
@@ -283,8 +449,8 @@ async def test_link_query_entities_exact_window_is_visibility_constrained(db):
             owner_user_id="other-user",
         )
     )
-    visible_entity = await db.upsert_entity("blocker hint", "Blocker Hint", ["feature"])
-    hidden_entity = await db.upsert_entity("secret project", "Secret Project", ["feature"])
+    visible_entity = await db.upsert_entity("blocker hint", "Blocker Hint")
+    hidden_entity = await db.upsert_entity("secret project", "Secret Project")
     await db.link_memory_entity("visible", visible_entity)
     await db.link_memory_entity("private-other-user", hidden_entity)
 
@@ -303,7 +469,7 @@ async def test_link_query_entities_exact_window_is_visibility_constrained(db):
 async def test_link_query_entities_compact_match_does_not_activate_graph(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
-    entity_id = await db.upsert_entity("blocker hint", "Blocker Hint", ["feature"])
+    entity_id = await db.upsert_entity("blocker hint", "Blocker Hint")
     await db.link_memory_entity("m1", entity_id)
 
     result = await store.link_query_entities(
@@ -321,7 +487,7 @@ async def test_link_query_entities_compact_match_does_not_activate_graph(db):
 async def test_link_query_entities_alias_fts_recalls_partial_alias_overlap(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
-    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
     await db.link_memory_entity("m1", entity_id)
 
     result = await store.link_query_entities(
@@ -339,7 +505,7 @@ async def test_link_query_entities_alias_fts_recalls_partial_alias_overlap(db):
 async def test_link_query_entities_alias_fts_refreshes_after_insert_alias(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
-    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
     await db.insert_alias("PCC Engine Lifecycle", "pcc engine lifecycle", entity_id, "admin_manual")
     await db.link_memory_entity("m1", entity_id)
 
@@ -355,35 +521,14 @@ async def test_link_query_entities_alias_fts_refreshes_after_insert_alias(db):
 
 
 @pytest.mark.asyncio
-async def test_link_query_entities_alias_fts_ignores_tag_only_overlap(db):
-    store = SqliteRelationalStore(db)
-    await store.insert_memory(_memory("m1"))
-    await store.insert_memory(_memory("m2"))
-    tagged_entity = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
-    named_entity = await db.upsert_entity("product release calendar", "Product Release Calendar", ["planning"])
-    await db.link_memory_entity("m1", tagged_entity)
-    await db.link_memory_entity("m2", named_entity)
-
-    result = await store.link_query_entities(
-        "product release status",
-        scope=_scope(),
-        limit=5,
-    )
-
-    assert [(c.entity_id, c.channel, c.matched_alias) for c in result.candidates] == [
-        (named_entity, "alias_fts", "product release calendar")
-    ]
-
-
-@pytest.mark.asyncio
 async def test_link_query_entities_alias_fts_honors_source_filter(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m-wiki"))
     await store.insert_memory(_memory("m-jira"))
     await _document(db, "doc-wiki", source="wiki")
     await _document(db, "doc-jira", source="jira")
-    wiki_entity = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
-    jira_entity = await db.upsert_entity("payroll control process", "Payroll Control Process", ["product"])
+    wiki_entity = await db.upsert_entity("payroll control center", "Payroll Control Center")
+    jira_entity = await db.upsert_entity("payroll control process", "Payroll Control Process")
     await db.link_memory_entity("m-wiki", wiki_entity)
     await db.link_memory_entity("m-jira", jira_entity)
     await store.add_memory_source("m-wiki", "doc-wiki", "confluence", None, source_updated_at=None)
@@ -406,8 +551,8 @@ async def test_link_query_entities_alias_fts_honors_memory_types(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m-fact", memory_type="fact"))
     await store.insert_memory(_memory("m-procedure", memory_type="procedure"))
-    fact_entity = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
-    procedure_entity = await db.upsert_entity("payroll control process", "Payroll Control Process", ["product"])
+    fact_entity = await db.upsert_entity("payroll control center", "Payroll Control Center")
+    procedure_entity = await db.upsert_entity("payroll control process", "Payroll Control Process")
     await db.link_memory_entity("m-fact", fact_entity)
     await db.link_memory_entity("m-procedure", procedure_entity)
 
@@ -432,7 +577,7 @@ async def test_link_query_entities_alias_fts_binds_query_before_source_count_par
         "src-disabled", "jira", "Disabled Jira", "{}", access_policy="workspace", owner_user_id="dev"
     )
     await _document(db, "doc-enabled", source="src-enabled")
-    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
     await db.link_memory_entity("m-enabled", entity_id)
     await store.add_memory_source("m-enabled", "doc-enabled", "jira", None, source_updated_at=None)
     await db.set_source_subscription("src-disabled", LOCAL_DEV_USER_ID, False)
@@ -453,7 +598,7 @@ async def test_link_query_entities_alias_fts_binds_query_before_source_count_par
 async def test_link_query_entities_alias_fts_refreshes_after_remove_alias(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m1"))
-    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
     await db.insert_alias("PCC Engine", "pcc engine", entity_id, "admin_manual")
     await db.link_memory_entity("m1", entity_id)
 
@@ -476,7 +621,7 @@ async def test_upsert_entity_rolls_back_after_cancellation(db, monkeypatch):
         await asyncio.Future()
 
     monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", refresh_then_block)
-    upsert = asyncio.create_task(db.upsert_entity("cancelled entity", "Cancelled Entity", ["product"]))
+    upsert = asyncio.create_task(db.upsert_entity("cancelled entity", "Cancelled Entity"))
     await refresh_started.wait()
     upsert.cancel()
 
@@ -486,7 +631,7 @@ async def test_upsert_entity_rolls_back_after_cancellation(db, monkeypatch):
     monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", original_refresh)
     assert await db.get_entity_by_canonical("cancelled entity") is None
 
-    entity_id = await db.upsert_entity("committed entity", "Committed Entity", ["product"])
+    entity_id = await db.upsert_entity("committed entity", "Committed Entity")
     assert await db.get_entity(entity_id) is not None
 
 
@@ -501,12 +646,12 @@ async def test_upsert_entity_rolls_back_after_fts_refresh_failure(db, monkeypatc
     monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", refresh_then_fail)
 
     with pytest.raises(RuntimeError, match="entity alias search refresh failed"):
-        await db.upsert_entity("failed entity", "Failed Entity", ["product"])
+        await db.upsert_entity("failed entity", "Failed Entity")
 
     monkeypatch.setattr(db, "_refresh_entity_alias_search_unlocked", original_refresh)
     assert await db.get_entity_by_canonical("failed entity") is None
 
-    entity_id = await db.upsert_entity("recovered entity", "Recovered Entity", ["product"])
+    entity_id = await db.upsert_entity("recovered entity", "Recovered Entity")
     assert await db.get_entity(entity_id) is not None
 
 
@@ -514,7 +659,7 @@ async def test_upsert_entity_rolls_back_after_fts_refresh_failure(db, monkeypatc
 async def test_remove_entity_alias_rolls_back_after_cancellation(db, monkeypatch):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m-alias-cancelled"))
-    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
     await db.insert_alias("PCC Engine", "pcc engine", entity_id, "admin_manual")
     await db.link_memory_entity("m-alias-cancelled", entity_id)
     refresh_started = asyncio.Event()
@@ -547,8 +692,8 @@ async def test_remove_entity_alias_rolls_back_after_cancellation(db, monkeypatch
 
 @pytest.mark.asyncio
 async def test_merge_entities_reads_source_and_target_inside_write_lock(db):
-    source_id = await db.upsert_entity("old payroll name", "Old Payroll Name", ["product"])
-    target_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    source_id = await db.upsert_entity("old payroll name", "Old Payroll Name")
+    target_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
 
     await db._write_lock.acquire()
     merge = asyncio.create_task(db.merge_entities(source_id=source_id, target_id=target_id))
@@ -574,8 +719,8 @@ async def test_merge_entities_reads_source_and_target_inside_write_lock(db):
 @pytest.mark.asyncio
 async def test_merge_entities_rolls_back_partial_work_after_cancellation(db, monkeypatch):
     await db.insert_memory(_memory("m-merge-cancelled"))
-    source_id = await db.upsert_entity("old payroll name", "Old Payroll Name", ["product"])
-    target_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    source_id = await db.upsert_entity("old payroll name", "Old Payroll Name")
+    target_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
     await db.link_memory_entity("m-merge-cancelled", source_id)
     await db.insert_alias("Old Payroll Alias", "old payroll alias", source_id, "admin_manual")
     refresh_started = asyncio.Event()
@@ -601,7 +746,7 @@ async def test_merge_entities_rolls_back_partial_work_after_cancellation(db, mon
 
 @pytest.mark.asyncio
 async def test_merge_entities_rejects_self_merge_without_mutation(db):
-    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
 
     with pytest.raises(ValueError, match="Source and target entities must differ"):
         await db.merge_entities(source_id=entity_id, target_id=entity_id)
@@ -620,8 +765,8 @@ async def test_link_query_entities_honors_disabled_sources(db):
     await db.upsert_source("src-enabled", "jira", "Enabled Jira", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(db, "doc-disabled", source="src-disabled")
     await _document(db, "doc-enabled", source="src-enabled")
-    disabled_entity = await db.upsert_entity("disabled blocker", "Disabled Blocker", ["feature"])
-    enabled_entity = await db.upsert_entity("enabled blocker", "Enabled Blocker", ["feature"])
+    disabled_entity = await db.upsert_entity("disabled blocker", "Disabled Blocker")
+    enabled_entity = await db.upsert_entity("enabled blocker", "Enabled Blocker")
     await db.link_memory_entity("m-disabled", disabled_entity)
     await db.link_memory_entity("m-enabled", enabled_entity)
     await store.add_memory_source("m-disabled", "doc-disabled", "jira", None, source_updated_at=None)
@@ -649,7 +794,7 @@ async def test_link_query_entities_visible_source_count_excludes_disabled_source
     )
     await _document(db, "doc-enabled", source="src-enabled")
     await _document(db, "doc-disabled", source="src-disabled")
-    entity_id = await db.upsert_entity("mixed blocker", "Mixed Blocker", ["feature"])
+    entity_id = await db.upsert_entity("mixed blocker", "Mixed Blocker")
     await db.link_memory_entity("m-mixed", entity_id)
     await store.add_memory_source("m-mixed", "doc-enabled", "jira", None, source_updated_at=None)
     await store.add_memory_source("m-mixed", "doc-disabled", "jira", None, source_updated_at=None)
@@ -670,8 +815,8 @@ async def test_link_query_entities_honors_source_filter(db):
     await store.insert_memory(_memory("m-jira"))
     await _document(db, "doc-wiki", source="wiki")
     await _document(db, "doc-jira", source="jira")
-    wiki_entity = await db.upsert_entity("wiki blocker", "Wiki Blocker", ["feature"])
-    jira_entity = await db.upsert_entity("jira blocker", "Jira Blocker", ["feature"])
+    wiki_entity = await db.upsert_entity("wiki blocker", "Wiki Blocker")
+    jira_entity = await db.upsert_entity("jira blocker", "Jira Blocker")
     await db.link_memory_entity("m-wiki", wiki_entity)
     await db.link_memory_entity("m-jira", jira_entity)
     await store.add_memory_source("m-wiki", "doc-wiki", "confluence", None, source_updated_at=None)
@@ -694,8 +839,8 @@ async def test_link_query_entities_honors_memory_types(db):
     store = SqliteRelationalStore(db)
     await store.insert_memory(_memory("m-fact", memory_type="fact"))
     await store.insert_memory(_memory("m-procedure", memory_type="procedure"))
-    fact_entity = await db.upsert_entity("fact blocker", "Fact Blocker", ["feature"])
-    procedure_entity = await db.upsert_entity("procedure blocker", "Procedure Blocker", ["feature"])
+    fact_entity = await db.upsert_entity("fact blocker", "Fact Blocker")
+    procedure_entity = await db.upsert_entity("procedure blocker", "Procedure Blocker")
     await db.link_memory_entity("m-fact", fact_entity)
     await db.link_memory_entity("m-procedure", procedure_entity)
 
@@ -718,7 +863,7 @@ async def test_link_query_entities_fanout_honors_time_range(db):
     await store.insert_memory(_memory("m-stale"))
     await _document(db, "doc-fresh", source="src-payroll")
     await _document(db, "doc-stale", source="src-payroll")
-    entity_id = await db.upsert_entity("cutoff blocker", "Cutoff Blocker", ["feature"])
+    entity_id = await db.upsert_entity("cutoff blocker", "Cutoff Blocker")
     await db.link_memory_entity("m-fresh", entity_id)
     await db.link_memory_entity("m-stale", entity_id)
     await store.add_memory_source(
@@ -959,7 +1104,7 @@ async def test_compact_entity_lookup_indexes_migration(db):
 
 @pytest.mark.asyncio
 async def test_entity_alias_search_fts_migration_backfills_existing_entities(db):
-    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
     await db.insert_alias("PCC Engine", "pcc engine", entity_id, "admin_manual")
     await db.db.execute("DELETE FROM entity_alias_search_fts")
     await db.db.execute("DELETE FROM schema_migrations WHERE version = 33")
@@ -976,7 +1121,7 @@ async def test_entity_alias_search_fts_migration_backfills_existing_entities(db)
 
 @pytest.mark.asyncio
 async def test_entity_alias_search_fts_rebuild_migration_removes_stale_tag_tokens(db):
-    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center", ["product"])
+    entity_id = await db.upsert_entity("payroll control center", "Payroll Control Center")
     await db.db.execute("DELETE FROM entity_alias_search_fts")
     await db.db.execute(
         """INSERT INTO entity_alias_search_fts (

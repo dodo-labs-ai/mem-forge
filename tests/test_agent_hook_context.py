@@ -24,7 +24,6 @@ def _memory(
     mem_id: str,
     content: str,
     *,
-    tags: list[str] | None = None,
     project_key: str | None = "mem-forge",
 ) -> Memory:
     now = datetime.now(timezone.utc)
@@ -33,7 +32,6 @@ def _memory(
         memory_type="decision",
         content=content,
         content_hash=content_hash(content),
-        tags=tags or [],
         project_key=project_key,
         confidence=0.91,
         created_at=now,
@@ -99,7 +97,6 @@ def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path, mon
             _memory(
                 "mem-hook-1",
                 "In the mem-forge project, MemForge lifecycle cleanup must route through MemoryStore so SQLite, FTS, and Chroma stay consistent.",
-                tags=["memory-lifecycle", "index-consistency"],
             )
         )
 

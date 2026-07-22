@@ -61,6 +61,10 @@ async def test_candidate_ledger_retries_once_when_decision_coverage_is_incomplet
     assert result.candidates == (first, second)
     assert len(client.prompts) == 2
     assert "<validation_feedback>" in client.prompts[1]
+    assert result.structured_llm_calls == 2
+    assert result.validation_retries == 1
+    assert result.prompt_chars == sum(len(prompt) for prompt in client.prompts)
+    assert result.structured_llm_elapsed_ms >= 0
 
 
 @pytest.mark.asyncio
@@ -82,6 +86,9 @@ async def test_candidate_ledger_fails_closed_after_second_incomplete_ledger():
         )
 
     assert exc_info.value.error_type == "invalid_ledger"
+    assert exc_info.value.structured_llm_calls == 2
+    assert exc_info.value.validation_retries == 1
+    assert exc_info.value.prompt_chars == sum(len(prompt) for prompt in client.prompts)
     assert len(client.prompts) == 2
 
 
@@ -100,6 +107,7 @@ async def test_candidate_ledger_collapses_exact_duplicates_without_an_llm_call()
     assert result.candidates == (first,)
     assert result.dropped_exact_count == 1
     assert result.dropped_redundant_count == 0
+    assert result.structured_llm_calls == 0
     assert client.prompts == []
 
 

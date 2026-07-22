@@ -444,7 +444,6 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
         doc_type="ticket",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=projection.observation_revisions[0].content,
         update_mode="full_document",
         changed_hunks=None,
@@ -458,6 +457,9 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
 
     assert stats["added"] == 1
     assert stats["skipped"] == 1
+    assert stats["candidate_ledger_input_count"] == 2
+    assert stats["candidate_ledger_selected_count"] == 1
+    assert stats["candidate_ledger_llm_calls"] == 0
     assert [row["content"] for row in rows] == [canonical.content]
     assert len(events) == 1
     assert events[0].source_id == "src-1"
@@ -467,8 +469,12 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
         "semantic_input_count": 1,
         "selected_count": 1,
         "dropped_exact_count": 1,
-        "dropped_redundant_count": 0,
-        "drops": [
+            "dropped_redundant_count": 0,
+            "structured_llm_calls": 0,
+            "structured_llm_elapsed_ms": 0,
+            "validation_retries": 0,
+            "prompt_chars": 0,
+            "drops": [
             {
                 "candidate_content_hash": content_hash(duplicate.content),
                 "candidate_source_observation_id": observation_id,
@@ -511,7 +517,6 @@ async def test_projected_create_persists_validity_as_dates(db: Database) -> None
         doc_type="document",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=revision.content,
         update_mode="full_document",
         changed_hunks=None,
@@ -566,7 +571,6 @@ async def test_incomplete_candidate_ledger_is_audited_and_writes_no_memory(
             doc_type="ticket",
             project_key="ENG",
             repo_identifier=None,
-            entity_ids=[],
             document_content=projection.observation_revisions[0].content,
             update_mode="full_document",
             changed_hunks=None,
@@ -765,7 +769,6 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
         content=incumbent.content,
         memory_type=incumbent.memory_type,
         confidence=incumbent.confidence,
-        tags=list(incumbent.tags),
         extraction_context="A7 is removed.",
         evidence_quote="A7 is removed.",
     )
@@ -1045,6 +1048,11 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
     assert current_unit is not None
     assert current_unit.id == second.source_unit_revisions[0].id
     assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+    support_state = (await db.get_active_memory_support_states((incumbent.id,)))[
+        incumbent.id
+    ]
+    assert support_state.reference_ids == old_support
+    assert support_state.current_reference_ids == ()
     review = await db.get_lifecycle_review(str(plan.mutations[0].payload["review_id"]))
     assert review is not None
     assert review.status is LifecycleReviewStatus.PENDING
@@ -1555,7 +1563,6 @@ async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extrac
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=second.observation_revisions[0].content,
         update_mode="diff_guided",
         changed_hunks="Old deployment note -> New deployment note",
@@ -1612,7 +1619,6 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=current_quote,
         update_mode="diff_guided",
         changed_hunks="A7 is removed. -> The A7 slot remains excluded.",
@@ -1671,7 +1677,6 @@ async def test_incremental_noop_reworded_primary_requires_exact_current_quote(
             doc_type="design-doc",
             project_key="ENG",
             repo_identifier=None,
-            entity_ids=[],
             document_content=second.observation_revisions[0].content,
             update_mode="diff_guided",
             changed_hunks="primary wording changed",
@@ -1715,7 +1720,6 @@ async def test_incremental_noop_invalidated_primary_creates_review(
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=second.observation_revisions[0].content,
         update_mode="diff_guided",
         changed_hunks="removed -> retained",
@@ -1762,7 +1766,6 @@ async def test_persistent_indexless_replacement_creates_review_without_mutating_
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=second.observation_revisions[0].content,
         update_mode="diff_guided",
         changed_hunks="removed -> retained",
@@ -1812,7 +1815,6 @@ async def test_explicit_empty_revision_deterministically_removes_incumbent_suppo
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content="",
         update_mode="diff_guided",
         changed_hunks="A7 is removed. -> empty",
@@ -1947,7 +1949,6 @@ async def test_partial_jira_projection_skips_llm_for_proven_disjoint_incumbent(
         doc_type="ticket",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content="PAY-12 changed description",
         update_mode="diff_guided",
         changed_hunks="description changed; comment page is truncated",
@@ -2034,7 +2035,6 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
         doc_type="ticket",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=description_revision.content,
         update_mode="diff_guided",
         changed_hunks="Payroll validation requires approval before release.",
@@ -2102,7 +2102,6 @@ async def test_partial_jira_projection_admits_directly_affected_incumbent_delete
         doc_type="ticket",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content="PAY-12 changed description",
         update_mode="diff_guided",
         changed_hunks="description changed; comment page is truncated",
@@ -2150,7 +2149,6 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
         doc_type="ticket",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content="PAY-12",
         update_mode="diff_guided",
         changed_hunks="wording clarified; scope remains regular payroll",
@@ -2218,7 +2216,6 @@ async def test_noop_with_invalidated_required_evidence_creates_review(db: Databa
         doc_type="ticket",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content="PAY-12",
         update_mode="diff_guided",
         changed_hunks="regular -> off-cycle",
@@ -2404,7 +2401,6 @@ async def test_cross_source_keep_persists_provenance_and_survives_other_source_r
         content=incumbent.content,
         memory_type=incumbent.memory_type,
         confidence=incumbent.confidence,
-        tags=list(incumbent.tags),
         evidence_quote="A7 is removed.",
     )
     evidence = build_projected_claim_evidence(
@@ -2545,7 +2541,6 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
         doc_type="design-doc",
         project_key=None,
         repo_identifier=None,
-        entity_ids=[],
         document_content="A7 remains excluded.",
         update_mode="full_document",
         changed_hunks=None,
@@ -2638,7 +2633,6 @@ async def test_same_source_cross_unit_semantic_equivalent_claim_reuses_memory_id
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content="A7 remains excluded.",
         update_mode="full_document",
         changed_hunks=None,
@@ -2698,7 +2692,6 @@ async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content="A7 is retained for regular payroll.",
         update_mode="full_document",
         changed_hunks=None,
@@ -2742,7 +2735,6 @@ async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content="A7 is retained for regular payroll.",
         update_mode="full_document",
         changed_hunks=None,
@@ -2852,7 +2844,6 @@ async def test_cross_source_exact_claim_reuses_memory_without_llm_and_preserves_
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=raw.content,
         update_mode="full_document",
         changed_hunks=None,
@@ -2941,7 +2932,6 @@ async def test_ordinary_exact_admission_preserves_agent_claim_identity(
         display_anchor="A7 handling",
         claim_text=claim_text,
         memory_type="decision",
-        tags=[],
         confidence=0.95,
         memory_id=agent_memory.id,
         observed_at=now,
@@ -2986,7 +2976,6 @@ async def test_ordinary_exact_admission_preserves_agent_claim_identity(
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier="repo-a",
-        entity_ids=[],
         document_content=claim_text,
         update_mode="full_document",
         changed_hunks=None,
@@ -3185,7 +3174,6 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
         doc_type="ticket",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content="PAY-12",
         update_mode="full_document",
         changed_hunks=None,
@@ -3483,7 +3471,6 @@ async def _create_relation_discovery_fixture(
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=projection.observation_revisions[0].content,
         update_mode="full_document",
         changed_hunks=None,
@@ -3658,6 +3645,77 @@ async def test_relation_discovery_rejects_candidate_provenance_removed_before_co
 
 
 @pytest.mark.asyncio
+async def test_relation_discovery_rejects_candidate_support_change_before_commit(
+    db: Database,
+) -> None:
+    projection, challenger = await _create_relation_discovery_fixture(
+        db,
+        run_id="projection-stale-candidate-support",
+    )
+    challenger_evidence = await db.get_active_memory_support_evidence(challenger.id)
+    assert len(challenger_evidence) == 1
+    unit = await db.get_current_relation_evidence_unit(
+        challenger.id,
+        source_id="src-1",
+        source_unit_id=projection.source_units[0].id,
+    )
+    assert unit is not None
+    candidate = Memory(
+        id="mem-stale-relation-support",
+        memory_type="decision",
+        content="A7 applies to payroll.",
+        content_hash=content_hash("A7 applies to payroll."),
+        project_key="ENG",
+    )
+    await db.insert_memory(candidate)
+    now = datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="other-doc",
+            source="src-other",
+            source_url="https://example.test/other-doc",
+            title="Relation candidate",
+            space_or_project="ENG",
+            author=None,
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="candidate-doc-hash",
+            token_count=4,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+    await db.add_memory_source(candidate.id, "other-doc", "confluence", source_updated_at=now)
+
+    async def attach_new_support() -> None:
+        await db.upsert_memory_support_assertion(
+            MemorySupportAssertion(
+                id="support-stale-relation-candidate",
+                memory_id=candidate.id,
+                evidence_reference_id=challenger_evidence[0].reference_id,
+                source_id="src-1",
+                access_context_hash=unit.access_context_hash or "",
+            )
+        )
+
+    result = await RelationDiscovery(
+        store=db,
+        candidate_retriever=_MutatingRelationCandidates(candidate, attach_new_support),
+        pair_classifier=_DeterministicRefinementClassifier(),
+    ).process_slice(worker_id="relation-worker")
+
+    assert result.failed_work == 1
+    [row] = await db.db.execute_fetchall("SELECT status, error FROM relation_discovery_work")
+    assert row["status"] == "failed"
+    assert "candidate current Support is stale" in row["error"]
+    assert await db.db.execute_fetchall("SELECT id FROM relation_runs") == []
+
+
+@pytest.mark.asyncio
 async def test_private_relation_completion_rechecks_access_as_current_owner(
     db: Database,
 ) -> None:
@@ -3767,7 +3825,6 @@ async def test_relation_discovery_persists_direction_after_lifecycle_commit(
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=projection.observation_revisions[0].content,
         update_mode="full_document",
         changed_hunks=None,
@@ -3867,7 +3924,6 @@ async def test_new_projected_memory_commit_survives_vector_outbox_delivery_failu
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=projection.observation_revisions[0].content,
         update_mode="full_document",
         changed_hunks=None,
@@ -3942,7 +3998,6 @@ async def test_rebaseline_replay_reuses_memory_with_explicit_observation_support
         "doc_type": "ticket",
         "project_key": "ENG",
         "repo_identifier": None,
-        "entity_ids": [],
         "document_content": "PAY-12",
         "update_mode": "full_document",
         "changed_hunks": None,
@@ -4234,7 +4289,6 @@ async def test_direct_terminal_transition_rejects_active_source_support(db: Data
             incumbent.id,
             "A7 was mutated in place.",
             None,
-            None,
         )
 
     # Non-semantic metadata tuning does not invalidate source evidence.
@@ -4242,7 +4296,6 @@ async def test_direct_terminal_transition_rejects_active_source_support(db: Data
         incumbent.id,
         incumbent.content,
         0.8,
-        list(incumbent.tags),
     )
 
     replacement = Memory(
@@ -4354,7 +4407,7 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
     )
     await db.enable_lifecycle_gate("src-1")
 
-    entity_id = await db.upsert_entity("A7", "A7", ["payroll-result-slot"])
+    entity_id = await db.upsert_entity("A7", "A7")
     await db.upsert_source(
         id="src-2",
         type="jira",
@@ -4468,7 +4521,7 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
         content="A7 is retained and marked as reduced retro chain.",
         memory_type="decision",
         confidence=0.95,
-        tags=["payroll", "retro"],
+        entity_refs=["A7"],
         extraction_context="A7 is retained and marked as reduced retro chain.",
     )
     evidence = build_projected_claim_evidence(
@@ -4497,7 +4550,6 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[entity_id],
         document_content=raw.content,
         update_mode="full_document",
         changed_hunks=None,
@@ -4572,7 +4624,6 @@ async def test_projected_quality_consumes_typed_observation_semantics(
         doc_type="document",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=typed_revision.content,
         update_mode="full_document",
         changed_hunks=None,
@@ -4643,7 +4694,6 @@ async def test_projected_lifecycle_enforces_candidate_quality_before_persistence
         doc_type="document",
         project_key="ENG",
         repo_identifier=None,
-        entity_ids=[],
         document_content=revision.content,
         update_mode="full_document",
         changed_hunks=None,

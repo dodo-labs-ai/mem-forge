@@ -26,7 +26,6 @@ def _memory(mem_id: str) -> Memory:
         content=f"content for {mem_id}",
         content_hash=content_hash(mem_id),
         project_key="PAY",
-        tags=[],
         confidence=0.9,
         created_at=now,
         updated_at=now,

@@ -674,7 +674,6 @@ class TestApprove:
         entity_id = await db.upsert_entity(
             "postgresql",
             display_name="PostgreSQL",
-            tags=["technology"],
         )
         await db.link_memory_entity(challenger.id, entity_id)
 
@@ -723,7 +722,6 @@ class TestApprove:
             incumbent.id,
             new_content="PostgreSQL is now version 15",
             new_confidence=None,
-            new_tags=None,
         )
 
         with pytest.raises(ReviewStaleConflict):
@@ -917,7 +915,6 @@ class TestRefresh:
             incumbent.id,
             new_content="PostgreSQL is now version 15",
             new_confidence=None,
-            new_tags=None,
         )
 
         result = await review_service.refresh(review.id)
@@ -934,7 +931,6 @@ class TestRefresh:
             incumbent.id,
             new_content="PostgreSQL is now version 15",
             new_confidence=None,
-            new_tags=None,
         )
         with pytest.raises(ReviewStaleConflict):
             await review_service.approve(review.id, reviewer="alice", note=None)

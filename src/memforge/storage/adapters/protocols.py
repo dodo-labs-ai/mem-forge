@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
+import json
 from typing import Any, Mapping, Protocol, Sequence, TypedDict, runtime_checkable
 
 from memforge.models import (
@@ -77,8 +79,79 @@ class KeywordCandidate:
     matched_text: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ActiveMemorySupportState:
+    """All active assertions plus the current-revision subset."""
+
+    reference_ids: tuple[str, ...]
+    support_set_hash: str
+    current_reference_ids: tuple[str, ...]
+    current_support_set_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveMemorySupportRow:
+    """Canonical current-revision support row shared by every adapter."""
+
+    memory_id: str
+    evidence_reference_id: str
+    source_id: str
+    access_context_hash: str
+    is_current: bool
+
+
+def build_active_memory_support_states(
+    memory_ids: Sequence[str],
+    rows: Sequence[ActiveMemorySupportRow],
+) -> Mapping[str, ActiveMemorySupportState]:
+    """Build explicit empty states and one canonical support hash per Memory."""
+
+    ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
+    grouped: dict[str, list[tuple[str, str, str]]] = {memory_id: [] for memory_id in ids}
+    current_grouped: dict[str, list[tuple[str, str, str]]] = {
+        memory_id: [] for memory_id in ids
+    }
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            item.memory_id,
+            item.evidence_reference_id,
+            item.source_id,
+            item.access_context_hash,
+        ),
+    ):
+        if row.memory_id in grouped:
+            value = (row.evidence_reference_id, row.source_id, row.access_context_hash)
+            grouped[row.memory_id].append(value)
+            if row.is_current:
+                current_grouped[row.memory_id].append(value)
+    return {
+        memory_id: ActiveMemorySupportState(
+            reference_ids=tuple(reference_id for reference_id, _source_id, _access_hash in state_rows),
+            support_set_hash=active_support_rows_hash(state_rows),
+            current_reference_ids=tuple(
+                reference_id
+                for reference_id, _source_id, _access_hash in current_grouped[memory_id]
+            ),
+            current_support_set_hash=active_support_rows_hash(current_grouped[memory_id]),
+        )
+        for memory_id, state_rows in grouped.items()
+    }
+
+
+def active_support_rows_hash(rows: Sequence[tuple[str, str, str]]) -> str:
+    """Hash canonical current Evidence support without adapter-specific drift."""
+
+    return hashlib.sha256(
+        json.dumps(list(rows), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 DEFAULT_ENTITY_LINK_LIMIT = 5
 """Default maximum linked entities per query; keeps graph fan-out bounded."""
+
+STORAGE_BIND_CHUNK_SIZE = 500
+"""Shared conservative bind-set size used inside relational adapters."""
 
 
 @dataclass(frozen=True)
@@ -112,6 +185,30 @@ class EntityLinkResult:
     unmatched_explicit_entities: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class EntityResolutionContext:
+    """Bounded exact, alias, and recall candidates for one resolver batch."""
+
+    exact_matches: Mapping[str, Entity]
+    alias_matches: Mapping[str, EntityAlias]
+    candidates: Mapping[str, tuple[Entity, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class EntityResolutionScope:
+    """Access fence for learned aliases during one extraction batch."""
+
+    access_context_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class EntityUpsert:
+    """One canonical Entity requested by the batch resolver."""
+
+    canonical_name: str
+    display_name: str
+
+
 class RankingMetadata(TypedDict, total=False):
     """The per-memory inputs the ranker needs alongside RRF scores.
 
@@ -140,6 +237,18 @@ class RelationalStore(Protocol):
     """
 
     async def insert_memory(self, memory: Memory) -> str: ...
+    async def load_entity_resolution_context(
+        self,
+        canonical_names: Sequence[str],
+        *,
+        candidate_limit: int,
+        scope: EntityResolutionScope,
+    ) -> EntityResolutionContext: ...
+    async def upsert_entities(
+        self,
+        entities: Sequence[EntityUpsert],
+    ) -> Mapping[str, int]: ...
+    async def insert_aliases(self, aliases: Sequence[EntityAlias]) -> None: ...
     async def get_memory(self, memory_id: str) -> Memory | None: ...
     async def get_memory_entity_ids(self, memory_id: str) -> list[int]: ...
     async def get_current_relation_evidence_unit(
@@ -150,7 +259,9 @@ class RelationalStore(Protocol):
         source_unit_id: str,
     ) -> EvidenceUnit | None: ...
     async def list_disabled_source_ids_for_user(self, user_id: str) -> list[str]: ...
-    async def list_active_memories(self, memory_ids: Sequence[str]) -> list[Memory]: ...
+    async def list_active_memories(self, memory_ids: Sequence[str]) -> list[Memory]:
+        """Return active rows in caller order, chunked by each adapter's bind limit."""
+        ...
     async def list_active_candidate_memories(
         self,
         memory_ids: Sequence[str],
@@ -404,12 +515,24 @@ class RelationalStore(Protocol):
     ) -> None: ...
     async def get_memory_support_set_hash(self, memory_id: str) -> str: ...
     async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]: ...
+    async def get_active_memory_support_states(
+        self,
+        memory_ids: Sequence[str],
+    ) -> Mapping[str, ActiveMemorySupportState]: ...
     async def get_active_memory_support_evidence(
         self,
         memory_id: str,
         *,
         source_id: str | None = None,
     ) -> tuple[ActiveSupportEvidence, ...]: ...
+    async def get_active_memory_support_evidence_many(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        source_id: str | None = None,
+    ) -> Mapping[str, tuple[ActiveSupportEvidence, ...]]:
+        """Map every requested id to active Evidence using adapter-bounded chunks."""
+        ...
     async def get_source_unit_support_reference_ids(
         self,
         source_unit_id: str,
@@ -433,7 +556,6 @@ class RelationalStore(Protocol):
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        tags: list[str],
         confidence: float,
         observed_at: datetime,
         citations: list[str] | None = None,

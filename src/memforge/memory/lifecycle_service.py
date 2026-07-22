@@ -72,7 +72,6 @@ class MemoryLifecycleService:
         owner_user_id: str,
         client: str,
         memory_type: str = MemoryType.FACT.value,
-        tags: list[str] | None = None,
         confidence: float = 0.95,
         repo_identifier: str | None = None,
         idempotency_key: str | None = None,
@@ -86,8 +85,6 @@ class MemoryLifecycleService:
         if not owner_user_id.strip():
             raise MemoryLifecycleConflict("owner_user_id_required")
         memory_type = self._validate_memory_type(memory_type)
-        normalized_tags = [tag.strip() for tag in (tags or []) if tag.strip()]
-
         now = datetime.now(timezone.utc)
         memory = Memory(
             id=generate_memory_id(),
@@ -98,7 +95,6 @@ class MemoryLifecycleService:
             owner_user_id=owner_user_id.strip(),
             project_key=UNSORTED_PROJECT_KEY,
             repo_identifier=repo_identifier.strip() if repo_identifier else None,
-            tags=normalized_tags,
             confidence=confidence,
             created_at=now,
             updated_at=now,
@@ -187,7 +183,6 @@ class MemoryLifecycleService:
             owner_user_id=old.owner_user_id,
             project_key=old.project_key,
             repo_identifier=old.repo_identifier,
-            tags=list(old.tags),
             confidence=old.confidence,
             created_at=now,
             updated_at=now,

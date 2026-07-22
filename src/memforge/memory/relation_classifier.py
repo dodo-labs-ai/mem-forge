@@ -36,6 +36,9 @@ class MemoryRelationType(str, Enum):
     UNRELATED = "unrelated"
 
 
+MEMORY_PAIR_CLASSIFIER_VERSION = "memory-relation-v1"
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryPair:
     challenger: Memory

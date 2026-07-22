@@ -29,7 +29,6 @@ from memforge.memory.lifecycle_plan import (
 from memforge.models import DocumentRecord, Memory, MemoryReview, MemorySource, content_hash
 from memforge.memory.review_service import ReviewKind, ReviewStatus
 from memforge.memory.store import MemoryStore
-from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -253,18 +252,6 @@ async def _insert_doc(db: Database, doc_id: str = "doc-1", source: str = "src-1"
 async def _insert_doc_side_tables(db: Database, doc_id: str, source: str = "src-1") -> None:
     now = datetime.now(timezone.utc).isoformat()
     await db.db.execute(
-        """INSERT INTO document_metadata
-           (doc_id, summary, tags, entities, doc_type, complexity, enriched_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (doc_id, "Summary", '["tag"]', '[{"name":"Entity","tags":[]}]', "doc", "low", now),
-    )
-    await db.db.execute(
-        """INSERT INTO document_relationships
-           (source_doc_id, target_doc_id, target_title, relation_type, confidence, link_source)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (doc_id, "target-doc", "Target", "mentions", 0.8, "enrichment"),
-    )
-    await db.db.execute(
         """INSERT INTO changelog
            (doc_id, change_type, previous_version, current_version, ai_change_summary, detected_at, title, source)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -303,11 +290,6 @@ async def _insert_doc_side_tables(db: Database, doc_id: str, source: str = "src-
 async def _doc_side_counts(db: Database, doc_id: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     queries = {
-        "metadata": ("SELECT COUNT(*) FROM document_metadata WHERE doc_id = ?", (doc_id,)),
-        "relationships": (
-            "SELECT COUNT(*) FROM document_relationships WHERE source_doc_id = ? OR target_doc_id = ?",
-            (doc_id, doc_id),
-        ),
         "changelog": ("SELECT COUNT(*) FROM changelog WHERE doc_id = ?", (doc_id,)),
         "receipts": ("SELECT COUNT(*) FROM agent_session_receipts WHERE doc_id = ?", (doc_id,)),
     }
@@ -425,7 +407,6 @@ def _relation_outcome_bundle(
 def _store(
     db: Database,
     collection: RecordingCollection,
-    document_collection: RecordingCollection | None = None,
 ) -> MemoryStore:
     logger = MemoryAuditLogger(db, default_context=AuditContext(actor_type="test", run_id="run-1"))
     adapters = build_sqlite_adapters(db, collection)
@@ -433,7 +414,6 @@ def _store(
         relational=adapters.relational,
         keyword=adapters.keyword,
         vector=adapters.vector,
-        document_index=DocumentVectorIndex(document_collection),
         embed_cfg={},
         audit_logger=logger,
     )
@@ -544,7 +524,6 @@ async def test_agent_claim_retry_with_unknown_source_timestamp_clears_stale_valu
         display_anchor="source-updated",
         claim_text="Agent claim source timestamp",
         memory_type="fact",
-        tags=["agent-session"],
         confidence=0.9,
         observed_at=observed_at,
         source_updated_at=source_updated_at,
@@ -574,7 +553,6 @@ async def test_agent_claim_retry_with_unknown_source_timestamp_clears_stale_valu
         display_anchor="source-updated",
         claim_text="Agent claim source timestamp",
         memory_type="fact",
-        tags=["agent-session"],
         confidence=0.9,
         observed_at=observed_at,
         source_updated_at=None,
@@ -1378,26 +1356,12 @@ async def test_purge_memory_redacts_existing_audit_payloads(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_delete_document_removes_document_chroma_vector(db: Database):
-    await _insert_doc(db, "doc-delete")
-    memory = _memory("mem-docdelete", "Document supported fact")
-    await db.insert_memory(memory)
-    await db.add_memory_source(memory.id, "doc-delete", "confluence", source_updated_at=None)
-    doc_collection = RecordingCollection()
-    store = _store(db, RecordingCollection(), document_collection=doc_collection)
-
-    await store.delete_document("doc-delete")
-
-    assert doc_collection.deleted == ["doc-delete"]
-
-
-@pytest.mark.asyncio
 async def test_delete_document_audit_records_source_absence_context(db: Database):
     await _insert_doc(db, "doc-source-absence")
     memory = _memory("mem-source-absence", "Only supported by source absence doc")
     await db.insert_memory(memory)
     await db.add_memory_source(memory.id, "doc-source-absence", "jira", source_updated_at=None)
-    store = _store(db, RecordingCollection(), document_collection=RecordingCollection())
+    store = _store(db, RecordingCollection())
 
     await store.delete_document(
         "doc-source-absence",
@@ -1416,67 +1380,6 @@ async def test_delete_document_audit_records_source_absence_context(db: Database
         "source_filter_summary": "updated >= -90d",
         "retired_memory_ids": [memory.id],
     }
-
-
-@pytest.mark.asyncio
-async def test_delete_document_fails_when_document_chroma_delete_fails(db: Database):
-    await _insert_doc(db, "doc-delete-fail")
-    store = _store(db, RecordingCollection(), document_collection=FailingDeleteCollection())
-
-    with pytest.raises(RuntimeError, match="delete failed"):
-        await store.delete_document("doc-delete-fail")
-
-    audit_rows = await db.list_memory_audit_events(event_type="index_operation_failed")
-    assert [(row.doc_id, row.payload["index"], row.payload["operation"]) for row in audit_rows] == [
-        ("doc-delete-fail", "document_chroma", "delete"),
-        ("doc-delete-fail", "document_chroma", "restore"),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_delete_document_restores_document_vector_when_chroma_delete_mutates_then_fails(db: Database):
-    await _insert_doc(db, "doc-delete-mutating-fail")
-    doc_collection = MutatingFailingDeleteCollection()
-    doc_collection.seed(
-        ids=["doc-delete-mutating-fail"],
-        embeddings=[[0.4, 0.5, 0.6]],
-        documents=["original mutating delete document text"],
-        metadatas=[{"content_hash": "hash-doc-delete-mutating-fail", "version": "1"}],
-    )
-    store = _store(db, RecordingCollection(), document_collection=doc_collection)
-
-    with pytest.raises(RuntimeError, match="delete failed after mutation"):
-        await store.delete_document("doc-delete-mutating-fail")
-
-    stored_doc = await db.get_document("doc-delete-mutating-fail")
-    assert stored_doc is not None
-    assert doc_collection.upserted["doc-delete-mutating-fail"]["document"] == ("original mutating delete document text")
-    assert doc_collection.upserted["doc-delete-mutating-fail"]["embedding"] == [0.4, 0.5, 0.6]
-
-
-@pytest.mark.asyncio
-async def test_delete_document_restores_document_vector_when_db_delete_fails(db: Database, monkeypatch):
-    await _insert_doc(db, "doc-db-delete-fail")
-    doc_collection = RecordingCollection()
-    doc_collection.upsert(
-        ids=["doc-db-delete-fail"],
-        embeddings=[[0.8, 0.7, 0.6]],
-        documents=["original semantic document text"],
-        metadatas=[{"content_hash": "hash-doc-db-delete-fail", "version": "1"}],
-    )
-    store = _store(db, RecordingCollection(), document_collection=doc_collection)
-
-    async def fail_delete_document(doc_id: str):
-        raise RuntimeError("db delete failed")
-
-    monkeypatch.setattr(db, "delete_document", fail_delete_document)
-
-    with pytest.raises(RuntimeError, match="db delete failed"):
-        await store.delete_document("doc-db-delete-fail")
-
-    assert doc_collection.deleted == ["doc-db-delete-fail"]
-    assert doc_collection.upserted["doc-db-delete-fail"]["document"] == "original semantic document text"
-    assert doc_collection.upserted["doc-db-delete-fail"]["embedding"] == [0.8, 0.7, 0.6]
 
 
 @pytest.mark.asyncio
@@ -1516,14 +1419,7 @@ async def test_delete_document_restores_db_when_retired_memory_index_delete_fail
         "source excerpt",
         source_updated_at=None,
     )
-    doc_collection = RecordingCollection()
-    doc_collection.upsert(
-        ids=["doc-delete-rollback"],
-        embeddings=[[0.1, 0.1, 0.1]],
-        documents=["original delete rollback document"],
-        metadatas=[{"content_hash": "hash-doc-delete-rollback", "version": "1"}],
-    )
-    store = _store(db, FailingDeleteCollection(), document_collection=doc_collection)
+    store = _store(db, FailingDeleteCollection())
 
     with pytest.raises(RuntimeError, match="delete failed"):
         await store.delete_document("doc-delete-rollback")
@@ -1535,15 +1431,9 @@ async def test_delete_document_restores_db_when_retired_memory_index_delete_fail
     assert stored_memory.status == "active"
     assert [(source.doc_id, source.excerpt) for source in sources] == [("doc-delete-rollback", "source excerpt")]
     assert await _doc_side_counts(db, "doc-delete-rollback") == {
-        "metadata": 1,
-        "relationships": 1,
         "changelog": 1,
         "receipts": 1,
     }
-    assert doc_collection.upserted["doc-delete-rollback"]["content_hash"] == "hash-doc-delete-rollback"
-    assert doc_collection.upserted["doc-delete-rollback"]["document"] == "original delete rollback document"
-
-
 @pytest.mark.asyncio
 async def test_delete_virtual_document_restores_without_configured_source_on_index_failure(
     db: Database,
@@ -1591,19 +1481,6 @@ async def test_delete_virtual_document_restores_without_configured_source_on_ind
 
 
 @pytest.mark.asyncio
-async def test_delete_document_restores_missing_document_vector_when_delete_mutates_then_fails(db: Database):
-    await _insert_doc(db, "doc-missing-vector-rollback")
-    doc_collection = InsertThenFailingDeleteCollection()
-    store = _store(db, RecordingCollection(), document_collection=doc_collection)
-
-    with pytest.raises(RuntimeError, match="delete failed after mutation"):
-        await store.delete_document("doc-missing-vector-rollback")
-
-    assert await db.get_document("doc-missing-vector-rollback") is not None
-    assert "doc-missing-vector-rollback" not in doc_collection.upserted
-
-
-@pytest.mark.asyncio
 async def test_delete_document_rolls_back_sqlite_when_db_delete_fails_mid_transaction(db: Database, monkeypatch):
     await _insert_doc(db, "doc-mid-db-fail")
     await _insert_doc_side_tables(db, "doc-mid-db-fail")
@@ -1616,7 +1493,7 @@ async def test_delete_document_rolls_back_sqlite_when_db_delete_fails_mid_transa
         "source excerpt",
         source_updated_at=None,
     )
-    store = _store(db, RecordingCollection(), document_collection=RecordingCollection())
+    store = _store(db, RecordingCollection())
 
     async def fail_refresh(memory_ids, *, retire_reason="source_deleted"):
         raise RuntimeError("refresh failed")
@@ -1631,8 +1508,6 @@ async def test_delete_document_rolls_back_sqlite_when_db_delete_fails_mid_transa
     assert stored_doc is not None
     assert [(source.doc_id, source.excerpt) for source in sources] == [("doc-mid-db-fail", "source excerpt")]
     assert await _doc_side_counts(db, "doc-mid-db-fail") == {
-        "metadata": 1,
-        "relationships": 1,
         "changelog": 1,
         "receipts": 1,
     }
@@ -1806,14 +1681,7 @@ async def test_delete_source_cascade_keeps_durable_cleanup_when_memory_vector_de
         "source excerpt",
         source_updated_at=None,
     )
-    doc_collection = RecordingCollection()
-    doc_collection.upsert(
-        ids=["doc-source-rollback"],
-        embeddings=[[0.2, 0.2, 0.2]],
-        documents=["original source rollback document"],
-        metadatas=[{"content_hash": "hash-doc-source-rollback", "version": "1"}],
-    )
-    store = _store(db, FailingDeleteCollection(), document_collection=doc_collection)
+    store = _store(db, FailingDeleteCollection())
 
     retired = await store.delete_source_cascade("src-rollback")
 
@@ -1827,8 +1695,6 @@ async def test_delete_source_cascade_keeps_durable_cleanup_when_memory_vector_de
     assert stored_memory.status == "retired"
     assert sources == []
     assert await _doc_side_counts(db, "doc-source-rollback") == {
-        "metadata": 0,
-        "relationships": 0,
         "changelog": 0,
         "receipts": 0,
     }
@@ -1854,37 +1720,6 @@ async def test_delete_source_cascade_keeps_durable_cleanup_when_memory_vector_de
         "completed",
         cleanup.error,
     )
-
-
-@pytest.mark.asyncio
-async def test_delete_source_cascade_restores_document_vectors_when_later_delete_fails(db: Database):
-    await db.upsert_source(
-        "src-partial-doc-delete",
-        "confluence",
-        "Partial Delete Source",
-        "{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    await _insert_doc(db, "doc-partial-1", source="src-partial-doc-delete")
-    await _insert_doc(db, "doc-partial-2", source="src-partial-doc-delete")
-    doc_collection = FailingSecondDeleteCollection()
-    for index, doc_id in enumerate(["doc-partial-1", "doc-partial-2"]):
-        doc_collection.upsert(
-            ids=[doc_id],
-            embeddings=[[float(index), float(index), float(index)]],
-            documents=[f"original {doc_id}"],
-            metadatas=[{"content_hash": f"hash-{doc_id}", "version": "1"}],
-        )
-    store = _store(db, RecordingCollection(), document_collection=doc_collection)
-
-    with pytest.raises(RuntimeError, match="second delete failed"):
-        await store.delete_source_cascade("src-partial-doc-delete")
-
-    assert doc_collection.upserted["doc-partial-1"]["document"] == "original doc-partial-1"
-    assert doc_collection.upserted["doc-partial-1"]["embedding"] == [0.0, 0.0, 0.0]
-    assert doc_collection.upserted["doc-partial-2"]["document"] == "original doc-partial-2"
-    assert doc_collection.upserted["doc-partial-2"]["embedding"] == [1.0, 1.0, 1.0]
 
 
 @pytest.mark.asyncio
@@ -1973,8 +1808,8 @@ async def test_insert_memory_purges_sqlite_when_chroma_cleanup_fails(db: Databas
 @pytest.mark.asyncio
 async def test_insert_memory_rebuilds_fts_from_canonical_entity_links(db: Database):
     await _insert_doc(db)
-    alpha_id = await db.upsert_entity("alpha", display_name="Alpha", tags=["team"])
-    beta_id = await db.upsert_entity("beta", display_name="Beta", tags=["team"])
+    alpha_id = await db.upsert_entity("alpha", display_name="Alpha")
+    beta_id = await db.upsert_entity("beta", display_name="Beta")
     memory = _memory("mem-canonical-fts", "Canonical entity search text")
     memory.entity_refs = ["beta", "alpha"]
     collection = RecordingCollection()
@@ -2004,8 +1839,8 @@ async def test_supersede_memory_rebuilds_fts_from_canonical_entity_links(db: Dat
     await _insert_doc(db)
     old = _memory("mem-canonical-supersede-old", "Old entity search text")
     await db.insert_memory(old)
-    alpha_id = await db.upsert_entity("alpha", display_name="Alpha", tags=["team"])
-    beta_id = await db.upsert_entity("beta", display_name="Beta", tags=["team"])
+    alpha_id = await db.upsert_entity("alpha", display_name="Alpha")
+    beta_id = await db.upsert_entity("beta", display_name="Beta")
     new = _memory("mem-canonical-supersede-new", "New entity search text")
     new.entity_refs = ["beta", "alpha"]
     store = _store(db, RecordingCollection())

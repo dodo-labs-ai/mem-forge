@@ -76,7 +76,6 @@ class TestMemoryDataclass:
         assert mem.corroboration_count == 1
         assert mem.contradiction_count == 0
         assert mem.entity_refs == []
-        assert mem.tags == []
 
     def test_custom_values(self):
         mem = Memory(
@@ -104,7 +103,6 @@ class TestRawMemory:
         rm = RawMemory(content="test", memory_type="fact")
         assert rm.confidence == 0.7
         assert rm.entity_refs == []
-        assert rm.tags == []
         assert rm.valid_from is None
 
 

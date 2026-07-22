@@ -446,7 +446,6 @@ class SourceSupportDetector:
                     "memory_id": memory.id,
                     "content": memory.content,
                     "memory_type": memory.memory_type,
-                    "tags": memory.tags,
                     "confidence": memory.confidence,
                     "corroboration_count": memory.corroboration_count,
                 }

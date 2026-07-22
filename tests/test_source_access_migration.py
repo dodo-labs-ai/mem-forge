@@ -31,6 +31,12 @@ CREATE TABLE sources (
 """
 
 
+def test_migration_versions_are_unique_and_strictly_increasing() -> None:
+    versions = [version for version, _description, _statements in MIGRATIONS]
+
+    assert versions == sorted(set(versions))
+
+
 async def _legacy_database(
     path: str,
     *,

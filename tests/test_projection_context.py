@@ -190,7 +190,6 @@ async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context
                         memory_type="decision",
                         confidence=0.9,
                         entity_refs=[],
-                        tags=["payroll"],
                         extraction_context="Reply 1: retain A7",
                         evidence_quote="Reply 1: retain A7",
                     ),
@@ -199,7 +198,6 @@ async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context
                         memory_type="fact",
                         confidence=0.9,
                         entity_refs=[],
-                        tags=["payroll"],
                         extraction_context="A7 processing context",
                         evidence_quote="A7 processing context",
                     ),
@@ -213,6 +211,8 @@ async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context
 
     assert [memory.content for memory in result.memories] == ["A7 is retained."]
     assert result.memories[0].source_observation_id == batch.primary_observation_ids[0]
+    assert result.metadata["structured_llm_calls"] == 1
+    assert result.metadata["prompt_chars"] > 0
 
 
 @pytest.mark.asyncio
