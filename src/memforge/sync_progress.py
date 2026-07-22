@@ -11,6 +11,7 @@ SYNC_PROGRESS_PHASES = frozenset(
         "waiting_for_device",
         "connecting",
         "discovering",
+        "fetching",
         "uploading",
         "processing",
         "reconciling",

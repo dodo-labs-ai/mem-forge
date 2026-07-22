@@ -1824,28 +1824,58 @@ def _push_github_profile_to_source(
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     prepared: list[dict[str, Any]] = []
-    for entry in selected_entries:
+    _report_local_agent_progress(
+        report_progress,
+        _sync_progress_snapshot(
+            phase="fetching",
+            completed=0,
+            total=len(selected_entries),
+            unit="file",
+        ),
+    )
+    for index, entry in enumerate(selected_entries, start=1):
         relative_path = str(entry["relative_path"])
         try:
             raw = _github_content(repo, ref, relative_path)
             text_body = raw.decode("utf-8")
         except UnicodeDecodeError:
             failed.append({"relative_path": relative_path, "error": "invalid utf-8"})
-            continue
         except click.ClickException as exc:
             failed.append({"relative_path": relative_path, "error": str(exc)})
-            continue
-        raw_hash = hashlib.sha256(raw).hexdigest()
-        prepared.append(
-            {
-                "relative_path": relative_path,
-                "markdown_body": text_body,
-                "content_type": str(entry.get("content_type") or "text/plain"),
-                "title": _github_title(text_body, relative_path),
-                "raw_hash": raw_hash,
-                "blob_sha": str(entry.get("blob_sha") or ""),
-            }
-        )
+        else:
+            raw_hash = hashlib.sha256(raw).hexdigest()
+            prepared.append(
+                {
+                    "relative_path": relative_path,
+                    "markdown_body": text_body,
+                    "content_type": str(entry.get("content_type") or "text/plain"),
+                    "title": _github_title(text_body, relative_path),
+                    "raw_hash": raw_hash,
+                    "blob_sha": str(entry.get("blob_sha") or ""),
+                }
+            )
+        finally:
+            _report_local_agent_progress(
+                report_progress,
+                _sync_progress_snapshot(
+                    phase="fetching",
+                    completed=index,
+                    total=len(selected_entries),
+                    unit="file",
+                    failed=len(failed),
+                ),
+            )
+
+    _report_local_agent_progress(
+        report_progress,
+        _sync_progress_snapshot(
+            phase="uploading",
+            completed=0,
+            total=len(prepared),
+            unit="file",
+            failed=len(failed),
+        ),
+    )
 
     for index, doc in enumerate(prepared, start=1):
         response = client.push_github_repo_document(
@@ -1863,6 +1893,7 @@ def _push_github_profile_to_source(
             local_agent_attempt_count=local_agent_attempt_count,
             submitted_by=submitted_by,
         )
+        _raise_if_local_agent_lease_not_current(response)
         if isinstance(response, dict) and response.get("error"):
             failed.append(
                 {
@@ -1966,6 +1997,14 @@ def _local_agent_lease_not_current(response: object) -> bool:
         if isinstance(parsed, dict):
             return parsed.get("detail") == "local_agent_lease_not_current"
     return detail == "local_agent_lease_not_current"
+
+
+def _raise_if_local_agent_lease_not_current(response: object) -> None:
+    if not _local_agent_lease_not_current(response):
+        return
+    from memforge.local_agent.runner import CloudJobLeaseLost
+
+    raise CloudJobLeaseLost("local_agent_lease_not_current")
 
 
 def _run_cloud_github_preview_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -2141,6 +2180,15 @@ def _run_cloud_jira_sync_job(
     scoped_client = client
     sync_snapshot_id = local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count"))
     sync_result: dict[str, Any] | None = None
+    _report_local_agent_progress(
+        report_progress,
+        _sync_progress_snapshot(
+            phase="uploading",
+            completed=0,
+            total=len(documents),
+            unit="issue",
+        ),
+    )
     for index, doc in enumerate(documents, start=1):
         response = scoped_client.push_jira_package(
             source_id=source_id,
@@ -2155,6 +2203,7 @@ def _run_cloud_jira_sync_job(
             local_agent_job_id=str(job["job_id"]),
             local_agent_attempt_count=int(job["attempt_count"]),
         )
+        _raise_if_local_agent_lease_not_current(response)
         if isinstance(response, dict) and response.get("error"):
             failed.append(
                 {
@@ -3651,6 +3700,16 @@ def _push_kb_profile_to_source(
         ),
     )
 
+    _report_local_agent_progress(
+        report_progress,
+        _sync_progress_snapshot(
+            phase="uploading",
+            completed=0,
+            total=len(selected_entries),
+            unit="file",
+        ),
+    )
+
     for index, entry in enumerate(selected_entries, start=1):
         response = client.push_local_markdown_document(
             source_id=source_id,
@@ -3665,6 +3724,7 @@ def _push_kb_profile_to_source(
             local_agent_attempt_count=local_agent_attempt_count,
             submitted_by=submitted_by,
         )
+        _raise_if_local_agent_lease_not_current(response)
         if isinstance(response, dict) and response.get("error"):
             failed.append(
                 {

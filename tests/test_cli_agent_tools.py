@@ -10,6 +10,7 @@ from click.testing import CliRunner
 import memforge.main as main
 from memforge.api_target import MemForgeTarget, build_target
 from memforge.local_agent import folder_picker
+from memforge.local_agent.runner import CloudJobLeaseLost
 from memforge.main import cli
 
 
@@ -905,6 +906,7 @@ def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
     FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
     monkeypatch.setattr(main.subprocess, "run", _fake_github_remote_run)
 
+    progress: list[dict] = []
     payload = main._run_cloud_local_agent_job(
         {
             "job_id": "laj-sync",
@@ -922,6 +924,7 @@ def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
             },
         },
         _cloud_test_client(),
+        report_progress=progress.append,
     )
 
     assert payload["operation"] == "github_repo_sync"
@@ -942,6 +945,13 @@ def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
     assert len(process_calls) == 1
     assert process_calls[0][1]["source_id"] == "src-from-cloud"
     assert process_calls[0][1]["sync_snapshot_id"] == "laj-sync:attempt:1"
+    assert [(item["phase"], item.get("progress", {}).get("completed")) for item in progress] == [
+        ("discovering", 1),
+        ("fetching", 0),
+        ("fetching", 1),
+        ("uploading", 0),
+        ("uploading", 1),
+    ]
 
 
 def test_local_agent_cloud_github_sync_reports_failed_paths_for_retry_diagnostics(monkeypatch):
@@ -978,6 +988,41 @@ def test_local_agent_cloud_github_sync_reports_failed_paths_for_retry_diagnostic
     assert payload["error"] == (
         "1 document(s) failed to push: Payroll Processing V2/Überblick.md: temporary GitHub API failure"
     )
+    assert not [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
+
+
+def test_local_agent_cloud_github_sync_stops_after_lease_rejection(monkeypatch):
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset(
+        {
+            "error": "MemForge API request failed",
+            "status_code": 409,
+            "detail": '{"detail":"local_agent_lease_not_current"}',
+        }
+    )
+    monkeypatch.setattr(main.subprocess, "run", _fake_github_remote_run)
+
+    with pytest.raises(CloudJobLeaseLost, match="local_agent_lease_not_current"):
+        main._run_cloud_local_agent_job(
+            {
+                "job_id": "laj-stale",
+                "attempt_count": 1,
+                "workspace_id": "ws-from-job-payload",
+                "operation": "github_repo_sync",
+                "source_id": "src-from-cloud",
+                "payload": {
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "ref": "main",
+                    "include_paths": ["Payroll Processing V2"],
+                    "include_extensions": ["md"],
+                    "limit": 2,
+                },
+            },
+            _cloud_test_client(),
+        )
+
+    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
+    assert len(push_calls) == 1
     assert not [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
 
 

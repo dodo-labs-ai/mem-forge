@@ -221,6 +221,8 @@ export function presentSourceSyncActivity(
       return { message: `Connecting to ${sourceName}`, detail: "Checking access" };
     case "discovering":
       return withProgress(`Finding ${label}`, snapshot, fallbackItems, true);
+    case "fetching":
+      return withProgress(`Reading ${label}`, snapshot, fallbackItems);
     case "uploading": {
       const date = currentSourceDate(snapshot);
       return withProgress(

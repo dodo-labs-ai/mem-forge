@@ -109,6 +109,7 @@ export type SyncProgressPhase =
   | "waiting_for_device"
   | "connecting"
   | "discovering"
+  | "fetching"
   | "uploading"
   | "processing"
   | "reconciling";
