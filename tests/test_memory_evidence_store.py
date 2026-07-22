@@ -21,7 +21,7 @@ from memforge.memory.evidence import (
     ReviewCase,
     relation_bundle_snapshot_audit,
 )
-from memforge.models import DocumentRecord, Memory, MemoryReview, content_hash
+from memforge.models import DocumentRecord, Memory, MemoryReview, MemorySource, content_hash
 from memforge.storage.database import Database
 
 
@@ -836,6 +836,52 @@ async def test_supersede_memory_with_relation_retry_is_idempotent_at_store_bound
 
 
 @pytest.mark.asyncio
+async def test_supersede_carries_the_exact_overlapping_source_projection(db: Database) -> None:
+    await db.upsert_document(_document("doc-current"))
+    await db.upsert_document(_document("doc-overlap"))
+    old = _memory("mem-old-overlap")
+    new = _memory("mem-new-overlap")
+    await db.insert_memory(old)
+    await db.restore_memory_source_snapshot(
+        MemorySource(
+            memory_id=old.id,
+            doc_id="doc-overlap",
+            source_id="src-secondary",
+            source_type="confluence",
+            excerpt="secondary configured source",
+            source_updated_at=None,
+        )
+    )
+    await db.restore_memory_source_snapshot(
+        MemorySource(
+            memory_id=old.id,
+            doc_id="doc-current",
+            source_id="src-secondary",
+            source_type="confluence",
+            excerpt="secondary configured source on the revised document",
+            source_updated_at=None,
+        )
+    )
+
+    await db.supersede_memory_with_source_and_relation(
+        old.id,
+        new,
+        replacement_kind="revision",
+        doc_id="doc-current",
+        source_type="confluence",
+        carry_revision_sources=True,
+        source_updated_at=None,
+    )
+
+    carried = await db.get_memory_sources(new.id)
+    assert {(item.source_id, item.doc_id) for item in carried} == {
+        ("src-1", "doc-current"),
+        ("src-secondary", "doc-overlap"),
+        ("src-secondary", "doc-current"),
+    }
+
+
+@pytest.mark.asyncio
 async def test_relation_outcome_bundle_rejects_run_id_collision(
     db: Database,
 ) -> None:
@@ -1393,19 +1439,36 @@ async def test_delete_source_cascade_deletes_docless_source_owned_evidence_graph
 
 
 @pytest.mark.asyncio
-async def test_remove_memory_source_deletes_linked_evidence_graph(db: Database) -> None:
+async def test_remove_memory_source_preserves_shared_evidence_audit(db: Database) -> None:
+    await db.upsert_source(
+        id="src-1",
+        type="confluence",
+        name="src-1",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
     await db.upsert_document(_document("doc-1"))
     await db.upsert_evidence_unit(_unit())
     await db.insert_memory(_memory("mem-source-evidence"))
+    await db.insert_memory(_memory("mem-other-evidence"))
     await db.add_memory_source("mem-source-evidence", "doc-1", "confluence", source_updated_at=None)
     await _record_run(db, action=LifecycleAction.ATTACH_SUPPORT, result_memory_id="mem-source-evidence")
-    await db.replace_evidence_relations("eu-1", [_relation("mem-source-evidence")])
+    await db.replace_evidence_relations(
+        "eu-1",
+        [
+            _relation("mem-source-evidence"),
+            _relation("mem-other-evidence"),
+        ],
+    )
 
-    await db.remove_memory_source("mem-source-evidence", "doc-1")
+    await db.remove_memory_source("mem-source-evidence", "doc-1", source_id="src-1")
 
-    assert await db.get_evidence_unit("eu-1") is None
-    assert await db.get_relation_run("rel-run-1") is None
-    assert await db.get_evidence_relations("eu-1") == []
+    assert await db.get_evidence_unit("eu-1") is not None
+    assert await db.get_relation_run("rel-run-1") is not None
+    assert [item.memory_id for item in await db.get_evidence_relations("eu-1")] == [
+        "mem-other-evidence"
+    ]
 
 
 @pytest.mark.asyncio

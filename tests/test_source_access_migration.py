@@ -58,6 +58,7 @@ async def _legacy_database(
     )
     for index, (visibility, owner_user_id) in enumerate(memory_access):
         memory_id = f"mem-{index}"
+        doc_id = f"doc-{index}"
         await connection.execute(
             """INSERT INTO memories (
                    id, memory_type, content, content_hash, tags, visibility,
@@ -66,10 +67,25 @@ async def _legacy_database(
             (memory_id, memory_id, f"hash-{index}", visibility, owner_user_id),
         )
         await connection.execute(
+            """INSERT INTO documents (
+                   doc_id, source, source_url, title, space_or_project,
+                   last_modified, version, content_hash, last_synced
+               ) VALUES (?, ?, ?, ?, 'UNSORTED', ?, '1', ?, ?)""",
+            (
+                doc_id,
+                source_id,
+                f"https://example.test/{doc_id}",
+                doc_id,
+                "2026-07-13T00:00:00+00:00",
+                f"doc-hash-{index}",
+                "2026-07-13T00:00:00+00:00",
+            ),
+        )
+        await connection.execute(
             """INSERT INTO memory_sources (
                memory_id, doc_id, source_id, source_type, support_kind
                ) VALUES (?, ?, ?, ?, 'extracted')""",
-            (memory_id, f"doc-{index}", source_id, source_type),
+            (memory_id, doc_id, source_id, source_type),
         )
     await connection.commit()
     await connection.close()

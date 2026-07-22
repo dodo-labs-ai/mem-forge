@@ -25,7 +25,7 @@ from memforge.source_projection import (
     SourceUnitInventoryFilter,
     SourceUnitRevision,
 )
-from memforge.models import DocumentMetadata, DocumentRecord, Memory
+from memforge.models import DocumentMetadata, DocumentRecord, Memory, MemorySource
 from memforge.storage.database import Database, MIGRATIONS
 
 
@@ -584,12 +584,33 @@ async def test_document_move_rebinds_legacy_support_without_cleaning_shared_arti
         "durable fact",
         source_updated_at=now,
     )
+    await db.add_memory_source(
+        memory.id,
+        "new-path",
+        "confluence",
+        "durable fact",
+        source_updated_at=now,
+    )
+    await db.restore_memory_source_snapshot(
+        MemorySource(
+            memory_id=memory.id,
+            doc_id="old-path",
+            source_id="src-overlap",
+            source_type="confluence",
+            excerpt="durable fact",
+            source_updated_at=now,
+        )
+    )
 
     await db.rebind_projected_document_support("old-path", "new-path")
     await db.delete_projected_document("old-path")
 
-    assert [source.doc_id for source in await db.get_memory_sources(memory.id)] == [
-        "new-path"
+    assert sorted(
+        (source.source_id, source.doc_id)
+        for source in await db.get_memory_sources(memory.id)
+    ) == [
+        ("src-1", "new-path"),
+        ("src-overlap", "new-path"),
     ]
     assert await db.get_document("old-path") is None
     assert await db.get_document("new-path") is not None

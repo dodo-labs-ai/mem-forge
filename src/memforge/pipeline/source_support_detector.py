@@ -634,7 +634,13 @@ class SourceSupportDetector:
                 and self._excerpt_in_document(source.excerpt, document)
             ):
                 continue
-            await self._remove_source_support(memory_store, source.memory_id, doc_id, context=audit_context)
+            await self._remove_source_support(
+                memory_store,
+                source.memory_id,
+                source.source_id,
+                doc_id,
+                context=audit_context,
+            )
             removed += 1
         return removed
 
@@ -642,11 +648,18 @@ class SourceSupportDetector:
     async def _remove_source_support(
         memory_store: MemoryStore,
         memory_id: str,
+        source_id: str,
         doc_id: str,
         *,
         context=None,
     ) -> None:
-        await memory_store.remove_source_support(memory_id, doc_id, reason="no_support", context=context)
+        await memory_store.remove_source_support(
+            memory_id,
+            doc_id,
+            source_id=source_id,
+            reason="no_support",
+            context=context,
+        )
 
     def _is_valid_support_excerpt(self, excerpt: str, document: str) -> bool:
         if not excerpt:

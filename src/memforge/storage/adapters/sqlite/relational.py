@@ -648,6 +648,12 @@ class SqliteRelationalStore:
     async def count_active_source_memories_without_support(self, source_id: str) -> int:
         return await self._db.count_active_source_memories_without_support(source_id)
 
+    async def count_active_supported_memories_without_source_provenance(
+        self,
+        source_id: str,
+    ) -> int:
+        return await self._db.count_active_supported_memories_without_source_provenance(source_id)
+
     async def count_active_source_memories(self, source_id: str) -> int:
         return await self._db.count_active_source_memories(source_id)
 
@@ -1068,6 +1074,21 @@ class SqliteRelationalStore:
             excerpt,
             support_kind=support_kind,
             source_updated_at=source_updated_at,
+        )
+
+    async def remove_memory_source(
+        self,
+        memory_id: str,
+        doc_id: str,
+        *,
+        source_id: str,
+        retire_reason: str = "source_deleted",
+    ) -> bool:
+        return await self._db.remove_memory_source(
+            memory_id,
+            doc_id,
+            source_id=source_id,
+            retire_reason=retire_reason,
         )
 
     async def promote_to_workspace(

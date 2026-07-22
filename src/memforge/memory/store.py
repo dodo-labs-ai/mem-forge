@@ -1728,25 +1728,21 @@ class MemoryStore:
         self,
         memory_id: str,
         doc_id: str,
-        reason: str = "no_support",
         *,
+        source_id: str,
+        reason: str = "no_support",
         context: AuditContext | None = None,
     ) -> bool:
         """Remove one source link and retire/hide the memory if support reaches zero."""
         context = context or self._operation_context(doc_id=doc_id)
-        previous = await self.db.get_memory(memory_id)
-        previous_sources = await self.db.get_memory_sources(memory_id)
-        retired = await self.db.remove_memory_source(memory_id, doc_id, retire_reason=reason)
+        retired = await self.db.remove_memory_source(
+            memory_id,
+            doc_id,
+            source_id=source_id,
+            retire_reason=reason,
+        )
         if retired:
-            try:
-                await self._remove_from_search_indexes(memory_id, label="retired", context=context)
-            except Exception:
-                if previous:
-                    await self._restore_memory_row(previous)
-                    await self._restore_search_indexes(previous, context=context, label="source_support_rollback")
-                for source in previous_sources:
-                    await self.db.restore_memory_source_snapshot(source)
-                raise
+            vector_delivery = await self.attempt_lifecycle_vector_delivery(source_id=source_id)
             await self._emit(
                 "source_support_removal_retired_memory",
                 "committed",
@@ -1754,6 +1750,7 @@ class MemoryStore:
                 memory_id=memory_id,
                 doc_id=doc_id,
                 reason=reason,
+                payload={"vector_delivery": vector_delivery.state.value},
             )
         await self._emit(
             "source_support_removed",

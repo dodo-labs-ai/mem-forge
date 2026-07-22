@@ -639,13 +639,13 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE TABLE IF NOT EXISTS memory_sources (
     memory_id   TEXT NOT NULL REFERENCES memories(id),
     doc_id      TEXT NOT NULL REFERENCES documents(doc_id),
-    source_id   TEXT,
+    source_id   TEXT NOT NULL,
     source_type TEXT NOT NULL,
     excerpt     TEXT,
     support_kind TEXT NOT NULL DEFAULT 'extracted',
     added_at    TEXT NOT NULL DEFAULT (datetime('now')),
     source_updated_at TEXT,
-    PRIMARY KEY (memory_id, doc_id)
+    PRIMARY KEY (memory_id, source_id, doc_id)
 );
 
 CREATE TABLE IF NOT EXISTS source_artifact_cleanup_tasks (
@@ -798,11 +798,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_search_metadata_alias_fts USING fts5(
 
 CREATE TABLE IF NOT EXISTS memory_search_metadata_trigram (
     memory_id        TEXT NOT NULL,
-    source_id        TEXT,
+    source_id        TEXT NOT NULL,
     doc_id           TEXT NOT NULL,
     source_type      TEXT NOT NULL,
     metadata_compact TEXT NOT NULL,
-    PRIMARY KEY (memory_id, doc_id)
+    PRIMARY KEY (memory_id, source_id, doc_id)
 );
 
 -- ---------------------------------------------------------------
@@ -2895,6 +2895,44 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ON relation_discovery_work(status, next_attempt_at, lease_until, created_at)",
         ],
     ),
+    (
+        66,
+        "Preserve Configured Source identity on memory provenance projections",
+        [
+            """CREATE TABLE memory_sources_source_identity_new (
+                memory_id        TEXT NOT NULL REFERENCES memories(id),
+                doc_id           TEXT NOT NULL REFERENCES documents(doc_id),
+                source_id        TEXT NOT NULL,
+                source_type      TEXT NOT NULL,
+                excerpt          TEXT,
+                support_kind     TEXT NOT NULL DEFAULT 'extracted',
+                added_at         TEXT NOT NULL DEFAULT (datetime('now')),
+                source_updated_at TEXT,
+                PRIMARY KEY (memory_id, source_id, doc_id)
+            )""",
+            """INSERT INTO memory_sources_source_identity_new (
+                   memory_id, doc_id, source_id, source_type, excerpt,
+                   support_kind, added_at, source_updated_at
+               )
+               SELECT memory_id, doc_id, source_id, source_type, excerpt,
+                      support_kind, added_at, source_updated_at
+                 FROM memory_sources""",
+            "DROP TABLE memory_sources",
+            "ALTER TABLE memory_sources_source_identity_new RENAME TO memory_sources",
+            "CREATE INDEX IF NOT EXISTS idx_memory_sources_doc ON memory_sources(doc_id)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_sources_doc_kind ON memory_sources(doc_id, support_kind)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_sources_source ON memory_sources(source_id)",
+            "DROP TABLE memory_search_metadata_trigram",
+            """CREATE TABLE memory_search_metadata_trigram (
+                memory_id        TEXT NOT NULL,
+                source_id        TEXT NOT NULL,
+                doc_id           TEXT NOT NULL,
+                source_type      TEXT NOT NULL,
+                metadata_compact TEXT NOT NULL,
+                PRIMARY KEY (memory_id, source_id, doc_id)
+            )""",
+        ],
+    ),
 ]
 
 
@@ -2951,6 +2989,8 @@ class Database:
         for version, description, statements in MIGRATIONS:
             if version in applied:
                 continue
+            if version == 66:
+                await self._assert_memory_source_ids_resolved()
             if version == 53:
                 async with self.db.execute("PRAGMA table_info(memories)") as cursor:
                     memory_columns = {str(row[1]) async for row in cursor}
@@ -2981,7 +3021,7 @@ class Database:
                         await self.db.execute(f"ALTER TABLE memories DROP COLUMN {column_name}")
             if version == 26:
                 await self._backfill_relation_run_snapshot_audit()
-            if version in (30, 31):
+            if version in (30, 31, 66):
                 await self._rebuild_memory_metadata_fts_unlocked()
             if version == 42:
                 await self._migrate_source_access_policy_unlocked()
@@ -4239,6 +4279,7 @@ class Database:
                          AND EXISTS (
                              SELECT 1 FROM memory_sources AS new_support
                              WHERE new_support.memory_id = old_support.memory_id
+                               AND new_support.source_id = old_support.source_id
                                AND new_support.doc_id = ?
                          )""",
                     (old_doc_id, new_doc_id),
@@ -5028,10 +5069,45 @@ class Database:
                WHERE ms.source_id = ?
                  AND m.status = 'active'
                  AND NOT EXISTS (
-                     SELECT 1 FROM memory_support_assertions msa
+                     SELECT 1
+                     FROM memory_support_assertions msa
+                     JOIN evidence_references er
+                       ON er.id = msa.evidence_reference_id
+                     JOIN evidence_units eu
+                       ON eu.id = er.evidence_unit_id
                      WHERE msa.memory_id = ms.memory_id
                        AND msa.source_id = ms.source_id
                        AND msa.active = 1
+                       AND eu.source_id = msa.source_id
+                       AND eu.doc_id = ms.doc_id
+                 )""",
+            (source_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["count"] if row is not None else 0)
+
+    async def count_active_supported_memories_without_source_provenance(
+        self,
+        source_id: str,
+    ) -> int:
+        """Count active supported Memories missing their same-source provenance projection."""
+
+        async with self.db.execute(
+            """SELECT COUNT(DISTINCT msa.memory_id) AS count
+               FROM memory_support_assertions msa
+               JOIN memories m ON m.id = msa.memory_id
+               LEFT JOIN evidence_references er ON er.id = msa.evidence_reference_id
+               LEFT JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+               WHERE msa.source_id = ?
+                 AND msa.active = 1
+                 AND m.status = 'active'
+                 AND (
+                     eu.id IS NULL OR eu.doc_id IS NULL OR NOT EXISTS (
+                         SELECT 1 FROM memory_sources ms
+                         WHERE ms.memory_id = msa.memory_id
+                           AND ms.source_id = msa.source_id
+                           AND ms.doc_id = eu.doc_id
+                     )
                  )""",
             (source_id,),
         ) as cursor:
@@ -5131,24 +5207,12 @@ class Database:
                     finding_count = int((await cursor.fetchone())["count"])
                 if finding_count:
                     raise ValueError("open lifecycle cutover findings block the lifecycle gate")
-                async with self.db.execute(
-                    """SELECT DISTINCT ms.memory_id
-                       FROM memory_sources ms
-                       JOIN memories m ON m.id = ms.memory_id
-                       WHERE ms.source_id = ?
-                         AND m.status = 'active'
-                         AND NOT EXISTS (
-                             SELECT 1 FROM memory_support_assertions msa
-                             WHERE msa.memory_id = ms.memory_id
-                               AND msa.source_id = ms.source_id
-                               AND msa.active = 1
-                         )
-                       LIMIT 1""",
-                    (source_id,),
-                ) as cursor:
-                    missing_lineage = await cursor.fetchone()
-                if missing_lineage is not None:
+                if await self.count_active_source_memories_without_support(source_id):
                     raise ValueError("source-backed Memory lacks validated support lineage")
+                if await self.count_active_supported_memories_without_source_provenance(
+                    source_id
+                ):
+                    raise ValueError("active support lacks source provenance")
                 now = _now_iso()
                 await self.db.execute(
                     """INSERT INTO source_lifecycle_gates (
@@ -6943,6 +7007,7 @@ class Database:
                     doc_id,
                     source_type,
                     (str(document_source.get("excerpt")) if document_source.get("excerpt") is not None else None),
+                    source_id=mutation.source_id,
                     source_updated_at=_parse_dt(document_source.get("source_updated_at")),
                 )
             await self._enqueue_lifecycle_vector_task_unlocked(
@@ -7027,6 +7092,7 @@ class Database:
                     str(reference["doc_id"]),
                     str(reference["source_type"]),
                     reference["excerpt"],
+                    source_id=mutation.source_id,
                     support_kind="corroborated",
                     source_updated_at=_parse_dt(mutation.payload.get("source_updated_at")),
                 )
@@ -7048,17 +7114,9 @@ class Database:
                     "DELETE FROM memory_sources WHERE memory_id = ? AND doc_id = ? AND source_id = ?",
                     (mutation.memory_id, document_id, mutation.source_id),
                 )
-                await self.db.execute(
-                    "DELETE FROM memory_search_metadata_fts WHERE memory_id = ? AND doc_id = ?",
-                    (mutation.memory_id, document_id),
-                )
-                await self.db.execute(
-                    "DELETE FROM memory_search_metadata_alias_fts WHERE memory_id = ? AND doc_id = ?",
-                    (mutation.memory_id, document_id),
-                )
-                await self.db.execute(
-                    "DELETE FROM memory_search_metadata_trigram WHERE memory_id = ? AND doc_id = ?",
-                    (mutation.memory_id, document_id),
+                await self._refresh_memory_metadata_fts_unlocked(
+                    mutation.memory_id,
+                    document_id,
                 )
             return
         if mutation_type is LifecycleMutationType.SUPERSEDE_MEMORY:
@@ -8197,45 +8255,20 @@ class Database:
         await self.db.execute("DELETE FROM relation_run_relations WHERE memory_id = ?", (memory_id,))
         await self.db.execute("DELETE FROM relation_candidates WHERE memory_id = ?", (memory_id,))
 
-    async def _delete_evidence_graph_for_memory_doc_unlocked(self, memory_id: str, doc_id: str) -> None:
-        """Remove evidence graph content for a single memory-source link."""
-        async with self.db.execute(
-            """SELECT DISTINCT eu.id
-               FROM evidence_units eu
-               JOIN relation_runs rr ON rr.evidence_unit_id = eu.id
-               WHERE eu.doc_id = ?
-                 AND rr.result_memory_id = ?
-                 AND rr.lifecycle_action IN (
-                     'attach_support', 'create_memory', 'create_revision',
-                     'supersede_memory', 'retire_memory'
-                 )""",
-            (doc_id, memory_id),
-        ) as cursor:
-            unit_ids = [row[0] async for row in cursor]
-        await self._delete_evidence_graph_for_unit_ids_unlocked(unit_ids)
+    async def _delete_current_evidence_relation_for_memory_doc_unlocked(
+        self,
+        memory_id: str,
+        source_id: str,
+        doc_id: str,
+    ) -> None:
+        """Remove the current relation for one Support without erasing run audit."""
         await self.db.execute(
             """DELETE FROM evidence_relations
                WHERE memory_id = ?
                  AND evidence_unit_id IN (
-                     SELECT id FROM evidence_units WHERE doc_id = ?
+                     SELECT id FROM evidence_units WHERE doc_id = ? AND source_id = ?
                  )""",
-            (memory_id, doc_id),
-        )
-        await self.db.execute(
-            """DELETE FROM relation_run_relations
-               WHERE memory_id = ?
-                 AND evidence_unit_id IN (
-                     SELECT id FROM evidence_units WHERE doc_id = ?
-                 )""",
-            (memory_id, doc_id),
-        )
-        await self.db.execute(
-            """DELETE FROM relation_candidates
-               WHERE memory_id = ?
-                 AND evidence_unit_id IN (
-                     SELECT id FROM evidence_units WHERE doc_id = ?
-                 )""",
-            (memory_id, doc_id),
+            (memory_id, doc_id, source_id),
         )
 
     async def _delete_evidence_graph_for_doc_ids_unlocked(self, doc_ids: Sequence[str]) -> None:
@@ -9023,8 +9056,7 @@ class Database:
                     """INSERT INTO memory_sources (
                         memory_id, doc_id, source_id, source_type, excerpt, support_kind, source_updated_at
                     ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, 'extracted', ?)
-                    ON CONFLICT(memory_id, doc_id) DO UPDATE SET
-                        source_id = excluded.source_id,
+                    ON CONFLICT(memory_id, source_id, doc_id) DO UPDATE SET
                         source_type = excluded.source_type,
                         excerpt = excluded.excerpt,
                         support_kind = excluded.support_kind,
@@ -9734,7 +9766,11 @@ class Database:
         support_kind: str = "extracted",
         source_updated_at: datetime | None,
     ) -> str:
-        """Add a supporting source and count only distinct source documents."""
+        """Corroborate the projection owned by the persisted Document's Source.
+
+        Secondary Configured Sources that overlap the same provider document are
+        attached only through an explicit Lifecycle Plan carrying ``source_id``.
+        """
         async with self._write_lock:
             outcome = await self._corroborate_memory_unlocked(
                 memory_id,
@@ -9786,14 +9822,19 @@ class Database:
         source_type: str,
         excerpt: str | None = None,
         *,
+        source_id: str | None = None,
         support_kind: str = "extracted",
         source_updated_at: datetime | None,
     ) -> str:
+        resolved_source_id = await self._resolve_memory_source_id_unlocked(
+            doc_id,
+            source_id=source_id,
+        )
         async with self.db.execute(
             """SELECT excerpt, support_kind, source_updated_at
                FROM memory_sources
-               WHERE memory_id = ? AND doc_id = ?""",
-            (memory_id, doc_id),
+               WHERE memory_id = ? AND source_id = ? AND doc_id = ?""",
+            (memory_id, resolved_source_id, doc_id),
         ) as cursor:
             existing = await cursor.fetchone()
 
@@ -9819,13 +9860,14 @@ class Database:
                 await self.db.execute(
                     """UPDATE memory_sources
                        SET source_type = ?, excerpt = ?, support_kind = ?, source_updated_at = ?
-                       WHERE memory_id = ? AND doc_id = ?""",
+                       WHERE memory_id = ? AND source_id = ? AND doc_id = ?""",
                     (
                         source_type,
                         excerpt if should_update_excerpt else existing_excerpt,
                         next_kind,
                         next_source_updated_at,
                         memory_id,
+                        resolved_source_id,
                         doc_id,
                     ),
                 )
@@ -9835,11 +9877,11 @@ class Database:
         cursor = await self.db.execute(
             """INSERT OR IGNORE INTO memory_sources (
                 memory_id, doc_id, source_id, source_type, excerpt, support_kind, source_updated_at
-            ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 memory_id,
                 doc_id,
-                doc_id,
+                resolved_source_id,
                 source_type,
                 excerpt,
                 support_kind,
@@ -9968,6 +10010,10 @@ class Database:
                     replacement_reason=replacement_reason,
                     replacement_kind=replacement_kind,
                 )
+                replacement_source_id = await self._resolve_memory_source_id_unlocked(
+                    doc_id,
+                    source_id=None,
+                )
                 if carry_revision_sources:
                     async with self.db.execute(
                         "SELECT * FROM memory_sources WHERE memory_id = ?",
@@ -9975,13 +10021,14 @@ class Database:
                     ) as cursor:
                         async for row in cursor:
                             d = dict(row)
-                            if d["doc_id"] == doc_id:
+                            if d["doc_id"] == doc_id and d["source_id"] == replacement_source_id:
                                 continue
                             await self._add_memory_source_unlocked(
                                 new_memory.id,
                                 d["doc_id"],
                                 d["source_type"],
                                 d["excerpt"],
+                                source_id=d["source_id"],
                                 support_kind=d.get("support_kind", "extracted"),
                                 source_updated_at=_parse_dt(d.get("source_updated_at")),
                             )
@@ -9990,6 +10037,7 @@ class Database:
                     doc_id,
                     source_type,
                     excerpt,
+                    source_id=replacement_source_id,
                     source_updated_at=source_updated_at,
                 )
                 await self._link_memory_entities_unlocked(new_memory.id, entity_ids)
@@ -10114,8 +10162,7 @@ class Database:
 
         if source:
             joins.append("JOIN memory_sources ms ON m.id = ms.memory_id")
-            joins.append("JOIN documents d ON ms.doc_id = d.doc_id")
-            conditions.append("d.source = ?")
+            conditions.append("ms.source_id = ?")
             params.append(source)
         if type:
             conditions.append("m.memory_type = ?")
@@ -10190,9 +10237,8 @@ class Database:
                     """EXISTS (
                         SELECT 1
                         FROM memory_sources ms_filter
-                        JOIN documents d_filter ON ms_filter.doc_id = d_filter.doc_id
                         WHERE ms_filter.memory_id = m.id
-                          AND d_filter.source = ?
+                          AND ms_filter.source_id = ?
                     )"""
                 )
                 params.append(filters.source)
@@ -10231,8 +10277,7 @@ class Database:
 
         if filters.source:
             joins.append("JOIN memory_sources ms ON m.id = ms.memory_id")
-            joins.append("JOIN documents d ON ms.doc_id = d.doc_id")
-            conditions.append("d.source = ?")
+            conditions.append("ms.source_id = ?")
             params.append(filters.source)
         if filters.memory_type:
             conditions.append("m.memory_type = ?")
@@ -10350,6 +10395,11 @@ class Database:
         support_kind: str = "extracted",
         source_updated_at: datetime | None,
     ) -> None:
+        """Attach the projection owned by the persisted Document's Source.
+
+        This convenience API must not infer a secondary overlapping Configured
+        Source; explicit cross-source attachment belongs to a Lifecycle Plan.
+        """
         async with self._write_lock:
             await self._add_memory_source_unlocked(
                 memory_id,
@@ -10368,15 +10418,19 @@ class Database:
         source_type: str,
         excerpt: str | None = None,
         *,
+        source_id: str | None = None,
         support_kind: str = "extracted",
         source_updated_at: datetime | None,
     ) -> None:
+        resolved_source_id = await self._resolve_memory_source_id_unlocked(
+            doc_id,
+            source_id=source_id,
+        )
         await self.db.execute(
             """INSERT INTO memory_sources (
                 memory_id, doc_id, source_id, source_type, excerpt, support_kind, source_updated_at
-            ) VALUES (?, ?, (SELECT source FROM documents WHERE doc_id = ?), ?, ?, ?, ?)
-            ON CONFLICT(memory_id, doc_id) DO UPDATE SET
-                source_id = excluded.source_id,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(memory_id, source_id, doc_id) DO UPDATE SET
                 source_type = excluded.source_type,
                 excerpt = excluded.excerpt,
                 support_kind = excluded.support_kind,
@@ -10384,7 +10438,7 @@ class Database:
             (
                 memory_id,
                 doc_id,
-                doc_id,
+                resolved_source_id,
                 source_type,
                 excerpt,
                 support_kind,
@@ -10392,6 +10446,28 @@ class Database:
             ),
         )
         await self._refresh_memory_metadata_fts_unlocked(memory_id, doc_id)
+
+    async def _resolve_memory_source_id_unlocked(
+        self,
+        doc_id: str,
+        *,
+        source_id: str | None,
+    ) -> str:
+        """Resolve an exact edge identity or the owner-only convenience boundary."""
+
+        if source_id is not None:
+            if not source_id:
+                raise ValueError("memory source projection requires source_id")
+            return source_id
+        async with self.db.execute(
+            "SELECT source FROM documents WHERE doc_id = ?",
+            (doc_id,),
+        ) as cursor:
+            document = await cursor.fetchone()
+        resolved = str(document["source"] or "") if document is not None else ""
+        if not resolved:
+            raise ValueError("memory source projection requires a persisted document source")
+        return resolved
 
     async def _refresh_memory_metadata_fts_unlocked(self, memory_id: str, doc_id: str) -> None:
         await self.db.execute(
@@ -10425,16 +10501,16 @@ class Database:
         )
         if not rows:
             return
-        record = rows[0]
-        labels_text = ""
-        try:
-            labels = json.loads(record["labels"] or "[]")
-            if isinstance(labels, list):
-                labels_text = " ".join(str(label) for label in labels)
-        except json.JSONDecodeError:
-            labels_text = str(record["labels"] or "")
-        await self.db.execute(
-            """INSERT INTO memory_search_metadata_fts (
+        for record in rows:
+            labels_text = ""
+            try:
+                labels = json.loads(record["labels"] or "[]")
+                if isinstance(labels, list):
+                    labels_text = " ".join(str(label) for label in labels)
+            except json.JSONDecodeError:
+                labels_text = str(record["labels"] or "")
+            await self.db.execute(
+                """INSERT INTO memory_search_metadata_fts (
                    memory_id,
                    source_id,
                    doc_id,
@@ -10445,58 +10521,58 @@ class Database:
                    metadata_source_name_tokens,
                    metadata_label_context_tokens
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                record["memory_id"],
-                record["source_id"],
-                record["doc_id"],
-                record["source_type"],
+                (
+                    record["memory_id"],
+                    record["source_id"],
+                    record["doc_id"],
+                    record["source_type"],
+                    record["title"] or "",
+                    record["doc_id"] or "",
+                    " ".join(part for part in (record["space_or_project"] or "", record["source_url"] or "") if part),
+                    record["source_name"] or "",
+                    labels_text,
+                ),
+            )
+            metadata_values = (
                 record["title"] or "",
                 record["doc_id"] or "",
-                " ".join(part for part in (record["space_or_project"] or "", record["source_url"] or "") if part),
+                record["space_or_project"] or "",
+                record["source_url"] or "",
                 record["source_name"] or "",
                 labels_text,
-            ),
-        )
-        metadata_values = (
-            record["title"] or "",
-            record["doc_id"] or "",
-            record["space_or_project"] or "",
-            record["source_url"] or "",
-            record["source_name"] or "",
-            labels_text,
-        )
-        await self.db.execute(
-            """INSERT INTO memory_search_metadata_alias_fts (
+            )
+            await self.db.execute(
+                """INSERT INTO memory_search_metadata_alias_fts (
                    memory_id,
                    source_id,
                    doc_id,
                    source_type,
                    metadata_alias_tokens
                ) VALUES (?, ?, ?, ?, ?)""",
-            (
-                record["memory_id"],
-                record["source_id"],
-                record["doc_id"],
-                record["source_type"],
-                metadata_alias_text(metadata_values),
-            ),
-        )
-        await self.db.execute(
-            """INSERT OR REPLACE INTO memory_search_metadata_trigram (
+                (
+                    record["memory_id"],
+                    record["source_id"],
+                    record["doc_id"],
+                    record["source_type"],
+                    metadata_alias_text(metadata_values),
+                ),
+            )
+            await self.db.execute(
+                """INSERT OR REPLACE INTO memory_search_metadata_trigram (
                    memory_id,
                    source_id,
                    doc_id,
                    source_type,
                    metadata_compact
                ) VALUES (?, ?, ?, ?, ?)""",
-            (
-                record["memory_id"],
-                record["source_id"],
-                record["doc_id"],
-                record["source_type"],
-                metadata_compact_text(metadata_values),
-            ),
-        )
+                (
+                    record["memory_id"],
+                    record["source_id"],
+                    record["doc_id"],
+                    record["source_type"],
+                    metadata_compact_text(metadata_values),
+                ),
+            )
 
     async def _refresh_metadata_fts_for_doc_unlocked(self, doc_id: str) -> None:
         rows = await self.db.execute_fetchall(
@@ -10527,7 +10603,9 @@ class Database:
         await self.db.execute("DELETE FROM memory_search_metadata_fts")
         await self.db.execute("DELETE FROM memory_search_metadata_alias_fts")
         await self.db.execute("DELETE FROM memory_search_metadata_trigram")
-        rows = await self.db.execute_fetchall("SELECT memory_id, doc_id FROM memory_sources ORDER BY memory_id, doc_id")
+        rows = await self.db.execute_fetchall(
+            "SELECT DISTINCT memory_id, doc_id FROM memory_sources ORDER BY memory_id, doc_id"
+        )
         for row in rows:
             await self._refresh_memory_metadata_fts_unlocked(
                 row["memory_id"],
@@ -10552,8 +10630,7 @@ class Database:
                 """INSERT INTO memory_sources (
                     memory_id, doc_id, source_id, source_type, excerpt, support_kind, added_at, source_updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(memory_id, doc_id) DO UPDATE SET
-                    source_id=excluded.source_id,
+                ON CONFLICT(memory_id, source_id, doc_id) DO UPDATE SET
                     source_type=excluded.source_type,
                     excerpt=excluded.excerpt,
                     support_kind=excluded.support_kind,
@@ -10580,7 +10657,8 @@ class Database:
                ORDER BY
                    CASE WHEN support_kind = 'extracted' THEN 0 ELSE 1 END,
                    added_at DESC,
-                   doc_id ASC""",
+                   doc_id ASC,
+                   source_id ASC""",
             (memory_id,),
         ) as cursor:
             async for row in cursor:
@@ -10987,9 +11065,15 @@ class Database:
                     ),
                 )
                 if carry_revision_sources:
+                    replacement_source_id = await self._resolve_memory_source_id_unlocked(
+                        doc_id,
+                        source_id=None,
+                    )
                     async with self.db.execute(
-                        "SELECT * FROM memory_sources WHERE memory_id = ? AND doc_id <> ?",
-                        (old_id, doc_id),
+                        """SELECT * FROM memory_sources
+                           WHERE memory_id = ?
+                             AND NOT (source_id = ? AND doc_id = ?)""",
+                        (old_id, replacement_source_id, doc_id),
                     ) as cursor:
                         async for row in cursor:
                             await self._add_memory_source_unlocked(
@@ -10997,6 +11081,7 @@ class Database:
                                 row["doc_id"],
                                 row["source_type"],
                                 row["excerpt"],
+                                source_id=row["source_id"],
                                 support_kind=row["support_kind"] or "extracted",
                                 source_updated_at=_parse_dt(row["source_updated_at"]),
                             )
@@ -11005,6 +11090,11 @@ class Database:
                     doc_id,
                     source_type,
                     excerpt,
+                    source_id=(
+                        replacement_source_id
+                        if carry_revision_sources
+                        else await self._resolve_memory_source_id_unlocked(doc_id, source_id=None)
+                    ),
                     support_kind="extracted",
                     source_updated_at=source_updated_at,
                 )
@@ -11140,7 +11230,7 @@ class Database:
                 FROM memory_sources ms
                 LEFT JOIN documents d ON d.doc_id = ms.doc_id
                 WHERE ms.memory_id IN ({placeholders})
-                ORDER BY ms.added_at ASC, ms.doc_id ASC""",
+                ORDER BY ms.added_at ASC, ms.doc_id ASC, ms.source_id ASC""",
             memory_ids,
         ) as cursor:
             async for row in cursor:
@@ -11260,34 +11350,73 @@ class Database:
         memory_id: str,
         doc_id: str,
         *,
+        source_id: str,
         retire_reason: str = "source_deleted",
     ) -> bool:
-        """Remove one source link and refresh support-derived memory state.
+        """Remove one exact Configured Source link and refresh Memory state.
 
         Returns ``True`` when the memory was retired.
         """
         async with self._write_lock:
-            await self._delete_evidence_graph_for_memory_doc_unlocked(memory_id, doc_id)
             await self.db.execute(
-                "DELETE FROM memory_search_metadata_fts WHERE memory_id = ? AND doc_id = ?",
-                (memory_id, doc_id),
+                """DELETE FROM memory_support_assertions
+                   WHERE memory_id = ? AND source_id = ?
+                     AND evidence_reference_id IN (
+                         SELECT er.id
+                           FROM evidence_references er
+                           JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                          WHERE eu.doc_id = ? AND eu.source_id = ?
+                     )""",
+                (memory_id, source_id, doc_id, source_id),
             )
+            await self._delete_current_evidence_relation_for_memory_doc_unlocked(memory_id, source_id, doc_id)
             await self.db.execute(
-                "DELETE FROM memory_search_metadata_alias_fts WHERE memory_id = ? AND doc_id = ?",
-                (memory_id, doc_id),
+                "DELETE FROM memory_sources WHERE memory_id = ? AND source_id = ? AND doc_id = ?",
+                (memory_id, source_id, doc_id),
             )
-            await self.db.execute(
-                "DELETE FROM memory_search_metadata_trigram WHERE memory_id = ? AND doc_id = ?",
-                (memory_id, doc_id),
-            )
-            await self.db.execute(
-                "DELETE FROM memory_sources WHERE memory_id = ? AND doc_id = ?",
-                (memory_id, doc_id),
-            )
+            await self._refresh_memory_metadata_fts_unlocked(memory_id, doc_id)
             retired = await self._refresh_memory_support_state_unlocked(
                 memory_id,
                 retire_reason=retire_reason,
             )
+            if retired:
+                now = _now_iso()
+                plan_id = f"support-removal-{uuid.uuid4().hex}"
+                scope_hash = hashlib.sha256(
+                    f"{memory_id}\x1f{source_id}\x1f{doc_id}".encode("utf-8")
+                ).hexdigest()[:20]
+                payload_json = json.dumps(
+                    {
+                        "operation": "remove_source_support",
+                        "memory_id": memory_id,
+                        "source_id": source_id,
+                        "doc_id": doc_id,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                await self.db.execute(
+                    """INSERT INTO lifecycle_plans (
+                           id, reconciliation_scope_id, source_id, source_unit_id,
+                           target_unit_revision_id, status, payload_json, payload_hash,
+                           created_at, applied_at, error
+                       ) VALUES (?, 'direct_support_removal', ?, ?, NULL, 'applied', ?, ?, ?, ?, NULL)""",
+                    (
+                        plan_id,
+                        source_id,
+                        f"support-removal:{scope_hash}",
+                        payload_json,
+                        hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+                        now,
+                        now,
+                    ),
+                )
+                await self._enqueue_lifecycle_vector_task_unlocked(
+                    plan_id,
+                    memory_id,
+                    LifecycleVectorOperation.DELETE,
+                    now=now,
+                )
             await self.db.commit()
             return retired
 
@@ -12904,8 +13033,7 @@ class Database:
                    COUNT(DISTINCT m.id) AS memory_count
             FROM memories m
             JOIN memory_sources ms ON ms.memory_id = m.id
-            JOIN documents d ON d.doc_id = ms.doc_id
-            WHERE d.source = ?
+            WHERE ms.source_id = ?
               AND {visibility_sql}
             GROUP BY m.project_key
             ORDER BY memory_count DESC, project_key ASC
@@ -13046,6 +13174,39 @@ class Database:
             await self.db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
             await self.db.commit()
 
+    async def _document_surviving_source_unlocked(
+        self,
+        doc_id: str,
+        *,
+        excluding_source_id: str,
+    ) -> str | None:
+        """Return a deterministic surviving Configured Source for a shared document."""
+
+        async with self.db.execute(
+            """SELECT MIN(candidate.source_id) AS source_id
+                 FROM (
+                     SELECT source_id FROM memory_sources
+                      WHERE doc_id = ? AND source_id <> ?
+                     UNION
+                     SELECT source_id FROM evidence_units
+                      WHERE doc_id = ? AND source_id <> ?
+                     UNION
+                     SELECT source_id FROM source_unit_document_lineage_history
+                      WHERE document_id = ? AND source_id <> ? AND is_current = 1
+                 ) candidate
+                 JOIN sources surviving ON surviving.id = candidate.source_id""",
+            (
+                doc_id,
+                excluding_source_id,
+                doc_id,
+                excluding_source_id,
+                doc_id,
+                excluding_source_id,
+            ),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return str(row["source_id"]) if row is not None and row["source_id"] else None
+
     async def delete_source_cascade(self, source_id: str) -> SourceDeletionResult:
         """Delete a source and cascade to all documents + memories linked to those docs.
 
@@ -13081,17 +13242,35 @@ class Database:
                     "UPDATE sources SET status = 'deleting' WHERE id = ?",
                     (source_id,),
                 )
-                retired_ids: list[str] = []
+                affected_memory_ids: set[str] = set()
+                async with self.db.execute(
+                    """SELECT DISTINCT memory_id FROM memory_sources WHERE source_id = ?
+                       UNION
+                       SELECT memory_id FROM memory_support_assertions WHERE source_id = ?""",
+                    (source_id, source_id),
+                ) as cursor:
+                    async for row in cursor:
+                        affected_memory_ids.add(str(row[0]))
+                projected_doc_ids: set[str] = set()
+                async with self.db.execute(
+                    "SELECT DISTINCT doc_id FROM memory_sources WHERE source_id = ?",
+                    (source_id,),
+                ) as cursor:
+                    async for row in cursor:
+                        projected_doc_ids.add(str(row[0]))
                 doc_ids: list[str] = []
-                artifact_uris: list[str] = []
+                exclusive_doc_ids: set[str] = set()
+                surviving_sources: dict[str, str] = {}
+                document_artifacts: dict[str, tuple[str, ...]] = {}
                 async with self.db.execute(
                     "SELECT doc_id, raw_content_uri, normalized_content_uri, pdf_content_uri "
                     "FROM documents WHERE source = ?",
                     (source_id,),
                 ) as cursor:
                     async for row in cursor:
-                        doc_ids.append(row["doc_id"])
-                        artifact_uris.extend(
+                        doc_id = str(row["doc_id"])
+                        doc_ids.append(doc_id)
+                        document_artifacts[doc_id] = tuple(
                             str(uri)
                             for uri in (
                                 row["raw_content_uri"],
@@ -13100,12 +13279,32 @@ class Database:
                             )
                             if uri
                         )
+                        survivor = await self._document_surviving_source_unlocked(
+                            doc_id,
+                            excluding_source_id=source_id,
+                        )
+                        if survivor is None:
+                            exclusive_doc_ids.add(doc_id)
+                        else:
+                            surviving_sources[doc_id] = survivor
+                shared_artifact_uris = {
+                    uri
+                    for doc_id, uris in document_artifacts.items()
+                    if doc_id in surviving_sources
+                    for uri in uris
+                }
+                artifact_uris = [
+                    uri
+                    for doc_id, uris in document_artifacts.items()
+                    if doc_id in exclusive_doc_ids
+                    for uri in uris
+                ]
                 async with self.db.execute(
                     "SELECT raw_uri FROM source_sync_inputs WHERE source_id = ?",
                     (source_id,),
                 ) as cursor:
                     async for row in cursor:
-                        if row["raw_uri"]:
+                        if row["raw_uri"] and str(row["raw_uri"]) not in shared_artifact_uris:
                             artifact_uris.append(str(row["raw_uri"]))
 
                 for artifact_uri in dict.fromkeys(artifact_uris):
@@ -13142,30 +13341,46 @@ class Database:
 
                 await self._delete_evidence_graph_for_source_id_unlocked(source_id)
                 for doc_id in doc_ids:
-                    memory_ids: list[str] = []
-                    async with self.db.execute(
-                        "SELECT memory_id FROM memory_sources WHERE doc_id = ?",
-                        (doc_id,),
-                    ) as cursor:
-                        async for row in cursor:
-                            memory_ids.append(row[0])
-
                     await self.db.execute("DELETE FROM memory_search_metadata_fts WHERE doc_id = ?", (doc_id,))
                     await self.db.execute("DELETE FROM memory_search_metadata_alias_fts WHERE doc_id = ?", (doc_id,))
                     await self.db.execute("DELETE FROM memory_search_metadata_trigram WHERE doc_id = ?", (doc_id,))
-                    await self.db.execute("DELETE FROM memory_sources WHERE doc_id = ?", (doc_id,))
-                    await self._delete_evidence_graph_for_doc_ids_unlocked([doc_id])
+                    if doc_id in surviving_sources:
+                        await self.db.execute(
+                            "DELETE FROM memory_sources WHERE source_id = ? AND doc_id = ?",
+                            (source_id, doc_id),
+                        )
+                        await self.db.execute(
+                            "UPDATE documents SET source = ? WHERE doc_id = ?",
+                            (surviving_sources[doc_id], doc_id),
+                        )
+                        await self._refresh_metadata_fts_for_doc_unlocked(doc_id)
+                    else:
+                        await self.db.execute("DELETE FROM memory_sources WHERE doc_id = ?", (doc_id,))
+                        await self._delete_evidence_graph_for_doc_ids_unlocked([doc_id])
 
-                    retired_ids.extend(await self._refresh_support_after_source_removal_unlocked(memory_ids))
+                    if doc_id in exclusive_doc_ids:
+                        await self.db.execute("DELETE FROM document_metadata WHERE doc_id = ?", (doc_id,))
+                        await self.db.execute(
+                            "DELETE FROM document_relationships WHERE source_doc_id = ? OR target_doc_id = ?",
+                            (doc_id, doc_id),
+                        )
+                        await self.db.execute("DELETE FROM changelog WHERE doc_id = ?", (doc_id,))
+                        await self.db.execute("DELETE FROM agent_session_receipts WHERE doc_id = ?", (doc_id,))
+                        await self.db.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
 
-                    await self.db.execute("DELETE FROM document_metadata WHERE doc_id = ?", (doc_id,))
-                    await self.db.execute(
-                        "DELETE FROM document_relationships WHERE source_doc_id = ? OR target_doc_id = ?",
-                        (doc_id, doc_id),
-                    )
-                    await self.db.execute("DELETE FROM changelog WHERE doc_id = ?", (doc_id,))
-                    await self.db.execute("DELETE FROM agent_session_receipts WHERE doc_id = ?", (doc_id,))
-                    await self.db.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                await self.db.execute(
+                    "DELETE FROM memory_sources WHERE source_id = ?",
+                    (source_id,),
+                )
+                for doc_id in projected_doc_ids.difference(doc_ids):
+                    await self.db.execute("DELETE FROM memory_search_metadata_fts WHERE doc_id = ?", (doc_id,))
+                    await self.db.execute("DELETE FROM memory_search_metadata_alias_fts WHERE doc_id = ?", (doc_id,))
+                    await self.db.execute("DELETE FROM memory_search_metadata_trigram WHERE doc_id = ?", (doc_id,))
+                    await self._refresh_metadata_fts_for_doc_unlocked(doc_id)
+
+                retired_ids = await self._refresh_support_after_source_removal_unlocked(
+                    list(affected_memory_ids),
+                )
 
                 await self.db.execute("DELETE FROM agent_session_receipts WHERE source_id = ?", (source_id,))
                 await self.db.execute("DELETE FROM sync_state WHERE source = ?", (source_id,))
@@ -13233,11 +13448,10 @@ class Database:
                     doc_ids = [str(row[0]) async for row in cursor]
                 memory_ids: set[str] = set()
                 async with self.db.execute(
-                    """SELECT DISTINCT ms.memory_id
-                         FROM memory_sources ms
-                         LEFT JOIN documents d ON d.doc_id = ms.doc_id
-                        WHERE ms.source_id = ? OR d.source = ?""",
-                    (source_id, source_id),
+                    """SELECT DISTINCT memory_id
+                         FROM memory_sources
+                        WHERE source_id = ?""",
+                    (source_id,),
                 ) as cursor:
                     async for row in cursor:
                         memory_ids.add(str(row[0]))
@@ -13343,15 +13557,14 @@ class Database:
                 await self.db.execute("DELETE FROM source_units WHERE source_id = ?", (source_id,))
                 await self.db.execute("DELETE FROM projection_scope_transitions WHERE source_id = ?", (source_id,))
                 await self.db.execute(
-                    """DELETE FROM memory_sources
-                        WHERE source_id = ?
-                           OR doc_id IN (SELECT doc_id FROM documents WHERE source = ?)""",
-                    (source_id, source_id),
+                    "DELETE FROM memory_sources WHERE source_id = ?",
+                    (source_id,),
                 )
                 for doc_id in doc_ids:
                     await self.db.execute("DELETE FROM memory_search_metadata_fts WHERE doc_id = ?", (doc_id,))
                     await self.db.execute("DELETE FROM memory_search_metadata_alias_fts WHERE doc_id = ?", (doc_id,))
                     await self.db.execute("DELETE FROM memory_search_metadata_trigram WHERE doc_id = ?", (doc_id,))
+                    await self._refresh_metadata_fts_for_doc_unlocked(doc_id)
 
                 retired_ids = await self._refresh_support_after_source_removal_unlocked(
                     list(memory_ids),

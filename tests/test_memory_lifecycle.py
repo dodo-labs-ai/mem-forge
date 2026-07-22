@@ -34,6 +34,15 @@ def _make_memory(mem_id: str, content: str, *, status: str = "active", corrobora
 
 
 async def _insert_doc(db: Database, doc_id: str, source: str = "src-1") -> None:
+    if await db.get_source(source) is None:
+        await db.upsert_source(
+            id=source,
+            type="confluence",
+            name=source,
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="owner-1",
+        )
     now = datetime.now(timezone.utc).isoformat()
     await db.db.execute(
         """INSERT INTO documents
@@ -68,7 +77,7 @@ class TestSupportAwareRetirement:
         await db.add_memory_source(mem.id, "doc-a", "confluence", source_updated_at=None)
         await db.add_memory_source(mem.id, "doc-b", "confluence", source_updated_at=None)
 
-        await db.remove_memory_source(mem.id, "doc-a", retire_reason="source_deleted")
+        await db.remove_memory_source(mem.id, "doc-a", source_id="src-1", retire_reason="source_deleted")
 
         stored = await db.get_memory(mem.id)
         sources = await db.get_memory_sources(mem.id)
@@ -82,7 +91,7 @@ class TestSupportAwareRetirement:
         await db.insert_memory(mem)
         await db.add_memory_source(mem.id, "doc-a", "confluence", source_updated_at=None)
 
-        await db.remove_memory_source(mem.id, "doc-a", retire_reason="source_deleted")
+        await db.remove_memory_source(mem.id, "doc-a", source_id="src-1", retire_reason="source_deleted")
 
         stored = await db.get_memory(mem.id)
         assert stored.status == "retired"
@@ -115,7 +124,7 @@ class TestSupportAwareRetirement:
         await db.add_memory_source(mem.id, "doc-owner", "confluence", support_kind="extracted", source_updated_at=None)
         await db.add_memory_source(mem.id, "doc-support", "jira", support_kind="corroborated", source_updated_at=None)
 
-        await db.remove_memory_source(mem.id, "doc-owner", retire_reason="source_deleted")
+        await db.remove_memory_source(mem.id, "doc-owner", source_id="src-1", retire_reason="source_deleted")
 
         stored = await db.get_memory(mem.id)
         sources = await db.get_memory_sources(mem.id)
@@ -135,7 +144,7 @@ class TestSupportAwareRetirement:
         await db.add_memory_source(mem.id, "doc-owner", "confluence", support_kind="extracted", source_updated_at=None)
         await db.add_memory_source(mem.id, "doc-support", "jira", support_kind="corroborated", source_updated_at=None)
 
-        await db.remove_memory_source(mem.id, "doc-support", retire_reason="no_support")
+        await db.remove_memory_source(mem.id, "doc-support", source_id="src-1", retire_reason="no_support")
 
         stored = await db.get_memory(mem.id)
         sources = await db.get_memory_sources(mem.id)

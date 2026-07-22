@@ -292,6 +292,10 @@ class RelationalStore(Protocol):
     ) -> list[LegacyMemoryProvenance]: ...
     async def count_active_source_memories(self, source_id: str) -> int: ...
     async def count_active_source_memories_without_support(self, source_id: str) -> int: ...
+    async def count_active_supported_memories_without_source_provenance(
+        self,
+        source_id: str,
+    ) -> int: ...
     async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate: ...
     async def enable_lifecycle_gate(
         self,
@@ -549,6 +553,14 @@ class RelationalStore(Protocol):
         support_kind: str = "extracted",
         source_updated_at: datetime | None,
     ) -> None: ...
+    async def remove_memory_source(
+        self,
+        memory_id: str,
+        doc_id: str,
+        *,
+        source_id: str,
+        retire_reason: str = "source_deleted",
+    ) -> bool: ...
     async def promote_to_workspace(
         self,
         memory_id: str,
