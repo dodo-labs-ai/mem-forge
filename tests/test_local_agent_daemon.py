@@ -5,9 +5,11 @@ import threading
 from datetime import datetime, timezone
 
 from click.testing import CliRunner
+import pytest
 
 import memforge.main as main
-from memforge.local_agent.runner import LocalAgentRunner
+import memforge.local_agent.runner as local_agent_runner
+from memforge.local_agent.runner import CloudJobLeaseLost, LocalAgentRunner, _CloudJobLeaseHeartbeat
 from memforge.local_agent.source_contract import SourceSyncRunReceiptError
 from memforge.local_agent.state import LocalAgentStateStore
 from memforge.main import cli
@@ -415,11 +417,10 @@ def test_local_agent_rejected_initial_heartbeat_never_runs_handler(tmp_path):
     report = runner.run_once(now=datetime(2026, 7, 16, tzinfo=timezone.utc))
 
     assert handled == []
-    assert len(completed) == 1
-    assert completed[0][2] == "failed"
-    assert completed[0][3] == {"retryable": False}
-    assert "local_agent_source_activity_epoch_required" in str(completed[0][4])
+    assert completed == []
     assert report["results"][-1]["status"] == "failed"
+    assert report["results"][-1]["error_type"] == "CloudJobLeaseLost"
+    assert "local_agent_source_activity_epoch_required" in report["results"][-1]["error"]
 
 
 def test_local_agent_forwards_retryable_handler_failure_to_broker(tmp_path):
@@ -548,8 +549,6 @@ def test_local_agent_reports_handler_progress_through_heartbeat(tmp_path):
 
 
 def test_local_agent_flushes_dirty_progress_before_lease_heartbeat():
-    from memforge.local_agent.runner import _CloudJobLeaseHeartbeat
-
     flushed = threading.Event()
 
     def heartbeat(job_id, attempt_count, lease_seconds, progress=None):
@@ -573,6 +572,95 @@ def test_local_agent_flushes_dirty_progress_before_lease_heartbeat():
             }
         )
         assert flushed.wait(1.5)
+
+
+def test_local_agent_heartbeat_rejection_fences_further_handler_work():
+    responses = iter(
+        [
+            {"ok": True},
+            {
+                "error": "MemForge API request failed",
+                "status_code": 404,
+                "detail": '{"detail":"local_agent_job_not_found"}',
+            },
+        ]
+    )
+    lease = _CloudJobLeaseHeartbeat(
+        heartbeat=lambda *args, **kwargs: next(responses),
+        job_id="laj-expired",
+        attempt_count=1,
+        lease_seconds=60,
+        interval_seconds=20,
+    )
+
+    with pytest.raises(CloudJobLeaseLost, match="local_agent_job_not_found"):
+        with lease:
+            lease._send_heartbeat()
+            lease.report_progress(
+                {
+                    "schema_version": 1,
+                    "phase": "uploading",
+                    "progress": {"completed": 555, "total": 555, "unit": "file"},
+                }
+            )
+
+
+def test_local_agent_lease_loss_does_not_attempt_stale_completion(tmp_path):
+    completed: list[tuple] = []
+
+    def lost_lease(_job, *, report_progress):
+        raise CloudJobLeaseLost("local_agent_job_not_found")
+
+    runner = LocalAgentRunner(
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        cloud_job_handler=lost_lease,
+        cloud_jobs_provider=lambda: {
+            "jobs": [
+                {
+                    "job_id": "laj-expired",
+                    "operation": "github_repo_sync",
+                    "source_id": "src-github",
+                    "attempt_count": 1,
+                }
+            ]
+        },
+        cloud_job_completer=lambda *args: completed.append(args) or {"ok": True},
+        cloud_job_heartbeat=lambda *args: {"ok": True},
+    )
+
+    report = runner.run_once(now=datetime(2026, 7, 22, tzinfo=timezone.utc))
+
+    assert completed == []
+    assert report["results"][-1]["status"] == "failed"
+    assert report["results"][-1]["error_type"] == "CloudJobLeaseLost"
+
+
+def test_local_agent_fences_itself_after_last_successful_lease_deadline(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(local_agent_runner.time, "monotonic", lambda: clock[0])
+
+    def slow_heartbeat(*args, **kwargs):
+        clock[0] += 10.0
+        return {"ok": True}
+
+    lease = _CloudJobLeaseHeartbeat(
+        heartbeat=slow_heartbeat,
+        job_id="laj-network-partition",
+        attempt_count=1,
+        lease_seconds=60,
+        interval_seconds=20,
+    )
+
+    with pytest.raises(CloudJobLeaseLost, match="lease expired"):
+        with lease:
+            clock[0] = 160.5
+            lease.report_progress(
+                {
+                    "schema_version": 1,
+                    "phase": "uploading",
+                    "progress": {"completed": 1, "total": 555, "unit": "file"},
+                }
+            )
 
 
 def test_local_agent_completion_failure_does_not_abort_following_job(tmp_path):

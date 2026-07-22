@@ -197,6 +197,19 @@ class LocalAgentRunner:
             if error:
                 result["error"] = error
             return result
+        except CloudJobLeaseLost as exc:
+            return {
+                "task_id": task_id,
+                "kind": "cloud_job",
+                "profile_name": None,
+                "origin": job.get("source_id"),
+                "status": "failed",
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "payload": {"retryable": True},
+            }
         except Exception as exc:  # cloud jobs must not stop the daemon loop
             error = str(exc)
             completion_error = self._complete_cloud_job(
@@ -339,6 +352,9 @@ class _CloudJobLeaseHeartbeat:
         self._progress: dict[str, Any] | None = None
         self._progress_revision = 0
         self._sent_progress_revision = 0
+        self._authority_lock = threading.Lock()
+        self._lease_deadline: float | None = None
+        self._lease_lost_error: str | None = None
         self._thread: threading.Thread | None = None
         self.errors: list[str] = []
 
@@ -358,10 +374,12 @@ class _CloudJobLeaseHeartbeat:
         if self._thread is not None:
             self._stop.set()
             self._thread.join(timeout=1)
+        self.raise_if_lost()
         with self._progress_lock:
             progress_dirty = self._progress_revision > self._sent_progress_revision
-        if progress_dirty:
+        if progress_dirty and not self.lease_lost:
             self._send_heartbeat()
+        self.raise_if_lost()
 
     def _run(self) -> None:
         next_lease_heartbeat = time.monotonic() + self._interval_seconds
@@ -372,13 +390,31 @@ class _CloudJobLeaseHeartbeat:
             if not progress_dirty and not lease_due:
                 continue
             self._send_heartbeat()
+            if self.lease_lost:
+                return
             if lease_due:
                 next_lease_heartbeat = time.monotonic() + self._interval_seconds
 
     def report_progress(self, progress: dict[str, Any]) -> None:
+        self.raise_if_lost()
         with self._progress_lock:
             self._progress = normalize_sync_progress_snapshot(progress)
             self._progress_revision += 1
+
+    @property
+    def lease_lost(self) -> bool:
+        with self._authority_lock:
+            return self._lease_lost_error is not None
+
+    def raise_if_lost(self) -> None:
+        with self._authority_lock:
+            error = self._lease_lost_error
+            deadline = self._lease_deadline
+        if error is None and deadline is not None and time.monotonic() >= deadline:
+            error = "local agent job lease expired before it could be renewed"
+            self._mark_lease_lost(error)
+        if error is not None:
+            raise CloudJobLeaseLost(error)
 
     @property
     def latest_progress(self) -> dict[str, Any] | None:
@@ -389,6 +425,7 @@ class _CloudJobLeaseHeartbeat:
         if self._heartbeat is None:
             return
         try:
+            heartbeat_started_at = time.monotonic()
             with self._progress_lock:
                 progress = dict(self._progress) if self._progress is not None else None
                 progress_revision = self._progress_revision
@@ -402,9 +439,13 @@ class _CloudJobLeaseHeartbeat:
             if isinstance(response, dict) and response.get("error"):
                 error = _api_error_message(response)
                 self.errors.append(error)
+                if response.get("status_code") in {404, 409}:
+                    self._mark_lease_lost(error)
                 if required:
                     raise CloudJobLeaseLost(error)
             else:
+                with self._authority_lock:
+                    self._lease_deadline = heartbeat_started_at + self._lease_seconds
                 with self._progress_lock:
                     self._sent_progress_revision = max(
                         self._sent_progress_revision,
@@ -416,6 +457,12 @@ class _CloudJobLeaseHeartbeat:
             self.errors.append(str(exc))
             if required:
                 raise CloudJobLeaseLost(str(exc)) from exc
+
+    def _mark_lease_lost(self, error: str) -> None:
+        with self._authority_lock:
+            if self._lease_lost_error is None:
+                self._lease_lost_error = error
+        self._stop.set()
 
 
 def _call_cloud_job_handler(

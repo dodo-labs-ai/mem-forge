@@ -42,6 +42,13 @@ and attempt count. The server rejects missing, expired, or superseded lease
 contexts before writing raw input, so an old daemon attempt cannot publish a
 partial snapshot after another daemon has reclaimed the job.
 
+The daemon also enforces that authority while a handler is running. A definitive
+heartbeat or package rejection stops the current attempt at its next progress
+checkpoint; if renewal remains unavailable, the daemon stops itself when the
+last confirmed lease deadline passes. It does not send a stale terminal
+completion. The same durable job can then be reclaimed with a higher attempt
+number and a new attempt-scoped snapshot.
+
 For each complete folder or repository scan, the daemon derives a snapshot id
 from the job id and lease attempt number. Every uploaded package and the final
 processing request use that same attempt-scoped id. The server processes only
@@ -52,6 +59,11 @@ If any package upload fails, the daemon does not publish the partial snapshot.
 The same job is retried with a new attempt-scoped snapshot, so membership from a
 partial attempt cannot leak into the retry. Stable document/content identities
 reuse raw inputs and prevent duplicate input generations or memories.
+
+Collection progress reports discovery, content fetching, and Cloud upload as
+separate phases. Large remote repositories therefore continue advancing while
+the daemon reads each selected file instead of leaving the Source row on the
+last discovery count.
 
 ## Scheduling
 

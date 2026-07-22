@@ -64,6 +64,28 @@ assert.deepEqual(
       state: "active",
       progress: {
         schema_version: 1,
+        phase: "fetching",
+        progress: { completed: 554, total: 555, unit: "file" },
+      },
+    },
+    "GitHub Repository",
+    "files",
+  ),
+  {
+    message: "Reading files",
+    detail: "554 of 555 files",
+    completed: 554,
+    total: 555,
+  },
+);
+
+assert.deepEqual(
+  presentSourceSyncActivity(
+    {
+      kind: "sync",
+      state: "active",
+      progress: {
+        schema_version: 1,
         phase: "processing",
         progress: { completed: 31, total: 86, unit: "page" },
         counts: { memories_created: 104 },
