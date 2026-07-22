@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -13,12 +14,80 @@ from fastapi.testclient import TestClient
 from memforge.config import AppConfig
 from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.local_agent.source_contract import source_with_sync_inputs
+from memforge.local_adapter import submit_github_repo_document
 from memforge.memory.lifecycle_plan import (
     LifecycleBackfillJob,
     LifecycleBackfillJobStatus,
 )
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
+
+
+class _EmptySourceInputDatabase:
+    async def list_source_sync_inputs(self, *, source_id: str, input_snapshot_id: str | None):
+        return []
+
+
+class _BlockingDocumentStore:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def store_raw(
+        self,
+        source_id: str,
+        title: str,
+        content: bytes,
+        content_type: str,
+        extension: str | None = None,
+    ) -> str:
+        self.started.set()
+        assert self.release.wait(timeout=2)
+        return "object-store://workspace/documents/package"
+
+
+@pytest.mark.asyncio
+async def test_github_package_artifact_io_does_not_block_event_loop(tmp_path: Path) -> None:
+    store = _BlockingDocumentStore()
+    release_timer = threading.Timer(0.5, store.release.set)
+    release_timer.start()
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    try:
+        task = asyncio.create_task(
+            submit_github_repo_document(
+                db=_EmptySourceInputDatabase(),
+                config=_config(tmp_path),
+                source={
+                    "id": "src-github",
+                    "type": "github_repo",
+                    "config": {
+                        "connection_mode": "local_push",
+                        "repo_url": "https://github.example.test/org/repo",
+                        "ref": "main",
+                        "include_paths": ["docs/"],
+                        "include_extensions": ["md"],
+                        "max_files": 500,
+                    },
+                },
+                repo_url="https://github.example.test/org/repo",
+                repo_ref="main",
+                relative_path="docs/guide.md",
+                markdown_body="# Guide",
+                document_store=store,
+                sync_snapshot_id="snapshot-1",
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert loop.time() - started_at < 0.2
+        assert store.started.is_set()
+        assert not task.done()
+        store.release.set()
+        result = await task
+    finally:
+        store.release.set()
+        release_timer.cancel()
+    assert result["package_uri"] == "object-store://workspace/documents/package"
 
 
 def _config(tmp_path: Path) -> AppConfig:
