@@ -876,6 +876,107 @@ async def test_discover_resets_hydrated_issue_cache_between_runs():
     assert set(gene._hydrated_issues) == {"PAY-2"}
 
 
+@pytest.mark.asyncio
+async def test_discover_inventory_uses_lightweight_complete_search_without_hydrating_cache():
+    issue = _jira_issue("PAY-1")
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
+        source_id="src-jira",
+    )
+    gene._base_url = "https://jira.example.test"
+    gene._hydrated_issues = {"stale": {}}
+    gene._request = AsyncMock(return_value=JsonResponse(_search_page([issue])))
+
+    items = [item async for item in gene.discover_inventory()]
+
+    assert [item.extra["issue_key"] for item in items] == ["PAY-1"]
+    assert items[0].extra["attest_materialized_revision"] is True
+    assert gene.discovery_complete is True
+    assert gene._hydrated_issues == {}
+    request = gene._request.await_args.kwargs["json_body"]
+    assert request["fields"] == ["summary", "updated", "project"]
+    assert "expand" not in request
+
+
+@pytest.mark.asyncio
+async def test_discover_inventory_preserves_lightweight_fields_across_pages():
+    class TwoPageInventoryClient(RecordingAsyncClient):
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls.append((method, url, kwargs))
+            start_at = kwargs["json"]["startAt"]
+            issue = _jira_issue("PAY-1" if start_at == 0 else "PAY-2")
+            return JsonResponse(_search_page([issue], total=2, start_at=start_at))
+
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
+        source_id="src-jira",
+    )
+    client = TwoPageInventoryClient(base_url="https://jira.example.test")
+    gene._client = client
+    gene._base_url = "https://jira.example.test"
+
+    items = [item async for item in gene.discover_inventory()]
+
+    assert [item.extra["issue_key"] for item in items] == ["PAY-1", "PAY-2"]
+    assert [call[2]["json"]["fields"] for call in client.calls] == [
+        ["summary", "updated", "project"],
+        ["summary", "updated", "project"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inventory_fetch_rejects_comment_body_from_newer_issue_revision():
+    original = _jira_issue("PAY-1")
+    updated = _jira_issue(
+        "PAY-1",
+        field_overrides={"updated": "2026-05-21T08:01:00.000+0000"},
+    )
+
+    class ConcurrentCommentClient(RecordingAsyncClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.issue_reads = 0
+
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls.append((method, url, kwargs))
+            if url == "/rest/api/2/search":
+                return JsonResponse(_search_page([original]))
+            if url.endswith("/comment"):
+                return JsonResponse(
+                    {
+                        "startAt": 0,
+                        "comments": [{"id": "comment-new", "body": "New comment"}],
+                        "total": 1,
+                    }
+                )
+            self.issue_reads += 1
+            return JsonResponse(original if self.issue_reads == 1 else updated)
+
+    gene = JiraGene(
+        config={
+            "base_url": "https://jira.example.test",
+            "projects": ["PAY"],
+            "include_comments": True,
+        },
+        source_id="src-jira",
+    )
+    client = ConcurrentCommentClient(base_url="https://jira.example.test")
+    gene._client = client
+    gene._base_url = "https://jira.example.test"
+    item = [item async for item in gene.discover_inventory()][0]
+
+    with pytest.raises(RuntimeError, match="changed during materialization; retry inventory"):
+        await gene.fetch(item)
+
+    assert [call[1] for call in client.calls] == [
+        "/rest/api/2/search",
+        "/rest/api/2/issue/PAY-1",
+        "/rest/api/2/issue/PAY-1/comment",
+        "/rest/api/2/issue/PAY-1",
+    ]
+    assert client.calls[-1][2]["params"] == {"fields": "updated"}
+
+
 async def _async_json_response(payload: dict) -> JsonResponse:
     return JsonResponse(payload)
 

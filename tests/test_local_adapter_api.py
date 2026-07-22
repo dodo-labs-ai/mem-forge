@@ -338,6 +338,7 @@ def test_create_github_repo_source_populates_inbox_path_for_local_push(tmp_path)
 
 def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
     from memforge.genes.jira_gene import JiraGene
+    from memforge.local_adapter import build_jira_doc_id
     from memforge.server.admin_api import create_admin_app
 
     cfg = _config(tmp_path)
@@ -372,6 +373,51 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
             assert initial_row is not None
             initial_documents_dir = Path(initial_row["config"]["local_agent_documents_dir"])
             assert initial_documents_dir.exists()
+            manifest_response = client.post(
+                f"/api/sources/{source_id}/adapter/manifest",
+                json={
+                    "items": [
+                        {
+                            "doc_id": build_jira_doc_id(
+                                source_id=source_id,
+                                issue_key="PAY-1",
+                            ),
+                            "revision": "2026-07-10T08:00:00+00:00",
+                            "change_kind": "upsert",
+                        }
+                    ],
+                    "coverage": "complete_snapshot",
+                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
+                },
+            )
+            premature_process = client.post(
+                f"/api/sources/{source_id}/process",
+                json={"sync_snapshot_id": "test-local-agent-job:attempt:1"},
+            )
+            revision_mismatch = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "base_url": "https://jira.example.test",
+                    "issue_key": "PAY-1",
+                    "source_url": "https://jira.example.test/browse/PAY-1",
+                    "title": "Create daemon source support",
+                    "raw_payload": raw_payload,
+                    "provider_revision": "2026-07-10T09:00:00+00:00",
+                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
+                },
+            )
+            undeclared = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "base_url": "https://jira.example.test",
+                    "issue_key": "PAY-2",
+                    "source_url": "https://jira.example.test/browse/PAY-2",
+                    "title": "Undeclared issue",
+                    "raw_payload": {**raw_payload, "id": "10002", "key": "PAY-2"},
+                    "provider_revision": "2026-07-10T08:00:00+00:00",
+                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
+                },
+            )
             response = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
                 json={
@@ -380,6 +426,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
                     "source_url": "https://jira.example.test/browse/PAY-1",
                     "title": "Create daemon source support",
                     "raw_payload": raw_payload,
+                    "provider_revision": "2026-07-10T08:00:00+00:00",
                     "sync_snapshot_id": "test-local-agent-job:attempt:1",
                     "submitted_at": "2026-07-10T08:00:00+00:00",
                 },
@@ -392,6 +439,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
                     "source_url": "https://jira.example.test/browse/PAY-1",
                     "title": "Create daemon source support",
                     "raw_payload": raw_payload,
+                    "provider_revision": "2026-07-10T08:00:00+00:00",
                     "sync_snapshot_id": "test-local-agent-job:attempt:1",
                     "submitted_at": "2026-07-10T08:05:00+00:00",
                 },
@@ -404,6 +452,13 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
                 },
             )
 
+        assert manifest_response.status_code == 200, manifest_response.text
+        assert premature_process.status_code == 409
+        assert premature_process.json()["detail"] == "source_snapshot_materialization_incomplete"
+        assert revision_mismatch.status_code == 409
+        assert "does not match manifest" in revision_mismatch.json()["detail"]
+        assert undeclared.status_code == 409
+        assert undeclared.json()["detail"] == "snapshot input was not declared by the manifest"
         assert response.status_code == 200, response.text
         assert repeated_response.status_code == 200, repeated_response.text
         payload = response.json()
@@ -426,6 +481,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
         assert inputs[0].raw_uri == payload["package_uri"]
         assert inputs[0].metadata["doc_id"] == payload["doc_id"]
         assert inputs[0].metadata["manifest_entry"]["doc_id"] == payload["doc_id"]
+        assert inputs[0].metadata["manifest_entry"]["provider_revision"] == "2026-07-10T08:00:00+00:00"
         snapshot_inputs = asyncio.run(
             database.list_source_sync_inputs(
                 source_id=source_id,
@@ -1032,6 +1088,192 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
         items, normalized = asyncio.run(_read_package())
         assert items[0].extra["package_uri"] == body["package_uri"]
         assert normalized.markdown_body.startswith("# Payroll Processing")
+    finally:
+        asyncio.run(database.close())
+
+
+def test_github_repo_manifest_reuses_unchanged_input_without_another_package(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_github_repo_source(client)["id"]
+            relative_path = "Payroll Processing/README.md"
+            doc_id = build_github_repo_doc_id(
+                source_id=source_id,
+                repo_url="https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                repo_ref="main",
+                relative_path=relative_path,
+            )
+            initial_manifest = client.post(
+                f"/api/sources/{source_id}/adapter/manifest",
+                json={
+                    "items": [
+                        {"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}
+                    ],
+                    "coverage": "complete_snapshot",
+                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
+                    "local_agent_job_id": "test-local-agent-job",
+                    "local_agent_attempt_count": 1,
+                },
+            )
+            first = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": relative_path,
+                    "markdown_body": "# Payroll Processing\n\nArchitecture notes.",
+                    "blob_sha": "blob-sha-1",
+                },
+            )
+            planned = client.post(
+                f"/api/sources/{source_id}/adapter/manifest",
+                json={
+                    "items": [{"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}],
+                    "coverage": "complete_snapshot",
+                    "sync_snapshot_id": "test-local-agent-job-2:attempt:1",
+                    "local_agent_job_id": "test-local-agent-job-2",
+                    "local_agent_attempt_count": 1,
+                },
+            )
+
+        assert initial_manifest.status_code == 200, initial_manifest.text
+        assert initial_manifest.json()["required_doc_ids"] == [doc_id]
+        assert first.status_code == 200, first.text
+        assert planned.status_code == 200, planned.text
+        assert planned.json() == {
+            "source_id": source_id,
+            "snapshot_id": "test-local-agent-job-2:attempt:1",
+            "coverage": "complete_snapshot",
+            "manifest_count": 1,
+            "reused_count": 1,
+            "required_doc_ids": [],
+        }
+        [first_input] = asyncio.run(
+            database.list_source_sync_inputs(
+                source_id=source_id,
+                input_snapshot_id="test-local-agent-job:attempt:1",
+            )
+        )
+        [reused_input] = asyncio.run(
+            database.list_source_sync_inputs(
+                source_id=source_id,
+                input_snapshot_id="test-local-agent-job-2:attempt:1",
+            )
+        )
+        assert reused_input.input_id == first_input.input_id
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_source_manifest_requests_changed_body_and_accepts_complete_removal(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_github_repo_source(client)["id"]
+            relative_path = "Payroll Processing/README.md"
+            doc_id = build_github_repo_doc_id(
+                source_id=source_id,
+                repo_url="https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                repo_ref="main",
+                relative_path=relative_path,
+            )
+            first = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": relative_path,
+                    "markdown_body": "# Payroll Processing",
+                    "blob_sha": "blob-sha-1",
+                },
+            )
+            changed = client.post(
+                f"/api/sources/{source_id}/adapter/manifest",
+                json={
+                    "items": [{"doc_id": doc_id, "revision": "blob-sha-2", "change_kind": "upsert"}],
+                    "coverage": "complete_snapshot",
+                    "sync_snapshot_id": "changed-job:attempt:1",
+                    "local_agent_job_id": "changed-job",
+                    "local_agent_attempt_count": 1,
+                },
+            )
+            changed_manifest_retry = client.post(
+                f"/api/sources/{source_id}/adapter/manifest",
+                json={
+                    "items": [{"doc_id": doc_id, "revision": "blob-sha-3", "change_kind": "upsert"}],
+                    "coverage": "complete_snapshot",
+                    "sync_snapshot_id": "changed-job:attempt:1",
+                    "local_agent_job_id": "changed-job",
+                    "local_agent_attempt_count": 1,
+                },
+            )
+            removed = client.post(
+                f"/api/sources/{source_id}/adapter/manifest",
+                json={
+                    "items": [],
+                    "coverage": "complete_snapshot",
+                    "sync_snapshot_id": "removed-job:attempt:1",
+                    "local_agent_job_id": "removed-job",
+                    "local_agent_attempt_count": 1,
+                },
+            )
+            incomplete = client.post(
+                f"/api/sources/{source_id}/adapter/manifest",
+                json={
+                    "items": [{"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}],
+                    "coverage": "partial",
+                    "sync_snapshot_id": "incomplete-job:attempt:1",
+                    "local_agent_job_id": "incomplete-job",
+                    "local_agent_attempt_count": 1,
+                },
+            )
+            bounded = client.post(
+                f"/api/sources/{source_id}/adapter/manifest",
+                json={
+                    "items": [{"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}],
+                    "coverage": "bounded_delta",
+                    "sync_snapshot_id": "bounded-job:attempt:1",
+                    "local_agent_job_id": "bounded-job",
+                    "local_agent_attempt_count": 1,
+                },
+            )
+
+        assert first.status_code == 200, first.text
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["required_doc_ids"] == [doc_id]
+        assert changed.json()["reused_count"] == 0
+        assert changed_manifest_retry.status_code == 409
+        assert changed_manifest_retry.json()["detail"] == "source snapshot manifest changed"
+        assert removed.status_code == 200, removed.text
+        assert removed.json()["manifest_count"] == 0
+        assert removed.json()["required_doc_ids"] == []
+        assert asyncio.run(
+            database.list_source_sync_inputs(
+                source_id=source_id,
+                input_snapshot_id="removed-job:attempt:1",
+            )
+        ) == []
+        assert incomplete.status_code == 400, incomplete.text
+        assert incomplete.json()["detail"] == "partial collection cannot be planned"
+        assert bounded.status_code == 409, bounded.text
+        assert bounded.json()["detail"] == "authoritative collection requires complete_snapshot coverage"
     finally:
         asyncio.run(database.close())
 
@@ -2001,7 +2243,7 @@ async def _allow_local_agent_lease(*args, **kwargs) -> bool:
 
 class LeaseAwareTestClient(TestClient):
     def post(self, url, *args, **kwargs):
-        if "/adapter/packages" in url or url.endswith("/process"):
+        if "/adapter/packages" in url or "/adapter/manifest" in url or url.endswith("/process"):
             body = dict(kwargs.get("json") or {})
             body.setdefault("local_agent_job_id", "test-local-agent-job")
             body.setdefault("local_agent_attempt_count", 1)

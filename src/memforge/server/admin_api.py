@@ -138,6 +138,7 @@ from memforge.local_agent.source_contract import (
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
+    local_agent_collection_is_authoritative,
     local_agent_rebaseline_snapshot_is_authoritative,
     local_agent_semantic_input_sha256,
     local_agent_completion_status,
@@ -1088,11 +1089,26 @@ class LocalSourcePackageRequest(BaseModel):
     source_url: str | None = None
     title: str | None = None
     raw_hash: str | None = None
+    provider_revision: str | None = None
     sync_snapshot_id: str | None = None
     local_agent_job_id: str | None = None
     local_agent_attempt_count: int | None = Field(default=None, ge=1)
     submitted_by: str | None = None
     submitted_at: str | None = None
+
+
+class LocalSourceManifestItemRequest(BaseModel):
+    doc_id: str = Field(min_length=1, max_length=512)
+    revision: str = Field(min_length=1, max_length=512)
+    change_kind: Literal["upsert", "tombstone"]
+
+
+class LocalSourceManifestRequest(BaseModel):
+    items: list[LocalSourceManifestItemRequest] = Field(max_length=10_000)
+    coverage: Literal["complete_snapshot", "bounded_delta", "partial"]
+    sync_snapshot_id: str
+    local_agent_job_id: str
+    local_agent_attempt_count: int = Field(ge=1)
 
 
 class AgentSessionWindowRequest(BaseModel):
@@ -5376,6 +5392,7 @@ def create_admin_app(
         source_id: str,
         req: SourceSyncRequest | None = Body(default=None),
         db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
         sync_service: SyncService = Depends(get_sync_service),
     ):
         """Enqueue server processing after the owner daemon persisted raw input."""
@@ -5408,6 +5425,30 @@ def create_admin_app(
             job_id=req.local_agent_job_id if req else None,
             attempt_count=req.local_agent_attempt_count if req else None,
         )
+        manifest_status = await db.get_source_sync_snapshot_manifest_status(
+            source_id=source_id,
+            workspace_id=workspace_id,
+            snapshot_id=input_snapshot_id,
+        )
+        if manifest_status is None:
+            raise HTTPException(status_code=409, detail="source_snapshot_manifest_required")
+        if (
+            manifest_status["local_agent_job_id"] != (req.local_agent_job_id if req else None)
+            or manifest_status["local_agent_attempt_count"]
+            != (req.local_agent_attempt_count if req else None)
+            or manifest_status["source_activity_epoch"]
+            != int(lease_payload["source_activity_epoch"])
+            or manifest_status["source_config_revision"]
+            != str(lease_payload["source_config_revision"])
+        ):
+            raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
+        if not manifest_status["ready"]:
+            raise HTTPException(status_code=409, detail="source_snapshot_materialization_incomplete")
+        if (
+            local_agent_collection_is_authoritative(current_source.get("type"))
+            and manifest_status["coverage"] != "complete_snapshot"
+        ):
+            raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
         try:
             run = await sync_service.enqueue_source(
                 source_id,
@@ -5618,6 +5659,7 @@ def create_admin_app(
                     source_url=req.source_url or "",
                     title=req.title,
                     raw_hash=req.raw_hash,
+                    provider_revision=req.provider_revision,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,
@@ -5758,6 +5800,111 @@ def create_admin_app(
         public_result = dict(result)
         public_result.pop("package_manifest_entry", None)
         return {**public_result, "sync_started": False}
+
+    @source_router.post("/{source_id}/adapter/manifest")
+    async def prepare_local_source_manifest(
+        source_id: str,
+        req: LocalSourceManifestRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Reuse unchanged immutable packages in one covered, fenced collection."""
+        from memforge.local_agent.snapshot_manifest import (
+            CollectionChangeKind,
+            CollectionCoverage,
+            SnapshotManifestItem,
+            plan_snapshot_manifest,
+        )
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
+        coverage = CollectionCoverage(req.coverage)
+        if coverage is CollectionCoverage.PARTIAL:
+            raise HTTPException(status_code=400, detail="partial collection cannot be planned")
+        if (
+            local_agent_collection_is_authoritative(source.get("type"))
+            and coverage is not CollectionCoverage.COMPLETE_SNAPSHOT
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="authoritative collection requires complete_snapshot coverage",
+            )
+        lease_payload = await _require_current_local_agent_lease(
+            request,
+            db,
+            source=source,
+            job_id=req.local_agent_job_id,
+            attempt_count=req.local_agent_attempt_count,
+        )
+        try:
+            snapshot_id = local_agent_collection_attempt_id(
+                source.get("type"),
+                req.local_agent_job_id,
+                req.local_agent_attempt_count,
+                req.sync_snapshot_id,
+            )
+            manifest_items = [
+                (item.doc_id, item.revision, item.change_kind)
+                for item in req.items
+            ]
+            retained_inputs = await db.find_source_sync_input_attestations(
+                source_id=source_id,
+                workspace_id=workspace_id,
+                manifest_items=manifest_items,
+            )
+            plan = plan_snapshot_manifest(
+                [
+                    SnapshotManifestItem(
+                        doc_id=item.doc_id,
+                        revision=item.revision,
+                        change_kind=CollectionChangeKind(item.change_kind),
+                    )
+                    for item in req.items
+                ],
+                retained_inputs,
+                coverage=coverage,
+            )
+            manifest_sha256 = hashlib.sha256(
+                json.dumps(
+                    {
+                        "coverage": req.coverage,
+                        "items": sorted(
+                            (item.model_dump() for item in req.items),
+                            key=lambda item: item["doc_id"],
+                        ),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            await db.attach_source_sync_inputs_to_snapshot(
+                source_id=source_id,
+                workspace_id=workspace_id,
+                snapshot_id=snapshot_id,
+                memberships=list(plan.reused_memberships),
+                coverage=req.coverage,
+                manifest_count=len(req.items),
+                manifest_sha256=manifest_sha256,
+                manifest_items=manifest_items,
+                local_agent_job_id=req.local_agent_job_id,
+                local_agent_attempt_count=req.local_agent_attempt_count,
+                source_config_revision=str(lease_payload["source_config_revision"]),
+                expected_activity_epoch=int(lease_payload["source_activity_epoch"]),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "source_id": source_id,
+            "snapshot_id": snapshot_id,
+            "coverage": req.coverage,
+            "manifest_count": len(req.items),
+            "reused_count": len(plan.reused_memberships),
+            "required_doc_ids": list(plan.required_doc_ids),
+        }
 
     # ===================================================================
     # 4b. Agent Session Document Intake

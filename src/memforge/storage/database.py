@@ -1325,6 +1325,36 @@ CREATE TABLE IF NOT EXISTS source_sync_snapshot_items (
 CREATE INDEX IF NOT EXISTS idx_source_sync_snapshot_items_input
     ON source_sync_snapshot_items(input_id);
 
+CREATE TABLE IF NOT EXISTS source_sync_snapshot_manifests (
+    workspace_id        TEXT NOT NULL,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    snapshot_id         TEXT NOT NULL,
+    coverage            TEXT NOT NULL CHECK (coverage IN ('complete_snapshot', 'bounded_delta')),
+    item_count          INTEGER NOT NULL CHECK (item_count >= 0),
+    manifest_sha256     TEXT NOT NULL,
+    local_agent_job_id  TEXT NOT NULL,
+    local_agent_attempt_count INTEGER NOT NULL,
+    source_activity_epoch INTEGER NOT NULL,
+    source_config_revision TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, source_id, snapshot_id)
+);
+
+CREATE TABLE IF NOT EXISTS source_sync_snapshot_manifest_items (
+    workspace_id        TEXT NOT NULL,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    snapshot_id         TEXT NOT NULL,
+    doc_id              TEXT NOT NULL,
+    revision            TEXT NOT NULL,
+    change_kind         TEXT NOT NULL CHECK (change_kind IN ('upsert', 'tombstone')),
+    PRIMARY KEY (workspace_id, source_id, snapshot_id, doc_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_sync_manifest_item_attestation
+    ON source_sync_snapshot_manifest_items(
+        workspace_id, source_id, doc_id, revision, change_kind, snapshot_id
+    );
+
 CREATE TABLE IF NOT EXISTS local_agent_jobs (
     job_id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL DEFAULT 'default',
@@ -2931,6 +2961,39 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                 metadata_compact TEXT NOT NULL,
                 PRIMARY KEY (memory_id, source_id, doc_id)
             )""",
+        ],
+    ),
+    (
+        67,
+        "Persist fenced local collection manifests",
+        [
+            """CREATE TABLE IF NOT EXISTS source_sync_snapshot_manifests (
+                workspace_id        TEXT NOT NULL,
+                source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                snapshot_id         TEXT NOT NULL,
+                coverage            TEXT NOT NULL CHECK (coverage IN ('complete_snapshot', 'bounded_delta')),
+                item_count          INTEGER NOT NULL CHECK (item_count >= 0),
+                manifest_sha256     TEXT NOT NULL,
+                local_agent_job_id  TEXT NOT NULL,
+                local_agent_attempt_count INTEGER NOT NULL,
+                source_activity_epoch INTEGER NOT NULL,
+                source_config_revision TEXT NOT NULL,
+                created_at          TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, source_id, snapshot_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS source_sync_snapshot_manifest_items (
+                workspace_id        TEXT NOT NULL,
+                source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                snapshot_id         TEXT NOT NULL,
+                doc_id              TEXT NOT NULL,
+                revision            TEXT NOT NULL,
+                change_kind         TEXT NOT NULL CHECK (change_kind IN ('upsert', 'tombstone')),
+                PRIMARY KEY (workspace_id, source_id, snapshot_id, doc_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_source_sync_manifest_item_attestation
+               ON source_sync_snapshot_manifest_items(
+                   workspace_id, source_id, doc_id, revision, change_kind, snapshot_id
+               )""",
         ],
     ),
 ]
@@ -13386,6 +13449,22 @@ class Database:
                 await self.db.execute("DELETE FROM sync_state WHERE source = ?", (source_id,))
                 await self.db.execute("DELETE FROM sync_history WHERE source = ?", (source_id,))
                 await self.db.execute("DELETE FROM source_list_pins WHERE source_id = ?", (source_id,))
+                await self.db.execute(
+                    "DELETE FROM source_sync_snapshot_items WHERE source_id = ?",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    "DELETE FROM source_sync_snapshot_manifest_items WHERE source_id = ?",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    "DELETE FROM source_sync_snapshot_manifests WHERE source_id = ?",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    "DELETE FROM source_sync_inputs WHERE source_id = ?",
+                    (source_id,),
+                )
                 now = _now_iso()
                 for memory_id in dict.fromkeys(retired_ids):
                     await self.db.execute(
@@ -14842,6 +14921,7 @@ class Database:
                             snapshot_id=snapshot_id,
                             doc_id=snapshot_doc_id,
                             input_id=str(existing["input_id"]),
+                            metadata=metadata_payload,
                             now=now,
                         )
                     await self.db.commit()
@@ -14879,6 +14959,7 @@ class Database:
                         snapshot_id=snapshot_id,
                         doc_id=snapshot_doc_id,
                         input_id=input_id,
+                        metadata=metadata_payload,
                         now=now,
                     )
                 await self.db.commit()
@@ -14918,6 +14999,315 @@ class Database:
             async for row in cursor:
                 results.append(_source_sync_input_from_row(row))
         return results
+
+    async def find_source_sync_input_attestations(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        manifest_items: Sequence[tuple[str, str, str]],
+    ) -> list[SourceSyncInput]:
+        """Return only latest immutable inputs matching exact manifest identities."""
+
+        from memforge.storage.source_sync_manifest import (
+            MANIFEST_ATTESTATION_LOOKUP_CHUNK_SIZE,
+        )
+
+        identities = tuple(
+            dict.fromkeys(
+                (str(doc_id), str(revision), str(change_kind))
+                for doc_id, revision, change_kind in manifest_items
+            )
+        )
+        if not identities:
+            return []
+        results: list[SourceSyncInput] = []
+        for offset in range(0, len(identities), MANIFEST_ATTESTATION_LOOKUP_CHUNK_SIZE):
+            chunk = identities[offset : offset + MANIFEST_ATTESTATION_LOOKUP_CHUNK_SIZE]
+            predicates = " OR ".join(
+                "(mi.doc_id = ? AND mi.revision = ? AND mi.change_kind = ?)"
+                for _identity in chunk
+            )
+            params: tuple[Any, ...] = (
+                workspace_id,
+                source_id,
+                *(value for identity in chunk for value in identity),
+            )
+            query = f"""WITH ranked_inputs AS (
+                           SELECT i.*,
+                                  ROW_NUMBER() OVER (
+                                      PARTITION BY mi.doc_id, mi.revision, mi.change_kind
+                                      ORDER BY i.input_generation DESC
+                                  ) AS attestation_rank
+                           FROM source_sync_snapshot_manifest_items mi
+                           JOIN source_sync_snapshot_items si
+                             ON si.workspace_id = mi.workspace_id
+                            AND si.source_id = mi.source_id
+                            AND si.snapshot_id = mi.snapshot_id
+                            AND si.doc_id = mi.doc_id
+                           JOIN source_sync_inputs i ON i.input_id = si.input_id
+                           WHERE mi.workspace_id = ? AND mi.source_id = ?
+                             AND ({predicates})
+                       )
+                       SELECT * FROM ranked_inputs
+                       WHERE attestation_rank = 1
+                       ORDER BY input_generation"""
+            async with self.db.execute(query, params) as cursor:
+                async for row in cursor:
+                    results.append(_source_sync_input_from_row(row))
+        return results
+
+    async def attach_source_sync_inputs_to_snapshot(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+        memberships: list[tuple[str, str]],
+        coverage: str,
+        manifest_count: int,
+        manifest_sha256: str,
+        manifest_items: list[tuple[str, str, str]],
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        source_config_revision: str,
+        expected_activity_epoch: int | None = None,
+    ) -> None:
+        """Persist one fenced manifest and attach its reusable immutable inputs."""
+        normalized_snapshot_id = _non_empty_string(snapshot_id)
+        if normalized_snapshot_id is None:
+            raise ValueError("snapshot_id is required")
+        if len({doc_id for doc_id, _input_id in memberships}) != len(memberships):
+            raise ValueError("snapshot memberships contain duplicate doc_id")
+        if coverage not in {"complete_snapshot", "bounded_delta"}:
+            raise ValueError("snapshot manifest coverage is invalid")
+        if manifest_count < 0 or len(memberships) > manifest_count:
+            raise ValueError("snapshot manifest count is invalid")
+        if manifest_count != len(manifest_items):
+            raise ValueError("snapshot manifest item count is invalid")
+        manifest_doc_ids = {doc_id for doc_id, _revision, _change_kind in manifest_items}
+        if len(manifest_doc_ids) != len(manifest_items):
+            raise ValueError("snapshot manifest contains duplicate doc_id")
+        if {doc_id for doc_id, _input_id in memberships} - manifest_doc_ids:
+            raise ValueError("snapshot membership was not declared by the manifest")
+        if len(manifest_sha256) != 64:
+            raise ValueError("snapshot manifest digest is invalid")
+        now = _now_iso()
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT activity_epoch FROM sources WHERE id = ?",
+                    (source_id,),
+                ) as cursor:
+                    source = await cursor.fetchone()
+                if source is None:
+                    raise ValueError(f"Source not found: {source_id}")
+                if (
+                    expected_activity_epoch is not None
+                    and int(source["activity_epoch"] or 0) != expected_activity_epoch
+                ):
+                    raise SourceActivityConflict("source activity epoch changed")
+                async with self.db.execute(
+                    """SELECT status, attempt_count, leased_until, payload_json
+                       FROM local_agent_jobs
+                       WHERE job_id = ? AND source_id = ?""",
+                    (local_agent_job_id, source_id),
+                ) as cursor:
+                    job = await cursor.fetchone()
+                # The embedded broker shares this transaction and is fenced
+                # again here. Cloud uses its external Service Metadata lease
+                # validator; the persisted job/attempt binding is rechecked
+                # by the processing route before enqueue.
+                if job is not None:
+                    job_payload = json.loads(job["payload_json"] or "{}") if job is not None else {}
+                    leased_until = _parse_dt(job["leased_until"]) if job is not None else None
+                    if not (
+                        job is not None
+                        and job["status"] == "leased"
+                        and int(job["attempt_count"] or 0) == local_agent_attempt_count
+                        and leased_until is not None
+                        and leased_until > datetime.now(timezone.utc)
+                        and str(job_payload.get("source_config_revision") or "") == source_config_revision
+                        and int(job_payload.get("source_activity_epoch", -1))
+                        == int(source["activity_epoch"] or 0)
+                    ):
+                        raise SourceActivityConflict("local agent lease changed")
+                async with self.db.execute(
+                    """SELECT id FROM lifecycle_backfill_jobs
+                       WHERE source_id = ? AND status IN ('queued', 'running')
+                       ORDER BY created_at LIMIT 1""",
+                    (source_id,),
+                ) as cursor:
+                    lifecycle_job = await cursor.fetchone()
+                if lifecycle_job is not None:
+                    raise SourceActivityConflict(
+                        f"source lifecycle maintenance active: {lifecycle_job['id']}"
+                    )
+                async with self.db.execute(
+                    """SELECT input_id FROM source_sync_inputs
+                       WHERE workspace_id = ? AND source_id = ?""",
+                    (workspace_id, source_id),
+                ) as cursor:
+                    valid_input_ids = {str(row["input_id"]) async for row in cursor}
+                missing_input_ids = {
+                    input_id for _doc_id, input_id in memberships
+                    if input_id not in valid_input_ids
+                }
+                if missing_input_ids:
+                    raise ValueError(
+                        f"Source sync input not found: {sorted(missing_input_ids)[0]}"
+                    )
+                async with self.db.execute(
+                    """SELECT coverage, item_count, manifest_sha256,
+                              local_agent_job_id, local_agent_attempt_count,
+                              source_activity_epoch, source_config_revision
+                       FROM source_sync_snapshot_manifests
+                       WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
+                    (workspace_id, source_id, normalized_snapshot_id),
+                ) as cursor:
+                    existing_manifest = await cursor.fetchone()
+                expected_manifest = (
+                    coverage,
+                    manifest_count,
+                    manifest_sha256,
+                    local_agent_job_id,
+                    local_agent_attempt_count,
+                    int(source["activity_epoch"] or 0),
+                    source_config_revision,
+                )
+                if existing_manifest is not None:
+                    actual_manifest = (
+                        str(existing_manifest["coverage"]),
+                        int(existing_manifest["item_count"]),
+                        str(existing_manifest["manifest_sha256"]),
+                        str(existing_manifest["local_agent_job_id"]),
+                        int(existing_manifest["local_agent_attempt_count"]),
+                        int(existing_manifest["source_activity_epoch"]),
+                        str(existing_manifest["source_config_revision"]),
+                    )
+                    if actual_manifest != expected_manifest:
+                        raise SourceActivityConflict("source snapshot manifest changed")
+                    async with self.db.execute(
+                        """SELECT doc_id, revision, change_kind
+                           FROM source_sync_snapshot_manifest_items
+                           WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?
+                           ORDER BY doc_id""",
+                        (workspace_id, source_id, normalized_snapshot_id),
+                    ) as cursor:
+                        existing_items = [
+                            (str(row["doc_id"]), str(row["revision"]), str(row["change_kind"]))
+                            async for row in cursor
+                        ]
+                    if existing_items != sorted(manifest_items):
+                        raise SourceActivityConflict("source snapshot manifest changed")
+                else:
+                    async with self.db.execute(
+                        """SELECT doc_id FROM source_sync_snapshot_items
+                           WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?
+                           LIMIT 1""",
+                        (workspace_id, source_id, normalized_snapshot_id),
+                    ) as cursor:
+                        preexisting_item = await cursor.fetchone()
+                    if preexisting_item is not None:
+                        raise SourceActivityConflict("source snapshot manifest must precede materialization")
+                    await self.db.execute(
+                        """INSERT INTO source_sync_snapshot_manifests (
+                        workspace_id, source_id, snapshot_id, coverage, item_count, manifest_sha256,
+                        local_agent_job_id, local_agent_attempt_count,
+                        source_activity_epoch, source_config_revision, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            workspace_id,
+                            source_id,
+                            normalized_snapshot_id,
+                            coverage,
+                            manifest_count,
+                            manifest_sha256,
+                            local_agent_job_id,
+                            local_agent_attempt_count,
+                            int(source["activity_epoch"] or 0),
+                            source_config_revision,
+                            now,
+                        ),
+                    )
+                    await self.db.executemany(
+                        """INSERT INTO source_sync_snapshot_manifest_items (
+                            workspace_id, source_id, snapshot_id, doc_id, revision, change_kind
+                        ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        [
+                            (
+                                workspace_id,
+                                source_id,
+                                normalized_snapshot_id,
+                                doc_id,
+                                revision,
+                                change_kind,
+                            )
+                            for doc_id, revision, change_kind in manifest_items
+                        ],
+                    )
+                await self.db.executemany(
+                    """INSERT INTO source_sync_snapshot_items (
+                        workspace_id, source_id, snapshot_id, doc_id, input_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(workspace_id, source_id, snapshot_id, doc_id)
+                    DO UPDATE SET input_id = excluded.input_id,
+                                  created_at = excluded.created_at""",
+                    [
+                        (
+                            workspace_id,
+                            source_id,
+                            normalized_snapshot_id,
+                            doc_id,
+                            input_id,
+                            now,
+                        )
+                        for doc_id, input_id in memberships
+                    ],
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def get_source_sync_snapshot_manifest_status(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+    ) -> dict[str, Any] | None:
+        """Return manifest coverage and whether every declared item is materialized."""
+        async with self.db.execute(
+            """SELECT m.coverage, m.item_count, m.local_agent_job_id,
+                      m.local_agent_attempt_count, m.source_activity_epoch,
+                      m.source_config_revision, COUNT(si.doc_id) AS materialized_count
+               FROM source_sync_snapshot_manifests m
+               LEFT JOIN source_sync_snapshot_items si
+                 ON si.workspace_id = m.workspace_id
+                AND si.source_id = m.source_id
+                AND si.snapshot_id = m.snapshot_id
+               WHERE m.workspace_id = ? AND m.source_id = ? AND m.snapshot_id = ?
+               GROUP BY m.coverage, m.item_count, m.local_agent_job_id,
+                        m.local_agent_attempt_count, m.source_activity_epoch,
+                        m.source_config_revision""",
+            (workspace_id, source_id, snapshot_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        materialized_count = int(row["materialized_count"] or 0)
+        item_count = int(row["item_count"] or 0)
+        return {
+            "coverage": str(row["coverage"]),
+            "item_count": item_count,
+            "materialized_count": materialized_count,
+            "ready": materialized_count == item_count,
+            "local_agent_job_id": str(row["local_agent_job_id"]),
+            "local_agent_attempt_count": int(row["local_agent_attempt_count"]),
+            "source_activity_epoch": int(row["source_activity_epoch"]),
+            "source_config_revision": str(row["source_config_revision"]),
+        }
 
     async def attest_source_sync_input_artifact(
         self,
@@ -14991,8 +15381,36 @@ class Database:
         snapshot_id: str,
         doc_id: str,
         input_id: str,
+        metadata: Mapping[str, object],
         now: str,
     ) -> None:
+        async with self.db.execute(
+            """SELECT revision, change_kind
+               FROM source_sync_snapshot_manifest_items
+               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ? AND doc_id = ?""",
+            (workspace_id, source_id, snapshot_id, doc_id),
+        ) as cursor:
+            expected = await cursor.fetchone()
+        async with self.db.execute(
+            """SELECT 1 FROM source_sync_snapshot_manifests
+               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
+            (workspace_id, source_id, snapshot_id),
+        ) as cursor:
+            manifest = await cursor.fetchone()
+        if expected is None:
+            if manifest is not None:
+                raise ValueError("snapshot input was not declared by the manifest")
+        else:
+            entry = metadata.get("manifest_entry")
+            if not isinstance(entry, Mapping):
+                raise ValueError("snapshot input requires manifest_entry metadata")
+            revision = str(entry.get("provider_revision") or entry.get("version") or "").strip()
+            change_kind = str(entry.get("change_kind") or "upsert").strip()
+            if (
+                str(expected["revision"]) != revision
+                or str(expected["change_kind"]) != change_kind
+            ):
+                raise ValueError("snapshot input revision or change kind does not match manifest")
         await self.db.execute(
             """INSERT INTO source_sync_snapshot_items (
                 workspace_id, source_id, snapshot_id, doc_id, input_id, created_at

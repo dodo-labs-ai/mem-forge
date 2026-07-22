@@ -988,6 +988,7 @@ def test_teams_scope_transition_is_attached_to_collection_job(tmp_path):
 
 
 def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp_path):
+    from memforge.local_adapter import build_teams_doc_id
     from memforge.local_agent.teams_ledger import build_teams_window_id
 
     database = _connect_database(tmp_path)
@@ -1012,6 +1013,27 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                 conversation_id="19:conversation-a@example.test",
                 root_or_anchor_message_id="m1",
                 window_type="time_block",
+            )
+            manifest = client.post(
+                f"/api/sources/{source_id}/adapter/manifest",
+                headers=headers,
+                json={
+                    **context,
+                    "sync_snapshot_id": (
+                        f"{leased['job_id']}:attempt:{leased['attempt_count']}"
+                    ),
+                    "coverage": "bounded_delta",
+                    "items": [
+                        {
+                            "doc_id": build_teams_doc_id(
+                                source_id=source_id,
+                                window_id=window_id,
+                            ),
+                            "revision": "revision-a",
+                            "change_kind": "upsert",
+                        }
+                    ],
+                },
             )
             accepted = client.post(
                 f"/api/sources/{source_id}/adapter/packages",
@@ -1067,6 +1089,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                 json=completion_body,
             )
 
+        assert manifest.status_code == 200, manifest.text
         assert accepted.status_code == 200, accepted.text
         assert accepted_process.status_code == 202, accepted_process.text
         expected_attempt_id = f"{leased['job_id']}:attempt:{leased['attempt_count']}"

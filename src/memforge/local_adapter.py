@@ -217,6 +217,7 @@ def _package_manifest_entry(
     package_path: str | None,
     submitted_at: str,
     submitted_by: str | None,
+    change_kind: str = "upsert",
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     entry = {
@@ -229,6 +230,7 @@ def _package_manifest_entry(
         "package_uri": package_uri,
         "submitted_at": submitted_at,
         "submitted_by": submitted_by,
+        "change_kind": change_kind,
     }
     if package_path:
         entry["package_path"] = package_path
@@ -539,6 +541,7 @@ async def submit_jira_package(
     source_url: str | None = None,
     title: str | None = None,
     raw_hash: str | None = None,
+    provider_revision: str | None = None,
     submitted_by: str | None = None,
     submitted_at: str | None = None,
     document_store: DocumentStore | None = None,
@@ -568,6 +571,7 @@ async def submit_jira_package(
     submitted_at = submitted_at or _now_iso()
     source_id = str(source["id"])
     payload_hash = _hash_json(raw_payload)
+    revision = (provider_revision or "").strip() or payload_hash
     doc_id = build_jira_doc_id(source_id=source_id, issue_key=normalized_issue_key)
     doc_title = (title or "").strip() or _jira_title_from_payload(raw_payload, normalized_issue_key)
     issue_url = (source_url or f"{configured_base_url}/browse/{normalized_issue_key}").strip()
@@ -620,6 +624,7 @@ async def submit_jira_package(
                 "content_type": "application/json",
                 "raw_hash": raw_hash or payload_hash,
                 "semantic_hash": payload_hash,
+                "provider_revision": revision,
             },
         )
     return {
@@ -746,6 +751,7 @@ async def submit_teams_window_package(
             package_path=package_path,
             submitted_at=submitted_at,
             submitted_by=submitted_by,
+            change_kind="tombstone" if raw_payload.get("_tombstone") is True else "upsert",
             extra={
                 "conversation_id": normalized_conversation_id,
                 "root_message_id": package["root_message_id"],

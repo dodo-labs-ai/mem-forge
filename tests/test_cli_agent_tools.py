@@ -31,6 +31,7 @@ class FakeToolClient:
     list_response: dict = {"data": []}
     create_response: dict = {"id": "src-created"}
     projection_inventory_response: dict = {"units": []}
+    snapshot_plan_response: dict | None = None
 
     def __init__(
         self,
@@ -52,6 +53,7 @@ class FakeToolClient:
         cls.list_response = {"data": []} if list_response is None else list_response
         cls.create_response = {"id": "src-created"} if create_response is None else create_response
         cls.projection_inventory_response = {"units": []}
+        cls.snapshot_plan_response = None
 
     def list_sources(self):
         self.calls.append(("list_sources", {"api_url": self.api_url, "api_token": self.api_token}))
@@ -142,6 +144,20 @@ class FakeToolClient:
             )
         )
         return self.response
+
+    def prepare_local_source_snapshot(self, **kwargs):
+        self.calls.append(
+            (
+                "prepare_local_source_snapshot",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
+        if self.snapshot_plan_response is not None:
+            return self.snapshot_plan_response
+        return {
+            "required_doc_ids": [str(item["doc_id"]) for item in kwargs.get("items", [])],
+            "reused_count": 0,
+        }
 
     def push_jira_package(self, **kwargs):
         self.calls.append(
@@ -853,8 +869,11 @@ def _fake_github_remote_run(cmd, *args, **kwargs):
     assert cmd[:2] == ["gh", "api"]
     assert kwargs["env"]["GH_HOST"] == "github.wdf.sap.corp"
     endpoint = cmd[2]
-    if "/git/trees/" in endpoint:
+    if endpoint.endswith("/commits/main"):
+        payload = {"sha": "commit-main", "commit": {"tree": {"sha": "tree-main"}}}
+    elif "/git/trees/tree-main" in endpoint:
         payload = {
+            "truncated": False,
             "tree": [
                 {"path": "Payroll Processing V2/README.md", "type": "blob", "sha": "readme", "size": 30},
                 {"path": "Payroll Processing V2/Überblick.md", "type": "blob", "sha": "overview", "size": 20},
@@ -863,9 +882,15 @@ def _fake_github_remote_run(cmd, *args, **kwargs):
                 {"path": "Flexible Payroll/README.md", "type": "blob", "sha": "flex", "size": 25},
             ]
         }
-    elif "/contents/" in endpoint:
+    elif "/git/blobs/" in endpoint:
+        blob_sha = endpoint.rsplit("/", 1)[-1]
         raw = b"# Payroll Processing V2\n\nBody"
-        payload = {"content": base64.b64encode(raw).decode(), "encoding": "base64", "size": len(raw)}
+        payload = {
+            "sha": blob_sha,
+            "content": base64.b64encode(raw).decode(),
+            "encoding": "base64",
+            "size": len(raw),
+        }
     else:
         raise AssertionError(f"unexpected gh endpoint: {endpoint}")
     return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
@@ -930,7 +955,13 @@ def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
     assert payload["operation"] == "github_repo_sync"
     assert payload["source_id"] == "src-from-cloud"
     assert payload["source_sync_run_id"] == "run-test"
-    assert payload["counts"] == {"selected": 1, "pushed": 1, "failed": 0}
+    assert payload["counts"] == {
+        "selected": 1,
+        "reused": 0,
+        "fetched": 1,
+        "pushed": 1,
+        "failed": 0,
+    }
     push_calls = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
     assert len(push_calls) == 1
     kwargs = push_calls[0][1]
@@ -954,17 +985,168 @@ def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
     ]
 
 
+def test_local_agent_cloud_github_noop_uses_manifest_without_reading_or_uploading_bodies(monkeypatch):
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({})
+    FakeToolClient.snapshot_plan_response = {"required_doc_ids": [], "reused_count": 555}
+    entries = [
+        {
+            "relative_path": f"docs/file-{index:03d}.md",
+            "blob_sha": f"blob-{index:03d}",
+            "content_type": "text/markdown",
+        }
+        for index in range(555)
+    ]
+    monkeypatch.setattr(
+        main,
+        "_preview_github_profile",
+        lambda *_args, **_kwargs: {"items": entries},
+    )
+    monkeypatch.setattr(
+        main,
+        "_github_blob",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged provider bodies must not be read")
+        ),
+    )
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-noop",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-job-payload",
+            "operation": "github_repo_sync",
+            "source_id": "src-from-cloud",
+            "payload": {
+                "repo_url": "https://github.wdf.sap.corp/example/public-howtos",
+                "ref": "main",
+                "include_extensions": ["md"],
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    assert payload["counts"] == {
+        "selected": 555,
+        "reused": 555,
+        "fetched": 0,
+        "pushed": 0,
+        "failed": 0,
+    }
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
+    [plan_call] = [call for call in FakeToolClient.calls if call[0] == "prepare_local_source_snapshot"]
+    assert len(plan_call[1]["items"]) == 555
+    assert plan_call[1]["coverage"] == "complete_snapshot"
+    assert {item["change_kind"] for item in plan_call[1]["items"]} == {"upsert"}
+    assert payload["metrics"]["manifest_items"] == 555
+    assert payload["metrics"]["full_bodies_read"] == 0
+    assert payload["metrics"]["full_bodies_uploaded"] == 0
+    assert payload["metrics"]["bytes_uploaded"] == 0
+    assert payload["metrics"]["fallback_reason"] is None
+
+
+def test_local_agent_cloud_github_sync_pins_tree_and_body_to_one_commit(monkeypatch):
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
+    endpoints: list[str] = []
+
+    def pinned_github_run(cmd, *args, **kwargs):
+        assert cmd[:2] == ["gh", "api"]
+        endpoint = cmd[2]
+        endpoints.append(endpoint)
+        if endpoint.endswith("/commits/main"):
+            payload = {"sha": "commit-1", "commit": {"tree": {"sha": "tree-1"}}}
+        elif "/git/trees/tree-1?recursive=1" in endpoint:
+            payload = {
+                "truncated": False,
+                "tree": [
+                    {"path": "README.md", "type": "blob", "sha": "blob-1", "size": 10}
+                ],
+            }
+        elif endpoint.endswith("/git/blobs/blob-1"):
+            raw = b"# Pinned body"
+            payload = {
+                "sha": "blob-1",
+                "content": base64.b64encode(raw).decode(),
+                "encoding": "base64",
+                "size": len(raw),
+            }
+        else:
+            raise AssertionError(f"unexpected gh endpoint: {endpoint}")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", pinned_github_run)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-pinned",
+            "attempt_count": 1,
+            "workspace_id": "workspace-a",
+            "operation": "github_repo_sync",
+            "source_id": "src-github",
+            "payload": {
+                "repo_url": "https://github.wdf.sap.corp/example/public-howtos",
+                "ref": "main",
+                "include_extensions": ["md"],
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    assert payload["counts"]["pushed"] == 1
+    assert endpoints == [
+        "repos/example/public-howtos/commits/main",
+        "repos/example/public-howtos/git/trees/tree-1?recursive=1",
+        "repos/example/public-howtos/git/blobs/blob-1",
+    ]
+    [push_call] = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
+    assert push_call[1]["blob_sha"] == "blob-1"
+
+
+def test_local_agent_cloud_github_sync_rejects_unproven_tree_completeness(monkeypatch):
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({})
+
+    def incomplete_tree_run(cmd, *args, **kwargs):
+        endpoint = cmd[2]
+        if endpoint.endswith("/commits/main"):
+            payload = {"sha": "commit-1", "commit": {"tree": {"sha": "tree-1"}}}
+        elif "/git/trees/tree-1?recursive=1" in endpoint:
+            payload = {"tree": []}
+        else:
+            raise AssertionError(f"unexpected gh endpoint: {endpoint}")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", incomplete_tree_run)
+
+    with pytest.raises(click.ClickException, match="did not prove complete"):
+        main._run_cloud_local_agent_job(
+            {
+                "job_id": "laj-incomplete",
+                "attempt_count": 1,
+                "workspace_id": "workspace-a",
+                "operation": "github_repo_sync",
+                "source_id": "src-github",
+                "payload": {
+                    "repo_url": "https://github.wdf.sap.corp/example/public-howtos",
+                    "ref": "main",
+                },
+            },
+            _cloud_test_client(),
+        )
+
+
 def test_local_agent_cloud_github_sync_reports_failed_paths_for_retry_diagnostics(monkeypatch):
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
     FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
     monkeypatch.setattr(main.subprocess, "run", _fake_github_remote_run)
 
-    def github_content(_repo, _ref, relative_path):
+    def github_blob(_repo, _blob_sha, relative_path):
         if relative_path.endswith("Überblick.md"):
             raise click.ClickException("temporary GitHub API failure")
         return b"# Durable document\n\nBody"
 
-    monkeypatch.setattr(main, "_github_content", github_content)
+    monkeypatch.setattr(main, "_github_blob", github_blob)
 
     payload = main._run_cloud_local_agent_job(
         {
@@ -983,7 +1165,13 @@ def test_local_agent_cloud_github_sync_reports_failed_paths_for_retry_diagnostic
         _cloud_test_client(),
     )
 
-    assert payload["counts"] == {"selected": 3, "pushed": 2, "failed": 1}
+    assert payload["counts"] == {
+        "selected": 3,
+        "reused": 0,
+        "fetched": 2,
+        "pushed": 2,
+        "failed": 1,
+    }
     assert payload["retryable"] is True
     assert payload["error"] == (
         "1 document(s) failed to push: Payroll Processing V2/Überblick.md: temporary GitHub API failure"
@@ -1242,6 +1430,132 @@ def test_local_agent_cloud_local_markdown_sync_publishes_empty_snapshot(monkeypa
     ]
 
 
+def test_local_agent_cloud_local_markdown_noop_plans_complete_manifest_without_uploading_bodies(
+    monkeypatch,
+    tmp_path: Path,
+):
+    root = tmp_path / "notes"
+    root.mkdir()
+    (root / "Decision.md").write_text("# Decision\n\nUse the daemon.", encoding="utf-8")
+    (root / "Runbook.md").write_text("# Runbook\n\nRestart safely.", encoding="utf-8")
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({})
+    FakeToolClient.snapshot_plan_response = {"required_doc_ids": [], "reused_count": 2}
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-local-noop",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-cloud",
+            "operation": "local_markdown_sync",
+            "source_id": "src-local",
+            "payload": {
+                "root": str(root),
+                "vault_id": "engineering",
+                "include": ["*.md", "**/*.md"],
+                "exclude": [],
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    [plan_call] = [call for call in FakeToolClient.calls if call[0] == "prepare_local_source_snapshot"]
+    assert plan_call[1]["coverage"] == "complete_snapshot"
+    assert len(plan_call[1]["items"]) == 2
+    assert {item["change_kind"] for item in plan_call[1]["items"]} == {"upsert"}
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_local_markdown_document"]
+    assert payload["counts"]["reused"] == 2
+    assert payload["counts"]["pushed"] == 0
+    assert payload["metrics"]["full_bodies_uploaded"] == 0
+
+
+def test_local_agent_cloud_local_markdown_incomplete_scan_fails_before_manifest_or_processing(
+    monkeypatch,
+    tmp_path: Path,
+):
+    root = tmp_path / "notes"
+    root.mkdir()
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({})
+
+    def incomplete_scan(_root, *, include, exclude, counts):
+        del include, exclude
+        counts["unreadable"] += 1
+        return iter(())
+
+    monkeypatch.setattr(main, "_scan_kb_profile", incomplete_scan)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-local-incomplete",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-cloud",
+            "operation": "local_markdown_sync",
+            "source_id": "src-local",
+            "payload": {"root": str(root), "vault_id": "engineering"},
+        },
+        _cloud_test_client(),
+    )
+
+    assert payload["error"] == "local collection was incomplete"
+    assert payload["retryable"] is True
+    assert not [
+        call
+        for call in FakeToolClient.calls
+        if call[0]
+        in {"prepare_local_source_snapshot", "push_local_markdown_document", "start_source_processing"}
+    ]
+
+
+def test_local_markdown_complete_scan_rejects_concurrent_file_change(tmp_path: Path):
+    root = tmp_path / "notes"
+    root.mkdir()
+    document = root / "Decision.md"
+    document.write_text("# Decision\n\nFirst version.", encoding="utf-8")
+    counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
+    entries = list(
+        main._scan_kb_profile(
+            root,
+            include=["*.md", "**/*.md"],
+            exclude=[],
+            counts=counts,
+        )
+    )
+    document.write_text("# Decision\n\nChanged during collection.", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="changed during collection"):
+        main._attest_kb_scan_stable(
+            root,
+            include=["*.md", "**/*.md"],
+            exclude=[],
+            entries=entries,
+        )
+
+
+def test_local_markdown_complete_scan_rejects_concurrent_membership_change(tmp_path: Path):
+    root = tmp_path / "notes"
+    root.mkdir()
+    (root / "Decision.md").write_text("# Decision", encoding="utf-8")
+    counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
+    entries = list(
+        main._scan_kb_profile(
+            root,
+            include=["*.md", "**/*.md"],
+            exclude=[],
+            counts=counts,
+        )
+    )
+    (root / "Runbook.md").write_text("# Runbook", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="membership changed during collection"):
+        main._attest_kb_scan_stable(
+            root,
+            include=["*.md", "**/*.md"],
+            exclude=[],
+            entries=entries,
+        )
+
+
 def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
     from datetime import datetime, timezone
 
@@ -1261,8 +1575,7 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
             assert "local_agent_documents_dir" not in self.config
             assert "pat" not in self.config
 
-        async def discover(self, since):
-            assert since is None
+        async def discover_inventory(self):
             yield ContentItem(
                 item_id="jira-PAY-1",
                 title="Create daemon source support",
@@ -1279,7 +1592,15 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
         async def fetch(self, item):
             return RawContent(
                 item=item,
-                body=json.dumps({"key": "PAY-1", "fields": {"summary": "Create daemon source support"}}).encode(),
+                body=json.dumps(
+                    {
+                        "key": "PAY-1",
+                        "fields": {
+                            "summary": "Create daemon source support",
+                            "updated": "v1",
+                        },
+                    }
+                ).encode(),
                 content_type="application/json",
             )
 
@@ -1326,7 +1647,7 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
     )
 
     assert payload["operation"] == "jira_sync"
-    assert payload["counts"] == {"selected": 1, "pushed": 1, "failed": 0}
+    assert payload["counts"] == {"selected": 1, "reused": 0, "pushed": 1, "failed": 0}
     assert payload["source_sync_run_id"] == "run-test"
     upload_calls = [call for call in FakeToolClient.calls if call[0] == "upload_jira_session"]
     assert upload_calls == [
@@ -1359,6 +1680,74 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
     assert process_calls[0][1]["sync_snapshot_id"] == "laj-jira-sync:attempt:3"
 
 
+def test_local_agent_cloud_jira_sync_rejects_issue_changed_after_inventory(monkeypatch):
+    import asyncio
+    from datetime import datetime, timezone
+
+    from memforge.models import ContentItem, RawContent
+
+    class ConcurrentUpdateJiraGene:
+        def __init__(self, config, source_id):
+            self.config = config
+            self.source_id = source_id
+            self._client = None
+
+        async def authenticate(self):
+            return None
+
+        async def discover_inventory(self):
+            yield ContentItem(
+                item_id="jira-PAY-1",
+                title="PAY-1 title",
+                source_url="https://jira.example.test/browse/PAY-1",
+                last_modified=datetime(2026, 7, 7, tzinfo=timezone.utc),
+                content_type="application/json",
+                version="inventory-v1",
+                extra={"issue_key": "PAY-1"},
+            )
+
+        async def fetch(self, item):
+            return RawContent(
+                item=item,
+                body=json.dumps(
+                    {
+                        "key": "PAY-1",
+                        "fields": {
+                            "summary": "Changed after inventory",
+                            "updated": "hydrated-v2",
+                        },
+                    }
+                ).encode(),
+                content_type="application/json",
+            )
+
+    import memforge.genes.jira_gene as jira_gene
+
+    monkeypatch.setattr(jira_gene, "JiraGene", ConcurrentUpdateJiraGene)
+    FakeToolClient.reset({})
+
+    with pytest.raises(RuntimeError, match="changed during materialization; retry inventory"):
+        asyncio.run(
+            main._collect_jira_documents_from_cloud_job(
+                {
+                    "payload": {
+                        "base_url": "https://jira.example.test",
+                        "auth_mode": "browser_cookie",
+                        "projects": ["PAY"],
+                    }
+                },
+                source_id="src-jira",
+                limit=0,
+                jira_cookie="JSESSIONID=local",
+                client=_cloud_test_client(),
+                sync_snapshot_id="job-jira:attempt:1",
+                local_agent_job_id="job-jira",
+                local_agent_attempt_count=1,
+            )
+        )
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_jira_package"]
+
+
 def test_local_agent_cloud_jira_sync_rejects_pat_payload():
     FakeToolClient.reset({"doc_id": "jira-doc", "document_hash": "hash"})
 
@@ -1383,6 +1772,76 @@ def test_local_agent_cloud_jira_sync_rejects_pat_payload():
     assert payload["error_type"] == "ClickException"
     assert "browser-session" in payload["error"]
     assert not [call for call in FakeToolClient.calls if call[0] == "push_jira_package"]
+
+
+def test_local_agent_cloud_jira_noop_uses_inventory_without_hydrating_issues(monkeypatch):
+    from datetime import datetime, timezone
+
+    from memforge.auth import jira_capture
+    from memforge.models import ContentItem
+
+    class FakeJiraGene:
+        def __init__(self, config, source_id):
+            self.config = config
+            self.source_id = source_id
+            self._client = None
+
+        async def authenticate(self):
+            return None
+
+        async def discover_inventory(self):
+            for key in ("PAY-1", "PAY-2"):
+                yield ContentItem(
+                    item_id=f"jira-{key}",
+                    title=f"{key} title",
+                    source_url=f"https://jira.example.test/browse/{key}",
+                    last_modified=datetime(2026, 7, 7, tzinfo=timezone.utc),
+                    content_type="application/json",
+                    version=f"revision-{key}",
+                    extra={"issue_key": key},
+                )
+
+        async def fetch(self, item):
+            raise AssertionError(f"unchanged issue must not be hydrated: {item.item_id}")
+
+    async def fake_capture(base_url, *, browser=None, tls_config=None):
+        return jira_capture.JiraCaptureResult(
+            origin=base_url,
+            cookie_header="JSESSIONID=local",
+            browser=browser,
+            principal={"name": "tester"},
+        )
+
+    import memforge.genes.jira_gene as jira_gene
+
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    monkeypatch.setattr(jira_gene, "JiraGene", FakeJiraGene)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({})
+    FakeToolClient.snapshot_plan_response = {"required_doc_ids": [], "reused_count": 2}
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-jira-noop",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-cloud",
+            "operation": "jira_sync",
+            "source_id": "src-jira",
+            "payload": {
+                "base_url": "https://jira.example.test",
+                "auth_mode": "browser_cookie",
+                "projects": ["PAY"],
+            },
+        },
+        _cloud_test_client(),
+        browser="chrome",
+    )
+
+    [plan_call] = [call for call in FakeToolClient.calls if call[0] == "prepare_local_source_snapshot"]
+    assert plan_call[1]["coverage"] == "complete_snapshot"
+    assert len(plan_call[1]["items"]) == 2
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_jira_package"]
+    assert payload["counts"] == {"selected": 2, "reused": 2, "pushed": 0, "failed": 0}
 
 
 def test_local_agent_cloud_jira_sync_stops_on_principal_change(monkeypatch):
@@ -1458,8 +1917,7 @@ def test_local_agent_cloud_jira_sync_does_not_publish_partial_snapshot(monkeypat
         async def authenticate(self):
             assert self.config["sync_mode"] == "cloud"
 
-        async def discover(self, since):
-            assert since is None
+        async def discover_inventory(self):
             for key in ("PAY-1", "PAY-2"):
                 yield ContentItem(
                     item_id=f"jira-{key}",
@@ -1478,7 +1936,12 @@ def test_local_agent_cloud_jira_sync_does_not_publish_partial_snapshot(monkeypat
             key = item.extra["issue_key"]
             return RawContent(
                 item=item,
-                body=json.dumps({"key": key, "fields": {"summary": f"{key} title"}}).encode(),
+                body=json.dumps(
+                    {
+                        "key": key,
+                        "fields": {"summary": f"{key} title", "updated": "v1"},
+                    }
+                ).encode(),
                 content_type="application/json",
             )
 
@@ -1528,7 +1991,7 @@ def test_local_agent_cloud_jira_sync_does_not_publish_partial_snapshot(monkeypat
         browser="chrome",
     )
 
-    assert payload["counts"] == {"selected": 2, "pushed": 1, "failed": 1}
+    assert payload["counts"] == {"selected": 2, "reused": 0, "pushed": 1, "failed": 1}
     assert payload["retryable"] is True
     push_calls = [call[1] for call in FakeToolClient.calls if call[0] == "push_jira_package"]
     assert [call["issue_key"] for call in push_calls] == ["PAY-1", "PAY-2"]
@@ -1862,6 +2325,56 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     assert audit_rows[-1]["sync_started"] is True
     assert audit_rows[-1]["sync_error"] is None
 
+
+def test_local_agent_cloud_teams_noop_reuses_bounded_window_without_reupload(monkeypatch, tmp_path: Path):
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
+        return [
+            {
+                "conversation_id": "19:conversation@thread.tacv2",
+                "root_message_id": "1783500000000",
+                "window_id": "teams-thread:v1:stable-window",
+                "window_type": "thread",
+                "revision_hash": "sha256:revision-1",
+                "title": "Thread window",
+                "source_url": "https://teams.microsoft.com/l/message/19:conversation@thread.tacv2/1783500000001",
+                "last_modified": "2026-07-08T09:24:57.5870000Z",
+                "raw_payload": {
+                    "conversation_type": "channel",
+                    "messages": [{"id": "1783500000000", "content": "Thread window", "from": "Alice"}],
+                },
+                "raw_hash": "sha256:raw-1",
+                "message_count": 1,
+            }
+        ]
+
+    monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({})
+    FakeToolClient.snapshot_plan_response = {"required_doc_ids": [], "reused_count": 1}
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-teams-noop",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-cloud",
+            "operation": "teams_sync",
+            "source_id": "src-teams",
+            "payload": {
+                "conversation_ids": ["19:conversation@thread.tacv2"],
+                "limit": 1,
+                "audit_log_path": str(tmp_path / "teams-audit.jsonl"),
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    [plan_call] = [call for call in FakeToolClient.calls if call[0] == "prepare_local_source_snapshot"]
+    assert plan_call[1]["coverage"] == "bounded_delta"
+    assert plan_call[1]["items"][0]["change_kind"] == "upsert"
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
+    assert payload["counts"]["skipped_existing"] == 1
+    [process_call] = [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
+    assert process_call[1]["sync_snapshot_id"] == "laj-teams-noop:attempt:1"
 
 def test_local_agent_cloud_teams_sync_reauths_after_stale_session(monkeypatch, tmp_path: Path):
     import memforge.auth.teams_auth as teams_auth
