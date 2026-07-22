@@ -568,7 +568,6 @@ def test_tool_client_create_memory_posts_user_memory_payload():
         content="Use readable confirmation previews before memory mutations.",
         provenance="User asked to remember this after reviewing the MemForge MCP UX.",
         memory_type="convention",
-        tags=["ux", "mcp"],
         client="codex",
         repo_identifier="github.com/shno-labs/mem-forge",
     )
@@ -582,7 +581,6 @@ def test_tool_client_create_memory_posts_user_memory_payload():
                 "content": "Use readable confirmation previews before memory mutations.",
                 "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
                 "memory_type": "convention",
-                "tags": ["ux", "mcp"],
                 "client": "codex",
                 "repo_identifier": "github.com/shno-labs/mem-forge",
             },

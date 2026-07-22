@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from memforge.memory.index_payloads import (
-    document_embedding_text,
     embedding_text_hash,
     embedding_vector_hash,
     memory_embedding_text,
@@ -34,17 +33,15 @@ class MemoryIndexHealthReport:
 
 
 class MemoryIndexHealthChecker:
-    """Compare SQLite state with FTS5, memory vectors, and document vectors."""
+    """Compare relational Memory state with its searchable projections."""
 
     def __init__(
         self,
         db,
         memory_collection: Any | None = None,
-        document_collection: Any | None = None,
     ) -> None:
         self.db = db
         self.memory_collection = memory_collection
-        self.document_collection = document_collection
 
     async def check(self) -> MemoryIndexHealthReport:
         statuses = await self._memory_statuses()
@@ -65,12 +62,6 @@ class MemoryIndexHealthChecker:
             issue_prefix="memory",
         )
         chroma_ids = set(chroma_records)
-        document_ids = await self._document_ids()
-        document_records, document_chroma_error = self._collection_records(
-            self.document_collection,
-            issue_prefix="document",
-        )
-        document_chroma_ids = set(document_records)
         confluence_documents_missing_pdf = await self._confluence_documents_missing_pdf()
         search_visible_statuses = set(allowed_search_statuses())
 
@@ -79,8 +70,6 @@ class MemoryIndexHealthChecker:
             issues.append(fts_error)
         if chroma_error:
             issues.append(chroma_error)
-        if document_chroma_error:
-            issues.append(document_chroma_error)
         for memory_id in sorted(duplicate_fts_ids):
             issues.append(MemoryIndexHealthIssue(
                 kind="fts_duplicate",
@@ -129,13 +118,6 @@ class MemoryIndexHealthChecker:
                         severity="P0",
                         memory_id=memory_id,
                         detail="SQLite memory content differs from FTS5 content",
-                    ))
-                if expected and fts_record.get("tags_text") != expected["tags_text"]:
-                    issues.append(MemoryIndexHealthIssue(
-                        kind="fts_tags_mismatch",
-                        severity="P0",
-                        memory_id=memory_id,
-                        detail="SQLite memory tags differ from FTS5 tags text",
                     ))
                 if expected and fts_record.get("entities_text") != expected["entities_text"]:
                     issues.append(MemoryIndexHealthIssue(
@@ -244,102 +226,6 @@ class MemoryIndexHealthChecker:
                 detail="Confluence document is missing its PDF provenance URI",
             ))
 
-        if self.document_collection is not None and not document_chroma_error:
-            document_state = await self._document_state()
-            for doc_id in document_ids - document_chroma_ids:
-                issues.append(MemoryIndexHealthIssue(
-                    kind="document_missing_chroma",
-                    severity="P0",
-                    memory_id=doc_id,
-                    detail="SQLite document is missing from document Chroma",
-                ))
-            for doc_id in document_chroma_ids - document_ids:
-                issues.append(MemoryIndexHealthIssue(
-                    kind="document_chroma_orphan",
-                    severity="P0",
-                    memory_id=doc_id,
-                    detail="Document Chroma contains a document ID missing from SQLite",
-                ))
-            for doc_id in document_ids & document_chroma_ids:
-                metadata = document_records.get(doc_id, {})
-                db_state = document_state.get(doc_id, {})
-                if (
-                    metadata.get("content_hash")
-                    and db_state.get("content_hash")
-                    and metadata["content_hash"] != db_state["content_hash"]
-                ):
-                    issues.append(MemoryIndexHealthIssue(
-                        kind="document_chroma_content_hash_mismatch",
-                        severity="P0",
-                        memory_id=doc_id,
-                        detail="SQLite document content hash differs from document Chroma metadata",
-                    ))
-                if db_state.get("content_hash") and not metadata.get("content_hash"):
-                    issues.append(MemoryIndexHealthIssue(
-                        kind="document_chroma_content_hash_missing",
-                        severity="P0",
-                        memory_id=doc_id,
-                        detail="Document Chroma metadata has no content hash",
-                    ))
-                if (
-                    metadata.get("version")
-                    and db_state.get("version")
-                    and metadata["version"] != db_state["version"]
-                ):
-                    issues.append(MemoryIndexHealthIssue(
-                        kind="document_chroma_version_mismatch",
-                        severity="P0",
-                        memory_id=doc_id,
-                        detail="SQLite document version differs from document Chroma metadata",
-                    ))
-                if db_state.get("version") and not metadata.get("version"):
-                    issues.append(MemoryIndexHealthIssue(
-                        kind="document_chroma_version_missing",
-                        severity="P0",
-                        memory_id=doc_id,
-                        detail="Document Chroma metadata has no document version",
-                    ))
-                expected_embedding_text_hash = await self._document_embedding_text_hash(doc_id)
-                actual_embedding_text_hash = metadata.get("embedding_text_hash")
-                if expected_embedding_text_hash and not actual_embedding_text_hash:
-                    issues.append(MemoryIndexHealthIssue(
-                        kind="document_chroma_embedding_text_hash_missing",
-                        severity="P0",
-                        memory_id=doc_id,
-                        detail="Document Chroma metadata has no embedding text hash",
-                    ))
-                if (
-                    expected_embedding_text_hash
-                    and actual_embedding_text_hash
-                    and actual_embedding_text_hash != expected_embedding_text_hash
-                ):
-                    issues.append(MemoryIndexHealthIssue(
-                        kind="document_chroma_embedding_text_hash_mismatch",
-                        severity="P0",
-                        memory_id=doc_id,
-                        detail="SQLite document embedding text differs from document Chroma metadata",
-                    ))
-                actual_embedding_vector_hash = metadata.get("_embedding_vector_hash")
-                metadata_embedding_vector_hash = metadata.get("embedding_vector_hash")
-                if actual_embedding_vector_hash and not metadata_embedding_vector_hash:
-                    issues.append(MemoryIndexHealthIssue(
-                        kind="document_chroma_embedding_vector_hash_missing",
-                        severity="P0",
-                        memory_id=doc_id,
-                        detail="Document Chroma metadata has no embedding vector hash",
-                    ))
-                if (
-                    actual_embedding_vector_hash
-                    and metadata_embedding_vector_hash
-                    and actual_embedding_vector_hash != metadata_embedding_vector_hash
-                ):
-                    issues.append(MemoryIndexHealthIssue(
-                        kind="document_chroma_embedding_vector_hash_mismatch",
-                        severity="P0",
-                        memory_id=doc_id,
-                        detail="Document Chroma embedding payload differs from document Chroma metadata",
-                    ))
-
         return MemoryIndexHealthReport(issues=issues)
 
     async def _memory_statuses(self) -> dict[str, str]:
@@ -353,7 +239,7 @@ class MemoryIndexHealthChecker:
         records: dict[str, dict[str, str]] = {}
         duplicate_ids: set[str] = set()
         async with self.db.db.execute(
-            "SELECT memory_id, content, entities_text, tags_text FROM memories_fts"
+            "SELECT memory_id, content, entities_text FROM memories_fts"
         ) as cursor:
             async for row in cursor:
                 if row[0] in records:
@@ -361,16 +247,8 @@ class MemoryIndexHealthChecker:
                 records[row[0]] = {
                     "content": row[1],
                     "entities_text": row[2],
-                    "tags_text": row[3],
                 }
         return records, duplicate_ids
-
-    async def _document_ids(self) -> set[str]:
-        ids: set[str] = set()
-        async with self.db.db.execute("SELECT doc_id FROM documents") as cursor:
-            async for row in cursor:
-                ids.add(row[0])
-        return ids
 
     async def _confluence_documents_missing_pdf(self) -> set[str]:
         doc_ids: set[str] = set()
@@ -397,7 +275,7 @@ class MemoryIndexHealthChecker:
 
     async def _memory_search_text(self, memory_id: str) -> dict[str, str] | None:
         async with self.db.db.execute(
-            "SELECT content, tags FROM memories WHERE id = ?",
+            "SELECT content FROM memories WHERE id = ?",
             (memory_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -414,12 +292,8 @@ class MemoryIndexHealthChecker:
         ) as cursor:
             async for entity_row in cursor:
                 entity_names.append(entity_row[0])
-        import json
-
-        tags = json.loads(row[1] or "[]")
         return {
             "content": row[0],
-            "tags_text": " ".join(tags),
             "entities_text": " ".join(entity_names),
         }
 
@@ -429,19 +303,6 @@ class MemoryIndexHealthChecker:
             return None
         entity_names = await self.db.get_memory_entity_names(memory_id)
         return embedding_text_hash(memory_embedding_text(memory, entity_names))
-
-    async def _document_embedding_text_hash(self, doc_id: str) -> str | None:
-        metadata = await self.db.get_metadata(doc_id)
-        if metadata is None:
-            return None
-        return embedding_text_hash(document_embedding_text(metadata))
-
-    async def _document_state(self) -> dict[str, dict[str, str | None]]:
-        state: dict[str, dict[str, str | None]] = {}
-        async with self.db.db.execute("SELECT doc_id, content_hash, version FROM documents") as cursor:
-            async for row in cursor:
-                state[row[0]] = {"content_hash": row[1], "version": row[2]}
-        return state
 
     def _collection_records(
         self,

@@ -12,7 +12,12 @@ from memforge.memory.relation_candidate_retrieval import (
     CrossDocumentCandidateSelection,
     CrossDocumentCandidateRetriever,
     RelationCandidateRetrievalPolicy,
+    RetrievedRelationCandidate,
     StaleCandidateSelectionError,
+)
+from memforge.storage.adapters.protocols import (
+    ActiveMemorySupportState,
+    active_support_rows_hash,
 )
 
 
@@ -209,6 +214,79 @@ async def test_selected_ledger_fails_closed_when_one_full_row_disappears() -> No
             challenger=challenger,
             doc_id="doc-new",
             source_id="src-new",
+        )
+
+
+@pytest.mark.asyncio
+async def test_selection_revalidation_fails_when_current_support_changes() -> None:
+    candidate = _candidate("mem-candidate")
+    challenger = SimpleNamespace(
+        id="mem-new",
+        status="active",
+        content="Current claim",
+        memory_type="fact",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier="repo-a",
+        project_key="PAY",
+    )
+
+    class SupportChangingRelational:
+        support_hash = active_support_rows_hash(())
+
+        async def get_memory(self, memory_id):
+            assert memory_id == challenger.id
+            return challenger
+
+        async def list_active_candidate_memories(self, memory_ids):
+            assert tuple(memory_ids) == (candidate.memory_id,)
+            return [candidate]
+
+        async def get_active_memory_support_states(self, memory_ids):
+            return {
+                memory_id: ActiveMemorySupportState(
+                    reference_ids=(),
+                    support_set_hash=self.support_hash,
+                    current_reference_ids=(),
+                    current_support_set_hash=self.support_hash,
+                )
+                for memory_id in memory_ids
+            }
+
+    relational = SupportChangingRelational()
+    retriever = CrossDocumentCandidateRetriever(
+        relational=relational,  # type: ignore[arg-type]
+        keyword=SimpleNamespace(),
+        vector=SimpleNamespace(),
+    )
+    selection = CrossDocumentCandidateSelection(
+        discovery=(
+            RetrievedRelationCandidate(
+                memory=candidate,
+                score=1.0,
+                channels=("lexical_bm25",),
+            ),
+        ),
+        audit={},
+    )
+    expected = {candidate.memory_id: relational.support_hash}
+
+    await retriever.ensure_selection_current(
+        selection,
+        challenger=challenger,
+        doc_id="doc-new",
+        source_id="src-new",
+        expected_support_set_hashes=expected,
+    )
+    relational.support_hash = "changed-support"
+
+    with pytest.raises(StaleCandidateSelectionError, match="current Support changed"):
+        await retriever.ensure_selection_current(
+            selection,
+            challenger=challenger,
+            doc_id="doc-new",
+            source_id="src-new",
+            expected_support_set_hashes=expected,
         )
 
 

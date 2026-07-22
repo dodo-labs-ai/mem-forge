@@ -222,7 +222,7 @@ export function SettingsPage() {
           <LlmSection
             kind="embedding"
             title="Embedding"
-            description="Used for vector search over documents and memories."
+            description="Used for vector search over memories."
             config={configQuery.data}
             form={form}
             keyAction={keyActions.embedding}

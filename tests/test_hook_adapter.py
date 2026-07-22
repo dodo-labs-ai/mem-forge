@@ -2004,7 +2004,6 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
             "content": "Use readable confirmation previews before memory mutations.",
             "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
             "memory_type": "convention",
-            "tags": ["ux", "mcp"],
             "confidence": 0.9,
         },
     )
@@ -2016,7 +2015,6 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
         "content": "Use readable confirmation previews before memory mutations.",
         "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
         "memory_type": "convention",
-        "tags": ["ux", "mcp"],
         "confidence": 0.9,
         "client": "claude-code",
         "repo_identifier": "github.com/shno-labs/mem-forge",
@@ -2059,7 +2057,6 @@ def test_mcp_proxy_create_memory_uses_codex_workspace_root_when_roots_are_not_ad
             "content": "Use readable confirmation previews before memory mutations.",
             "provenance": "User confirmed this convention after reviewing the MemForge MCP UX.",
             "memory_type": "convention",
-            "tags": ["ux", "mcp"],
         },
     )
 
@@ -2068,7 +2065,6 @@ def test_mcp_proxy_create_memory_uses_codex_workspace_root_when_roots_are_not_ad
         "content": "Use readable confirmation previews before memory mutations.",
         "provenance": "User confirmed this convention after reviewing the MemForge MCP UX.",
         "memory_type": "convention",
-        "tags": ["ux", "mcp"],
         "client": "codex",
         "repo_identifier": "github.com/shno-labs/mem-forge",
     }
@@ -2089,7 +2085,6 @@ def test_mcp_proxy_rejects_create_memory_when_repo_roots_are_missing(monkeypatch
             "content": "Use readable confirmation previews before memory mutations.",
             "provenance": "User confirmed this convention after reviewing the MemForge MCP UX.",
             "memory_type": "convention",
-            "tags": ["ux", "mcp"],
         },
     )
 
@@ -2141,7 +2136,6 @@ def test_mcp_proxy_reports_roots_error_response_for_create_memory(monkeypatch):
             "content": "Use readable confirmation previews before memory mutations.",
             "provenance": "User confirmed this convention after reviewing the MemForge MCP UX.",
             "memory_type": "convention",
-            "tags": ["ux", "mcp"],
         },
     )
 
@@ -2169,7 +2163,6 @@ def test_mcp_proxy_rejects_create_memory_without_provenance(monkeypatch):
         {
             "content": "Use readable confirmation previews before memory mutations.",
             "memory_type": "convention",
-            "tags": ["ux", "mcp"],
         },
     )
 
@@ -2485,7 +2478,6 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
                             "summary": "Create blocker hint task details",
                             "confidence": 0.9,
                             "relevance_score": 0.99,
-                            "tags": ["blocker-hint"],
                             "freshness": "current",
                             "status": "active",
                             "follow_up": {"suggested_tool": "get_memory"},
@@ -2522,7 +2514,6 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
                 "summary": "Create blocker hint task details",
                 "confidence": 0.9,
                 "relevance_score": 0.99,
-                "tags": ["blocker-hint"],
                 "freshness": "current",
                 "status": "active",
                 "follow_up": {"suggested_tool": "get_memory"},
@@ -2559,7 +2550,6 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
                     "visibility": "workspace",
                     "owner_user_id": "user-1",
                     "project_key": "PAY",
-                    "tags": ["blocker-hint"],
                     "confidence": 0.93,
                     "corroboration_count": 1,
                     "contradiction_count": 0,
@@ -2601,7 +2591,6 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
         "content": "Persist blocker hints.",
         "content_hash": "sha256-secret",
         "confidence": 0.93,
-        "tags": ["blocker-hint"],
         "status": "active",
         "entity_refs": ["periodcutoffblockerhint"],
         "sources": [

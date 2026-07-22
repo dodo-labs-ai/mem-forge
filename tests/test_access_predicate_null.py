@@ -90,14 +90,14 @@ async def _insert_null_visibility_row(db: Database, mid: str, content: str) -> N
     db._db.row_factory = aiosqlite.Row
     await db.db.execute(
         """INSERT INTO memories (
-            id, memory_type, content, content_hash, tags,
+            id, memory_type, content, content_hash,
             visibility, owner_user_id, project_key, confidence,
             corroboration_count, contradiction_count,
             valid_from, valid_until, superseded_by, status,
             retirement_reason, retired_at, superseded_at,
             replacement_reason, extraction_context,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, '[]',
+        ) VALUES (?, ?, ?, ?,
                   NULL, NULL, ?, 0.5,
                   1, 0,
                   NULL, NULL, NULL, 'active',
@@ -108,7 +108,7 @@ async def _insert_null_visibility_row(db: Database, mid: str, content: str) -> N
     )
     # FTS5 row so BM25 can attempt to surface it; the predicate must still hide.
     await db.db.execute(
-        "INSERT INTO memories_fts (memory_id, content, entities_text, tags_text) VALUES (?, ?, '', '')",
+        "INSERT INTO memories_fts (memory_id, content, entities_text) VALUES (?, ?, '')",
         (mid, content),
     )
     await db.db.commit()
@@ -124,7 +124,6 @@ async def _insert_workspace_row(db: Database, mid: str, content: str) -> None:
             visibility=WORKSPACE,
             owner_user_id=None,
             project_key=SHARED_PROJECT_KEY,
-            tags=[],
         )
     )
 

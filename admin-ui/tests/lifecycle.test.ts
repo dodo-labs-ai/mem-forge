@@ -11,7 +11,6 @@ const baseMemory: Memory = {
   visibility: "workspace",
   owner_user_id: null,
   project_key: null,
-  tags: [],
   confidence: 0.9,
   corroboration_count: 1,
   contradiction_count: 0,

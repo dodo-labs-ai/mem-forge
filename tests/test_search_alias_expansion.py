@@ -101,7 +101,7 @@ async def test_bm25_with_alias_expansion_still_matches(db):
     await db.insert_memory(target)
     await db.insert_memory(distractor)
 
-    cutoff_id = await db.upsert_entity("cutoff", "Cutoff", tags=["concept"])
+    cutoff_id = await db.upsert_entity("cutoff", "Cutoff")
     for alias in ("reverse cutoff", "cut off", "reverse cut off"):
         await db.insert_alias(alias, alias.lower(), cutoff_id, source="manual")
 
@@ -132,7 +132,7 @@ async def test_build_alias_clause_emits_fts5_or_group(db):
     only contributes new terms. The user query itself is composed in by
     ``_bm25_search`` after sanitization, never returned from this helper.
     """
-    cutoff_id = await db.upsert_entity("cutoff", "Cutoff", tags=["concept"])
+    cutoff_id = await db.upsert_entity("cutoff", "Cutoff")
     for alias in ("reverse cutoff", "cut off", "reverse cut off"):
         await db.insert_alias(alias, alias.lower(), cutoff_id, source="manual")
 
@@ -157,7 +157,7 @@ async def test_build_alias_clause_returns_empty_when_no_new_terms(db):
     sanitized user terms alone, instead of appending a stray space or empty
     parens that would invalidate the MATCH.
     """
-    entity_id = await db.upsert_entity("payroll", "Payroll", tags=["concept"])
+    entity_id = await db.upsert_entity("payroll", "Payroll")
     await db.insert_alias("payroll", "payroll", entity_id, source="manual")
 
     adapters = build_sqlite_adapters(db, FakeCollection())

@@ -52,7 +52,6 @@ def _memory(mid: str, content: str, *, visibility: str, owner: str | None) -> Me
         visibility=visibility,
         owner_user_id=owner,
         project_key=SHARED_PROJECT_KEY,
-        tags=[],
         confidence=0.9,
         created_at=now,
         updated_at=now,

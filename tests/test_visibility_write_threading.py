@@ -54,7 +54,7 @@ async def engine_fixture(tmp_path):
 async def test_build_memory_stamps_resolved_source_access(engine_fixture):
     from memforge.models import Visibility
 
-    raw = RawMemory(memory_type="fact", content="x", entity_refs=[], tags=[], confidence=0.8)
+    raw = RawMemory(memory_type="fact", content="x", entity_refs=[], confidence=0.8)
     memory = engine_fixture._build_memory(
         raw,
         project_key="ACME",

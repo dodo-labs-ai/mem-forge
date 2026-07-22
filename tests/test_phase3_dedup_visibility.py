@@ -51,7 +51,6 @@ def _mem(mid, content, *, visibility=WORKSPACE, owner=None, project_key=SHARED_P
         visibility=visibility,
         owner_user_id=owner,
         project_key=project_key,
-        tags=[],
         status=status,
     )
 
@@ -287,7 +286,6 @@ async def test_projected_equivalence_uses_shared_entities_when_strict_vector_rec
     entity_id = await db.upsert_entity(
         "GHLC-20260720-A",
         "GHLC-20260720-A",
-        ["refresh-policy"],
     )
     await db.link_memory_entity(incumbent.id, entity_id)
     adapters = build_sqlite_adapters(db, memory_collection=_FakeColl())
@@ -326,7 +324,6 @@ async def test_projected_equivalence_filters_access_before_entity_candidate_limi
     entity_id = await db.upsert_entity(
         "GHLC-20260720-A",
         "GHLC-20260720-A",
-        ["refresh-policy"],
     )
     for index in range(10):
         incompatible = _mem(
@@ -433,12 +430,11 @@ async def test_projected_equivalence_excludes_explicit_agent_claim_identity(
             display_anchor="A7 handling",
             claim_text=memory.content,
             memory_type=memory.memory_type,
-            tags=[],
             confidence=memory.confidence,
             memory_id=memory.id,
             observed_at=now,
         )
-    entity_id = await db.upsert_entity("A7", "A7", ["payroll-result-slot"])
+    entity_id = await db.upsert_entity("A7", "A7")
     await db.link_memory_entity(active.id, entity_id)
     adapters = build_sqlite_adapters(
         db,

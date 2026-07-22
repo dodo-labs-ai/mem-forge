@@ -1,23 +1,15 @@
-"""Call 2: Memory Extraction.
-
-Extracts atomic knowledge units (memories) from a document.
-Receives Call 1 output (entities, doc_type) + existing memories as context.
-"""
+"""Single semantic extraction of claim-sized Memory candidates."""
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
-
+from time import perf_counter
 from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
 from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.document_units import ExtractionContext
 from memforge.pipeline.document_update import DEFAULT_MAX_DIFF_CHARS
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
-
-if TYPE_CHECKING:
-    from memforge.models import Memory
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +22,9 @@ __all__ = ["MemoryExtractor"]
 # ---------------------------------------------------------------------------
 
 EXTRACTION_QUOTE_MAX_CHARS = 200
-EXTRACTION_TAG_MIN = 2
-EXTRACTION_TAG_MAX = 5
 DOC_CONTENT_CHAR_CAP = 100_000
 CHANGED_HUNK_CHAR_CAP = DEFAULT_MAX_DIFF_CHARS
 UPDATED_DOC_CHAR_CAP = 100_000
-EXISTING_MEMORIES_WINDOW = 30
-EXISTING_MEMORIES_WINDOW_CHANGE = 50
 DOCUMENT_OUTLINE_CHAR_CAP = 8_000
 GLOSSARY_APPENDIX_CHAR_CAP = 2_000
 UNIT_MARKDOWN_CHAR_CAP = 80_000
@@ -50,10 +38,6 @@ MEMORY_EXTRACTION_PROMPT = """You are extracting atomic knowledge from a documen
 
 <source_type>{source_type}</source_type>
 <doc_type>{doc_type}</doc_type>
-<entities_found>{entities_found}</entities_found>
-<existing_memories_for_these_entities>
-{existing_memories}
-</existing_memories_for_these_entities>
 <document>
 {content}
 </document>
@@ -62,8 +46,7 @@ Extract durable atomic knowledge units justified by the document. Returning an e
 - "content": self-contained factual sentence (understandable without the source document)
 - "memory_type": one of "fact", "decision", "convention", "procedure"
 - "confidence": 0.0-1.0 (use high confidence only when the source directly states durable domain knowledge)
-- "entity_refs": list of key entity names (use the canonical names from <entities_found>)
-- "tags": {tag_min}-{tag_max} lowercase topic tags
+- "entity_refs": list of key entity mentions copied from the owned evidence
 - "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "extraction_context": exact quote from the document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix (e.g. "**Alice** (10:05): the actual message content")
@@ -84,11 +67,9 @@ Top rules (apply these first; reject candidates that fail any of them):
 
 Standard rules:
 - Each memory must be SELF-CONTAINED (understandable without the source document).
-- Existing memories are comparison context, not a novelty filter. If this document
-  directly states the same durable claim, still emit one candidate with exact
-  evidence from this document. Reconciliation, not extraction, decides whether
-  to reuse the Memory ID and attach another Support Assertion.
-- Use entity names from <entities_found>, not your own variations.
+- Extraction does not decide novelty against historical Memory rows. Emit each
+  durable claim once with exact current evidence; lifecycle reconciliation owns
+  identity, support, and replacement decisions after extraction.
 - Prefer specifics ("PostgreSQL 15" not "a database").
 - For tickets: extract the decision/outcome, not the discussion.
 - For runbooks: each distinct step is a separate procedural memory.
@@ -110,10 +91,6 @@ MEMORY_CHANGE_EXTRACTION_PROMPT = """You are extracting memory changes from an u
 
 <source_type>{source_type}</source_type>
 <doc_type>{doc_type}</doc_type>
-<entities_found>{entities_found}</entities_found>
-<existing_memories_for_this_document>
-{existing_memories}
-</existing_memories_for_this_document>
 <changed_hunks>
 {changed_hunks}
 </changed_hunks>
@@ -129,8 +106,7 @@ For changed durable knowledge, return JSON objects with:
 - "content": self-contained factual sentence (understandable without the source document)
 - "memory_type": one of "fact", "decision", "convention", "procedure"
 - "confidence": 0.0-1.0
-- "entity_refs": list of key entity names (use the canonical names from <entities_found>)
-- "tags": {tag_min}-{tag_max} lowercase topic tags
+- "entity_refs": list of key entity mentions copied from the changed evidence
 - "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "extraction_context": exact quote from the updated document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix from the updated document.
@@ -152,7 +128,8 @@ Top rules (apply these first; reject candidates that fail any of them):
 Standard rules:
 - Focus ONLY on durable memory changes caused by <changed_hunks>.
 - Use <updated_document> only to understand context and copy exact quotes; do not extract unaffected facts elsewhere in it.
-- Do NOT re-extract facts already covered by <existing_memories_for_this_document> unless <changed_hunks> materially changes the current durable claim.
+- Extract the current durable claims changed by <changed_hunks>; lifecycle
+  reconciliation, not this prompt, compares them with existing Memory rows.
 - If <changed_hunks> only removes old durable knowledge without stating replacement current knowledge, return an empty "memories" array; reconciliation will decide whether to retire the old memory.
 - Do not create memories about the edit itself, such as "was removed", "no longer mentioned", "the document changed", or "previously".
 - For agent_session sources: keep only durable, reusable project knowledge (confirmed decisions, conventions, procedures, architectural rules) that is NOT visible by reading the current code. Record a change's durable outcome and the WHY as a single fact, not before/after/verified play-by-play. Do not create memories about the memory system, the agent's tooling or context injection, or session mechanics, and never include internal memory ids. Skip one-off run output and smoke-test results, receipt/session metadata, runtime notes, local paths, and working-tree state.
@@ -172,11 +149,6 @@ UNIT_MEMORY_EXTRACTION_PROMPT = """You are extracting atomic knowledge from one 
 <document_title>{document_title}</document_title>
 <document_url>{document_url}</document_url>
 <heading_path>{heading_path}</heading_path>
-<entities_found>{entities_found}</entities_found>
-<existing_memories_for_these_entities>
-{existing_memories}
-</existing_memories_for_these_entities>
-
 The following context is read-only. Use it only to resolve scope, acronyms, and references.
 Do not extract facts that appear only in this context.
 <document_outline>
@@ -195,8 +167,7 @@ Each memory must be a JSON object with:
 - "content": self-contained factual sentence
 - "memory_type": one of "fact", "decision", "convention", "procedure"
 - "confidence": 0.0-1.0
-- "entity_refs": list of key entity names from <entities_found>
-- "tags": {tag_min}-{tag_max} lowercase topic tags
+- "entity_refs": list of key entity mentions copied from <unit_markdown>
 - "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "extraction_context": exact quote from <unit_markdown> (max {quote_max} chars)
@@ -219,10 +190,8 @@ Top rules (apply these first; reject candidates that fail any of them):
 
 Standard rules:
 - Extract only durable team knowledge grounded in <unit_markdown>.
-- Existing memories are comparison context, not a novelty filter. If this unit
-  directly states the same durable claim, still emit one candidate with exact
-  evidence from this unit. Reconciliation, not extraction, decides whether to
-  reuse the Memory ID and attach another Support Assertion.
+- Extraction emits each current durable claim once with exact evidence.
+  Reconciliation owns historical identity and support decisions.
 - Do not extract document outline, glossary, title, URL, or source metadata as memories.
 - For agent_session sources, extract only durable project decisions, conventions, procedures, and architectural rules that are NOT visible by reading the current code. Skip receipt/session metadata, validation commands/results, runtime notes, service start/stop state, local paths, working-tree state, and facts about the agent session itself.
 - Do not extract passwords, credentials, tokens, API keys, or secrets.
@@ -236,11 +205,6 @@ PROJECTION_BATCH_EXTRACTION_PROMPT = """You are extracting durable atomic knowle
 
 <source_type>{source_type}</source_type>
 <doc_type>{doc_type}</doc_type>
-<entities_found>{entities_found}</entities_found>
-<existing_memories_for_this_source_unit>
-{existing_memories}
-</existing_memories_for_this_source_unit>
-
 Only PRIMARY observations grant extraction authority:
 <primary_observations>
 {primary_observations}
@@ -253,10 +217,8 @@ The following observations are CONTEXT only. Use them to resolve references and 
 
 Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
 
-Existing memories are comparison context, not a novelty filter. If a PRIMARY
-observation directly states the same durable claim, still emit one candidate
-with exact evidence from that observation. Reconciliation, not extraction,
-decides whether to reuse the Memory ID and attach another Support Assertion.
+Extraction emits each current durable claim once with exact evidence from a
+PRIMARY observation. Reconciliation owns historical identity and support.
 
 Prefer an empty memories array over weak or transient claims. Do not emit records that only say an item was created, updated, uploaded, attached, assigned, labeled, ranked, moved, reprioritized, or passed through a routine workflow status. Do not emit revision history, source metadata, routing fields, questions, or secrets. An attachment-upload event is provenance, not authority about the attachment's contents; only separately supplied attachment-content evidence may support a claim. Preserve durable resolution rationale and settled outcomes, conditions, and source language.
 
@@ -269,12 +231,7 @@ Return ONLY a JSON object with a "memories" array."""
 
 
 class MemoryExtractor:
-    """Memory extraction via LLM (Call 2 of the two-call extraction pipeline).
-
-    Receives enrichment output (entities, doc_type) and existing memories as
-    comparison context while preserving every durable claim directly supported
-    by the current Primary Evidence.
-    """
+    """Extract current claims without loading historical Memory rows."""
 
     def __init__(
         self,
@@ -303,23 +260,8 @@ class MemoryExtractor:
         content: str,
         source_type: str = "unknown",
         doc_type: str = "unknown",
-        entities: list[str] | None = None,
-        existing_memories: list[Memory] | None = None,
     ) -> MemoryExtractionResult:
-        """Run Call 2: extract atomic memories from document content.
-
-        Args:
-            content: Normalized markdown content of the document.
-            source_type: Type of the source gene (confluence, jira, etc.)
-            doc_type: Document type from Call 1 (design-doc, runbook, etc.)
-            entities: Canonical entity names found by Call 1.
-            existing_memories: Memories already in DB for these entities.
-                They provide comparison context but do not suppress a candidate
-                directly supported by this document.
-
-        Returns:
-            MemoryExtractionResult with list of RawMemory candidates.
-        """
+        """Extract atomic memories from current document evidence."""
         if not self.structured_llm_client:
             logger.warning("No LLM client — skipping memory extraction")
             return MemoryExtractionResult(
@@ -327,26 +269,10 @@ class MemoryExtractor:
                 error="No LLM client configured for memory extraction",
             )
 
-        # Format entities list
-        entities_str = ", ".join(entities) if entities else "(none found)"
-
-        # Format existing memories
-        if existing_memories:
-            existing_str = "\n".join(
-                f"- [{m.id}] [{m.memory_type}] {m.content}"
-                for m in existing_memories[:EXISTING_MEMORIES_WINDOW]
-            )
-        else:
-            existing_str = "(no existing memories for these entities)"
-
         prompt = MEMORY_EXTRACTION_PROMPT.format(
             source_type=source_type,
             doc_type=doc_type,
-            entities_found=entities_str,
-            existing_memories=existing_str,
             content=content[:DOC_CONTENT_CHAR_CAP],
-            tag_min=EXTRACTION_TAG_MIN,
-            tag_max=EXTRACTION_TAG_MAX,
             quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
 
@@ -359,8 +285,6 @@ class MemoryExtractor:
         updated_document: str,
         source_type: str = "unknown",
         doc_type: str = "unknown",
-        entities: list[str] | None = None,
-        existing_memories: list[Memory] | None = None,
     ) -> MemoryExtractionResult:
         """Extract only durable memory changes from a document update."""
         if not self.structured_llm_client:
@@ -370,24 +294,11 @@ class MemoryExtractor:
                 error="No LLM client configured for memory change extraction",
             )
 
-        entities_str = ", ".join(entities) if entities else "(none found)"
-        if existing_memories:
-            existing_str = "\n".join(
-                f"- [{m.id}] [{m.memory_type}] {m.content}"
-                for m in existing_memories[:EXISTING_MEMORIES_WINDOW_CHANGE]
-            )
-        else:
-            existing_str = "(no existing memories for this document)"
-
         prompt = MEMORY_CHANGE_EXTRACTION_PROMPT.format(
             source_type=source_type,
             doc_type=doc_type,
-            entities_found=entities_str,
-            existing_memories=existing_str,
             changed_hunks=changed_hunks[:CHANGED_HUNK_CHAR_CAP],
             updated_document=updated_document[:UPDATED_DOC_CHAR_CAP],
-            tag_min=EXTRACTION_TAG_MIN,
-            tag_max=EXTRACTION_TAG_MAX,
             quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
 
@@ -398,7 +309,6 @@ class MemoryExtractor:
         context: ExtractionContext,
         *,
         doc_type: str = "unknown",
-        existing_memories: list[Memory] | None = None,
     ) -> MemoryExtractionResult:
         """Extract memories from one deterministic unit and enforce unit evidence."""
         if not self.structured_llm_client:
@@ -408,28 +318,15 @@ class MemoryExtractor:
                 error="No LLM client configured for memory extraction",
             )
 
-        entities_str = ", ".join(context.entities) if context.entities else "(none found)"
-        if existing_memories:
-            existing_str = "\n".join(
-                f"- [{m.id}] [{m.memory_type}] {m.content}"
-                for m in existing_memories[:EXISTING_MEMORIES_WINDOW]
-            )
-        else:
-            existing_str = "(no existing memories for these entities)"
-
         prompt = UNIT_MEMORY_EXTRACTION_PROMPT.format(
             source_type=context.source_type,
             doc_type=doc_type,
             document_title=context.document_title,
             document_url=context.document_url,
             heading_path=" > ".join(context.unit.heading_path),
-            entities_found=entities_str,
-            existing_memories=existing_str,
             document_outline=context.document_outline[:DOCUMENT_OUTLINE_CHAR_CAP],
             glossary_appendix=context.glossary_appendix[:GLOSSARY_APPENDIX_CHAR_CAP],
             unit_markdown=context.unit.unit_markdown[:UNIT_MARKDOWN_CHAR_CAP],
-            tag_min=EXTRACTION_TAG_MIN,
-            tag_max=EXTRACTION_TAG_MAX,
             quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
         result = await self._extract_with_schema(prompt, label="unit memory extraction")
@@ -445,7 +342,7 @@ class MemoryExtractor:
             memory.evidence_anchor = "unit"
             memory.extraction_context = evidence_quote[:EXTRACTION_QUOTE_MAX_CHARS]
             kept.append(memory)
-        return MemoryExtractionResult(memories=kept)
+        return MemoryExtractionResult(memories=kept, metadata=result.metadata)
 
     async def extract_projection_batch_memories(
         self,
@@ -453,8 +350,6 @@ class MemoryExtractor:
         *,
         source_type: str,
         doc_type: str = "unknown",
-        entities: list[str] | None = None,
-        existing_memories: list[Memory] | None = None,
     ) -> MemoryExtractionResult:
         """Extract from Primary observations while treating neighbors as context."""
 
@@ -463,19 +358,9 @@ class MemoryExtractor:
                 error_type="llm_client_unavailable",
                 error="No LLM client configured for memory extraction",
             )
-        entities_str = ", ".join(entities) if entities else "(none found)"
-        existing_str = (
-            "\n".join(
-                f"- [{memory.id}] [{memory.memory_type}] {memory.content}"
-                for memory in (existing_memories or [])[:EXISTING_MEMORIES_WINDOW]
-            )
-            or "(no existing memories for this source unit)"
-        )
         prompt = PROJECTION_BATCH_EXTRACTION_PROMPT.format(
             source_type=source_type,
             doc_type=doc_type,
-            entities_found=entities_str,
-            existing_memories=existing_str,
             primary_observations=batch.primary_markdown[:UNIT_MARKDOWN_CHAR_CAP],
             context_observations=batch.context_markdown[:PROJECTION_CONTEXT_CHAR_CAP],
         )
@@ -516,9 +401,14 @@ class MemoryExtractor:
                 continue
             memory.required_source_observation_ids = list(required_ids)
             kept.append(memory)
-        return MemoryExtractionResult(memories=kept)
+        return MemoryExtractionResult(memories=kept, metadata=result.metadata)
 
     async def _extract_with_schema(self, prompt: str, *, label: str) -> MemoryExtractionResult:
+        started = perf_counter()
+        metrics = {
+            "structured_llm_calls": 1,
+            "prompt_chars": len(prompt),
+        }
         try:
             response = await self.structured_llm_client.extract_memories(
                 prompt,
@@ -531,7 +421,6 @@ class MemoryExtractor:
                     memory_type=memory.memory_type,
                     confidence=memory.confidence,
                     entity_refs=memory.entity_refs,
-                    tags=memory.tags,
                     valid_from=memory.valid_from,
                     valid_until=memory.valid_until,
                     extraction_context=memory.extraction_context,
@@ -543,10 +432,36 @@ class MemoryExtractor:
                 for memory in response.memories
             ]
             logger.info("Extracted %d memories from document", len(memories))
-            return MemoryExtractionResult(memories=memories)
+            return MemoryExtractionResult(
+                memories=memories,
+                metadata={
+                    **metrics,
+                    "structured_llm_elapsed_ms": max(
+                        0, round((perf_counter() - started) * 1000)
+                    ),
+                },
+            )
         except StructuredLlmError as e:
             logger.warning("Structured %s failed: %s", label, e)
-            return MemoryExtractionResult(error_type="structured_llm_error", error=str(e))
+            return MemoryExtractionResult(
+                error_type="structured_llm_error",
+                error=str(e),
+                metadata={
+                    **metrics,
+                    "structured_llm_elapsed_ms": max(
+                        0, round((perf_counter() - started) * 1000)
+                    ),
+                },
+            )
         except Exception as e:
             logger.error("Unexpected %s error: %s", label, e)
-            return MemoryExtractionResult(error_type="unexpected_error", error=str(e))
+            return MemoryExtractionResult(
+                error_type="unexpected_error",
+                error=str(e),
+                metadata={
+                    **metrics,
+                    "structured_llm_elapsed_ms": max(
+                        0, round((perf_counter() - started) * 1000)
+                    ),
+                },
+            )

@@ -23,12 +23,18 @@ from memforge.memory.relation_classifier import (
     MemoryRelationType,
 )
 from memforge.memory.relation_discovery import RelationDiscovery, RelationDiscoveryBudget
+from memforge.memory.lifecycle_planner import lifecycle_access_context_hash
 from memforge.memory.relation_discovery_contract import (
+    PreclassifiedRelationDecision,
     RelationDiscoveryRequest,
     RelationDiscoveryWork,
     RelationDiscoveryWorkStatus,
 )
 from memforge.models import Memory, MemoryStatus, content_hash
+from memforge.storage.adapters.protocols import (
+    ActiveMemorySupportState,
+    active_support_rows_hash,
+)
 
 
 def _memory(memory_id: str, content: str) -> Memory:
@@ -42,6 +48,9 @@ def _memory(memory_id: str, content: str) -> Memory:
 
 
 class _Classifier:
+    def __init__(self) -> None:
+        self.classified_pair_ids: tuple[str, ...] = ()
+
     def plan(self, pairs):
         return MemoryPairClassificationPlan(
             pair_count=len(pairs),
@@ -50,6 +59,7 @@ class _Classifier:
         )
 
     async def classify(self, pairs):
+        self.classified_pair_ids = tuple(pair.candidate.id for pair in pairs)
         return MemoryPairClassification(
             decisions=tuple(
                 MemoryPairDecision(
@@ -161,6 +171,17 @@ class _Store:
     async def get_memory_entity_ids(self, _memory_id):
         return []
 
+    async def get_active_memory_support_states(self, memory_ids):
+        return {
+            memory_id: ActiveMemorySupportState(
+                reference_ids=(),
+                support_set_hash=active_support_rows_hash(()),
+                current_reference_ids=(),
+                current_support_set_hash=active_support_rows_hash(()),
+            )
+            for memory_id in memory_ids
+        }
+
     async def complete_relation_discovery_work(self, _work_id, **kwargs):
         self.completed = kwargs["relation_outcome"]
         self.reviews = kwargs["reviews"]
@@ -245,6 +266,112 @@ async def test_relation_discovery_finishes_one_selected_ledger_before_slice_budg
         "candidate-1",
         "candidate-2",
     }
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_reuses_current_identity_pair_and_only_classifies_new_candidates() -> None:
+    challenger = _memory("challenger", "Current claim")
+    candidates = (
+        _memory("candidate-reused", "Previously classified claim"),
+        _memory("candidate-new", "Newly recalled claim"),
+    )
+    store = _Store(challenger, candidates)
+    store.work = replace(
+        store.work,
+        request=replace(
+            store.work.request,
+            preclassified_decisions=(
+                PreclassifiedRelationDecision(
+                    candidate_memory_id=candidates[0].id,
+                    expected_candidate_content_hash=candidates[0].content_hash,
+                    expected_candidate_support_set_hash=active_support_rows_hash(()),
+                    expected_candidate_access_context_hash=lifecycle_access_context_hash(
+                        visibility=candidates[0].visibility,
+                        owner_user_id=candidates[0].owner_user_id,
+                        project_key=candidates[0].project_key,
+                        repo_identifier=candidates[0].repo_identifier,
+                    ),
+                    expected_challenger_access_context_hash=lifecycle_access_context_hash(
+                        visibility=challenger.visibility,
+                        owner_user_id=challenger.owner_user_id,
+                        project_key=challenger.project_key,
+                        repo_identifier=challenger.repo_identifier,
+                    ),
+                    relation_type=MemoryRelationType.UNRELATED,
+                    direction=RelationDirection.SYMMETRIC,
+                    reason="identity stage already checked this pair",
+                    classifier_version="memory-relation-v1",
+                ),
+            ),
+        ),
+    )
+    classifier = _Classifier()
+
+    result = await RelationDiscovery(
+        store=store,  # type: ignore[arg-type]
+        candidate_retriever=_Candidates(candidates),  # type: ignore[arg-type]
+        pair_classifier=classifier,
+    ).process_slice(worker_id="worker-1")
+
+    assert result.checked_candidate_pairs == 2
+    assert result.reused_candidate_pairs == 1
+    assert result.llm_calls == 1
+    assert classifier.classified_pair_ids == ("candidate-new",)
+    assert store.completed is not None
+    assert store.completed.relation_run.audit["reused_identity_pair_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_field",
+    ("expected_candidate_support_set_hash", "expected_candidate_access_context_hash"),
+)
+async def test_relation_discovery_reclassifies_identity_seed_with_stale_context(
+    stale_field: str,
+) -> None:
+    challenger = _memory("challenger", "Current claim")
+    candidate = _memory("candidate", "Previously classified claim")
+    store = _Store(challenger, (candidate,))
+    seed = PreclassifiedRelationDecision(
+        candidate_memory_id=candidate.id,
+        expected_candidate_content_hash=candidate.content_hash,
+        expected_candidate_support_set_hash=active_support_rows_hash(()),
+        expected_candidate_access_context_hash=lifecycle_access_context_hash(
+            visibility=candidate.visibility,
+            owner_user_id=candidate.owner_user_id,
+            project_key=candidate.project_key,
+            repo_identifier=candidate.repo_identifier,
+        ),
+        expected_challenger_access_context_hash=lifecycle_access_context_hash(
+            visibility=challenger.visibility,
+            owner_user_id=challenger.owner_user_id,
+            project_key=challenger.project_key,
+            repo_identifier=challenger.repo_identifier,
+        ),
+        relation_type=MemoryRelationType.UNRELATED,
+        direction=RelationDirection.SYMMETRIC,
+        reason="identity stage already checked this pair",
+        classifier_version="memory-relation-v1",
+    )
+    store.work = replace(
+        store.work,
+        request=replace(
+            store.work.request,
+            preclassified_decisions=(replace(seed, **{stale_field: "stale"}),),
+        ),
+    )
+    classifier = _Classifier()
+
+    result = await RelationDiscovery(
+        store=store,  # type: ignore[arg-type]
+        candidate_retriever=_Candidates((candidate,)),  # type: ignore[arg-type]
+        pair_classifier=classifier,
+    ).process_slice(worker_id="worker-1")
+
+    assert result.reused_candidate_pairs == 0
+    assert classifier.classified_pair_ids == ("candidate",)
+    assert store.completed is not None
+    assert store.completed.relation_run.audit["reused_identity_pair_count"] == 0
 
 
 @pytest.mark.asyncio

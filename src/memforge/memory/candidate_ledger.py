@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Literal, Sequence
 
 from memforge.llm.structured import CandidateLedgerDecision
@@ -60,6 +61,10 @@ class CandidateLedgerResult:
     semantic_input_count: int
     dropped_exact_count: int
     dropped_redundant_count: int
+    structured_llm_calls: int
+    structured_llm_elapsed_ms: int
+    validation_retries: int
+    prompt_chars: int
     drops: tuple[CandidateLedgerDrop, ...]
 
 
@@ -73,11 +78,19 @@ class CandidateLedgerError(RuntimeError):
         *,
         input_count: int,
         semantic_input_count: int,
+        structured_llm_calls: int = 0,
+        structured_llm_elapsed_ms: int = 0,
+        validation_retries: int = 0,
+        prompt_chars: int = 0,
     ) -> None:
         super().__init__(message)
         self.error_type = error_type
         self.input_count = input_count
         self.semantic_input_count = semantic_input_count
+        self.structured_llm_calls = structured_llm_calls
+        self.structured_llm_elapsed_ms = structured_llm_elapsed_ms
+        self.validation_retries = validation_retries
+        self.prompt_chars = prompt_chars
 
 
 async def select_unique_memory_candidates(
@@ -112,6 +125,10 @@ async def select_unique_memory_candidates(
             semantic_input_count=semantic_count,
             dropped_exact_count=dropped_exact_count,
             dropped_redundant_count=0,
+            structured_llm_calls=0,
+            structured_llm_elapsed_ms=0,
+            validation_retries=0,
+            prompt_chars=0,
             drops=exact_drops,
         )
 
@@ -149,20 +166,37 @@ async def select_unique_memory_candidates(
 
     decisions_by_index: dict[int, CandidateLedgerDecision] | None = None
     validation_error: ValueError | None = None
+    structured_llm_calls = 0
+    structured_llm_elapsed_ms = 0
+    validation_retries = 0
+    prompt_chars = 0
     for attempt in range(_VALIDATION_ATTEMPTS):
+        prompt_chars += len(prompt)
+        call_started = perf_counter()
         try:
+            structured_llm_calls += 1
             response = await selector(
                 prompt,
                 max_tokens=_DEFAULT_MAX_OUTPUT_TOKENS,
                 model=llm_model,
             )
         except Exception as exc:
+            structured_llm_elapsed_ms += max(
+                0, round((perf_counter() - call_started) * 1000)
+            )
             raise CandidateLedgerError(
                 "structured_llm_error",
                 f"candidate ledger structured call failed: {exc}",
                 input_count=len(original),
                 semantic_input_count=semantic_count,
+                structured_llm_calls=structured_llm_calls,
+                structured_llm_elapsed_ms=structured_llm_elapsed_ms,
+                validation_retries=validation_retries,
+                prompt_chars=prompt_chars,
             ) from exc
+        structured_llm_elapsed_ms += max(
+            0, round((perf_counter() - call_started) * 1000)
+        )
         try:
             decisions_by_index = _validate_complete_ledger(
                 response.decisions,
@@ -173,6 +207,7 @@ async def select_unique_memory_candidates(
             validation_error = exc
             if attempt + 1 >= _VALIDATION_ATTEMPTS:
                 break
+            validation_retries += 1
             prompt = (
                 f"{prompt}\n\n<validation_feedback>\n"
                 f"The previous response was rejected: {exc}. Return a complete candidate ledger "
@@ -186,6 +221,10 @@ async def select_unique_memory_candidates(
             f"complete candidate ledger validation failed: {validation_error}",
             input_count=len(original),
             semantic_input_count=semantic_count,
+            structured_llm_calls=structured_llm_calls,
+            structured_llm_elapsed_ms=structured_llm_elapsed_ms,
+            validation_retries=validation_retries,
+            prompt_chars=prompt_chars,
         )
 
     selected = tuple(
@@ -210,6 +249,10 @@ async def select_unique_memory_candidates(
         semantic_input_count=semantic_count,
         dropped_exact_count=dropped_exact_count,
         dropped_redundant_count=semantic_count - len(selected),
+        structured_llm_calls=structured_llm_calls,
+        structured_llm_elapsed_ms=structured_llm_elapsed_ms,
+        validation_retries=validation_retries,
+        prompt_chars=prompt_chars,
         drops=exact_drops + semantic_drops,
     )
 

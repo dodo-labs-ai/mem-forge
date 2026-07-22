@@ -50,7 +50,6 @@ from memforge.models import (
     VIRTUAL_DOCUMENT_SOURCE_IDS,
     Visibility,
 )
-from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
@@ -205,12 +204,10 @@ class MemoryStore:
         embed_cfg: dict,
         dedup_threshold: float = 0.08,
         audit_logger: MemoryAuditLogger | None = None,
-        document_index: DocumentVectorIndex | None = None,
     ) -> None:
         self.relational = relational
         self.keyword = keyword
         self.vector = vector
-        self.document_index = document_index or DocumentVectorIndex(None)
         self.embed_cfg = embed_cfg
         self.dedup_threshold = dedup_threshold
         self._embedding_cache = EmbeddingCache()
@@ -1036,7 +1033,6 @@ class MemoryStore:
         memory_id: str,
         new_content: str,
         new_confidence: float | None = None,
-        new_tags: list[str] | None = None,
     ) -> None:
         """Update a memory's content across all stores."""
         context = self._operation_context()
@@ -1044,7 +1040,7 @@ class MemoryStore:
         previous_vector = await self._memory_vector_snapshot(memory_id)
         memory = None
         try:
-            await self.db.update_memory_content(memory_id, new_content, new_confidence, new_tags)
+            await self.db.update_memory_content(memory_id, new_content, new_confidence)
 
             # Re-embed and update ChromaDB
             memory = await self.db.get_memory(memory_id)
@@ -1292,7 +1288,6 @@ class MemoryStore:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        tags: list[str],
         confidence: float,
         observed_at: datetime,
         source_updated_at: datetime | None,
@@ -1316,7 +1311,6 @@ class MemoryStore:
                 display_anchor=display_anchor,
                 claim_text=claim_text,
                 memory_type=memory_type,
-                tags=tags,
                 confidence=confidence,
                 observed_at=observed_at,
                 citations=citations,
@@ -1361,7 +1355,6 @@ class MemoryStore:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        tags: list[str],
         confidence: float,
         observed_at: datetime,
         source_updated_at: datetime | None,
@@ -1394,7 +1387,6 @@ class MemoryStore:
                 display_anchor=display_anchor,
                 claim_text=claim_text,
                 memory_type=memory_type,
-                tags=tags,
                 confidence=confidence,
                 observed_at=observed_at,
                 citations=citations,
@@ -1441,7 +1433,6 @@ class MemoryStore:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        tags: list[str],
         confidence: float,
         observed_at: datetime,
         concept_markdown_body: str,
@@ -1460,7 +1451,6 @@ class MemoryStore:
                 display_anchor=display_anchor,
                 claim_text=claim_text,
                 memory_type=memory_type,
-                tags=tags,
                 confidence=confidence,
                 observed_at=observed_at,
                 concept_markdown_body=concept_markdown_body,
@@ -1773,22 +1763,15 @@ class MemoryStore:
         context = self._operation_context(doc_id=doc_id)
         document_snapshot = await self.db.get_document(doc_id)
         document_side_snapshot = await self.db.get_document_side_table_snapshots([doc_id])
-        document_vector_snapshot = self._document_vector_snapshot(doc_id)
         memory_ids = await self._memory_ids_for_doc(doc_id)
         memory_snapshots = await self._memory_snapshots(memory_ids)
         source_snapshots = await self._source_snapshots(memory_ids)
-        try:
-            await self._remove_document_vector(doc_id, context=context)
-        except Exception:
-            await self._restore_document_vector_snapshot(doc_id, document_vector_snapshot, context=context)
-            raise
         try:
             retired_ids = await self.db.delete_document(doc_id)
         except Exception:
             await self._restore_deleted_document_state(
                 document_snapshot=document_snapshot,
                 document_side_snapshot=document_side_snapshot,
-                document_vector_snapshot=document_vector_snapshot,
                 memory_snapshots=memory_snapshots,
                 source_snapshots=source_snapshots,
                 context=context,
@@ -1800,7 +1783,6 @@ class MemoryStore:
             await self._restore_deleted_document_state(
                 document_snapshot=document_snapshot,
                 document_side_snapshot=document_side_snapshot,
-                document_vector_snapshot=document_vector_snapshot,
                 memory_snapshots=memory_snapshots,
                 source_snapshots=source_snapshots,
                 context=context,
@@ -1827,24 +1809,13 @@ class MemoryStore:
         """Remove document storage after lifecycle was committed separately.
 
         This path deliberately performs no Memory mutation. Source Projection
-        lineage and Evidence records remain durable for audit, while the
-        document vector and relational document artifacts are removed together
-        with rollback protection.
+        lineage and Evidence records remain durable for audit while relational
+        document artifacts are removed with rollback protection.
         """
 
         context = self._operation_context(doc_id=doc_id)
         document_snapshot = await self.db.get_document(doc_id)
         document_side_snapshot = await self.db.get_document_side_table_snapshots([doc_id])
-        document_vector_snapshot = self._document_vector_snapshot(doc_id)
-        try:
-            await self._remove_document_vector(doc_id, context=context)
-        except Exception:
-            await self._restore_document_vector_snapshot(
-                doc_id,
-                document_vector_snapshot,
-                context=context,
-            )
-            raise
         try:
             await self.db.delete_projected_document(doc_id)
         except Exception:
@@ -1854,11 +1825,6 @@ class MemoryStore:
                     require_configured_source=True,
                 )
                 await self.db.restore_document_side_table_snapshots(document_side_snapshot)
-            await self._restore_document_vector_snapshot(
-                doc_id,
-                document_vector_snapshot,
-                context=context,
-            )
             raise
         await self._emit(
             "projected_document_delete_committed",
@@ -1878,23 +1844,9 @@ class MemoryStore:
             doc_ids,
             source_id=source_id,
         )
-        document_vector_snapshots = {
-            doc.doc_id: self._document_vector_snapshot(doc.doc_id) for doc in document_snapshots
-        }
         memory_ids = await self._memory_ids_for_docs(doc_ids)
         memory_snapshots = await self._memory_snapshots(memory_ids)
         source_snapshots = await self._source_snapshots(memory_ids)
-        try:
-            for doc in document_snapshots:
-                await self._remove_document_vector(doc.doc_id, context=context)
-        except Exception:
-            for doc in document_snapshots:
-                await self._restore_document_vector_snapshot(
-                    doc.doc_id,
-                    document_vector_snapshots.get(doc.doc_id),
-                    context=context,
-                )
-            raise
         try:
             deletion_result = await self.db.delete_source_cascade(source_id)
         except Exception:
@@ -1902,7 +1854,6 @@ class MemoryStore:
                 source_snapshot=source_snapshot,
                 document_snapshots=document_snapshots,
                 document_side_snapshot=document_side_snapshot,
-                document_vector_snapshots=document_vector_snapshots,
                 memory_snapshots=memory_snapshots,
                 source_snapshots=source_snapshots,
                 context=context,
@@ -2351,36 +2302,6 @@ class MemoryStore:
             logger.warning("ChromaDB delete failed for %s: %s", memory_id, e)
             raise
 
-    async def _remove_document_vector(self, doc_id: str, *, context: AuditContext) -> None:
-        if not self.document_index.enabled:
-            return
-        try:
-            await self._emit(
-                "document_chroma_delete_attempted",
-                "attempted",
-                context=context,
-                doc_id=doc_id,
-                payload={"index": "document_chroma"},
-            )
-            self.document_index.delete(doc_id)
-            await self._emit(
-                "document_chroma_delete_committed",
-                "committed",
-                context=context,
-                doc_id=doc_id,
-                payload={"index": "document_chroma"},
-            )
-        except Exception as e:
-            await self._emit(
-                "index_operation_failed",
-                "failed",
-                context=context,
-                doc_id=doc_id,
-                error=str(e),
-                payload={"index": "document_chroma", "operation": "delete"},
-            )
-            raise
-
     async def _restore_memory_row(self, memory: Memory) -> None:
         """Restore SQLite memory/FTS state after an external index write fails."""
         await self.db.restore_memory_snapshot(
@@ -2467,9 +2388,6 @@ class MemoryStore:
             snapshots.extend(await self.db.get_memory_sources(memory_id))
         return snapshots
 
-    def _document_vector_snapshot(self, doc_id: str) -> dict[str, Any] | None:
-        return self.document_index.snapshot(doc_id)
-
     async def _memory_vector_snapshot(self, memory_id: str) -> dict[str, Any] | None:
         record = await self.vector.get_record(memory_id)
         if record is None:
@@ -2486,7 +2404,6 @@ class MemoryStore:
         *,
         document_snapshot,
         document_side_snapshot,
-        document_vector_snapshot: dict[str, Any] | None,
         memory_snapshots: list[Memory],
         source_snapshots,
         context: AuditContext,
@@ -2499,11 +2416,6 @@ class MemoryStore:
                 ),
             )
             await self.db.restore_document_side_table_snapshots(document_side_snapshot)
-            await self._restore_document_vector_snapshot(
-                document_snapshot.doc_id,
-                document_vector_snapshot,
-                context=context,
-            )
         for memory in memory_snapshots:
             await self._restore_memory_row(memory)
             await self._restore_search_indexes(memory, context=context, label="document_delete_rollback")
@@ -2516,7 +2428,6 @@ class MemoryStore:
         source_snapshot,
         document_snapshots,
         document_side_snapshot,
-        document_vector_snapshots: dict[str, dict[str, Any] | None],
         memory_snapshots: list[Memory],
         source_snapshots,
         context: AuditContext,
@@ -2529,39 +2440,11 @@ class MemoryStore:
                 require_configured_source=True,
             )
         await self.db.restore_document_side_table_snapshots(document_side_snapshot)
-        for document in document_snapshots:
-            await self._restore_document_vector_snapshot(
-                document.doc_id,
-                document_vector_snapshots.get(document.doc_id),
-                context=context,
-            )
         for memory in memory_snapshots:
             await self._restore_memory_row(memory)
             await self._restore_search_indexes(memory, context=context, label="source_delete_rollback")
         for source in source_snapshots:
             await self.db.restore_memory_source_snapshot(source)
-
-    async def _restore_document_vector_snapshot(
-        self,
-        doc_id: str,
-        snapshot: dict[str, Any] | None,
-        *,
-        context: AuditContext,
-    ) -> None:
-        if not self.document_index.enabled:
-            return
-        try:
-            self.document_index.restore(doc_id, snapshot)
-        except Exception as exc:
-            await self._emit(
-                "index_operation_failed",
-                "failed",
-                context=context,
-                doc_id=doc_id,
-                error=str(exc),
-                payload={"index": "document_chroma", "operation": "restore"},
-            )
-            raise
 
     async def _restore_memory_vector_snapshot(
         self,

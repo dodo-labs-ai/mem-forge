@@ -147,7 +147,7 @@ async def test_search_routes_vector_and_bm25_through_the_adapters(db, monkeypatc
 async def test_search_path_uses_entity_linker_not_legacy_query_analysis(db, monkeypatch):
     active = _memory("m-active", "PostgreSQL pooling memory")
     await db.insert_memory(active)
-    entity_id = await db.upsert_entity("postgresql", "PostgreSQL", ["database"])
+    entity_id = await db.upsert_entity("postgresql", "PostgreSQL")
     await db.link_memory_entity(active.id, entity_id)
 
     adapters = build_sqlite_adapters(db, FakeCollection([active.id]))
@@ -716,8 +716,8 @@ async def test_graph_exploration_downweights_broad_entity_fanout(db, monkeypatch
     broad_target = _memory("m-broad-target", "Broad graph target")
     await db.insert_memory(specific)
     await db.insert_memory(broad_target)
-    specific_entity = await db.upsert_entity("specific topic", "Specific Topic", ["feature"])
-    broad_entity = await db.upsert_entity("broad topic", "Broad Topic", ["team"])
+    specific_entity = await db.upsert_entity("specific topic", "Specific Topic")
+    broad_entity = await db.upsert_entity("broad topic", "Broad Topic")
     await db.link_memory_entity(specific.id, specific_entity)
     await db.link_memory_entity(broad_target.id, broad_entity)
     for index in range(100):

@@ -14,7 +14,6 @@ export interface Memory {
   visibility: Visibility | string;
   owner_user_id: string | null;
   project_key: string | null;
-  tags: string[];
   confidence: number;
   corroboration_count: number;
   contradiction_count: number;
@@ -59,7 +58,6 @@ export interface MemorySource {
 export interface Entity {
   id: number;
   canonical_name: string;
-  tags: string[];
   display_name: string;
   created_at: string | null;
 }
@@ -620,7 +618,6 @@ export interface MemoryReviewMemorySummary {
   confidence: number;
   corroboration_count: number;
   status: string;
-  tags: string[];
   entity_refs: string[];
   sources: MemorySource[];
   created_at: string | null;

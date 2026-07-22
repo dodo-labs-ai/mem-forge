@@ -108,7 +108,6 @@ def _proposal(**overrides) -> AgentKnowledgePatchProposal:
             "rationale": "This lets overdue schedules run without waiting for UI traffic.",
         },
         "memory_type": "procedure",
-        "tags": ["scheduler", "source-sync"],
         "reason": "The window confirms a durable scheduler invariant.",
         "confidence": 0.9,
         "citations": ["agent-window://codex/sess-1/sha256-window"],

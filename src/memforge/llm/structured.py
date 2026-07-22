@@ -111,64 +111,6 @@ class AgentSessionAuthorityResponse(StructuredResponseModel):
     decisions: list[AgentSessionAuthorityDecision]
 
 
-class EnrichmentEntity(StructuredResponseModel):
-    """One entity identified during document enrichment."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    name: str = Field(min_length=1)
-    type: str = "unknown"
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-    aliases: list[str] = Field(default_factory=list)
-    tags: list[str] = Field(default_factory=list)
-
-
-class EnrichmentRelationship(StructuredResponseModel):
-    """One document relationship identified during enrichment."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    target_title: str = ""
-    relation_type: Literal["depends-on", "extends", "supersedes", "references", "related"] = "related"
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-
-
-class EnrichmentAliasGroup(StructuredResponseModel):
-    """Legacy alias group shape preserved for enrichment compatibility."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    canonical: str = ""
-    aliases: list[str] = Field(default_factory=list)
-    evidence: str = ""
-
-
-class EnrichmentResponse(StructuredResponseModel):
-    """Schema returned by document enrichment."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    summary: str = "No summary available."
-    tags: list[str] = Field(default_factory=list)
-    entities: list[EnrichmentEntity] = Field(default_factory=list)
-    relationships: list[EnrichmentRelationship] = Field(default_factory=list)
-    doc_type: Literal[
-        "design-doc",
-        "runbook",
-        "decision-record",
-        "how-to",
-        "reference",
-        "postmortem",
-        "meeting-notes",
-        "ticket",
-        "discussion",
-        "email",
-        "unknown",
-    ] = "unknown"
-    complexity: Literal["low", "medium", "high"] = "medium"
-    entity_aliases: list[EnrichmentAliasGroup] = Field(default_factory=list)
-
-
 class MemoryCandidate(StructuredResponseModel):
     """One memory candidate extracted from a source document."""
 
@@ -178,7 +120,6 @@ class MemoryCandidate(StructuredResponseModel):
     memory_type: Literal["fact", "decision", "convention", "procedure"]
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     entity_refs: list[str] = Field(default_factory=list)
-    tags: list[str] = Field(default_factory=list)
     valid_from: str | None = None
     valid_until: str | None = None
     extraction_context: str | None = None
@@ -287,6 +228,25 @@ class EntityValidationResponse(StructuredResponseModel):
     reason: str | None = None
 
 
+class EntityBatchValidationDecision(StructuredResponseModel):
+    """One attributable decision for a bounded entity-mention candidate set."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mention: str = Field(min_length=1)
+    matched_id: int | None = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = Field(default="", max_length=1000)
+
+
+class EntityBatchValidationResponse(StructuredResponseModel):
+    """Schema returned by one batched entity ambiguity adjudication call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[EntityBatchValidationDecision]
+
+
 class QueryEntityDetectionResponse(StructuredResponseModel):
     """Schema returned by query entity detection."""
 
@@ -317,15 +277,6 @@ class StructuredLlmConfig:
 
 
 class SourceSupportStructuredClient(Protocol):
-    async def enrich_document(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int,
-        model: str | None = None,
-    ) -> EnrichmentResponse:
-        """Return schema-validated document enrichment."""
-
     async def verify_source_support(
         self,
         prompt: str,
@@ -387,6 +338,15 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> EntityValidationResponse:
         """Return schema-validated entity validation."""
+
+    async def validate_entity_batch(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 2048,
+        model: str | None = None,
+    ) -> EntityBatchValidationResponse:
+        """Return attributable decisions for bounded entity candidate sets."""
 
     async def detect_query_entities(
         self,
@@ -546,20 +506,6 @@ class LiteLlmStructuredClient:
     def __init__(self, config: StructuredLlmConfig) -> None:
         self.config = config
 
-    async def enrich_document(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int,
-        model: str | None = None,
-    ) -> EnrichmentResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=EnrichmentResponse,
-            max_tokens=max_tokens,
-            model=model,
-        )
-
     async def verify_source_support(
         self,
         prompt: str,
@@ -653,6 +599,20 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=EntityValidationResponse,
+            max_tokens=max_tokens,
+            model=model,
+        )
+
+    async def validate_entity_batch(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 2048,
+        model: str | None = None,
+    ) -> EntityBatchValidationResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=EntityBatchValidationResponse,
             max_tokens=max_tokens,
             model=model,
         )

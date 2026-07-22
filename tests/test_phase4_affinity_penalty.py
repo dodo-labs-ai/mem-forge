@@ -107,7 +107,6 @@ async def test_project_mode_upstream_prunes_other_projects(tmp_path):
                     visibility=Visibility.WORKSPACE.value,
                     owner_user_id=None,
                     project_key=key,
-                    tags=[],
                 )
             )
         adapters = build_sqlite_adapters(db, memory_collection=None)
@@ -151,7 +150,6 @@ async def test_project_first_mode_keeps_all_projects_visible(tmp_path):
                     visibility=Visibility.WORKSPACE.value,
                     owner_user_id=None,
                     project_key=key,
-                    tags=[],
                 )
             )
         adapters = build_sqlite_adapters(db, memory_collection=None)
@@ -184,7 +182,6 @@ async def test_fetch_ranking_metadata_returns_updated_at_and_project_key(tmp_pat
                 visibility=Visibility.WORKSPACE.value,
                 owner_user_id=None,
                 project_key="PAY",
-                tags=[],
             )
         )
         adapters = build_sqlite_adapters(db, memory_collection=None)
@@ -229,7 +226,6 @@ async def test_project_first_visibility_survives_real_cross_project_rows(tmp_pat
                     visibility=Visibility.WORKSPACE.value,
                     owner_user_id=None,
                     project_key=key,
-                    tags=[],
                 )
             )
         adapters = build_sqlite_adapters(db, memory_collection=None)

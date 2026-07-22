@@ -634,6 +634,9 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
                 "doc_id": item.doc_id,
                 "actor_user_id": item.actor_user_id,
                 "entity_ids": list(item.entity_ids),
+                "preclassified_decisions": [
+                    decision.to_payload() for decision in item.preclassified_decisions
+                ],
             }
             for item in plan.relation_discovery_requests
         ],

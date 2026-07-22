@@ -9,7 +9,6 @@ from memforge.llm.structured import (
     AgentSessionAuthorityResponse,
     CandidateLedgerResponse,
     EntityValidationResponse,
-    EnrichmentResponse,
     LiteLlmStructuredClient,
     MemoryCandidate,
     MemoryExtractionResponse,
@@ -143,7 +142,6 @@ def test_memory_extraction_response_accepts_memory_list():
                     "memory_type": "fact",
                     "confidence": 0.9,
                     "entity_refs": ["Service A"],
-                    "tags": ["database", "storage"],
                     "valid_from": None,
                     "valid_until": None,
                     "extraction_context": "Service A uses PostgreSQL 16",
@@ -158,7 +156,6 @@ def test_memory_extraction_response_accepts_memory_list():
             memory_type="fact",
             confidence=0.9,
             entity_refs=["Service A"],
-            tags=["database", "storage"],
             valid_from=None,
             valid_until=None,
             extraction_context="Service A uses PostgreSQL 16",
@@ -487,10 +484,6 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         schema = kwargs["response_format"]
-        if schema is EnrichmentResponse:
-            return CompletionResponse(
-                '{"summary":"Summary","tags":["tag"],"entities":[],"relationships":[],"doc_type":"reference","complexity":"low"}'
-            )
         if schema is ReconciliationResponse:
             return CompletionResponse('{"decisions":[{"action":"ADD","index":0,"reason":"new"}]}')
         if schema is CandidateLedgerResponse:
@@ -519,7 +512,6 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         )
     )
 
-    assert (await client.enrich_document("prompt", max_tokens=64000)).summary == "Summary"
     assert (await client.select_memory_candidates("prompt")).decisions[0].action == "KEEP"
     assert (await client.reconcile_memories("prompt")).decisions[0].action == "ADD"
     assert (await client.classify_memory_relations("prompt")).decisions[0].direction == "challenger_to_candidate"
@@ -528,7 +520,6 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     assert (await client.rerank_memories("prompt")).ranking == [2, 0, 1]
 
     assert [call["response_format"] for call in calls] == [
-        EnrichmentResponse,
         CandidateLedgerResponse,
         ReconciliationResponse,
         MemoryRelationResponse,

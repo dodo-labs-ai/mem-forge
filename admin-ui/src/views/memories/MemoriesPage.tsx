@@ -78,7 +78,6 @@ interface SearchHit {
   summary: string;
   confidence: number;
   relevance_score: number;
-  tags: string[];
   corroborated_by: number;
   last_observed_at: string | null;
   status: Memory["status"] | null;
@@ -112,7 +111,6 @@ function searchHitToMemoryRow(hit: SearchHit): Memory {
     visibility: "workspace",
     owner_user_id: null,
     project_key: null,
-    tags: hit.tags ?? [],
     confidence: hit.confidence,
     corroboration_count: hit.corroborated_by,
     contradiction_count: 0,
@@ -521,13 +519,8 @@ export function MemoriesPage() {
                           </TableCell>
                           <TableCell>
                             <div className="max-w-2xl truncate text-sm font-medium">{memory.content}</div>
-                            {(memory.tags.length > 0 || projectKey) && (
+                            {projectKey && (
                               <div className="mt-1 flex flex-wrap items-center gap-1">
-                                {memory.tags.slice(0, 3).map((tag) => (
-                                  <Badge key={tag} variant="secondary" className="text-[11px]">
-                                    {tag}
-                                  </Badge>
-                                ))}
                                 {projectKey && (!isReservedProjectKey(projectKey) || isUnsortedProject) && (
                                   <Badge
                                     variant="outline"

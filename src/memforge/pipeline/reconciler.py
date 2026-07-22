@@ -436,7 +436,6 @@ def _parse_decisions(
                 memory_type=raw.memory_type,
                 confidence=raw.confidence,
                 entity_refs=raw.entity_refs,
-                tags=raw.tags,
                 valid_from=raw.valid_from,
                 valid_until=raw.valid_until,
                 extraction_context=raw.extraction_context,

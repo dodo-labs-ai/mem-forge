@@ -20,6 +20,7 @@ from memforge.memory.lifecycle_plan import (
     StaleGuard,
 )
 from memforge.memory.relation_discovery_contract import (
+    PreclassifiedRelationDecision,
     RelationDiscoveryRequest,
     relation_discovery_request_id,
     resolve_relation_discovery_actor_user_id,
@@ -44,7 +45,10 @@ class NewMemoryDefaults:
     source_type: str
     access_context_hash: str
     actor_user_id: str | None = None
-    entity_ids: tuple[int, ...] = ()
+    entity_ids_by_claim_hash: Mapping[str, tuple[int, ...]] | None = None
+    preclassified_relations_by_claim_hash: Mapping[
+        str, tuple[PreclassifiedRelationDecision, ...]
+    ] | None = None
     source_updated_at: str | None = None
 
 
@@ -100,7 +104,26 @@ def build_lifecycle_plan(
         requested_actor_user_id=defaults.actor_user_id,
     )
 
-    def request_relation_discovery(memory_id: str, expected_content_hash: str) -> None:
+    def entity_ids_for(raw: RawMemory) -> tuple[int, ...]:
+        if defaults.entity_ids_by_claim_hash is None:
+            return ()
+        return defaults.entity_ids_by_claim_hash.get(content_hash(raw.content.strip()), ())
+
+    def preclassified_relations_for(
+        raw: RawMemory,
+    ) -> tuple[PreclassifiedRelationDecision, ...]:
+        if defaults.preclassified_relations_by_claim_hash is None:
+            return ()
+        return defaults.preclassified_relations_by_claim_hash.get(
+            content_hash(raw.content.strip()), ()
+        )
+
+    def request_relation_discovery(
+        memory_id: str,
+        expected_content_hash: str,
+        entity_ids: tuple[int, ...] = (),
+        preclassified_decisions: tuple[PreclassifiedRelationDecision, ...] = (),
+    ) -> None:
         relation_discovery_requests.append(
             RelationDiscoveryRequest(
                 id=relation_discovery_request_id(
@@ -115,7 +138,8 @@ def build_lifecycle_plan(
                 source_unit_revision_id=scope.target_unit_revision_id,
                 doc_id=defaults.doc_id,
                 actor_user_id=relation_discovery_actor_user_id,
-                entity_ids=defaults.entity_ids,
+                entity_ids=entity_ids,
+                preclassified_decisions=preclassified_decisions,
             )
         )
 
@@ -138,7 +162,7 @@ def build_lifecycle_plan(
                     LifecycleMutationType.CREATE_MEMORY,
                     memory_id=memory_id,
                     source_id=scope.source_id,
-                    payload={"memory": _memory_payload(raw, defaults)},
+                    payload={"memory": _memory_payload(raw, defaults, entity_ids=entity_ids_for(raw))},
                 ),
                 LifecycleMutation(
                     LifecycleMutationType.ATTACH_SUPPORT,
@@ -158,7 +182,12 @@ def build_lifecycle_plan(
         if memory_id not in created_ids:
             mutations.extend(creation_mutations)
             created_ids.add(memory_id)
-            request_relation_discovery(memory_id, content_hash(raw.content.strip()))
+            request_relation_discovery(
+                memory_id,
+                content_hash(raw.content.strip()),
+                entity_ids_for(raw),
+                preclassified_relations_for(raw),
+            )
         return memory_id
 
     corroboration_targets = corroboration_targets_by_claim_hash or {}
@@ -386,7 +415,7 @@ def build_lifecycle_plan(
                             "source_unit_revision_id": scope.target_unit_revision_id,
                             "doc_id": defaults.doc_id,
                             "actor_user_id": relation_discovery_actor_user_id,
-                            "entity_ids": list(defaults.entity_ids),
+                            "entity_ids": list(entity_ids_for(operation.memory)),
                         },
                     )
                 )
@@ -517,7 +546,6 @@ def _review_mutation(
             "content": operation.memory.content,
             "memory_type": operation.memory.memory_type,
             "confidence": operation.memory.confidence,
-            "tags": operation.memory.tags,
         }
     staged["proposed_disposition"] = disposition.value
     staged["replacement_memory_id"] = replacement_memory_id
@@ -547,7 +575,12 @@ def _serialize_mutation(mutation: LifecycleMutation) -> dict[str, object]:
     }
 
 
-def _memory_payload(raw: RawMemory, defaults: NewMemoryDefaults) -> dict[str, object]:
+def _memory_payload(
+    raw: RawMemory,
+    defaults: NewMemoryDefaults,
+    *,
+    entity_ids: tuple[int, ...],
+) -> dict[str, object]:
     content = raw.content.strip()
     valid_from = parse_memory_validity_date(raw.valid_from)
     valid_until = parse_memory_validity_date(raw.valid_until)
@@ -556,7 +589,6 @@ def _memory_payload(raw: RawMemory, defaults: NewMemoryDefaults) -> dict[str, ob
         "content_hash": content_hash(content),
         "memory_type": raw.memory_type,
         "confidence": raw.confidence,
-        "tags": list(raw.tags),
         "visibility": defaults.visibility,
         "owner_user_id": defaults.owner_user_id,
         "project_key": defaults.project_key,
@@ -565,7 +597,7 @@ def _memory_payload(raw: RawMemory, defaults: NewMemoryDefaults) -> dict[str, ob
         "valid_from": valid_from.isoformat() if valid_from is not None else None,
         "valid_until": valid_until.isoformat() if valid_until is not None else None,
         "entity_refs": list(raw.entity_refs),
-        "entity_ids": list(defaults.entity_ids),
+        "entity_ids": list(entity_ids),
         "document_source": {
             "doc_id": defaults.doc_id,
             "source_type": defaults.source_type,

@@ -87,7 +87,6 @@ async def test_project_first_visibility_after_projects_table_rename(db):
         visibility=Visibility.WORKSPACE.value,
         owner_user_id=None,
         project_key="DANGLING",
-        tags=[],
     )
     await db.insert_memory(mem)
 

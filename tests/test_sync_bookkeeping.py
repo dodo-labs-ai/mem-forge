@@ -20,14 +20,10 @@ from memforge.local_agent.document_identity import build_teams_doc_id
 from memforge.local_agent.teams_ledger import build_teams_window_id
 from memforge.models import (
     ContentItem,
-    DocumentMetadata,
-    Entity,
-    EnrichmentResult,
     GeneMetadata,
     Memory,
     MemoryExtractionResult,
     NormalizedContent,
-    RawEntityRef,
     RawContent,
     RawMemory,
     SyncState,
@@ -2264,17 +2260,16 @@ async def test_shared_extraction_pool_caps_orchestrator_work_across_sources(db: 
         )
 
     pool = ExtractionWorkPool(max_workers=4)
-    release_enrichment = asyncio.Event()
+    release_extraction = asyncio.Event()
     release_fetch = asyncio.Event()
     release_fetch.set()
-    enricher = BlockingEnricher(release=release_enrichment, target_entries=4)
+    extractor = BlockingMemoryExtractor(release=release_extraction, target_entries=4)
 
     def make_orchestrator() -> GeneSyncOrchestrator:
         return GeneSyncOrchestrator(
             db=db,
             doc_store=StubDocumentStore(),
-            enricher=enricher,
-            memory_extractor=NoopMemoryExtractor(),
+            memory_extractor=extractor,
             memory_engine=NoopMemoryEngine(),
             memory_store=None,
             max_concurrent=4,
@@ -2296,12 +2291,12 @@ async def test_shared_extraction_pool_caps_orchestrator_work_across_sources(db: 
         )
     )
 
-    await asyncio.wait_for(enricher.target_reached.wait(), timeout=2)
+    await asyncio.wait_for(extractor.target_reached.wait(), timeout=2)
     await asyncio.sleep(0.05)
 
-    assert enricher.max_active == 4
+    assert extractor.max_active == 4
 
-    release_enrichment.set()
+    release_extraction.set()
     states = await asyncio.gather(task_a, task_b)
     assert [state.last_sync_status for state in states] == ["success", "success"]
 
@@ -2326,7 +2321,6 @@ async def test_document_lifecycle_admission_caps_fetch_across_sources(db: Databa
         return GeneSyncOrchestrator(
             db=db,
             doc_store=StubDocumentStore(),
-            enricher=InstantEnricher(),
             memory_extractor=NoopMemoryExtractor(),
             memory_engine=NoopMemoryEngine(),
             memory_store=None,
@@ -2381,7 +2375,6 @@ async def test_document_lifecycle_admission_does_not_prequeue_one_source_ahead_o
         return GeneSyncOrchestrator(
             db=db,
             doc_store=StubDocumentStore(),
-            enricher=InstantEnricher(),
             memory_extractor=NoopMemoryExtractor(),
             memory_engine=NoopMemoryEngine(),
             memory_store=None,
@@ -2692,7 +2685,6 @@ async def test_sync_gene_binds_document_store_at_pipeline_boundary(db: Database)
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
-        enricher=InstantEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -2785,76 +2777,6 @@ class FailingProjectedMemoryEngine(NoopMemoryEngine):
     async def apply_projected_lifecycle(self, **kwargs):
         self.calls += 1
         raise RuntimeError("lifecycle apply failed")
-
-
-class FailingVectorStore:
-    def __init__(self) -> None:
-        self.upserted: dict[str, dict] = {}
-        self.deleted: list[str] = []
-
-    def get(self, *, ids=None, include=None):
-        selected = [record_id for record_id in (ids or []) if record_id in self.upserted]
-        return {
-            "ids": selected,
-            "metadatas": [self.upserted[record_id].get("metadata", {}) for record_id in selected],
-            "embeddings": [self.upserted[record_id].get("embedding") for record_id in selected],
-            "documents": [self.upserted[record_id].get("document") for record_id in selected],
-        }
-
-    def upsert(self, *, ids, embeddings=None, metadatas=None, documents=None):
-        for index, record_id in enumerate(ids):
-            self.upserted[record_id] = {
-                "metadata": metadatas[index] if metadatas else {},
-                "embedding": embeddings[index] if embeddings else None,
-                "document": documents[index] if documents else None,
-            }
-        raise RuntimeError("document vector failed after mutation")
-
-    def delete(self, *, ids):
-        self.deleted.extend(ids)
-        for record_id in ids:
-            self.upserted.pop(record_id, None)
-
-
-class FalseyVectorStore:
-    def __init__(self) -> None:
-        self.upserted: dict[str, dict] = {}
-
-    def __bool__(self) -> bool:
-        return False
-
-    def get(self, *, ids=None, include=None):
-        selected = [record_id for record_id in (ids or []) if record_id in self.upserted]
-        return {
-            "ids": selected,
-            "metadatas": [self.upserted[record_id].get("metadata", {}) for record_id in selected],
-            "embeddings": [self.upserted[record_id].get("embedding") for record_id in selected],
-            "documents": [self.upserted[record_id].get("document") for record_id in selected],
-        }
-
-    def upsert(self, *, ids, embeddings=None, metadatas=None, documents=None):
-        for index, record_id in enumerate(ids):
-            self.upserted[record_id] = {
-                "metadata": metadatas[index] if metadatas else {},
-                "embedding": embeddings[index] if embeddings else None,
-                "document": documents[index] if documents else None,
-            }
-
-    def delete(self, *, ids):
-        for record_id in ids:
-            self.upserted.pop(record_id, None)
-
-
-class FlakyFalseyVectorStore(FalseyVectorStore):
-    def __init__(self) -> None:
-        super().__init__()
-        self.failures_remaining = 1
-
-    def upsert(self, *, ids, embeddings=None, metadatas=None, documents=None):
-        if self.failures_remaining:
-            self.failures_remaining -= 1
-            raise RuntimeError("transient vector failure")
-        super().upsert(ids=ids, embeddings=embeddings, metadatas=metadatas, documents=documents)
 
 
 class FailingLifecycleOutboxMemoryStore:
@@ -3004,7 +2926,6 @@ async def test_unchanged_multi_observation_projection_skips_full_document_extrac
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -3017,8 +2938,6 @@ async def test_unchanged_multi_observation_projection_skips_full_document_extrac
         markdown_body=normalized.markdown_body,
         source_type="teams",
         doc_type="conversation",
-        entity_names=[],
-        existing_memories=[],
         doc_id=item.item_id,
         source_id=source_id,
         run_id=unchanged.run_id,
@@ -3504,61 +3423,7 @@ class MovingGithubFileGene(UpdatingDocumentGene):
         )
 
 
-class DocumentVisibleEnricher:
-    def __init__(self, db: Database, source_id: str):
-        self.db = db
-        self.source_id = source_id
-
-    async def enrich_document(self, *, doc_id, content, source_type):
-        async with self.db.db.execute(
-            "SELECT COUNT(*) FROM documents WHERE source = ? AND doc_id = ?",
-            (self.source_id, doc_id),
-        ) as cursor:
-            row = await cursor.fetchone()
-        assert row[0] == 1
-        return EnrichmentResult(
-            summary="Summary",
-            tags=[],
-            entities=[],
-            relationships=[],
-            doc_type="jira_issue",
-            complexity="low",
-        )
-
-
-class EntityMentioningEnricher:
-    async def enrich_document(self, *, doc_id, content, source_type):
-        return EnrichmentResult(
-            summary="Summary",
-            tags=["tag-one"],
-            entities=[
-                RawEntityRef(
-                    name="Raw Extracted Entity",
-                    type="service",
-                    tags=["service"],
-                    aliases=["Raw Alias"],
-                )
-            ],
-            relationships=[],
-            doc_type="jira_issue",
-            complexity="low",
-        )
-
-
-class InstantEnricher:
-    async def enrich_document(self, *, doc_id, content, source_type):
-        del doc_id, content, source_type
-        return EnrichmentResult(
-            summary="Summary",
-            tags=[],
-            entities=[],
-            relationships=[],
-            doc_type="jira_issue",
-            complexity="low",
-        )
-
-
-class BlockingEnricher:
+class BlockingMemoryExtractor(NoopMemoryExtractor):
     def __init__(self, release: asyncio.Event, target_entries: int):
         self.release = release
         self.target_entries = target_entries
@@ -3567,8 +3432,7 @@ class BlockingEnricher:
         self.max_active = 0
         self.target_reached = asyncio.Event()
 
-    async def enrich_document(self, *, doc_id, content, source_type):
-        del doc_id, content, source_type
+    async def _extract(self):
         self.entered += 1
         self.active += 1
         self.max_active = max(self.max_active, self.active)
@@ -3576,26 +3440,21 @@ class BlockingEnricher:
             self.target_reached.set()
         try:
             await self.release.wait()
-            return EnrichmentResult(
-                summary="Summary",
-                tags=[],
-                entities=[],
-                relationships=[],
-                doc_type="jira_issue",
-                complexity="low",
-            )
+            return MemoryExtractionResult(memories=[])
         finally:
             self.active -= 1
 
+    async def extract_memories(self, **kwargs):
+        del kwargs
+        return await self._extract()
 
-class ExplodingEnricher:
-    async def enrich_document(self, *, doc_id, content, source_type):
-        raise AssertionError("unchanged document should not be enriched")
+    async def extract_unit_memories(self, context, **kwargs):
+        del context, kwargs
+        return await self._extract()
 
-
-class RaisingEnricher:
-    async def enrich_document(self, *, doc_id, content, source_type):
-        raise RuntimeError("enrichment exploded")
+    async def extract_projection_batch_memories(self, batch, **kwargs):
+        del batch, kwargs
+        return await self._extract()
 
 
 class ConstantMemorySampler:
@@ -3696,24 +3555,6 @@ async def _insert_document_with_metadata(
             now.isoformat(),
         ),
     )
-    await db.upsert_metadata(
-        DocumentMetadata(
-            doc_id=doc_id,
-            summary="Existing summary",
-            tags=["existing"],
-            entities=[
-                Entity(
-                    id=1,
-                    canonical_name="Existing Entity",
-                    tags=[],
-                    display_name="Existing Entity",
-                )
-            ],
-            doc_type="jira_issue",
-            complexity="low",
-            enriched_at=now,
-        )
-    )
     await db.update_source_doc_count(source_id, 1)
 
 
@@ -3747,7 +3588,6 @@ async def test_large_single_observation_uses_bounded_projection_batches(db: Data
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -3786,7 +3626,6 @@ async def test_projection_batch_candidates_are_aggregated_before_projected_lifec
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=extractor,
         memory_engine=memory_engine,
         memory_store=None,
@@ -3827,7 +3666,6 @@ async def test_sync_memory_observer_records_discovery_and_document_stages(db: Da
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -3853,7 +3691,6 @@ async def test_sync_memory_observer_records_discovery_and_document_stages(db: Da
     assert "after_fetch" in stages
     assert "after_normalize" in stages
     assert "after_raw_store" in stages
-    assert "after_enrich" in stages
     assert "after_extract" in stages
     assert "after_memory_engine" in stages
     assert "document_lifecycle_exit" in stages
@@ -3889,7 +3726,6 @@ async def test_document_lifecycle_reclaims_process_memory_after_each_document(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -3936,7 +3772,6 @@ async def test_sync_memory_observer_records_pdf_export_stage(db: Database):
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -3972,8 +3807,7 @@ async def test_sync_memory_observer_records_lifecycle_exit_when_document_fails(d
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=RaisingEnricher(),
-        memory_extractor=NoopMemoryExtractor(),
+        memory_extractor=FailingMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
         max_concurrent=1,
@@ -4010,7 +3844,6 @@ async def test_successful_zero_change_sync_advances_last_sync_and_keeps_doc_coun
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=None,
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -4057,7 +3890,6 @@ async def test_full_discovery_without_completion_evidence_never_deletes_existing
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=None,
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
         memory_store=FailingDocumentDeleteMemoryStore(),
@@ -4092,7 +3924,6 @@ async def test_incremental_sync_uses_overlap_window_for_discovery(db: Database):
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=None,
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -4126,7 +3957,6 @@ async def test_incremental_sync_does_not_delete_unchanged_documents_from_small_s
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=_audited_memory_store(db),
@@ -4166,7 +3996,6 @@ async def test_force_full_sync_ignores_incremental_cursor(db: Database):
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=None,
-        enricher=None,
         memory_extractor=None,
         memory_engine=None,
         memory_store=None,
@@ -4199,7 +4028,6 @@ async def test_authoritative_snapshot_ignores_cursor_without_forcing_reprocessin
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=None,
-        enricher=None,
         memory_extractor=None,
         memory_engine=None,
         memory_store=None,
@@ -4238,7 +4066,6 @@ async def test_complete_source_scope_transition_forces_snapshot_and_applies(db: 
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=None,
-        enricher=None,
         memory_extractor=None,
         memory_engine=None,
         memory_store=None,
@@ -4278,7 +4105,6 @@ async def test_scope_transition_reenters_same_durable_run_on_worker_retry(db: Da
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=None,
-        enricher=None,
         memory_extractor=None,
         memory_engine=None,
         memory_store=None,
@@ -4360,7 +4186,6 @@ async def test_partial_conversation_scope_transition_preserves_old_membership(db
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=None,
-        enricher=None,
         memory_extractor=None,
         memory_engine=None,
         memory_store=None,
@@ -4408,7 +4233,6 @@ async def test_teams_scope_transition_applies_after_removed_units_are_tombstoned
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=None,
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -4506,7 +4330,6 @@ async def test_teams_max_age_transition_applies_only_with_target_time_attestatio
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=None,
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -4548,7 +4371,6 @@ async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=memory_engine,
         memory_store=None,
@@ -4598,7 +4420,6 @@ async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=memory_engine,
         memory_store=None,
@@ -4638,7 +4459,6 @@ async def test_document_last_modified_becomes_memory_source_updated_at(db: Datab
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=RecordingMemoryExtractor(),
         memory_engine=memory_engine,
         memory_store=None,
@@ -4677,7 +4497,6 @@ async def test_explicit_source_updated_at_overrides_document_last_modified(db: D
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=RecordingMemoryExtractor(),
         memory_engine=memory_engine,
         memory_store=None,
@@ -4724,7 +4543,6 @@ async def test_deletion_failure_marks_sync_failed(db: Database):
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=None,
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
         memory_store=FailingDocumentDeleteMemoryStore(),
@@ -4753,7 +4571,6 @@ async def test_rebaseline_replay_removes_legacy_document_without_source_unit(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=None,
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
         memory_store=memory_store,
@@ -4791,7 +4608,6 @@ async def test_normal_sync_keeps_legacy_document_without_source_unit_fail_closed
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=None,
         memory_extractor=None,
         memory_engine=NoopMemoryEngine(),
         memory_store=memory_store,
@@ -4824,7 +4640,6 @@ async def test_auth_failure_records_failed_sync_state_without_secondary_error(db
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=None,
-        enricher=None,
         memory_extractor=None,
         memory_engine=None,
         memory_store=None,
@@ -7281,7 +7096,6 @@ async def test_document_is_indexed_before_enrichment(db: Database):
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -7341,11 +7155,9 @@ async def test_projection_repair_targets_only_requested_documents_without_semant
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=semantic_guard,
         memory_extractor=semantic_guard,
         memory_engine=semantic_guard,
         memory_store=None,
-        vector_store=FailingVectorStore(),
         max_concurrent=1,
     )
 
@@ -7410,11 +7222,9 @@ async def test_rebaseline_preflight_reads_full_provider_corpus_without_persistin
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=semantic_guard,
         memory_extractor=semantic_guard,
         memory_engine=semantic_guard,
         memory_store=None,
-        vector_store=FailingVectorStore(),
         max_concurrent=1,
     )
 
@@ -7553,11 +7363,9 @@ async def test_rebaseline_preflight_accepts_proven_authoritative_teams_package(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=semantic_guard,
         memory_extractor=semantic_guard,
         memory_engine=semantic_guard,
         memory_store=None,
-        vector_store=FailingVectorStore(),
         max_concurrent=1,
     )
 
@@ -7601,7 +7409,6 @@ async def test_rebaseline_preflight_accepts_missing_units_only_with_complete_dis
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -7651,7 +7458,6 @@ async def test_rebaseline_preflight_fails_closed_on_empty_normalized_content(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -7714,7 +7520,6 @@ async def test_rebaseline_preflight_rejects_truncated_jira_projection(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -7813,7 +7618,6 @@ async def test_rebaseline_preflight_accepts_provider_attested_empty_page(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -7850,7 +7654,6 @@ async def test_normal_sync_reconciles_empty_revision_without_llm_extraction(
     first = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=first_engine,
         memory_store=None,
@@ -7874,7 +7677,6 @@ async def test_normal_sync_reconciles_empty_revision_without_llm_extraction(
     second = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=SemanticWorkMustNotRun(),
         memory_extractor=SemanticWorkMustNotRun(),
         memory_engine=empty_engine,
         memory_store=None,
@@ -7910,7 +7712,6 @@ async def test_projection_repair_fails_when_requested_document_is_not_discovered
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -7948,7 +7749,6 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -8008,7 +7808,6 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     assert await db.get_document("github-old-design") is None
     assert await db.get_document("github-new-design") is None
     assert await db.get_document("github-final-design") is not None
-    assert await db.get_metadata("github-final-design") is not None
     unit_rows = await db.db.execute_fetchall(
         "SELECT id FROM source_units WHERE source_id = ?",
         (source_id,),
@@ -8061,7 +7860,6 @@ async def test_exact_version_github_file_move_a_to_b_to_a_keeps_one_lineage(db: 
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -8152,7 +7950,6 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=RecordingMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=_audited_memory_store(db),
@@ -8315,6 +8112,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
     class ReplayMemoryStore:
         def __init__(self, database: Database) -> None:
             self.db = database
+            self.relational = adapters.relational
 
         def operation_context(self, **kwargs):
             del kwargs
@@ -8370,7 +8168,6 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=InstantEnricher(),
         memory_extractor=extractor,
         memory_engine=MemoryEngine(
             cross_document_candidates=CrossDocumentCandidateRetriever(
@@ -8462,7 +8259,6 @@ async def test_full_document_extraction_failure_is_audited(db: Database):
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=FailingMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=memory_store,
@@ -8520,7 +8316,6 @@ async def test_document_update_uses_diff_guided_extraction_and_audits_strategy(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=memory_engine,
         memory_store=memory_store,
@@ -8614,7 +8409,6 @@ async def test_diff_guided_extraction_rejects_candidates_outside_current_change(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=memory_engine,
         memory_store=_audited_memory_store(db),
@@ -8668,7 +8462,6 @@ async def test_large_single_observation_update_keeps_diff_guided_authority(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=RecordingMemoryEngine(),
         memory_store=_audited_memory_store(db),
@@ -8715,7 +8508,6 @@ async def test_structured_source_update_uses_diff_guided_extraction_and_audits_s
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=memory_engine,
         memory_store=memory_store,
@@ -8773,7 +8565,6 @@ async def test_document_update_falls_back_to_full_extraction_when_previous_conte
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
         memory_store=memory_store,
@@ -8820,7 +8611,6 @@ async def test_large_full_document_uses_deterministic_units(db: Database):
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
         memory_store=memory_store,
@@ -8857,7 +8647,6 @@ async def test_full_document_unit_extraction_honors_orchestrator_concurrency(db:
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, "src-large-doc-full"),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
         memory_store=_audited_memory_store(db),
@@ -8869,8 +8658,6 @@ async def test_full_document_unit_extraction_honors_orchestrator_concurrency(db:
             markdown_body=markdown,
             source_type="github_pages",
             doc_type="reference",
-            entity_names=[],
-            existing_memories=[],
             doc_id="doc-large",
             source_id="src-large-doc-full",
             document_title="Design Doc",
@@ -8896,7 +8683,6 @@ async def test_document_admission_capacity_does_not_throttle_unit_extraction(db:
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, "src-large-doc-admission"),
         memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
         memory_store=_audited_memory_store(db),
@@ -8909,8 +8695,6 @@ async def test_document_admission_capacity_does_not_throttle_unit_extraction(db:
             markdown_body=markdown,
             source_type="github_pages",
             doc_type="reference",
-            entity_names=[],
-            existing_memories=[],
             doc_id="doc-large",
             source_id="src-large-doc-admission",
             document_title="Design Doc",
@@ -8960,7 +8744,6 @@ async def test_partial_unit_extraction_failure_skips_reconciliation(db: Database
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=extractor,
         memory_engine=memory_engine,
         memory_store=memory_store,
@@ -9008,7 +8791,6 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
     first = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=RecordingMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -9030,7 +8812,6 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
     failed = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=RecordingMemoryExtractor(),
         memory_engine=failing_engine,
         memory_store=None,
@@ -9052,7 +8833,6 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
     retry = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=RecordingMemoryExtractor(),
         memory_engine=retry_engine,
         memory_store=None,
@@ -9086,7 +8866,6 @@ async def test_item_processing_is_bounded_by_max_concurrent(db: Database):
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -9128,7 +8907,6 @@ async def test_sync_cancels_and_drains_sibling_items_when_one_item_is_cancelled(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
@@ -9184,7 +8962,6 @@ async def test_running_progress_reports_extracted_memories(db: Database):
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=CountingMemoryEngine(inserted=3),
         memory_store=None,
@@ -9212,196 +8989,6 @@ async def test_running_progress_reports_extracted_memories(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_document_vector_failure_happens_before_memory_mutations(db: Database, monkeypatch):
-    source_id = "src-vector-before-memory"
-    await db.upsert_source(
-        id=source_id,
-        type="jira",
-        name="Jira Board",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    release = asyncio.Event()
-    release.set()
-    memory_engine = CountingMemoryEngine(inserted=3)
-    vector_store = FailingVectorStore()
-    retry_delays: list[float] = []
-
-    async def record_retry_delay(delay: float) -> None:
-        retry_delays.append(delay)
-
-    def fake_embed_texts(texts, *args, **kwargs):
-        return [[0.1, 0.2, 0.3] for _ in texts]
-
-    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
-
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
-        memory_extractor=NoopMemoryExtractor(),
-        memory_engine=memory_engine,
-        memory_store=None,
-        vector_store=vector_store,
-        embed_cfg={"base_url": "http://embedding", "api_key": "test", "model": "test"},
-        max_concurrent=1,
-        retry_sleep=record_retry_delay,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=BlockingFetchGene(item_count=1, release=release),
-        source_name="Jira Board",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "failed"
-    assert retry_delays == [2, 4]
-    assert memory_engine.enrichment_calls == 0
-    assert memory_engine.projected_lifecycle_calls == 0
-    assert await db.get_document("jira-0") is None
-    assert "jira-0" not in vector_store.upserted
-
-
-@pytest.mark.asyncio
-async def test_falsey_document_collection_still_receives_vector_upsert(db: Database, monkeypatch):
-    source_id = "src-falsey-vector"
-    await db.upsert_source(
-        id=source_id,
-        type="jira",
-        name="Jira Board",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    release = asyncio.Event()
-    release.set()
-    vector_store = FalseyVectorStore()
-
-    def fake_embed_texts(texts, *args, **kwargs):
-        return [[0.1, 0.2, 0.3] for _ in texts]
-
-    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
-
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
-        memory_extractor=NoopMemoryExtractor(),
-        memory_engine=NoopMemoryEngine(),
-        memory_store=None,
-        vector_store=vector_store,
-        embed_cfg={"base_url": "http://embedding", "api_key": "test", "model": "test"},
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=BlockingFetchGene(item_count=1, release=release),
-        source_name="Jira Board",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "success"
-    assert vector_store.upserted["jira-0"]["metadata"]["content_hash"]
-    assert vector_store.upserted["jira-0"]["metadata"]["version"] == "0"
-
-
-@pytest.mark.asyncio
-async def test_document_vector_text_is_independent_of_extracted_entity_names(db: Database, monkeypatch):
-    source_id = "src-vector-text"
-    await db.upsert_source(
-        id=source_id,
-        type="jira",
-        name="Jira Board",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    release = asyncio.Event()
-    release.set()
-    vector_store = FalseyVectorStore()
-
-    def fake_embed_texts(texts, *args, **kwargs):
-        return [[0.1, 0.2, 0.3] for _ in texts]
-
-    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
-
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        enricher=EntityMentioningEnricher(),
-        memory_extractor=NoopMemoryExtractor(),
-        memory_engine=NoopMemoryEngine(),
-        memory_store=None,
-        vector_store=vector_store,
-        embed_cfg={"base_url": "http://embedding", "api_key": "test", "model": "test"},
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=BlockingFetchGene(item_count=1, release=release),
-        source_name="Jira Board",
-        source_id=source_id,
-    )
-
-    document_text = vector_store.upserted["jira-0"]["document"]
-    assert state.last_sync_status == "success"
-    assert "Raw Extracted Entity" not in document_text
-    assert "Raw Alias" not in document_text
-    assert document_text == "Summary\ntag-one\njira_issue\nlow"
-
-
-@pytest.mark.asyncio
-async def test_unchanged_document_repairs_stale_vector_without_llm_reprocessing(
-    db: Database,
-    monkeypatch,
-):
-    source_id = "src-stale-vector-repair"
-    markdown = "# Jira 0\n\nBody"
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id="jira-0",
-        title="Jira 0",
-        markdown=markdown,
-        version="0",
-    )
-    release = asyncio.Event()
-    release.set()
-    vector_store = FalseyVectorStore()
-
-    def fake_embed_texts(texts, *args, **kwargs):
-        return [[0.1, 0.2, 0.3] for _ in texts]
-
-    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
-
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        enricher=ExplodingEnricher(),
-        memory_extractor=NoopMemoryExtractor(),
-        memory_engine=NoopMemoryEngine(),
-        memory_store=None,
-        vector_store=vector_store,
-        embed_cfg={"base_url": "http://embedding", "api_key": "test", "model": "test"},
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=BlockingFetchGene(item_count=1, release=release),
-        source_name="Jira Board",
-        source_id=source_id,
-    )
-
-    history = await db.get_sync_history(source=source_id, limit=1)
-    assert state.last_sync_status == "success"
-    assert state.docs_updated == 0
-    assert history[0]["docs_updated"] == 0
-    assert vector_store.upserted["jira-0"]["metadata"]["content_hash"] == content_hash(markdown)
-    assert vector_store.upserted["jira-0"]["metadata"]["version"] == "0"
-
-
-@pytest.mark.asyncio
 async def test_unchanged_document_backfills_pdf_uri_without_llm_reprocessing(db: Database):
     source_id = "src-unchanged-pdf-backfill"
     markdown = "# Jira 0\n\nBody"
@@ -9419,12 +9006,9 @@ async def test_unchanged_document_backfills_pdf_uri_without_llm_reprocessing(db:
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=ExplodingEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
-        vector_store=None,
-        embed_cfg={},
         max_concurrent=1,
     )
 
@@ -9467,12 +9051,9 @@ async def test_missing_pdf_uri_forces_full_sync_without_llm_reprocessing(db: Dat
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=ExplodingEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
-        vector_store=None,
-        embed_cfg={},
         max_concurrent=1,
     )
 
@@ -9509,12 +9090,9 @@ async def test_missing_required_confluence_pdf_fails_sync_without_hiding_gap(db:
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=ExplodingEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
-        vector_store=None,
-        embed_cfg={},
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     )
@@ -9551,12 +9129,9 @@ async def test_authoritative_empty_confluence_page_does_not_require_pdf(db: Data
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=ExplodingEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
-        vector_store=None,
-        embed_cfg={},
         max_concurrent=1,
     )
 
@@ -9594,12 +9169,9 @@ async def test_confluence_pdf_storage_failure_is_not_reported_as_export_failure(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=FailingPdfDocumentStore(),
-        enricher=ExplodingEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
-        vector_store=None,
-        embed_cfg={},
         max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     )
@@ -9640,12 +9212,9 @@ async def test_existing_confluence_pdf_uri_is_preserved_when_unchanged_export_is
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=ExplodingEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
-        vector_store=None,
-        embed_cfg={},
         max_concurrent=1,
     )
 
@@ -9696,12 +9265,9 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=NoArtifactRewriteDocumentStore(),
-        enricher=ExplodingEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
-        vector_store=None,
-        embed_cfg={},
         max_concurrent=1,
     )
 
@@ -9718,47 +9284,6 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
     assert document.raw_content_uri == "file:///tmp/Architecture/existing.raw"
     assert document.normalized_content_uri == "file:///tmp/Architecture/existing.md"
     assert document.pdf_content_uri == "file:///tmp/Architecture/existing.pdf"
-
-
-@pytest.mark.asyncio
-async def test_unchanged_stale_vector_fails_when_embedding_config_is_incomplete(
-    db: Database,
-):
-    source_id = "src-stale-vector-no-embed"
-    markdown = "# Jira 0\n\nBody"
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id="jira-0",
-        title="Jira 0",
-        markdown=markdown,
-        version="0",
-    )
-    release = asyncio.Event()
-    release.set()
-    vector_store = FalseyVectorStore()
-
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        enricher=ExplodingEnricher(),
-        memory_extractor=NoopMemoryExtractor(),
-        memory_engine=NoopMemoryEngine(),
-        memory_store=None,
-        vector_store=vector_store,
-        embed_cfg={"base_url": "http://embedding", "api_key": "", "model": "test"},
-        max_concurrent=1,
-        retry_sleep=_skip_retry_delay,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=BlockingFetchGene(item_count=1, release=release),
-        source_name="Jira Board",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "failed"
-    assert "embedding config is missing" in state.failed_docs[0].error
 
 
 @pytest.mark.asyncio
@@ -9781,12 +9306,9 @@ async def test_unchanged_document_survives_pending_lifecycle_vector_delivery(
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        enricher=ExplodingEnricher(),
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=memory_store,
-        vector_store=None,
-        embed_cfg={},
         max_concurrent=1,
     )
 
@@ -9801,98 +9323,3 @@ async def test_unchanged_document_survives_pending_lifecycle_vector_delivery(
     assert state.docs_updated == 0
     assert memory_store.drain_calls == 1
     assert await db.get_document("jira-0") is not None
-
-
-@pytest.mark.asyncio
-async def test_embedding_connection_failure_is_reported_as_provider_unreachable(
-    db: Database,
-    monkeypatch,
-):
-    source_id = "src-embedding-refused"
-    await db.upsert_source(
-        id=source_id,
-        type="jira",
-        name="Jira Board",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    release = asyncio.Event()
-    release.set()
-
-    def fake_embed_texts(texts, *args, **kwargs):
-        raise OSError("[Errno 111] Connection refused")
-
-    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
-
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        enricher=DocumentVisibleEnricher(db, source_id),
-        memory_extractor=NoopMemoryExtractor(),
-        memory_engine=NoopMemoryEngine(),
-        memory_store=None,
-        vector_store=FalseyVectorStore(),
-        embed_cfg={"base_url": "https://embedding.example", "api_key": "test-key", "model": "test"},
-        max_concurrent=1,
-        retry_sleep=_skip_retry_delay,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=BlockingFetchGene(item_count=1, release=release),
-        source_name="Jira Board",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "failed"
-    assert state.docs_failed == 1
-    assert "Embedding provider unreachable" in state.failed_docs[0].error
-    assert state.error_message is not None
-    assert "Embedding provider was unreachable for 1 document" in state.error_message
-
-
-@pytest.mark.asyncio
-async def test_unchanged_document_retries_stale_vector_repair_without_reprocessing(
-    db: Database,
-    monkeypatch,
-):
-    source_id = "src-stale-vector-retry"
-    markdown = "# Jira 0\n\nBody"
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id="jira-0",
-        title="Jira 0",
-        markdown=markdown,
-        version="0",
-    )
-    release = asyncio.Event()
-    release.set()
-    vector_store = FlakyFalseyVectorStore()
-
-    def fake_embed_texts(texts, *args, **kwargs):
-        return [[0.1, 0.2, 0.3] for _ in texts]
-
-    monkeypatch.setattr("memforge.retrieval.embeddings.embed_texts", fake_embed_texts)
-
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        enricher=ExplodingEnricher(),
-        memory_extractor=NoopMemoryExtractor(),
-        memory_engine=NoopMemoryEngine(),
-        memory_store=None,
-        vector_store=vector_store,
-        embed_cfg={"base_url": "http://embedding", "api_key": "test", "model": "test"},
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=BlockingFetchGene(item_count=1, release=release),
-        source_name="Jira Board",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "success"
-    assert state.docs_updated == 0
-    assert vector_store.upserted["jira-0"]["metadata"]["content_hash"] == content_hash(markdown)

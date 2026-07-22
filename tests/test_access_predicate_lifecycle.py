@@ -40,7 +40,6 @@ def _mem(mid: str, *, visibility=WORKSPACE, owner=None, status="active") -> Memo
         visibility=visibility,
         owner_user_id=owner,
         project_key=SHARED_PROJECT_KEY,
-        tags=[],
         status=status,
     )
 

@@ -4,7 +4,7 @@ Coordinates the full lifecycle of syncing data from a gene (external source)
 into the memory layer:
 
     authenticate -> discover -> fetch -> normalize -> store ->
-    enrich (Call 1) -> extract memories (Call 2) -> persist -> detect deletions
+    extract claim-sized memories -> reconcile lifecycle -> detect deletions
 
 Concurrency is managed via an asyncio.Semaphore (for LLM/embedding calls)
 and an asyncio.Lock (for SQLite writes). Each content item is processed
@@ -21,7 +21,6 @@ import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -30,16 +29,12 @@ import tiktoken
 
 from memforge.models import (
     ChangelogEntry,
-    DocumentMetadata,
     DocumentRecord,
-    Entity,
-    EnrichmentResult,
     FailedDoc,
     MemoryExtractionResult,
     SyncState,
     content_hash as compute_content_hash,
 )
-from memforge.retrieval.document_index import DocumentVectorIndex
 from memforge.pipeline.sync_memory import ProcessMemoryReclaimer, SyncMemoryObserver
 
 from memforge.pipeline.document_units import ExtractionContextPacker, UnitizationPolicy, unitize_markdown
@@ -54,12 +49,7 @@ from memforge.pipeline.source_projection_adapters import (
     source_run_projection_coverage,
 )
 from memforge.pipeline.projection_context import plan_projection_extraction_batches
-from memforge.memory.index_payloads import (
-    document_embedding_text,
-    embedding_text_hash,
-)
 from memforge.memory.lifecycle_plan import AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON
-from memforge.llm.providers import is_litellm_provider_model
 from memforge.memory.project_resolver import resolve_project_key
 from memforge.source_projection import (
     ProjectionCoverage,
@@ -77,7 +67,6 @@ if TYPE_CHECKING:
     from memforge.memory.engine import MemoryEngine
     from memforge.memory.store import MemoryStore
     from memforge.models import ContentItem, Memory
-    from memforge.pipeline.enricher import Enricher
     from memforge.pipeline.memory_extractor import MemoryExtractor
     from memforge.pipeline.source_support_detector import SourceSupportDetector
     from memforge.storage.database import Database
@@ -109,6 +98,22 @@ class SourceSyncMode(str, Enum):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _aggregate_extraction_metrics(
+    results: list[MemoryExtractionResult],
+) -> dict[str, int]:
+    """Aggregate content-free LLM cost signals across one bounded extraction fan-out."""
+
+    keys = (
+        "structured_llm_calls",
+        "prompt_chars",
+        "structured_llm_elapsed_ms",
+    )
+    return {
+        key: sum(int((result.metadata or {}).get(key, 0) or 0) for result in results)
+        for key in keys
+    }
 
 
 class ExtractionWorkPool:
@@ -412,7 +417,7 @@ class GeneSyncOrchestrator:
 
     Lifecycle per sync run::
 
-        orchestrator = GeneSyncOrchestrator(db, doc_store, enricher, ...)
+        orchestrator = GeneSyncOrchestrator(db, doc_store, memory_extractor, ...)
         state = await orchestrator.sync_gene(gene, source_name, source_id)
 
     Each content item discovered by the Gene flows through one provider-neutral
@@ -428,12 +433,9 @@ class GeneSyncOrchestrator:
         self,
         db: Database,
         doc_store: DocumentStore,
-        enricher: Enricher,
         memory_extractor: MemoryExtractor,
         memory_engine: MemoryEngine,
         memory_store: MemoryStore,
-        vector_store: Any | None = None,
-        embed_cfg: dict | None = None,
         source_support_detector: SourceSupportDetector | None = None,
         max_concurrent: int = 3,
         extraction_pool: ExtractionWorkPool | None = None,
@@ -445,13 +447,9 @@ class GeneSyncOrchestrator:
     ) -> None:
         self.db = db
         self.doc_store = doc_store
-        self.enricher = enricher
         self.memory_extractor = memory_extractor
         self.memory_engine = memory_engine
         self.memory_store = memory_store
-        self.vector_store = vector_store
-        self.document_index = DocumentVectorIndex(vector_store)
-        self.embed_cfg = embed_cfg
         self.source_support_detector = source_support_detector
         self.max_concurrent = max(1, max_concurrent)
         self.extraction_pool = extraction_pool
@@ -1291,11 +1289,9 @@ class GeneSyncOrchestrator:
             3. Compare the content hash and inspect stored artifacts
             4. Store new or missing artifacts
             5. Count tokens
-            6. Call 1: Enrich document -> entity resolution
-            7. Call 2: Extract memories -> dedup + persist
-            8. Upsert document record + metadata in DB
-            9. Upsert document embedding in vector store
-            10. Record changelog
+            6. Extract current Memory candidates once per bounded Source Unit batch
+            7. Reconcile lifecycle, batch-resolve candidate entity mentions, and persist
+            8. Record the changelog
 
         Returns
         -------
@@ -1583,12 +1579,9 @@ class GeneSyncOrchestrator:
             if existing_doc is None and lineage_predecessor_docs:
                 existing_doc = lineage_predecessor_docs[0]
                 existing_hash = existing_doc.content_hash
-            existing_metadata = await self.db.get_metadata(existing_doc.doc_id) if existing_doc is not None else None
-
         content_unchanged = existing_hash == new_hash
         unchanged = (
             (content_unchanged or not projection_requires_extraction)
-            and existing_metadata is not None
             and not force_reprocess
         )
         previous_markdown = (
@@ -1672,14 +1665,6 @@ class GeneSyncOrchestrator:
                 pdf_bytes=len(pdf_bytes) if pdf_bytes else 0,
             )
 
-        vector_current = False
-        if execution_mode is not SourceSyncMode.PROJECTION_REPAIR:
-            vector_current = await self._document_vector_is_current(
-                doc_id=doc_id,
-                content_hash=new_hash,
-                version=item.version,
-            )
-
         token_count = _count_tokens(markdown_body)
         now = datetime.now(timezone.utc)
         source_row = await self.db.get_source(source_id)
@@ -1744,58 +1729,14 @@ class GeneSyncOrchestrator:
                 await self.memory_store.attempt_lifecycle_vector_delivery(
                     source_id=source_id
                 )
-            if vector_current:
-                async with self._db_lock:
-                    await self.db.upsert_document(
-                        doc_record,
-                        require_configured_source=True,
-                    )
-                await self._finalize_projected_document_moves(
-                    predecessor_docs=lineage_predecessor_docs,
-                    current_doc_id=doc_id,
-                    metadata=existing_metadata,
-                    source_unit_id=source_unit.id,
-                )
-                logger.debug("Skipping %s (content unchanged)", doc_id)
-                return stats
-
-            if self.document_index.enabled and not self._has_embedding_config():
-                raise RuntimeError(f"Cannot repair stale document vector for {doc_id}: embedding config is missing")
-
             async with self._db_lock:
                 await self.db.upsert_document(
                     doc_record,
                     require_configured_source=True,
                 )
-
-            document_vector_snapshot = await self._document_vector_snapshot(doc_id)
-            try:
-                await self._upsert_document_embedding(
-                    doc_id=doc_id,
-                    metadata=existing_metadata,
-                    source_id=source_id,
-                    source_type=source_type,
-                    space_or_project=item.space_or_project,
-                    token_count=token_count,
-                    content_hash=new_hash,
-                    version=item.version,
-                )
-            except Exception:
-                await self._restore_document_vector_snapshot(doc_id, document_vector_snapshot)
-                async with self._db_lock:
-                    if existing_doc:
-                        await self.db.restore_document_snapshot(
-                            existing_doc,
-                            require_configured_source=True,
-                        )
-                    else:
-                        await self.db.delete_document(doc_id)
-                raise
-
             await self._finalize_projected_document_moves(
                 predecessor_docs=lineage_predecessor_docs,
                 current_doc_id=doc_id,
-                metadata=existing_metadata,
                 source_unit_id=source_unit.id,
             )
 
@@ -1807,7 +1748,7 @@ class GeneSyncOrchestrator:
                         "title": item.title,
                     }
                 )
-            logger.info("Repaired stale document vector for unchanged %s (%s)", item.title, doc_id)
+            logger.debug("Skipping semantic work for unchanged %s (%s)", item.title, doc_id)
             return stats
 
         stats["updated"] = True
@@ -1836,7 +1777,6 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         # 5. Store document record before expensive enrichment/memory work
         # ------------------------------------------------------------------
-        document_vector_snapshot = await self._document_vector_snapshot(doc_id)
         async with self._db_lock:
             await self.db.upsert_document(
                 doc_record,
@@ -1845,16 +1785,13 @@ class GeneSyncOrchestrator:
 
         if empty_content:
             try:
-                if self.document_index.enabled:
-                    self.document_index.delete(doc_id)
                 memory_stats = await self.memory_engine.apply_projected_lifecycle(
                     projection=projection,
                     doc_id=doc_id,
                     raw_memories=[],
-                    doc_type=(existing_metadata.doc_type if existing_metadata is not None else f"{source_type}_empty"),
+                    doc_type=f"{source_type}_empty",
                     project_key=project_key,
                     repo_identifier=normalized.source_semantics.get("repo_identifier"),
-                    entity_ids=[],
                     document_content="",
                     update_mode=update_plan.mode if update_plan else "full_document",
                     changed_hunks=(update_plan.changed_hunks if update_plan else None),
@@ -1874,7 +1811,6 @@ class GeneSyncOrchestrator:
                 await self._restore_document_processing_snapshot(
                     doc_id=doc_id,
                     existing_doc=existing_doc,
-                    document_vector_snapshot=document_vector_snapshot,
                 )
                 raise
             await self.db.record_source_projection(
@@ -1884,17 +1820,6 @@ class GeneSyncOrchestrator:
             stats["memories_extracted"] = memory_stats.get("added", 0)
             stats["memories_corroborated"] = memory_stats.get("updated", 0)
             stats["memory_supports_removed"] = memory_stats.get("deleted", 0)
-            await self.db.upsert_metadata(
-                DocumentMetadata(
-                    doc_id=doc_id,
-                    summary="",
-                    tags=[],
-                    entities=[],
-                    doc_type=(existing_metadata.doc_type if existing_metadata is not None else f"{source_type}_empty"),
-                    complexity="empty",
-                    enriched_at=now,
-                )
-            )
             await self._insert_changelog(
                 ChangelogEntry(
                     id=None,
@@ -1912,7 +1837,6 @@ class GeneSyncOrchestrator:
             await self._finalize_projected_document_moves(
                 predecessor_docs=lineage_predecessor_docs,
                 current_doc_id=doc_id,
-                metadata=await self.db.get_metadata(doc_id),
                 source_unit_id=source_unit.id,
             )
             if progress_callback:
@@ -1930,122 +1854,16 @@ class GeneSyncOrchestrator:
             )
             return stats
 
-        # ------------------------------------------------------------------
-        # 6. Call 1: Enrich document (under semaphore)
-        # ------------------------------------------------------------------
-        enrichment: EnrichmentResult
-
-        async with self._heavy_work_slot(source_id):
-            enrichment = await self.enricher.enrich_document(
-                doc_id=doc_id,
-                content=markdown_body,
-                source_type=source_type,
-            )
-
-        logger.debug(
-            "Enrichment for %s: %d entities, %d tags, doc_type=%s",
-            doc_id,
-            len(enrichment.entities),
-            len(enrichment.tags),
-            enrichment.doc_type,
-        )
-        self._memory_sample(
-            "after_enrich",
-            source_id=source_id,
-            run_id=run_id,
-            doc_id=doc_id,
-            entity_count=len(enrichment.entities),
-            tag_count=len(enrichment.tags),
-            content_chars=len(markdown_body),
-        )
-
-        # ------------------------------------------------------------------
-        # 6b. Upsert document embedding before memory mutations
-        # ------------------------------------------------------------------
-        index_metadata = self._document_metadata_from_enrichment(
-            doc_id=doc_id,
-            enrichment=enrichment,
-            enriched_at=now,
-        )
-        if self.document_index.enabled and not self._has_embedding_config():
-            raise RuntimeError(f"Cannot index document vector for {doc_id}: embedding config is missing")
-
-        if self.document_index.enabled:
-            try:
-                await self._upsert_document_embedding(
-                    doc_id=doc_id,
-                    metadata=index_metadata,
-                    source_id=source_id,
-                    source_type=source_type,
-                    space_or_project=item.space_or_project,
-                    token_count=token_count,
-                    content_hash=new_hash,
-                    version=item.version,
-                )
-            except Exception:
-                await self._restore_document_vector_snapshot(doc_id, document_vector_snapshot)
-                async with self._db_lock:
-                    if existing_doc:
-                        await self.db.restore_document_snapshot(
-                            existing_doc,
-                            require_configured_source=True,
-                        )
-                    else:
-                        await self.db.delete_document(doc_id)
-                raise
-
-        # ------------------------------------------------------------------
-        # 6c. Process enrichment: resolve entities, insert aliases
-        # ------------------------------------------------------------------
-        entity_ids = await self.memory_engine.process_enrichment(
-            doc_id=doc_id,
-            enrichment=enrichment,
-        )
-
-        # ------------------------------------------------------------------
-        # 6d. Get canonical entity names for the resolved IDs
-        # ------------------------------------------------------------------
-        entity_names: list[str] = []
-        for eid in entity_ids:
-            name = await self._get_entity_canonical_name(eid)
-            if name:
-                entity_names.append(name)
-
         repo_identifier = normalized.source_semantics.get("repo_identifier")
-
-        # ------------------------------------------------------------------
-        # 6e. Get existing memories for those entities (context for Call 2)
-        # ------------------------------------------------------------------
-        existing_memories = []
-        seen_memory_ids: set[str] = set()
-        for eid in entity_ids:
-            try:
-                entity_memories = await self.db.get_memories_by_entity(eid)
-                for mem in entity_memories:
-                    if mem.id not in seen_memory_ids and mem.status == "active":
-                        existing_memories.append(mem)
-                        seen_memory_ids.add(mem.id)
-            except Exception as e:
-                logger.warning(
-                    "Failed to fetch memories for entity %d: %s",
-                    eid,
-                    e,
-                )
-
-        # Cap existing memories to avoid excessive token usage in Call 2
-        existing_memories = existing_memories[:50]
-
-        # ------------------------------------------------------------------
-        # 7. Call 2: Extract memories (under semaphore)
-        # ------------------------------------------------------------------
+        # Extraction owns the only document-content model call. Historical
+        # cross-document/cross-source discovery remains post-commit Relation
+        # work; same-source incumbents are loaded by exact lifecycle lineage.
         extraction_result = await self._extract_for_document_update(
             projection=projection,
             update_plan=update_plan,
             markdown_body=markdown_body,
             source_type=source_type,
-            doc_type=enrichment.doc_type,
-            entity_names=entity_names,
-            existing_memories=existing_memories,
+            doc_type=source_type,
             doc_id=doc_id,
             source_id=source_id,
             run_id=run_id,
@@ -2058,7 +1876,6 @@ class GeneSyncOrchestrator:
             await self._restore_document_processing_snapshot(
                 doc_id=doc_id,
                 existing_doc=existing_doc,
-                document_vector_snapshot=document_vector_snapshot,
             )
             error_detail = extraction_result.error or ""
             raise RuntimeError(f"memory extraction failed for {doc_id}: {extraction_result.error_type}: {error_detail}")
@@ -2073,31 +1890,15 @@ class GeneSyncOrchestrator:
             run_id=run_id,
             doc_id=doc_id,
             raw_memory_count=len(raw_memories),
-            existing_memory_count=len(existing_memories),
-            entity_count=len(entity_ids),
+            existing_memory_count=0,
+            entity_mention_count=len(
+                {
+                    entity_ref
+                    for raw_memory in raw_memories
+                    for entity_ref in raw_memory.entity_refs
+                }
+            ),
             content_chars=len(markdown_body),
-        )
-
-        # ------------------------------------------------------------------
-        # 7b. Build metadata once enrichment has resolved canonical entities
-        # ------------------------------------------------------------------
-        meta_entities = [
-            Entity(
-                id=eid,
-                canonical_name=name,
-                tags=[],
-                display_name=name,
-            )
-            for eid, name in zip(entity_ids, entity_names)
-        ]
-        doc_metadata = DocumentMetadata(
-            doc_id=doc_id,
-            summary=enrichment.summary,
-            tags=enrichment.tags,
-            entities=meta_entities,
-            doc_type=enrichment.doc_type,
-            complexity=enrichment.complexity,
-            enriched_at=now,
         )
 
         # ------------------------------------------------------------------
@@ -2114,10 +1915,9 @@ class GeneSyncOrchestrator:
                 projection=projection,
                 doc_id=doc_id,
                 raw_memories=raw_memories,
-                doc_type=enrichment.doc_type,
+                doc_type=source_type,
                 project_key=project_key,
                 repo_identifier=repo_identifier,
-                entity_ids=entity_ids,
                 document_content=markdown_body,
                 update_mode=update_plan.mode if update_plan else "full_document",
                 changed_hunks=update_plan.changed_hunks if update_plan else None,
@@ -2128,12 +1928,11 @@ class GeneSyncOrchestrator:
             )
         except Exception:
             # Projection and lifecycle state roll back together in the engine;
-            # keep the document/vector snapshot on the same prior revision so
+            # keep the durable document snapshot on the same prior revision so
             # an ordinary retry still observes the semantic delta.
             await self._restore_document_processing_snapshot(
                 doc_id=doc_id,
                 existing_doc=existing_doc,
-                document_vector_snapshot=document_vector_snapshot,
             )
             raise
         # The production engine commits this projection with its Lifecycle
@@ -2154,11 +1953,56 @@ class GeneSyncOrchestrator:
             raw_memory_count=len(raw_memories),
             memories_extracted=stats["memories_extracted"],
             memories_corroborated=stats["memories_corroborated"],
-            entity_count=len(entity_ids),
+            entity_mention_count=len(
+                {
+                    entity_ref
+                    for raw_memory in raw_memories
+                    for entity_ref in raw_memory.entity_refs
+                }
+            ),
+            entity_resolution_unique_mentions=memory_stats.get(
+                "entity_resolution_unique_mentions", 0
+            ),
+            entity_resolution_exact_hits=memory_stats.get(
+                "entity_resolution_exact_hits", 0
+            ),
+            entity_resolution_alias_hits=memory_stats.get(
+                "entity_resolution_alias_hits", 0
+            ),
+            entity_resolution_embedded_mentions=memory_stats.get(
+                "entity_resolution_embedded_mentions", 0
+            ),
+            entity_resolution_ambiguous_mentions=memory_stats.get(
+                "entity_resolution_ambiguous_mentions", 0
+            ),
+            entity_resolution_embedding_batches=memory_stats.get(
+                "entity_resolution_embedding_batches", 0
+            ),
+            entity_resolution_llm_calls=memory_stats.get(
+                "entity_resolution_llm_calls", 0
+            ),
+            entity_resolution_candidate_count=memory_stats.get(
+                "entity_resolution_candidate_count", 0
+            ),
+            entity_resolution_new_entities=memory_stats.get(
+                "entity_resolution_new_entities", 0
+            ),
+            entity_resolution_elapsed_ms=memory_stats.get(
+                "entity_resolution_elapsed_ms", 0
+            ),
+            identity_resolution_pair_count=memory_stats.get(
+                "identity_resolution_pair_count", 0
+            ),
+            identity_resolution_llm_calls=memory_stats.get(
+                "identity_resolution_llm_calls", 0
+            ),
+            identity_resolution_prompt_chars=memory_stats.get(
+                "identity_resolution_prompt_chars", 0
+            ),
+            identity_resolution_elapsed_ms=memory_stats.get(
+                "identity_resolution_elapsed_ms", 0
+            ),
         )
-
-        async with self._db_lock:
-            await self.db.upsert_metadata(doc_metadata)
 
         # ------------------------------------------------------------------
         # 10. Record changelog
@@ -2173,7 +2017,7 @@ class GeneSyncOrchestrator:
             ai_change_summary=(
                 f"New document: {item.title}"
                 if change_type == "created"
-                else f"Updated: {item.title} - {enrichment.summary[:200]}"
+                else f"Updated: {item.title}"
             ),
             detected_at=now,
             title=item.title,
@@ -2186,7 +2030,6 @@ class GeneSyncOrchestrator:
         await self._finalize_projected_document_moves(
             predecessor_docs=lineage_predecessor_docs,
             current_doc_id=doc_id,
-            metadata=doc_metadata,
             source_unit_id=source_unit.id,
         )
 
@@ -2219,8 +2062,6 @@ class GeneSyncOrchestrator:
         markdown_body: str,
         source_type: str,
         doc_type: str,
-        entity_names: list[str],
-        existing_memories: list[Memory],
         doc_id: str,
         source_id: str,
         run_id: str | None,
@@ -2270,8 +2111,6 @@ class GeneSyncOrchestrator:
                 projection_batches=projection_batches,
                 source_type=source_type,
                 doc_type=doc_type,
-                entity_names=entity_names,
-                existing_memories=existing_memories,
                 source_id=source_id,
             )
             await self._record_memory_extraction_result(
@@ -2291,15 +2130,12 @@ class GeneSyncOrchestrator:
             and hasattr(self.memory_extractor, "extract_memory_changes")
         ):
             try:
-                same_document_memories = await self._get_existing_document_memories(doc_id)
                 async with self._heavy_work_slot(source_id):
                     result = await self.memory_extractor.extract_memory_changes(
                         changed_hunks=update_plan.changed_hunks or "",
                         updated_document=markdown_body,
                         source_type=source_type,
                         doc_type=doc_type,
-                        entities=entity_names,
-                        existing_memories=same_document_memories,
                     )
                 if not result.error_type:
                     result = self._enforce_diff_guided_evidence_boundary(
@@ -2354,8 +2190,6 @@ class GeneSyncOrchestrator:
                 markdown_body=markdown_body,
                 source_type=source_type,
                 doc_type=doc_type,
-                entity_names=entity_names,
-                existing_memories=existing_memories,
                 doc_id=doc_id,
                 source_id=source_id,
                 document_title=document_title,
@@ -2390,8 +2224,6 @@ class GeneSyncOrchestrator:
                 content=markdown_body,
                 source_type=source_type,
                 doc_type=doc_type,
-                entities=entity_names,
-                existing_memories=existing_memories,
             )
         await self._record_memory_extraction_result(
             mode="full_document",
@@ -2448,8 +2280,6 @@ class GeneSyncOrchestrator:
         projection_batches,
         source_type: str,
         doc_type: str,
-        entity_names: list[str],
-        existing_memories: list[Memory],
         source_id: str,
     ) -> MemoryExtractionResult:
         """Execute all transient Observation batches as one extraction outcome."""
@@ -2463,11 +2293,10 @@ class GeneSyncOrchestrator:
                         batch,
                         source_type=source_type,
                         doc_type=doc_type,
-                        entities=entity_names,
-                        existing_memories=existing_memories,
                     )
 
         results = await asyncio.gather(*(extract_one(batch) for batch in projection_batches))
+        llm_metrics = _aggregate_extraction_metrics(results)
         memories = []
         failures = [result for result in results if result.error_type]
         for result in results:
@@ -2479,6 +2308,7 @@ class GeneSyncOrchestrator:
                 error_type="projection_batch_failure",
                 error=first.error or first.error_type,
                 metadata={
+                    **llm_metrics,
                     "batch_count": len(projection_batches),
                     "failed_batch_count": len(failures),
                     "extracted_count_before_failure": len(memories),
@@ -2487,6 +2317,7 @@ class GeneSyncOrchestrator:
         return MemoryExtractionResult(
             memories=memories,
             metadata={
+                **llm_metrics,
                 "batch_count": len(projection_batches),
                 "failed_batch_count": 0,
             },
@@ -2498,8 +2329,6 @@ class GeneSyncOrchestrator:
         markdown_body: str,
         source_type: str,
         doc_type: str,
-        entity_names: list[str],
-        existing_memories: list[Memory],
         doc_id: str,
         source_id: str,
         document_title: str,
@@ -2518,17 +2347,17 @@ class GeneSyncOrchestrator:
                 source_type=source_type,
                 unit=unit,
                 all_units=units,
-                entities=entity_names,
+                entities=(),
             )
             async with unit_semaphore:
                 async with self._heavy_work_slot(source_id):
                     return await self.memory_extractor.extract_unit_memories(
                         context,
                         doc_type=doc_type,
-                        existing_memories=existing_memories,
                     )
 
         results = await asyncio.gather(*(extract_one(unit) for unit in units))
+        llm_metrics = _aggregate_extraction_metrics(results)
 
         all_memories = []
         first_error: MemoryExtractionResult | None = None
@@ -2545,6 +2374,7 @@ class GeneSyncOrchestrator:
                 error_type="partial_unit_failure",
                 error=first_error.error or first_error.error_type,
                 metadata={
+                    **llm_metrics,
                     "unit_count": len(units),
                     "failed_unit_count": failed_unit_count,
                     "extracted_count_before_failure": len(all_memories),
@@ -2556,6 +2386,7 @@ class GeneSyncOrchestrator:
         return MemoryExtractionResult(
             memories=all_memories,
             metadata={
+                **llm_metrics,
                 "unit_count": len(units),
                 "failed_unit_count": failed_unit_count,
                 "partial_error_type": first_error.error_type if first_error else None,
@@ -2722,6 +2553,8 @@ class GeneSyncOrchestrator:
             "extraction_mode": mode,
             "extracted_count": len(result.memories),
         }
+        if result.metadata:
+            payload.update(result.metadata)
         if extraction_metadata:
             payload.update(extraction_metadata)
         if plan:
@@ -2767,14 +2600,11 @@ class GeneSyncOrchestrator:
         *,
         predecessor_docs: list[DocumentRecord],
         current_doc_id: str,
-        metadata: DocumentMetadata | None,
         source_unit_id: str,
     ) -> None:
         """Atomically rebind provenance, then remove obsolete document aliases."""
         if not predecessor_docs:
             return
-        if metadata is not None and metadata.doc_id != current_doc_id:
-            await self.db.upsert_metadata(replace(metadata, doc_id=current_doc_id))
         for predecessor in predecessor_docs:
             if predecessor.doc_id == current_doc_id:
                 continue
@@ -2994,107 +2824,6 @@ class GeneSyncOrchestrator:
             )
         return doc_ids
 
-    async def _get_entity_canonical_name(self, entity_id: int) -> str | None:
-        """Look up the canonical name for an entity by its ID."""
-        try:
-            async with self.db.db.execute(
-                "SELECT canonical_name FROM entities WHERE id = ?",
-                (entity_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
-                return row[0] if row else None
-        except Exception as e:
-            logger.warning(
-                "Failed to get canonical name for entity %d: %s",
-                entity_id,
-                e,
-            )
-            return None
-
-    async def _upsert_document_embedding(
-        self,
-        doc_id: str,
-        metadata: DocumentMetadata,
-        source_id: str,
-        source_type: str,
-        space_or_project: str,
-        token_count: int,
-        content_hash: str,
-        version: str | None,
-    ) -> None:
-        """Compute and upsert a document-level embedding in the vector store."""
-        if not self.document_index.enabled:
-            return
-        if not self._has_embedding_config():
-            raise RuntimeError(f"Cannot index document vector for {doc_id}: embedding config is missing")
-
-        try:
-            from memforge.retrieval.embeddings import embed_texts
-
-            # Keep document vectors independent of entity resolution so indexing can
-            # happen before any durable memory-layer mutations.
-            embedding_text = document_embedding_text(metadata)
-
-            async with self._heavy_work_slot(source_id):
-                try:
-                    vectors = await asyncio.to_thread(
-                        embed_texts,
-                        [embedding_text],
-                        self.embed_cfg["base_url"],
-                        self.embed_cfg["api_key"],
-                        self.embed_cfg["model"],
-                    )
-                except Exception as e:
-                    if _is_provider_unreachable(str(e)):
-                        raise RuntimeError(f"Embedding provider unreachable: {e}") from e
-                    raise
-
-            await asyncio.to_thread(
-                self.document_index.upsert,
-                doc_id=doc_id,
-                embedding=vectors[0],
-                document=embedding_text,
-                metadata={
-                    "source": source_id,
-                    "source_type": source_type,
-                    "doc_type": metadata.doc_type,
-                    "space": space_or_project,
-                    "token_count": token_count,
-                    "content_hash": content_hash,
-                    "version": version or "",
-                    "embedding_text_hash": embedding_text_hash(embedding_text),
-                },
-            )
-            logger.debug("Upserted document embedding for %s", doc_id)
-
-        except Exception as e:
-            logger.error(
-                "Vector indexing failed for %s: %s",
-                doc_id,
-                e,
-            )
-            raise
-
-    async def _document_vector_is_current(
-        self,
-        *,
-        doc_id: str,
-        content_hash: str,
-        version: str | None,
-    ) -> bool:
-        if not self.document_index.enabled:
-            return True
-        try:
-            return await asyncio.to_thread(
-                self.document_index.is_current,
-                doc_id,
-                content_hash=content_hash,
-                version=version,
-            )
-        except Exception:
-            logger.warning("Document vector freshness check failed for %s", doc_id)
-            return False
-
     async def _count_missing_pdf_uris(self, source_id: str) -> int:
         async with self.db.db.execute(
             """SELECT COUNT(*)
@@ -3110,28 +2839,12 @@ class GeneSyncOrchestrator:
             row = await cursor.fetchone()
             return int(row[0] if row else 0)
 
-    async def _document_vector_snapshot(self, doc_id: str) -> dict | None:
-        if not self.document_index.enabled:
-            return None
-        return await asyncio.to_thread(self.document_index.snapshot, doc_id)
-
-    async def _restore_document_vector_snapshot(
-        self,
-        doc_id: str,
-        snapshot: dict | None,
-    ) -> None:
-        if not self.document_index.enabled:
-            return
-        await asyncio.to_thread(self.document_index.restore, doc_id, snapshot)
-
     async def _restore_document_processing_snapshot(
         self,
         *,
         doc_id: str,
         existing_doc: DocumentRecord | None,
-        document_vector_snapshot: dict | None,
     ) -> None:
-        await self._restore_document_vector_snapshot(doc_id, document_vector_snapshot)
         async with self._db_lock:
             if existing_doc:
                 await self.db.restore_document_snapshot(
@@ -3140,41 +2853,6 @@ class GeneSyncOrchestrator:
                 )
             else:
                 await self.db.delete_document(doc_id)
-
-    def _has_embedding_config(self) -> bool:
-        if not self.embed_cfg:
-            return False
-        model = str(self.embed_cfg.get("model") or "").strip()
-        if not model:
-            return False
-        if is_litellm_provider_model(model):
-            return True
-        return all(str(self.embed_cfg.get(key) or "").strip() for key in ("base_url", "api_key", "model"))
-
-    def _document_metadata_from_enrichment(
-        self,
-        *,
-        doc_id: str,
-        enrichment: EnrichmentResult,
-        enriched_at: datetime,
-    ) -> DocumentMetadata:
-        return DocumentMetadata(
-            doc_id=doc_id,
-            summary=enrichment.summary,
-            tags=enrichment.tags,
-            entities=[
-                Entity(
-                    id=0,
-                    canonical_name=entity.name,
-                    tags=entity.tags or ([entity.type] if entity.type != "unknown" else []),
-                    display_name=entity.name,
-                )
-                for entity in enrichment.entities
-            ],
-            doc_type=enrichment.doc_type,
-            complexity=enrichment.complexity,
-            enriched_at=enriched_at,
-        )
 
     async def _insert_changelog(self, entry: ChangelogEntry) -> None:
         """Insert a changelog entry into the database.

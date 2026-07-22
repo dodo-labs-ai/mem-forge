@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -25,8 +26,10 @@ from memforge.memory.relation_candidate_retrieval import (
 )
 from memforge.memory.relation_classifier import (
     MemoryPair,
+    MemoryPairClassification,
     MemoryPairClassifier,
     MemoryPairClassificationError,
+    MEMORY_PAIR_CLASSIFIER_VERSION,
     MemoryPairDecision,
     MemoryRelationType,
 )
@@ -34,6 +37,7 @@ from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryWork,
     resolve_relation_discovery_actor_user_id,
 )
+from memforge.memory.lifecycle_planner import lifecycle_access_context_hash
 from memforge.models import (
     Memory,
     MemoryReview,
@@ -45,7 +49,7 @@ from memforge.models import (
 from memforge.storage.adapters.protocols import RelationalStore
 
 
-RELATION_DISCOVERY_CLASSIFIER_VERSION = "memory-relation-v1"
+RELATION_DISCOVERY_CLASSIFIER_VERSION = MEMORY_PAIR_CLASSIFIER_VERSION
 logger = logging.getLogger(__name__)
 
 
@@ -84,6 +88,7 @@ class RelationDiscoverySliceResult:
     failed_work: int = 0
     obsolete_work: int = 0
     checked_candidate_pairs: int = 0
+    reused_candidate_pairs: int = 0
     llm_calls: int = 0
     prompt_chars: int = 0
     elapsed_ms: int = 0
@@ -112,7 +117,7 @@ class RelationDiscovery:
         policy = budget or DEFAULT_RELATION_DISCOVERY_BUDGET
         started = time.perf_counter()
         attempted = completed = failed = obsolete = 0
-        checked_pairs = llm_calls = prompt_chars = 0
+        checked_pairs = reused_pairs = llm_calls = prompt_chars = 0
 
         while attempted < policy.max_work_items:
             if time.perf_counter() - started >= policy.max_wall_time_seconds:
@@ -144,6 +149,7 @@ class RelationDiscovery:
                     continue
                 relation_outcome, reviews, classification = outcome
                 checked_pairs += classification.pair_count
+                reused_pairs += classification.reused_pair_count
                 llm_calls += classification.llm_calls
                 prompt_chars += classification.prompt_chars
                 await self._store.complete_relation_discovery_work(
@@ -158,6 +164,7 @@ class RelationDiscovery:
                 recorded_error = error
                 if isinstance(error, _WorkProcessingError):
                     checked_pairs += error.pair_count
+                    reused_pairs += error.reused_pair_count
                     llm_calls += error.llm_calls
                     prompt_chars += error.prompt_chars
                     recorded_error = error.cause
@@ -187,6 +194,7 @@ class RelationDiscovery:
             failed_work=failed,
             obsolete_work=obsolete,
             checked_candidate_pairs=checked_pairs,
+            reused_candidate_pairs=reused_pairs,
             llm_calls=llm_calls,
             prompt_chars=prompt_chars,
             elapsed_ms=max(0, round((time.perf_counter() - started) * 1000)),
@@ -247,8 +255,53 @@ class RelationDiscovery:
             MemoryPair(challenger=challenger, candidate=loaded_by_id[memory_id])
             for memory_id in selection.candidate_ids
         )
+        reusable_by_candidate_id = {
+            item.candidate_memory_id: item
+            for item in request.preclassified_decisions
+        }
+        candidate_support = await self._store.get_active_memory_support_states(
+            tuple(pair.candidate.id for pair in pairs)
+        )
+        challenger_access_context_hash = lifecycle_access_context_hash(
+            visibility=challenger.visibility,
+            owner_user_id=challenger.owner_user_id,
+            project_key=challenger.project_key,
+            repo_identifier=challenger.repo_identifier,
+        )
+        reused_decisions: dict[tuple[str, str], MemoryPairDecision] = {}
+        pending_pairs: list[MemoryPair] = []
+        for pair in pairs:
+            saved = reusable_by_candidate_id.get(pair.candidate.id)
+            if (
+                saved is None
+                or saved.expected_candidate_content_hash != pair.candidate.content_hash
+                or saved.expected_candidate_support_set_hash
+                != candidate_support[pair.candidate.id].current_support_set_hash
+                or saved.expected_candidate_access_context_hash
+                != lifecycle_access_context_hash(
+                    visibility=pair.candidate.visibility,
+                    owner_user_id=pair.candidate.owner_user_id,
+                    project_key=pair.candidate.project_key,
+                    repo_identifier=pair.candidate.repo_identifier,
+                )
+                or saved.expected_challenger_access_context_hash
+                != challenger_access_context_hash
+                or saved.classifier_version != RELATION_DISCOVERY_CLASSIFIER_VERSION
+            ):
+                pending_pairs.append(pair)
+                continue
+            reused_decisions[pair.key] = MemoryPairDecision(
+                pair=pair,
+                relation_type=saved.relation_type,
+                direction=saved.direction,
+                reason=saved.reason,
+            )
         try:
-            classification = await self._pair_classifier.classify(pairs)
+            classification = (
+                await self._pair_classifier.classify(tuple(pending_pairs))
+                if pending_pairs
+                else MemoryPairClassification(decisions=(), llm_calls=0, prompt_chars=0)
+            )
         except MemoryPairClassificationError as error:
             raise _WorkProcessingError(
                 cause=error,
@@ -257,12 +310,23 @@ class RelationDiscovery:
                 prompt_chars=error.prompt_chars,
             ) from error
         try:
+            classified_by_key = {
+                **reused_decisions,
+                **{decision.pair.key: decision for decision in classification.decisions},
+            }
+            decisions = tuple(classified_by_key[pair.key] for pair in pairs)
             await self._candidate_retriever.ensure_selection_current(
                 selection,
                 challenger=challenger,
                 doc_id=evidence_unit.doc_id or request.doc_id,
                 source_id=request.source_id,
                 excluded_source_ids=disabled_source_ids,
+                expected_support_set_hashes={
+                    pair.candidate.id: candidate_support[
+                        pair.candidate.id
+                    ].current_support_set_hash
+                    for pair in pairs
+                },
             )
             bundle, reviews = await self._build_outcome(
                 work=work,
@@ -270,15 +334,23 @@ class RelationDiscovery:
                 actor_user_id=actor_user_id,
                 evidence_unit=evidence_unit,
                 selection=selection,
-                decisions=classification.decisions,
+                decisions=decisions,
                 loaded_by_id=loaded_by_id,
                 classification_llm_calls=classification.llm_calls,
                 classification_prompt_chars=classification.prompt_chars,
+                reused_pair_count=len(reused_decisions),
+                candidate_support_set_hashes={
+                    pair.candidate.id: candidate_support[
+                        pair.candidate.id
+                    ].current_support_set_hash
+                    for pair in pairs
+                },
             )
         except Exception as error:
             raise _WorkProcessingError(
                 cause=error,
                 pair_count=len(pairs),
+                reused_pair_count=len(reused_decisions),
                 llm_calls=classification.llm_calls,
                 prompt_chars=classification.prompt_chars,
             ) from error
@@ -287,6 +359,7 @@ class RelationDiscovery:
             reviews,
             _CompletedClassification(
                 pair_count=len(pairs),
+                reused_pair_count=len(reused_decisions),
                 llm_calls=classification.llm_calls,
                 prompt_chars=classification.prompt_chars,
             ),
@@ -304,6 +377,8 @@ class RelationDiscovery:
         loaded_by_id,
         classification_llm_calls: int,
         classification_prompt_chars: int,
+        reused_pair_count: int,
+        candidate_support_set_hashes: Mapping[str, str],
     ) -> tuple[RelationOutcomeBundle, tuple[MemoryReview, ...]]:
         relation_run_id = _relation_run_id(work, selection)
         universe = build_candidate_universe(
@@ -395,6 +470,7 @@ class RelationDiscovery:
                 "candidate_count_kind": "windowed",
                 "llm_calls": classification_llm_calls,
                 "prompt_chars": classification_prompt_chars,
+                "reused_identity_pair_count": reused_pair_count,
                 **selection.audit,
                 **selection.telemetry,
             },
@@ -407,6 +483,7 @@ class RelationDiscovery:
             candidates=universe.candidates,
             relations=tuple(relations),
             candidate_provenance=tuple(candidate.memory for candidate in selection.discovery),
+            expected_candidate_support_set_hashes=dict(candidate_support_set_hashes),
         )
         reviews = tuple(
             _cross_source_review(
@@ -425,6 +502,7 @@ class RelationDiscovery:
 @dataclass(frozen=True, slots=True)
 class _CompletedClassification:
     pair_count: int
+    reused_pair_count: int
     llm_calls: int
     prompt_chars: int
 
@@ -435,6 +513,7 @@ class _WorkProcessingError(RuntimeError):
     pair_count: int
     llm_calls: int
     prompt_chars: int
+    reused_pair_count: int = 0
 
 
 def _persisted_relation_type(

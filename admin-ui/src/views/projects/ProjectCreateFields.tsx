@@ -71,7 +71,7 @@ export function ProjectCreateFields({
               placeholder={keyPlaceholder}
             />
             <span className="block text-xs text-muted-foreground">
-              Short code shown in URLs and tags (e.g., PAY).
+              Short code shown in URLs and project labels (e.g., PAY).
             </span>
             {keyConflictsWithBuiltIn && (
               <span className="block text-xs text-destructive" role="alert">

@@ -32,7 +32,6 @@ def _replacement() -> RawMemory:
         content="A7 is retained and marked as reduced retro chain.",
         memory_type="decision",
         confidence=0.9,
-        tags=["payroll", "retro"],
         extraction_context="A7 is retained",
     )
 
@@ -57,7 +56,7 @@ def _defaults() -> NewMemoryDefaults:
         source_type="jira",
         access_context_hash="workspace-pay",
         actor_user_id="reviewer-1",
-        entity_ids=(7, 11),
+        entity_ids_by_claim_hash={content_hash(_replacement().content): (7, 11)},
     )
 
 

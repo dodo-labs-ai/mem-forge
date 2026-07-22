@@ -145,19 +145,6 @@ export function MemoryDetailPage() {
             </div>
           </div>
 
-          {memory.tags.length > 0 && (
-            <>
-              <Separator className="my-4" />
-              <div className="flex flex-wrap gap-1.5">
-                {memory.tags.map((tag) => (
-                  <Badge key={tag} variant="secondary">
-                    {tag}
-                  </Badge>
-                ))}
-              </div>
-            </>
-          )}
-
           {memory.entity_refs.length > 0 && (
             <>
               <Separator className="my-4" />

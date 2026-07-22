@@ -265,6 +265,7 @@ class CrossDocumentCandidateRetriever:
         doc_id: str,
         source_id: str,
         excluded_source_ids: Sequence[str] = (),
+        expected_support_set_hashes: Mapping[str, str] | None = None,
     ) -> None:
         """Fail closed if access or provenance changed before relation writes."""
 
@@ -286,6 +287,18 @@ class CrossDocumentCandidateRetriever:
         current_ids = tuple(memory_id for memory_id in selection.candidate_ids if memory_id in eligible)
         if current_ids != selection.candidate_ids:
             raise StaleCandidateSelectionError("candidate access or provenance changed")
+        if expected_support_set_hashes is not None:
+            expected = dict(expected_support_set_hashes)
+            if set(expected) != set(selection.candidate_ids):
+                raise StaleCandidateSelectionError("candidate Support fence is incomplete")
+            current_support = await self._relational.get_active_memory_support_states(
+                selection.candidate_ids
+            )
+            if any(
+                current_support[memory_id].current_support_set_hash != expected[memory_id]
+                for memory_id in selection.candidate_ids
+            ):
+                raise StaleCandidateSelectionError("candidate current Support changed")
 
     async def _retrieve_channels(
         self,

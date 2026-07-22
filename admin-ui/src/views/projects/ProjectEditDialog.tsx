@@ -1,7 +1,7 @@
 /**
  * Dialog for editing an existing project's name and team-wide flag.
  *
- * The project key is immutable once created (it lives in URLs, tags, and
+ * The project key is immutable once created (it lives in URLs, identifiers, and
  * memory rows), so the form intentionally exposes only the fields the
  * PATCH /projects/{id} endpoint accepts: name and kind.
  */
@@ -131,7 +131,7 @@ function ProjectEditForm({
           </span>
           <span className="font-mono text-sm">{project.key}</span>
           <span className="mt-1 block text-xs text-muted-foreground">
-            The code stays the same so existing tags and links keep working.
+            The code stays the same so existing identifiers and links keep working.
           </span>
         </div>
 

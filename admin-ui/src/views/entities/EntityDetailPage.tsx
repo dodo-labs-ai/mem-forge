@@ -4,7 +4,6 @@ import { useNavigate, useParams } from "react-router-dom";
 import { AlertCircle, ArrowLeft, Loader2, Plus, Trash2 } from "lucide-react";
 import { resourceClient } from "@/api/client";
 import type { EntityDetail as EntityDetailType } from "@/api/types";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -131,11 +130,6 @@ export function EntityDetailPage() {
         <CardHeader>
           <div className="flex flex-wrap items-center gap-3">
             <CardTitle className="text-xl">{entity.canonical_name}</CardTitle>
-            {entity.tags.map((entityTag) => (
-              <Badge key={entityTag} variant="secondary">
-                {entityTag}
-              </Badge>
-            ))}
           </div>
           {entity.display_name &&
             entity.display_name !== entity.canonical_name && (

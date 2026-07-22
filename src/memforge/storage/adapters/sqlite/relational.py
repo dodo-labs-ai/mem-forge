@@ -63,9 +63,12 @@ from memforge.source_projection import (
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.adapters.protocols import (
+    ActiveMemorySupportState,
     DEFAULT_ENTITY_LINK_LIMIT,
     EntityLinkCandidate,
     EntityLinkResult,
+    EntityResolutionScope,
+    EntityUpsert,
 )
 
 logger = logging.getLogger(__name__)
@@ -354,6 +357,28 @@ class SqliteRelationalStore:
 
     async def insert_memory(self, memory: Memory) -> str:
         return await self._db.insert_memory(memory)
+
+    async def load_entity_resolution_context(
+        self,
+        canonical_names: Sequence[str],
+        *,
+        candidate_limit: int,
+        scope: EntityResolutionScope,
+    ):
+        return await self._db.load_entity_resolution_context(
+            canonical_names,
+            candidate_limit=candidate_limit,
+            scope=scope,
+        )
+
+    async def upsert_entities(
+        self,
+        entities: Sequence[EntityUpsert],
+    ):
+        return await self._db.upsert_entities(entities)
+
+    async def insert_aliases(self, aliases: Sequence[EntityAlias]) -> None:
+        await self._db.insert_aliases(aliases)
 
     async def get_memory(self, memory_id: str) -> Memory | None:
         return await self._db.get_memory(memory_id)
@@ -847,6 +872,12 @@ class SqliteRelationalStore:
     async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]:
         return await self._db.get_active_memory_support_reference_ids(memory_id)
 
+    async def get_active_memory_support_states(
+        self,
+        memory_ids: Sequence[str],
+    ) -> Mapping[str, ActiveMemorySupportState]:
+        return await self._db.get_active_memory_support_states(memory_ids)
+
     async def get_active_memory_support_evidence(
         self,
         memory_id: str,
@@ -855,6 +886,17 @@ class SqliteRelationalStore:
     ) -> tuple[ActiveSupportEvidence, ...]:
         return await self._db.get_active_memory_support_evidence(
             memory_id,
+            source_id=source_id,
+        )
+
+    async def get_active_memory_support_evidence_many(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        source_id: str | None = None,
+    ) -> Mapping[str, tuple[ActiveSupportEvidence, ...]]:
+        return await self._db.get_active_memory_support_evidence_many(
+            memory_ids,
             source_id=source_id,
         )
 
@@ -889,7 +931,6 @@ class SqliteRelationalStore:
         display_anchor: str,
         claim_text: str,
         memory_type: str,
-        tags: list[str],
         confidence: float,
         observed_at: datetime,
         citations: list[str] | None = None,
@@ -906,7 +947,6 @@ class SqliteRelationalStore:
             display_anchor=display_anchor,
             claim_text=claim_text,
             memory_type=memory_type,
-            tags=tags,
             confidence=confidence,
             observed_at=observed_at,
             citations=citations,
@@ -1594,7 +1634,9 @@ class SqliteRelationalStore:
             f"FROM entities e WHERE {entity_match} "
             "UNION ALL "
             f"SELECT ea.canonical_id, ea.alias, ea.alias_normalized, {alias_match_key} "
-            f"FROM entity_aliases ea WHERE {alias_match}"
+            f"FROM entity_aliases ea WHERE {alias_match} "
+            "AND ea.access_context_hash = '' "
+            "AND ea.source IN ('manual', 'admin_manual', 'deterministic')"
             ") "
             "SELECT ma.entity_id, e.canonical_name, ma.matched_alias, "
             f"ma.alias_normalized, ma.match_key, {count_select} "

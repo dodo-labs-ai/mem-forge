@@ -7,23 +7,20 @@ import type { Entity, PaginatedResponse } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
 import { EmptyState } from "@/components/admin/EmptyState";
-import { FilterSelect } from "@/components/admin/FilterSelect";
 import { PageHeader } from "@/components/admin/PageHeader";
 import { Pagination } from "@/components/admin/Pagination";
 import { SearchInput } from "@/components/admin/SearchInput";
 import { Toolbar } from "@/components/admin/Toolbar";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ENTITY_PAGE_SIZE } from "@/lib/constants";
 
 export function EntitiesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const search = searchParams.get("search") ?? "";
-  const tag = searchParams.get("tag") ?? "all";
   const [page, setPage] = useState(0);
   const navigate = useNavigate();
 
-  const updateFilter = (key: "search" | "tag", value: string) => {
+  const updateFilter = (key: "search", value: string) => {
     const next = new URLSearchParams(searchParams);
     if (!value || value === "all") {
       next.delete(key);
@@ -35,13 +32,12 @@ export function EntitiesPage() {
   };
 
   const entitiesQuery = useQuery<PaginatedResponse<Entity>>({
-    queryKey: ["entities", search, tag, page],
+    queryKey: ["entities", search, page],
     queryFn: () =>
       resourceClient
         .get("/entities", {
           params: {
             search: search || undefined,
-            tag: tag !== "all" ? tag : undefined,
             limit: ENTITY_PAGE_SIZE,
             offset: page * ENTITY_PAGE_SIZE,
           },
@@ -51,9 +47,6 @@ export function EntitiesPage() {
 
   const entities = entitiesQuery.data?.data ?? [];
   const total = entitiesQuery.data?.total ?? 0;
-  const allTags = Array.from(
-    new Set(entities.flatMap((entity) => entity.tags)),
-  ).sort();
 
   return (
     <div className="space-y-4">
@@ -81,15 +74,6 @@ export function EntitiesPage() {
               value={search}
               onChange={(value) => updateFilter("search", value)}
               placeholder="Filter entities..."
-            />
-            <FilterSelect
-              value={tag}
-              onChange={(value) => updateFilter("tag", value)}
-              label="Filter by tag"
-              options={[
-                { value: "all", label: "All tags" },
-                ...allTags.map((value) => ({ value, label: value })),
-              ]}
             />
           </Toolbar>
         </div>
@@ -125,15 +109,6 @@ export function EntitiesPage() {
                         <span className="text-sm font-medium text-foreground">
                           {display}
                         </span>
-                        {entity.tags.map((entityTag) => (
-                          <Badge
-                            key={entityTag}
-                            variant="secondary"
-                            className="text-[11px]"
-                          >
-                            {entityTag}
-                          </Badge>
-                        ))}
                       </div>
                       {showCanonical && (
                         <p className="mt-0.5 text-xs text-muted-foreground">

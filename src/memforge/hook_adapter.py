@@ -98,7 +98,7 @@ SESSION_START_USAGE_GUIDANCE = (
     "`not X, actually Y`, `don't use this anymore`). For create, search first "
     "to avoid duplicates. For replace/retire, locate the memory with "
     "`search`/`get_memory`. Show a readable preview: new claim or old/new claim, "
-    "provenance/evidence, scope, and type/tags.\n"
+    "provenance/evidence, scope, and type.\n"
     "- For `create_memory`, confirmed content must be the durable memory only. Keep "
     "confirmation details, test/deploy notes, and why-the-tool-was-called out "
     "of content; put source evidence/details in `provenance`.\n"

@@ -19,7 +19,6 @@ async def test_filter_visible_ids_strips_other_users_private(tmp_path):
                 visibility=Visibility.WORKSPACE.value,
                 owner_user_id=None,
                 project_key=SHARED_PROJECT_KEY,
-                tags=[],
             )
         )
         await db.insert_memory(
@@ -31,7 +30,6 @@ async def test_filter_visible_ids_strips_other_users_private(tmp_path):
                 visibility=Visibility.PRIVATE.value,
                 owner_user_id="u-2",
                 project_key=SHARED_PROJECT_KEY,
-                tags=[],
             )
         )
         adapters = build_sqlite_adapters(db, memory_collection=None)

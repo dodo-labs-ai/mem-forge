@@ -20,7 +20,7 @@ from memforge.memory.candidate_ledger import (
     CandidateLedgerResult,
     select_unique_memory_candidates,
 )
-from memforge.memory.entity_resolver import EntityResolver, insert_llm_alias, resolve_entity
+from memforge.memory.entity_resolver import EntityResolver
 from memforge.memory.evidence import EvidenceRole
 from memforge.memory.identity_resolver import (
     IdentityResolutionRequest,
@@ -35,9 +35,14 @@ from memforge.memory.lifecycle_planner import (
 )
 from memforge.memory.quality import classify_memory_candidate
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
-from memforge.memory.relation_classifier import StructuredMemoryPairClassifier
+from memforge.memory.relation_classifier import (
+    MEMORY_PAIR_CLASSIFIER_VERSION,
+    StructuredMemoryPairClassifier,
+)
+from memforge.memory.relation_discovery_contract import PreclassifiedRelationDecision
 from memforge.source_access import memory_visibility_for_document
 from memforge.source_projection import ImpactResult, ProjectionCoverage, resolve_anchor_impact
+from memforge.storage.adapters.protocols import EntityResolutionScope
 from memforge.models import (
     Memory,
     RawMemory,
@@ -50,7 +55,6 @@ from memforge.models import (
 
 if TYPE_CHECKING:
     from memforge.memory.store import MemoryStore
-    from memforge.models import EnrichmentResult
     from memforge.source_projection import SourceProjection
     from memforge.storage.database import Database
 
@@ -111,79 +115,11 @@ class MemoryEngine:
         )
         # Entity resolver with embedding + LLM capabilities
         self.entity_resolver = EntityResolver(
-            db=db,
+            store=db,
             embed_cfg=embed_cfg,
             structured_llm_client=structured_llm_client,
             llm_model=llm_model,
         )
-
-    # -------------------------------------------------------------------
-    # Process Call 1: Entity resolution + alias insertion
-    # -------------------------------------------------------------------
-
-    async def process_enrichment(
-        self,
-        doc_id: str,
-        enrichment: EnrichmentResult,
-        doc_context: str | None = None,
-    ) -> list[int]:
-        """Process enrichment result: resolve entities and register their aliases.
-
-        For each entity extracted by Call 1, resolves it against the DB
-        (exact match → alias lookup → embedding search → create new),
-        then registers any aliases the LLM found for it.
-
-        Returns list of resolved entity IDs (passed to Call 2 as context).
-        """
-        from memforge.pipeline.entity_filter import filter_entities
-
-        # Filter low-confidence or malformed entities
-        raw_dicts = [
-            {"name": e.name, "type": e.type, "tags": e.tags, "confidence": e.confidence} for e in enrichment.entities
-        ]
-        filtered_dicts, filter_stats = filter_entities(raw_dicts)
-        filtered_names = {d["name"] for d in filtered_dicts}
-
-        logger.info(
-            "Entity filter: %d → %d (removed %d noise)",
-            len(enrichment.entities),
-            len(filtered_dicts),
-            len(enrichment.entities) - len(filtered_dicts),
-        )
-
-        resolved_ids: list[int] = []
-
-        for raw_entity in enrichment.entities:
-            if raw_entity.name not in filtered_names:
-                continue
-
-            tags = (
-                raw_entity.tags
-                if raw_entity.tags
-                else ([raw_entity.type] if raw_entity.type and raw_entity.type != "unknown" else [])
-            )
-
-            # Resolve: find existing entity or create new
-            entity_id = await self.entity_resolver.resolve(
-                extracted_name=raw_entity.name,
-                db=self.db,
-                extracted_tags=tags,
-                doc_context=doc_context,
-            )
-            resolved_ids.append(entity_id)
-
-            # Register aliases the LLM found for this entity
-            for alias_name in raw_entity.aliases or []:
-                await insert_llm_alias(
-                    alias_name=alias_name,
-                    canonical_name=raw_entity.name,
-                    canonical_id=entity_id,
-                    evidence="",
-                    db=self.db,
-                )
-
-        self.entity_resolver.invalidate_cache()
-        return resolved_ids
 
     async def _active_projected_incumbents(
         self,
@@ -199,11 +135,10 @@ class MemoryEngine:
         keep pre-cutover rows visible to the conservative lineage gate.
         """
         unit_support = await self.db.get_source_unit_support_reference_ids(source_unit_id)
-        incumbents_by_id: dict[str, Memory] = {}
-        for memory_id in sorted(unit_support):
-            memory = await self.db.get_memory(memory_id)
-            if memory is not None and memory.status == "active":
-                incumbents_by_id[memory.id] = memory
+        incumbents_by_id = {
+            memory.id: memory
+            for memory in await self.db.list_active_memories(tuple(sorted(unit_support)))
+        }
         for memory in await self.db.get_memories_by_source_doc(
             doc_id,
             support_kind="extracted",
@@ -227,17 +162,19 @@ class MemoryEngine:
         """
 
         delta = projection.deltas[0]
+        ordered_incumbent_ids = tuple(sorted(incumbent_ids))
+        evidence_by_memory_id = await self.db.get_active_memory_support_evidence_many(
+            ordered_incumbent_ids,
+            source_id=projection.source_id,
+        )
         resolved: dict[str, ImpactResult] = {}
-        for memory_id in incumbent_ids:
+        for memory_id in ordered_incumbent_ids:
             reference_ids = unit_support.get(memory_id)
             if not reference_ids:
                 resolved[memory_id] = ImpactResult.UNKNOWN
                 continue
             scoped_reference_ids = frozenset(reference_ids)
-            evidence = await self.db.get_active_memory_support_evidence(
-                memory_id,
-                source_id=projection.source_id,
-            )
+            evidence = evidence_by_memory_id.get(memory_id, ())
             impacts = {
                 resolve_anchor_impact(item.anchor, delta)
                 for item in evidence
@@ -411,7 +348,6 @@ class MemoryEngine:
                         content=incumbent.content,
                         memory_type=incumbent.memory_type,
                         confidence=incumbent.confidence,
-                        tags=list(incumbent.tags),
                         extraction_context=current_primary_quote,
                         evidence_quote=current_primary_quote,
                         evidence_anchor="revalidated_noop",
@@ -434,7 +370,6 @@ class MemoryEngine:
         doc_type: str,
         project_key: str | None,
         repo_identifier: str | None,
-        entity_ids: list[int],
         document_content: str,
         update_mode: str,
         changed_hunks: str | None,
@@ -489,10 +424,31 @@ class MemoryEngine:
             ):
                 filtered_memories.append(raw)
         quality_candidate_count = len(filtered_memories)
-        filtered_memories = await self._select_projected_candidates(
+        candidate_ledger = await self._select_projected_candidates(
             projection=projection,
             doc_id=doc_id,
             candidates=filtered_memories,
+        )
+        filtered_memories = list(candidate_ledger.candidates)
+        stats.update(
+            {
+                "candidate_ledger_input_count": candidate_ledger.input_count,
+                "candidate_ledger_selected_count": len(candidate_ledger.candidates),
+                "candidate_ledger_dropped_exact_count": (
+                    candidate_ledger.dropped_exact_count
+                ),
+                "candidate_ledger_dropped_redundant_count": (
+                    candidate_ledger.dropped_redundant_count
+                ),
+                "candidate_ledger_llm_calls": candidate_ledger.structured_llm_calls,
+                "candidate_ledger_llm_elapsed_ms": (
+                    candidate_ledger.structured_llm_elapsed_ms
+                ),
+                "candidate_ledger_validation_retries": (
+                    candidate_ledger.validation_retries
+                ),
+                "candidate_ledger_prompt_chars": candidate_ledger.prompt_chars,
+            }
         )
         stats["skipped"] += quality_candidate_count - len(filtered_memories)
         reconciliation_started = perf_counter()
@@ -625,12 +581,16 @@ class MemoryEngine:
             projection=projection,
         )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
+        incumbent_support_states = await self.db.get_active_memory_support_states(
+            tuple(incumbents_by_id)
+        )
         all_support = {
-            memory_id: await self.db.get_active_memory_support_reference_ids(memory_id)
-            for memory_id in incumbents_by_id
+            memory_id: state.reference_ids
+            for memory_id, state in incumbent_support_states.items()
         }
         support_hashes = {
-            memory_id: await self.db.get_memory_support_set_hash(memory_id) for memory_id in incumbents_by_id
+            memory_id: state.support_set_hash
+            for memory_id, state in incumbent_support_states.items()
         }
         visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
         if visibility == "private" and user_id is not None and user_id != owner_user_id:
@@ -643,8 +603,45 @@ class MemoryEngine:
         )
         corroboration_targets: dict[str, Memory] = {}
         corroboration_proofs: dict[str, dict[str, object]] = {}
+        preclassified_relations: dict[str, tuple[PreclassifiedRelationDecision, ...]] = {}
         identity_claim_hashes: list[str] = []
         identity_requests: list[IdentityResolutionRequest] = []
+        operation_memories = tuple(
+            operation.memory for operation in operations if operation.memory is not None
+        )
+        entity_resolution = await self.entity_resolver.resolve_many(
+            tuple(
+                entity_ref
+                for raw_memory in operation_memories
+                for entity_ref in raw_memory.entity_refs
+            ),
+            scope=EntityResolutionScope(access_context_hash=access_context_hash),
+            doc_context=document_content[:2000],
+        )
+        stats.update(
+            {
+                "entity_resolution_unique_mentions": entity_resolution.metrics.unique_mentions,
+                "entity_resolution_exact_hits": entity_resolution.metrics.exact_hits,
+                "entity_resolution_alias_hits": entity_resolution.metrics.alias_hits,
+                "entity_resolution_embedded_mentions": entity_resolution.metrics.embedded_mentions,
+                "entity_resolution_ambiguous_mentions": entity_resolution.metrics.ambiguous_mentions,
+                "entity_resolution_embedding_batches": entity_resolution.metrics.embedding_batches,
+                "entity_resolution_llm_calls": entity_resolution.metrics.structured_llm_calls,
+                "entity_resolution_candidate_count": entity_resolution.metrics.candidate_count,
+                "entity_resolution_new_entities": entity_resolution.metrics.new_entities,
+                "entity_resolution_elapsed_ms": entity_resolution.metrics.elapsed_ms,
+            }
+        )
+        entity_ids_by_claim_hash = {
+            content_hash(raw_memory.content.strip()): tuple(
+                dict.fromkeys(
+                    entity_id
+                    for entity_ref in raw_memory.entity_refs
+                    if (entity_id := entity_resolution.entity_id(entity_ref)) is not None
+                )
+            )
+            for raw_memory in operation_memories
+        }
         for operation in operations:
             if operation.action is not ReconcileAction.ADD or operation.memory is None:
                 continue
@@ -660,11 +657,37 @@ class MemoryEngine:
                 IdentityResolutionRequest(
                     challenger=candidate,
                     doc_id=doc_id,
-                    entity_ids=tuple(entity_ids),
+                    entity_ids=entity_ids_by_claim_hash.get(
+                        content_hash(operation.memory.content.strip()),
+                        (),
+                    ),
                     excluded_memory_ids=frozenset(incumbents_by_id),
                 )
             )
-        identity_resolutions = await self.identity_resolver.resolve(tuple(identity_requests))
+        identity_resolution = await self.identity_resolver.resolve(tuple(identity_requests))
+        identity_resolutions = identity_resolution.resolutions
+        stats.update(
+            {
+                "identity_resolution_pair_count": identity_resolution.metrics.pair_count,
+                "identity_resolution_llm_calls": identity_resolution.metrics.llm_calls,
+                "identity_resolution_prompt_chars": identity_resolution.metrics.prompt_chars,
+                "identity_resolution_elapsed_ms": identity_resolution.metrics.elapsed_ms,
+            }
+        )
+        classified_candidate_ids = tuple(
+            dict.fromkeys(
+                memory_id
+                for resolution in identity_resolutions
+                for memory_id in (
+                    *(decision.pair.candidate.id for decision in resolution.classified_pairs),
+                    *((resolution.target.id,) if resolution.target is not None else ()),
+                )
+            )
+        )
+        classified_candidate_support = await self.db.get_active_memory_support_states(
+            classified_candidate_ids
+        )
+        attached_target_ids: list[str] = []
         for claim_hash, resolution in zip(
             identity_claim_hashes,
             identity_resolutions,
@@ -672,12 +695,41 @@ class MemoryEngine:
         ):
             target = resolution.target
             equivalence_proof = resolution.equivalence_proof
+            preclassified_relations[claim_hash] = tuple(
+                PreclassifiedRelationDecision(
+                    candidate_memory_id=decision.pair.candidate.id,
+                    expected_candidate_content_hash=decision.pair.candidate.content_hash,
+                    expected_candidate_support_set_hash=(
+                        classified_candidate_support[
+                            decision.pair.candidate.id
+                        ].current_support_set_hash
+                    ),
+                    expected_candidate_access_context_hash=lifecycle_access_context_hash(
+                        visibility=decision.pair.candidate.visibility,
+                        owner_user_id=decision.pair.candidate.owner_user_id,
+                        project_key=decision.pair.candidate.project_key,
+                        repo_identifier=decision.pair.candidate.repo_identifier,
+                    ),
+                    expected_challenger_access_context_hash=access_context_hash,
+                    relation_type=decision.relation_type,
+                    direction=decision.direction,
+                    reason=decision.reason,
+                    classifier_version=MEMORY_PAIR_CLASSIFIER_VERSION,
+                )
+                for decision in resolution.classified_pairs
+            )
             if target is None or equivalence_proof is None:
                 continue
             corroboration_targets[claim_hash] = target
             corroboration_proofs[claim_hash] = dict(equivalence_proof)
-            all_support[target.id] = await self.db.get_active_memory_support_reference_ids(target.id)
-            support_hashes[target.id] = await self.db.get_memory_support_set_hash(target.id)
+            attached_target_ids.append(target.id)
+        attached_support_states = {
+            memory_id: classified_candidate_support[memory_id]
+            for memory_id in attached_target_ids
+        }
+        for memory_id, state in attached_support_states.items():
+            all_support[memory_id] = state.reference_ids
+            support_hashes[memory_id] = state.support_set_hash
         evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
         projected_evidence = build_projected_claim_evidence(
             projection=projection,
@@ -716,7 +768,8 @@ class MemoryEngine:
                 source_type=source_type,
                 access_context_hash=access_context_hash,
                 actor_user_id=user_id,
-                entity_ids=tuple(entity_ids),
+                entity_ids_by_claim_hash=entity_ids_by_claim_hash,
+                preclassified_relations_by_claim_hash=preclassified_relations,
                 source_updated_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
             ),
             evidence_units=projected_evidence.units,
@@ -762,7 +815,7 @@ class MemoryEngine:
         projection: SourceProjection,
         doc_id: str,
         candidates: list[RawMemory],
-    ) -> list[RawMemory]:
+    ) -> CandidateLedgerResult:
         """Select one complete within-revision candidate ledger before writes."""
 
         try:
@@ -781,6 +834,10 @@ class MemoryEngine:
                     "input_count": exc.input_count,
                     "semantic_input_count": exc.semantic_input_count,
                     "selected_count": 0,
+                    "structured_llm_calls": exc.structured_llm_calls,
+                    "structured_llm_elapsed_ms": exc.structured_llm_elapsed_ms,
+                    "validation_retries": exc.validation_retries,
+                    "prompt_chars": exc.prompt_chars,
                     "candidate_fingerprints": _candidate_fingerprints(candidates),
                     "fingerprints_truncated": len(candidates) > 200,
                 },
@@ -796,7 +853,7 @@ class MemoryEngine:
                 reason="complete_candidate_ledger",
                 payload=_candidate_ledger_audit_payload(result),
             )
-        return list(result.candidates)
+        return result
 
     async def _record_candidate_ledger_audit(
         self,
@@ -893,12 +950,12 @@ class MemoryEngine:
             for memory_id in sorted(incumbents_by_id)
         )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
+        support_states = await self.db.get_active_memory_support_states(tuple(incumbents_by_id))
         all_support = {
-            memory_id: await self.db.get_active_memory_support_reference_ids(memory_id)
-            for memory_id in incumbents_by_id
+            memory_id: state.reference_ids for memory_id, state in support_states.items()
         }
         support_hashes = {
-            memory_id: await self.db.get_memory_support_set_hash(memory_id) for memory_id in incumbents_by_id
+            memory_id: state.support_set_hash for memory_id, state in support_states.items()
         }
         visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
         plan = build_lifecycle_plan(
@@ -986,7 +1043,6 @@ class MemoryEngine:
             project_key=project_key,
             repo_identifier=repo_identifier,
             entity_refs=raw.entity_refs,
-            tags=raw.tags,
             confidence=raw.confidence,
             corroboration_count=1,
             contradiction_count=0,
@@ -997,18 +1053,6 @@ class MemoryEngine:
             status="active",
             extraction_context=raw.extraction_context,
         )
-
-    async def _resolve_entity_refs(self, entity_refs: list[str]) -> list[int]:
-        """Resolve entity names to IDs."""
-        ids: list[int] = []
-        for name in entity_refs:
-            try:
-                eid = await resolve_entity(name, db=self.db)
-                ids.append(eid)
-            except Exception as e:
-                logger.warning("Failed to resolve entity %r: %s", name, e)
-        return ids
-
 
 def _observation_semantic_class(
     projection: SourceProjection,
@@ -1031,6 +1075,10 @@ def _candidate_ledger_audit_payload(result: CandidateLedgerResult) -> dict[str, 
         "selected_count": len(result.candidates),
         "dropped_exact_count": result.dropped_exact_count,
         "dropped_redundant_count": result.dropped_redundant_count,
+        "structured_llm_calls": result.structured_llm_calls,
+        "structured_llm_elapsed_ms": result.structured_llm_elapsed_ms,
+        "validation_retries": result.validation_retries,
+        "prompt_chars": result.prompt_chars,
         "drops": [
             {
                 "candidate_content_hash": content_hash(drop.candidate.content),

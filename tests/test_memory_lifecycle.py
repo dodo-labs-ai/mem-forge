@@ -541,7 +541,7 @@ class TestHardPurge:
     @pytest.mark.asyncio
     async def test_hard_purge_removes_memory_content_indexes_and_sensitive_links(self, db):
         await _insert_doc(db, "doc-a")
-        entity_id = await db.upsert_entity("postgresql", display_name="PostgreSQL", tags=["technology"])
+        entity_id = await db.upsert_entity("postgresql", display_name="PostgreSQL")
         memory = _make_memory("mem-purge01", "Private credential detail")
         dependent = _make_memory("mem-dependent", "This memory used to replace the purged one")
         await db.insert_memory(memory)

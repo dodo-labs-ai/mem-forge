@@ -276,7 +276,7 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Create a new memory when the user asks to remember or record durable knowledge. "
             "Users need not name this tool. First search for similar memories to avoid duplicates, "
-            "show a readable preview with the new durable claim, provenance/evidence, scope, and type/tags, then get "
+            "show a readable preview with the new durable claim, provenance/evidence, scope, and type, then get "
             "explicit confirmation via request_user_input if available, else a concise text question. "
             "Generate durable memory content from the confirmed preview without unapproved semantic changes. "
             "Keep provenance, confirmation details, test/deploy notes, and why-the-tool-was-called "
@@ -306,11 +306,6 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "enum": ["fact", "decision", "convention", "procedure"],
                     "default": "fact",
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Short topical tags from the confirmed preview.",
                 },
                 "confidence": {"type": "number"},
                 "idempotency_key": {
@@ -554,14 +549,10 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             memory_type = str(args.get("memory_type") or "fact").strip()
             if memory_type not in {"fact", "decision", "convention", "procedure"}:
                 raise ValueError("memory_type must be fact, decision, convention, or procedure")
-            tags = args.get("tags") or []
-            if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
-                raise ValueError("tags must be an array of strings")
             body = {
                 "content": _required_string_arg(args, "content"),
                 "provenance": _required_string_arg(args, "provenance"),
                 "memory_type": memory_type,
-                "tags": tags,
                 "client": _mcp_client(),
             }
             if "confidence" in args:
@@ -975,7 +966,6 @@ def _compact_search_result(result: dict[str, Any]) -> dict[str, Any]:
         "summary",
         "confidence",
         "relevance_score",
-        "tags",
         "freshness",
         "status",
         "follow_up",
@@ -996,7 +986,6 @@ def _compact_memory_response(payload: dict[str, Any]) -> dict[str, Any]:
         "content",
         "content_hash",
         "confidence",
-        "tags",
         "status",
         "entity_refs",
     ):

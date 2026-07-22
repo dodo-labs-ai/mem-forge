@@ -32,7 +32,6 @@ async def test_add_source_support_does_not_cross_visibility(tmp_path):
             visibility=Visibility.PRIVATE.value,
             owner_user_id="u-alice",
             project_key=SHARED_PROJECT_KEY,
-            tags=[],
         )
         await db.insert_memory(priv)
 
@@ -68,7 +67,6 @@ async def test_add_source_support_does_not_cross_private_owner(tmp_path):
             visibility=Visibility.PRIVATE.value,
             owner_user_id="u-alice",
             project_key=SHARED_PROJECT_KEY,
-            tags=[],
         )
         await db.insert_memory(alice)
 
@@ -104,7 +102,6 @@ async def test_add_source_support_does_not_cross_workspace_project(tmp_path):
             visibility=Visibility.WORKSPACE.value,
             owner_user_id=None,
             project_key="RISK",
-            tags=[],
         )
         await db.insert_memory(risk)
 
@@ -141,7 +138,6 @@ async def test_add_source_support_rejects_workspace_writer_with_none_project_aga
         visibility=Visibility.WORKSPACE.value,
         owner_user_id=None,
         project_key="PAY",
-        tags=[],
     )
     db = Database(str(tmp_path / "c2.db"))
     await db.connect()

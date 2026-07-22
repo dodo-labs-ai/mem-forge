@@ -4722,7 +4722,6 @@ def maintenance_repair_indexes(ctx):
         config: AppConfig = ctx.obj["config"]
         db = await _get_db(config)
         memory_collection = get_chroma_collection(config.storage.chroma_path, name="memories")
-        document_collection = get_chroma_collection(config.storage.chroma_path, name="documents")
         llm = await get_effective_llm_config(db, config)
         embed_cfg = {
             "base_url": llm.embedding_base_url,
@@ -4733,13 +4732,11 @@ def maintenance_repair_indexes(ctx):
             result = await MemoryIndexRepairer(
                 db=db,
                 memory_collection=memory_collection,
-                document_collection=document_collection,
                 embed_cfg=embed_cfg,
             ).repair()
             report = await MemoryIndexHealthChecker(
                 db=db,
                 memory_collection=memory_collection,
-                document_collection=document_collection,
             ).check()
         finally:
             await db.close()
@@ -4751,10 +4748,7 @@ def maintenance_repair_indexes(ctx):
         table.add_row("FTS rows deleted", str(result.fts_rows_deleted))
         table.add_row("Memory vectors repaired", str(result.memory_vectors_repaired))
         table.add_row("Memory vectors deleted", str(result.memory_vectors_deleted))
-        table.add_row("Document vectors repaired", str(result.document_vectors_repaired))
-        table.add_row("Document vectors created", str(result.document_vectors_created))
         table.add_row("Unrepaired memories", str(len(result.unrepaired_memories)))
-        table.add_row("Unrepaired documents", str(len(result.unrepaired_documents)))
         console.print(table)
         if report.ok:
             console.print("[green]Index health is clean.[/]")
