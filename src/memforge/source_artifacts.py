@@ -24,12 +24,19 @@ SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES = frozenset(
     }
 )
 MAX_SOURCE_ARTIFACT_BYTES = 10 * 1024 * 1024
-MAX_SOURCE_ARTIFACTS_PER_UNIT = 20
+MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT = 200
+MAX_SOURCE_ARTIFACTS_PER_UNIT = 100
 MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT = 30 * 1024 * 1024
 
 
 class SourceArtifactContractError(ValueError):
     """Provider Artifact materialization violated the shared contract."""
+
+
+def normalize_source_artifact_media_type(value: object) -> str:
+    """Return one canonical media type for provider descriptors and payloads."""
+
+    return str(value or "").split(";", 1)[0].strip().lower()
 
 
 class SourceArtifactByteStore(Protocol):
@@ -212,7 +219,7 @@ def materialize_source_artifact(
 ) -> StoredSourceArtifact:
     """Validate one provider payload and store its exact bytes."""
 
-    media_type = artifact.media_type.split(";", 1)[0].strip().lower()
+    media_type = normalize_source_artifact_media_type(artifact.media_type)
     if media_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
         raise SourceArtifactContractError(f"unsupported Source Artifact media type: {media_type}")
     size_bytes = len(artifact.body)
@@ -286,7 +293,7 @@ def materialize_source_artifacts(
 def extension_for_media_type(media_type: str) -> str:
     """Return a safe filename extension for an Artifact media type."""
 
-    normalized = media_type.split(";", 1)[0].strip().lower()
+    normalized = normalize_source_artifact_media_type(media_type)
     if normalized == "image/jpeg":
         return ".jpg"
     return mimetypes.guess_extension(normalized) or ".bin"

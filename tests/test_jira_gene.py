@@ -9,6 +9,7 @@ import pytest
 
 from memforge.genes.jira_gene import JiraGene
 from memforge.models import ContentItem
+from memforge.source_artifacts import SourceArtifactContractError
 
 
 def _search_page(issues: list[dict], *, total: int | None = None, start_at: int = 0) -> dict:
@@ -591,6 +592,98 @@ async def test_fetch_materializes_jira_image_attachment_with_comment_parent():
     assert artifact.parent_provider_key == "comment-9"
     assert artifact.media_type == "image/png"
     assert artifact.body == image
+
+
+@pytest.mark.asyncio
+async def test_fetch_does_not_count_unsupported_jira_attachments_against_image_budget():
+    image = b"\x89PNG\r\n\x1a\nbounded-jira-image"
+    unsupported = [
+        {
+            "id": str(8000 + index),
+            "filename": f"document-{index}.docx",
+            "mimeType": (
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+            "size": 100,
+            "created": "2026-05-21T09:00:00Z",
+            "content": (
+                "https://jira.example.test"
+                f"/rest/api/2/attachment/content/{8000 + index}"
+            ),
+        }
+        for index in range(20)
+    ]
+    supported = {
+        "id": "9001",
+        "filename": "screenshot.png",
+        "mimeType": "image/png",
+        "size": len(image),
+        "created": "2026-05-21T09:01:00Z",
+        "content": "https://jira.example.test/rest/api/2/attachment/content/9001",
+    }
+
+    class AttachmentClient(RecordingAsyncClient):
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls.append((method, url, kwargs))
+            if url == "/rest/api/2/attachment/content/9001":
+                return BinaryResponse(image, "image/png")
+            return JsonResponse(
+                _search_page(
+                    [
+                        _jira_issue(
+                            "PAY-123",
+                            issue_id="100123",
+                            field_overrides={"attachment": [*unsupported, supported]},
+                        )
+                    ]
+                )
+            )
+
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
+        source_id="src-jira",
+    )
+    client = AttachmentClient(base_url="https://jira.example.test")
+    gene._client = client
+    gene._base_url = "https://jira.example.test"
+
+    items = [item async for item in gene.discover()]
+    raw = await gene.fetch(items[0])
+
+    assert [artifact.provider_key for artifact in raw.artifacts] == ["9001"]
+    assert [call[1] for call in client.calls] == [
+        "/rest/api/2/search",
+        "/rest/api/2/attachment/content/9001",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_jira_attachment_descriptor_scan_is_bounded_before_download():
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
+        source_id="src-jira",
+    )
+    issue = _jira_issue(
+        "PAY-123",
+        issue_id="100123",
+        field_overrides={
+            "attachment": [
+                {
+                    "id": str(8000 + index),
+                    "filename": f"document-{index}.bin",
+                    "mimeType": "application/octet-stream",
+                    "size": 1,
+                    "created": "2026-05-21T09:00:00Z",
+                    "content": f"/rest/api/2/attachment/content/{8000 + index}",
+                }
+                for index in range(201)
+            ]
+        },
+    )
+
+    with pytest.raises(SourceArtifactContractError, match="descriptor scan limit"):
+        await gene._fetch_source_artifacts(issue)
 
 
 @pytest.mark.asyncio

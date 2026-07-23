@@ -8,6 +8,7 @@ import pytest
 
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
 from memforge.models import ContentItem
+from memforge.source_artifacts import SourceArtifactContractError
 
 
 def test_confluence_schema_hides_runtime_transport_fields_from_ui():
@@ -361,6 +362,108 @@ async def test_fetch_materializes_confluence_image_attachment_with_parent_identi
     assert artifact.provider_revision == "3"
     assert artifact.media_type == "image/png"
     assert artifact.body == image
+
+
+@pytest.mark.asyncio
+async def test_fetch_does_not_count_unsupported_confluence_attachments_against_image_budget():
+    image = b"\x89PNG\r\n\x1a\nbounded-confluence-image"
+    unsupported = [
+        {
+            "id": f"document-{index}",
+            "title": f"document-{index}.docx",
+            "version": {"number": 1},
+            "extensions": {
+                "mediaType": (
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                "fileSize": 100,
+            },
+            "_links": {"download": f"/download/attachments/123/document-{index}.docx"},
+        }
+        for index in range(20)
+    ]
+    supported = {
+        "id": "image-1",
+        "title": "diagram.png",
+        "version": {"number": 2},
+        "extensions": {
+            "mediaType": "image/png",
+            "fileSize": len(image),
+        },
+        "_links": {"download": "/download/attachments/123/diagram.png"},
+    }
+    gene = ConfluenceGene(
+        config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
+        source_id="src-confluence",
+    )
+    gene._api_prefix = "/wiki"
+    gene._get = AsyncMock(
+        side_effect=[
+            JsonResponse(
+                {
+                    "id": "123",
+                    "version": {"number": 7},
+                    "body": {"storage": {"value": "<p>See diagram.</p>"}},
+                    "ancestors": [],
+                    "space": {"key": "PAY"},
+                    "children": {
+                        "attachment": {
+                            "results": [*unsupported, supported],
+                            "start": 0,
+                            "size": 21,
+                            "_links": {},
+                        }
+                    },
+                }
+            ),
+            BinaryResponse(image, "image/png"),
+        ]
+    )
+    item = ContentItem(
+        item_id="confluence-123",
+        title="Page",
+        source_url="https://wiki.example.test/wiki/pages/123",
+        last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        space_or_project="PAY",
+        version="7",
+        extra={"page_id": "123"},
+    )
+
+    raw = await gene.fetch(item)
+
+    assert [artifact.provider_key for artifact in raw.artifacts] == ["image-1"]
+    assert gene._get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_confluence_attachment_descriptor_scan_is_bounded_before_download():
+    gene = ConfluenceGene(
+        config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
+        source_id="src-confluence",
+    )
+    gene._api_prefix = "/wiki"
+    first_page = {
+        "results": [
+            {
+                "id": f"document-{index}",
+                "title": f"document-{index}.docx",
+                "version": {"number": 1},
+                "extensions": {
+                    "mediaType": "application/octet-stream",
+                    "fileSize": 1,
+                },
+                "_links": {"download": f"/download/attachments/123/document-{index}.docx"},
+            }
+            for index in range(201)
+        ],
+        "start": 0,
+        "size": 201,
+        "_links": {},
+    }
+
+    with pytest.raises(SourceArtifactContractError, match="descriptor scan limit"):
+        await gene._fetch_source_artifacts("123", first_page=first_page)
 
 
 @pytest.mark.asyncio
