@@ -76,8 +76,16 @@ class _Classifier:
 
 
 class _Candidates:
-    def __init__(self, candidates: tuple[Memory, ...]) -> None:
+    def __init__(
+        self,
+        candidates: tuple[Memory, ...],
+        *,
+        source_ids: tuple[str, ...] | None = None,
+    ) -> None:
         self._candidates = candidates
+        self._source_ids = source_ids or tuple(f"src-{index}" for index in range(len(candidates)))
+        if len(self._source_ids) != len(candidates):
+            raise ValueError("source_ids must align with candidates")
         self.actor_user_id = None
         self.excluded_source_ids = ()
 
@@ -89,7 +97,7 @@ class _Candidates:
                 RetrievedRelationCandidate(
                     memory=CandidateMemory(
                         memory_id=candidate.id,
-                        source_id=f"src-{index}",
+                        source_id=self._source_ids[index],
                         doc_id=f"doc-{index}",
                         source_lineage_id=f"doc-{index}",
                         visibility=candidate.visibility,
@@ -455,3 +463,38 @@ async def test_private_relation_discovery_without_explicit_actor_builds_valid_cr
     assert store.completed.relations[0].authority_case is AuthorityCase.CROSS_SOURCE_CONFLICT
     assert len(store.reviews) == 1
     assert store.reviews[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_mixed_relation_run_creates_review_only_for_cross_source_conflict() -> None:
+    challenger = _memory("challenger", "Current claim")
+    cross_source = _memory("cross-source", "Conflicting external claim")
+    same_source = _memory("same-source", "Conflicting sibling document claim")
+    candidates = (cross_source, same_source)
+    store = _Store(challenger, candidates)
+
+    result = await RelationDiscovery(
+        store=store,  # type: ignore[arg-type]
+        candidate_retriever=_Candidates(
+            candidates,
+            source_ids=("src-external", "src-challenger"),
+        ),  # type: ignore[arg-type]
+        pair_classifier=_ConflictClassifier(),
+    ).process_slice(
+        worker_id="worker-1",
+        budget=RelationDiscoveryBudget(max_candidate_pairs=2, max_llm_calls=1),
+    )
+
+    assert result.completed_work == 1
+    assert store.completed is not None
+    assert store.completed.relation_run.lifecycle_action == "create_review"
+    assert store.completed.relation_run.review_case == "cross_source_conflict"
+    assert {
+        relation.memory_id: relation.authority_case for relation in store.completed.relations
+    } == {
+        cross_source.id: AuthorityCase.CROSS_SOURCE_CONFLICT,
+        same_source.id: AuthorityCase.INDEPENDENT_CONFLICT,
+    }
+    assert len(store.reviews) == 1
+    assert store.reviews[0].incumbent_memory_id == cross_source.id
+    assert store.reviews[0].challenger_memory_id == challenger.id
