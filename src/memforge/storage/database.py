@@ -161,6 +161,11 @@ from memforge.source_projection import (
     source_projection_from_payload,
     source_projection_to_payload,
 )
+from memforge.source_artifacts import (
+    SourceArtifactEvidence,
+    SourceArtifactRevision,
+    source_artifact_revision_from_metadata,
+)
 from memforge.storage.admin_memory import (
     MemoryAdminListFilters,
     MemoryAdminQueryPage,
@@ -4922,6 +4927,75 @@ class Database:
                     metadata=json.loads(row["metadata_json"] or "{}"),
                 )
         return revisions
+
+    async def get_source_artifact_revision(
+        self,
+        observation_revision_id: str,
+    ) -> SourceArtifactRevision | None:
+        """Resolve one exact current binary Artifact revision."""
+
+        async with self.db.execute(
+            """SELECT so.id AS observation_id, so.source_id, so.source_unit_id,
+                      sor.id AS observation_revision_id, sor.metadata_json
+               FROM source_observations so
+               JOIN source_observation_revisions sor ON sor.id = so.current_revision_id
+               WHERE sor.id = ? AND so.observation_type = 'binary_artifact'""",
+            (observation_revision_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return source_artifact_revision_from_metadata(
+            observation_id=str(row["observation_id"]),
+            observation_revision_id=str(row["observation_revision_id"]),
+            source_id=str(row["source_id"]),
+            source_unit_id=str(row["source_unit_id"]),
+            metadata=json.loads(row["metadata_json"] or "{}"),
+        )
+
+    async def get_memory_source_artifacts(
+        self,
+        memory_id: str,
+    ) -> tuple[SourceArtifactEvidence, ...]:
+        """Return active Evidence that targets current binary Artifacts."""
+
+        rows = await self.db.execute_fetchall(
+            """SELECT msa.memory_id, er.id AS evidence_reference_id,
+                      er.evidence_unit_id, er.role,
+                      so.id AS observation_id, so.source_id, so.source_unit_id,
+                      sor.id AS observation_revision_id, sor.metadata_json
+               FROM memory_support_assertions msa
+               JOIN evidence_references er ON er.id = msa.evidence_reference_id
+               JOIN source_observations so ON so.id = er.observation_id
+               JOIN source_observation_revisions sor
+                 ON sor.id = er.observation_revision_id
+                AND sor.id = so.current_revision_id
+               WHERE msa.memory_id = ? AND msa.active = 1
+                 AND so.observation_type = 'binary_artifact'
+               ORDER BY er.id""",
+            (memory_id,),
+        )
+        evidence: list[SourceArtifactEvidence] = []
+        for row in rows:
+            artifact = source_artifact_revision_from_metadata(
+                observation_id=str(row["observation_id"]),
+                observation_revision_id=str(row["observation_revision_id"]),
+                source_id=str(row["source_id"]),
+                source_unit_id=str(row["source_unit_id"]),
+                metadata=json.loads(row["metadata_json"] or "{}"),
+            )
+            if artifact is None:
+                continue
+            evidence.append(
+                SourceArtifactEvidence(
+                    memory_id=str(row["memory_id"]),
+                    evidence_reference_id=str(row["evidence_reference_id"]),
+                    evidence_unit_id=str(row["evidence_unit_id"]),
+                    role=str(row["role"]),
+                    artifact=artifact,
+                )
+            )
+        return tuple(evidence)
 
     async def find_source_unit_by_document_id(
         self,

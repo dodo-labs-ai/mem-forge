@@ -25,6 +25,7 @@ from memforge.llm.structured import (
     StructuredLlmError,
     StructuredLlmMetricsCollector,
     StructuredLlmMetricsSummary,
+    StructuredLlmImage,
     litellm_model_name,
 )
 
@@ -345,6 +346,53 @@ async def test_litellm_structured_client_uses_response_schema_for_memory_extract
     assert "tools" not in calls[0]
     assert "tool_choice" not in calls[0]
     assert calls[0]["max_tokens"] == 8192
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_sends_images_in_same_logical_extraction_call(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse('{"memories":[]}')
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url="http://localhost:6655/anthropic",
+            api_key="local-key",
+            timeout_s=120.0,
+        )
+    )
+
+    await client.extract_memories(
+        "Inspect the attached PRIMARY observation.",
+        max_tokens=8192,
+        images=(
+            StructuredLlmImage(
+                source_observation_id="obs-image-1",
+                media_type="image/png",
+                body=b"\x89PNG",
+            ),
+        ),
+    )
+
+    assert len(calls) == 1
+    content = calls[0]["messages"][0]["content"]
+    assert content[0] == {
+        "type": "text",
+        "text": "Inspect the attached PRIMARY observation.",
+    }
+    assert content[1] == {
+        "type": "text",
+        "text": "Image evidence for Source Observation obs-image-1:",
+    }
+    assert content[2] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,iVBORw=="},
+    }
 
 
 @pytest.mark.asyncio

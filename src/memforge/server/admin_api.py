@@ -453,6 +453,21 @@ class MemorySourceDetail(BaseModel):
     source_updated_at: str | None = None
 
 
+class MemoryEvidenceArtifactDetail(BaseModel):
+    artifact_id: str
+    observation_id: str
+    observation_revision_id: str
+    parent_observation_id: str
+    evidence_reference_id: str
+    evidence_unit_id: str
+    evidence_role: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    url: str
+
+
 class MemoryResponse(BaseModel):
     id: str
     memory_type: str
@@ -487,6 +502,7 @@ class MemoryResponse(BaseModel):
 class MemoryDetailResponse(MemoryResponse):
     entity_refs: list[str] = []
     sources: list[MemorySourceDetail] = []
+    evidence_artifacts: list[MemoryEvidenceArtifactDetail] = []
 
 
 class MemoryListResponse(BaseModel):
@@ -2775,6 +2791,7 @@ def create_admin_app(
     # -- Register routers --
     health_router = APIRouter(tags=["health"])
     document_router = APIRouter(prefix="/api/documents", tags=["documents"])
+    source_artifact_router = APIRouter(prefix="/api/source-artifacts", tags=["source-artifacts"])
     memory_router = APIRouter(prefix="/api/memories", tags=["memories"])
     review_router = APIRouter(prefix="/api/memory-reviews", tags=["memory-reviews"])
     entity_router = APIRouter(prefix="/api/entities", tags=["entities"])
@@ -2907,6 +2924,58 @@ def create_admin_app(
             content=content,
             media_type=artifact.media_type,
             headers={"Content-Disposition": f'inline; filename="{artifact.filename}"'},
+        )
+
+    @source_artifact_router.api_route(
+        "/{observation_revision_id}",
+        methods=["GET", "HEAD"],
+    )
+    async def get_source_artifact(
+        observation_revision_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
+    ):
+        """Serve one exact current Artifact revision under source access."""
+
+        artifact = await db.get_source_artifact_revision(observation_revision_id)
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="Source Artifact not found")
+        source = await db.get_source(artifact.source_id)
+        principal = resolve_request_principal(request)
+        if (
+            source is None
+            or source.get("access_state") != "active"
+            or (
+                source.get("access_policy") == "private"
+                and source.get("owner_user_id") != principal
+            )
+        ):
+            raise HTTPException(status_code=404, detail="Source Artifact not found")
+        stored = artifact_store.get_artifact(artifact.uri, artifact.media_type)
+        if (
+            stored is None
+            or stored.size_bytes is not None
+            and stored.size_bytes != artifact.size_bytes
+        ):
+            raise HTTPException(status_code=409, detail="Source Artifact integrity mismatch")
+        content = b""
+        if request.method != "HEAD":
+            content = artifact_store.read_artifact(artifact.uri)
+            if (
+                len(content) != artifact.size_bytes
+                or hashlib.sha256(content).hexdigest() != artifact.sha256
+            ):
+                raise HTTPException(status_code=409, detail="Source Artifact integrity mismatch")
+        filename = Path(artifact.filename).name.replace('"', "")
+        return Response(
+            content=content,
+            media_type=artifact.media_type,
+            headers={
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "ETag": f'"sha256:{artifact.sha256}"',
+                "X-Content-SHA256": artifact.sha256,
+            },
         )
 
     @document_router.api_route("/{doc_id}/content", methods=["GET", "HEAD"])
@@ -3091,6 +3160,10 @@ def create_admin_app(
         for ms in raw_sources:
             doc = await db.get_document(ms.doc_id)
             source_details.append(_memory_source_detail(ms, doc, config, artifact_store))
+        evidence_artifacts = [
+            item.metadata()
+            for item in await db.get_memory_source_artifacts(memory_id)
+        ]
 
         # Fetch linked entity names.
         entity_names = await db.get_memory_entity_names(memory_id)
@@ -3123,6 +3196,7 @@ def create_admin_app(
             updated_at=_dt_iso(mem.updated_at),
             entity_refs=entity_names,
             sources=source_details,
+            evidence_artifacts=evidence_artifacts,
             origin_source_type=origin_source_type,
             origin_client=origin_client,
         )
@@ -6680,6 +6754,7 @@ def create_admin_app(
     app.include_router(auth_router)
     app.include_router(health_router)
     app.include_router(document_router)
+    app.include_router(source_artifact_router)
     app.include_router(memory_router)
     app.include_router(review_router)
     app.include_router(entity_router)

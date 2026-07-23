@@ -52,6 +52,7 @@ from memforge.models import (
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.source_activity import SourceActivityLease
+from memforge.source_artifacts import SourceArtifactEvidence, SourceArtifactRevision
 from memforge.source_projection import (
     SourceObservationRevision,
     SourceProjection,
@@ -617,6 +618,18 @@ class SqliteRelationalStore:
         source_unit_id: str,
     ) -> dict[str, SourceObservationRevision]:
         return dict(await self._db.get_current_source_observation_revisions(source_unit_id))
+
+    async def get_source_artifact_revision(
+        self,
+        observation_revision_id: str,
+    ) -> SourceArtifactRevision | None:
+        return await self._db.get_source_artifact_revision(observation_revision_id)
+
+    async def get_memory_source_artifacts(
+        self,
+        memory_id: str,
+    ) -> tuple[SourceArtifactEvidence, ...]:
+        return await self._db.get_memory_source_artifacts(memory_id)
 
     async def find_source_unit_by_document_id(
         self,

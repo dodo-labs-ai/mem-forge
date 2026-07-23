@@ -463,11 +463,20 @@ class NoRedirectHandler(HTTPRedirectHandler):
 
 
 class ResourceTarget:
-    def __init__(self, doc_id: str, kind: str, relative_url: str, request_url: str) -> None:
-        self.doc_id = doc_id
+    def __init__(
+        self,
+        resource_id: str,
+        kind: str,
+        relative_url: str,
+        request_url: str,
+        *,
+        identity_key: str = "doc_id",
+    ) -> None:
+        self.resource_id = resource_id
         self.kind = kind
         self.relative_url = relative_url
         self.request_url = request_url
+        self.identity_key = identity_key
 
 
 def main() -> int:
@@ -918,6 +927,17 @@ def _root_path(item: Any) -> str | None:
 
 
 def _tool_result(payload: dict[str, Any]) -> dict[str, Any]:
+    content_type = str(payload.get("content_type") or "").split(";", 1)[0].strip().lower()
+    encoded = payload.get("data_base64")
+    if content_type.startswith("image/") and isinstance(encoded, str):
+        metadata = {key: value for key, value in payload.items() if key != "data_base64"}
+        return {
+            "content": [
+                {"type": "text", "text": json.dumps(metadata, indent=2)},
+                {"type": "image", "data": encoded, "mimeType": content_type},
+            ],
+            "isError": False,
+        }
     return {
         "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
         "isError": False,
@@ -999,6 +1019,13 @@ def _compact_memory_response(payload: dict[str, Any]) -> dict[str, Any]:
             for source in sources
             if isinstance(source, dict)
         ]
+    evidence_artifacts = payload.get("evidence_artifacts")
+    if isinstance(evidence_artifacts, list):
+        compact["evidence_artifacts"] = [
+            artifact
+            for artifact in evidence_artifacts
+            if isinstance(artifact, dict)
+        ]
     return compact
 
 
@@ -1076,7 +1103,8 @@ def _handle_get_resource(args: dict[str, Any]) -> dict[str, Any]:
             "error": "unsupported resource URL",
             "hint": (
                 "Use a relative MemForge /api/documents/{doc_id}/content, /pdf, "
-                "or /artifacts/{kind} URL, or an absolute URL under MEMFORGE_API_URL."
+                "/artifacts/{kind}, or /api/source-artifacts/{observation_revision_id} "
+                "URL, or an absolute URL under MEMFORGE_API_URL."
             ),
         }
 
@@ -1138,7 +1166,7 @@ def _fetch_resource_file(target: ResourceTarget) -> dict[str, Any]:
             digest = hashlib.sha256()
             observed_size = 0
             cache_root = _artifact_cache_root()
-            safe_doc = _safe_cache_component(target.doc_id) or "document"
+            safe_doc = _safe_cache_component(target.resource_id) or "resource"
             safe_kind = _safe_cache_component(target.kind) or "artifact"
             with tempfile.NamedTemporaryFile(
                 "wb",
@@ -1155,7 +1183,12 @@ def _fetch_resource_file(target: ResourceTarget) -> dict[str, Any]:
                     digest.update(chunk)
                     observed_size += len(chunk)
                     handle.write(chunk)
-            final_path = _cache_artifact_path(target.doc_id, target.kind, filename, digest.hexdigest()[:16])
+            final_path = _cache_artifact_path(
+                target.resource_id,
+                target.kind,
+                filename,
+                digest.hexdigest()[:16],
+            )
             if final_path.exists():
                 tmp_path.unlink(missing_ok=True)
             else:
@@ -1179,7 +1212,7 @@ def _resource_metadata(
     mode: str,
 ) -> dict[str, Any]:
     return {
-        "doc_id": target.doc_id,
+        target.identity_key: target.resource_id,
         "kind": target.kind,
         "content_type": headers.get("content-type", "application/octet-stream"),
         "filename": _resource_filename(headers, target),
@@ -1216,6 +1249,14 @@ def _parse_resource_url(url: str, origin: str) -> ResourceTarget | None:
         return ResourceTarget(parts[2], "pdf", path, _resource_url(path[len("/api") :]))
     if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
         return ResourceTarget(parts[2], parts[4], path, _resource_url(path[len("/api") :]))
+    if len(parts) == 3 and parts[:2] == ["api", "source-artifacts"]:
+        return ResourceTarget(
+            parts[2],
+            "source_artifact",
+            path,
+            _resource_url(path[len("/api") :]),
+            identity_key="observation_revision_id",
+        )
     return None
 
 
@@ -1247,7 +1288,7 @@ def _resource_filename(headers: dict[str, str], target: ResourceTarget) -> str:
     if match:
         return Path(match.group(1)).name
     suffix = ".pdf" if target.kind == "pdf" else ".md" if target.kind == "content" else ".bin"
-    return f"{target.doc_id}-{target.kind}{suffix}"
+    return f"{target.resource_id}-{target.kind}{suffix}"
 
 
 def _is_text_content_type(media_type: str) -> bool:

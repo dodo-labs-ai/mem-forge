@@ -63,6 +63,7 @@ class CandidateBucket(str, Enum):
 
 class EvidenceContentProvenance(str, Enum):
     SOURCE_EXCERPT = "source_excerpt"
+    SOURCE_ARTIFACT = "source_artifact"
     LEGACY_LIMITED = "legacy_limited"
     NO_EXCERPT = "no_excerpt"
 

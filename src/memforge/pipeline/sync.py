@@ -14,6 +14,7 @@ independently with retry logic and per-item error isolation.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -31,6 +32,7 @@ import tiktoken
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
     StructuredLlmMetricsCollector,
+    StructuredLlmImage,
 )
 from memforge.models import (
     ChangelogEntry,
@@ -65,6 +67,7 @@ from memforge.source_projection import (
     SourceProjectionAdapter,
     SourceRelationType,
 )
+from memforge.source_artifacts import StoredSourceArtifact, materialize_source_artifacts
 from memforge.source_projection_config import canonical_projection_scope
 
 if TYPE_CHECKING:
@@ -1422,6 +1425,7 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         normalized = await gene.normalize(raw)
         markdown_body = normalized.markdown_body
+        stored_source_artifacts: tuple[StoredSourceArtifact, ...] = ()
         self._memory_sample(
             "after_normalize",
             source_id=source_id,
@@ -1595,6 +1599,43 @@ class GeneSyncOrchestrator:
                 )
             return stats
 
+        # Artifact identity belongs to the immutable Source Unit, not to its
+        # current document locator. Jira issue keys and repository paths can
+        # change while the provider-native unit remains the same. Materialize
+        # only after the identity probe, then rebuild the authoritative probe
+        # with the revision-pinned Artifact observations.
+        if raw.artifacts:
+            stored_source_artifacts = materialize_source_artifacts(
+                source_id=source_id,
+                source_unit_key=source_unit.id,
+                artifacts=raw.artifacts,
+                store=self.doc_store,
+            )
+            probe_scope.update(
+                {
+                    "source_unit_id": source_unit.id,
+                    "source_unit_provider_key": source_unit.provider_key,
+                }
+            )
+            projection_probe = await self.source_projection_adapter.project(
+                ProjectionEnvelope(
+                    request=ProjectionRequest(
+                        run_id="projection-probe",
+                        source_id=source_id,
+                        source_type=source_type,
+                        scope=probe_scope,
+                        run_mode=ProjectionRunMode.FULL_SNAPSHOT,
+                        scope_transition=scope_transition,
+                        access_context=dict(projection_access_context or {}),
+                    ),
+                    item=item,
+                    raw=raw,
+                    normalized=normalized,
+                    artifacts=stored_source_artifacts,
+                )
+            )
+            source_unit = projection_probe.source_units[0]
+
         if source_unit_id_callback is not None:
             source_unit_id_callback(source_unit.id)
         stats["source_unit_id"] = source_unit.id
@@ -1630,6 +1671,7 @@ class GeneSyncOrchestrator:
                         item=item,
                         raw=raw,
                         normalized=normalized,
+                        artifacts=stored_source_artifacts,
                         prior_unit_revision=(
                             None if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT else prior_unit_revision
                         ),
@@ -1960,6 +2002,7 @@ class GeneSyncOrchestrator:
         # work; same-source incumbents are loaded by exact lifecycle lineage.
         extraction_result = await self._extract_for_document_update(
             projection=projection,
+            source_artifacts=stored_source_artifacts,
             update_plan=update_plan,
             markdown_body=markdown_body,
             source_type=source_type,
@@ -2163,6 +2206,7 @@ class GeneSyncOrchestrator:
         self,
         *,
         projection: SourceProjection,
+        source_artifacts: tuple[StoredSourceArtifact, ...],
         update_plan: DocumentUpdatePlan | None,
         markdown_body: str,
         source_type: str,
@@ -2206,6 +2250,15 @@ class GeneSyncOrchestrator:
                 extraction_metadata=result.metadata,
             )
             return result
+        projection_images = self._projection_images(
+            projection=projection,
+            source_artifacts=source_artifacts,
+            observation_ids={
+                observation_id
+                for batch in projection_batches
+                for observation_id in batch.primary_observation_ids
+            },
+        )
         if (
             (len(projection.observations) > 1 or len(projection_batches) > 1)
             and not prefer_single_observation_diff
@@ -2214,6 +2267,7 @@ class GeneSyncOrchestrator:
         ):
             result = await self._extract_projection_batches(
                 projection_batches=projection_batches,
+                projection_images=projection_images,
                 source_type=source_type,
                 doc_type=doc_type,
                 source_id=source_id,
@@ -2383,6 +2437,7 @@ class GeneSyncOrchestrator:
         self,
         *,
         projection_batches,
+        projection_images: tuple[StructuredLlmImage, ...],
         source_type: str,
         doc_type: str,
         source_id: str,
@@ -2392,12 +2447,19 @@ class GeneSyncOrchestrator:
         batch_semaphore = asyncio.Semaphore(self._source_parallelism_limit())
 
         async def extract_one(batch):
+            primary_ids = set(batch.primary_observation_ids)
+            batch_images = tuple(
+                image
+                for image in projection_images
+                if image.source_observation_id in primary_ids
+            )
             async with batch_semaphore:
                 async with self._heavy_work_slot(source_id):
                     return await self.memory_extractor.extract_projection_batch_memories(
                         batch,
                         source_type=source_type,
                         doc_type=doc_type,
+                        images=batch_images,
                     )
 
         results = await asyncio.gather(*(extract_one(batch) for batch in projection_batches))
@@ -2427,6 +2489,44 @@ class GeneSyncOrchestrator:
                 "failed_batch_count": 0,
             },
         )
+
+    def _projection_images(
+        self,
+        *,
+        projection: SourceProjection,
+        source_artifacts: tuple[StoredSourceArtifact, ...],
+        observation_ids: set[str],
+    ) -> tuple[StructuredLlmImage, ...]:
+        """Load exact stored bytes for image Artifact Observations only."""
+
+        artifacts_by_id = {artifact.id: artifact for artifact in source_artifacts}
+        images = []
+        for revision in projection.observation_revisions:
+            if revision.observation_id not in observation_ids:
+                continue
+            raw = revision.metadata.get("source_artifact")
+            if not isinstance(raw, dict):
+                continue
+            media_type = str(raw.get("media_type") or "")
+            if not media_type.startswith("image/"):
+                continue
+            artifact = artifacts_by_id.get(str(raw.get("artifact_id") or ""))
+            if artifact is None:
+                raise RuntimeError("projected image Artifact is unavailable for extraction")
+            body = self.doc_store.read_artifact(artifact.uri)
+            if (
+                len(body) != artifact.size_bytes
+                or hashlib.sha256(body).hexdigest() != artifact.sha256
+            ):
+                raise RuntimeError("projected image Artifact failed integrity validation")
+            images.append(
+                StructuredLlmImage(
+                    source_observation_id=revision.observation_id,
+                    media_type=artifact.media_type,
+                    body=body,
+                )
+            )
+        return tuple(images)
 
     async def _extract_full_document_units(
         self,

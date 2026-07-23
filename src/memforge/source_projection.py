@@ -14,6 +14,11 @@ from typing import TYPE_CHECKING, Mapping, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from memforge.models import ContentItem, NormalizedContent, RawContent
+    from memforge.source_artifacts import (
+        SourceArtifactEvidence,
+        SourceArtifactRevision,
+        StoredSourceArtifact,
+    )
 
 
 class ProjectionRunMode(str, Enum):
@@ -251,6 +256,7 @@ class ProjectionEnvelope:
     item: ContentItem
     raw: RawContent
     normalized: NormalizedContent
+    artifacts: tuple[StoredSourceArtifact, ...] = ()
     prior_unit_revision: SourceUnitRevision | None = None
     prior_observation_revisions: Mapping[str, SourceObservationRevision] = field(default_factory=dict)
 
@@ -384,6 +390,14 @@ class ProjectionStore(Protocol):
         self,
         source_unit_id: str,
     ) -> Mapping[str, SourceObservationRevision]: ...
+    async def get_source_artifact_revision(
+        self,
+        observation_revision_id: str,
+    ) -> SourceArtifactRevision | None: ...
+    async def get_memory_source_artifacts(
+        self,
+        memory_id: str,
+    ) -> tuple[SourceArtifactEvidence, ...]: ...
     async def find_source_unit_by_document_id(
         self,
         source_id: str,
