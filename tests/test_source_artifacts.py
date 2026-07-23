@@ -6,6 +6,7 @@ import pytest
 
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_BYTES,
+    MAX_SOURCE_ARTIFACTS_PER_UNIT,
     RawSourceArtifact,
     SourceArtifactContractError,
     materialize_source_artifact,
@@ -93,6 +94,55 @@ def test_source_artifact_set_preserves_multiple_identities_and_rejects_duplicate
             source_id="source-a",
             source_unit_key="page-1",
             artifacts=(artifact("attachment-1"), artifact("attachment-1")),
+            store=store,
+        )
+
+
+def test_materialization_accepts_customer_sized_bounded_artifact_set(tmp_path) -> None:
+    store = LocalDocumentStore(str(tmp_path))
+    artifact_count = 56
+
+    stored = materialize_source_artifacts(
+        source_id="source-a",
+        source_unit_key="page-1",
+        artifacts=tuple(
+            RawSourceArtifact(
+                provider_key=f"attachment-{index}",
+                parent_observation_type="page_body",
+                parent_provider_key="page-1:body",
+                provider_revision="1",
+                filename=f"attachment-{index}.png",
+                media_type="image/png",
+                body=f"image-{index}".encode(),
+            )
+            for index in range(artifact_count)
+        ),
+        store=store,
+    )
+
+    assert artifact_count <= MAX_SOURCE_ARTIFACTS_PER_UNIT
+    assert len(stored) == artifact_count
+
+
+def test_materialization_rejects_artifact_set_beyond_persistence_budget(tmp_path) -> None:
+    store = LocalDocumentStore(str(tmp_path))
+
+    with pytest.raises(SourceArtifactContractError, match="Artifact limit"):
+        materialize_source_artifacts(
+            source_id="source-a",
+            source_unit_key="page-1",
+            artifacts=tuple(
+                RawSourceArtifact(
+                    provider_key=f"attachment-{index}",
+                    parent_observation_type="page_body",
+                    parent_provider_key="page-1:body",
+                    provider_revision="1",
+                    filename=f"attachment-{index}.png",
+                    media_type="image/png",
+                    body=b"x",
+                )
+                for index in range(MAX_SOURCE_ARTIFACTS_PER_UNIT + 1)
+            ),
             store=store,
         )
 

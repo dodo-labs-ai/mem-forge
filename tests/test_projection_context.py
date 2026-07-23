@@ -15,6 +15,7 @@ from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import plan_projection_extraction_batches
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_projection import AnchorKind, DeltaAxis, SourceAnchor
+from memforge.source_artifacts import StoredSourceArtifact
 
 
 def _jira_projection(comment_count: int = 3):
@@ -78,6 +79,39 @@ def _confluence_projection(body: str):
     )
 
 
+def _confluence_projection_with_images(image_count: int):
+    item = ContentItem(
+        item_id="confluence-42",
+        title="Visual design",
+        source_url="https://confluence.example.test/pages/42",
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        version="7",
+        extra={"page_id": "42", "space_key": "ENG"},
+    )
+    artifacts = tuple(
+        StoredSourceArtifact(
+            id=f"artifact-{index}",
+            provider_key=f"attachment-{index}",
+            parent_observation_type="page_body",
+            parent_provider_key="42:body",
+            provider_revision="1",
+            filename=f"diagram-{index}.png",
+            media_type="image/png",
+            size_bytes=10,
+            sha256=f"{index:064x}",
+            uri=f"source-artifacts/src-c/artifact-{index}.png",
+        )
+        for index in range(image_count)
+    )
+    return project_source_item(
+        source_id="src-c",
+        source_type="confluence",
+        run_id="run-c",
+        item=item,
+        raw=RawContent(item=item, body=b"<p>Visual design.</p>", content_type="text/html"),
+        normalized=NormalizedContent(item=item, markdown_body="Visual design."),
+        artifacts=artifacts,
+    )
 def _teams_projection():
     item = ContentItem(
         item_id="teams-window-1",
@@ -137,6 +171,31 @@ def test_many_messages_use_bounded_transient_batches_not_persisted_units() -> No
     assert len(batches) == 3
     assert all(len(batch.primary_observation_ids) <= 8 for batch in batches)
     assert {batch.source_unit_id for batch in batches} == {projection.source_units[0].id}
+
+
+def test_many_images_use_bounded_multimodal_batches_without_losing_artifacts() -> None:
+    projection = _confluence_projection_with_images(56)
+
+    batches = plan_projection_extraction_batches(projection)
+    binary_observation_ids = {
+        observation.id
+        for observation in projection.observations
+        if observation.observation_type == "binary_artifact"
+    }
+    batched_binary_ids = [
+        observation_id
+        for batch in batches
+        for observation_id in batch.primary_observation_ids
+        if observation_id in binary_observation_ids
+    ]
+
+    assert len(binary_observation_ids) == 56
+    assert set(batched_binary_ids) == binary_observation_ids
+    assert len(batched_binary_ids) == len(binary_observation_ids)
+    assert all(
+        len(binary_observation_ids.intersection(batch.primary_observation_ids)) <= 8
+        for batch in batches
+    )
 
 
 def test_one_large_document_is_range_sliced_without_creating_finer_source_units() -> None:
