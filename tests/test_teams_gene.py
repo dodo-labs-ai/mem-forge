@@ -48,8 +48,8 @@ class FakeDocumentStore:
     def __init__(self):
         self._objects: dict[str, bytes] = {}
 
-    def store_raw(self, source_id, title, content, content_type, extension=None):
-        uri = f"fake://{source_id}/{title}{extension or ''}"
+    def store_raw(self, source_id, doc_id, title, content, content_type, extension=None):
+        uri = f"fake://{source_id}/{doc_id}/{title}{extension or ''}"
         self._objects[uri] = content
         return uri
 
@@ -249,6 +249,7 @@ class TestMetadata:
         package_body = json.dumps(package).encode("utf-8")
         package_uri = store.store_raw(
             "PCC Agent Dev",
+            "teams-doc-1",
             "teams-doc-1-package",
             package_body,
             "application/json",
@@ -334,6 +335,7 @@ class TestMetadata:
         store = FakeDocumentStore()
         package_uri = store.store_raw(
             "test",
+            "removed-window",
             "removed-window-package",
             package_body,
             "application/json",

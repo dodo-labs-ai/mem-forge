@@ -128,6 +128,7 @@ def _store_package_artifact(
         return None, package_sha256
     package_uri = document_store.store_raw(
         source_id,
+        doc_id,
         f"{doc_id}-{package_sha256}-package",
         payload_bytes,
         "application/json",

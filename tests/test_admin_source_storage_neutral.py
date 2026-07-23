@@ -146,6 +146,7 @@ async def _setup_completed_teams_local_replay(
     if include_retired_input:
         retired_uri = document_store.store_raw(
             "src-teams",
+            "teams-window-retired",
             "Retired Conversation Window",
             json.dumps(
                 {
@@ -201,6 +202,7 @@ async def _setup_completed_teams_local_replay(
         ).encode()
         current_uri = document_store.store_raw(
             "src-teams",
+            _teams_doc_id(),
             "Conversation A",
             package_body,
             "application/json",
@@ -255,6 +257,7 @@ async def _setup_completed_teams_local_replay(
         ).encode()
         newer_uri = document_store.store_raw(
             "src-teams",
+            _teams_doc_id(),
             "Temporary Newer Conversation A",
             newer_body,
             "application/json",
@@ -1942,6 +1945,7 @@ def test_incremental_local_rebaseline_ignores_input_uploaded_after_success(tmp_p
         )
         unconsumed_uri = document_store.store_raw(
             "src-teams",
+            _teams_doc_id(),
             "Unconsumed Conversation A",
             json.dumps(
                 {

@@ -2619,13 +2619,15 @@ class FailingAuthGene:
 class StubDocumentStore:
     def __init__(self) -> None:
         self.normalized_content: dict[str, str] = {}
+        self.normalized_store_calls = 0
 
-    def store_raw(self, *, source_id, title, content, content_type, extension=None):
+    def store_raw(self, *, source_id, doc_id, title, content, content_type, extension=None):
         suffix = extension or ".raw"
-        return f"file:///tmp/{source_id}/{title}{suffix}"
+        return f"file:///tmp/{source_id}/{doc_id}/{title}{suffix}"
 
-    def store_normalized(self, *, source_id, title, markdown):
-        uri = f"stub-doc://{source_id}/{title}.md"
+    def store_normalized(self, *, source_id, doc_id, title, markdown):
+        self.normalized_store_calls += 1
+        uri = f"stub-doc://{source_id}/{doc_id}/{title}.md"
         self.normalized_content[uri] = markdown
         return uri
 
@@ -2657,11 +2659,12 @@ class RecordingSyncMemoryLogger:
 
 
 class FailingPdfDocumentStore(StubDocumentStore):
-    def store_raw(self, *, source_id, title, content, content_type, extension=None):
+    def store_raw(self, *, source_id, doc_id, title, content, content_type, extension=None):
         if content_type == "application/pdf":
             raise RuntimeError("disk full while storing PDF")
         return super().store_raw(
             source_id=source_id,
+            doc_id=doc_id,
             title=title,
             content=content,
             content_type=content_type,
@@ -4377,6 +4380,7 @@ async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
         source_id="src-documents",
+        doc_id="doc-1",
         title="Design Doc",
         markdown=markdown,
     )
@@ -4410,6 +4414,7 @@ async def test_force_full_sync_reprocesses_unchanged_document(db: Database, tmp_
     assert state.last_sync_status == "success"
     assert state.docs_processed == 1
     assert state.docs_updated == 1
+    assert doc_store.normalized_store_calls == 2
     assert extractor.full_calls == []
     assert len(extractor.unit_calls) == 1
     assert extractor.change_calls == []
@@ -4426,6 +4431,7 @@ async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
         source_id=source_id,
+        doc_id="doc-1",
         title="Design Doc",
         markdown=markdown,
     )
@@ -8404,6 +8410,7 @@ async def test_document_update_uses_diff_guided_extraction_and_audits_strategy(
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
         source_id="src-documents",
+        doc_id="doc-1",
         title="Design Doc",
         markdown=old_markdown,
     )
@@ -8498,6 +8505,7 @@ async def test_diff_guided_extraction_rejects_candidates_outside_current_change(
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
         source_id=source_id,
+        doc_id="doc-1",
         title="Shared HANA Database Connections",
         markdown=old_markdown,
     )
@@ -8552,6 +8560,7 @@ async def test_large_single_observation_update_keeps_diff_guided_authority(
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
         source_id=source_id,
+        doc_id="doc-1",
         title="Design Doc",
         markdown=old_markdown,
     )
@@ -8596,6 +8605,7 @@ async def test_structured_source_update_uses_diff_guided_extraction_and_audits_s
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
         source_id=source_id,
+        doc_id="doc-1",
         title="PAY-123",
         markdown=old_markdown,
     )
@@ -8832,6 +8842,7 @@ async def test_partial_unit_extraction_failure_skips_reconciliation(db: Database
     doc_store = StubDocumentStore()
     normalized_content_uri = doc_store.store_normalized(
         source_id=source_id,
+        doc_id="doc-1",
         title="Design Doc",
         markdown=markdown,
     )
@@ -9128,7 +9139,7 @@ async def test_unchanged_document_backfills_pdf_uri_without_llm_reprocessing(db:
     assert state.last_sync_status == "success"
     assert state.docs_updated == 0
     assert document is not None
-    assert document.pdf_content_uri == f"file:///tmp/{source_id}/Jira 0.pdf"
+    assert document.pdf_content_uri == f"file:///tmp/{source_id}/jira-0/Jira 0.pdf"
 
 
 @pytest.mark.asyncio
@@ -9174,7 +9185,7 @@ async def test_missing_pdf_uri_forces_full_sync_without_llm_reprocessing(db: Dat
     assert state.docs_processed == 1
     assert state.docs_updated == 0
     assert document is not None
-    assert document.pdf_content_uri == f"file:///tmp/{source_id}/Jira 0.pdf"
+    assert document.pdf_content_uri == f"file:///tmp/{source_id}/jira-0/Jira 0.pdf"
 
 
 @pytest.mark.asyncio

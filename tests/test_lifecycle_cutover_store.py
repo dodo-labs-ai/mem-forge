@@ -1929,12 +1929,14 @@ async def test_cutover_reconstructs_historical_projection_from_exact_stored_arti
     store = LocalDocumentStore(str(tmp_path / "artifacts"))
     raw_uri = store.store_raw(
         "src-1",
+        "doc-legacy",
         "Historical Teams block",
         json.dumps(raw_payload).encode(),
         "application/json",
     )
     normalized_uri = store.store_normalized(
         "src-1",
+        "doc-legacy",
         "Historical Teams block",
         "# Historical Teams block\n\nLegacy claim",
     )

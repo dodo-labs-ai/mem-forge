@@ -36,6 +36,7 @@ class _BlockingDocumentStore:
     def store_raw(
         self,
         source_id: str,
+        doc_id: str,
         title: str,
         content: bytes,
         content_type: str,
