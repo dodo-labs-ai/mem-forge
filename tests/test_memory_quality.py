@@ -668,6 +668,13 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
         """INSERT INTO evidence_references
            (id, evidence_unit_id, role, anchor_kind, observation_id,
             observation_revision_id, created_at)
+           VALUES (?, ?, 'required', 'whole_observation', ?, ?, ?)""",
+        ("eref-required", "evidence-image", "obs-page", "obsrev-page", now),
+    )
+    await db.db.execute(
+        """INSERT INTO evidence_references
+           (id, evidence_unit_id, role, anchor_kind, observation_id,
+            observation_revision_id, created_at)
            VALUES (?, ?, 'context', 'whole_observation', ?, ?, ?)""",
         ("eref-image", "evidence-image", "obs-image", "obsrev-image", now),
     )
@@ -677,6 +684,20 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
             active, created_at)
            VALUES (?, ?, ?, ?, ?, 1, ?)""",
         ("support-image", memory.id, "eref-primary", "src-confluence", "access-hash", now),
+    )
+    await db.db.execute(
+        """INSERT INTO memory_support_assertions
+           (id, memory_id, evidence_reference_id, source_id, access_context_hash,
+            active, created_at)
+           VALUES (?, ?, ?, ?, ?, 1, ?)""",
+        (
+            "support-image-required",
+            memory.id,
+            "eref-required",
+            "src-confluence",
+            "access-hash",
+            now,
+        ),
     )
     await db.db.commit()
 
