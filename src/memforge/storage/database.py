@@ -4960,7 +4960,7 @@ class Database:
         """Return current binary Artifacts in actively supported Evidence bundles."""
 
         rows = await self.db.execute_fetchall(
-            """SELECT DISTINCT msa.memory_id,
+            """SELECT msa.memory_id,
                       artifact_er.id AS evidence_reference_id,
                       artifact_er.evidence_unit_id, artifact_er.role,
                       so.id AS observation_id, so.source_id, so.source_unit_id,
@@ -4991,7 +4991,11 @@ class Database:
             (memory_id,),
         )
         evidence: list[SourceArtifactEvidence] = []
+        seen_reference_ids: set[str] = set()
         for row in rows:
+            evidence_reference_id = str(row["evidence_reference_id"])
+            if evidence_reference_id in seen_reference_ids:
+                continue
             artifact = source_artifact_revision_from_metadata(
                 observation_id=str(row["observation_id"]),
                 observation_revision_id=str(row["observation_revision_id"]),
@@ -5001,10 +5005,11 @@ class Database:
             )
             if artifact is None:
                 continue
+            seen_reference_ids.add(evidence_reference_id)
             evidence.append(
                 SourceArtifactEvidence(
                     memory_id=str(row["memory_id"]),
-                    evidence_reference_id=str(row["evidence_reference_id"]),
+                    evidence_reference_id=evidence_reference_id,
                     evidence_unit_id=str(row["evidence_unit_id"]),
                     role=str(row["role"]),
                     artifact=artifact,
