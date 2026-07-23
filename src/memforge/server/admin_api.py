@@ -14,13 +14,14 @@ import logging
 import os
 import re
 import time
+import unicodedata
 import uuid
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Request
@@ -208,6 +209,31 @@ def _workspace_default_scope(request: Request, *, include_private: bool):
         allowed_statuses=("active",),
         active_project=None,
         scope_mode="project-first",
+    )
+
+
+def _inline_content_disposition(filename: str) -> str:
+    """Return an RFC 8187 filename header with an ASCII-safe fallback."""
+
+    basename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    basename = "".join(
+        character
+        for character in basename
+        if character not in {"\r", "\n", "\x7f"} and ord(character) >= 0x20
+    )
+    if not basename:
+        basename = "artifact"
+    suffix = Path(basename).suffix
+    stem = basename[: -len(suffix)] if suffix else basename
+    ascii_stem = unicodedata.normalize("NFKD", stem).encode("ascii", "ignore").decode()
+    ascii_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", ascii_stem).strip("_-")
+    ascii_suffix = unicodedata.normalize("NFKD", suffix).encode("ascii", "ignore").decode()
+    ascii_suffix = re.sub(r"[^A-Za-z0-9.]+", "", ascii_suffix)
+    ascii_fallback = f"{ascii_stem or 'artifact'}{ascii_suffix}"
+    encoded = quote(basename, safe="!#$&+-.^_`|~")
+    return (
+        f'inline; filename="{ascii_fallback}"; '
+        f"filename*=UTF-8''{encoded}"
     )
 
 
@@ -2923,7 +2949,7 @@ def create_admin_app(
         return Response(
             content=content,
             media_type=artifact.media_type,
-            headers={"Content-Disposition": f'inline; filename="{artifact.filename}"'},
+            headers={"Content-Disposition": _inline_content_disposition(artifact.filename)},
         )
 
     @source_artifact_router.api_route(
@@ -2967,12 +2993,11 @@ def create_admin_app(
                 or hashlib.sha256(content).hexdigest() != artifact.sha256
             ):
                 raise HTTPException(status_code=409, detail="Source Artifact integrity mismatch")
-        filename = Path(artifact.filename).name.replace('"', "")
         return Response(
             content=content,
             media_type=artifact.media_type,
             headers={
-                "Content-Disposition": f'inline; filename="{filename}"',
+                "Content-Disposition": _inline_content_disposition(artifact.filename),
                 "ETag": f'"sha256:{artifact.sha256}"',
                 "X-Content-SHA256": artifact.sha256,
             },
@@ -2999,7 +3024,7 @@ def create_admin_app(
         return Response(
             content=content,
             media_type=artifact.media_type,
-            headers={"Content-Disposition": f'inline; filename="{artifact.filename}"'},
+            headers={"Content-Disposition": _inline_content_disposition(artifact.filename)},
         )
 
     @document_router.api_route("/{doc_id}/pdf", methods=["GET", "HEAD"])
@@ -3023,7 +3048,7 @@ def create_admin_app(
         return Response(
             content=content,
             media_type=artifact.media_type,
-            headers={"Content-Disposition": f'inline; filename="{artifact.filename}"'},
+            headers={"Content-Disposition": _inline_content_disposition(artifact.filename)},
         )
 
     # ===================================================================
