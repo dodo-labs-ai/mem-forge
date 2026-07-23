@@ -556,7 +556,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     uri = document_store.store_source_artifact(
         source_id="src-confluence",
         artifact_id="artifact-42",
-        filename="diagram.png",
+        filename="diagram\u202foverview.png",
         content=image,
         content_type="image/png",
     )
@@ -579,7 +579,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
             "artifact_id": "artifact-42",
             "parent_observation_id": "obs-page",
             "provider_revision": "3",
-            "filename": "diagram.png",
+            "filename": "diagram\u202foverview.png",
             "media_type": "image/png",
             "size_bytes": len(image),
             "sha256": digest,
@@ -726,6 +726,11 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     assert stale_support_detail.json()["evidence_artifacts"] == []
     assert resource.status_code == 200
     assert resource.headers["content-type"] == "image/png"
+    assert (
+        resource.headers["content-disposition"]
+        == "inline; filename=\"diagram_overview.png\"; "
+        "filename*=UTF-8''diagram%E2%80%AFoverview.png"
+    )
     assert resource.content == image
 
     await db.db.execute(
@@ -749,6 +754,33 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     with TestClient(app) as client:
         unauthorized_replay = client.get("/api/source-artifacts/obsrev-image")
     assert unauthorized_replay.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        (
+            r"..\secret.pdf",
+            "inline; filename=\"secret.pdf\"; filename*=UTF-8''secret.pdf",
+        ),
+        (
+            "../secret.pdf",
+            "inline; filename=\"secret.pdf\"; filename*=UTF-8''secret.pdf",
+        ),
+        (
+            'bad\r\nX-Evil: yes".png',
+            "inline; filename=\"badX-Evil_yes.png\"; "
+            "filename*=UTF-8''badX-Evil%3A%20yes%22.png",
+        ),
+    ],
+)
+def test_artifact_content_disposition_rejects_path_and_header_injection(
+    filename: str,
+    expected: str,
+) -> None:
+    from memforge.server.admin_api import _inline_content_disposition
+
+    assert _inline_content_disposition(filename) == expected
 
 
 @pytest.mark.asyncio
