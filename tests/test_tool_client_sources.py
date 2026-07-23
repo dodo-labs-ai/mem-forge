@@ -687,3 +687,56 @@ def test_tool_client_fetches_resource_through_hosted_workspace(monkeypatch):
         == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/documents/doc-1/content"
     )
     assert captured["authorization"] == "Bearer tok"
+
+
+def test_tool_client_fetches_source_artifact_through_hosted_workspace(monkeypatch):
+    captured = {}
+    body = b"\x89PNG\r\n\x1a\n"
+
+    class FakeResponse:
+        headers = {
+            "content-type": "image/png",
+            "content-disposition": 'inline; filename="diagram.png"',
+            "content-length": str(len(body)),
+            "x-content-sha256": "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6",
+        }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return body
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["authorization"] = request.get_header("Authorization")
+            return FakeResponse()
+
+    monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
+    client = ToolClient(
+        target=build_target(
+            origin="https://memforge.example.hana.ondemand.com",
+            workspace_id="mount_tai",
+        ),
+        api_token="tok",
+    )
+
+    result = client.get_resource(
+        url="/api/source-artifacts/obsrev-1",
+        mode="base64",
+    )
+
+    assert result["observation_revision_id"] == "obsrev-1"
+    assert "doc_id" not in result
+    assert result["content_type"] == "image/png"
+    assert result["sha256"] == "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6"
+    assert (
+        captured["url"]
+        == "https://memforge.example.hana.ondemand.com"
+        "/api/workspaces/mount_tai/api/source-artifacts/obsrev-1"
+    )
+    assert captured["authorization"] == "Bearer tok"
