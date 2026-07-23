@@ -896,9 +896,9 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
-def test_packaged_plugin_version_0_1_28_is_consistent():
+def test_packaged_plugin_version_0_1_29_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.28"
+    version = "0.1.29"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
@@ -1815,6 +1815,9 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "memory_types" not in properties
     assert "active_repo_identifier" not in properties
     assert "search -> get_memory -> get_resource" in tools["get_resource"]["description"]
+    get_resource_url = tools["get_resource"]["inputSchema"]["properties"]["url"]["description"]
+    assert "get_memory.evidence_artifacts[].url" in get_resource_url
+    assert "/api/source-artifacts/{observation_revision_id}" in get_resource_url
 
     create_schema = tools["create_memory"]["inputSchema"]
     assert create_schema["required"] == ["content", "provenance"]
@@ -2857,6 +2860,7 @@ def test_mcp_proxy_returns_source_artifact_as_native_image_content(monkeypatch):
             "content-type": "image/png",
             "content-disposition": 'inline; filename="diagram.png"',
             "content-length": str(len(body)),
+            "x-content-sha256": "0f4636c78f65d3639ece5a064b5ae753e3408614a14fb18ab4d7540d2c248543",
         }
 
         def __enter__(self):
@@ -2898,6 +2902,7 @@ def test_mcp_proxy_returns_source_artifact_as_native_image_content(monkeypatch):
     }
     metadata = json.loads(response["result"]["content"][0]["text"])
     assert metadata["url"] == "/api/source-artifacts/obsrev-1"
+    assert metadata["sha256"] == "0f4636c78f65d3639ece5a064b5ae753e3408614a14fb18ab4d7540d2c248543"
     assert "data_base64" not in metadata
 
 

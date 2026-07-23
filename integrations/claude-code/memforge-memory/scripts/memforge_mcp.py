@@ -61,7 +61,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.28"
+SERVER_VERSION = "0.1.29"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
@@ -244,8 +244,9 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_resource",
         "description": (
-            "Fetch a MemForge source artifact from get_memory.sources[].content_url or "
-            "get_memory.sources[].pdf_url. In file mode this local proxy writes the "
+            "Fetch a MemForge source artifact from get_memory.sources[].content_url, "
+            "get_memory.sources[].pdf_url, or get_memory.evidence_artifacts[].url. "
+            "In file mode this local proxy writes the "
             "artifact to the agent host cache and returns a real local_path. Use "
             "search -> get_memory -> get_resource "
             "when exact source text, quotes, or document evidence is needed."
@@ -256,8 +257,11 @@ TOOLS: list[dict[str, Any]] = [
                 "url": {
                     "type": "string",
                     "description": (
-                        "A MemForge artifact URL such as /api/documents/{doc_id}/content, "
-                        "/api/documents/{doc_id}/pdf, or /api/documents/{doc_id}/artifacts/{kind}."
+                        "A MemForge artifact URL from get_memory.sources[] or "
+                        "get_memory.evidence_artifacts[].url, such as "
+                        "/api/documents/{doc_id}/content, /api/documents/{doc_id}/pdf, "
+                        "/api/documents/{doc_id}/artifacts/{kind}, or "
+                        "/api/source-artifacts/{observation_revision_id}."
                     ),
                 },
                 "mode": {
@@ -1166,12 +1170,12 @@ def _fetch_resource_file(target: ResourceTarget) -> dict[str, Any]:
             digest = hashlib.sha256()
             observed_size = 0
             cache_root = _artifact_cache_root()
-            safe_doc = _safe_cache_component(target.resource_id) or "resource"
+            safe_resource = _safe_cache_component(target.resource_id) or "resource"
             safe_kind = _safe_cache_component(target.kind) or "artifact"
             with tempfile.NamedTemporaryFile(
                 "wb",
                 dir=cache_root,
-                prefix=f".{safe_doc}-{safe_kind}-",
+                prefix=f".{safe_resource}-{safe_kind}-",
                 suffix=".tmp",
                 delete=False,
             ) as handle:
@@ -1211,7 +1215,7 @@ def _resource_metadata(
     observed_size: int,
     mode: str,
 ) -> dict[str, Any]:
-    return {
+    metadata = {
         target.identity_key: target.resource_id,
         "kind": target.kind,
         "content_type": headers.get("content-type", "application/octet-stream"),
@@ -1220,6 +1224,9 @@ def _resource_metadata(
         "url": target.relative_url,
         "mode": mode,
     }
+    if sha256 := headers.get("x-content-sha256"):
+        metadata["sha256"] = sha256
+    return metadata
 
 
 def _parse_resource_url(url: str, origin: str) -> ResourceTarget | None:
@@ -1312,11 +1319,11 @@ def _safe_cache_component(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
 
 
-def _cache_artifact_path(doc_id: str, kind: str, filename: str, digest: str) -> Path:
-    safe_doc = _safe_cache_component(doc_id) or "document"
+def _cache_artifact_path(resource_id: str, kind: str, filename: str, digest: str) -> Path:
+    safe_resource = _safe_cache_component(resource_id) or "resource"
     safe_kind = _safe_cache_component(kind) or "artifact"
     suffix = Path(filename).suffix or ".bin"
-    return _artifact_cache_root() / f"{safe_doc}-{safe_kind}-{digest}{suffix}"
+    return _artifact_cache_root() / f"{safe_resource}-{safe_kind}-{digest}{suffix}"
 
 
 def _read_message() -> tuple[dict[str, Any], str] | None:

@@ -27,11 +27,20 @@ class NoRedirectHandler(HTTPRedirectHandler):
 
 
 class ResourceTarget:
-    def __init__(self, doc_id: str, kind: str, relative_url: str, request_url: str) -> None:
-        self.doc_id = doc_id
+    def __init__(
+        self,
+        resource_id: str,
+        kind: str,
+        relative_url: str,
+        request_url: str,
+        *,
+        identity_key: str = "doc_id",
+    ) -> None:
+        self.resource_id = resource_id
         self.kind = kind
         self.relative_url = relative_url
         self.request_url = request_url
+        self.identity_key = identity_key
 
 
 class ToolClient:
@@ -659,7 +668,8 @@ class ToolClient:
                 "error": "unsupported resource URL",
                 "hint": (
                     "Use a relative MemForge /api/documents/{doc_id}/content, /pdf, "
-                    "or /artifacts/{kind} URL, or an absolute URL under MEMFORGE_API_URL."
+                    "/artifacts/{kind}, or /api/source-artifacts/{observation_revision_id} "
+                    "URL, or an absolute URL under MEMFORGE_API_URL."
                 ),
             }
 
@@ -763,12 +773,12 @@ class ToolClient:
                 digest = hashlib.sha256()
                 observed_size = 0
                 cache_root = _artifact_cache_root()
-                safe_doc = _safe_cache_component(target.doc_id) or "document"
+                safe_resource = _safe_cache_component(target.resource_id) or "resource"
                 safe_kind = _safe_cache_component(target.kind) or "artifact"
                 with tempfile.NamedTemporaryFile(
                     "wb",
                     dir=cache_root,
-                    prefix=f".{safe_doc}-{safe_kind}-",
+                    prefix=f".{safe_resource}-{safe_kind}-",
                     suffix=".tmp",
                     delete=False,
                 ) as handle:
@@ -780,7 +790,12 @@ class ToolClient:
                         digest.update(chunk)
                         observed_size += len(chunk)
                         handle.write(chunk)
-                final_path = _cache_artifact_path(target.doc_id, target.kind, filename, digest.hexdigest()[:16])
+                final_path = _cache_artifact_path(
+                    target.resource_id,
+                    target.kind,
+                    filename,
+                    digest.hexdigest()[:16],
+                )
                 if final_path.exists():
                     tmp_path.unlink(missing_ok=True)
                 else:
@@ -827,6 +842,14 @@ def _parse_resource_url(
         return ResourceTarget(parts[2], "pdf", path, request_url_for_path(path[len("/api") :]))
     if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
         return ResourceTarget(parts[2], parts[4], path, request_url_for_path(path[len("/api") :]))
+    if len(parts) == 3 and parts[:2] == ["api", "source-artifacts"]:
+        return ResourceTarget(
+            parts[2],
+            "source_artifact",
+            path,
+            request_url_for_path(path[len("/api") :]),
+            identity_key="observation_revision_id",
+        )
     return None
 
 
@@ -846,8 +869,8 @@ def _resource_metadata(
     observed_size: int,
     mode: str,
 ) -> dict[str, Any]:
-    return {
-        "doc_id": target.doc_id,
+    metadata = {
+        target.identity_key: target.resource_id,
         "kind": target.kind,
         "content_type": headers.get("content-type", "application/octet-stream"),
         "filename": _resource_filename(headers, target),
@@ -855,6 +878,9 @@ def _resource_metadata(
         "url": target.relative_url,
         "mode": mode,
     }
+    if sha256 := headers.get("x-content-sha256"):
+        metadata["sha256"] = sha256
+    return metadata
 
 
 def _lower_headers(headers: Any) -> dict[str, str]:
@@ -874,7 +900,7 @@ def _resource_filename(headers: dict[str, str], target: ResourceTarget) -> str:
     if match:
         return Path(match.group(1)).name
     suffix = ".pdf" if target.kind == "pdf" else ".md" if target.kind == "content" else ".bin"
-    return f"{target.doc_id}-{target.kind}{suffix}"
+    return f"{target.resource_id}-{target.kind}{suffix}"
 
 
 def _is_text_content_type(media_type: str) -> bool:
@@ -899,8 +925,8 @@ def _safe_cache_component(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
 
 
-def _cache_artifact_path(doc_id: str, kind: str, filename: str, digest: str) -> Path:
-    safe_doc = _safe_cache_component(doc_id) or "document"
+def _cache_artifact_path(resource_id: str, kind: str, filename: str, digest: str) -> Path:
+    safe_resource = _safe_cache_component(resource_id) or "resource"
     safe_kind = _safe_cache_component(kind) or "artifact"
     suffix = Path(filename).suffix or ".bin"
-    return _artifact_cache_root() / f"{safe_doc}-{safe_kind}-{digest}{suffix}"
+    return _artifact_cache_root() / f"{safe_resource}-{safe_kind}-{digest}{suffix}"
