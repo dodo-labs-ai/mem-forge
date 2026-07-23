@@ -202,8 +202,9 @@ could change your recommendation.
 ```
 
 The plugin returns compact memory cards from search. Agents call `get_memory`
-for source provenance, then use those `source_url`, `content_url`, and `pdf_url`
-links with `get_resource` when they need more than the memory card.
+for source provenance, then use its Document `content_url`/`pdf_url` or
+revision-pinned `evidence_artifacts[].url` links with `get_resource` when they
+need more than the memory card.
 
 Both plugins follow the same MemForge boundary: the local agent gets useful
 memory in the moment, while the service owns extraction, provenance, and review.
