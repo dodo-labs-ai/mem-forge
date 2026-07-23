@@ -42,12 +42,14 @@ from memforge.models import (
     RawContent,
 )
 from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
     MAX_SOURCE_ARTIFACT_BYTES,
     MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT,
     MAX_SOURCE_ARTIFACTS_PER_UNIT,
     RawSourceArtifact,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
     SourceArtifactContractError,
+    normalize_source_artifact_media_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -666,21 +668,29 @@ class JiraGene(Gene):
 
         fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
         raw_descriptors = fields.get("attachment")
-        descriptors = raw_descriptors if isinstance(raw_descriptors, list) else []
+        provider_descriptors = raw_descriptors if isinstance(raw_descriptors, list) else []
+        if len(provider_descriptors) > MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT:
+            raise SourceArtifactContractError(
+                "Jira issue exceeds the Source Artifact descriptor scan limit"
+            )
+        descriptors: list[tuple[dict, str]] = []
+        for descriptor in provider_descriptors:
+            if not isinstance(descriptor, dict):
+                raise SourceArtifactContractError(
+                    "Jira attachment response contains an invalid record"
+                )
+            media_type = normalize_source_artifact_media_type(descriptor.get("mimeType"))
+            if media_type in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
+                descriptors.append((descriptor, media_type))
         if len(descriptors) > MAX_SOURCE_ARTIFACTS_PER_UNIT:
             raise SourceArtifactContractError(
-                f"Jira issue exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} Artifact limit"
+                f"Jira issue exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} supported Artifact limit"
             )
         comments = issue.get("_comments") if isinstance(issue.get("_comments"), list) else []
         issue_id = str(issue.get("id") or "").strip()
         artifacts: list[RawSourceArtifact] = []
         declared_bytes = 0
-        for descriptor in descriptors:
-            if not isinstance(descriptor, dict):
-                raise SourceArtifactContractError("Jira attachment response contains an invalid record")
-            media_type = str(descriptor.get("mimeType") or "").split(";", 1)[0].strip().lower()
-            if media_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
-                continue
+        for descriptor, media_type in descriptors:
             size_value = descriptor.get("size")
             if not isinstance(size_value, int) or isinstance(size_value, bool) or size_value < 0:
                 raise SourceArtifactContractError("Jira attachment is missing a valid file size")
