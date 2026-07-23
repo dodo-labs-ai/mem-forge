@@ -598,6 +598,34 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
             locator_json, current_revision_id, updated_at)
            VALUES (?, ?, ?, ?, ?, '{}', ?, ?)""",
         (
+            "obs-page",
+            "src-confluence",
+            "unit-image",
+            "page_body",
+            "page-1",
+            "obsrev-page",
+            now,
+        ),
+    )
+    await db.db.execute(
+        """INSERT INTO source_observation_revisions
+           (id, observation_id, semantic_hash, content, metadata_json, observed_at, created_at)
+           VALUES (?, ?, ?, ?, '{}', ?, ?)""",
+        (
+            "obsrev-page",
+            "obs-page",
+            "page-hash",
+            "The page provides the primary claim.",
+            now,
+            now,
+        ),
+    )
+    await db.db.execute(
+        """INSERT INTO source_observations
+           (id, source_id, source_unit_id, observation_type, provider_key,
+            locator_json, current_revision_id, updated_at)
+           VALUES (?, ?, ?, ?, ?, '{}', ?, ?)""",
+        (
             "obs-image",
             "src-confluence",
             "unit-image",
@@ -616,14 +644,15 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     await db.db.execute(
         """INSERT INTO evidence_units
            (id, source_id, doc_id, source_type, visibility, content, excerpt,
-            evidence_provenance, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'workspace', ?, NULL, 'extracted', ?, ?)""",
+            evidence_provenance, access_context_hash, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'workspace', ?, NULL, 'extracted', ?, ?, ?)""",
         (
             "evidence-image",
             "src-confluence",
             doc.doc_id,
             "confluence",
             memory.content,
+            "access-hash",
             now,
             now,
         ),
@@ -633,6 +662,13 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
            (id, evidence_unit_id, role, anchor_kind, observation_id,
             observation_revision_id, created_at)
            VALUES (?, ?, 'primary', 'whole_observation', ?, ?, ?)""",
+        ("eref-primary", "evidence-image", "obs-page", "obsrev-page", now),
+    )
+    await db.db.execute(
+        """INSERT INTO evidence_references
+           (id, evidence_unit_id, role, anchor_kind, observation_id,
+            observation_revision_id, created_at)
+           VALUES (?, ?, 'context', 'whole_observation', ?, ?, ?)""",
         ("eref-image", "evidence-image", "obs-image", "obsrev-image", now),
     )
     await db.db.execute(
@@ -640,7 +676,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
            (id, memory_id, evidence_reference_id, source_id, access_context_hash,
             active, created_at)
            VALUES (?, ?, ?, ?, ?, 1, ?)""",
-        ("support-image", memory.id, "eref-image", "src-confluence", "access-hash", now),
+        ("support-image", memory.id, "eref-primary", "src-confluence", "access-hash", now),
     )
     await db.db.commit()
 
@@ -653,9 +689,20 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     [artifact] = detail.json()["evidence_artifacts"]
     assert artifact["observation_revision_id"] == "obsrev-image"
     assert artifact["evidence_reference_id"] == "eref-image"
+    assert artifact["evidence_role"] == "context"
     assert artifact["content_type"] == "image/png"
     assert artifact["sha256"] == digest
     assert artifact["url"] == "/api/source-artifacts/obsrev-image"
+
+    await db.db.execute(
+        "UPDATE source_observations SET current_revision_id = ? WHERE id = ?",
+        (None, "obs-page"),
+    )
+    await db.db.commit()
+    with TestClient(app) as client:
+        stale_support_detail = client.get(f"/api/memories/{memory.id}")
+    assert stale_support_detail.status_code == 200
+    assert stale_support_detail.json()["evidence_artifacts"] == []
     assert resource.status_code == 200
     assert resource.headers["content-type"] == "image/png"
     assert resource.content == image
