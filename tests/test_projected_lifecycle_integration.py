@@ -4791,3 +4791,69 @@ async def test_gated_source_tombstone_only_opens_review(db: Database) -> None:
     assert result == {"retired": 0, "pending_review": 1, "can_delete_document": False}
     with pytest.raises(ValueError, match="active document support remains"):
         await db.delete_projected_document("confluence-123")
+
+
+@pytest.mark.asyncio
+async def test_tombstone_retains_document_when_unmapped_provenance_remains(
+    db: Database,
+) -> None:
+    initial = _projection(
+        run_id="projection-before-unmapped-delete",
+        body="A7 was previously corroborated.",
+    )
+    await db.record_source_projection(initial)
+    memory = await _seed_incumbent_support(db, projection=initial)
+    await db.db.execute(
+        "UPDATE memory_sources SET support_kind = 'corroborated' "
+        "WHERE memory_id = ? AND doc_id = ?",
+        (memory.id, "confluence-123"),
+    )
+    await db.db.execute(
+        "UPDATE memory_support_assertions SET active = 0, removed_at = ? "
+        "WHERE memory_id = ?",
+        (datetime.now(timezone.utc).isoformat(), memory.id),
+    )
+    await db.db.commit()
+    tombstone = project_source_unit_tombstone(
+        source_type="confluence",
+        run_id="projection-unmapped-delete",
+        source_unit=initial.source_units[0],
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in initial.observation_revisions
+        },
+        reason="not_returned_by_authoritative_snapshot",
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+
+    result = await engine.apply_projected_tombstone(
+        projection=tombstone,
+        doc_id="confluence-123",
+        reason="not_returned_by_authoritative_snapshot",
+        lifecycle_cycle_id="unmapped-source-removal",
+    )
+
+    assert result == {
+        "retired": 0,
+        "pending_review": 0,
+        "can_delete_document": False,
+    }
+    assert await db.get_document("confluence-123") is not None
+    assert [source.doc_id for source in await db.get_memory_sources(memory.id)] == [
+        "confluence-123"
+    ]
+
+    retry = await engine.apply_projected_tombstone(
+        projection=tombstone,
+        doc_id="confluence-123",
+        reason="not_returned_by_authoritative_snapshot",
+        lifecycle_cycle_id="unmapped-source-removal",
+    )
+
+    assert retry == result
