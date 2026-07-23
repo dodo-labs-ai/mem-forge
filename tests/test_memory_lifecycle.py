@@ -275,7 +275,12 @@ class TestSupportAwareRetirement:
         source_id = "src-cleanup"
         now = datetime.now(timezone.utc)
         document_store = LocalDocumentStore(str(tmp_path / "documents"))
-        artifact_uri = document_store.store_normalized(source_id, "Architecture", "# Architecture")
+        artifact_uri = document_store.store_normalized(
+            source_id,
+            "doc-cleanup",
+            "Architecture",
+            "# Architecture",
+        )
         await db.upsert_source(
             source_id, "confluence", "Cleanup Source", "{}", access_policy="workspace", owner_user_id="dev"
         )

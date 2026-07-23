@@ -540,6 +540,56 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
 
 
 @pytest.mark.asyncio
+async def test_admin_document_content_uses_exact_document_identity_for_same_title(
+    db: Database,
+    tmp_path: Path,
+) -> None:
+    from memforge.server.admin_api import create_admin_app
+    from memforge.storage.document_store import LocalDocumentStore
+
+    config = _config(tmp_path)
+    document_store = LocalDocumentStore(config.storage.docs_path)
+    first_doc_id = "doc-user-guide-a"
+    second_doc_id = "doc-user-guide-b"
+    first_uri = document_store.store_normalized(
+        source_id="src-repository",
+        doc_id=first_doc_id,
+        title="User Guide",
+        markdown="# First guide",
+    )
+    second_uri = document_store.store_normalized(
+        source_id="src-repository",
+        doc_id=second_doc_id,
+        title="User Guide",
+        markdown="# Second guide",
+    )
+    await _insert_document(
+        db,
+        doc_id=first_doc_id,
+        source="src-repository",
+        normalized_content_uri=first_uri,
+        raw_content_uri=None,
+    )
+    await _insert_document(
+        db,
+        doc_id=second_doc_id,
+        source="src-repository",
+        normalized_content_uri=second_uri,
+        raw_content_uri=None,
+    )
+
+    app = create_admin_app(db=db, config=config, document_store=document_store)
+    with TestClient(app) as client:
+        first = client.get("/api/documents/doc-user-guide-a/content")
+        second = client.get("/api/documents/doc-user-guide-b/content")
+
+    assert first.status_code == 200
+    assert first.text == "# First guide"
+    assert second.status_code == 200
+    assert second.text == "# Second guide"
+
+
+@pytest.mark.asyncio
 async def test_admin_document_content_alias_falls_back_to_raw_source(db: Database, tmp_path: Path):
     from memforge.server.admin_api import create_admin_app
 

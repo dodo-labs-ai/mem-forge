@@ -1658,6 +1658,7 @@ class GeneSyncOrchestrator:
         if not content_unchanged or not raw_uri:
             raw_uri = self.doc_store.store_raw(
                 source_id=source_id,
+                doc_id=doc_id,
                 title=item.title,
                 content=raw.body,
                 content_type=raw.content_type,
@@ -1666,6 +1667,7 @@ class GeneSyncOrchestrator:
         if not content_unchanged or not norm_uri:
             norm_uri = self.doc_store.store_normalized(
                 source_id=source_id,
+                doc_id=doc_id,
                 title=item.title,
                 markdown=markdown_body,
             )
@@ -1701,6 +1703,7 @@ class GeneSyncOrchestrator:
             if pdf_bytes and len(pdf_bytes) > 100:
                 pdf_uri = self.doc_store.store_raw(
                     source_id=source_id,
+                    doc_id=doc_id,
                     title=item.title,
                     content=pdf_bytes,
                     content_type="application/pdf",

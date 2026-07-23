@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Protocol
 
@@ -19,6 +20,7 @@ __all__ = [
     "DocumentStore",
     "LocalDocumentStore",
     "StoredDocumentArtifact",
+    "document_artifact_identity",
 ]
 
 
@@ -36,18 +38,37 @@ class StoredDocumentArtifact:
     size_bytes: int | None = None
 
 
+def document_artifact_identity(doc_id: str) -> str:
+    """Return the stable collision-resistant namespace for one Document."""
+    return sha256(doc_id.encode("utf-8")).hexdigest()
+
+
 class DocumentStore(Protocol):
     def store_raw(
         self,
         source_id: str,
+        doc_id: str,
         title: str,
         content: bytes,
         content_type: str,
         extension: str | None = None,
     ) -> str: ...
 
-    def store_normalized(self, source_id: str, title: str, markdown: str) -> str: ...
-    def store_pdf(self, source_id: str, title: str, pdf_bytes: bytes) -> str: ...
+    def store_normalized(
+        self,
+        source_id: str,
+        doc_id: str,
+        title: str,
+        markdown: str,
+    ) -> str: ...
+
+    def store_pdf(
+        self,
+        source_id: str,
+        doc_id: str,
+        title: str,
+        pdf_bytes: bytes,
+    ) -> str: ...
     def read_normalized(self, stored_path: str) -> str | None: ...
     def get_artifact(self, uri: str | None, media_type: str) -> StoredDocumentArtifact | None: ...
     def read_artifact(self, uri: str) -> bytes: ...
@@ -58,9 +79,9 @@ class LocalDocumentStore:
     """Filesystem-based document content storage.
 
     Directory layout:
-        {docs_path}/{source_id_slug}/{doc_slug}.raw.html   (or .raw.json)
-        {docs_path}/{source_id_slug}/{doc_slug}.md
-        {docs_path}/{source_id_slug}/{doc_slug}.pdf         (optional)
+        {docs_path}/{source_id_slug}/{document_identity}/{title_slug}.raw.html
+        {docs_path}/{source_id_slug}/{document_identity}/{title_slug}.md
+        {docs_path}/{source_id_slug}/{document_identity}/{title_slug}.pdf
     """
 
     def __init__(self, docs_path: str) -> None:
@@ -86,8 +107,8 @@ class LocalDocumentStore:
             return None
         return resolved
 
-    def _source_dir(self, source_id: str) -> Path:
-        return self._root / slugify(source_id)
+    def _document_dir(self, source_id: str, doc_id: str) -> Path:
+        return self._root / slugify(source_id) / document_artifact_identity(doc_id)
 
     def _doc_stem(self, title: str) -> str:
         return slugify(title)
@@ -95,14 +116,15 @@ class LocalDocumentStore:
     def store_raw(
         self,
         source_id: str,
+        doc_id: str,
         title: str,
         content: bytes,
         content_type: str,
         extension: str | None = None,
     ) -> str:
         """Store raw document content. Returns the stored file path."""
-        source_dir = self._source_dir(source_id)
-        source_dir.mkdir(parents=True, exist_ok=True)
+        document_dir = self._document_dir(source_id, doc_id)
+        document_dir.mkdir(parents=True, exist_ok=True)
         if extension:
             ext = extension
         elif "pdf" in content_type:
@@ -111,33 +133,35 @@ class LocalDocumentStore:
             ext = ".raw.json"
         else:
             ext = ".raw.html"
-        path = source_dir / f"{self._doc_stem(title)}{ext}"
+        path = document_dir / f"{self._doc_stem(title)}{ext}"
         path.write_bytes(content)
         return str(path)
 
     def store_normalized(
         self,
         source_id: str,
+        doc_id: str,
         title: str,
         markdown: str,
     ) -> str:
         """Store normalized markdown content. Returns the stored file path."""
-        source_dir = self._source_dir(source_id)
-        source_dir.mkdir(parents=True, exist_ok=True)
-        path = source_dir / f"{self._doc_stem(title)}.md"
+        document_dir = self._document_dir(source_id, doc_id)
+        document_dir.mkdir(parents=True, exist_ok=True)
+        path = document_dir / f"{self._doc_stem(title)}.md"
         path.write_text(markdown, encoding="utf-8")
         return str(path)
 
     def store_pdf(
         self,
         source_id: str,
+        doc_id: str,
         title: str,
         pdf_bytes: bytes,
     ) -> str:
         """Store PDF export. Returns the stored file path."""
-        source_dir = self._source_dir(source_id)
-        source_dir.mkdir(parents=True, exist_ok=True)
-        path = source_dir / f"{self._doc_stem(title)}.pdf"
+        document_dir = self._document_dir(source_id, doc_id)
+        document_dir.mkdir(parents=True, exist_ok=True)
+        path = document_dir / f"{self._doc_stem(title)}.pdf"
         path.write_bytes(pdf_bytes)
         return str(path)
 
