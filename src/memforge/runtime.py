@@ -167,6 +167,7 @@ class SyncRuntime:
             extraction_pool=self.extraction_pool,
             document_lifecycle_admission=self.document_lifecycle_admission,
             memory_observer=self.memory_observer,
+            structured_llm_client=self.structured_llm_client,
         )
 
 

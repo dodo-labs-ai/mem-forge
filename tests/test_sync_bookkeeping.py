@@ -4,9 +4,15 @@ import asyncio
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
+from memforge.llm.structured import (
+    LiteLlmStructuredClient,
+    StructuredLlmConfig,
+    StructuredLlmError,
+)
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
@@ -8752,6 +8758,201 @@ async def test_large_full_document_uses_deterministic_units(db: Database):
     assert audit_rows[0].payload["unitized"] is True
     assert audit_rows[0].payload["unit_count"] == len(extractor.unit_calls)
     assert audit_rows[0].payload["segmentation_version"] == "v2"
+
+
+@pytest.mark.asyncio
+async def test_sync_gene_records_source_unit_llm_summary_for_changed_and_noop_runs(
+    db: Database,
+    monkeypatch,
+):
+    source_id = "src-source-unit-llm-summary"
+    await db.upsert_source(
+        id=source_id,
+        type="github_pages",
+        name="Documents",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
+    async def fake_acompletion(**kwargs):
+        del kwargs
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"memories":[]}')
+                )
+            ],
+            usage={
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "total_tokens": 18,
+            },
+        )
+
+    monkeypatch.setattr(
+        "memforge.llm.structured.litellm.supports_response_schema",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "memforge.llm.structured.litellm.acompletion",
+        fake_acompletion,
+    )
+    structured_client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+        )
+    )
+
+    class StructuredMemoryExtractor(RecordingMemoryExtractor):
+        async def extract_unit_memories(self, context, **kwargs):
+            self.unit_calls.append({"context": context, **kwargs})
+            await structured_client.extract_memories("extract", max_tokens=1024)
+            return MemoryExtractionResult(
+                memories=[],
+                metadata={
+                    "structured_llm_calls": 1,
+                    "prompt_chars": 7,
+                    "structured_llm_elapsed_ms": 1,
+                },
+            )
+
+    memory_store = _audited_memory_store(db)
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=StructuredMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=memory_store,
+        structured_llm_client=structured_client,
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UpdatingDocumentGene("# Design\n\nOne durable statement.", version="1"),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    audit_rows = await db.list_memory_audit_events(
+        event_type="source_unit_llm_summary",
+    )
+    assert state.last_sync_status == "success"
+    assert len(audit_rows) == 1
+    payload = audit_rows[0].payload
+    assert payload["source_unit_id"]
+    assert payload["logical_calls"] == 1
+    assert payload["provider_attempts"] == 1
+    assert payload["retries"] == 0
+    assert payload["schema_fallbacks"] == 0
+    assert payload["reported_input_tokens"] == 11
+    assert payload["reported_output_tokens"] == 7
+    assert payload["reported_total_tokens"] == 18
+    assert payload["usage_known_calls"] == 1
+    assert payload["usage_unknown_calls"] == 0
+    assert payload["terminal_category_counts"] == {"success": 1}
+    assert payload["operation_counts"] == {"memory_extraction": 1}
+    assert payload["source_unit_elapsed_ms"] >= 0
+
+    noop_state = await orchestrator.sync_gene(
+        gene=UpdatingDocumentGene("# Design\n\nOne durable statement.", version="1"),
+        source_name="Documents",
+        source_id=source_id,
+    )
+    audit_rows = await db.list_memory_audit_events(
+        event_type="source_unit_llm_summary",
+    )
+    assert noop_state.last_sync_status == "success"
+    assert len(audit_rows) == 2
+    noop_payload = audit_rows[-1].payload
+    assert noop_payload["source_unit_id"] == payload["source_unit_id"]
+    assert noop_payload["logical_calls"] == 0
+    assert noop_payload["provider_attempts"] == 0
+    assert noop_payload["usage_known_calls"] == 0
+    assert noop_payload["usage_unknown_calls"] == 0
+    assert noop_payload["terminal_category_counts"] == {}
+    assert noop_payload["operation_counts"] == {}
+
+
+@pytest.mark.asyncio
+async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fails(
+    db: Database,
+    monkeypatch,
+):
+    source_id = "src-source-unit-llm-summary-failure"
+    await db.upsert_source(
+        id=source_id,
+        type="github_pages",
+        name="Documents",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
+    async def failing_acompletion(**kwargs):
+        del kwargs
+        raise TimeoutError("provider unavailable")
+
+    monkeypatch.setattr(
+        "memforge.llm.structured.litellm.supports_response_schema",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "memforge.llm.structured.litellm.acompletion",
+        failing_acompletion,
+    )
+    structured_client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+            num_retries=0,
+        )
+    )
+
+    class FailingStructuredMemoryExtractor(RecordingMemoryExtractor):
+        async def extract_unit_memories(self, context, **kwargs):
+            self.unit_calls.append({"context": context, **kwargs})
+            await structured_client.extract_memories("extract", max_tokens=1024)
+            raise AssertionError("unreachable")
+
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=FailingStructuredMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=_audited_memory_store(db),
+        structured_llm_client=structured_client,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    )
+
+    gene = UpdatingDocumentGene("# Design\n\nOne durable statement.", version="1")
+    item = await anext(gene.discover())
+    with pytest.raises(StructuredLlmError, match="provider unavailable"):
+        await orchestrator._process_item(
+            gene=gene,
+            item=item,
+            source_name="Documents",
+            source_id=source_id,
+        )
+
+    audit_rows = await db.list_memory_audit_events(
+        event_type="source_unit_llm_summary",
+    )
+    assert len(audit_rows) == 1
+    audit_row = audit_rows[0]
+    assert audit_row.status == "failed"
+    assert audit_row.payload["logical_calls"] == 1
+    assert audit_row.payload["provider_attempts"] == 1
+    assert audit_row.payload["usage_known_calls"] == 0
+    assert audit_row.payload["usage_unknown_calls"] == 1
+    assert audit_row.payload["terminal_category_counts"] == {"provider_error": 1}
+    assert audit_row.payload["operation_counts"] == {"memory_extraction": 1}
 
 
 @pytest.mark.asyncio

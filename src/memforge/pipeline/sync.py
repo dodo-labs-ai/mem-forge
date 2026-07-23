@@ -14,19 +14,24 @@ independently with retry logic and per-item error isolation.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import threading
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import tiktoken
 
+from memforge.llm.structured import (
+    LiteLlmStructuredClient,
+    StructuredLlmMetricsCollector,
+)
 from memforge.models import (
     ChangelogEntry,
     DocumentRecord,
@@ -444,6 +449,7 @@ class GeneSyncOrchestrator:
         memory_reclaimer: ProcessMemoryReclaimer | None = None,
         source_projection_adapter: SourceProjectionAdapter | None = None,
         retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        structured_llm_client: LiteLlmStructuredClient | None = None,
     ) -> None:
         self.db = db
         self.doc_store = doc_store
@@ -458,6 +464,7 @@ class GeneSyncOrchestrator:
         self.memory_reclaimer = memory_reclaimer or ProcessMemoryReclaimer()
         self.source_projection_adapter = source_projection_adapter or DEFAULT_SOURCE_PROJECTION_ADAPTER
         self._retry_sleep = retry_sleep
+        self.structured_llm_client = structured_llm_client
 
         self._llm_semaphore = asyncio.Semaphore(self.max_concurrent)
         self._db_lock = asyncio.Lock()
@@ -1274,30 +1281,65 @@ class GeneSyncOrchestrator:
         self._memory_sample("document_wait_start", source_id=source_id, run_id=run_id, doc_id=doc_id)
         lifecycle_error: Exception | None = None
         lifecycle_ok = False
+        source_unit_id: str | None = None
+        metrics_collector = StructuredLlmMetricsCollector() if self.structured_llm_client is not None else None
+
+        def bind_source_unit(candidate_source_unit_id: str) -> None:
+            nonlocal source_unit_id
+            source_unit_id = candidate_source_unit_id
+
         async with self._document_lifecycle_slot(source_id, doc_id):
+            lifecycle_started = asyncio.get_running_loop().time()
             self._memory_sample("document_lifecycle_enter", source_id=source_id, run_id=run_id, doc_id=doc_id)
+            metrics_scope = (
+                self.structured_llm_client.metrics_scope(metrics_collector)
+                if self.structured_llm_client is not None and metrics_collector is not None
+                else nullcontext()
+            )
             try:
-                result = await self._process_item_admitted(
-                    gene=gene,
-                    item=item,
-                    source_name=source_name,
-                    source_id=source_id,
-                    run_id=run_id,
-                    progress_callback=progress_callback,
-                    force_reprocess=force_reprocess,
-                    projection_scope=projection_scope,
-                    scope_transition=scope_transition,
-                    projection_access_context=projection_access_context,
-                    authoritative_snapshot=authoritative_snapshot,
-                    execution_mode=execution_mode,
-                    expected_source_activity_epoch=expected_source_activity_epoch,
-                )
+                with metrics_scope:
+                    result = await self._process_item_admitted(
+                        gene=gene,
+                        item=item,
+                        source_name=source_name,
+                        source_id=source_id,
+                        run_id=run_id,
+                        progress_callback=progress_callback,
+                        force_reprocess=force_reprocess,
+                        projection_scope=projection_scope,
+                        scope_transition=scope_transition,
+                        projection_access_context=projection_access_context,
+                        authoritative_snapshot=authoritative_snapshot,
+                        execution_mode=execution_mode,
+                        expected_source_activity_epoch=expected_source_activity_epoch,
+                        source_unit_id_callback=bind_source_unit,
+                    )
                 lifecycle_ok = True
                 return result
             except Exception as exc:
                 lifecycle_error = exc
                 raise
             finally:
+                if metrics_collector is not None and source_unit_id is not None:
+                    try:
+                        await self._record_source_unit_llm_summary(
+                            collector=metrics_collector,
+                            source_unit_id=source_unit_id,
+                            source_id=source_id,
+                            run_id=run_id,
+                            doc_id=doc_id,
+                            source_unit_elapsed_ms=max(
+                                0,
+                                round((asyncio.get_running_loop().time() - lifecycle_started) * 1000),
+                            ),
+                            ok=lifecycle_ok,
+                            error_class=(type(lifecycle_error).__name__ if lifecycle_error is not None else None),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to record Source Unit LLM summary",
+                            exc_info=True,
+                        )
                 self._memory_sample(
                     "document_lifecycle_exit",
                     source_id=source_id,
@@ -1332,6 +1374,7 @@ class GeneSyncOrchestrator:
         authoritative_snapshot: bool = False,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         expected_source_activity_epoch: int | None = None,
+        source_unit_id_callback: Callable[[str], None] | None = None,
     ) -> dict:
         """Process a single content item through the full pipeline.
 
@@ -1551,6 +1594,10 @@ class GeneSyncOrchestrator:
                     }
                 )
             return stats
+
+        if source_unit_id_callback is not None:
+            source_unit_id_callback(source_unit.id)
+        stats["source_unit_id"] = source_unit.id
 
         projection_run_id = f"{run_id or 'direct'}:{source_unit.id}:{projection_probe.source_unit_revisions[0].id}"
         async with self._db_lock:
@@ -2629,6 +2676,60 @@ class GeneSyncOrchestrator:
             thresholds=plan.thresholds if plan else None,
             payload=payload,
             error=result.error,
+        )
+
+    async def _record_source_unit_llm_summary(
+        self,
+        *,
+        collector: StructuredLlmMetricsCollector,
+        source_unit_id: str,
+        source_id: str,
+        run_id: str | None,
+        doc_id: str,
+        source_unit_elapsed_ms: int,
+        ok: bool,
+        error_class: str | None,
+    ) -> None:
+        """Emit one content-free LLM aggregate for a completed Source Unit scope."""
+
+        summary = collector.summary(
+            source_unit_elapsed_ms=source_unit_elapsed_ms,
+        )
+        payload = {
+            "event": "source_unit_llm_summary",
+            "source_id": source_id,
+            "source_unit_id": source_unit_id,
+            "run_id": run_id,
+            "doc_id": doc_id,
+            "ok": ok,
+            "error_class": error_class,
+            **summary.to_payload(),
+        }
+        logger.info(
+            "source_unit_llm_summary %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+        if not self.memory_store or not hasattr(
+            self.memory_store,
+            "record_audit_event",
+        ):
+            return
+        await self.memory_store.record_audit_event(
+            "source_unit_llm_summary",
+            "committed" if ok else "failed",
+            context=self._memory_store_context(
+                run_id=run_id,
+                source_id=source_id,
+                doc_id=doc_id,
+            ),
+            doc_id=doc_id,
+            source_id=source_id,
+            reason=("source_unit_lifecycle_completed" if ok else "source_unit_lifecycle_failed"),
+            payload={
+                "source_unit_id": source_unit_id,
+                "error_class": error_class,
+                **summary.to_payload(),
+            },
         )
 
     def _memory_store_context(
