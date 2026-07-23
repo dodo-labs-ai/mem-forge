@@ -75,6 +75,7 @@ async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, t
 
     assert sync_runtime.structured_llm_client is captured["client"]
     assert sync_runtime.memory_engine.structured_llm_client is captured["client"]
+    assert sync_runtime.orchestrator().structured_llm_client is captured["client"]
     assert sync_runtime.memory_engine.llm_model == "claude-sonnet-4-20250514"
     assert sync_runtime.memory_extractor.max_tokens == 32768
 

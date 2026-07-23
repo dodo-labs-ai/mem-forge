@@ -23,6 +23,8 @@ from memforge.llm.structured import (
     StructuredLlmCallTelemetry,
     StructuredLlmConfig,
     StructuredLlmError,
+    StructuredLlmMetricsCollector,
+    StructuredLlmMetricsSummary,
     litellm_model_name,
 )
 
@@ -40,6 +42,105 @@ class Choice:
 class CompletionResponse:
     def __init__(self, content: str | None) -> None:
         self.choices = [Choice(content)]
+
+
+def test_structured_llm_metrics_collector_summarizes_known_and_unknown_usage():
+    collector = StructuredLlmMetricsCollector()
+    collector.record(
+        StructuredLlmCallTelemetry(
+            operation="memory_extraction",
+            attempt_count=2,
+            retry_count=1,
+            fallback_count=0,
+            final_mode="native_schema",
+            elapsed_ms=80,
+            terminal_category="success",
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+        )
+    )
+    collector.record(
+        StructuredLlmCallTelemetry(
+            operation="entity_batch_validation",
+            attempt_count=1,
+            retry_count=0,
+            fallback_count=1,
+            final_mode="json_text",
+            elapsed_ms=40,
+            terminal_category="deadline_exceeded",
+            prompt_tokens=None,
+            completion_tokens=None,
+            total_tokens=None,
+        )
+    )
+
+    assert collector.summary(source_unit_elapsed_ms=100) == StructuredLlmMetricsSummary(
+        logical_calls=2,
+        provider_attempts=3,
+        retries=1,
+        schema_fallbacks=1,
+        reported_input_tokens=10,
+        reported_output_tokens=5,
+        reported_total_tokens=15,
+        usage_known_calls=1,
+        usage_unknown_calls=1,
+        llm_elapsed_ms=120,
+        source_unit_elapsed_ms=100,
+        terminal_category_counts={
+            "deadline_exceeded": 1,
+            "success": 1,
+        },
+        operation_counts={
+            "entity_batch_validation": 1,
+            "memory_extraction": 1,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_structured_llm_metrics_scope_isolates_concurrent_source_units(
+    monkeypatch,
+):
+    set_native_schema_support(monkeypatch, False)
+
+    async def fake_acompletion(**kwargs):
+        prompt = kwargs["messages"][0]["content"]
+        await asyncio.sleep(0)
+        response = CompletionResponse('{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}')
+        token_count = 11 if "source-a" in prompt else 23
+        response.usage = {
+            "prompt_tokens": token_count,
+            "completion_tokens": 3,
+            "total_tokens": token_count + 3,
+        }
+        return response
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+        )
+    )
+    source_a = StructuredLlmMetricsCollector()
+    source_b = StructuredLlmMetricsCollector()
+
+    async def extract(prompt: str, collector: StructuredLlmMetricsCollector):
+        with client.metrics_scope(collector):
+            await client.extract_memories(prompt, max_tokens=1024)
+
+    await asyncio.gather(
+        extract("source-a", source_a),
+        extract("source-b", source_b),
+    )
+
+    assert source_a.summary(source_unit_elapsed_ms=10).reported_input_tokens == 11
+    assert source_b.summary(source_unit_elapsed_ms=10).reported_input_tokens == 23
+    assert source_a.summary(source_unit_elapsed_ms=10).logical_calls == 1
+    assert source_b.summary(source_unit_elapsed_ms=10).logical_calls == 1
 
 
 def set_native_schema_support(monkeypatch, supported: bool) -> None:

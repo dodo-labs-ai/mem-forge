@@ -6,9 +6,12 @@ import asyncio
 import json
 import logging
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from threading import Lock
 from time import perf_counter
-from typing import Any, Callable, Literal, Mapping, Protocol, get_args, get_origin
+from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, get_args, get_origin
 
 import litellm
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -298,6 +301,91 @@ class StructuredLlmCallTelemetry:
     prompt_tokens: int | None
     completion_tokens: int | None
     total_tokens: int | None
+
+
+@dataclass(frozen=True)
+class StructuredLlmMetricsSummary:
+    """Content-free aggregate for one bounded Source Unit lifecycle."""
+
+    logical_calls: int
+    provider_attempts: int
+    retries: int
+    schema_fallbacks: int
+    reported_input_tokens: int
+    reported_output_tokens: int
+    reported_total_tokens: int
+    usage_known_calls: int
+    usage_unknown_calls: int
+    llm_elapsed_ms: int
+    source_unit_elapsed_ms: int
+    terminal_category_counts: Mapping[str, int]
+    operation_counts: Mapping[str, int]
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "logical_calls": self.logical_calls,
+            "provider_attempts": self.provider_attempts,
+            "retries": self.retries,
+            "schema_fallbacks": self.schema_fallbacks,
+            "reported_input_tokens": self.reported_input_tokens,
+            "reported_output_tokens": self.reported_output_tokens,
+            "reported_total_tokens": self.reported_total_tokens,
+            "usage_known_calls": self.usage_known_calls,
+            "usage_unknown_calls": self.usage_unknown_calls,
+            "llm_elapsed_ms": self.llm_elapsed_ms,
+            "source_unit_elapsed_ms": self.source_unit_elapsed_ms,
+            "terminal_category_counts": dict(self.terminal_category_counts),
+            "operation_counts": dict(self.operation_counts),
+        }
+
+
+class StructuredLlmMetricsCollector:
+    """Collect logical-call outcomes for one request-local lifecycle scope."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._calls: list[StructuredLlmCallTelemetry] = []
+
+    def record(self, telemetry: StructuredLlmCallTelemetry) -> None:
+        with self._lock:
+            self._calls.append(telemetry)
+
+    def summary(self, *, source_unit_elapsed_ms: int) -> StructuredLlmMetricsSummary:
+        with self._lock:
+            calls = tuple(self._calls)
+
+        terminal_category_counts: dict[str, int] = {}
+        operation_counts: dict[str, int] = {}
+        reported_input_tokens = 0
+        reported_output_tokens = 0
+        reported_total_tokens = 0
+        usage_known_calls = 0
+        for call in calls:
+            terminal_category_counts[call.terminal_category] = (
+                terminal_category_counts.get(call.terminal_category, 0) + 1
+            )
+            operation_counts[call.operation] = operation_counts.get(call.operation, 0) + 1
+            if call.prompt_tokens is not None and call.completion_tokens is not None and call.total_tokens is not None:
+                usage_known_calls += 1
+                reported_input_tokens += call.prompt_tokens
+                reported_output_tokens += call.completion_tokens
+                reported_total_tokens += call.total_tokens
+
+        return StructuredLlmMetricsSummary(
+            logical_calls=len(calls),
+            provider_attempts=sum(call.attempt_count for call in calls),
+            retries=sum(call.retry_count for call in calls),
+            schema_fallbacks=sum(call.fallback_count for call in calls),
+            reported_input_tokens=reported_input_tokens,
+            reported_output_tokens=reported_output_tokens,
+            reported_total_tokens=reported_total_tokens,
+            usage_known_calls=usage_known_calls,
+            usage_unknown_calls=len(calls) - usage_known_calls,
+            llm_elapsed_ms=sum(call.elapsed_ms for call in calls),
+            source_unit_elapsed_ms=max(0, int(source_unit_elapsed_ms)),
+            terminal_category_counts=dict(sorted(terminal_category_counts.items())),
+            operation_counts=dict(sorted(operation_counts.items())),
+        )
 
 
 @dataclass
@@ -645,6 +733,23 @@ class LiteLlmStructuredClient:
     ) -> None:
         self.config = config
         self._telemetry_sink = telemetry_sink
+        self._scoped_metrics_collector: ContextVar[StructuredLlmMetricsCollector | None] = ContextVar(
+            f"memforge_structured_llm_metrics_collector_{id(self)}",
+            default=None,
+        )
+
+    @contextmanager
+    def metrics_scope(
+        self,
+        collector: StructuredLlmMetricsCollector,
+    ) -> Iterator[StructuredLlmMetricsCollector]:
+        """Route calls in the current async context to one request-local collector."""
+
+        token = self._scoped_metrics_collector.set(collector)
+        try:
+            yield collector
+        finally:
+            self._scoped_metrics_collector.reset(token)
 
     async def verify_source_support(
         self,
@@ -1058,6 +1163,9 @@ class LiteLlmStructuredClient:
             "total_tokens": telemetry.total_tokens,
         }
         logger.info("structured_llm_call %s", json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        scoped_collector = self._scoped_metrics_collector.get()
+        if scoped_collector is not None:
+            scoped_collector.record(telemetry)
         if self._telemetry_sink is not None:
             try:
                 self._telemetry_sink(telemetry)
