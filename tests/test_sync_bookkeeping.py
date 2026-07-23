@@ -3559,10 +3559,11 @@ async def _insert_document_with_metadata(
     markdown: str,
     version: str,
     normalized_content_uri: str | None = None,
+    projection_source_type: str | None = None,
 ) -> None:
     await db.upsert_source(
         id=source_id,
-        type="jira",
+        type=projection_source_type or "jira",
         name="Jira Board",
         config_json="{}",
         access_policy="workspace",
@@ -3588,6 +3589,40 @@ async def _insert_document_with_metadata(
         ),
     )
     await db.update_source_doc_count(source_id, 1)
+    if projection_source_type is None:
+        return
+
+    item_extra = (
+        {"issue_id": "100000", "issue_key": "PAY-0"}
+        if projection_source_type == "jira"
+        else {}
+    )
+    item = ContentItem(
+        item_id=doc_id,
+        title=title,
+        source_url=f"http://example/{doc_id}",
+        last_modified=now,
+        content_type="application/json" if projection_source_type == "jira" else "text/markdown",
+        space_or_project="ARCH",
+        version=version,
+        extra=item_extra,
+    )
+    raw = (
+        _jira_raw_content(item)
+        if projection_source_type == "jira"
+        else RawContent(item=item, body=markdown.encode("utf-8"), content_type="text/markdown")
+    )
+    await db.record_source_projection(
+        project_source_item(
+            source_id=source_id,
+            source_type=projection_source_type,
+            run_id=f"projection-fixture:{source_id}:{doc_id}",
+            item=item,
+            raw=raw,
+            normalized=NormalizedContent(item=item, markdown_body=markdown),
+            access_context={"access_policy": "workspace", "owner_user_id": "dev"},
+        )
+    )
 
 
 def _audited_memory_store(db: Database) -> MemoryStore:
@@ -4449,6 +4484,7 @@ async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope
         markdown=markdown,
         version="2",
         normalized_content_uri=normalized_content_uri,
+        projection_source_type="docs",
     )
     extractor = RecordingMemoryExtractor()
     memory_engine = RecordingMemoryEngine()
@@ -8396,7 +8432,9 @@ async def test_full_document_extraction_failure_is_audited(db: Database):
     assert state.docs_failed == 1
     assert state.failed_docs
     assert "json_parse_error" in state.failed_docs[0].error
-    assert await db.count_documents(source=source_id) == 0
+    assert await db.count_documents(source=source_id) == 1
+    assert await db.find_source_unit_by_document_id(source_id, "doc-1", current_only=True) is None
+    assert await db.list_source_artifact_cleanup_tasks() == []
     assert len(rows) == 3
     assert rows[0].doc_id == "doc-1"
     assert rows[0].source_id == source_id
@@ -9169,6 +9207,152 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
 
 
 @pytest.mark.asyncio
+async def test_matching_staged_document_without_projection_runs_semantic_work(db: Database) -> None:
+    source_id = "src-staged-document-retry"
+    markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=markdown,
+        version="2",
+    )
+    extractor = RecordingMemoryExtractor()
+    engine = RecordingMemoryEngine()
+
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=extractor,
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+    ).sync_gene(
+        gene=UpdatingDocumentGene(markdown, version="2"),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    source_unit = await db.find_source_unit_by_document_id(source_id, "doc-1", current_only=True)
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == 1
+    assert state.docs_failed == 0
+    assert len(engine.projected_lifecycle_calls) == 1
+    assert len(extractor.full_calls) + len(extractor.change_calls) + len(extractor.unit_calls) == 1
+    assert source_unit is not None
+    assert await db.get_current_source_unit_revision(source_unit.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_new_document_lifecycle_retry_reuses_staged_document(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_id = "src-staged-document-lifecycle-retry"
+    markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Documents",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    legacy_delete_calls = 0
+
+    async def reject_legacy_delete(doc_id: str) -> list[str]:
+        nonlocal legacy_delete_calls
+        legacy_delete_calls += 1
+        raise ValueError(
+            "direct configured-source Memory write rejected after cutover; projected lifecycle required"
+        )
+
+    async def reject_projected_delete(doc_id: str) -> None:
+        raise AssertionError(f"sync retry must not delete staged Document {doc_id}")
+
+    monkeypatch.setattr(db, "delete_document", reject_legacy_delete)
+    monkeypatch.setattr(db, "delete_projected_document", reject_projected_delete)
+
+    class FailOnceProjectedMemoryEngine(NoopMemoryEngine):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def apply_projected_lifecycle(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("lifecycle apply failed")
+            return await super().apply_projected_lifecycle(**kwargs)
+
+    engine = FailOnceProjectedMemoryEngine()
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=UpdatingDocumentGene(markdown),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    source_unit = await db.find_source_unit_by_document_id(source_id, "doc-1", current_only=True)
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == 1
+    assert state.docs_failed == 0
+    assert engine.calls == 2
+    assert legacy_delete_calls == 0
+    assert source_unit is not None
+    assert await db.get_current_source_unit_revision(source_unit.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_restore_failure_does_not_mask_processing_failure(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_id = "src-snapshot-restore-failure"
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown="# Design Doc\n\nThe service uses PostgreSQL 14.",
+        version="1",
+    )
+
+    async def reject_snapshot_restore(*_args, **_kwargs) -> None:
+        raise RuntimeError("Document snapshot restore failed")
+
+    monkeypatch.setattr(db, "restore_document_snapshot", reject_snapshot_restore)
+    engine = FailingProjectedMemoryEngine()
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=UpdatingDocumentGene("# Design Doc\n\nThe service uses PostgreSQL 15."),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "failed"
+    assert state.docs_processed == 0
+    assert state.docs_failed == 1
+    assert engine.calls == 3
+    assert state.failed_docs[0].error == "lifecycle apply failed"
+    assert await db.get_document("doc-1") is not None
+    assert await db.find_source_unit_by_document_id(source_id, "doc-1", current_only=True) is None
+
+
+@pytest.mark.asyncio
 async def test_item_processing_is_bounded_by_max_concurrent(db: Database):
     source_id = "src-bounded-sync"
     await db.upsert_source(
@@ -9317,6 +9501,7 @@ async def test_unchanged_document_backfills_pdf_uri_without_llm_reprocessing(db:
         title="Jira 0",
         markdown=markdown,
         version="0",
+        projection_source_type="confluence",
     )
     release = asyncio.Event()
     release.set()
@@ -9354,8 +9539,8 @@ async def test_missing_pdf_uri_forces_full_sync_without_llm_reprocessing(db: Dat
         title="Jira 0",
         markdown=markdown,
         version="0",
+        projection_source_type="confluence",
     )
-    await db.db.execute("UPDATE sources SET type = ? WHERE id = ?", ("confluence", source_id))
     await db.upsert_sync_state(
         SyncState(
             source=source_id,
@@ -9400,8 +9585,8 @@ async def test_missing_required_confluence_pdf_fails_sync_without_hiding_gap(db:
         title="Jira 0",
         markdown=markdown,
         version="0",
+        projection_source_type="confluence",
     )
-    await db.db.execute("UPDATE sources SET type = ? WHERE id = ?", ("confluence", source_id))
     release = asyncio.Event()
     release.set()
 
@@ -9479,8 +9664,8 @@ async def test_confluence_pdf_storage_failure_is_not_reported_as_export_failure(
         title="Jira 0",
         markdown=markdown,
         version="0",
+        projection_source_type="confluence",
     )
-    await db.db.execute("UPDATE sources SET type = ? WHERE id = ?", ("confluence", source_id))
     release = asyncio.Event()
     release.set()
 
@@ -9517,8 +9702,8 @@ async def test_existing_confluence_pdf_uri_is_preserved_when_unchanged_export_is
         title="Jira 0",
         markdown=markdown,
         version="0",
+        projection_source_type="confluence",
     )
-    await db.db.execute("UPDATE sources SET type = ? WHERE id = ?", ("confluence", source_id))
     await db.db.execute(
         "UPDATE documents SET pdf_content_uri = ? WHERE doc_id = ?",
         ("file:///tmp/Architecture/existing.pdf", "jira-0"),
@@ -9563,8 +9748,8 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
         markdown=markdown,
         version="0",
         normalized_content_uri="file:///tmp/Architecture/existing.md",
+        projection_source_type="confluence",
     )
-    await db.db.execute("UPDATE sources SET type = ? WHERE id = ?", ("confluence", source_id))
     await db.db.execute(
         """UPDATE documents
            SET raw_content_uri = ?, raw_content_type = ?, pdf_content_uri = ?
@@ -9617,6 +9802,7 @@ async def test_unchanged_document_survives_pending_lifecycle_vector_delivery(
         title="Jira 0",
         markdown=markdown,
         version="0",
+        projection_source_type="jira",
     )
     release = asyncio.Event()
     release.set()
@@ -9659,6 +9845,7 @@ async def test_sync_run_keeps_success_when_vector_delivery_raises(
         title="Jira 0",
         markdown=markdown,
         version="0",
+        projection_source_type="jira",
     )
     release = asyncio.Event()
     release.set()
