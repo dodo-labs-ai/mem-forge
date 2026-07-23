@@ -3037,7 +3037,8 @@ class GeneSyncOrchestrator:
                     )
                 else:
                     logger.warning(
-                        "Retained removed document %s while %d lifecycle review(s) are pending",
+                        "Retained removed document %s while lifecycle review or "
+                        "document support remains (pending_reviews=%d)",
                         doc_id,
                         lifecycle_result["pending_review"],
                     )

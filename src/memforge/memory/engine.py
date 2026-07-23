@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
@@ -929,12 +929,10 @@ class MemoryEngine:
             if len(mutation_types) != len(mutations):
                 raise ValueError("applied tombstone lifecycle mutation ledger is malformed")
             await self.memory_store.attempt_lifecycle_vector_delivery(plan_id)
-            pending_review = mutation_types.count("create_review")
-            return {
-                "retired": mutation_types.count("retire_memory"),
-                "pending_review": pending_review,
-                "can_delete_document": pending_review == 0,
-            }
+            return await self._projected_tombstone_result(
+                doc_id=doc_id,
+                mutation_types=mutation_types,
+            )
         source_type = projection.source_type
         incumbents, unit_support = await self._active_projected_incumbents(
             doc_id=doc_id,
@@ -990,12 +988,32 @@ class MemoryEngine:
             expected_source_activity_epoch=expected_source_activity_epoch,
         )
         await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
-        pending_review = sum(mutation.mutation_type.value == "create_review" for mutation in plan.mutations)
-        retired = sum(mutation.mutation_type.value == "retire_memory" for mutation in plan.mutations)
+        return await self._projected_tombstone_result(
+            doc_id=doc_id,
+            mutation_types=tuple(
+                mutation.mutation_type.value for mutation in plan.mutations
+            ),
+        )
+
+    async def _projected_tombstone_result(
+        self,
+        *,
+        doc_id: str,
+        mutation_types: Sequence[str],
+    ) -> dict[str, int | bool]:
+        """Return deletion eligibility from the committed document provenance."""
+
+        pending_review = mutation_types.count("create_review")
+        remaining_document_support = await self.db.get_memories_by_source_doc(
+            doc_id,
+            support_kind=None,
+        )
         return {
-            "retired": retired,
+            "retired": mutation_types.count("retire_memory"),
             "pending_review": pending_review,
-            "can_delete_document": pending_review == 0,
+            "can_delete_document": (
+                pending_review == 0 and not remaining_document_support
+            ),
         }
 
     def _candidate_can_persist(
