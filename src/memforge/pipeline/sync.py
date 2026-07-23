@@ -1679,8 +1679,8 @@ class GeneSyncOrchestrator:
                 existing_doc = lineage_predecessor_docs[0]
                 existing_hash = existing_doc.content_hash
         content_unchanged = existing_hash == new_hash
-        unchanged = (
-            (content_unchanged or not projection_requires_extraction)
+        skip_semantic_work = (
+            not projection_requires_extraction
             and not force_reprocess
         )
         previous_markdown = (
@@ -1699,8 +1699,9 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         # 3. Store raw + normalized on disk
         # ------------------------------------------------------------------
-        raw_uri = existing_doc.raw_content_uri if unchanged and existing_doc else None
-        norm_uri = existing_doc.normalized_content_uri if unchanged and existing_doc else None
+        reuse_content_artifacts = content_unchanged and not force_reprocess
+        raw_uri = existing_doc.raw_content_uri if reuse_content_artifacts and existing_doc else None
+        norm_uri = existing_doc.normalized_content_uri if reuse_content_artifacts and existing_doc else None
         stored_content_artifact = False
         if not content_unchanged or not raw_uri:
             raw_uri = self.doc_store.store_raw(
@@ -1732,12 +1733,12 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         # 3b. Export PDF (if gene supports it)
         # ------------------------------------------------------------------
-        pdf_uri = existing_doc.pdf_content_uri if unchanged and existing_doc else None
+        pdf_uri = existing_doc.pdf_content_uri if reuse_content_artifacts and existing_doc else None
         should_fetch_pdf = (
             execution_mode is not SourceSyncMode.PROJECTION_REPAIR
             and not raw.authoritative_empty
             and hasattr(gene, "fetch_pdf")
-            and (projection_requires_extraction or requires_pdf_uri or not pdf_uri)
+            and (force_reprocess or requires_pdf_uri or not pdf_uri)
         )
         if should_fetch_pdf:
             try:
@@ -1825,7 +1826,7 @@ class GeneSyncOrchestrator:
             )
             return stats
 
-        if unchanged:
+        if skip_semantic_work:
             stats["updated"] = not content_unchanged
             async with self._db_lock:
                 await self.db.upsert_document(
@@ -1846,7 +1847,7 @@ class GeneSyncOrchestrator:
                         "title": item.title,
                     }
                 )
-            logger.debug("Skipping semantic work for unchanged %s (%s)", item.title, doc_id)
+            logger.debug("Skipping semantic work for projected no-op %s (%s)", item.title, doc_id)
             return stats
 
         stats["updated"] = True
@@ -1905,10 +1906,11 @@ class GeneSyncOrchestrator:
                     ),
                     expected_source_activity_epoch=expected_source_activity_epoch,
                 )
-            except Exception:
-                await self._restore_document_processing_snapshot(
+            except Exception as processing_error:
+                await self._restore_document_processing_snapshot_preserving_failure(
                     doc_id=doc_id,
                     existing_doc=existing_doc,
+                    processing_error=processing_error,
                 )
                 raise
             await self.db.record_source_projection(
@@ -1971,12 +1973,16 @@ class GeneSyncOrchestrator:
 
         raw_memories = extraction_result.memories
         if extraction_result.error_type:
-            await self._restore_document_processing_snapshot(
+            error_detail = extraction_result.error or ""
+            processing_error = RuntimeError(
+                f"memory extraction failed for {doc_id}: {extraction_result.error_type}: {error_detail}"
+            )
+            await self._restore_document_processing_snapshot_preserving_failure(
                 doc_id=doc_id,
                 existing_doc=existing_doc,
+                processing_error=processing_error,
             )
-            error_detail = extraction_result.error or ""
-            raise RuntimeError(f"memory extraction failed for {doc_id}: {extraction_result.error_type}: {error_detail}")
+            raise processing_error
         logger.debug(
             "Extracted %d raw memories from %s",
             len(raw_memories),
@@ -2024,13 +2030,14 @@ class GeneSyncOrchestrator:
                 user_id=actor_user_id,
                 expected_source_activity_epoch=expected_source_activity_epoch,
             )
-        except Exception:
-            # Projection and lifecycle state roll back together in the engine;
-            # keep the durable document snapshot on the same prior revision so
-            # an ordinary retry still observes the semantic delta.
-            await self._restore_document_processing_snapshot(
+        except Exception as processing_error:
+            # Projection and lifecycle roll back together. Existing Documents
+            # restore their prior snapshot; new Documents remain staged. In
+            # both cases the missing target projection requires retry work.
+            await self._restore_document_processing_snapshot_preserving_failure(
                 doc_id=doc_id,
                 existing_doc=existing_doc,
+                processing_error=processing_error,
             )
             raise
         # The production engine commits this projection with its Lifecycle
@@ -2997,14 +3004,35 @@ class GeneSyncOrchestrator:
         doc_id: str,
         existing_doc: DocumentRecord | None,
     ) -> None:
+        # A new Document is a durable content read model, not lifecycle
+        # authority. Keep that stage so the retry can reuse its artifacts and
+        # let the still-missing Source Projection require semantic work.
+        if existing_doc is None:
+            return
         async with self._db_lock:
-            if existing_doc:
-                await self.db.restore_document_snapshot(
-                    existing_doc,
-                    require_configured_source=True,
-                )
-            else:
-                await self.db.delete_document(doc_id)
+            await self.db.restore_document_snapshot(
+                existing_doc,
+                require_configured_source=True,
+            )
+
+    async def _restore_document_processing_snapshot_preserving_failure(
+        self,
+        *,
+        doc_id: str,
+        existing_doc: DocumentRecord | None,
+        processing_error: Exception,
+    ) -> None:
+        try:
+            await self._restore_document_processing_snapshot(
+                doc_id=doc_id,
+                existing_doc=existing_doc,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to restore staged Document %s after processing error: %s",
+                doc_id,
+                processing_error,
+            )
 
     async def _insert_changelog(self, entry: ChangelogEntry) -> None:
         """Insert a changelog entry into the database.
