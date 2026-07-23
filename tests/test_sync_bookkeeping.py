@@ -2745,6 +2745,9 @@ class RecordingDocumentDeleteMemoryStore:
         self.calls.append((doc_id, kwargs))
         await self.db.delete_projected_document(doc_id)
 
+    async def attempt_lifecycle_vector_delivery(self, *, source_id: str) -> None:
+        del source_id
+
 
 class CountingMemoryEngine(NoopMemoryEngine):
     def __init__(self, inserted: int):
@@ -2797,6 +2800,11 @@ class FailingLifecycleOutboxMemoryStore:
             failed_tasks=1,
             error_types=("RuntimeError",),
         )
+
+
+class RaisingLifecycleOutboxMemoryStore:
+    async def attempt_lifecycle_vector_delivery(self, *, source_id: str) -> None:
+        raise RuntimeError(f"temporary vector failure for {source_id}")
 
 
 class NoopMemoryExtractor:
@@ -3092,6 +3100,21 @@ class EmptyNormalizedBlockingFetchGene(BlockingFetchGene):
 
     async def normalize(self, raw):
         return NormalizedContent(item=raw.item, markdown_body="")
+
+
+class UnexpectedFetchGene(BlockingFetchGene):
+    async def fetch(self, item):
+        raise AssertionError(f"reused projection must not fetch {item.item_id}")
+
+
+class RecordingFetchGene(BlockingFetchGene):
+    def __init__(self, item_count: int, release: asyncio.Event):
+        super().__init__(item_count=item_count, release=release)
+        self.fetched_doc_ids: list[str] = []
+
+    async def fetch(self, item):
+        self.fetched_doc_ids.append(item.item_id)
+        return await super().fetch(item)
 
 
 class GitHubPagesBlockingFetchGene(BlockingFetchGene):
@@ -5472,6 +5495,7 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
         async def run_source_sync(self, **kwargs):
             self.force_full_sync_values.append(bool(kwargs["force_full_sync"]))
             self.lifecycle_cycle_ids.append(str(kwargs["lifecycle_cycle_id"]))
+            await self.attempt_lifecycle_vector_delivery(source_id=source_id)
             return SyncState(
                 source=source_id,
                 last_sync_at=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
@@ -5506,66 +5530,6 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
     assert provider.extraction_pools == [worker._extraction_pool]
     assert provider.lifecycle_cycle_ids == [f"{enqueued.run_id}:attempt:1"]
     assert provider.vector_delivery_source_ids == [source_id]
-
-
-@pytest.mark.asyncio
-async def test_source_sync_worker_keeps_success_when_vector_delivery_raises(
-    db: Database,
-    monkeypatch,
-) -> None:
-    import memforge.runtime as runtime
-
-    source_id = "src-worker-vector-pending"
-    await db.upsert_source(
-        id=source_id,
-        type="jira",
-        name="Worker vector pending",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-
-    class PendingVectorRuntimeProvider:
-        def __init__(self) -> None:
-            self.memory_store = self
-
-        async def build_sync_runtime(self, db, config, **kwargs):
-            del db, config, kwargs
-            return self
-
-        async def attempt_lifecycle_vector_delivery(self, *, source_id: str) -> None:
-            raise RuntimeError(f"temporary vector failure for {source_id}")
-
-        async def run_source_sync(self, **kwargs):
-            return SyncState(
-                source=str(kwargs["source"]["id"]),
-                last_sync_at=datetime(2026, 7, 17, 9, 0, tzinfo=timezone.utc),
-                last_sync_status="success",
-            )
-
-    logged_errors: list[tuple] = []
-    monkeypatch.setattr(
-        runtime.logger,
-        "exception",
-        lambda *args, **kwargs: logged_errors.append((args, kwargs)),
-    )
-    provider = PendingVectorRuntimeProvider()
-    service = SyncService(db, AppConfig(), runtime_provider=provider)
-    enqueued = await service.enqueue_source(source_id, trigger="manual")
-    worker = runtime.SourceSyncWorker(
-        db,
-        AppConfig(),
-        runtime_provider=provider,
-        worker_id="worker-vector-pending",
-    )
-
-    await worker.run_once()
-
-    completed = await db.get_source_sync_run(enqueued.run_id)
-    assert completed is not None
-    assert completed.status == "success"
-    assert len(logged_errors) == 1
-    assert logged_errors[0][0][1] == source_id
 
 
 @pytest.mark.asyncio
@@ -5696,6 +5660,7 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
             self.force_full_sync: bool | None = None
             self.authoritative_snapshot: bool | None = None
             self.source: dict | None = None
+            self.reusable_projection_doc_ids: frozenset[str] | None = None
 
         async def build_sync_runtime(self, db, config, **kwargs):
             del db, config, kwargs
@@ -5705,6 +5670,9 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
             self.force_full_sync = kwargs["force_full_sync"]
             self.authoritative_snapshot = kwargs["authoritative_snapshot"]
             self.source = kwargs["source"]
+            self.reusable_projection_doc_ids = kwargs[
+                "reusable_projection_doc_ids"
+            ]
             return SyncState(
                 source=source_id,
                 last_sync_at=datetime.now(timezone.utc),
@@ -5712,6 +5680,16 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
             )
 
     provider = CapturingRuntimeProvider()
+
+    async def find_reusable_source_projection_memberships(**kwargs):
+        assert kwargs["source_id"] == source_id
+        assert kwargs["snapshot_id"] == "laj-empty"
+        assert kwargs["expected_access_hash"]
+        return frozenset({"doc-reused"})
+
+    db.find_reusable_source_projection_memberships = (
+        find_reusable_source_projection_memberships
+    )
     await db.enqueue_source_sync_run(
         source_id=source_id,
         trigger="local_agent",
@@ -5731,6 +5709,134 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
     assert provider.authoritative_snapshot is True
     assert provider.source is not None
     assert provider.source["config"]["local_agent_package_manifest"] == []
+    assert provider.reusable_projection_doc_ids == frozenset({"doc-reused"})
+
+
+@pytest.mark.asyncio
+async def test_source_projection_reuse_requires_prior_manifest_and_current_lineage(
+    db: Database,
+) -> None:
+    source_id = "src-projection-reuse-plan"
+    doc_id = "jira-0"
+    revision = "0"
+    markdown = "# Jira 0\n\nBody"
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id=doc_id,
+        title="Jira 0",
+        markdown=markdown,
+        version=revision,
+    )
+    item = ContentItem(
+        item_id=doc_id,
+        title="Jira 0",
+        source_url="https://jira.example/browse/PAY-0",
+        last_modified=datetime.now(timezone.utc),
+        content_type="application/json",
+        space_or_project="PAY",
+        version=revision,
+        extra={"issue_id": "100000", "issue_key": "PAY-0"},
+    )
+    raw = _jira_raw_content(item)
+    projection = project_source_item(
+        source_id=source_id,
+        source_type="jira",
+        run_id="projection-reuse-current",
+        item=item,
+        raw=raw,
+        normalized=NormalizedContent(item=item, markdown_body=markdown),
+        access_context={"access_policy": "workspace", "owner_user_id": "dev"},
+    )
+    await db.record_source_projection(projection)
+    access_hash = projection.source_unit_revisions[0].access_hash
+    assert access_hash is not None
+
+    package_hash = "a" * 64
+    retained = await db.create_source_sync_input(
+        source_id=source_id,
+        raw_uri="object://projection-reuse/jira-0",
+        raw_sha256="b" * 64,
+        raw_content_type="application/json",
+        metadata={
+            "package_sha256": package_hash,
+            "manifest_entry": {
+                "doc_id": doc_id,
+                "provider_revision": revision,
+                "version": revision,
+                "change_kind": "upsert",
+                "package_sha256": package_hash,
+            },
+        },
+    )
+    for snapshot_id in ("snapshot-prior", "snapshot-current"):
+        await db.attach_source_sync_inputs_to_snapshot(
+            source_id=source_id,
+            workspace_id="default",
+            snapshot_id=snapshot_id,
+            memberships=[(doc_id, retained.input_id)],
+            coverage="complete_snapshot",
+            manifest_count=1,
+            manifest_sha256=("c" if snapshot_id == "snapshot-prior" else "d") * 64,
+            manifest_items=[(doc_id, revision, "upsert")],
+            local_agent_job_id=f"job-{snapshot_id}",
+            local_agent_attempt_count=1,
+            source_config_revision="config-revision",
+        )
+
+    assert await db.find_reusable_source_projection_memberships(
+        source_id=source_id,
+        workspace_id="default",
+        snapshot_id="snapshot-current",
+        expected_access_hash=access_hash,
+    ) == frozenset({doc_id})
+    assert await db.find_reusable_source_projection_memberships(
+        source_id=source_id,
+        workspace_id="default",
+        snapshot_id="snapshot-current",
+        expected_access_hash="stale-access-hash",
+    ) == frozenset()
+    await db.db.execute(
+        """UPDATE source_sync_snapshot_manifests
+           SET source_config_revision = 'stale-config-revision'
+           WHERE source_id = ? AND snapshot_id = 'snapshot-prior'""",
+        (source_id,),
+    )
+    await db.db.commit()
+    assert await db.find_reusable_source_projection_memberships(
+        source_id=source_id,
+        workspace_id="default",
+        snapshot_id="snapshot-current",
+        expected_access_hash=access_hash,
+    ) == frozenset()
+    await db.db.execute(
+        """UPDATE source_sync_snapshot_manifests
+           SET source_config_revision = 'config-revision'
+           WHERE source_id = ? AND snapshot_id = 'snapshot-prior'""",
+        (source_id,),
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO projection_scope_transitions (
+               id, source_id, previous_scope_json, target_scope_json, status,
+               created_at, updated_at
+           ) VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+        (
+            "scope-transition-reuse-plan",
+            source_id,
+            '{"projects":["PAY"]}',
+            '{"projects":["OPS"]}',
+            now,
+            now,
+        ),
+    )
+    await db.db.commit()
+    assert await db.find_reusable_source_projection_memberships(
+        source_id=source_id,
+        workspace_id="default",
+        snapshot_id="snapshot-current",
+        expected_access_hash=access_hash,
+    ) == frozenset()
 
 
 @pytest.mark.asyncio
@@ -9323,3 +9429,233 @@ async def test_unchanged_document_survives_pending_lifecycle_vector_delivery(
     assert state.docs_updated == 0
     assert memory_store.drain_calls == 1
     assert await db.get_document("jira-0") is not None
+
+
+@pytest.mark.asyncio
+async def test_sync_run_keeps_success_when_vector_delivery_raises(
+    db: Database,
+    monkeypatch,
+) -> None:
+    import memforge.pipeline.sync as sync_pipeline
+
+    source_id = "src-run-vector-pending"
+    markdown = "# Jira 0\n\nBody"
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="jira-0",
+        title="Jira 0",
+        markdown=markdown,
+        version="0",
+    )
+    release = asyncio.Event()
+    release.set()
+    logged_errors: list[tuple] = []
+    monkeypatch.setattr(
+        sync_pipeline.logger,
+        "exception",
+        lambda *args, **kwargs: logged_errors.append((args, kwargs)),
+    )
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=RaisingLifecycleOutboxMemoryStore(),
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=BlockingFetchGene(item_count=1, release=release),
+        source_name="Jira Board",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_failed == 0
+    assert len(logged_errors) == 1
+
+
+@pytest.mark.asyncio
+async def test_reused_projection_skips_per_document_work_and_drains_outbox_once(
+    db: Database,
+) -> None:
+    source_id = "src-reused-projection"
+    item_count = 20
+    for index in range(item_count):
+        await _insert_document_with_metadata(
+            db,
+            source_id=source_id,
+            doc_id=f"jira-{index}",
+            title=f"Jira {index}",
+            markdown=f"# Jira {index}\n\nBody",
+            version=str(index),
+        )
+    release = asyncio.Event()
+    release.set()
+    memory_store = FailingLifecycleOutboxMemoryStore()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=memory_store,
+        max_concurrent=4,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UnexpectedFetchGene(item_count=item_count, release=release),
+        source_name="Jira Board",
+        source_id=source_id,
+        reusable_projection_doc_ids=frozenset(
+            f"jira-{index}" for index in range(item_count)
+        ),
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == item_count
+    assert state.docs_updated == 0
+    assert state.docs_failed == 0
+    assert memory_store.drain_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reused_projection_materializes_only_changed_member(
+    db: Database,
+) -> None:
+    source_id = "src-reused-projection-one-change"
+    for index in range(2):
+        await _insert_document_with_metadata(
+            db,
+            source_id=source_id,
+            doc_id=f"jira-{index}",
+            title=f"Jira {index}",
+            markdown=f"# Jira {index}\n\nBody",
+            version=str(index),
+        )
+    release = asyncio.Event()
+    release.set()
+    gene = RecordingFetchGene(item_count=2, release=release)
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=FailingLifecycleOutboxMemoryStore(),
+        max_concurrent=2,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=gene,
+        source_name="Jira Board",
+        source_id=source_id,
+        reusable_projection_doc_ids=frozenset({"jira-0"}),
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == 2
+    assert gene.fetched_doc_ids == ["jira-1"]
+
+
+@pytest.mark.asyncio
+async def test_force_sync_ignores_reused_projection_plan(db: Database) -> None:
+    source_id = "src-reused-projection-force"
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="jira-0",
+        title="Jira 0",
+        markdown="# Jira 0\n\nBody",
+        version="0",
+    )
+    release = asyncio.Event()
+    release.set()
+    gene = RecordingFetchGene(item_count=1, release=release)
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=FailingLifecycleOutboxMemoryStore(),
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=gene,
+        source_name="Jira Board",
+        source_id=source_id,
+        force_full_sync=True,
+        reusable_projection_doc_ids=frozenset({"jira-0"}),
+    )
+
+    assert state.last_sync_status == "success"
+    assert gene.fetched_doc_ids == ["jira-0"]
+
+
+@pytest.mark.asyncio
+async def test_reused_projection_remains_complete_snapshot_membership_for_deletions(
+    db: Database,
+) -> None:
+    source_id = "src-reused-projection-deletion-proof"
+    documents = (
+        ("jira-0", "0"),
+        ("jira-removed", "removed-v1"),
+    )
+    for index, (doc_id, version) in enumerate(documents):
+        markdown = f"# {doc_id}\n\nBody"
+        await _insert_document_with_metadata(
+            db,
+            source_id=source_id,
+            doc_id=doc_id,
+            title=doc_id,
+            markdown=markdown,
+            version=version,
+        )
+        item = ContentItem(
+            item_id=doc_id,
+            title=doc_id,
+            source_url=f"https://jira.example/browse/{doc_id}",
+            last_modified=datetime.now(timezone.utc),
+            content_type="application/json",
+            space_or_project="PAY",
+            version=version,
+            extra={
+                "issue_id": str(200000 + index),
+                "issue_key": f"PAY-{index}",
+            },
+        )
+        await db.record_source_projection(
+            project_source_item(
+                source_id=source_id,
+                source_type="jira",
+                run_id=f"projection-{doc_id}",
+                item=item,
+                raw=_jira_raw_content(item),
+                normalized=NormalizedContent(item=item, markdown_body=markdown),
+            )
+        )
+
+    release = asyncio.Event()
+    release.set()
+    memory_store = RecordingDocumentDeleteMemoryStore(db)
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=memory_store,
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UnexpectedFetchGene(item_count=1, release=release),
+        source_name="Jira Board",
+        source_id=source_id,
+        authoritative_snapshot=True,
+        reusable_projection_doc_ids=frozenset({"jira-0"}),
+    )
+
+    assert state.last_sync_status == "success"
+    assert await db.get_document("jira-0") is not None
+    assert await db.get_document("jira-removed") is None
+    assert [doc_id for doc_id, _ in memory_store.calls] == ["jira-removed"]

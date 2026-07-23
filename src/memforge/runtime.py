@@ -23,6 +23,7 @@ from memforge.local_agent.source_contract import (
     local_agent_sync_operation,
     source_with_sync_inputs,
 )
+from memforge.source_projection_config import projection_access_fingerprint
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthReport
@@ -213,6 +214,7 @@ class RuntimeProvider(Protocol):
         lifecycle_job_id: str | None = None,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
+        reusable_projection_doc_ids: frozenset[str] = frozenset(),
     ) -> SyncState: ...
 
 
@@ -273,6 +275,7 @@ class DefaultRuntimeProvider:
         lifecycle_job_id: str | None = None,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
+        reusable_projection_doc_ids: frozenset[str] = frozenset(),
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -287,6 +290,7 @@ class DefaultRuntimeProvider:
             lifecycle_job_id=lifecycle_job_id,
             lifecycle_cycle_id=lifecycle_cycle_id,
             scope_transition_run_id=scope_transition_run_id,
+            reusable_projection_doc_ids=reusable_projection_doc_ids,
         )
 
 
@@ -631,6 +635,7 @@ async def run_source_sync(
     lifecycle_job_id: str | None = None,
     lifecycle_cycle_id: str | None = None,
     scope_transition_run_id: str | None = None,
+    reusable_projection_doc_ids: frozenset[str] = frozenset(),
 ) -> SyncState:
     await authorize_source_sync_maintenance(
         db,
@@ -688,6 +693,7 @@ async def run_source_sync(
             "source_activity_epoch": source_activity_epoch,
             "lifecycle_cycle_id": lifecycle_cycle_id,
             "scope_transition_run_id": scope_transition_run_id,
+            "reusable_projection_doc_ids": reusable_projection_doc_ids,
         }
         if execution_mode is not SourceSyncMode.NORMAL:
             sync_kwargs["execution_mode"] = execution_mode
@@ -983,6 +989,21 @@ class SourceSyncWorker:
                         if source_input.input_generation <= run.input_generation_watermark
                     ]
             authoritative_collection = local_agent_collection_is_authoritative(source["type"])
+            reusable_projection_doc_ids = frozenset()
+            if run.input_snapshot_id is not None and not run.force_full_sync:
+                reusable_projection_doc_ids = (
+                    await self.db.find_reusable_source_projection_memberships(
+                        source_id=run.source_id,
+                        workspace_id=run.workspace_id,
+                        snapshot_id=run.input_snapshot_id,
+                        expected_access_hash=projection_access_fingerprint(
+                            {
+                                "access_policy": str(source.get("access_policy") or "workspace"),
+                                "owner_user_id": source.get("owner_user_id"),
+                            }
+                        ),
+                    )
+                )
             source = source_with_sync_inputs(
                 source,
                 inputs,
@@ -1007,6 +1028,7 @@ class SourceSyncWorker:
                 authoritative_snapshot=authoritative_collection,
                 lifecycle_cycle_id=(f"{run.run_id}:attempt:{run.lease_attempt_count}"),
                 scope_transition_run_id=run.run_id,
+                reusable_projection_doc_ids=reusable_projection_doc_ids,
             )
             if final_state is None:
                 final_state = SyncState(
@@ -1032,16 +1054,6 @@ class SourceSyncWorker:
                 if not failed:
                     raise SourceSyncLeaseLost(f"source sync lease lost before failure update for run {run.run_id}")
                 return run
-            try:
-                await runtime.memory_store.attempt_lifecycle_vector_delivery(source_id=run.source_id)
-            except Exception:
-                # The relational lifecycle graph is already authoritative.
-                # Delivery stays durable in the outbox and must never turn a
-                # successful source run into a failed extraction transaction.
-                logger.exception(
-                    "Source sync completed with lifecycle vector delivery still pending for source %s",
-                    run.source_id,
-                )
             completed = await self.db.complete_source_sync_run(
                 run.run_id,
                 worker_id=self.worker_id,

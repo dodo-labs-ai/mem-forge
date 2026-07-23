@@ -1891,12 +1891,14 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             source_activity_epoch=None,
             lifecycle_cycle_id=None,
             scope_transition_run_id=None,
+            reusable_projection_doc_ids=frozenset(),
         ):
             del (
                 authoritative_snapshot,
                 reprocess_doc_ids,
                 source_activity_epoch,
                 scope_transition_run_id,
+                reusable_projection_doc_ids,
             )
             self.lifecycle_cycle_id = lifecycle_cycle_id
             await gene.authenticate()
@@ -2007,6 +2009,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             source_activity_epoch=None,
             lifecycle_cycle_id=None,
             scope_transition_run_id=None,
+            reusable_projection_doc_ids=frozenset(),
         ):
             del (
                 authoritative_snapshot,
@@ -2014,6 +2017,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
                 source_activity_epoch,
                 lifecycle_cycle_id,
                 scope_transition_run_id,
+                reusable_projection_doc_ids,
             )
             self.gene = gene
             return SyncState(source=source_id, last_sync_status="success")

@@ -123,6 +123,19 @@ def projection_scope_fingerprint(scope: Mapping[str, object]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def projection_access_fingerprint(access_context: Mapping[str, object]) -> str:
+    """Return the exact access identity embedded in Source Unit revisions."""
+
+    payload = json.dumps(
+        dict(access_context),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def projection_scope_transition_id(
     source_id: str,
     previous_scope: Mapping[str, object],
