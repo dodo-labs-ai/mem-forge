@@ -4957,22 +4957,37 @@ class Database:
         self,
         memory_id: str,
     ) -> tuple[SourceArtifactEvidence, ...]:
-        """Return active Evidence that targets current binary Artifacts."""
+        """Return current binary Artifacts in actively supported Evidence bundles."""
 
         rows = await self.db.execute_fetchall(
-            """SELECT msa.memory_id, er.id AS evidence_reference_id,
-                      er.evidence_unit_id, er.role,
+            """SELECT DISTINCT msa.memory_id,
+                      artifact_er.id AS evidence_reference_id,
+                      artifact_er.evidence_unit_id, artifact_er.role,
                       so.id AS observation_id, so.source_id, so.source_unit_id,
                       sor.id AS observation_revision_id, sor.metadata_json
                FROM memory_support_assertions msa
-               JOIN evidence_references er ON er.id = msa.evidence_reference_id
-               JOIN source_observations so ON so.id = er.observation_id
+               JOIN evidence_references supported_er
+                 ON supported_er.id = msa.evidence_reference_id
+               JOIN evidence_units eu
+                 ON eu.id = supported_er.evidence_unit_id
+                AND eu.source_id = msa.source_id
+                AND eu.access_context_hash = msa.access_context_hash
+               JOIN source_observations supported_so
+                 ON supported_so.id = supported_er.observation_id
+                AND supported_so.source_id = eu.source_id
+                AND supported_so.current_revision_id =
+                    supported_er.observation_revision_id
+               JOIN evidence_references artifact_er
+                 ON artifact_er.evidence_unit_id = supported_er.evidence_unit_id
+               JOIN source_observations so
+                 ON so.id = artifact_er.observation_id
+                AND so.source_id = eu.source_id
                JOIN source_observation_revisions sor
-                 ON sor.id = er.observation_revision_id
+                 ON sor.id = artifact_er.observation_revision_id
                 AND sor.id = so.current_revision_id
                WHERE msa.memory_id = ? AND msa.active = 1
                  AND so.observation_type = 'binary_artifact'
-               ORDER BY er.id""",
+               ORDER BY artifact_er.id""",
             (memory_id,),
         )
         evidence: list[SourceArtifactEvidence] = []
