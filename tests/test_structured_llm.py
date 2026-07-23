@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from time import perf_counter
 
 import pytest
 from pydantic import ValidationError
@@ -18,6 +20,7 @@ from memforge.llm.structured import (
     RerankResponse,
     SourceSupportDecision,
     SourceSupportResponse,
+    StructuredLlmCallTelemetry,
     StructuredLlmConfig,
     StructuredLlmError,
     litellm_model_name,
@@ -204,7 +207,7 @@ async def test_litellm_structured_client_uses_response_schema_for_source_support
     assert calls[0]["model"] == "anthropic/anthropic--claude-sonnet-latest"
     assert calls[0]["api_base"] == "http://localhost:6655/anthropic"
     assert calls[0]["api_key"] == "local-key"
-    assert calls[0]["timeout"] == 120.0
+    assert calls[0]["timeout"] == pytest.approx(120.0, abs=0.01)
     assert calls[0]["messages"] == [{"role": "user", "content": "prompt"}]
     assert calls[0]["response_format"] is SourceSupportResponse
     assert "tools" not in calls[0]
@@ -338,7 +341,7 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
     assert calls[0]["model"] == "anthropic/anthropic--claude-sonnet-latest"
     assert calls[0]["api_base"] == "http://localhost:6655/anthropic"
     assert calls[0]["api_key"] == "local-key"
-    assert calls[0]["timeout"] == 120.0
+    assert calls[0]["timeout"] == pytest.approx(120.0, abs=0.01)
     assert calls[0]["max_tokens"] == 8192
     assert calls[0]["messages"][0]["content"].startswith("prompt\n\nReturn ONLY")
     assert "response_format" not in calls[0]
@@ -567,7 +570,8 @@ async def test_litellm_structured_client_falls_back_once_to_json_text(monkeypatc
     assert fallback_log.exc_info is None
     assert "anthropic/anthropic--claude-sonnet-latest" in fallback_log.message
     assert "MemoryExtractionResponse" in fallback_log.message
-    assert "Exception: response_format unsupported" in fallback_log.message
+    assert "error_type=Exception" in fallback_log.message
+    assert "response_format unsupported" not in fallback_log.message
     assert "local-key" not in fallback_log.message
     assert "prompt" not in fallback_log.message
 
@@ -637,6 +641,208 @@ async def test_litellm_structured_client_fails_closed_on_missing_content(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_litellm_structured_client_bounds_native_and_json_fallback_by_one_deadline(
+    monkeypatch,
+):
+    calls = []
+    telemetry: list[StructuredLlmCallTelemetry] = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            await asyncio.sleep(0.02)
+            return CompletionResponse("{}")
+        await asyncio.sleep(1)
+        raise AssertionError("the logical deadline should cancel the fallback")
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=0.05,
+        ),
+        telemetry_sink=telemetry.append,
+    )
+
+    started = perf_counter()
+    with pytest.raises(StructuredLlmError, match="logical deadline exceeded"):
+        await client.extract_memories("prompt", max_tokens=1024)
+    elapsed = perf_counter() - started
+
+    assert elapsed < 0.25
+    assert len(calls) == 2
+    assert calls[0]["timeout"] <= 0.05
+    assert calls[1]["timeout"] < calls[0]["timeout"]
+    assert calls[0]["num_retries"] == 0
+    assert calls[1]["num_retries"] == 0
+    assert telemetry == [
+        StructuredLlmCallTelemetry(
+            operation="memory_extraction",
+            attempt_count=2,
+            retry_count=0,
+            fallback_count=1,
+            final_mode="json_text",
+            elapsed_ms=pytest.approx(50, abs=40),
+            terminal_category="deadline_exceeded",
+            prompt_tokens=None,
+            completion_tokens=None,
+            total_tokens=None,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_shares_one_transport_retry_budget_across_modes(
+    monkeypatch,
+):
+    calls = []
+    telemetry: list[StructuredLlmCallTelemetry] = []
+
+    class RetryableFailure(Exception):
+        status_code = 503
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RetryableFailure("temporary")
+        if len(calls) == 2:
+            return CompletionResponse("{}")
+        return CompletionResponse(
+            '{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}'
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+            num_retries=1,
+        ),
+        telemetry_sink=telemetry.append,
+    )
+
+    response = await client.extract_memories("prompt", max_tokens=1024)
+
+    assert response.memories[0].content == "A durable fact."
+    assert len(calls) == 3
+    assert telemetry[0].attempt_count == 3
+    assert telemetry[0].retry_count == 1
+    assert telemetry[0].fallback_count == 1
+    assert telemetry[0].final_mode == "json_text"
+    assert telemetry[0].terminal_category == "success"
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_aggregates_available_usage_without_estimating_missing_tokens(
+    monkeypatch,
+):
+    telemetry: list[StructuredLlmCallTelemetry] = []
+    response = CompletionResponse(
+        '{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}'
+    )
+    response.usage = {
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
+        "total_tokens": 18,
+    }
+
+    async def fake_acompletion(**kwargs):
+        return response
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+        ),
+        telemetry_sink=telemetry.append,
+    )
+
+    await client.extract_memories("prompt", max_tokens=1024)
+
+    assert telemetry[0].prompt_tokens == 11
+    assert telemetry[0].completion_tokens == 7
+    assert telemetry[0].total_tokens == 18
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_does_not_use_schema_fallback_for_provider_outage(
+    monkeypatch,
+):
+    calls = []
+    telemetry: list[StructuredLlmCallTelemetry] = []
+
+    class ProviderUnavailable(Exception):
+        status_code = 503
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        raise ProviderUnavailable("temporary")
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+            num_retries=1,
+        ),
+        telemetry_sink=telemetry.append,
+    )
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await client.extract_memories("prompt", max_tokens=1024)
+
+    assert raised.value.terminal_category == "provider_error"
+    assert len(calls) == 2
+    assert telemetry[0].attempt_count == 2
+    assert telemetry[0].retry_count == 1
+    assert telemetry[0].fallback_count == 0
+    assert telemetry[0].terminal_category == "provider_error"
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_distinguishes_provider_timeout_from_logical_deadline(
+    monkeypatch,
+):
+    telemetry: list[StructuredLlmCallTelemetry] = []
+
+    async def fake_acompletion(**kwargs):
+        raise TimeoutError("provider request timed out")
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+            num_retries=0,
+        ),
+        telemetry_sink=telemetry.append,
+    )
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await client.extract_memories("prompt", max_tokens=1024)
+
+    assert raised.value.terminal_category == "provider_error"
+    assert telemetry[0].terminal_category == "provider_error"
+    assert telemetry[0].fallback_count == 0
+
+
+@pytest.mark.asyncio
 async def test_litellm_structured_client_fails_closed_on_invalid_schema(monkeypatch):
     async def fake_acompletion(**kwargs):
         return CompletionResponse('[{"memory_id":"mem-1","supported":true}]')
@@ -675,7 +881,7 @@ async def test_litellm_structured_client_fails_closed_when_decisions_missing(mon
 
 
 @pytest.mark.asyncio
-async def test_litellm_structured_client_passes_num_retries(monkeypatch):
+async def test_litellm_structured_client_disables_nested_litellm_retries(monkeypatch):
     calls = []
 
     async def fake_acompletion(**kwargs):
@@ -684,8 +890,7 @@ async def test_litellm_structured_client_passes_num_retries(monkeypatch):
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
 
-    # Default: transient gateway/connection blips are retried by litellm.
-    default_client = LiteLlmStructuredClient(
+    client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic--claude-sonnet-latest",
             base_url="http://localhost:6655/anthropic",
@@ -693,19 +898,8 @@ async def test_litellm_structured_client_passes_num_retries(monkeypatch):
             timeout_s=120.0,
         )
     )
-    await default_client.extract_memories("prompt", max_tokens=8192)
-    assert calls[0]["num_retries"] == 2
+    await client.extract_memories("prompt", max_tokens=8192)
 
-    # An explicit retry budget flows through unchanged.
-    calls.clear()
-    tuned_client = LiteLlmStructuredClient(
-        StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url=None,
-            api_key="local-key",
-            timeout_s=120.0,
-            num_retries=5,
-        )
-    )
-    await tuned_client.extract_memories("prompt", max_tokens=8192)
-    assert calls[0]["num_retries"] == 5
+    # The adapter owns one exact logical retry budget; allowing LiteLLM to
+    # retry again would multiply both the deadline and attempt telemetry.
+    assert calls[0]["num_retries"] == 0

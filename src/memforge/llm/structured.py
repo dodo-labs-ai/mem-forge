@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, get_args, get_origin
+from time import perf_counter
+from typing import Any, Callable, Literal, Mapping, Protocol, get_args, get_origin
 
 import litellm
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -14,6 +16,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from memforge.llm.providers import litellm_optional_kwargs
 
 logger = logging.getLogger(__name__)
+
+type StructuredLlmTerminalCategory = Literal[
+    "success",
+    "deadline_exceeded",
+    "provider_error",
+    "invalid_response",
+]
 
 
 def _expects_container(annotation: object) -> bool:
@@ -269,11 +278,76 @@ class StructuredLlmConfig:
     base_url: str | None
     api_key: str | None
     timeout_s: float
-    # Transparently retry transient gateway/connection blips (e.g. a stale
-    # keep-alive connection through an Envoy gateway closed on idle timeout, or a
-    # momentary upstream 502). litellm retries 408/429/5xx and connection errors
-    # with backoff, so a recoverable hiccup never reaches the caller.
+    # One logical-call-wide budget for transient 408/409/429/5xx or connection
+    # failures. The adapter owns these retries so fallback shares the same
+    # deadline and attempt telemetry remains exact.
     num_retries: int = 2
+
+
+@dataclass(frozen=True)
+class StructuredLlmCallTelemetry:
+    """Content-free outcome for one complete logical structured call."""
+
+    operation: str
+    attempt_count: int
+    retry_count: int
+    fallback_count: int
+    final_mode: Literal["native_schema", "json_text"]
+    elapsed_ms: int
+    terminal_category: StructuredLlmTerminalCategory
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+
+
+@dataclass
+class _StructuredCallState:
+    operation: str
+    retry_budget: int
+    attempt_count: int = 0
+    retry_count: int = 0
+    fallback_count: int = 0
+    final_mode: Literal["native_schema", "json_text"] = "native_schema"
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    usage_complete: bool = True
+    usage_seen: bool = False
+
+    def record_response(self, response: object) -> None:
+        usage = _response_usage(response)
+        if usage is None:
+            self.usage_complete = False
+            return
+        self.usage_seen = True
+        self.prompt_tokens += usage[0]
+        self.completion_tokens += usage[1]
+        self.total_tokens += usage[2]
+
+    def record_failed_attempt(self) -> None:
+        # A provider may have consumed tokens before surfacing an error. Without
+        # an explicit usage object the logical total is unknown, never estimated.
+        self.usage_complete = False
+
+    def telemetry(
+        self,
+        *,
+        elapsed_ms: int,
+        terminal_category: StructuredLlmTerminalCategory,
+    ) -> StructuredLlmCallTelemetry:
+        usage_known = self.usage_complete and self.usage_seen
+        return StructuredLlmCallTelemetry(
+            operation=self.operation,
+            attempt_count=self.attempt_count,
+            retry_count=self.retry_count,
+            fallback_count=self.fallback_count,
+            final_mode=self.final_mode,
+            elapsed_ms=elapsed_ms,
+            terminal_category=terminal_category,
+            prompt_tokens=self.prompt_tokens if usage_known else None,
+            completion_tokens=self.completion_tokens if usage_known else None,
+            total_tokens=self.total_tokens if usage_known else None,
+        )
 
 
 class SourceSupportStructuredClient(Protocol):
@@ -388,6 +462,15 @@ class SourceSupportStructuredClient(Protocol):
 class StructuredLlmError(RuntimeError):
     """Raised when a required structured LLM call cannot produce valid schema output."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        terminal_category: StructuredLlmTerminalCategory = "invalid_response",
+    ) -> None:
+        super().__init__(message)
+        self.terminal_category = terminal_category
+
 
 def _message_content(response) -> object:
     try:
@@ -397,6 +480,57 @@ def _message_content(response) -> object:
     if content is None:
         raise StructuredLlmError("missing structured response content")
     return content
+
+
+def _response_usage(response: object) -> tuple[int, int, int] | None:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+
+    def value(name: str) -> int | None:
+        raw = usage.get(name) if isinstance(usage, Mapping) else getattr(usage, name, None)
+        if raw is None:
+            return None
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return None
+
+    prompt_tokens = value("prompt_tokens")
+    completion_tokens = value("completion_tokens")
+    total_tokens = value("total_tokens")
+    if prompt_tokens is None or completion_tokens is None or total_tokens is None:
+        return None
+    return prompt_tokens, completion_tokens, total_tokens
+
+
+def _schema_operation_name(response_format: type[BaseModel]) -> str:
+    name = response_format.__name__.removesuffix("Response")
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def _provider_status_code(exc: BaseException) -> int | None:
+    raw = getattr(exc, "status_code", None)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_retryable_provider_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    status_code = _provider_status_code(exc)
+    return status_code in {408, 409, 429} or bool(status_code is not None and status_code >= 500)
+
+
+def _is_non_fallback_provider_error(exc: BaseException) -> bool:
+    if isinstance(exc, StructuredLlmError):
+        return exc.terminal_category in {"deadline_exceeded", "provider_error"}
+    if _is_retryable_provider_error(exc):
+        return True
+    status_code = _provider_status_code(exc)
+    return status_code in {401, 403, 404}
 
 
 def litellm_model_name(model: str) -> str:
@@ -503,8 +637,14 @@ class LiteLlmStructuredClient:
     pydantic model before returning to callers.
     """
 
-    def __init__(self, config: StructuredLlmConfig) -> None:
+    def __init__(
+        self,
+        config: StructuredLlmConfig,
+        *,
+        telemetry_sink: Callable[[StructuredLlmCallTelemetry], None] | None = None,
+    ) -> None:
         self.config = config
+        self._telemetry_sink = telemetry_sink
 
     async def verify_source_support(
         self,
@@ -685,7 +825,74 @@ class LiteLlmStructuredClient:
         retry_with_json_text: bool = True,
     ):
         model_name = litellm_model_name(model or self.config.model)
+        started = perf_counter()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, self.config.timeout_s)
+        state = _StructuredCallState(
+            operation=_schema_operation_name(response_format),
+            retry_budget=max(0, self.config.num_retries),
+        )
+        try:
+            async with asyncio.timeout_at(deadline):
+                result = await self._call_schema_with_deadline(
+                    prompt=prompt,
+                    response_format=response_format,
+                    max_tokens=max_tokens,
+                    model_name=model_name,
+                    retry_with_json_text=retry_with_json_text,
+                    deadline=deadline,
+                    state=state,
+                )
+        except TimeoutError as exc:
+            self._emit_telemetry(
+                state.telemetry(
+                    elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
+                    terminal_category="deadline_exceeded",
+                )
+            )
+            raise StructuredLlmError(
+                f"structured LLM logical deadline exceeded after {self.config.timeout_s:g}s",
+                terminal_category="deadline_exceeded",
+            ) from exc
+        except StructuredLlmError as exc:
+            self._emit_telemetry(
+                state.telemetry(
+                    elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
+                    terminal_category=exc.terminal_category,
+                )
+            )
+            raise
+        except Exception as exc:
+            category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
+            self._emit_telemetry(
+                state.telemetry(
+                    elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
+                    terminal_category=category,
+                )
+            )
+            raise StructuredLlmError(str(exc), terminal_category=category) from exc
+
+        self._emit_telemetry(
+            state.telemetry(
+                elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
+                terminal_category="success",
+            )
+        )
+        return result
+
+    async def _call_schema_with_deadline(
+        self,
+        *,
+        prompt: str,
+        response_format: type[BaseModel],
+        max_tokens: int,
+        model_name: str,
+        retry_with_json_text: bool,
+        deadline: float,
+        state: _StructuredCallState,
+    ):
         if not _supports_native_response_schema(model_name):
+            state.final_mode = "json_text"
             logger.debug(
                 "Structured LLM model %s does not advertise native response_schema support; "
                 "using JSON-text schema for %s",
@@ -699,10 +906,14 @@ class LiteLlmStructuredClient:
                     model_name=model_name,
                     max_tokens=max_tokens,
                     native_schema=False,
+                    deadline=deadline,
+                    state=state,
                 )
             except Exception as exc:
-                raise StructuredLlmError(str(exc)) from exc
+                category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
+                raise StructuredLlmError(str(exc), terminal_category=category) from exc
 
+        state.final_mode = "native_schema"
         try:
             return await self._attempt_schema(
                 prompt=prompt,
@@ -710,17 +921,25 @@ class LiteLlmStructuredClient:
                 model_name=model_name,
                 max_tokens=max_tokens,
                 native_schema=True,
+                deadline=deadline,
+                state=state,
             )
         except Exception as schema_exc:
-            if not retry_with_json_text:
-                raise StructuredLlmError(str(schema_exc)) from schema_exc
+            category = "provider_error" if _is_non_fallback_provider_error(schema_exc) else "invalid_response"
+            if not retry_with_json_text or category == "provider_error":
+                raise StructuredLlmError(
+                    str(schema_exc),
+                    terminal_category=category,
+                ) from schema_exc
+            state.fallback_count += 1
+            state.final_mode = "json_text"
             logger.warning(
                 "Structured LLM response_schema attempt failed for model %s and schema %s; "
-                "retrying with JSON-text schema: %s: %s",
+                "retrying with JSON-text schema (error_type=%s, category=%s)",
                 model_name,
                 response_format.__name__,
                 type(schema_exc).__name__,
-                schema_exc,
+                category,
             )
             try:
                 return await self._attempt_schema(
@@ -729,9 +948,15 @@ class LiteLlmStructuredClient:
                     model_name=model_name,
                     max_tokens=max_tokens,
                     native_schema=False,
+                    deadline=deadline,
+                    state=state,
                 )
             except Exception as exc:
-                raise StructuredLlmError(f"{exc} (response_schema attempt failed first: {schema_exc})") from exc
+                category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
+                raise StructuredLlmError(
+                    f"{exc} (response_schema attempt failed first: {schema_exc})",
+                    terminal_category=category,
+                ) from exc
 
     async def _attempt_schema(
         self,
@@ -741,6 +966,8 @@ class LiteLlmStructuredClient:
         model_name: str,
         max_tokens: int,
         native_schema: bool,
+        deadline: float,
+        state: _StructuredCallState,
     ):
         request_prompt = prompt if native_schema else _json_text_prompt(prompt, response_format)
         messages = [{"role": "user", "content": request_prompt}]
@@ -752,18 +979,14 @@ class LiteLlmStructuredClient:
             # nested template syntax remains source data rather than SAP input.
             messages = [{"role": "user", "content": "{{?memforge_prompt}}"}]
             provider_kwargs["placeholder_values"] = {"memforge_prompt": request_prompt}
-        response = await litellm.acompletion(
-            model=model_name,
+        response = await self._completion_with_retries(
+            model_name=model_name,
             messages=messages,
-            timeout=self.config.timeout_s,
             max_tokens=max_tokens,
-            num_retries=self.config.num_retries,
-            **litellm_optional_kwargs(
-                api_base=self.config.base_url,
-                api_key=self.config.api_key,
-            ),
-            **provider_kwargs,
-            **({"response_format": response_format} if native_schema else {}),
+            provider_kwargs=provider_kwargs,
+            response_format=response_format if native_schema else None,
+            deadline=deadline,
+            state=state,
         )
         raw_content = _message_content(response)
         if isinstance(raw_content, response_format):
@@ -771,3 +994,72 @@ class LiteLlmStructuredClient:
         if isinstance(raw_content, dict):
             return response_format.model_validate(raw_content)
         return _validate_structured_json_text(str(raw_content), response_format)
+
+    async def _completion_with_retries(
+        self,
+        *,
+        model_name: str,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        provider_kwargs: dict[str, Any],
+        response_format: type[BaseModel] | None,
+        deadline: float,
+        state: _StructuredCallState,
+    ):
+        loop = asyncio.get_running_loop()
+        while True:
+            remaining_s = max(0.001, deadline - loop.time())
+            state.attempt_count += 1
+            try:
+                response = await litellm.acompletion(
+                    model=model_name,
+                    messages=messages,
+                    timeout=remaining_s,
+                    max_tokens=max_tokens,
+                    # The adapter owns the logical retry budget so attempt
+                    # telemetry is exact and fallback cannot multiply it.
+                    num_retries=0,
+                    **litellm_optional_kwargs(
+                        api_base=self.config.base_url,
+                        api_key=self.config.api_key,
+                    ),
+                    **provider_kwargs,
+                    **({"response_format": response_format} if response_format else {}),
+                )
+            except Exception as exc:
+                state.record_failed_attempt()
+                if not _is_retryable_provider_error(exc) or state.retry_budget <= 0:
+                    if isinstance(exc, TimeoutError):
+                        raise StructuredLlmError(
+                            str(exc),
+                            terminal_category="provider_error",
+                        ) from exc
+                    raise
+                state.retry_budget -= 1
+                state.retry_count += 1
+                backoff_s = min(0.25 * (2 ** (state.retry_count - 1)), 1.0)
+                await asyncio.sleep(min(backoff_s, max(0.0, deadline - loop.time())))
+                continue
+            state.record_response(response)
+            return response
+
+    def _emit_telemetry(self, telemetry: StructuredLlmCallTelemetry) -> None:
+        payload = {
+            "event": "structured_llm_call",
+            "operation": telemetry.operation,
+            "attempt_count": telemetry.attempt_count,
+            "retry_count": telemetry.retry_count,
+            "fallback_count": telemetry.fallback_count,
+            "final_mode": telemetry.final_mode,
+            "elapsed_ms": telemetry.elapsed_ms,
+            "terminal_category": telemetry.terminal_category,
+            "prompt_tokens": telemetry.prompt_tokens,
+            "completion_tokens": telemetry.completion_tokens,
+            "total_tokens": telemetry.total_tokens,
+        }
+        logger.info("structured_llm_call %s", json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        if self._telemetry_sink is not None:
+            try:
+                self._telemetry_sink(telemetry)
+            except Exception:
+                logger.warning("Structured LLM telemetry sink failed", exc_info=True)
