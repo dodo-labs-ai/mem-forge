@@ -2,7 +2,7 @@
 
 This plugin connects Codex lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.28`.
+The packaged runtime and plugin version is `0.1.29`.
 
 With no routing variables, the plugin targets local OSS at
 `http://127.0.0.1:8765/api`. Otherwise set the target in `~/.codex/config.toml`.
