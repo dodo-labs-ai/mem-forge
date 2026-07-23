@@ -37,6 +37,7 @@ from memforge.source_projection_config import (
     projection_access_fingerprint,
     projection_scope_fingerprint,
 )
+from memforge.source_artifacts import StoredSourceArtifact
 
 
 BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
@@ -99,6 +100,7 @@ class _ObservationInput:
     locator: Mapping[str, object]
     observed_at: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+    semantic_hash: str | None = None
 
 
 class GeneSourceProjectionAdapter:
@@ -113,6 +115,7 @@ class GeneSourceProjectionAdapter:
             item=envelope.item,
             raw=envelope.raw,
             normalized=envelope.normalized,
+            artifacts=envelope.artifacts,
             scope=request.scope,
             access_context=request.access_context,
             prior_unit_revision=envelope.prior_unit_revision,
@@ -204,6 +207,7 @@ def project_source_item(
     item: ContentItem,
     raw: RawContent,
     normalized: NormalizedContent,
+    artifacts: tuple[StoredSourceArtifact, ...] = (),
     scope: Mapping[str, object] | None = None,
     access_context: Mapping[str, object] | None = None,
     prior_unit_revision: SourceUnitRevision | None = None,
@@ -260,12 +264,41 @@ def project_source_item(
         provider_key=provider_key,
         locator={**locator, "document_id": item.item_id},
     )
+    artifact_inputs = tuple(
+        _ObservationInput(
+            observation_type="binary_artifact",
+            provider_key=f"artifact:{artifact.provider_key}",
+            content="",
+            semantic_value=artifact.sha256,
+            locator=dict(artifact.locator),
+            metadata={
+                "source_artifact": {
+                    "artifact_id": artifact.id,
+                    "provider_revision": artifact.provider_revision,
+                    "filename": artifact.filename,
+                    "media_type": artifact.media_type,
+                    "size_bytes": artifact.size_bytes,
+                    "sha256": artifact.sha256,
+                    "uri": artifact.uri,
+                    "parent_observation_id": _stable_id(
+                        "obs",
+                        unit_id,
+                        artifact.parent_observation_type,
+                        artifact.parent_provider_key,
+                    ),
+                }
+            },
+            semantic_hash=artifact.sha256,
+        )
+        for artifact in artifacts
+    )
+    observations_input = (*observations_input, *artifact_inputs)
     observations: list[SourceObservation] = []
     revisions: list[SourceObservationRevision] = []
     carried_revision_ids: list[str] = []
     for value in observations_input:
         observation_id = _stable_id("obs", unit_id, value.observation_type, value.provider_key)
-        semantic_hash = _canonical_hash(value.semantic_value)
+        semantic_hash = value.semantic_hash or _canonical_hash(value.semantic_value)
         revision_id = _stable_id("obsrev", observation_id, semantic_hash)
         observations.append(
             SourceObservation(

@@ -53,6 +53,7 @@ from memforge.source_projection import (
     SourceUnitInventoryPage,
     SourceUnitRevision,
 )
+from memforge.source_artifacts import SourceArtifactEvidence, SourceArtifactRevision
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.source_activity import SourceActivityLease
 from memforge.storage.adapters.context import AccessScope
@@ -335,6 +336,14 @@ class RelationalStore(Protocol):
         self,
         source_unit_id: str,
     ) -> Mapping[str, SourceObservationRevision]: ...
+    async def get_source_artifact_revision(
+        self,
+        observation_revision_id: str,
+    ) -> SourceArtifactRevision | None: ...
+    async def get_memory_source_artifacts(
+        self,
+        memory_id: str,
+    ) -> tuple[SourceArtifactEvidence, ...]: ...
     async def find_source_unit_by_document_id(
         self,
         source_id: str,

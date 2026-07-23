@@ -102,6 +102,16 @@ class JsonResponse:
             raise httpx.HTTPStatusError("request failed", request=request, response=response)
 
 
+class BinaryResponse:
+    def __init__(self, content: bytes, content_type: str):
+        self.content = content
+        self.headers = {"content-type": content_type}
+        self.status_code = 200
+
+    def raise_for_status(self) -> None:
+        return None
+
+
 class NotFoundClient:
     async def request(self, _method: str, _url: str, **_kwargs):
         return JsonResponse({}, status_code=404)
@@ -227,6 +237,14 @@ async def test_semantically_empty_confluence_page_stays_empty_after_normalizatio
                 "body": {"storage": {"value": "<p></p>"}},
                 "ancestors": [],
                 "space": {"key": "PAY"},
+                "children": {
+                    "attachment": {
+                        "results": [],
+                        "start": 0,
+                        "size": 0,
+                        "_links": {},
+                    }
+                },
             }
         )
     )
@@ -280,6 +298,69 @@ async def test_fetch_rejects_missing_or_invalid_storage_body(payload):
 
     with pytest.raises(RuntimeError, match="body.storage.value"):
         await gene.fetch(item)
+
+
+@pytest.mark.asyncio
+async def test_fetch_materializes_confluence_image_attachment_with_parent_identity():
+    image = b"\x89PNG\r\n\x1a\nknown-confluence-image"
+    gene = ConfluenceGene(
+        config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
+        source_id="src-confluence",
+    )
+    gene._api_prefix = "/wiki"
+    gene._get = AsyncMock(
+        side_effect=[
+            JsonResponse(
+                {
+                    "id": "123",
+                    "version": {"number": 7},
+                    "body": {"storage": {"value": "<p>See diagram.</p>"}},
+                    "ancestors": [],
+                    "space": {"key": "PAY"},
+                    "children": {
+                        "attachment": {
+                            "results": [
+                                {
+                                    "id": "att-42",
+                                    "title": "diagram.png",
+                                    "version": {"number": 3},
+                                    "extensions": {
+                                        "mediaType": "image/png",
+                                        "fileSize": len(image),
+                                    },
+                                    "_links": {"download": "/download/attachments/123/diagram.png"},
+                                }
+                            ],
+                            "start": 0,
+                            "size": 1,
+                            "_links": {},
+                        }
+                    },
+                }
+            ),
+            BinaryResponse(image, "image/png"),
+        ]
+    )
+    item = ContentItem(
+        item_id="confluence-123",
+        title="Page",
+        source_url="https://wiki.example.test/wiki/pages/123",
+        last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        space_or_project="PAY",
+        version="7",
+        extra={"page_id": "123"},
+    )
+
+    raw = await gene.fetch(item)
+
+    assert len(raw.artifacts) == 1
+    artifact = raw.artifacts[0]
+    assert artifact.provider_key == "att-42"
+    assert artifact.parent_observation_type == "page_body"
+    assert artifact.parent_provider_key == "123:body"
+    assert artifact.provider_revision == "3"
+    assert artifact.media_type == "image/png"
+    assert artifact.body == image
 
 
 @pytest.mark.asyncio

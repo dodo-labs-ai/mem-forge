@@ -23,6 +23,7 @@ from memforge.source_projection import (
     SourceUnit,
 )
 from memforge.source_projection_config import projection_scope_fingerprint
+from memforge.source_artifacts import StoredSourceArtifact
 from memforge.storage.database import Database
 
 
@@ -152,6 +153,145 @@ def test_confluence_page_id_is_unit_and_parent_is_location_only() -> None:
     assert moved.deltas[0].axes == frozenset({DeltaAxis.LOCATION})
     assert moved.deltas[0].requires_extraction is False
     assert moved.relations[0].relation_type is SourceRelationType.CONTAINED_BY
+
+
+def test_binary_artifact_revision_is_bound_to_parent_observation_and_exact_hash() -> None:
+    item = _item(
+        item_id="confluence-123",
+        extra={"page_id": "123", "space_key": "ENG"},
+    )
+    raw, normalized = _inputs(item, b"<p>See diagram.</p>")
+    artifact = StoredSourceArtifact(
+        id="artifact-stable",
+        provider_key="attachment-42",
+        parent_observation_type="page_body",
+        parent_provider_key="123:body",
+        provider_revision="3",
+        filename="diagram.png",
+        media_type="image/png",
+        size_bytes=17,
+        sha256="a" * 64,
+        uri="/store/artifact-stable/diagram.png",
+    )
+
+    projection = project_source_item(
+        source_id="src-c",
+        source_type="confluence",
+        run_id="run-artifact",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+        artifacts=(artifact,),
+    )
+
+    artifact_observation = next(
+        observation
+        for observation in projection.observations
+        if observation.observation_type == "binary_artifact"
+    )
+    artifact_revision = next(
+        revision
+        for revision in projection.observation_revisions
+        if revision.observation_id == artifact_observation.id
+    )
+    parent_observation = next(
+        observation
+        for observation in projection.observations
+        if observation.observation_type == "page_body"
+    )
+    assert artifact_revision.semantic_hash == "a" * 64
+    assert artifact_revision.content == ""
+    assert artifact_revision.metadata["source_artifact"]["parent_observation_id"] == parent_observation.id
+    assert artifact_revision.metadata["source_artifact"]["media_type"] == "image/png"
+    assert artifact_revision.metadata["source_artifact"]["uri"] == artifact.uri
+
+
+def test_binary_artifact_retry_edit_and_removal_follow_observation_lifecycle() -> None:
+    item = _item(
+        item_id="confluence-123",
+        extra={"page_id": "123", "space_key": "ENG"},
+    )
+    raw, normalized = _inputs(item, b"<p>See diagram.</p>")
+    initial_artifact = StoredSourceArtifact(
+        id="artifact-stable",
+        provider_key="attachment-42",
+        parent_observation_type="page_body",
+        parent_provider_key="123:body",
+        provider_revision="1",
+        filename="diagram.png",
+        media_type="image/png",
+        size_bytes=4,
+        sha256="a" * 64,
+        uri="/store/artifact-stable/diagram.png",
+    )
+    initial = project_source_item(
+        source_id="src-c",
+        source_type="confluence",
+        run_id="run-artifact-initial",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+        artifacts=(initial_artifact,),
+    )
+    prior_revisions = {
+        revision.observation_id: revision
+        for revision in initial.observation_revisions
+    }
+    artifact_observation_id = next(
+        item.id
+        for item in initial.observations
+        if item.observation_type == "binary_artifact"
+    )
+
+    retry = project_source_item(
+        source_id="src-c",
+        source_type="confluence",
+        run_id="run-artifact-retry",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+        artifacts=(initial_artifact,),
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions=prior_revisions,
+    )
+    assert artifact_observation_id not in {
+        anchor.observation_id for anchor in retry.deltas[0].changed_anchors
+    }
+
+    edited_artifact = replace(
+        initial_artifact,
+        provider_revision="2",
+        size_bytes=5,
+        sha256="b" * 64,
+        uri="/store/artifact-stable/diagram-v2.png",
+    )
+    edited = project_source_item(
+        source_id="src-c",
+        source_type="confluence",
+        run_id="run-artifact-edit",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+        artifacts=(edited_artifact,),
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions=prior_revisions,
+    )
+    assert artifact_observation_id in {
+        anchor.observation_id for anchor in edited.deltas[0].changed_anchors
+    }
+
+    removed = project_source_item(
+        source_id="src-c",
+        source_type="confluence",
+        run_id="run-artifact-remove",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+        artifacts=(),
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions=prior_revisions,
+    )
+    assert removed.deltas[0].removed_observation_ids == (artifact_observation_id,)
 
 
 def test_confluence_title_change_is_semantic_not_location() -> None:

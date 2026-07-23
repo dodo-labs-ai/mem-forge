@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -26,6 +27,57 @@ type StructuredLlmTerminalCategory = Literal[
     "provider_error",
     "invalid_response",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredLlmImage:
+    """One revision-pinned image supplied to a structured logical call."""
+
+    source_observation_id: str
+    media_type: str
+    body: bytes
+
+    def __post_init__(self) -> None:
+        if not self.source_observation_id.strip():
+            raise ValueError("image source_observation_id is required")
+        if self.media_type not in {
+            "image/gif",
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        }:
+            raise ValueError(f"unsupported structured LLM image type: {self.media_type}")
+        if not self.body:
+            raise ValueError("structured LLM image body is required")
+
+
+def _structured_user_content(
+    prompt: str,
+    images: tuple[StructuredLlmImage, ...],
+) -> str | list[dict[str, object]]:
+    if not images:
+        return prompt
+    content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
+    for image in images:
+        encoded = base64.b64encode(image.body).decode("ascii")
+        content.extend(
+            (
+                {
+                    "type": "text",
+                    "text": (
+                        "Image evidence for Source Observation "
+                        f"{image.source_observation_id}:"
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image.media_type};base64,{encoded}",
+                    },
+                },
+            )
+        )
+    return content
 
 
 def _expects_container(annotation: object) -> bool:
@@ -770,12 +822,14 @@ class LiteLlmStructuredClient:
         *,
         max_tokens: int,
         model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
     ) -> MemoryExtractionResponse:
         return await self._call_schema(
             prompt=prompt,
             response_format=MemoryExtractionResponse,
             max_tokens=max_tokens,
             model=model,
+            images=images,
         )
 
     async def select_memory_candidates(
@@ -928,6 +982,7 @@ class LiteLlmStructuredClient:
         max_tokens: int,
         model: str | None = None,
         retry_with_json_text: bool = True,
+        images: tuple[StructuredLlmImage, ...] = (),
     ):
         model_name = litellm_model_name(model or self.config.model)
         started = perf_counter()
@@ -947,6 +1002,7 @@ class LiteLlmStructuredClient:
                     retry_with_json_text=retry_with_json_text,
                     deadline=deadline,
                     state=state,
+                    images=images,
                 )
         except TimeoutError as exc:
             self._emit_telemetry(
@@ -995,6 +1051,7 @@ class LiteLlmStructuredClient:
         retry_with_json_text: bool,
         deadline: float,
         state: _StructuredCallState,
+        images: tuple[StructuredLlmImage, ...],
     ):
         if not _supports_native_response_schema(model_name):
             state.final_mode = "json_text"
@@ -1013,6 +1070,7 @@ class LiteLlmStructuredClient:
                     native_schema=False,
                     deadline=deadline,
                     state=state,
+                    images=images,
                 )
             except Exception as exc:
                 category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
@@ -1028,6 +1086,7 @@ class LiteLlmStructuredClient:
                 native_schema=True,
                 deadline=deadline,
                 state=state,
+                images=images,
             )
         except Exception as schema_exc:
             category = "provider_error" if _is_non_fallback_provider_error(schema_exc) else "invalid_response"
@@ -1055,6 +1114,7 @@ class LiteLlmStructuredClient:
                     native_schema=False,
                     deadline=deadline,
                     state=state,
+                    images=images,
                 )
             except Exception as exc:
                 category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
@@ -1073,16 +1133,22 @@ class LiteLlmStructuredClient:
         native_schema: bool,
         deadline: float,
         state: _StructuredCallState,
+        images: tuple[StructuredLlmImage, ...],
     ):
         request_prompt = prompt if native_schema else _json_text_prompt(prompt, response_format)
-        messages = [{"role": "user", "content": request_prompt}]
+        messages = [{"role": "user", "content": _structured_user_content(request_prompt, images)}]
         provider_kwargs: dict[str, Any] = {}
         if model_name.startswith("sap/"):
             # SAP AI Core treats every chat message as a prompt template. Source
             # documents can legitimately contain examples such as {{?input}};
             # pass the complete MemForge prompt as one placeholder value so
             # nested template syntax remains source data rather than SAP input.
-            messages = [{"role": "user", "content": "{{?memforge_prompt}}"}]
+            messages = [
+                {
+                    "role": "user",
+                    "content": _structured_user_content("{{?memforge_prompt}}", images),
+                }
+            ]
             provider_kwargs["placeholder_values"] = {"memforge_prompt": request_prompt}
         response = await self._completion_with_retries(
             model_name=model_name,

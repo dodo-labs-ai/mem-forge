@@ -73,6 +73,11 @@ def build_projected_claim_evidence(
         if observation_id in revisions_by_observation
     }
     candidate_ids = current_evidence_ids or set(ordered_observation_ids)
+    artifact_observation_ids = {
+        observation_id
+        for observation_id, observation in observations_by_id.items()
+        if observation.observation_type == "binary_artifact"
+    }
 
     units_by_id: dict[str, EvidenceUnit] = {}
     references_by_id: dict[str, EvidenceReference] = {}
@@ -85,9 +90,18 @@ def build_projected_claim_evidence(
             quote=quote,
             observation_hint=raw.source_observation_id,
             revalidated_noop=raw.evidence_anchor == "revalidated_noop",
+            empty_quote_observation_ids=(
+                artifact_observation_ids
+                if raw.evidence_anchor == "source_artifact"
+                else set()
+            ),
         )
 
         primary_revision = revisions_by_observation[primary_id]
+        artifact_evidence = (
+            raw.evidence_anchor == "source_artifact"
+            and primary_id in artifact_observation_ids
+        )
         evidence_unit_id = _stable_id(
             "eu-projected",
             projection.run_id,
@@ -109,7 +123,11 @@ def build_projected_claim_evidence(
             repo_identifier=repo_identifier,
             content=primary_revision.content,
             excerpt=quote or None,
-            evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+            evidence_provenance=(
+                EvidenceContentProvenance.SOURCE_ARTIFACT
+                if artifact_evidence
+                else EvidenceContentProvenance.SOURCE_EXCERPT
+            ),
             source_metadata={
                 "projection_run_id": projection.run_id,
                 "source_unit_revision_id": unit_revision.id,
@@ -194,6 +212,7 @@ def _primary_observation_id(
     quote: str,
     observation_hint: str | None,
     revalidated_noop: bool,
+    empty_quote_observation_ids: set[str],
 ) -> str:
     exact_quote_matches = [
         observation_id
@@ -212,6 +231,11 @@ def _primary_observation_id(
     if observation_hint in candidate_ids or revalidated_noop:
         if observation_hint not in revisions_by_observation:
             raise ValueError("explicit source observation is unavailable in the current revision")
+        if (
+            not quote
+            and observation_hint in empty_quote_observation_ids
+        ):
+            return observation_hint
         if not quote or quote not in revisions_by_observation[observation_hint].content:
             raise ValueError("explicit source observation does not contain the evidence quote")
         return observation_hint

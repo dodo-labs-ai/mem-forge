@@ -14,6 +14,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal
 
+from memforge.source_artifacts import RawSourceArtifact
 
 # ---------------------------------------------------------------------------
 # Entity name canonicalization
@@ -369,6 +370,7 @@ class RawContent:
     # source object itself is authoritatively empty.
     authoritative_empty: bool = False
     empty_evidence: str | None = None
+    artifacts: tuple[RawSourceArtifact, ...] = ()
 
 
 @dataclass

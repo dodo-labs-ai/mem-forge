@@ -98,6 +98,16 @@ class JsonResponse:
         return None
 
 
+class BinaryResponse:
+    def __init__(self, content: bytes, content_type: str):
+        self.content = content
+        self.headers = {"content-type": content_type}
+        self.status_code = 200
+
+    def raise_for_status(self) -> None:
+        return None
+
+
 class RecordingAsyncClient:
     instances: list["RecordingAsyncClient"] = []
 
@@ -518,6 +528,69 @@ async def test_discover_hydrates_search_result_so_fetch_uses_no_per_issue_reques
     assert raw_payload["_changelog_truncated"] == {"returned": 0, "total": 3}
     assert "Design context" in normalized.markdown_body
     assert "Keep the low-request path." in normalized.markdown_body
+
+
+@pytest.mark.asyncio
+async def test_fetch_materializes_jira_image_attachment_with_comment_parent():
+    image = b"\x89PNG\r\n\x1a\nknown-jira-image"
+
+    class AttachmentClient(RecordingAsyncClient):
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls.append((method, url, kwargs))
+            if url == "/rest/api/2/attachment/content/7001":
+                return BinaryResponse(image, "image/png")
+            return JsonResponse(
+                _search_page(
+                    [
+                        _jira_issue(
+                            "PAY-123",
+                            issue_id="100123",
+                            field_overrides={
+                                "attachment": [
+                                    {
+                                        "id": "7001",
+                                        "filename": "screenshot.png",
+                                        "mimeType": "image/png",
+                                        "size": len(image),
+                                        "created": "2026-05-21T09:01:00Z",
+                                        "content": (
+                                            "https://jira.example.test"
+                                            "/rest/api/2/attachment/content/7001"
+                                        ),
+                                    }
+                                ]
+                            },
+                            comments=[
+                                {
+                                    "id": "comment-9",
+                                    "author": {"displayName": "Grace"},
+                                    "created": "2026-05-21T09:00:00Z",
+                                    "body": "The result is shown in screenshot.png.",
+                                }
+                            ],
+                        )
+                    ]
+                )
+            )
+
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"], "include_comments": True},
+        source_id="src-jira",
+    )
+    client = AttachmentClient(base_url="https://jira.example.test")
+    gene._client = client
+    gene._base_url = "https://jira.example.test"
+
+    items = [item async for item in gene.discover()]
+    raw = await gene.fetch(items[0])
+
+    assert len(raw.artifacts) == 1
+    artifact = raw.artifacts[0]
+    assert artifact.provider_key == "7001"
+    assert artifact.parent_observation_type == "comment"
+    assert artifact.parent_provider_key == "comment-9"
+    assert artifact.media_type == "image/png"
+    assert artifact.body == image
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -537,6 +539,148 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
     assert content.text == "# Source\n\nDurable memory evidence."
     assert pdf.status_code == 200
     assert pdf.content == b"%PDF-1.4\n%memforge\n"
+
+
+@pytest.mark.asyncio
+async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evidence(
+    db: Database,
+    tmp_path: Path,
+) -> None:
+    from memforge.server.admin_api import create_admin_app
+    from memforge.storage.document_store import LocalDocumentStore
+
+    config = _config(tmp_path)
+    document_store = LocalDocumentStore(config.storage.docs_path)
+    image = b"\x89PNG\r\n\x1a\nknown-evidence-image"
+    digest = hashlib.sha256(image).hexdigest()
+    uri = document_store.store_source_artifact(
+        source_id="src-confluence",
+        artifact_id="artifact-42",
+        filename="diagram.png",
+        content=image,
+        content_type="image/png",
+    )
+    doc = await _insert_document(db, doc_id="doc-image")
+    memory = await _insert_memory(
+        db,
+        mem_id="mem-image",
+        content="The diagram records the accepted payroll flow.",
+    )
+    await db.add_memory_source(
+        memory.id,
+        doc.doc_id,
+        "confluence",
+        excerpt=None,
+        source_updated_at=None,
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    artifact_metadata = {
+        "source_artifact": {
+            "artifact_id": "artifact-42",
+            "parent_observation_id": "obs-page",
+            "provider_revision": "3",
+            "filename": "diagram.png",
+            "media_type": "image/png",
+            "size_bytes": len(image),
+            "sha256": digest,
+            "uri": uri,
+        }
+    }
+    await db.db.execute(
+        """INSERT INTO source_units
+           (id, source_id, unit_type, provider_key, locator_json, current_revision_id, updated_at)
+           VALUES (?, ?, ?, ?, '{}', NULL, ?)""",
+        ("unit-image", "src-confluence", "confluence_page", "page-1", now),
+    )
+    await db.db.execute(
+        """INSERT INTO source_observations
+           (id, source_id, source_unit_id, observation_type, provider_key,
+            locator_json, current_revision_id, updated_at)
+           VALUES (?, ?, ?, ?, ?, '{}', ?, ?)""",
+        (
+            "obs-image",
+            "src-confluence",
+            "unit-image",
+            "binary_artifact",
+            "artifact:42",
+            "obsrev-image",
+            now,
+        ),
+    )
+    await db.db.execute(
+        """INSERT INTO source_observation_revisions
+           (id, observation_id, semantic_hash, content, metadata_json, observed_at, created_at)
+           VALUES (?, ?, ?, '', ?, ?, ?)""",
+        ("obsrev-image", "obs-image", digest, json.dumps(artifact_metadata), now, now),
+    )
+    await db.db.execute(
+        """INSERT INTO evidence_units
+           (id, source_id, doc_id, source_type, visibility, content, excerpt,
+            evidence_provenance, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'workspace', ?, NULL, 'extracted', ?, ?)""",
+        (
+            "evidence-image",
+            "src-confluence",
+            doc.doc_id,
+            "confluence",
+            memory.content,
+            now,
+            now,
+        ),
+    )
+    await db.db.execute(
+        """INSERT INTO evidence_references
+           (id, evidence_unit_id, role, anchor_kind, observation_id,
+            observation_revision_id, created_at)
+           VALUES (?, ?, 'primary', 'whole_observation', ?, ?, ?)""",
+        ("eref-image", "evidence-image", "obs-image", "obsrev-image", now),
+    )
+    await db.db.execute(
+        """INSERT INTO memory_support_assertions
+           (id, memory_id, evidence_reference_id, source_id, access_context_hash,
+            active, created_at)
+           VALUES (?, ?, ?, ?, ?, 1, ?)""",
+        ("support-image", memory.id, "eref-image", "src-confluence", "access-hash", now),
+    )
+    await db.db.commit()
+
+    app = create_admin_app(db=db, config=config, document_store=document_store)
+    with TestClient(app) as client:
+        detail = client.get(f"/api/memories/{memory.id}")
+        resource = client.get("/api/source-artifacts/obsrev-image")
+
+    assert detail.status_code == 200
+    [artifact] = detail.json()["evidence_artifacts"]
+    assert artifact["observation_revision_id"] == "obsrev-image"
+    assert artifact["evidence_reference_id"] == "eref-image"
+    assert artifact["content_type"] == "image/png"
+    assert artifact["sha256"] == digest
+    assert artifact["url"] == "/api/source-artifacts/obsrev-image"
+    assert resource.status_code == 200
+    assert resource.headers["content-type"] == "image/png"
+    assert resource.content == image
+
+    await db.db.execute(
+        "UPDATE source_observations SET current_revision_id = NULL WHERE id = ?",
+        ("obs-image",),
+    )
+    await db.db.commit()
+    with TestClient(app) as client:
+        stale_revision = client.get("/api/source-artifacts/obsrev-image")
+    assert stale_revision.status_code == 404
+
+    await db.db.execute(
+        "UPDATE source_observations SET current_revision_id = ? WHERE id = ?",
+        ("obsrev-image", "obs-image"),
+    )
+    await db.db.execute(
+        "UPDATE sources SET access_policy = 'private', owner_user_id = ? WHERE id = ?",
+        ("different-user", "src-confluence"),
+    )
+    await db.db.commit()
+    with TestClient(app) as client:
+        unauthorized_replay = client.get("/api/source-artifacts/obsrev-image")
+    assert unauthorized_replay.status_code == 404
 
 
 @pytest.mark.asyncio

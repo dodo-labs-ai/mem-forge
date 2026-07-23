@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 
 import pytest
 
-from memforge.llm.structured import MemoryCandidate, MemoryExtractionResponse
+from memforge.llm.structured import (
+    MemoryCandidate,
+    MemoryExtractionResponse,
+    StructuredLlmImage,
+)
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import plan_projection_extraction_batches
@@ -213,6 +217,54 @@ async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context
     assert result.memories[0].source_observation_id == batch.primary_observation_ids[0]
     assert result.metadata["structured_llm_calls"] == 1
     assert result.metadata["prompt_chars"] > 0
+
+
+@pytest.mark.asyncio
+async def test_projection_batch_extractor_accepts_only_explicit_visual_evidence() -> None:
+    projection = _jira_projection(1)
+    batch = plan_projection_extraction_batches(projection)[0]
+    visual_observation_id = batch.primary_observation_ids[-1]
+    observed_images = ()
+
+    class Client:
+        async def extract_memories(self, prompt: str, **kwargs):
+            nonlocal observed_images
+            del prompt
+            observed_images = kwargs["images"]
+            return MemoryExtractionResponse(
+                memories=[
+                    MemoryCandidate(
+                        content="The screenshot shows a settled validation result.",
+                        memory_type="fact",
+                        evidence_quote="",
+                        source_observation_id=visual_observation_id,
+                    ),
+                    MemoryCandidate(
+                        content="An unbound visual claim must be rejected.",
+                        memory_type="fact",
+                        evidence_quote="",
+                    ),
+                ]
+            )
+
+    image = StructuredLlmImage(
+        source_observation_id=visual_observation_id,
+        media_type="image/png",
+        body=b"\x89PNG",
+    )
+    result = await MemoryExtractor(structured_llm_client=Client()).extract_projection_batch_memories(
+        batch,
+        source_type="jira",
+        images=(image,),
+    )
+
+    assert observed_images == (image,)
+    assert [item.content for item in result.memories] == [
+        "The screenshot shows a settled validation result."
+    ]
+    assert result.memories[0].source_observation_id == visual_observation_id
+    assert result.memories[0].evidence_anchor == "source_artifact"
+    assert result.memories[0].evidence_quote is None
 
 
 @pytest.mark.asyncio

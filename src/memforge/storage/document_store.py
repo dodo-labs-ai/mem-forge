@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Protocol
 
 from memforge.models import slugify
+from memforge.source_artifacts import extension_for_media_type
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,15 @@ class DocumentStore(Protocol):
         doc_id: str,
         title: str,
         pdf_bytes: bytes,
+    ) -> str: ...
+    def store_source_artifact(
+        self,
+        *,
+        source_id: str,
+        artifact_id: str,
+        filename: str,
+        content: bytes,
+        content_type: str,
     ) -> str: ...
     def read_normalized(self, stored_path: str) -> str | None: ...
     def get_artifact(self, uri: str | None, media_type: str) -> StoredDocumentArtifact | None: ...
@@ -163,6 +173,24 @@ class LocalDocumentStore:
         document_dir.mkdir(parents=True, exist_ok=True)
         path = document_dir / f"{self._doc_stem(title)}.pdf"
         path.write_bytes(pdf_bytes)
+        return str(path)
+
+    def store_source_artifact(
+        self,
+        *,
+        source_id: str,
+        artifact_id: str,
+        filename: str,
+        content: bytes,
+        content_type: str,
+    ) -> str:
+        """Store an exact provider Artifact under stable Artifact identity."""
+
+        artifact_dir = self._root / slugify(source_id) / "source-artifacts" / document_artifact_identity(artifact_id)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        safe_stem = slugify(Path(filename).stem) or "artifact"
+        path = artifact_dir / f"{safe_stem}{extension_for_media_type(content_type)}"
+        path.write_bytes(content)
         return str(path)
 
     def read_normalized(self, stored_path: str) -> str | None:

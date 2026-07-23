@@ -33,6 +33,14 @@ from memforge.models import (
     RawContent,
 )
 from memforge.pipeline.normalizer_utils import html_to_markdown, strip_boilerplate
+from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_BYTES,
+    MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT,
+    MAX_SOURCE_ARTIFACTS_PER_UNIT,
+    RawSourceArtifact,
+    SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
+    SourceArtifactContractError,
+)
 
 logger = logging.getLogger(__name__)
 CONFLUENCE_REQUEST_INTERVAL_SECONDS = 2.0
@@ -507,7 +515,12 @@ class ConfluenceGene(Gene):
         page_id = item.extra.get("page_id", item.item_id.replace("confluence-", ""))
         resp = await self._get(
             f"{self._api_prefix}/rest/api/content/{page_id}",
-            params={"expand": "body.storage,version,ancestors,space"},
+            params={
+                "expand": (
+                    "body.storage,version,ancestors,space,"
+                    "children.attachment.version,children.attachment.extensions"
+                )
+            },
         )
         data = self._json_response(resp, f"fetching page content {page_id}")
         if str(data.get("id") or "").strip() != str(page_id):
@@ -532,6 +545,13 @@ class ConfluenceGene(Gene):
         item.extra["space_key"] = str(
             (data.get("space") or {}).get("key") or item.extra.get("space_key") or item.space_or_project
         )
+        children = data.get("children") if isinstance(data.get("children"), dict) else {}
+        attachment_page = children.get("attachment")
+        if not isinstance(attachment_page, dict):
+            raise SourceArtifactContractError(
+                f"Confluence page {page_id} response is missing attachment membership"
+            )
+        artifacts = await self._fetch_source_artifacts(str(page_id), first_page=attachment_page)
 
         return RawContent(
             item=item,
@@ -543,7 +563,101 @@ class ConfluenceGene(Gene):
                 if authoritative_empty
                 else None
             ),
+            artifacts=artifacts,
         )
+
+    async def _fetch_source_artifacts(
+        self,
+        page_id: str,
+        *,
+        first_page: dict,
+    ) -> tuple[RawSourceArtifact, ...]:
+        """Return bounded provider attachments with exact bytes."""
+
+        descriptors: list[dict] = []
+        start = 0
+        payload = first_page
+        while True:
+            results = self._validated_attachment_results(payload, expected_start=start)
+            descriptors.extend(results)
+            if len(descriptors) > MAX_SOURCE_ARTIFACTS_PER_UNIT:
+                raise SourceArtifactContractError(
+                    f"Confluence page exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} Artifact limit"
+                )
+            if not self._has_next_page(payload):
+                break
+            start += len(results)
+            response = await self._get(
+                f"{self._api_prefix}/rest/api/content/{page_id}/child/attachment",
+                params={
+                    "start": start,
+                    "limit": MAX_SOURCE_ARTIFACTS_PER_UNIT + 1,
+                    "expand": "version,extensions",
+                },
+            )
+            payload = self._json_response(response, f"listing attachments for page {page_id}")
+
+        artifacts: list[RawSourceArtifact] = []
+        declared_bytes = 0
+        for descriptor in descriptors:
+            extensions = descriptor.get("extensions") if isinstance(descriptor.get("extensions"), dict) else {}
+            media_type = str(extensions.get("mediaType") or "").split(";", 1)[0].strip().lower()
+            if media_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
+                continue
+            size_value = extensions.get("fileSize")
+            if not isinstance(size_value, int) or isinstance(size_value, bool) or size_value < 0:
+                raise SourceArtifactContractError("Confluence attachment is missing a valid file size")
+            if size_value > MAX_SOURCE_ARTIFACT_BYTES:
+                raise SourceArtifactContractError(
+                    f"Confluence attachment exceeds {MAX_SOURCE_ARTIFACT_BYTES} byte limit"
+                )
+            declared_bytes += size_value
+            if declared_bytes > MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT:
+                raise SourceArtifactContractError(
+                    "Confluence attachments exceed the Source Unit byte aggregate limit"
+                )
+            attachment_id = str(descriptor.get("id") or "").strip()
+            filename = str(descriptor.get("title") or "").strip()
+            version = descriptor.get("version") if isinstance(descriptor.get("version"), dict) else {}
+            provider_revision = str(version.get("number") or "").strip()
+            links = descriptor.get("_links") if isinstance(descriptor.get("_links"), dict) else {}
+            download_path = str(links.get("download") or "").strip()
+            if not attachment_id or not filename or not provider_revision or not download_path:
+                raise SourceArtifactContractError("Confluence attachment identity is incomplete")
+            response = await self._get(download_path)
+            response.raise_for_status()
+            response_media_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+            if response_media_type and response_media_type != media_type:
+                raise SourceArtifactContractError("Confluence attachment media type changed during download")
+            artifacts.append(
+                RawSourceArtifact(
+                    provider_key=attachment_id,
+                    parent_observation_type="page_body",
+                    parent_provider_key=f"{page_id}:body",
+                    provider_revision=provider_revision,
+                    filename=filename,
+                    media_type=media_type,
+                    body=bytes(response.content),
+                    declared_size_bytes=size_value,
+                    locator={"attachment_id": attachment_id},
+                )
+            )
+        return tuple(artifacts)
+
+    @staticmethod
+    def _validated_attachment_results(data: object, *, expected_start: int) -> list[dict]:
+        if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+            raise SourceArtifactContractError("Confluence attachment response is missing results")
+        results = data["results"]
+        if any(not isinstance(item, dict) for item in results):
+            raise SourceArtifactContractError("Confluence attachment response contains an invalid record")
+        if data.get("start") != expected_start or data.get("size") != len(results):
+            raise SourceArtifactContractError("Confluence attachment pagination is inconsistent")
+        if not isinstance(data.get("_links"), dict):
+            raise SourceArtifactContractError("Confluence attachment response is missing pagination links")
+        if not results and ConfluenceGene._has_next_page(data):
+            raise SourceArtifactContractError("Confluence attachment response cannot advance pagination")
+        return results
 
     @staticmethod
     def _has_next_page(data: dict) -> bool:

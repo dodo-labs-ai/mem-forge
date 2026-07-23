@@ -5,7 +5,12 @@ from __future__ import annotations
 import logging
 from time import perf_counter
 from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
-from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
+from memforge.llm.structured import (
+    LiteLlmStructuredClient,
+    StructuredLlmConfig,
+    StructuredLlmError,
+    StructuredLlmImage,
+)
 from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.document_units import ExtractionContext
 from memforge.pipeline.document_update import DEFAULT_MAX_DIFF_CHARS
@@ -217,6 +222,14 @@ The following observations are CONTEXT only. Use them to resolve references and 
 
 Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
 
+For a PRIMARY `binary_artifact` observation with separately supplied image
+evidence, inspect the image itself. A claim grounded in that image must set
+`source_observation_id` to that exact Artifact Observation, and must leave
+`evidence_quote` and `extraction_context` empty because binary evidence has no
+text quote. Do not infer image contents from the filename, upload event, parent
+text, or metadata. Do not emit a claim for an Artifact image that was not
+supplied in this request.
+
 Extraction emits each current durable claim once with exact evidence from a
 PRIMARY observation. Reconciliation owns historical identity and support.
 
@@ -350,6 +363,7 @@ class MemoryExtractor:
         *,
         source_type: str,
         doc_type: str = "unknown",
+        images: tuple[StructuredLlmImage, ...] = (),
     ) -> MemoryExtractionResult:
         """Extract from Primary observations while treating neighbors as context."""
 
@@ -364,17 +378,42 @@ class MemoryExtractor:
             primary_observations=batch.primary_markdown[:UNIT_MARKDOWN_CHAR_CAP],
             context_observations=batch.context_markdown[:PROJECTION_CONTEXT_CHAR_CAP],
         )
-        result = await self._extract_with_schema(prompt, label="projection batch extraction")
+        result = await self._extract_with_schema(
+            prompt,
+            label="projection batch extraction",
+            images=images,
+        )
         if result.error_type:
             return result
         kept = []
         primary_content = dict(batch.primary_content_by_observation_id)
         context_by_primary = dict(batch.context_observation_ids_by_primary)
+        visual_observation_ids = {
+            image.source_observation_id
+            for image in images
+            if image.source_observation_id in batch.primary_observation_ids
+        }
         for memory in result.memories:
             quote = (memory.evidence_quote or memory.extraction_context or "").strip()
+            explicit_observation_id = memory.source_observation_id
+            if explicit_observation_id in visual_observation_ids:
+                if quote:
+                    continue
+                memory.evidence_quote = None
+                memory.evidence_anchor = "source_artifact"
+                memory.extraction_context = None
+                required_ids = tuple(dict.fromkeys(memory.required_source_observation_ids))
+                allowed_context_ids = context_by_primary.get(explicit_observation_id, ())
+                if (
+                    explicit_observation_id in required_ids
+                    or any(item not in allowed_context_ids for item in required_ids)
+                ):
+                    continue
+                memory.required_source_observation_ids = list(required_ids)
+                kept.append(memory)
+                continue
             if not quote or quote not in batch.primary_markdown:
                 continue
-            explicit_observation_id = memory.source_observation_id
             if explicit_observation_id is not None:
                 if quote not in primary_content.get(explicit_observation_id, ""):
                     continue
@@ -403,18 +442,28 @@ class MemoryExtractor:
             kept.append(memory)
         return MemoryExtractionResult(memories=kept, metadata=result.metadata)
 
-    async def _extract_with_schema(self, prompt: str, *, label: str) -> MemoryExtractionResult:
+    async def _extract_with_schema(
+        self,
+        prompt: str,
+        *,
+        label: str,
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> MemoryExtractionResult:
         started = perf_counter()
         metrics = {
             "structured_llm_calls": 1,
             "prompt_chars": len(prompt),
+            "image_count": len(images),
+            "image_bytes": sum(len(image.body) for image in images),
         }
         try:
-            response = await self.structured_llm_client.extract_memories(
-                prompt,
-                max_tokens=self.max_tokens,
-                model=self.model,
-            )
+            call_kwargs = {
+                "max_tokens": self.max_tokens,
+                "model": self.model,
+            }
+            if images:
+                call_kwargs["images"] = images
+            response = await self.structured_llm_client.extract_memories(prompt, **call_kwargs)
             memories = [
                 RawMemory(
                     content=memory.content,

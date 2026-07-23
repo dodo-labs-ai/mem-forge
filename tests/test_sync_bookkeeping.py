@@ -56,6 +56,7 @@ from memforge.pipeline.sync import (
 )
 from memforge.runtime import SourceLifecycleMaintenanceError, SyncService
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
+from memforge.source_artifacts import RawSourceArtifact
 from memforge.config import AppConfig, SyncConfig
 from memforge.storage.database import Database
 from memforge.storage.database import MIGRATIONS
@@ -2626,6 +2627,8 @@ class StubDocumentStore:
     def __init__(self) -> None:
         self.normalized_content: dict[str, str] = {}
         self.normalized_store_calls = 0
+        self.source_artifacts: dict[str, bytes] = {}
+        self.source_artifact_ids: list[str] = []
 
     def store_raw(self, *, source_id, doc_id, title, content, content_type, extension=None):
         suffix = extension or ".raw"
@@ -2639,6 +2642,24 @@ class StubDocumentStore:
 
     def read_normalized(self, uri):
         return self.normalized_content.get(uri)
+
+    def store_source_artifact(
+        self,
+        *,
+        source_id,
+        artifact_id,
+        filename,
+        content,
+        content_type,
+    ):
+        del content_type
+        uri = f"stub-artifact://{source_id}/{artifact_id}/{filename}"
+        self.source_artifacts[uri] = content
+        self.source_artifact_ids.append(artifact_id)
+        return uri
+
+    def read_artifact(self, uri):
+        return self.source_artifacts[uri]
 
 
 class NoArtifactRewriteDocumentStore(StubDocumentStore):
@@ -2951,6 +2972,7 @@ async def test_unchanged_multi_observation_projection_skips_full_document_extrac
 
     result = await orchestrator._extract_for_document_update(
         projection=unchanged,
+        source_artifacts=(),
         update_plan=None,
         markdown_body=normalized.markdown_body,
         source_type="teams",
@@ -3101,6 +3123,99 @@ class BlockingFetchGene:
 
     async def normalize(self, raw):
         return NormalizedContent(item=raw.item, markdown_body=f"# {raw.item.title}\n\nBody")
+
+
+class JiraArtifactGene(BlockingFetchGene):
+    def __init__(self, *, issue_id: str, issue_key: str) -> None:
+        super().__init__(item_count=1, release=asyncio.Event())
+        self.issue_id = issue_id
+        self.issue_key = issue_key
+        self.release.set()
+
+    async def discover(self, since=None):
+        del since
+        yield ContentItem(
+            item_id=f"jira-{self.issue_key}",
+            title=f"Jira {self.issue_key}",
+            source_url=f"https://jira.example/browse/{self.issue_key}",
+            last_modified=datetime(2026, 7, 22, tzinfo=timezone.utc),
+            content_type="application/json",
+            space_or_project=self.issue_key.split("-", 1)[0],
+            version="1",
+            extra={"issue_id": self.issue_id, "issue_key": self.issue_key},
+        )
+
+    async def fetch(self, item):
+        raw = _jira_raw_content(item)
+        return RawContent(
+            item=item,
+            body=raw.body,
+            content_type=raw.content_type,
+            artifacts=(
+                RawSourceArtifact(
+                    provider_key="attachment-7001",
+                    parent_observation_type="issue_core",
+                    parent_provider_key=f"{self.issue_id}:core",
+                    provider_revision="1",
+                    filename="architecture.png",
+                    media_type="image/png",
+                    body=b"\x89PNG\r\n\x1a\nstable-image",
+                ),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_jira_artifact_identity_survives_mutable_issue_key(db: Database) -> None:
+    source_id = "src-jira-artifact-identity"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Artifacts",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    document_store = StubDocumentStore()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=document_store,
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    initial = await orchestrator.sync_gene(
+        gene=JiraArtifactGene(issue_id="424242", issue_key="PAY-42"),
+        source_name="Jira Artifacts",
+        source_id=source_id,
+    )
+    moved = await orchestrator.sync_gene(
+        gene=JiraArtifactGene(issue_id="424242", issue_key="ARCH-42"),
+        source_name="Jira Artifacts",
+        source_id=source_id,
+    )
+
+    assert initial.last_sync_status == "success"
+    assert moved.last_sync_status == "success"
+    assert len(document_store.source_artifact_ids) == 2
+    assert len(set(document_store.source_artifact_ids)) == 1
+    unit_rows = await db.db.execute_fetchall(
+        "SELECT id, provider_key FROM source_units WHERE source_id = ?",
+        (source_id,),
+    )
+    assert [(row["provider_key"]) for row in unit_rows] == ["424242"]
+    artifact_rows = await db.db.execute_fetchall(
+        """SELECT so.id, sor.metadata_json
+             FROM source_observations so
+             JOIN source_observation_revisions sor ON sor.id = so.current_revision_id
+            WHERE so.source_id = ? AND so.observation_type = 'binary_artifact'""",
+        (source_id,),
+    )
+    assert len(artifact_rows) == 1
+    metadata = json.loads(str(artifact_rows[0]["metadata_json"]))
+    assert metadata["source_artifact"]["artifact_id"] == document_store.source_artifact_ids[0]
 
 
 class EmptyNormalizedBlockingFetchGene(BlockingFetchGene):

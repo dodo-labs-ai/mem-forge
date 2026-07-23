@@ -18,8 +18,16 @@ class RecordingStructuredMemoryClient:
         *,
         max_tokens: int,
         model: str | None = None,
+        images=(),
     ) -> MemoryExtractionResponse:
-        self.calls.append({"prompt": prompt, "max_tokens": max_tokens, "model": model})
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "model": model,
+                "images": images,
+            }
+        )
         if self.error:
             raise self.error
         return self.response

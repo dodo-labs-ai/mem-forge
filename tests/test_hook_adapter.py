@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import importlib.util
 import json
 import os
@@ -2813,6 +2814,91 @@ def test_mcp_proxy_fetches_resource_through_hosted_workspace(monkeypatch):
         == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/documents/doc-1/content"
     )
     assert captured["authorization"] == "Bearer token-123"
+
+
+def test_mcp_proxy_preserves_evidence_artifacts_on_get_memory(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    artifact = {
+        "artifact_id": "artifact-1",
+        "observation_id": "obs-1",
+        "observation_revision_id": "obsrev-1",
+        "parent_observation_id": "obs-parent",
+        "evidence_reference_id": "eref-1",
+        "evidence_unit_id": "evidence-1",
+        "evidence_role": "primary",
+        "filename": "diagram.png",
+        "content_type": "image/png",
+        "size_bytes": 3,
+        "sha256": "abc",
+        "url": "/api/source-artifacts/obsrev-1",
+    }
+    monkeypatch.setattr(
+        proxy,
+        "_http_json",
+        lambda *_args: {
+            "id": "mem-1",
+            "memory_type": "fact",
+            "content": "A visual claim",
+            "evidence_artifacts": [artifact],
+        },
+    )
+
+    result = proxy._call_tool("get_memory", {"memory_id": "mem-1"})
+
+    assert result["evidence_artifacts"] == [artifact]
+
+
+def test_mcp_proxy_returns_source_artifact_as_native_image_content(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    body = b"\x89PNG"
+
+    class FakeResponse:
+        headers = {
+            "content-type": "image/png",
+            "content-disposition": 'inline; filename="diagram.png"',
+            "content-length": str(len(body)),
+        }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return body
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            assert request.full_url == "http://memforge.test/api/source-artifacts/obsrev-1"
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "http://memforge.test")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    response = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "get_resource",
+                "arguments": {
+                    "url": "/api/source-artifacts/obsrev-1",
+                    "mode": "base64",
+                },
+            },
+        }
+    )
+
+    assert response["result"]["content"][1] == {
+        "type": "image",
+        "data": base64.b64encode(body).decode("ascii"),
+        "mimeType": "image/png",
+    }
+    metadata = json.loads(response["result"]["content"][0]["text"])
+    assert metadata["url"] == "/api/source-artifacts/obsrev-1"
+    assert "data_base64" not in metadata
 
 
 def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):

@@ -10,6 +10,7 @@ import pytest_asyncio
 from memforge.models import ContentItem, NormalizedContent, RawContent, RawMemory, content_hash
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.source_artifacts import StoredSourceArtifact
 from memforge.storage.database import Database
 
 
@@ -118,6 +119,98 @@ async def test_short_jira_comment_is_primary_with_adjacent_context_only(db: Data
     }
     assert await db.db.execute_fetchall("SELECT id FROM evidence_units") == []
     assert await db.db.execute_fetchall("SELECT id FROM evidence_references") == []
+
+
+def test_visual_claim_is_bound_to_exact_artifact_revision_without_fabricated_quote() -> None:
+    item = ContentItem(
+        item_id="jira-PAY-12",
+        title="PAY-12",
+        source_url="https://jira.example/browse/PAY-12",
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        version="2",
+        extra={"issue_key": "PAY-12", "issue_id": "10012"},
+    )
+    payload = {
+        "id": "10012",
+        "key": "PAY-12",
+        "fields": {
+            "summary": "Payroll",
+            "description": "Issue context",
+            "status": None,
+            "priority": None,
+            "assignee": None,
+            "labels": [],
+            "resolution": None,
+            "updated": "2026-07-15T00:00:00Z",
+        },
+        "_comments": [
+            {"id": "502", "body": "See result", "created": "2026-07-15T10:01:00Z"}
+        ],
+        "_comments_included": True,
+        "_comments_total": 1,
+        "changelog": {"startAt": 0, "histories": [], "total": 0},
+    }
+    artifact = StoredSourceArtifact(
+        id="artifact-1",
+        provider_key="attachment-1",
+        parent_observation_type="comment",
+        parent_provider_key="502",
+        provider_revision="1",
+        filename="result.png",
+        media_type="image/png",
+        size_bytes=4,
+        sha256="a" * 64,
+        uri="/stored/result.png",
+    )
+    projection = project_source_item(
+        source_id="src-jira",
+        source_type="jira",
+        run_id="projection-jira-image",
+        item=item,
+        raw=RawContent(
+            item=item,
+            body=json.dumps(payload).encode(),
+            content_type="application/json",
+        ),
+        normalized=NormalizedContent(
+            item=item,
+            markdown_body="# PAY-12\n\nIssue context\n\nSee result",
+        ),
+        artifacts=(artifact,),
+    )
+    artifact_observation = next(
+        item for item in projection.observations if item.observation_type == "binary_artifact"
+    )
+    artifact_revision = next(
+        item
+        for item in projection.observation_revisions
+        if item.observation_id == artifact_observation.id
+    )
+    raw = RawMemory(
+        content="The screenshot shows a settled validation result.",
+        memory_type="fact",
+        source_observation_id=artifact_observation.id,
+        evidence_anchor="source_artifact",
+    )
+
+    staged = build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=(raw,),
+        doc_id="jira-PAY-12",
+        source_type="jira",
+        project_key="PAY",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        access_context_hash="workspace-pay",
+        extractor_run_id="sync-1",
+    )
+
+    primary = next(item for item in staged.references if item.role.value == "primary")
+    assert primary.anchor.observation_revision_id == artifact_revision.id
+    assert staged.units[0].content == ""
+    assert staged.units[0].excerpt is None
+    assert staged.units[0].evidence_provenance.value == "source_artifact"
 
 
 @pytest.mark.asyncio

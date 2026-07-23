@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -39,6 +40,14 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+)
+from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_BYTES,
+    MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT,
+    MAX_SOURCE_ARTIFACTS_PER_UNIT,
+    RawSourceArtifact,
+    SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
+    SourceArtifactContractError,
 )
 
 logger = logging.getLogger(__name__)
@@ -598,10 +607,12 @@ class JiraGene(Gene):
             if payload.get("_comments_truncated"):
                 await self._top_up_truncated_comments(key, payload)
             getattr(self, "_hydrated_issues", {}).pop(key, None)
+            artifacts = await self._fetch_source_artifacts(payload)
             return RawContent(
                 item=item,
                 body=json.dumps(payload).encode("utf-8"),
                 content_type="application/json",
+                artifacts=artifacts,
             )
 
         resp = await self._request(
@@ -641,12 +652,109 @@ class JiraGene(Gene):
         if item.extra.get("attest_materialized_revision") is True:
             await self._attest_materialized_revision(key, str(item.version or ""))
         validate_jira_observation_identities(data)
+        artifacts = await self._fetch_source_artifacts(data)
 
         return RawContent(
             item=item,
             body=json.dumps(data).encode("utf-8"),
             content_type="application/json",
+            artifacts=artifacts,
         )
+
+    async def _fetch_source_artifacts(self, issue: dict) -> tuple[RawSourceArtifact, ...]:
+        """Return bounded issue attachments with exact bytes."""
+
+        fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+        raw_descriptors = fields.get("attachment")
+        descriptors = raw_descriptors if isinstance(raw_descriptors, list) else []
+        if len(descriptors) > MAX_SOURCE_ARTIFACTS_PER_UNIT:
+            raise SourceArtifactContractError(
+                f"Jira issue exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} Artifact limit"
+            )
+        comments = issue.get("_comments") if isinstance(issue.get("_comments"), list) else []
+        issue_id = str(issue.get("id") or "").strip()
+        artifacts: list[RawSourceArtifact] = []
+        declared_bytes = 0
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict):
+                raise SourceArtifactContractError("Jira attachment response contains an invalid record")
+            media_type = str(descriptor.get("mimeType") or "").split(";", 1)[0].strip().lower()
+            if media_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
+                continue
+            size_value = descriptor.get("size")
+            if not isinstance(size_value, int) or isinstance(size_value, bool) or size_value < 0:
+                raise SourceArtifactContractError("Jira attachment is missing a valid file size")
+            if size_value > MAX_SOURCE_ARTIFACT_BYTES:
+                raise SourceArtifactContractError(
+                    f"Jira attachment exceeds {MAX_SOURCE_ARTIFACT_BYTES} byte limit"
+                )
+            declared_bytes += size_value
+            if declared_bytes > MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT:
+                raise SourceArtifactContractError(
+                    "Jira attachments exceed the Source Unit byte aggregate limit"
+                )
+            attachment_id = str(descriptor.get("id") or "").strip()
+            filename = str(descriptor.get("filename") or "").strip()
+            provider_revision = str(descriptor.get("created") or "immutable").strip()
+            content_url = str(descriptor.get("content") or "").strip()
+            if not attachment_id or not filename or not content_url:
+                raise SourceArtifactContractError("Jira attachment identity is incomplete")
+            request_path = self._attachment_request_path(content_url)
+            response = await self._request("GET", request_path)
+            response.raise_for_status()
+            response_media_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+            if response_media_type and response_media_type != media_type:
+                raise SourceArtifactContractError("Jira attachment media type changed during download")
+            parent_type, parent_key = self._jira_attachment_parent(
+                filename=filename,
+                issue_id=issue_id,
+                comments=comments,
+            )
+            artifacts.append(
+                RawSourceArtifact(
+                    provider_key=attachment_id,
+                    parent_observation_type=parent_type,
+                    parent_provider_key=parent_key,
+                    provider_revision=provider_revision,
+                    filename=filename,
+                    media_type=media_type,
+                    body=bytes(response.content),
+                    declared_size_bytes=size_value,
+                    locator={"attachment_id": attachment_id},
+                )
+            )
+        return tuple(artifacts)
+
+    def _attachment_request_path(self, content_url: str) -> str:
+        parsed = urlsplit(content_url)
+        if parsed.query or parsed.fragment:
+            raise SourceArtifactContractError("Jira attachment URL cannot contain query or fragment")
+        if parsed.scheme or parsed.netloc:
+            base = urlsplit(self._base_url)
+            if parsed.scheme != base.scheme or parsed.netloc != base.netloc:
+                raise SourceArtifactContractError("Jira attachment URL is outside the configured origin")
+            return parsed.path
+        if not content_url.startswith("/"):
+            raise SourceArtifactContractError("Jira attachment URL must be absolute or root-relative")
+        return content_url
+
+    @staticmethod
+    def _jira_attachment_parent(
+        *,
+        filename: str,
+        issue_id: str,
+        comments: list[object],
+    ) -> tuple[str, str]:
+        matches = [
+            str(comment.get("id"))
+            for comment in comments
+            if isinstance(comment, dict)
+            and filename in str(comment.get("body") or "")
+            and str(comment.get("id") or "").strip()
+        ]
+        if len(matches) == 1:
+            return "comment", matches[0]
+        return "issue_core", f"{issue_id}:core"
 
     async def _attest_materialized_revision(self, key: str, expected_revision: str) -> None:
         response = await self._request(
