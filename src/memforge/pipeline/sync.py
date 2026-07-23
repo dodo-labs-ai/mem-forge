@@ -552,6 +552,7 @@ class GeneSyncOrchestrator:
         source_activity_epoch: int | None = None,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
+        reusable_projection_doc_ids: frozenset[str] = frozenset(),
     ) -> SyncState:
         """Run the full sync pipeline for a gene.
 
@@ -634,8 +635,18 @@ class GeneSyncOrchestrator:
         scope_transition = None
         if not non_mutating_run:
             scope_transition = await self.db.get_open_projection_scope_transition(source_id)
+        if (
+            force_full_sync
+            or execution_mode is not SourceSyncMode.NORMAL
+            or scope_transition is not None
+        ):
+            # Reuse is an ordinary incremental optimization only. Recovery
+            # modes and scope transitions require the full per-document path.
+            reusable_projection_doc_ids = frozenset()
         transition_started = False
         run_coverage = ProjectionCoverage.PARTIAL_PROJECTION
+        reused_projection_count = 0
+        total_item_count = 0
 
         try:
             # ----------------------------------------------------------
@@ -755,11 +766,36 @@ class GeneSyncOrchestrator:
                 source_name,
                 last_sync_time.isoformat() if last_sync_time else "full sync",
             )
+            discovered_doc_ids = {item.item_id for item in items}
+            unexpected_reuse_ids = reusable_projection_doc_ids - discovered_doc_ids
+            if unexpected_reuse_ids and authoritative_snapshot:
+                raise ValueError(
+                    "reusable Source Projection membership is outside provider discovery: "
+                    f"{sorted(unexpected_reuse_ids)[0]}"
+                )
+            reusable_projection_doc_ids = (
+                reusable_projection_doc_ids & discovered_doc_ids
+            )
+            total_item_count = len(items)
+            if reusable_projection_doc_ids:
+                items = [
+                    item
+                    for item in items
+                    if item.item_id not in reusable_projection_doc_ids
+                ]
+                reused_projection_count = total_item_count - len(items)
+                docs_processed += reused_projection_count
+                logger.info(
+                    "Reused %d current Source Projections for %s without per-document materialization",
+                    reused_projection_count,
+                    source_id,
+                )
             self._memory_sample(
                 "after_discovery",
                 source_id=source_id,
                 run_id=run_id,
-                item_count=len(items),
+                item_count=total_item_count,
+                reused_projection_count=reused_projection_count,
                 indexed_doc_count=len(indexed_doc_ids),
                 full_sync=last_sync_time is None,
                 projection_coverage=run_coverage.value,
@@ -769,8 +805,8 @@ class GeneSyncOrchestrator:
                 progress_callback(
                     {
                         "phase": "processing",
-                        "current": 0,
-                        "total": len(items),
+                        "current": reused_projection_count,
+                        "total": total_item_count,
                         "title": None,
                     }
                 )
@@ -778,7 +814,7 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             # Step 4: Process items concurrently (with retry + error isolation)
             # ----------------------------------------------------------
-            progress_counter = 0
+            progress_counter = reused_projection_count
             docs_updated_counter = 0
             memories_extracted_counter = 0
             item_semaphore = asyncio.Semaphore(self._document_parallelism_limit())
@@ -810,7 +846,7 @@ class GeneSyncOrchestrator:
                                 {
                                     "phase": "processing",
                                     "current": progress_counter,
-                                    "total": len(items),
+                                    "total": total_item_count,
                                     "title": progress.get("title"),
                                     "docs_updated": docs_updated_counter,
                                     "memories_extracted": memories_extracted_counter,
@@ -905,7 +941,7 @@ class GeneSyncOrchestrator:
                             {
                                 "phase": "processing",
                                 "current": progress_counter,
-                                "total": len(items),
+                                "total": total_item_count,
                                 "title": item.title,
                                 "docs_updated": docs_updated_counter,
                                 "memories_extracted": memories_extracted_counter,
@@ -919,7 +955,7 @@ class GeneSyncOrchestrator:
                         {
                             "phase": "processing",
                             "current": progress_counter,
-                            "total": len(items),
+                            "total": total_item_count,
                             "title": item.title,
                             "docs_updated": docs_updated_counter,
                             "memories_extracted": memories_extracted_counter,
@@ -1101,6 +1137,20 @@ class GeneSyncOrchestrator:
                         scope_transition.id,
                     )
 
+        if self.memory_store is not None:
+            try:
+                await self.memory_store.attempt_lifecycle_vector_delivery(
+                    source_id=source_id
+                )
+            except Exception:
+                # Relational lifecycle state and its durable outbox are
+                # authoritative. Delivery is run-level and independent of
+                # whether later source work completed successfully.
+                logger.exception(
+                    "Source sync completed with lifecycle vector delivery still pending for source %s",
+                    source_id,
+                )
+
         # ------------------------------------------------------------------
         # Step 7: Record SyncState and sync_history
         # ------------------------------------------------------------------
@@ -1162,13 +1212,13 @@ class GeneSyncOrchestrator:
             progress_callback(
                 {
                     "phase": "complete",
-                    "current": len(items) if "items" in dir() else 0,
-                    "total": len(items) if "items" in dir() else 0,
+                    "current": total_item_count,
+                    "total": total_item_count,
                     "title": None,
                 }
             )
 
-        item_count = len(items) if "items" in locals() else 0
+        materialized_item_count = len(items) if "items" in locals() else 0
         self._memory_sample(
             "sync_run_end",
             source_id=source_id,
@@ -1179,7 +1229,9 @@ class GeneSyncOrchestrator:
             docs_failed=docs_failed,
             memories_extracted=memories_extracted,
             memories_corroborated=memories_corroborated,
-            item_count=item_count,
+            item_count=total_item_count,
+            materialized_item_count=materialized_item_count,
+            reused_projection_count=reused_projection_count,
         )
 
         logger.info(
@@ -1725,10 +1777,6 @@ class GeneSyncOrchestrator:
 
         if unchanged:
             stats["updated"] = not content_unchanged
-            if self.memory_store is not None:
-                await self.memory_store.attempt_lifecycle_vector_delivery(
-                    source_id=source_id
-                )
             async with self._db_lock:
                 await self.db.upsert_document(
                     doc_record,

@@ -33,7 +33,10 @@ from memforge.source_projection import (
     SourceUnit,
     SourceUnitRevision,
 )
-from memforge.source_projection_config import projection_scope_fingerprint
+from memforge.source_projection_config import (
+    projection_access_fingerprint,
+    projection_scope_fingerprint,
+)
 
 
 BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
@@ -305,7 +308,7 @@ def project_source_item(
     semantic_hash = _canonical_hash(observation_hashes)
     location_hash = _canonical_hash(unit.locator)
     membership_hash = _canonical_hash(sorted(item.observation_id for item in revisions))
-    access_hash = _canonical_hash(dict(access_context)) if access_context else None
+    access_hash = projection_access_fingerprint(access_context) if access_context else None
     unit_revision_id = _stable_id(
         "unitrev",
         unit_id,

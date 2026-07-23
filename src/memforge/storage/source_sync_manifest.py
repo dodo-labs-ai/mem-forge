@@ -23,3 +23,14 @@ class SourceSyncManifestStore(Protocol):
         workspace_id: str,
         manifest_items: Sequence[tuple[str, str, str]],
     ) -> list[SourceSyncInput]: ...
+
+    async def find_reusable_source_projection_memberships(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+        expected_access_hash: str,
+    ) -> frozenset[str]:
+        """Return exact reused members whose current projection is compatible."""
+        ...

@@ -15308,6 +15308,97 @@ class Database:
                     results.append(_source_sync_input_from_row(row))
         return results
 
+    async def find_reusable_source_projection_memberships(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+        expected_access_hash: str,
+    ) -> frozenset[str]:
+        """Resolve current projections reusable by one exact manifest snapshot.
+
+        A current membership is reusable only when its immutable input was
+        already attested by an earlier manifest, its document revision still
+        matches the current manifest, and its active Source Unit revision was
+        projected under the current access context. Scope transitions retain
+        the full projection path because they require run-scoped coverage.
+        """
+
+        normalized_snapshot_id = _non_empty_string(snapshot_id)
+        normalized_access_hash = _non_empty_string(expected_access_hash)
+        if normalized_snapshot_id is None or normalized_access_hash is None:
+            return frozenset()
+        query = """SELECT DISTINCT mi.doc_id
+                   FROM source_sync_snapshot_manifest_items mi
+                   JOIN source_sync_snapshot_manifests current_manifest
+                     ON current_manifest.workspace_id = mi.workspace_id
+                    AND current_manifest.source_id = mi.source_id
+                    AND current_manifest.snapshot_id = mi.snapshot_id
+                   JOIN source_sync_snapshot_items si
+                     ON si.workspace_id = mi.workspace_id
+                    AND si.source_id = mi.source_id
+                    AND si.snapshot_id = mi.snapshot_id
+                    AND si.doc_id = mi.doc_id
+                   JOIN documents d
+                     ON d.source = mi.source_id
+                    AND d.doc_id = mi.doc_id
+                    AND d.version = mi.revision
+                   JOIN source_unit_document_lineage_history lineage
+                     ON lineage.source_id = mi.source_id
+                    AND lineage.document_id = mi.doc_id
+                    AND lineage.is_current = 1
+                   JOIN source_units unit
+                     ON unit.id = lineage.source_unit_id
+                    AND unit.source_id = mi.source_id
+                   JOIN source_unit_revisions revision
+                     ON revision.id = unit.current_revision_id
+                    AND revision.access_hash = ?
+                   JOIN sources src
+                     ON src.id = mi.source_id
+                    AND src.access_state = 'active'
+                   WHERE mi.workspace_id = ?
+                     AND mi.source_id = ?
+                     AND mi.snapshot_id = ?
+                     AND mi.change_kind = 'upsert'
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM projection_scope_transitions transition
+                         WHERE transition.source_id = mi.source_id
+                           AND transition.status IN ('pending', 'running')
+                     )
+                     AND EXISTS (
+                         SELECT 1
+                         FROM source_sync_snapshot_manifest_items prior_mi
+                         JOIN source_sync_snapshot_manifests prior_manifest
+                           ON prior_manifest.workspace_id = prior_mi.workspace_id
+                          AND prior_manifest.source_id = prior_mi.source_id
+                          AND prior_manifest.snapshot_id = prior_mi.snapshot_id
+                         JOIN source_sync_snapshot_items prior_si
+                           ON prior_si.workspace_id = prior_mi.workspace_id
+                          AND prior_si.source_id = prior_mi.source_id
+                          AND prior_si.snapshot_id = prior_mi.snapshot_id
+                          AND prior_si.doc_id = prior_mi.doc_id
+                         WHERE prior_mi.workspace_id = mi.workspace_id
+                           AND prior_mi.source_id = mi.source_id
+                           AND prior_mi.snapshot_id <> mi.snapshot_id
+                           AND prior_mi.doc_id = mi.doc_id
+                           AND prior_mi.revision = mi.revision
+                           AND prior_mi.change_kind = mi.change_kind
+                           AND prior_si.input_id = si.input_id
+                           AND prior_manifest.source_activity_epoch = current_manifest.source_activity_epoch
+                           AND prior_manifest.source_config_revision = current_manifest.source_config_revision
+                     )
+                   ORDER BY mi.doc_id"""
+        params = (
+            normalized_access_hash,
+            workspace_id,
+            source_id,
+            normalized_snapshot_id,
+        )
+        async with self.db.execute(query, params) as cursor:
+            return frozenset([str(row["doc_id"]) async for row in cursor])
+
     async def attach_source_sync_inputs_to_snapshot(
         self,
         *,
