@@ -34,12 +34,14 @@ from memforge.models import (
 )
 from memforge.pipeline.normalizer_utils import html_to_markdown, strip_boilerplate
 from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
     MAX_SOURCE_ARTIFACT_BYTES,
     MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT,
     MAX_SOURCE_ARTIFACTS_PER_UNIT,
     RawSourceArtifact,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
     SourceArtifactContractError,
+    normalize_source_artifact_media_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -575,14 +577,31 @@ class ConfluenceGene(Gene):
         """Return bounded provider attachments with exact bytes."""
 
         descriptors: list[dict] = []
+        descriptor_count = 0
         start = 0
         payload = first_page
         while True:
             results = self._validated_attachment_results(payload, expected_start=start)
-            descriptors.extend(results)
+            descriptor_count += len(results)
+            if descriptor_count > MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT:
+                raise SourceArtifactContractError(
+                    "Confluence page exceeds the Source Artifact descriptor scan limit"
+                )
+            descriptors.extend(
+                descriptor
+                for descriptor in results
+                if normalize_source_artifact_media_type(
+                    (
+                        descriptor.get("extensions")
+                        if isinstance(descriptor.get("extensions"), dict)
+                        else {}
+                    ).get("mediaType")
+                )
+                in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES
+            )
             if len(descriptors) > MAX_SOURCE_ARTIFACTS_PER_UNIT:
                 raise SourceArtifactContractError(
-                    f"Confluence page exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} Artifact limit"
+                    f"Confluence page exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} supported Artifact limit"
                 )
             if not self._has_next_page(payload):
                 break
@@ -591,7 +610,7 @@ class ConfluenceGene(Gene):
                 f"{self._api_prefix}/rest/api/content/{page_id}/child/attachment",
                 params={
                     "start": start,
-                    "limit": MAX_SOURCE_ARTIFACTS_PER_UNIT + 1,
+                    "limit": 100,
                     "expand": "version,extensions",
                 },
             )
@@ -601,9 +620,7 @@ class ConfluenceGene(Gene):
         declared_bytes = 0
         for descriptor in descriptors:
             extensions = descriptor.get("extensions") if isinstance(descriptor.get("extensions"), dict) else {}
-            media_type = str(extensions.get("mediaType") or "").split(";", 1)[0].strip().lower()
-            if media_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
-                continue
+            media_type = normalize_source_artifact_media_type(extensions.get("mediaType"))
             size_value = extensions.get("fileSize")
             if not isinstance(size_value, int) or isinstance(size_value, bool) or size_value < 0:
                 raise SourceArtifactContractError("Confluence attachment is missing a valid file size")
