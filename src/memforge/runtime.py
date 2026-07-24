@@ -39,6 +39,7 @@ from memforge.pipeline.sync import (
     GeneSyncOrchestrator,
     SourceSyncMode,
     get_process_document_lifecycle_admission,
+    get_process_extraction_work_pool,
 )
 from memforge.retrieval.embeddings import get_chroma_collection
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
@@ -148,6 +149,16 @@ class SyncRuntime:
     orchestrator_factory: Callable[["SyncRuntime"], GeneSyncOrchestrator] | None = None
 
     def __post_init__(self) -> None:
+        if self.extraction_pool is None:
+            self.extraction_pool = get_process_extraction_work_pool(
+                max(
+                    1,
+                    int(
+                        self.config.sync.max_extraction_workers
+                        or self.config.llm.enrichment_max_concurrent
+                    ),
+                )
+            )
         if self.document_lifecycle_admission is None:
             self.document_lifecycle_admission = get_process_document_lifecycle_admission(
                 max(0, int(self.config.sync.max_document_lifecycles))
@@ -749,8 +760,16 @@ class SourceSyncWorker:
             else max(1.0, min(30.0, lease_seconds / 3))
         )
         self.progress_flush_seconds = max(0.001, float(progress_flush_seconds))
-        max_extraction_workers = max(0, int(config.sync.max_extraction_workers))
-        self._extraction_pool = ExtractionWorkPool(max_extraction_workers) if max_extraction_workers else None
+        max_extraction_workers = max(
+            1,
+            int(
+                config.sync.max_extraction_workers
+                or config.llm.enrichment_max_concurrent
+            ),
+        )
+        self._extraction_pool = get_process_extraction_work_pool(
+            max_extraction_workers
+        )
         max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
         self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
         self._relation_runtime: SyncRuntime | None = None
@@ -1130,8 +1149,16 @@ class SyncService:
         self.progress: dict[str, dict] = {}
         max_active_sources = max(0, int(config.sync.max_active_sources))
         self._source_slots = asyncio.Semaphore(max_active_sources) if max_active_sources else None
-        max_extraction_workers = max(0, int(config.sync.max_extraction_workers))
-        self._extraction_pool = ExtractionWorkPool(max_extraction_workers) if max_extraction_workers else None
+        max_extraction_workers = max(
+            1,
+            int(
+                config.sync.max_extraction_workers
+                or config.llm.enrichment_max_concurrent
+            ),
+        )
+        self._extraction_pool = get_process_extraction_work_pool(
+            max_extraction_workers
+        )
         max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
         self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
 

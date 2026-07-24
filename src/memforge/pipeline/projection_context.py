@@ -18,6 +18,7 @@ class ProjectionExtractionBatch:
 
     id: str
     source_unit_id: str
+    primary_image_bytes: int
     primary_observation_ids: tuple[str, ...]
     primary_content_by_observation_id: tuple[tuple[str, str], ...]
     context_observation_ids: tuple[str, ...]
@@ -195,6 +196,10 @@ def plan_projection_extraction_batches(
             ProjectionExtractionBatch(
                 id=f"xbatch-{digest}",
                 source_unit_id=unit.id,
+                primary_image_bytes=sum(
+                    _observation_image_size(revisions[observation_id].metadata)
+                    for observation_id in primary
+                ),
                 primary_observation_ids=primary,
                 primary_content_by_observation_id=primary_content_by_observation_id,
                 context_observation_ids=context,
@@ -233,6 +238,16 @@ def _observation_binary_size(metadata: dict) -> int:
     except (TypeError, ValueError):
         return 0
     return max(size_bytes, 0)
+
+
+def _observation_image_size(metadata: dict) -> int:
+    raw = metadata.get("source_artifact")
+    if not isinstance(raw, dict):
+        return 0
+    media_type = str(raw.get("media_type") or "").lower()
+    if not media_type.startswith("image/"):
+        return 0
+    return _observation_binary_size(metadata)
 
 
 def context_observation_ids_for(

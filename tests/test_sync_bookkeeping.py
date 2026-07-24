@@ -50,6 +50,7 @@ from memforge.source_projection_config import (
 )
 from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
+    ExtractionAdmission,
     ExtractionWorkPool,
     GeneSyncOrchestrator,
     SourceSyncMode,
@@ -2256,6 +2257,83 @@ async def test_extraction_work_pool_favors_waiting_source_over_extra_borrowed_wo
 
 
 @pytest.mark.asyncio
+async def test_extraction_work_pool_serializes_multimodal_without_blocking_text():
+    pool = ExtractionWorkPool(max_workers=3)
+    first_multimodal_entered = asyncio.Event()
+    second_multimodal_entered = asyncio.Event()
+    text_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    release_remaining = asyncio.Event()
+    observed_admissions: list[ExtractionAdmission] = []
+
+    async def hold_first_multimodal() -> None:
+        async with pool.slot("src-a", multimodal=True) as admission:
+            observed_admissions.append(admission)
+            first_multimodal_entered.set()
+            await release_first.wait()
+
+    async def hold_second_multimodal() -> None:
+        async with pool.slot("src-b", multimodal=True):
+            second_multimodal_entered.set()
+            await release_remaining.wait()
+
+    async def hold_text() -> None:
+        async with pool.slot("src-b"):
+            text_entered.set()
+            await release_remaining.wait()
+
+    first_task = asyncio.create_task(hold_first_multimodal())
+    await asyncio.wait_for(first_multimodal_entered.wait(), timeout=1)
+    assert observed_admissions[0].multimodal is True
+    assert observed_admissions[0].active_multimodal == 1
+    assert observed_admissions[0].queue_wait_ms >= 0
+    second_task = asyncio.create_task(hold_second_multimodal())
+    text_task = asyncio.create_task(hold_text())
+
+    await asyncio.wait_for(text_entered.wait(), timeout=1)
+    assert not second_multimodal_entered.is_set()
+
+    release_first.set()
+    await asyncio.wait_for(second_multimodal_entered.wait(), timeout=1)
+    release_remaining.set()
+    await asyncio.gather(first_task, second_task, text_task)
+
+
+@pytest.mark.asyncio
+async def test_extraction_work_pool_releases_multimodal_permit_when_worker_wait_is_cancelled():
+    pool = ExtractionWorkPool(max_workers=1)
+    text_entered = asyncio.Event()
+    release_text = asyncio.Event()
+    replacement_entered = asyncio.Event()
+
+    async def hold_text_worker() -> None:
+        async with pool.slot("src-text"):
+            text_entered.set()
+            await release_text.wait()
+
+    async def wait_for_multimodal_worker() -> None:
+        async with pool.slot("src-image", multimodal=True):
+            raise AssertionError("cancelled work must not enter")
+
+    async def replacement_multimodal_work() -> None:
+        async with pool.slot("src-image", multimodal=True):
+            replacement_entered.set()
+
+    text_task = asyncio.create_task(hold_text_worker())
+    await asyncio.wait_for(text_entered.wait(), timeout=1)
+    cancelled_task = asyncio.create_task(wait_for_multimodal_worker())
+    await asyncio.sleep(0)
+    cancelled_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_task
+
+    replacement_task = asyncio.create_task(replacement_multimodal_work())
+    release_text.set()
+    await asyncio.wait_for(replacement_entered.wait(), timeout=1)
+    await asyncio.gather(text_task, replacement_task)
+
+
+@pytest.mark.asyncio
 async def test_shared_extraction_pool_caps_orchestrator_work_across_sources(db: Database):
     for source_id in ("src-pool-a", "src-pool-b"):
         await db.upsert_source(
@@ -2359,6 +2437,35 @@ async def test_document_lifecycle_admission_caps_fetch_across_sources(db: Databa
     release_fetch.set()
     states = await asyncio.gather(task_a, task_b)
     assert [state.last_sync_status for state in states] == ["success", "success"]
+
+
+@pytest.mark.asyncio
+async def test_document_lifecycle_admission_reports_queue_wait():
+    admission = DocumentLifecycleAdmission(max_active=1)
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    observed_wait_ms: list[int] = []
+
+    async def first_document() -> None:
+        async with admission.slot("src-doc-a", "doc-a") as queue_wait_ms:
+            observed_wait_ms.append(queue_wait_ms)
+            first_entered.set()
+            await release_first.wait()
+
+    async def queued_document() -> None:
+        await first_entered.wait()
+        async with admission.slot("src-doc-b", "doc-b") as queue_wait_ms:
+            observed_wait_ms.append(queue_wait_ms)
+
+    first_task = asyncio.create_task(first_document())
+    queued_task = asyncio.create_task(queued_document())
+    await asyncio.wait_for(first_entered.wait(), timeout=2)
+    await asyncio.sleep(0.01)
+    release_first.set()
+    await asyncio.gather(first_task, queued_task)
+
+    assert observed_wait_ms[0] >= 0
+    assert observed_wait_ms[1] > 0
 
 
 @pytest.mark.asyncio
@@ -3620,6 +3727,73 @@ class BlockingMemoryExtractor(NoopMemoryExtractor):
     async def extract_projection_batch_memories(self, batch, **kwargs):
         del batch, kwargs
         return await self._extract()
+
+
+@pytest.mark.asyncio
+async def test_projection_images_load_only_after_shared_multimodal_admission(
+    db: Database,
+):
+    class TrackingArtifactStore(StubDocumentStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.artifact_read_count = 0
+
+        def read_artifact(self, uri):
+            self.artifact_read_count += 1
+            return super().read_artifact(uri)
+
+    source_ids = ("src-image-a", "src-image-b")
+    for source_id in source_ids:
+        await db.upsert_source(
+            id=source_id,
+            type="jira",
+            name=source_id,
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id="dev",
+        )
+
+    release_extraction = asyncio.Event()
+    extractor = BlockingMemoryExtractor(release_extraction, target_entries=1)
+    shared_pool = ExtractionWorkPool(max_workers=2)
+    stores = [TrackingArtifactStore(), TrackingArtifactStore()]
+
+    def orchestrator(store: TrackingArtifactStore) -> GeneSyncOrchestrator:
+        return GeneSyncOrchestrator(
+            db=db,
+            doc_store=store,
+            memory_extractor=extractor,
+            memory_engine=NoopMemoryEngine(),
+            memory_store=None,
+            max_concurrent=2,
+            extraction_pool=shared_pool,
+        )
+
+    first_task = asyncio.create_task(
+        orchestrator(stores[0]).sync_gene(
+            gene=JiraArtifactGene(issue_id="7001", issue_key="IMG-1"),
+            source_name="Images A",
+            source_id=source_ids[0],
+        )
+    )
+    await asyncio.wait_for(extractor.target_reached.wait(), timeout=2)
+    assert stores[0].artifact_read_count == 1
+
+    second_task = asyncio.create_task(
+        orchestrator(stores[1]).sync_gene(
+            gene=JiraArtifactGene(issue_id="7002", issue_key="IMG-2"),
+            source_name="Images B",
+            source_id=source_ids[1],
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert stores[1].artifact_read_count == 0
+
+    release_extraction.set()
+    states = await asyncio.gather(first_task, second_task)
+
+    assert [state.last_sync_status for state in states] == ["success", "success"]
+    assert stores[1].artifact_read_count == 1
 
 
 class ConstantMemorySampler:
@@ -7243,6 +7417,20 @@ async def test_sync_service_passes_shared_extraction_pool_to_runtime_provider(db
 
 
 @pytest.mark.asyncio
+async def test_sync_services_share_process_extraction_pool_with_default_capacity(
+    db: Database,
+):
+    service_a = SyncService(db, AppConfig())
+    service_b = SyncService(
+        db,
+        AppConfig(sync=SyncConfig(max_extraction_workers=6)),
+    )
+
+    assert service_a._extraction_pool is not None
+    assert service_a._extraction_pool is service_b._extraction_pool
+
+
+@pytest.mark.asyncio
 async def test_sync_service_passes_shared_document_lifecycle_admission_to_runtime_provider(db: Database):
     source_id = "src-shared-doc-admission"
     await db.upsert_source(
@@ -8929,6 +9117,10 @@ async def test_large_full_document_uses_deterministic_units(db: Database):
     assert audit_rows[0].payload["unitized"] is True
     assert audit_rows[0].payload["unit_count"] == len(extractor.unit_calls)
     assert audit_rows[0].payload["segmentation_version"] == "v2"
+    assert audit_rows[0].payload["extraction_queue_wait_ms"] >= 0
+    assert audit_rows[0].payload["input_binary_bytes"] == 0
+    assert audit_rows[0].payload["multimodal_calls"] == 0
+    assert audit_rows[0].payload["max_active_multimodal"] == 0
 
 
 @pytest.mark.asyncio

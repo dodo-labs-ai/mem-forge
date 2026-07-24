@@ -83,6 +83,10 @@ class _SectionNode:
 class ExtractionContextPacker:
     """Build deterministic read-only context around an extraction unit."""
 
+    def __init__(self, all_units: list[ExtractionUnit]) -> None:
+        self._document_outline = _outline_from_units(all_units)
+        self._glossary_appendix = _glossary_from_units(all_units)
+
     def pack(
         self,
         *,
@@ -90,7 +94,6 @@ class ExtractionContextPacker:
         document_url: str,
         source_type: str,
         unit: ExtractionUnit,
-        all_units: list[ExtractionUnit],
         entities: list[str] | None = None,
     ) -> ExtractionContext:
         return ExtractionContext(
@@ -98,8 +101,8 @@ class ExtractionContextPacker:
             document_url=document_url,
             source_type=source_type,
             unit=unit,
-            document_outline=_outline_from_units(all_units),
-            glossary_appendix=_glossary_from_units(all_units),
+            document_outline=self._document_outline,
+            glossary_appendix=self._glossary_appendix,
             entities=entities or [],
         )
 

@@ -23,6 +23,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -42,6 +43,7 @@ from memforge.models import (
     SyncState,
     content_hash as compute_content_hash,
 )
+from memforge.pipeline.bounded_work import collect_bounded
 from memforge.pipeline.sync_memory import ProcessMemoryReclaimer, SyncMemoryObserver
 
 from memforge.pipeline.document_units import ExtractionContextPacker, UnitizationPolicy, unitize_markdown
@@ -121,11 +123,25 @@ def _aggregate_extraction_metrics(
         "structured_llm_calls",
         "prompt_chars",
         "structured_llm_elapsed_ms",
+        "extraction_queue_wait_ms",
+        "input_binary_bytes",
+        "multimodal_calls",
     )
-    return {
-        key: sum(int((result.metadata or {}).get(key, 0) or 0) for result in results)
-        for key in keys
-    }
+    aggregated = {key: sum(int((result.metadata or {}).get(key, 0) or 0) for result in results) for key in keys}
+    aggregated["max_active_multimodal"] = max(
+        (int((result.metadata or {}).get("max_active_multimodal", 0) or 0) for result in results),
+        default=0,
+    )
+    return aggregated
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionAdmission:
+    """Content-free observation of one admitted extraction work item."""
+
+    queue_wait_ms: int
+    multimodal: bool
+    active_multimodal: int
 
 
 class ExtractionWorkPool:
@@ -134,17 +150,42 @@ class ExtractionWorkPool:
     def __init__(self, max_workers: int) -> None:
         self.max_workers = max(1, int(max_workers))
         self._condition = asyncio.Condition()
+        self._multimodal_semaphore = asyncio.Semaphore(1)
         self._active_by_source: dict[str, int] = defaultdict(int)
         self._waiting_by_source: dict[str, int] = defaultdict(int)
         self._total_active = 0
+        self._active_multimodal = 0
 
     @asynccontextmanager
-    async def slot(self, source_id: str):
-        await self.acquire(source_id)
+    async def slot(self, source_id: str, *, multimodal: bool = False):
+        started_at = asyncio.get_running_loop().time()
+        multimodal_acquired = False
+        multimodal_active = False
+        worker_acquired = False
         try:
-            yield
+            if multimodal:
+                await self._multimodal_semaphore.acquire()
+                multimodal_acquired = True
+            await self.acquire(source_id)
+            worker_acquired = True
+            if multimodal:
+                self._active_multimodal += 1
+                multimodal_active = True
+            yield ExtractionAdmission(
+                queue_wait_ms=max(
+                    0,
+                    round((asyncio.get_running_loop().time() - started_at) * 1000),
+                ),
+                multimodal=multimodal,
+                active_multimodal=self._active_multimodal,
+            )
         finally:
-            await self.release(source_id)
+            if worker_acquired:
+                await self.release(source_id)
+            if multimodal_active:
+                self._active_multimodal -= 1
+            if multimodal_acquired:
+                self._multimodal_semaphore.release()
 
     async def acquire(self, source_id: str) -> None:
         async with self._condition:
@@ -194,6 +235,31 @@ class ExtractionWorkPool:
                 return False
         return True
 
+_PROCESS_EXTRACTION_POOL_LOCK = threading.Lock()
+_PROCESS_EXTRACTION_POOL: ExtractionWorkPool | None = None
+_PROCESS_EXTRACTION_POOL_LIMIT: int | None = None
+
+
+def get_process_extraction_work_pool(max_workers: int) -> ExtractionWorkPool:
+    """Return the one process-wide pool for heavy extraction work."""
+    global _PROCESS_EXTRACTION_POOL, _PROCESS_EXTRACTION_POOL_LIMIT
+
+    requested_limit = max(1, int(max_workers))
+    with _PROCESS_EXTRACTION_POOL_LOCK:
+        if _PROCESS_EXTRACTION_POOL is None:
+            _PROCESS_EXTRACTION_POOL = ExtractionWorkPool(requested_limit)
+            _PROCESS_EXTRACTION_POOL_LIMIT = requested_limit
+            return _PROCESS_EXTRACTION_POOL
+
+        if requested_limit != _PROCESS_EXTRACTION_POOL_LIMIT:
+            logger.warning(
+                "Ignoring sync extraction worker limit %d because process-wide limit %d is already active",
+                requested_limit,
+                _PROCESS_EXTRACTION_POOL_LIMIT,
+            )
+
+        return _PROCESS_EXTRACTION_POOL
+
 
 class DocumentLifecycleAdmission:
     """Process-wide admission control for memory-heavy document lifecycles."""
@@ -208,12 +274,17 @@ class DocumentLifecycleAdmission:
     @asynccontextmanager
     async def slot(self, source_id: str, doc_id: str):
         del source_id, doc_id
+        started_at = asyncio.get_running_loop().time()
         await self._semaphore.acquire()
+        queue_wait_ms = max(
+            0,
+            round((asyncio.get_running_loop().time() - started_at) * 1000),
+        )
         async with self._lock:
             self._active += 1
             self._max_active_seen = max(self._max_active_seen, self._active)
         try:
-            yield
+            yield queue_wait_ms
         finally:
             async with self._lock:
                 self._active -= 1
@@ -465,7 +536,7 @@ class GeneSyncOrchestrator:
         self.memory_store = memory_store
         self.source_support_detector = source_support_detector
         self.max_concurrent = max(1, max_concurrent)
-        self.extraction_pool = extraction_pool
+        self.extraction_pool = extraction_pool or ExtractionWorkPool(self.max_concurrent)
         self.document_lifecycle_admission = document_lifecycle_admission
         self.memory_observer = memory_observer
         self.memory_reclaimer = memory_reclaimer or ProcessMemoryReclaimer()
@@ -473,26 +544,7 @@ class GeneSyncOrchestrator:
         self._retry_sleep = retry_sleep
         self.structured_llm_client = structured_llm_client
 
-        self._llm_semaphore = asyncio.Semaphore(self.max_concurrent)
         self._db_lock = asyncio.Lock()
-        # Rate limiter: token-bucket style, refills at calls_per_minute rate
-        self._rate_limit_interval = 60.0 / max(self.max_concurrent * 10, 30)  # seconds between calls
-        self._last_llm_call_time: float = 0.0
-
-    async def _acquire_llm_slot(self) -> None:
-        """Acquire semaphore + enforce rate limit before an LLM call."""
-        await self._llm_semaphore.acquire()
-        import time
-
-        now = time.monotonic()
-        elapsed = now - self._last_llm_call_time
-        if elapsed < self._rate_limit_interval:
-            await asyncio.sleep(self._rate_limit_interval - elapsed)
-        self._last_llm_call_time = time.monotonic()
-
-    def _release_llm_slot(self) -> None:
-        """Release semaphore after an LLM call."""
-        self._llm_semaphore.release()
 
     def _source_parallelism_limit(self) -> int:
         return self.max_concurrent
@@ -503,21 +555,20 @@ class GeneSyncOrchestrator:
         return min(self.max_concurrent, self.document_lifecycle_admission.max_active)
 
     @asynccontextmanager
-    async def _heavy_work_slot(self, source_id: str):
-        if self.extraction_pool is not None:
-            async with self.extraction_pool.slot(source_id):
-                yield
-            return
-        async with self._llm_semaphore:
-            yield
+    async def _heavy_work_slot(self, source_id: str, *, multimodal: bool = False):
+        async with self.extraction_pool.slot(
+            source_id,
+            multimodal=multimodal,
+        ) as admission:
+            yield admission
 
     @asynccontextmanager
     async def _document_lifecycle_slot(self, source_id: str, doc_id: str):
         if self.document_lifecycle_admission is None:
-            yield
+            yield 0
             return
-        async with self.document_lifecycle_admission.slot(source_id, doc_id):
-            yield
+        async with self.document_lifecycle_admission.slot(source_id, doc_id) as queue_wait_ms:
+            yield queue_wait_ms
 
     def _memory_sample(
         self,
@@ -1295,9 +1346,15 @@ class GeneSyncOrchestrator:
             nonlocal source_unit_id
             source_unit_id = candidate_source_unit_id
 
-        async with self._document_lifecycle_slot(source_id, doc_id):
+        async with self._document_lifecycle_slot(source_id, doc_id) as document_queue_wait_ms:
             lifecycle_started = asyncio.get_running_loop().time()
-            self._memory_sample("document_lifecycle_enter", source_id=source_id, run_id=run_id, doc_id=doc_id)
+            self._memory_sample(
+                "document_lifecycle_enter",
+                source_id=source_id,
+                run_id=run_id,
+                doc_id=doc_id,
+                document_queue_wait_ms=document_queue_wait_ms,
+            )
             metrics_scope = (
                 self.structured_llm_client.metrics_scope(metrics_collector)
                 if self.structured_llm_client is not None and metrics_collector is not None
@@ -2442,25 +2499,37 @@ class GeneSyncOrchestrator:
     ) -> MemoryExtractionResult:
         """Execute all transient Observation batches as one extraction outcome."""
 
-        batch_semaphore = asyncio.Semaphore(self._source_parallelism_limit())
-
         async def extract_one(batch):
             primary_ids = set(batch.primary_observation_ids)
-            async with batch_semaphore:
-                async with self._heavy_work_slot(source_id):
-                    batch_images = self._projection_images(
-                        projection=projection,
-                        source_artifacts=source_artifacts,
-                        observation_ids=primary_ids,
-                    )
-                    return await self.memory_extractor.extract_projection_batch_memories(
-                        batch,
-                        source_type=source_type,
-                        doc_type=doc_type,
-                        images=batch_images,
-                    )
+            async with self._heavy_work_slot(
+                source_id,
+                multimodal=batch.primary_image_bytes > 0,
+            ) as admission:
+                batch_images = self._projection_images(
+                    projection=projection,
+                    source_artifacts=source_artifacts,
+                    observation_ids=primary_ids,
+                )
+                result = await self.memory_extractor.extract_projection_batch_memories(
+                    batch,
+                    source_type=source_type,
+                    doc_type=doc_type,
+                    images=batch_images,
+                )
+                result.metadata = {
+                    **(result.metadata or {}),
+                    "extraction_queue_wait_ms": admission.queue_wait_ms,
+                    "input_binary_bytes": batch.primary_image_bytes,
+                    "multimodal_calls": int(admission.multimodal),
+                    "max_active_multimodal": admission.active_multimodal,
+                }
+                return result
 
-        results = await asyncio.gather(*(extract_one(batch) for batch in projection_batches))
+        results = await collect_bounded(
+            projection_batches,
+            extract_one,
+            max_concurrent=self._source_parallelism_limit(),
+        )
         llm_metrics = _aggregate_extraction_metrics(results)
         memories = []
         failures = [result for result in results if result.error_type]
@@ -2546,8 +2615,7 @@ class GeneSyncOrchestrator:
         """Extract a full document by deterministic structural units."""
         unitization_policy = UnitizationPolicy()
         units = unitize_markdown(markdown_body, doc_id=doc_id, policy=unitization_policy)
-        packer = ExtractionContextPacker()
-        unit_semaphore = asyncio.Semaphore(self._source_parallelism_limit())
+        packer = ExtractionContextPacker(units)
 
         async def extract_one(unit) -> MemoryExtractionResult:
             context = packer.pack(
@@ -2555,17 +2623,27 @@ class GeneSyncOrchestrator:
                 document_url=document_url,
                 source_type=source_type,
                 unit=unit,
-                all_units=units,
                 entities=(),
             )
-            async with unit_semaphore:
-                async with self._heavy_work_slot(source_id):
-                    return await self.memory_extractor.extract_unit_memories(
-                        context,
-                        doc_type=doc_type,
-                    )
+            async with self._heavy_work_slot(source_id) as admission:
+                result = await self.memory_extractor.extract_unit_memories(
+                    context,
+                    doc_type=doc_type,
+                )
+                result.metadata = {
+                    **(result.metadata or {}),
+                    "extraction_queue_wait_ms": admission.queue_wait_ms,
+                    "input_binary_bytes": 0,
+                    "multimodal_calls": 0,
+                    "max_active_multimodal": admission.active_multimodal,
+                }
+                return result
 
-        results = await asyncio.gather(*(extract_one(unit) for unit in units))
+        results = await collect_bounded(
+            units,
+            extract_one,
+            max_concurrent=self._source_parallelism_limit(),
+        )
         llm_metrics = _aggregate_extraction_metrics(results)
 
         all_memories = []
