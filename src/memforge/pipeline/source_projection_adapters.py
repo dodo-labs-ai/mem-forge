@@ -280,6 +280,7 @@ def project_source_item(
                     "size_bytes": artifact.size_bytes,
                     "sha256": artifact.sha256,
                     "uri": artifact.uri,
+                    "inference_eligible": artifact.inference_eligible,
                     "parent_observation_id": _stable_id(
                         "obs",
                         unit_id,

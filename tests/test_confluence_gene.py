@@ -8,7 +8,7 @@ import pytest
 
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
 from memforge.models import ContentItem
-from memforge.source_artifacts import SourceArtifactContractError
+from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 
 
 def test_confluence_schema_hides_runtime_transport_fields_from_ui():
@@ -302,7 +302,7 @@ async def test_fetch_rejects_missing_or_invalid_storage_body(payload):
 
 
 @pytest.mark.asyncio
-async def test_fetch_materializes_confluence_image_attachment_with_parent_identity():
+async def test_fetch_describes_confluence_image_attachment_with_parent_identity():
     image = b"\x89PNG\r\n\x1a\nknown-confluence-image"
     gene = ConfluenceGene(
         config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
@@ -339,7 +339,6 @@ async def test_fetch_materializes_confluence_image_attachment_with_parent_identi
                     },
                 }
             ),
-            BinaryResponse(image, "image/png"),
         ]
     )
     item = ContentItem(
@@ -361,7 +360,48 @@ async def test_fetch_materializes_confluence_image_attachment_with_parent_identi
     assert artifact.parent_provider_key == "123:body"
     assert artifact.provider_revision == "3"
     assert artifact.media_type == "image/png"
-    assert artifact.body == image
+    assert artifact.declared_size_bytes == len(image)
+    assert artifact.locator["download_path"] == "/download/attachments/123/diagram.png"
+    assert gene._get.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_open_source_artifact_streams_confluence_attachment():
+    image = b"\x89PNG\r\n\x1a\nknown-confluence-image"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/download/attachments/123/diagram.png"
+        return httpx.Response(
+            200,
+            content=image,
+            headers={"content-type": "image/png", "content-length": str(len(image))},
+        )
+
+    gene = ConfluenceGene(
+        config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
+        source_id="src-confluence",
+    )
+    gene._client = httpx.AsyncClient(
+        base_url="https://wiki.example.test",
+        transport=httpx.MockTransport(handler),
+    )
+    gene._request_limiter = None
+    artifact = RawSourceArtifact(
+        provider_key="att-42",
+        parent_observation_type="page_body",
+        parent_provider_key="123:body",
+        provider_revision="3",
+        filename="diagram.png",
+        media_type="image/png",
+        declared_size_bytes=len(image),
+        locator={"download_path": "/download/attachments/123/diagram.png"},
+    )
+    try:
+        async with gene.open_source_artifact(artifact) as download:
+            assert b"".join([chunk async for chunk in download.chunks]) == image
+            assert download.content_length == len(image)
+    finally:
+        await gene._client.aclose()
 
 
 @pytest.mark.asyncio
@@ -417,7 +457,6 @@ async def test_fetch_does_not_count_unsupported_confluence_attachments_against_i
                     },
                 }
             ),
-            BinaryResponse(image, "image/png"),
         ]
     )
     item = ContentItem(
@@ -433,7 +472,7 @@ async def test_fetch_does_not_count_unsupported_confluence_attachments_against_i
     raw = await gene.fetch(item)
 
     assert [artifact.provider_key for artifact in raw.artifacts] == ["image-1"]
-    assert gene._get.await_count == 2
+    assert gene._get.await_count == 1
 
 
 @pytest.mark.asyncio

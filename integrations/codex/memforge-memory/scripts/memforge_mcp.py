@@ -1187,11 +1187,17 @@ def _fetch_resource_file(target: ResourceTarget) -> dict[str, Any]:
                     digest.update(chunk)
                     observed_size += len(chunk)
                     handle.write(chunk)
+            observed_sha256 = digest.hexdigest()
+            _verify_resource_integrity(
+                headers,
+                observed_size=observed_size,
+                observed_sha256=observed_sha256,
+            )
             final_path = _cache_artifact_path(
                 target.resource_id,
                 target.kind,
                 filename,
-                digest.hexdigest()[:16],
+                observed_sha256[:16],
             )
             if final_path.exists():
                 tmp_path.unlink(missing_ok=True)
@@ -1227,6 +1233,27 @@ def _resource_metadata(
     if sha256 := headers.get("x-content-sha256"):
         metadata["sha256"] = sha256
     return metadata
+
+
+def _verify_resource_integrity(
+    headers: dict[str, str],
+    *,
+    observed_size: int,
+    observed_sha256: str,
+) -> None:
+    """Fail closed when authoritative resource headers disagree with the stream."""
+
+    expected_size = headers.get("content-length")
+    if expected_size:
+        try:
+            parsed_size = int(expected_size)
+        except ValueError as exc:
+            raise OSError("resource response has an invalid Content-Length") from exc
+        if parsed_size != observed_size:
+            raise OSError("resource byte count does not match Content-Length")
+    expected_sha256 = headers.get("x-content-sha256")
+    if expected_sha256 and expected_sha256.strip().lower() != observed_sha256:
+        raise OSError("resource SHA-256 does not match X-Content-SHA256")
 
 
 def _parse_resource_url(url: str, origin: str) -> ResourceTarget | None:

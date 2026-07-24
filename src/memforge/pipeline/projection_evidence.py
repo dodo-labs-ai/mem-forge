@@ -14,7 +14,10 @@ from memforge.memory.evidence import (
     evidence_reference_id_for,
 )
 from memforge.models import RawMemory, content_hash
-from memforge.pipeline.projection_context import context_observation_ids_for
+from memforge.pipeline.projection_context import (
+    context_observation_ids_for,
+    observation_is_inference_eligible,
+)
 from memforge.source_projection import (
     AnchorKind,
     SourceAnchor,
@@ -58,25 +61,35 @@ def build_projected_claim_evidence(
     unit_revision = projection.source_unit_revisions[0]
     observations_by_id = {item.id: item for item in projection.observations}
     revisions_by_observation = {item.observation_id: item for item in projection.observation_revisions}
+    inference_eligible_ids = {
+        observation_id
+        for observation_id, revision in revisions_by_observation.items()
+        if observation_id in observations_by_id
+        and observation_is_inference_eligible(
+            observations_by_id[observation_id].observation_type,
+            revision.metadata,
+        )
+    }
     ordered_observation_ids = [
-        item.id for item in projection.observations if item.id in revisions_by_observation
+        item.id for item in projection.observations if item.id in inference_eligible_ids
     ]
     current_evidence_ids = {
         anchor.observation_id
         for delta in projection.deltas
         for anchor in delta.changed_anchors
-        if anchor.observation_id in revisions_by_observation
+        if anchor.observation_id in inference_eligible_ids
     } | {
         observation_id
         for delta in projection.deltas
         for observation_id in delta.added_observation_ids
-        if observation_id in revisions_by_observation
+        if observation_id in inference_eligible_ids
     }
     candidate_ids = current_evidence_ids or set(ordered_observation_ids)
     artifact_observation_ids = {
         observation_id
         for observation_id, observation in observations_by_id.items()
         if observation.observation_type == "binary_artifact"
+        and observation_id in inference_eligible_ids
     }
 
     units_by_id: dict[str, EvidenceUnit] = {}

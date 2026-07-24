@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -2916,6 +2917,7 @@ def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):
             "content-type": "application/pdf",
             "content-disposition": 'attachment; filename="source.pdf"',
             "content-length": str(len(body)),
+            "x-content-sha256": hashlib.sha256(body).hexdigest(),
         }
 
         def __init__(self):
@@ -2958,6 +2960,53 @@ def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):
     assert result["size_bytes"] == len(body)
     assert local_path.parent == tmp_path
     assert local_path.read_bytes() == body
+
+
+def test_mcp_proxy_file_mode_rejects_truncated_resource(monkeypatch, tmp_path):
+    proxy = _load_plugin_mcp_proxy()
+    body = b"truncated"
+
+    class FakeResponse:
+        headers = {
+            "content-type": "image/png",
+            "content-length": str(len(body) + 1),
+            "x-content-sha256": hashlib.sha256(body).hexdigest(),
+        }
+
+        def __init__(self):
+            self._offset = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            if size is None or size < 0:
+                size = len(body) - self._offset
+            chunk = body[self._offset : self._offset + size]
+            self._offset += len(chunk)
+            return chunk
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "http://memforge.test")
+    monkeypatch.setenv("MEMFORGE_ARTIFACT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._handle_get_resource(
+        {
+            "url": "/api/source-artifacts/obsrev-1",
+            "mode": "file",
+        }
+    )
+
+    assert result["error"] == "resource fetch failed"
+    assert result["detail"] == "resource byte count does not match Content-Length"
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_mcp_proxy_rejects_foreign_and_ambiguous_resource_urls(monkeypatch):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -56,7 +57,7 @@ from memforge.pipeline.sync import (
 )
 from memforge.runtime import SourceLifecycleMaintenanceError, SyncService
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
-from memforge.source_artifacts import RawSourceArtifact
+from memforge.source_artifacts import RawSourceArtifact, SourceArtifactDownload
 from memforge.config import AppConfig, SyncConfig
 from memforge.storage.database import Database
 from memforge.storage.database import MIGRATIONS
@@ -2651,10 +2652,12 @@ class StubDocumentStore:
         filename,
         content,
         content_type,
+        size_bytes,
+        sha256,
     ):
-        del content_type
+        del content_type, size_bytes, sha256
         uri = f"stub-artifact://{source_id}/{artifact_id}/{filename}"
-        self.source_artifacts[uri] = content
+        self.source_artifacts[uri] = content.read()
         self.source_artifact_ids.append(artifact_id)
         return uri
 
@@ -3159,9 +3162,24 @@ class JiraArtifactGene(BlockingFetchGene):
                     provider_revision="1",
                     filename="architecture.png",
                     media_type="image/png",
-                    body=b"\x89PNG\r\n\x1a\nstable-image",
+                    declared_size_bytes=len(b"\x89PNG\r\n\x1a\nstable-image"),
+                    locator={"attachment_id": "attachment-7001"},
                 ),
             ),
+        )
+
+    @asynccontextmanager
+    async def open_source_artifact(self, artifact):
+        del artifact
+        payload = b"\x89PNG\r\n\x1a\nstable-image"
+
+        async def chunks():
+            yield payload
+
+        yield SourceArtifactDownload(
+            chunks=chunks(),
+            media_type="image/png",
+            content_length=len(payload),
         )
 
 

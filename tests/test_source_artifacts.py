@@ -1,180 +1,208 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import asynccontextmanager
 
 import pytest
 
+from memforge import source_artifacts
 from memforge.source_artifacts import (
-    MAX_SOURCE_ARTIFACT_BYTES,
     MAX_SOURCE_ARTIFACTS_PER_UNIT,
     RawSourceArtifact,
     SourceArtifactContractError,
-    materialize_source_artifact,
+    SourceArtifactDownload,
     materialize_source_artifacts,
 )
 from memforge.storage.document_store import LocalDocumentStore
 
 
-def test_materialized_source_artifact_round_trips_exact_bytes_and_identity(tmp_path) -> None:
+def _artifact(provider_key: str, payload: bytes, **overrides) -> RawSourceArtifact:
+    values = {
+        "provider_key": provider_key,
+        "parent_observation_type": "page_body",
+        "parent_provider_key": "page-1:body",
+        "provider_revision": "1",
+        "filename": f"{provider_key}.png",
+        "media_type": "image/png",
+        "declared_size_bytes": len(payload),
+        "locator": {"payload_key": provider_key},
+    }
+    values.update(overrides)
+    return RawSourceArtifact(**values)
+
+
+def _opener(payloads: dict[str, bytes], *, transport_length_delta: int = 0):
+    @asynccontextmanager
+    async def open_artifact(artifact: RawSourceArtifact):
+        payload = payloads[str(artifact.locator["payload_key"])]
+
+        async def chunks():
+            midpoint = max(1, len(payload) // 2)
+            yield payload[:midpoint]
+            yield payload[midpoint:]
+
+        yield SourceArtifactDownload(
+            chunks=chunks(),
+            media_type=artifact.media_type,
+            content_length=len(payload) + transport_length_delta,
+        )
+
+    return open_artifact
+
+
+@pytest.mark.asyncio
+async def test_materialization_streams_exact_bytes_and_identity(tmp_path) -> None:
     store = LocalDocumentStore(str(tmp_path))
     payload = b"\x89PNG\r\n\x1a\nknown-image-bytes"
-    raw = RawSourceArtifact(
-        provider_key="attachment-42",
-        parent_observation_type="comment",
-        parent_provider_key="comment-7",
-        provider_revision="3",
-        filename="diagram.png",
-        media_type="image/png",
-        body=payload,
-        declared_size_bytes=len(payload),
-    )
 
-    artifact = materialize_source_artifact(
+    (artifact,) = await materialize_source_artifacts(
         source_id="source-a",
         source_unit_key="issue-10",
-        artifact=raw,
+        artifacts=(_artifact("attachment-42", payload),),
         store=store,
+        open_artifact=_opener({"attachment-42": payload}),
     )
 
     assert artifact.provider_key == "attachment-42"
-    assert artifact.parent_observation_type == "comment"
-    assert artifact.parent_provider_key == "comment-7"
     assert artifact.sha256 == hashlib.sha256(payload).hexdigest()
     assert artifact.size_bytes == len(payload)
-    assert artifact.media_type == "image/png"
+    assert artifact.inference_eligible is True
     assert store.read_artifact(artifact.uri) == payload
 
-
-def test_materialization_rejects_provider_size_drift_before_projection(tmp_path) -> None:
-    store = LocalDocumentStore(str(tmp_path))
-    raw = RawSourceArtifact(
-        provider_key="attachment-42",
-        parent_observation_type="page_body",
-        parent_provider_key="page-1:body",
-        provider_revision="1",
-        filename="diagram.png",
-        media_type="image/png",
-        body=b"actual",
-        declared_size_bytes=99,
+    replacement = b"\x89PNG\r\n\x1a\nrevised-image-bytes"
+    (revised,) = await materialize_source_artifacts(
+        source_id="source-a",
+        source_unit_key="issue-10",
+        artifacts=(_artifact("attachment-42", replacement),),
+        store=store,
+        open_artifact=_opener({"attachment-42": replacement}),
     )
+
+    assert revised.uri != artifact.uri
+    assert store.read_artifact(artifact.uri) == payload
+    assert store.read_artifact(revised.uri) == replacement
+
+
+@pytest.mark.asyncio
+async def test_storage_and_inference_budgets_are_independent(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(source_artifacts, "MAX_SOURCE_ARTIFACT_INFERENCE_BYTES", 4)
+    monkeypatch.setattr(source_artifacts, "MAX_SOURCE_ARTIFACT_STORAGE_BYTES", 32)
+    payload = b"retrievable-original"
+
+    (artifact,) = await materialize_source_artifacts(
+        source_id="source-a",
+        source_unit_key="page-1",
+        artifacts=(_artifact("large", payload),),
+        store=LocalDocumentStore(str(tmp_path)),
+        open_artifact=_opener({"large": payload}),
+    )
+
+    assert artifact.size_bytes > source_artifacts.MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
+    assert artifact.inference_eligible is False
+
+
+@pytest.mark.asyncio
+async def test_materialization_rejects_descriptor_or_transport_size_drift(tmp_path) -> None:
+    payload = b"actual"
+    descriptor = _artifact("attachment-42", payload, declared_size_bytes=99)
 
     with pytest.raises(SourceArtifactContractError, match="declared size"):
-        materialize_source_artifact(
+        await materialize_source_artifacts(
             source_id="source-a",
             source_unit_key="page-1",
-            artifact=raw,
-            store=store,
+            artifacts=(descriptor,),
+            store=LocalDocumentStore(str(tmp_path)),
+            open_artifact=_opener({"attachment-42": payload}),
+        )
+
+    with pytest.raises(SourceArtifactContractError, match="transport length"):
+        await materialize_source_artifacts(
+            source_id="source-a",
+            source_unit_key="page-1",
+            artifacts=(_artifact("attachment-42", payload),),
+            store=LocalDocumentStore(str(tmp_path)),
+            open_artifact=_opener({"attachment-42": payload}, transport_length_delta=1),
         )
 
 
-def test_source_artifact_set_preserves_multiple_identities_and_rejects_duplicates(tmp_path) -> None:
-    store = LocalDocumentStore(str(tmp_path))
-
-    def artifact(provider_key: str) -> RawSourceArtifact:
-        return RawSourceArtifact(
-            provider_key=provider_key,
-            parent_observation_type="page_body",
-            parent_provider_key="page-1:body",
-            provider_revision="1",
-            filename=f"{provider_key}.png",
-            media_type="image/png",
-            body=provider_key.encode(),
-        )
-
-    stored = materialize_source_artifacts(
+@pytest.mark.asyncio
+async def test_materialization_validates_the_set_before_persistence(tmp_path) -> None:
+    payloads = {"one": b"one", "two": b"two"}
+    stored = await materialize_source_artifacts(
         source_id="source-a",
         source_unit_key="page-1",
-        artifacts=(artifact("attachment-1"), artifact("attachment-2")),
-        store=store,
+        artifacts=tuple(_artifact(key, body) for key, body in payloads.items()),
+        store=LocalDocumentStore(str(tmp_path)),
+        open_artifact=_opener(payloads),
     )
-
     assert len({item.id for item in stored}) == 2
+
     with pytest.raises(SourceArtifactContractError, match="duplicate"):
-        materialize_source_artifacts(
+        await materialize_source_artifacts(
             source_id="source-a",
             source_unit_key="page-1",
-            artifacts=(artifact("attachment-1"), artifact("attachment-1")),
-            store=store,
+            artifacts=(
+                _artifact("one", payloads["one"]),
+                _artifact("one", payloads["one"]),
+            ),
+            store=LocalDocumentStore(str(tmp_path)),
+            open_artifact=_opener(payloads),
         )
 
 
-def test_materialization_accepts_customer_sized_bounded_artifact_set(tmp_path) -> None:
-    store = LocalDocumentStore(str(tmp_path))
-    artifact_count = 56
-
-    stored = materialize_source_artifacts(
-        source_id="source-a",
-        source_unit_key="page-1",
-        artifacts=tuple(
-            RawSourceArtifact(
-                provider_key=f"attachment-{index}",
-                parent_observation_type="page_body",
-                parent_provider_key="page-1:body",
-                provider_revision="1",
-                filename=f"attachment-{index}.png",
-                media_type="image/png",
-                body=f"image-{index}".encode(),
-            )
-            for index in range(artifact_count)
-        ),
-        store=store,
-    )
-
-    assert artifact_count <= MAX_SOURCE_ARTIFACTS_PER_UNIT
-    assert len(stored) == artifact_count
-
-
-def test_materialization_rejects_artifact_set_beyond_persistence_budget(tmp_path) -> None:
-    store = LocalDocumentStore(str(tmp_path))
-
+@pytest.mark.asyncio
+async def test_materialization_rejects_count_and_storage_limits(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    payload = b"12345"
     with pytest.raises(SourceArtifactContractError, match="Artifact limit"):
-        materialize_source_artifacts(
+        await materialize_source_artifacts(
             source_id="source-a",
             source_unit_key="page-1",
             artifacts=tuple(
-                RawSourceArtifact(
-                    provider_key=f"attachment-{index}",
-                    parent_observation_type="page_body",
-                    parent_provider_key="page-1:body",
-                    provider_revision="1",
-                    filename=f"attachment-{index}.png",
-                    media_type="image/png",
-                    body=b"x",
-                )
-                for index in range(MAX_SOURCE_ARTIFACTS_PER_UNIT + 1)
+                _artifact(f"attachment-{index}", payload) for index in range(MAX_SOURCE_ARTIFACTS_PER_UNIT + 1)
             ),
-            store=store,
+            store=LocalDocumentStore(str(tmp_path)),
+            open_artifact=_opener({}),
         )
 
-
-@pytest.mark.parametrize(
-    ("media_type", "body", "error"),
-    [
-        ("application/octet-stream", b"binary", "unsupported"),
-        ("image/png", b"x" * (MAX_SOURCE_ARTIFACT_BYTES + 1), "byte limit"),
-    ],
-)
-def test_materialization_rejects_unsupported_or_oversized_artifact(
-    tmp_path,
-    media_type: str,
-    body: bytes,
-    error: str,
-) -> None:
-    store = LocalDocumentStore(str(tmp_path))
-    raw = RawSourceArtifact(
-        provider_key="attachment-42",
-        parent_observation_type="page_body",
-        parent_provider_key="page-1:body",
-        provider_revision="1",
-        filename="artifact.bin",
-        media_type=media_type,
-        body=body,
-    )
-
-    with pytest.raises(SourceArtifactContractError, match=error):
-        materialize_source_artifact(
+    monkeypatch.setattr(source_artifacts, "MAX_SOURCE_ARTIFACT_STORAGE_BYTES", 4)
+    with pytest.raises(SourceArtifactContractError, match="storage limit"):
+        await materialize_source_artifacts(
             source_id="source-a",
             source_unit_key="page-1",
-            artifact=raw,
-            store=store,
+            artifacts=(_artifact("one", payload),),
+            store=LocalDocumentStore(str(tmp_path)),
+            open_artifact=_opener({"one": payload}),
+        )
+
+    monkeypatch.setattr(source_artifacts, "MAX_SOURCE_ARTIFACT_STORAGE_BYTES", 10)
+    monkeypatch.setattr(
+        source_artifacts,
+        "MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT",
+        8,
+    )
+    with pytest.raises(SourceArtifactContractError, match="storage aggregate"):
+        await materialize_source_artifacts(
+            source_id="source-a",
+            source_unit_key="page-1",
+            artifacts=(
+                _artifact("one", payload),
+                _artifact("two", payload),
+            ),
+            store=LocalDocumentStore(str(tmp_path)),
+            open_artifact=_opener({"one": payload, "two": payload}),
+        )
+
+    with pytest.raises(SourceArtifactContractError, match="storage aggregate"):
+        await materialize_source_artifacts(
+            source_id="source-a",
+            source_unit_key="page-1",
+            artifacts=(
+                _artifact("one", payload, declared_size_bytes=None),
+                _artifact("two", payload, declared_size_bytes=None),
+            ),
+            store=LocalDocumentStore(str(tmp_path)),
+            open_artifact=_opener({"one": payload, "two": payload}),
         )

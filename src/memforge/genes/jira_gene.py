@@ -10,6 +10,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from memforge.genes.atlassian_auth import (
     bearer_headers,
     request_with_rate_limit_retry,
     require_https_base_url,
+    stream_with_rate_limit_retry,
     tls_verify,
 )
 from memforge.genes.base import Gene
@@ -43,13 +45,15 @@ from memforge.models import (
 )
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
-    MAX_SOURCE_ARTIFACT_BYTES,
-    MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT,
     MAX_SOURCE_ARTIFACTS_PER_UNIT,
+    MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
+    MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT,
     RawSourceArtifact,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
     SourceArtifactContractError,
+    SourceArtifactDownload,
     normalize_source_artifact_media_type,
+    parse_source_artifact_content_length,
 )
 
 logger = logging.getLogger(__name__)
@@ -664,7 +668,7 @@ class JiraGene(Gene):
         )
 
     async def _fetch_source_artifacts(self, issue: dict) -> tuple[RawSourceArtifact, ...]:
-        """Return bounded issue attachments with exact bytes."""
+        """Return bounded issue attachment descriptors."""
 
         fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
         raw_descriptors = fields.get("attachment")
@@ -694,14 +698,14 @@ class JiraGene(Gene):
             size_value = descriptor.get("size")
             if not isinstance(size_value, int) or isinstance(size_value, bool) or size_value < 0:
                 raise SourceArtifactContractError("Jira attachment is missing a valid file size")
-            if size_value > MAX_SOURCE_ARTIFACT_BYTES:
+            if size_value > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
                 raise SourceArtifactContractError(
-                    f"Jira attachment exceeds {MAX_SOURCE_ARTIFACT_BYTES} byte limit"
+                    f"Jira attachment exceeds {MAX_SOURCE_ARTIFACT_STORAGE_BYTES} byte storage limit"
                 )
             declared_bytes += size_value
-            if declared_bytes > MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT:
+            if declared_bytes > MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT:
                 raise SourceArtifactContractError(
-                    "Jira attachments exceed the Source Unit byte aggregate limit"
+                    "Jira attachments exceed the Source Unit storage aggregate limit"
                 )
             attachment_id = str(descriptor.get("id") or "").strip()
             filename = str(descriptor.get("filename") or "").strip()
@@ -710,11 +714,6 @@ class JiraGene(Gene):
             if not attachment_id or not filename or not content_url:
                 raise SourceArtifactContractError("Jira attachment identity is incomplete")
             request_path = self._attachment_request_path(content_url)
-            response = await self._request("GET", request_path)
-            response.raise_for_status()
-            response_media_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
-            if response_media_type and response_media_type != media_type:
-                raise SourceArtifactContractError("Jira attachment media type changed during download")
             parent_type, parent_key = self._jira_attachment_parent(
                 filename=filename,
                 issue_id=issue_id,
@@ -728,12 +727,40 @@ class JiraGene(Gene):
                     provider_revision=provider_revision,
                     filename=filename,
                     media_type=media_type,
-                    body=bytes(response.content),
                     declared_size_bytes=size_value,
-                    locator={"attachment_id": attachment_id},
+                    locator={
+                        "attachment_id": attachment_id,
+                        "request_path": request_path,
+                    },
                 )
             )
         return tuple(artifacts)
+
+    @asynccontextmanager
+    async def open_source_artifact(self, artifact: RawSourceArtifact):
+        """Open one Jira attachment without buffering its body."""
+
+        request_path = str(artifact.locator.get("request_path") or "").strip()
+        if not request_path:
+            raise SourceArtifactContractError("Jira attachment locator is incomplete")
+        async with stream_with_rate_limit_retry(
+            self._client,
+            "GET",
+            request_path,
+            product_name="Jira",
+            limiter=getattr(self, "_request_limiter", None),
+            zero_quota_message=_zero_quota_message(
+                getattr(self, "_auth_mode", _auth_mode(self.config))
+            ),
+        ) as response:
+            yield SourceArtifactDownload(
+                chunks=response.aiter_bytes(),
+                media_type=response.headers.get("content-type"),
+                content_length=parse_source_artifact_content_length(
+                    response.headers.get("content-length")
+                ),
+                content_encoding=response.headers.get("content-encoding"),
+            )
 
     def _attachment_request_path(self, content_url: str) -> str:
         parsed = urlsplit(content_url)

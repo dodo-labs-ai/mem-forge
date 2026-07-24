@@ -161,6 +161,7 @@ def test_visual_claim_is_bound_to_exact_artifact_revision_without_fabricated_quo
         size_bytes=4,
         sha256="a" * 64,
         uri="/stored/result.png",
+        inference_eligible=True,
     )
     projection = project_source_item(
         source_id="src-jira",
@@ -211,6 +212,34 @@ def test_visual_claim_is_bound_to_exact_artifact_revision_without_fabricated_quo
     assert staged.units[0].content == ""
     assert staged.units[0].excerpt is None
     assert staged.units[0].evidence_provenance.value == "source_artifact"
+
+    ineligible_metadata = dict(artifact_revision.metadata)
+    ineligible_metadata["source_artifact"] = {
+        **dict(ineligible_metadata["source_artifact"]),
+        "inference_eligible": False,
+    }
+    ineligible_projection = replace(
+        projection,
+        observation_revisions=tuple(
+            replace(revision, metadata=ineligible_metadata)
+            if revision.id == artifact_revision.id
+            else revision
+            for revision in projection.observation_revisions
+        ),
+    )
+    with pytest.raises(ValueError, match="outside the current evidence scope"):
+        build_projected_claim_evidence(
+            projection=ineligible_projection,
+            raw_memories=(raw,),
+            doc_id="jira-PAY-12",
+            source_type="jira",
+            project_key="PAY",
+            visibility="workspace",
+            owner_user_id=None,
+            repo_identifier=None,
+            access_context_hash="workspace-pay",
+            extractor_run_id="sync-1",
+        )
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -253,6 +254,64 @@ async def request_with_rate_limit_retry(
         await asyncio.sleep(delay)
 
     raise RuntimeError("Atlassian request retry loop exited unexpectedly")
+
+
+@asynccontextmanager
+async def stream_with_rate_limit_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    product_name: str,
+    limiter: AtlassianRequestLimiter | None = None,
+    zero_quota_message: str | None = None,
+):
+    """Open one streaming Atlassian response with bounded retry ownership."""
+
+    for attempt in range(1, ATLASSIAN_REQUEST_ATTEMPTS + 1):
+        response: httpx.Response | None = None
+        try:
+            request = client.build_request(method, url)
+
+            async def operation() -> httpx.Response:
+                return await client.send(request, stream=True)
+
+            if limiter is not None:
+                response = await limiter.run(
+                    operation,
+                    delay_for_response=lambda item: _limiter_delay_seconds(item, attempt),
+                )
+            else:
+                response = await operation()
+        except httpx.TransportError as exc:
+            if attempt == ATLASSIAN_REQUEST_ATTEMPTS:
+                detail = str(exc) or type(exc).__name__
+                raise AtlassianRequestTransportError(
+                    f"{product_name} request failed to reach {url} after "
+                    f"{ATLASSIAN_REQUEST_ATTEMPTS} attempts ({detail}). "
+                    "The instance may be slow or unreachable; check VPN or network, then retry."
+                ) from exc
+            await asyncio.sleep(ATLASSIAN_TRANSPORT_RETRY_DELAY_SECONDS)
+            continue
+
+        try:
+            if response.status_code != 429:
+                response.raise_for_status()
+                yield response
+                return
+            if _is_zero_quota_rate_limit(response):
+                raise AtlassianZeroQuotaRateLimitError(
+                    zero_quota_message or f"{product_name} REST API quota is zero for this request."
+                )
+            if attempt == ATLASSIAN_REQUEST_ATTEMPTS:
+                raise AtlassianRateLimitError(
+                    f"{product_name} rate limit persisted after {ATLASSIAN_REQUEST_ATTEMPTS} attempts for {url}."
+                )
+            await asyncio.sleep(_retry_delay_seconds(response, attempt))
+        finally:
+            await response.aclose()
+
+    raise RuntimeError("Atlassian streaming request retry loop exited unexpectedly")
 
 
 def _limiter_delay_seconds(resp: httpx.Response, attempt: int) -> float | None:

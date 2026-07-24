@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
@@ -18,6 +19,7 @@ from memforge.genes.atlassian_auth import (
     bearer_headers,
     get_with_rate_limit_retry,
     require_https_base_url,
+    stream_with_rate_limit_retry,
     tls_verify,
 )
 from memforge.genes.base import Gene
@@ -35,13 +37,15 @@ from memforge.models import (
 from memforge.pipeline.normalizer_utils import html_to_markdown, strip_boilerplate
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
-    MAX_SOURCE_ARTIFACT_BYTES,
-    MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT,
     MAX_SOURCE_ARTIFACTS_PER_UNIT,
+    MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
+    MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT,
     RawSourceArtifact,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
     SourceArtifactContractError,
+    SourceArtifactDownload,
     normalize_source_artifact_media_type,
+    parse_source_artifact_content_length,
 )
 
 logger = logging.getLogger(__name__)
@@ -574,7 +578,7 @@ class ConfluenceGene(Gene):
         *,
         first_page: dict,
     ) -> tuple[RawSourceArtifact, ...]:
-        """Return bounded provider attachments with exact bytes."""
+        """Return bounded provider attachment descriptors."""
 
         descriptors: list[dict] = []
         descriptor_count = 0
@@ -624,14 +628,14 @@ class ConfluenceGene(Gene):
             size_value = extensions.get("fileSize")
             if not isinstance(size_value, int) or isinstance(size_value, bool) or size_value < 0:
                 raise SourceArtifactContractError("Confluence attachment is missing a valid file size")
-            if size_value > MAX_SOURCE_ARTIFACT_BYTES:
+            if size_value > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
                 raise SourceArtifactContractError(
-                    f"Confluence attachment exceeds {MAX_SOURCE_ARTIFACT_BYTES} byte limit"
+                    f"Confluence attachment exceeds {MAX_SOURCE_ARTIFACT_STORAGE_BYTES} byte storage limit"
                 )
             declared_bytes += size_value
-            if declared_bytes > MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT:
+            if declared_bytes > MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT:
                 raise SourceArtifactContractError(
-                    "Confluence attachments exceed the Source Unit byte aggregate limit"
+                    "Confluence attachments exceed the Source Unit storage aggregate limit"
                 )
             attachment_id = str(descriptor.get("id") or "").strip()
             filename = str(descriptor.get("title") or "").strip()
@@ -641,11 +645,6 @@ class ConfluenceGene(Gene):
             download_path = str(links.get("download") or "").strip()
             if not attachment_id or not filename or not provider_revision or not download_path:
                 raise SourceArtifactContractError("Confluence attachment identity is incomplete")
-            response = await self._get(download_path)
-            response.raise_for_status()
-            response_media_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
-            if response_media_type and response_media_type != media_type:
-                raise SourceArtifactContractError("Confluence attachment media type changed during download")
             artifacts.append(
                 RawSourceArtifact(
                     provider_key=attachment_id,
@@ -654,12 +653,37 @@ class ConfluenceGene(Gene):
                     provider_revision=provider_revision,
                     filename=filename,
                     media_type=media_type,
-                    body=bytes(response.content),
                     declared_size_bytes=size_value,
-                    locator={"attachment_id": attachment_id},
+                    locator={
+                        "attachment_id": attachment_id,
+                        "download_path": download_path,
+                    },
                 )
             )
         return tuple(artifacts)
+
+    @asynccontextmanager
+    async def open_source_artifact(self, artifact: RawSourceArtifact):
+        """Open one Confluence attachment without buffering its body."""
+
+        download_path = str(artifact.locator.get("download_path") or "").strip()
+        if not download_path:
+            raise SourceArtifactContractError("Confluence attachment locator is incomplete")
+        async with stream_with_rate_limit_retry(
+            self._client,
+            "GET",
+            download_path,
+            product_name="Confluence",
+            limiter=getattr(self, "_request_limiter", None),
+        ) as response:
+            yield SourceArtifactDownload(
+                chunks=response.aiter_bytes(),
+                media_type=response.headers.get("content-type"),
+                content_length=parse_source_artifact_content_length(
+                    response.headers.get("content-length")
+                ),
+                content_encoding=response.headers.get("content-encoding"),
+            )
 
     @staticmethod
     def _validated_attachment_results(data: object, *, expected_start: int) -> list[dict]:

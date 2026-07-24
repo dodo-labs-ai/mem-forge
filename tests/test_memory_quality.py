@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -549,16 +550,22 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     from memforge.server.admin_api import create_admin_app
     from memforge.storage.document_store import LocalDocumentStore
 
+    class StreamingOnlyLocalDocumentStore(LocalDocumentStore):
+        def read_artifact(self, uri: str) -> bytes:
+            raise AssertionError("Source Artifact route must use the streaming reader")
+
     config = _config(tmp_path)
-    document_store = LocalDocumentStore(config.storage.docs_path)
+    document_store = StreamingOnlyLocalDocumentStore(config.storage.docs_path)
     image = b"\x89PNG\r\n\x1a\nknown-evidence-image"
     digest = hashlib.sha256(image).hexdigest()
     uri = document_store.store_source_artifact(
         source_id="src-confluence",
         artifact_id="artifact-42",
         filename="diagram\u202foverview.png",
-        content=image,
+        content=io.BytesIO(image),
         content_type="image/png",
+        size_bytes=len(image),
+        sha256=digest,
     )
     doc = await _insert_document(db, doc_id="doc-image")
     memory = await _insert_memory(
@@ -705,6 +712,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     with TestClient(app) as client:
         detail = client.get(f"/api/memories/{memory.id}")
         resource = client.get("/api/source-artifacts/obsrev-image")
+        resource_head = client.head("/api/source-artifacts/obsrev-image")
 
     assert detail.status_code == 200
     [artifact] = detail.json()["evidence_artifacts"]
@@ -725,7 +733,13 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     assert stale_support_detail.status_code == 200
     assert stale_support_detail.json()["evidence_artifacts"] == []
     assert resource.status_code == 200
+    assert resource_head.status_code == 200
     assert resource.headers["content-type"] == "image/png"
+    assert resource.headers["content-length"] == str(len(image))
+    assert resource.headers["x-content-sha256"] == digest
+    assert resource_head.headers["content-length"] == str(len(image))
+    assert resource_head.headers["x-content-sha256"] == digest
+    assert resource_head.content == b""
     assert (
         resource.headers["content-disposition"]
         == "inline; filename=\"diagram_overview.png\"; "
