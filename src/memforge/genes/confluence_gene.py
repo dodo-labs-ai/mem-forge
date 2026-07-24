@@ -38,8 +38,6 @@ from memforge.pipeline.normalizer_utils import html_to_markdown, strip_boilerpla
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
     MAX_SOURCE_ARTIFACTS_PER_UNIT,
-    MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
-    MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT,
     RawSourceArtifact,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
     SourceArtifactContractError,
@@ -621,22 +619,9 @@ class ConfluenceGene(Gene):
             payload = self._json_response(response, f"listing attachments for page {page_id}")
 
         artifacts: list[RawSourceArtifact] = []
-        declared_bytes = 0
         for descriptor in descriptors:
             extensions = descriptor.get("extensions") if isinstance(descriptor.get("extensions"), dict) else {}
             media_type = normalize_source_artifact_media_type(extensions.get("mediaType"))
-            size_value = extensions.get("fileSize")
-            if not isinstance(size_value, int) or isinstance(size_value, bool) or size_value < 0:
-                raise SourceArtifactContractError("Confluence attachment is missing a valid file size")
-            if size_value > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
-                raise SourceArtifactContractError(
-                    f"Confluence attachment exceeds {MAX_SOURCE_ARTIFACT_STORAGE_BYTES} byte storage limit"
-                )
-            declared_bytes += size_value
-            if declared_bytes > MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT:
-                raise SourceArtifactContractError(
-                    "Confluence attachments exceed the Source Unit storage aggregate limit"
-                )
             attachment_id = str(descriptor.get("id") or "").strip()
             filename = str(descriptor.get("title") or "").strip()
             version = descriptor.get("version") if isinstance(descriptor.get("version"), dict) else {}
@@ -653,7 +638,10 @@ class ConfluenceGene(Gene):
                     provider_revision=provider_revision,
                     filename=filename,
                     media_type=media_type,
-                    declared_size_bytes=size_value,
+                    # Confluence's extensions.fileSize may disagree with the
+                    # exact bytes returned by its revision-pinned download.
+                    # Streaming limits and integrity checks use observed bytes.
+                    declared_size_bytes=None,
                     locator={
                         "attachment_id": attachment_id,
                         "download_path": download_path,

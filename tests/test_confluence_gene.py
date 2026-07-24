@@ -302,7 +302,7 @@ async def test_fetch_rejects_missing_or_invalid_storage_body(payload):
 
 
 @pytest.mark.asyncio
-async def test_fetch_describes_confluence_image_attachment_with_parent_identity():
+async def test_fetch_does_not_promote_confluence_reported_size_to_exact_byte_contract():
     image = b"\x89PNG\r\n\x1a\nknown-confluence-image"
     gene = ConfluenceGene(
         config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
@@ -327,7 +327,7 @@ async def test_fetch_describes_confluence_image_attachment_with_parent_identity(
                                     "version": {"number": 3},
                                     "extensions": {
                                         "mediaType": "image/png",
-                                        "fileSize": len(image),
+                                        "fileSize": len(image) - 3,
                                     },
                                     "_links": {"download": "/download/attachments/123/diagram.png"},
                                 }
@@ -360,7 +360,7 @@ async def test_fetch_describes_confluence_image_attachment_with_parent_identity(
     assert artifact.parent_provider_key == "123:body"
     assert artifact.provider_revision == "3"
     assert artifact.media_type == "image/png"
-    assert artifact.declared_size_bytes == len(image)
+    assert artifact.declared_size_bytes is None
     assert artifact.locator["download_path"] == "/download/attachments/123/diagram.png"
     assert gene._get.await_count == 1
 
