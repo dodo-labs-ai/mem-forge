@@ -114,6 +114,35 @@ async def test_direct_sync_runtime_uses_configured_process_document_admission(
 
 
 @pytest.mark.asyncio
+async def test_direct_sync_runtime_uses_process_extraction_pool(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    """Maintenance callers must share heavy-work admission with workers."""
+    from memforge import runtime
+
+    monkeypatch.setattr(runtime, "get_chroma_collection", lambda **kwargs: FakeCollection())
+    config = _config(tmp_path)
+
+    sync_runtime = await runtime.build_sync_runtime(db, config)
+    second_runtime = await runtime.build_sync_runtime(db, config)
+
+    assert sync_runtime.extraction_pool is runtime.get_process_extraction_work_pool(
+        config.llm.enrichment_max_concurrent
+    )
+    assert second_runtime.extraction_pool is sync_runtime.extraction_pool
+
+    explicit_pool = runtime.ExtractionWorkPool(2)
+    explicitly_admitted_runtime = await runtime.build_sync_runtime(
+        db,
+        config,
+        extraction_pool=explicit_pool,
+    )
+    assert explicitly_admitted_runtime.extraction_pool is explicit_pool
+
+
+@pytest.mark.asyncio
 async def test_sync_runtime_bounds_structured_request_timeout(db, tmp_path, monkeypatch):
     """Long-running sync model calls should fail as document errors, not hang forever."""
     from memforge import runtime

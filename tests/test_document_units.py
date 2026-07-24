@@ -177,12 +177,11 @@ def test_context_packer_uses_outline_and_glossary_but_not_neighbor_headings():
     units = unitize_markdown(markdown, policy=UnitizationPolicy(max_unit_input_tokens=18))
     tracking = next(unit for unit in units if unit.heading_path == ("Process Tracking", "Tracking"))
 
-    context = ExtractionContextPacker().pack(
+    context = ExtractionContextPacker(units).pack(
         document_title="Process Tracking",
         document_url="https://example.test/process-tracking",
         source_type="github_pages",
         unit=tracking,
-        all_units=units,
         entities=["On-Demand", "UnifiedContextApi"],
     )
 

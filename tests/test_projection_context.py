@@ -84,6 +84,7 @@ def _confluence_projection_with_images(
     *,
     artifact_size: int = 10,
     inference_eligible: bool = True,
+    media_type: str = "image/png",
 ):
     item = ContentItem(
         item_id="confluence-42",
@@ -101,7 +102,7 @@ def _confluence_projection_with_images(
             parent_provider_key="42:body",
             provider_revision="1",
             filename=f"diagram-{index}.png",
-            media_type="image/png",
+            media_type=media_type,
             size_bytes=artifact_size,
             sha256=f"{index:064x}",
             uri=f"source-artifacts/src-c/artifact-{index}.png",
@@ -219,6 +220,7 @@ def test_multimodal_batches_bound_bytes_and_exclude_ineligible_originals() -> No
         len(binary_ids.intersection(batch.primary_observation_ids)) <= 1
         for batch in batches
     )
+    assert [batch.primary_image_bytes for batch in batches] == [7, 7, 7]
 
     ineligible = _confluence_projection_with_images(
         1,
@@ -249,6 +251,29 @@ def test_multimodal_batches_bound_bytes_and_exclude_ineligible_originals() -> No
         )
         for batch in ineligible_batches
     )
+
+
+def test_pdf_artifact_does_not_claim_multimodal_image_input_bytes() -> None:
+    projection = _confluence_projection_with_images(
+        1,
+        artifact_size=7,
+        media_type="application/pdf",
+    )
+
+    batches = plan_projection_extraction_batches(projection)
+
+    assert any(
+        observation_id
+        for batch in batches
+        for observation_id in batch.primary_observation_ids
+        if observation_id
+        in {
+            observation.id
+            for observation in projection.observations
+            if observation.observation_type == "binary_artifact"
+        }
+    )
+    assert all(batch.primary_image_bytes == 0 for batch in batches)
 
 
 def test_one_large_document_is_range_sliced_without_creating_finer_source_units() -> None:
