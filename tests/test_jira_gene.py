@@ -9,7 +9,7 @@ import pytest
 
 from memforge.genes.jira_gene import JiraGene
 from memforge.models import ContentItem
-from memforge.source_artifacts import SourceArtifactContractError
+from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 
 
 def _search_page(issues: list[dict], *, total: int | None = None, start_at: int = 0) -> dict:
@@ -532,7 +532,7 @@ async def test_discover_hydrates_search_result_so_fetch_uses_no_per_issue_reques
 
 
 @pytest.mark.asyncio
-async def test_fetch_materializes_jira_image_attachment_with_comment_parent():
+async def test_fetch_describes_jira_image_attachment_with_comment_parent():
     image = b"\x89PNG\r\n\x1a\nknown-jira-image"
 
     class AttachmentClient(RecordingAsyncClient):
@@ -591,7 +591,49 @@ async def test_fetch_materializes_jira_image_attachment_with_comment_parent():
     assert artifact.parent_observation_type == "comment"
     assert artifact.parent_provider_key == "comment-9"
     assert artifact.media_type == "image/png"
-    assert artifact.body == image
+    assert artifact.declared_size_bytes == len(image)
+    assert artifact.locator["request_path"] == "/rest/api/2/attachment/content/7001"
+    assert [call[1] for call in client.calls] == ["/rest/api/2/search"]
+
+
+@pytest.mark.asyncio
+async def test_open_source_artifact_streams_jira_attachment():
+    image = b"\x89PNG\r\n\x1a\nknown-jira-image"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/rest/api/2/attachment/content/7001"
+        return httpx.Response(
+            200,
+            content=image,
+            headers={"content-type": "image/png", "content-length": str(len(image))},
+        )
+
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
+        source_id="src-jira",
+    )
+    gene._client = httpx.AsyncClient(
+        base_url="https://jira.example.test",
+        transport=httpx.MockTransport(handler),
+    )
+    gene._request_limiter = None
+    gene._auth_mode = "pat"
+    artifact = RawSourceArtifact(
+        provider_key="7001",
+        parent_observation_type="comment",
+        parent_provider_key="comment-9",
+        provider_revision="1",
+        filename="screenshot.png",
+        media_type="image/png",
+        declared_size_bytes=len(image),
+        locator={"request_path": "/rest/api/2/attachment/content/7001"},
+    )
+    try:
+        async with gene.open_source_artifact(artifact) as download:
+            assert b"".join([chunk async for chunk in download.chunks]) == image
+            assert download.content_length == len(image)
+    finally:
+        await gene._client.aclose()
 
 
 @pytest.mark.asyncio
@@ -626,8 +668,6 @@ async def test_fetch_does_not_count_unsupported_jira_attachments_against_image_b
     class AttachmentClient(RecordingAsyncClient):
         async def request(self, method: str, url: str, **kwargs):
             self.calls.append((method, url, kwargs))
-            if url == "/rest/api/2/attachment/content/9001":
-                return BinaryResponse(image, "image/png")
             return JsonResponse(
                 _search_page(
                     [
@@ -652,10 +692,7 @@ async def test_fetch_does_not_count_unsupported_jira_attachments_against_image_b
     raw = await gene.fetch(items[0])
 
     assert [artifact.provider_key for artifact in raw.artifacts] == ["9001"]
-    assert [call[1] for call in client.calls] == [
-        "/rest/api/2/search",
-        "/rest/api/2/attachment/content/9001",
-    ]
+    assert [call[1] for call in client.calls] == ["/rest/api/2/search"]
 
 
 @pytest.mark.asyncio

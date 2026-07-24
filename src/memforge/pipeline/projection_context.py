@@ -5,6 +5,10 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
+from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_INFERENCE_BYTES,
+    MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
+)
 from memforge.source_projection import SourceProjection
 
 
@@ -37,6 +41,7 @@ def plan_projection_extraction_batches(
     max_primary_chars: int = 30_000,
     max_context_chars: int = 20_000,
     primary_overlap_chars: int = 2_000,
+    max_primary_binary_bytes: int = MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
 ) -> tuple[ProjectionExtractionBatch, ...]:
     """Build bounded batches using only generic deltas and relations.
 
@@ -61,11 +66,24 @@ def plan_projection_extraction_batches(
         for delta in projection.deltas
         for observation_id in delta.added_observation_ids
     )
-    primary_ids = tuple(item for item in ordered_ids if item in changed)
+    eligible_ordered_ids = tuple(
+        item
+        for item in ordered_ids
+        if observation_is_inference_eligible(
+            observations[item].observation_type,
+            revisions[item].metadata,
+        )
+    )
+    primary_ids = tuple(item for item in eligible_ordered_ids if item in changed)
     if not primary_ids:
         return ()
 
-    if max_primary_observations < 1 or max_primary_chars < 1 or max_context_chars < 0:
+    if (
+        max_primary_observations < 1
+        or max_primary_chars < 1
+        or max_context_chars < 0
+        or max_primary_binary_bytes < 1
+    ):
         raise ValueError("projection extraction budgets must be positive")
     if primary_overlap_chars < 0:
         raise ValueError("primary overlap cannot be negative")
@@ -84,17 +102,34 @@ def plan_projection_extraction_batches(
     groups: list[list[_PrimarySegment]] = []
     current: list[_PrimarySegment] = []
     current_chars = 0
+    current_binary_bytes = 0
+    current_observation_ids: set[str] = set()
     for segment in segments:
         content_chars = len(segment.markdown)
+        new_binary_bytes = (
+            _observation_binary_size(revisions[segment.observation_id].metadata)
+            if segment.observation_id not in current_observation_ids
+            else 0
+        )
         if current and (
             len(current) >= max_primary_observations
             or current_chars + content_chars > max_primary_chars
+            or current_binary_bytes + new_binary_bytes > max_primary_binary_bytes
         ):
             groups.append(current)
             current = []
             current_chars = 0
+            current_binary_bytes = 0
+            current_observation_ids = set()
+            new_binary_bytes = _observation_binary_size(
+                revisions[segment.observation_id].metadata
+            )
+        if new_binary_bytes > max_primary_binary_bytes:
+            raise ValueError("one inference-eligible Artifact exceeds the batch byte budget")
         current.append(segment)
         current_chars += content_chars
+        current_binary_bytes += new_binary_bytes
+        current_observation_ids.add(segment.observation_id)
     if current:
         groups.append(current)
 
@@ -113,7 +148,9 @@ def plan_projection_extraction_batches(
             )
             for observation_id in primary
         )
-        root_observation_id = ordered_ids[0] if ordered_ids else None
+        root_observation_id = (
+            eligible_ordered_ids[0] if eligible_ordered_ids else None
+        )
         context_candidates = [
             item
             for _, candidates in context_candidates_by_primary
@@ -169,14 +206,57 @@ def plan_projection_extraction_batches(
     return tuple(batches)
 
 
+def observation_is_inference_eligible(
+    observation_type: str,
+    metadata: dict,
+) -> bool:
+    if observation_type != "binary_artifact":
+        return True
+    raw = metadata.get("source_artifact")
+    if not isinstance(raw, dict):
+        return False
+    size_bytes = _observation_binary_size(metadata)
+    inference_eligible = raw.get("inference_eligible")
+    if inference_eligible is None:
+        inference_eligible = size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
+    if not isinstance(inference_eligible, bool):
+        return False
+    return inference_eligible and size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
+
+
+def _observation_binary_size(metadata: dict) -> int:
+    raw = metadata.get("source_artifact")
+    if not isinstance(raw, dict):
+        return 0
+    try:
+        size_bytes = int(raw.get("size_bytes") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(size_bytes, 0)
+
+
 def context_observation_ids_for(
     projection: SourceProjection,
     primary_observation_id: str,
 ) -> tuple[str, ...]:
     """Return deterministic claim context for one projected Observation."""
 
-    revisions = {item.observation_id for item in projection.observation_revisions}
-    ordered_ids = tuple(item.id for item in projection.observations if item.id in revisions)
+    revisions_by_observation = {
+        item.observation_id: item for item in projection.observation_revisions
+    }
+    observations_by_id = {item.id: item for item in projection.observations}
+    eligible_ids = {
+        observation_id
+        for observation_id, revision in revisions_by_observation.items()
+        if observation_id in observations_by_id
+        and observation_is_inference_eligible(
+            observations_by_id[observation_id].observation_type,
+            revision.metadata,
+        )
+    }
+    ordered_ids = tuple(
+        item.id for item in projection.observations if item.id in eligible_ids
+    )
     if primary_observation_id not in ordered_ids:
         return ()
     position = ordered_ids.index(primary_observation_id)
@@ -186,9 +266,9 @@ def context_observation_ids_for(
     if position + 1 < len(ordered_ids):
         candidates.append(ordered_ids[position + 1])
     for relation in projection.relations:
-        if relation.from_id == primary_observation_id and relation.to_id in revisions:
+        if relation.from_id == primary_observation_id and relation.to_id in eligible_ids:
             candidates.append(relation.to_id)
-        elif relation.to_id == primary_observation_id and relation.from_id in revisions:
+        elif relation.to_id == primary_observation_id and relation.from_id in eligible_ids:
             candidates.append(relation.from_id)
     if ordered_ids and ordered_ids[0] != primary_observation_id:
         candidates.append(ordered_ids[0])

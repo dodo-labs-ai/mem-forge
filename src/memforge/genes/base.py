@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
@@ -27,6 +28,11 @@ from memforge.models import (
     GeneMetadata,
     NormalizedContent,
     RawContent,
+)
+from memforge.source_artifacts import (
+    RawSourceArtifact,
+    SourceArtifactContractError,
+    SourceArtifactDownload,
 )
 
 __all__ = [
@@ -203,6 +209,20 @@ class Gene(ABC):
         RawContent
             The raw bytes and content-type for downstream normalisation.
         """
+
+    @asynccontextmanager
+    async def open_source_artifact(
+        self,
+        artifact: RawSourceArtifact,
+    ) -> AsyncIterator[SourceArtifactDownload]:
+        """Open one body described by ``RawContent.artifacts``.
+
+        Genes that return Artifact descriptors must override this method. The
+        sync pipeline owns transfer, validation, and persistence after opening.
+        """
+
+        raise SourceArtifactContractError(f"{type(self).__name__} returned Source Artifacts without a body stream")
+        yield  # pragma: no cover
 
     @abstractmethod
     async def normalize(self, raw: RawContent) -> NormalizedContent:

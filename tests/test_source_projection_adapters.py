@@ -172,6 +172,7 @@ def test_binary_artifact_revision_is_bound_to_parent_observation_and_exact_hash(
         size_bytes=17,
         sha256="a" * 64,
         uri="/store/artifact-stable/diagram.png",
+        inference_eligible=True,
     )
 
     projection = project_source_item(
@@ -204,6 +205,7 @@ def test_binary_artifact_revision_is_bound_to_parent_observation_and_exact_hash(
     assert artifact_revision.metadata["source_artifact"]["parent_observation_id"] == parent_observation.id
     assert artifact_revision.metadata["source_artifact"]["media_type"] == "image/png"
     assert artifact_revision.metadata["source_artifact"]["uri"] == artifact.uri
+    assert artifact_revision.metadata["source_artifact"]["inference_eligible"] is True
 
 
 def test_binary_artifact_retry_edit_and_removal_follow_observation_lifecycle() -> None:
@@ -223,6 +225,7 @@ def test_binary_artifact_retry_edit_and_removal_follow_observation_lifecycle() -
         size_bytes=4,
         sha256="a" * 64,
         uri="/store/artifact-stable/diagram.png",
+        inference_eligible=True,
     )
     initial = project_source_item(
         source_id="src-c",
@@ -264,6 +267,7 @@ def test_binary_artifact_retry_edit_and_removal_follow_observation_lifecycle() -
         size_bytes=5,
         sha256="b" * 64,
         uri="/store/artifact-stable/diagram-v2.png",
+        inference_eligible=True,
     )
     edited = project_source_item(
         source_id="src-c",

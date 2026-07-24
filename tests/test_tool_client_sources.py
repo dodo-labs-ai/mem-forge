@@ -7,6 +7,7 @@ the parts most likely to drift from the admin API. The transport itself
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 from urllib.error import URLError
@@ -740,3 +741,72 @@ def test_tool_client_fetches_source_artifact_through_hosted_workspace(monkeypatc
         "/api/workspaces/mount_tai/api/source-artifacts/obsrev-1"
     )
     assert captured["authorization"] == "Bearer tok"
+
+
+@pytest.mark.parametrize(
+    ("size_delta", "sha256", "expected_error"),
+    [
+        (0, "actual", None),
+        (1, "actual", "resource byte count does not match Content-Length"),
+        (0, "wrong", "resource SHA-256 does not match X-Content-SHA256"),
+    ],
+)
+def test_tool_client_file_mode_verifies_resource_integrity(
+    monkeypatch,
+    tmp_path,
+    size_delta: int,
+    sha256: str,
+    expected_error: str | None,
+) -> None:
+    body = b"streamed-source-artifact"
+    actual_sha256 = hashlib.sha256(body).hexdigest()
+
+    class FakeResponse:
+        headers = {
+            "content-type": "image/png",
+            "content-disposition": 'inline; filename="diagram.png"',
+            "content-length": str(len(body) + size_delta),
+            "x-content-sha256": actual_sha256 if sha256 == "actual" else "0" * 64,
+        }
+
+        def __init__(self):
+            self._offset = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            if size is None or size < 0:
+                size = len(body) - self._offset
+            chunk = body[self._offset : self._offset + size]
+            self._offset += len(chunk)
+            return chunk
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_ARTIFACT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
+    client = ToolClient(
+        target=build_target(
+            origin="https://memforge.example.hana.ondemand.com",
+            workspace_id="mount_tai",
+        ),
+        api_token="tok",
+    )
+
+    result = client.get_resource(
+        url="/api/source-artifacts/obsrev-1",
+        mode="file",
+    )
+
+    if expected_error is None:
+        assert result["sha256"] == actual_sha256
+        assert result["size_bytes"] == len(body)
+    else:
+        assert result["error"] == "resource fetch failed"
+        assert result["detail"] == expected_error

@@ -67,7 +67,11 @@ from memforge.source_projection import (
     SourceProjectionAdapter,
     SourceRelationType,
 )
-from memforge.source_artifacts import StoredSourceArtifact, materialize_source_artifacts
+from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
+    StoredSourceArtifact,
+    materialize_source_artifacts,
+)
 from memforge.source_projection_config import canonical_projection_scope
 
 if TYPE_CHECKING:
@@ -1605,11 +1609,12 @@ class GeneSyncOrchestrator:
         # only after the identity probe, then rebuild the authoritative probe
         # with the revision-pinned Artifact observations.
         if raw.artifacts:
-            stored_source_artifacts = materialize_source_artifacts(
+            stored_source_artifacts = await materialize_source_artifacts(
                 source_id=source_id,
                 source_unit_key=source_unit.id,
                 artifacts=raw.artifacts,
                 store=self.doc_store,
+                open_artifact=gene.open_source_artifact,
             )
             probe_scope.update(
                 {
@@ -2250,15 +2255,6 @@ class GeneSyncOrchestrator:
                 extraction_metadata=result.metadata,
             )
             return result
-        projection_images = self._projection_images(
-            projection=projection,
-            source_artifacts=source_artifacts,
-            observation_ids={
-                observation_id
-                for batch in projection_batches
-                for observation_id in batch.primary_observation_ids
-            },
-        )
         if (
             (len(projection.observations) > 1 or len(projection_batches) > 1)
             and not prefer_single_observation_diff
@@ -2267,7 +2263,8 @@ class GeneSyncOrchestrator:
         ):
             result = await self._extract_projection_batches(
                 projection_batches=projection_batches,
-                projection_images=projection_images,
+                projection=projection,
+                source_artifacts=source_artifacts,
                 source_type=source_type,
                 doc_type=doc_type,
                 source_id=source_id,
@@ -2437,7 +2434,8 @@ class GeneSyncOrchestrator:
         self,
         *,
         projection_batches,
-        projection_images: tuple[StructuredLlmImage, ...],
+        projection: SourceProjection,
+        source_artifacts: tuple[StoredSourceArtifact, ...],
         source_type: str,
         doc_type: str,
         source_id: str,
@@ -2448,13 +2446,13 @@ class GeneSyncOrchestrator:
 
         async def extract_one(batch):
             primary_ids = set(batch.primary_observation_ids)
-            batch_images = tuple(
-                image
-                for image in projection_images
-                if image.source_observation_id in primary_ids
-            )
             async with batch_semaphore:
                 async with self._heavy_work_slot(source_id):
+                    batch_images = self._projection_images(
+                        projection=projection,
+                        source_artifacts=source_artifacts,
+                        observation_ids=primary_ids,
+                    )
                     return await self.memory_extractor.extract_projection_batch_memories(
                         batch,
                         source_type=source_type,
@@ -2501,6 +2499,7 @@ class GeneSyncOrchestrator:
 
         artifacts_by_id = {artifact.id: artifact for artifact in source_artifacts}
         images = []
+        total_bytes = 0
         for revision in projection.observation_revisions:
             if revision.observation_id not in observation_ids:
                 continue
@@ -2513,6 +2512,11 @@ class GeneSyncOrchestrator:
             artifact = artifacts_by_id.get(str(raw.get("artifact_id") or ""))
             if artifact is None:
                 raise RuntimeError("projected image Artifact is unavailable for extraction")
+            if not artifact.inference_eligible:
+                continue
+            total_bytes += artifact.size_bytes
+            if total_bytes > MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH:
+                raise RuntimeError("projected image batch exceeds the inference byte budget")
             body = self.doc_store.read_artifact(artifact.uri)
             if (
                 len(body) != artifact.size_bytes

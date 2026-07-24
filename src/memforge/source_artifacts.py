@@ -8,10 +8,13 @@ Observations.
 from __future__ import annotations
 
 import mimetypes
+import tempfile
+from collections.abc import AsyncIterable, Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
-from typing import Mapping, Protocol
+from typing import BinaryIO, Mapping, Protocol
 
 
 SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES = frozenset(
@@ -23,10 +26,14 @@ SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES = frozenset(
         "image/webp",
     }
 )
-MAX_SOURCE_ARTIFACT_BYTES = 10 * 1024 * 1024
 MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT = 200
 MAX_SOURCE_ARTIFACTS_PER_UNIT = 100
-MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT = 30 * 1024 * 1024
+MAX_SOURCE_ARTIFACT_STORAGE_BYTES = 64 * 1024 * 1024
+MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT = 128 * 1024 * 1024
+MAX_SOURCE_ARTIFACT_INFERENCE_BYTES = 10 * 1024 * 1024
+MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH = 30 * 1024 * 1024
+SOURCE_ARTIFACT_STREAM_CHUNK_BYTES = 256 * 1024
+SOURCE_ARTIFACT_SPOOL_MEMORY_BYTES = 1024 * 1024
 
 
 class SourceArtifactContractError(ValueError):
@@ -39,6 +46,21 @@ def normalize_source_artifact_media_type(value: object) -> str:
     return str(value or "").split(";", 1)[0].strip().lower()
 
 
+def parse_source_artifact_content_length(value: object) -> int | None:
+    """Parse an optional non-negative HTTP Content-Length."""
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        length = int(text)
+    except ValueError as exc:
+        raise SourceArtifactContractError("Source Artifact has an invalid transport length") from exc
+    if length < 0:
+        raise SourceArtifactContractError("Source Artifact has an invalid transport length")
+    return length
+
+
 class SourceArtifactByteStore(Protocol):
     def store_source_artifact(
         self,
@@ -46,14 +68,16 @@ class SourceArtifactByteStore(Protocol):
         source_id: str,
         artifact_id: str,
         filename: str,
-        content: bytes,
+        content: BinaryIO,
         content_type: str,
+        size_bytes: int,
+        sha256: str,
     ) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
 class RawSourceArtifact:
-    """Exact provider bytes plus stable attachment identity."""
+    """Stable provider descriptor whose body is opened only by the owning Gene."""
 
     provider_key: str
     parent_observation_type: str
@@ -61,7 +85,6 @@ class RawSourceArtifact:
     provider_revision: str
     filename: str
     media_type: str
-    body: bytes
     declared_size_bytes: int | None = None
     locator: Mapping[str, object] = field(default_factory=dict)
 
@@ -79,6 +102,16 @@ class RawSourceArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceArtifactDownload:
+    """One opened provider body plus transport metadata."""
+
+    chunks: AsyncIterable[bytes]
+    media_type: str | None = None
+    content_length: int | None = None
+    content_encoding: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class StoredSourceArtifact:
     """Validated immutable bytes ready for Source Projection."""
 
@@ -92,6 +125,7 @@ class StoredSourceArtifact:
     size_bytes: int
     sha256: str
     uri: str
+    inference_eligible: bool
     locator: Mapping[str, object] = field(default_factory=dict)
 
 
@@ -111,6 +145,7 @@ class SourceArtifactRevision:
     size_bytes: int
     sha256: str
     uri: str
+    inference_eligible: bool
 
     @property
     def resource_url(self) -> str:
@@ -129,6 +164,7 @@ class SourceArtifactRevision:
             "content_type": self.media_type,
             "size_bytes": self.size_bytes,
             "sha256": self.sha256,
+            "inference_eligible": self.inference_eligible,
             "url": self.resource_url,
         }
 
@@ -166,6 +202,13 @@ def source_artifact_revision_from_metadata(
     if not isinstance(raw, Mapping):
         return None
     try:
+        size_bytes = int(raw["size_bytes"])
+        inference_eligible = raw.get("inference_eligible")
+        if inference_eligible is None:
+            # A missing decision is safe only within the inference budget.
+            inference_eligible = size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
+        elif not isinstance(inference_eligible, bool):
+            return None
         artifact = SourceArtifactRevision(
             artifact_id=str(raw["artifact_id"]),
             observation_id=observation_id,
@@ -176,9 +219,10 @@ def source_artifact_revision_from_metadata(
             provider_revision=str(raw["provider_revision"]),
             filename=str(raw["filename"]),
             media_type=str(raw["media_type"]),
-            size_bytes=int(raw["size_bytes"]),
+            size_bytes=size_bytes,
             sha256=str(raw["sha256"]),
             uri=str(raw["uri"]),
+            inference_eligible=inference_eligible,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -204,90 +248,194 @@ def source_artifact_identity(
 ) -> str:
     """Return a stable opaque identity independent of filename and title."""
 
-    digest = sha256(
-        "\x1f".join((source_id, source_unit_key, provider_key)).encode("utf-8")
-    ).hexdigest()[:24]
+    digest = sha256("\x1f".join((source_id, source_unit_key, provider_key)).encode("utf-8")).hexdigest()[:24]
     return f"artifact-{digest}"
 
 
-def materialize_source_artifact(
+@dataclass(slots=True)
+class _DownloadedSourceArtifact:
+    descriptor: RawSourceArtifact
+    content: BinaryIO
+    media_type: str
+    size_bytes: int
+    sha256: str
+
+
+async def _download_source_artifact(
     *,
-    source_id: str,
-    source_unit_key: str,
     artifact: RawSourceArtifact,
-    store: SourceArtifactByteStore,
-) -> StoredSourceArtifact:
-    """Validate one provider payload and store its exact bytes."""
+    remaining_unit_bytes: int,
+    open_artifact: Callable[
+        [RawSourceArtifact],
+        AbstractAsyncContextManager[SourceArtifactDownload],
+    ],
+) -> _DownloadedSourceArtifact:
+    """Stream one provider body into a bounded spool and validate exact bytes."""
 
     media_type = normalize_source_artifact_media_type(artifact.media_type)
     if media_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
         raise SourceArtifactContractError(f"unsupported Source Artifact media type: {media_type}")
-    size_bytes = len(artifact.body)
-    if artifact.declared_size_bytes is not None and artifact.declared_size_bytes != size_bytes:
+    if artifact.declared_size_bytes is not None and artifact.declared_size_bytes > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
         raise SourceArtifactContractError(
-            "Source Artifact declared size does not match downloaded bytes"
+            f"Source Artifact exceeds {MAX_SOURCE_ARTIFACT_STORAGE_BYTES} byte storage limit"
         )
-    if size_bytes > MAX_SOURCE_ARTIFACT_BYTES:
+    if artifact.declared_size_bytes is not None and artifact.declared_size_bytes > remaining_unit_bytes:
         raise SourceArtifactContractError(
-            f"Source Artifact exceeds {MAX_SOURCE_ARTIFACT_BYTES} byte limit"
+            "Source Unit Artifacts exceed "
+            f"{MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT} byte storage aggregate limit"
         )
+    content = tempfile.SpooledTemporaryFile(
+        max_size=SOURCE_ARTIFACT_SPOOL_MEMORY_BYTES,
+        mode="w+b",
+    )
+    digest = sha256()
+    size_bytes = 0
+    try:
+        async with open_artifact(artifact) as download:
+            response_media_type = normalize_source_artifact_media_type(download.media_type)
+            if response_media_type and response_media_type != media_type:
+                raise SourceArtifactContractError("Source Artifact media type changed during download")
+            if download.content_length is not None and download.content_length > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
+                raise SourceArtifactContractError(
+                    f"Source Artifact exceeds {MAX_SOURCE_ARTIFACT_STORAGE_BYTES} byte storage limit"
+                )
+            if download.content_length is not None and download.content_length > remaining_unit_bytes:
+                raise SourceArtifactContractError(
+                    "Source Unit Artifacts exceed "
+                    f"{MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT} byte storage aggregate limit"
+                )
+            async for chunk in download.chunks:
+                if not isinstance(chunk, bytes):
+                    chunk = bytes(chunk)
+                if not chunk:
+                    continue
+                size_bytes += len(chunk)
+                if size_bytes > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
+                    raise SourceArtifactContractError(
+                        f"Source Artifact exceeds {MAX_SOURCE_ARTIFACT_STORAGE_BYTES} byte storage limit"
+                    )
+                if size_bytes > remaining_unit_bytes:
+                    raise SourceArtifactContractError(
+                        "Source Unit Artifacts exceed "
+                        f"{MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT} byte storage aggregate limit"
+                    )
+                digest.update(chunk)
+                content.write(chunk)
+            if (
+                download.content_length is not None
+                and not str(download.content_encoding or "").strip()
+                and download.content_length != size_bytes
+            ):
+                raise SourceArtifactContractError("Source Artifact transport length does not match downloaded bytes")
+        if artifact.declared_size_bytes is not None and artifact.declared_size_bytes != size_bytes:
+            raise SourceArtifactContractError("Source Artifact declared size does not match downloaded bytes")
+        content.rollover()
+        content.seek(0)
+        return _DownloadedSourceArtifact(
+            descriptor=artifact,
+            content=content,
+            media_type=media_type,
+            size_bytes=size_bytes,
+            sha256=digest.hexdigest(),
+        )
+    except Exception:
+        content.close()
+        raise
+
+
+def _store_downloaded_source_artifact(
+    *,
+    source_id: str,
+    source_unit_key: str,
+    artifact: _DownloadedSourceArtifact,
+    store: SourceArtifactByteStore,
+) -> StoredSourceArtifact:
+    """Store one fully validated spooled body without materializing it in memory."""
+
+    descriptor = artifact.descriptor
     artifact_id = source_artifact_identity(
         source_id=source_id,
         source_unit_key=source_unit_key,
-        provider_key=artifact.provider_key,
+        provider_key=descriptor.provider_key,
     )
     uri = store.store_source_artifact(
         source_id=source_id,
         artifact_id=artifact_id,
-        filename=artifact.filename,
-        content=artifact.body,
-        content_type=media_type,
+        filename=descriptor.filename,
+        content=artifact.content,
+        content_type=artifact.media_type,
+        size_bytes=artifact.size_bytes,
+        sha256=artifact.sha256,
     )
     return StoredSourceArtifact(
         id=artifact_id,
-        provider_key=artifact.provider_key,
-        parent_observation_type=artifact.parent_observation_type,
-        parent_provider_key=artifact.parent_provider_key,
-        provider_revision=artifact.provider_revision,
-        filename=Path(artifact.filename).name,
-        media_type=media_type,
-        size_bytes=size_bytes,
-        sha256=sha256(artifact.body).hexdigest(),
+        provider_key=descriptor.provider_key,
+        parent_observation_type=descriptor.parent_observation_type,
+        parent_provider_key=descriptor.parent_provider_key,
+        provider_revision=descriptor.provider_revision,
+        filename=Path(descriptor.filename).name,
+        media_type=artifact.media_type,
+        size_bytes=artifact.size_bytes,
+        sha256=artifact.sha256,
         uri=uri,
-        locator=dict(artifact.locator),
+        inference_eligible=artifact.size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES,
+        locator=dict(descriptor.locator),
     )
 
 
-def materialize_source_artifacts(
+async def materialize_source_artifacts(
     *,
     source_id: str,
     source_unit_key: str,
     artifacts: tuple[RawSourceArtifact, ...],
     store: SourceArtifactByteStore,
+    open_artifact: Callable[
+        [RawSourceArtifact],
+        AbstractAsyncContextManager[SourceArtifactDownload],
+    ],
 ) -> tuple[StoredSourceArtifact, ...]:
-    """Validate the bounded Artifact set and store each exact payload."""
+    """Validate one bounded descriptor set, spool it, then persist exact bodies."""
 
     if len(artifacts) > MAX_SOURCE_ARTIFACTS_PER_UNIT:
-        raise SourceArtifactContractError(
-            f"Source Unit exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} Artifact limit"
-        )
-    total_bytes = sum(len(artifact.body) for artifact in artifacts)
-    if total_bytes > MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT:
-        raise SourceArtifactContractError(
-            f"Source Unit Artifacts exceed {MAX_SOURCE_ARTIFACT_BYTES_PER_UNIT} byte aggregate limit"
-        )
+        raise SourceArtifactContractError(f"Source Unit exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} Artifact limit")
     provider_keys = [artifact.provider_key for artifact in artifacts]
     if len(set(provider_keys)) != len(provider_keys):
         raise SourceArtifactContractError("Source Unit contains duplicate Artifact provider identity")
-    return tuple(
-        materialize_source_artifact(
-            source_id=source_id,
-            source_unit_key=source_unit_key,
-            artifact=artifact,
-            store=store,
-        )
+    declared_total = sum(
+        artifact.declared_size_bytes
         for artifact in artifacts
+        if artifact.declared_size_bytes is not None
     )
+    if declared_total > MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT:
+        raise SourceArtifactContractError(
+            "Source Unit Artifacts exceed "
+            f"{MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT} byte storage aggregate limit"
+        )
+    downloaded: list[_DownloadedSourceArtifact] = []
+    try:
+        total_bytes = 0
+        for descriptor in artifacts:
+            item = await _download_source_artifact(
+                artifact=descriptor,
+                remaining_unit_bytes=(
+                    MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT - total_bytes
+                ),
+                open_artifact=open_artifact,
+            )
+            downloaded.append(item)
+            total_bytes += item.size_bytes
+        return tuple(
+            _store_downloaded_source_artifact(
+                source_id=source_id,
+                source_unit_key=source_unit_key,
+                artifact=artifact,
+                store=store,
+            )
+            for artifact in downloaded
+        )
+    finally:
+        for artifact in downloaded:
+            artifact.content.close()
 
 
 def extension_for_media_type(media_type: str) -> str:

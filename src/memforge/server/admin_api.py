@@ -26,7 +26,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -235,6 +235,26 @@ def _inline_content_disposition(filename: str) -> str:
         f'inline; filename="{ascii_fallback}"; '
         f"filename*=UTF-8''{encoded}"
     )
+
+
+def _verified_artifact_chunks(
+    artifact_store: DocumentArtifactStore,
+    uri: str,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+):
+    """Yield one stored Artifact while verifying its immutable revision."""
+
+    digest = hashlib.sha256()
+    observed_size = 0
+    with artifact_store.open_artifact(uri) as body:
+        while chunk := body.read(256 * 1024):
+            observed_size += len(chunk)
+            digest.update(chunk)
+            yield chunk
+    if observed_size != expected_size or digest.hexdigest() != expected_sha256:
+        raise RuntimeError("Source Artifact integrity mismatch during streaming")
 
 
 def resolve_request_principal(request: Request) -> str:
@@ -2985,22 +3005,23 @@ def create_admin_app(
             and stored.size_bytes != artifact.size_bytes
         ):
             raise HTTPException(status_code=409, detail="Source Artifact integrity mismatch")
-        content = b""
-        if request.method != "HEAD":
-            content = artifact_store.read_artifact(artifact.uri)
-            if (
-                len(content) != artifact.size_bytes
-                or hashlib.sha256(content).hexdigest() != artifact.sha256
-            ):
-                raise HTTPException(status_code=409, detail="Source Artifact integrity mismatch")
-        return Response(
-            content=content,
+        headers = {
+            "Content-Disposition": _inline_content_disposition(artifact.filename),
+            "Content-Length": str(artifact.size_bytes),
+            "ETag": f'"sha256:{artifact.sha256}"',
+            "X-Content-SHA256": artifact.sha256,
+        }
+        if request.method == "HEAD":
+            return Response(content=b"", media_type=artifact.media_type, headers=headers)
+        return StreamingResponse(
+            _verified_artifact_chunks(
+                artifact_store,
+                artifact.uri,
+                expected_size=artifact.size_bytes,
+                expected_sha256=artifact.sha256,
+            ),
             media_type=artifact.media_type,
-            headers={
-                "Content-Disposition": _inline_content_disposition(artifact.filename),
-                "ETag": f'"sha256:{artifact.sha256}"',
-                "X-Content-SHA256": artifact.sha256,
-            },
+            headers=headers,
         )
 
     @document_router.api_route("/{doc_id}/content", methods=["GET", "HEAD"])

@@ -5,11 +5,15 @@ Stores raw content, normalized markdown, and optional PDFs for synced documents.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Protocol
+from typing import BinaryIO, ContextManager, Iterator, Protocol
 
 from memforge.models import slugify
 from memforge.source_artifacts import extension_for_media_type
@@ -70,18 +74,22 @@ class DocumentStore(Protocol):
         title: str,
         pdf_bytes: bytes,
     ) -> str: ...
+
     def store_source_artifact(
         self,
         *,
         source_id: str,
         artifact_id: str,
         filename: str,
-        content: bytes,
+        content: BinaryIO,
         content_type: str,
+        size_bytes: int,
+        sha256: str,
     ) -> str: ...
     def read_normalized(self, stored_path: str) -> str | None: ...
     def get_artifact(self, uri: str | None, media_type: str) -> StoredDocumentArtifact | None: ...
     def read_artifact(self, uri: str) -> bytes: ...
+    def open_artifact(self, uri: str) -> ContextManager[BinaryIO]: ...
     def delete_artifact(self, uri: str) -> None: ...
 
 
@@ -181,16 +189,44 @@ class LocalDocumentStore:
         source_id: str,
         artifact_id: str,
         filename: str,
-        content: bytes,
+        content: BinaryIO,
         content_type: str,
+        size_bytes: int,
+        sha256: str,
     ) -> str:
         """Store an exact provider Artifact under stable Artifact identity."""
 
         artifact_dir = self._root / slugify(source_id) / "source-artifacts" / document_artifact_identity(artifact_id)
-        artifact_dir.mkdir(parents=True, exist_ok=True)
+        revision_dir = artifact_dir / sha256
+        revision_dir.mkdir(parents=True, exist_ok=True)
         safe_stem = slugify(Path(filename).stem) or "artifact"
-        path = artifact_dir / f"{safe_stem}{extension_for_media_type(content_type)}"
-        path.write_bytes(content)
+        path = revision_dir / f"{safe_stem}{extension_for_media_type(content_type)}"
+        temp_path: Path | None = None
+        digest = hashlib.sha256()
+        observed_size = 0
+        try:
+            content.seek(0)
+            with tempfile.NamedTemporaryFile(
+                "wb",
+                dir=revision_dir,
+                prefix=f".{safe_stem}-",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                while chunk := content.read(1024 * 1024):
+                    digest.update(chunk)
+                    observed_size += len(chunk)
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if observed_size != size_bytes or digest.hexdigest() != sha256:
+                raise ValueError("Source Artifact changed before persistence")
+            temp_path.replace(path)
+        except Exception:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+            raise
         return str(path)
 
     def read_normalized(self, stored_path: str) -> str | None:
@@ -218,6 +254,16 @@ class LocalDocumentStore:
         if path is None:
             raise FileNotFoundError(uri)
         return path.read_bytes()
+
+    @contextmanager
+    def open_artifact(self, uri: str) -> Iterator[BinaryIO]:
+        """Open one store-owned artifact for bounded streaming reads."""
+
+        path = self._resolve_artifact_path(uri)
+        if path is None:
+            raise FileNotFoundError(uri)
+        with path.open("rb") as handle:
+            yield handle
 
     def delete_artifact(self, uri: str) -> None:
         """Idempotently delete one exact artifact owned by this store."""

@@ -79,7 +79,12 @@ def _confluence_projection(body: str):
     )
 
 
-def _confluence_projection_with_images(image_count: int):
+def _confluence_projection_with_images(
+    image_count: int,
+    *,
+    artifact_size: int = 10,
+    inference_eligible: bool = True,
+):
     item = ContentItem(
         item_id="confluence-42",
         title="Visual design",
@@ -97,9 +102,10 @@ def _confluence_projection_with_images(image_count: int):
             provider_revision="1",
             filename=f"diagram-{index}.png",
             media_type="image/png",
-            size_bytes=10,
+            size_bytes=artifact_size,
             sha256=f"{index:064x}",
             uri=f"source-artifacts/src-c/artifact-{index}.png",
+            inference_eligible=inference_eligible,
         )
         for index in range(image_count)
     )
@@ -195,6 +201,53 @@ def test_many_images_use_bounded_multimodal_batches_without_losing_artifacts() -
     assert all(
         len(binary_observation_ids.intersection(batch.primary_observation_ids)) <= 8
         for batch in batches
+    )
+
+
+def test_multimodal_batches_bound_bytes_and_exclude_ineligible_originals() -> None:
+    eligible = _confluence_projection_with_images(3, artifact_size=7)
+    batches = plan_projection_extraction_batches(
+        eligible,
+        max_primary_binary_bytes=10,
+    )
+    binary_ids = {
+        observation.id
+        for observation in eligible.observations
+        if observation.observation_type == "binary_artifact"
+    }
+    assert all(
+        len(binary_ids.intersection(batch.primary_observation_ids)) <= 1
+        for batch in batches
+    )
+
+    ineligible = _confluence_projection_with_images(
+        1,
+        artifact_size=11,
+        inference_eligible=False,
+    )
+    ineligible_binary_id = next(
+        observation.id
+        for observation in ineligible.observations
+        if observation.observation_type == "binary_artifact"
+    )
+    ineligible_batches = plan_projection_extraction_batches(
+        ineligible,
+        max_primary_binary_bytes=10,
+    )
+    assert all(
+        ineligible_binary_id not in batch.primary_observation_ids
+        for batch in ineligible_batches
+    )
+    assert all(
+        ineligible_binary_id not in batch.context_observation_ids
+        for batch in ineligible_batches
+    )
+    assert any(
+        any(
+            observation_id != ineligible_binary_id
+            for observation_id in batch.primary_observation_ids
+        )
+        for batch in ineligible_batches
     )
 
 
