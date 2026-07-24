@@ -607,9 +607,56 @@ class StructuredLlmError(RuntimeError):
         message: str,
         *,
         terminal_category: StructuredLlmTerminalCategory = "invalid_response",
+        error_code: str = "structured_llm_error",
     ) -> None:
         super().__init__(message)
         self.terminal_category = terminal_category
+        self.error_code = error_code
+
+
+@dataclass(frozen=True, slots=True)
+class _StructuredLlmFailure:
+    """Content-free failure value that can outlive provider call frames."""
+
+    terminal_category: StructuredLlmTerminalCategory
+    error_code: str
+
+    def to_error(self, *, timeout_s: float | None = None) -> StructuredLlmError:
+        if self.terminal_category == "deadline_exceeded":
+            message = (
+                f"structured LLM logical deadline exceeded after {timeout_s:g}s"
+                if timeout_s is not None
+                else "structured LLM logical deadline exceeded"
+            )
+        elif self.terminal_category == "provider_error":
+            message = "structured LLM provider request failed"
+        else:
+            message = "structured LLM returned an invalid response"
+        message = f"{message} (code={self.error_code})"
+        return StructuredLlmError(
+            message,
+            terminal_category=self.terminal_category,
+            error_code=self.error_code,
+        )
+
+
+def _structured_failure(
+    exc: BaseException,
+    *,
+    terminal_category: StructuredLlmTerminalCategory | None = None,
+) -> _StructuredLlmFailure:
+    if isinstance(exc, StructuredLlmError):
+        return _StructuredLlmFailure(
+            terminal_category=terminal_category or exc.terminal_category,
+            error_code=exc.error_code,
+        )
+    category = terminal_category
+    if category is None:
+        category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
+    return _StructuredLlmFailure(
+        terminal_category=category,
+        error_code=type(exc).__name__,
+    )
 
 
 def _message_content(response) -> object:
@@ -992,6 +1039,7 @@ class LiteLlmStructuredClient:
             operation=_schema_operation_name(response_format),
             retry_budget=max(0, self.config.num_retries),
         )
+        failure: _StructuredLlmFailure | None = None
         try:
             async with asyncio.timeout_at(deadline):
                 result = await self._call_schema_with_deadline(
@@ -1004,34 +1052,24 @@ class LiteLlmStructuredClient:
                     state=state,
                     images=images,
                 )
-        except TimeoutError as exc:
-            self._emit_telemetry(
-                state.telemetry(
-                    elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
-                    terminal_category="deadline_exceeded",
-                )
-            )
-            raise StructuredLlmError(
-                f"structured LLM logical deadline exceeded after {self.config.timeout_s:g}s",
+        except TimeoutError:
+            failure = _StructuredLlmFailure(
                 terminal_category="deadline_exceeded",
-            ) from exc
+                error_code="logical_deadline_exceeded",
+            )
         except StructuredLlmError as exc:
-            self._emit_telemetry(
-                state.telemetry(
-                    elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
-                    terminal_category=exc.terminal_category,
-                )
-            )
-            raise
+            failure = _structured_failure(exc)
         except Exception as exc:
-            category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
+            failure = _structured_failure(exc)
+
+        if failure is not None:
             self._emit_telemetry(
                 state.telemetry(
                     elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
-                    terminal_category=category,
+                    terminal_category=failure.terminal_category,
                 )
             )
-            raise StructuredLlmError(str(exc), terminal_category=category) from exc
+            raise failure.to_error(timeout_s=self.config.timeout_s)
 
         self._emit_telemetry(
             state.telemetry(
@@ -1061,8 +1099,9 @@ class LiteLlmStructuredClient:
                 model_name,
                 response_format.__name__,
             )
+            failure: _StructuredLlmFailure | None = None
             try:
-                return await self._attempt_schema(
+                result = await self._attempt_schema(
                     prompt=prompt,
                     response_format=response_format,
                     model_name=model_name,
@@ -1073,12 +1112,15 @@ class LiteLlmStructuredClient:
                     images=images,
                 )
             except Exception as exc:
-                category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
-                raise StructuredLlmError(str(exc), terminal_category=category) from exc
+                failure = _structured_failure(exc)
+            if failure is not None:
+                raise failure.to_error()
+            return result
 
         state.final_mode = "native_schema"
+        schema_failure: _StructuredLlmFailure | None = None
         try:
-            return await self._attempt_schema(
+            result = await self._attempt_schema(
                 prompt=prompt,
                 response_format=response_format,
                 model_name=model_name,
@@ -1088,40 +1130,40 @@ class LiteLlmStructuredClient:
                 state=state,
                 images=images,
             )
-        except Exception as schema_exc:
-            category = "provider_error" if _is_non_fallback_provider_error(schema_exc) else "invalid_response"
-            if not retry_with_json_text or category == "provider_error":
-                raise StructuredLlmError(
-                    str(schema_exc),
-                    terminal_category=category,
-                ) from schema_exc
-            state.fallback_count += 1
-            state.final_mode = "json_text"
-            logger.warning(
-                "Structured LLM response_schema attempt failed for model %s and schema %s; "
-                "retrying with JSON-text schema (error_type=%s, category=%s)",
-                model_name,
-                response_format.__name__,
-                type(schema_exc).__name__,
-                category,
+        except Exception as exc:
+            schema_failure = _structured_failure(exc)
+        if schema_failure is None:
+            return result
+        if not retry_with_json_text or schema_failure.terminal_category == "provider_error":
+            raise schema_failure.to_error()
+
+        state.fallback_count += 1
+        state.final_mode = "json_text"
+        logger.warning(
+            "Structured LLM response_schema attempt failed for model %s and schema %s; "
+            "retrying with JSON-text schema (error_code=%s, category=%s)",
+            model_name,
+            response_format.__name__,
+            schema_failure.error_code,
+            schema_failure.terminal_category,
+        )
+        fallback_failure: _StructuredLlmFailure | None = None
+        try:
+            result = await self._attempt_schema(
+                prompt=prompt,
+                response_format=response_format,
+                model_name=model_name,
+                max_tokens=max_tokens,
+                native_schema=False,
+                deadline=deadline,
+                state=state,
+                images=images,
             )
-            try:
-                return await self._attempt_schema(
-                    prompt=prompt,
-                    response_format=response_format,
-                    model_name=model_name,
-                    max_tokens=max_tokens,
-                    native_schema=False,
-                    deadline=deadline,
-                    state=state,
-                    images=images,
-                )
-            except Exception as exc:
-                category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
-                raise StructuredLlmError(
-                    f"{exc} (response_schema attempt failed first: {schema_exc})",
-                    terminal_category=category,
-                ) from exc
+        except Exception as exc:
+            fallback_failure = _structured_failure(exc)
+        if fallback_failure is not None:
+            raise fallback_failure.to_error()
+        return result
 
     async def _attempt_schema(
         self,
@@ -1181,6 +1223,8 @@ class LiteLlmStructuredClient:
         while True:
             remaining_s = max(0.001, deadline - loop.time())
             state.attempt_count += 1
+            failure: _StructuredLlmFailure | None = None
+            retry = False
             try:
                 response = await litellm.acompletion(
                     model=model_name,
@@ -1199,13 +1243,18 @@ class LiteLlmStructuredClient:
                 )
             except Exception as exc:
                 state.record_failed_attempt()
-                if not _is_retryable_provider_error(exc) or state.retry_budget <= 0:
-                    if isinstance(exc, TimeoutError):
-                        raise StructuredLlmError(
-                            str(exc),
-                            terminal_category="provider_error",
-                        ) from exc
-                    raise
+                retry = _is_retryable_provider_error(exc) and state.retry_budget > 0
+                failure = _structured_failure(
+                    exc,
+                    terminal_category=(
+                        "provider_error"
+                        if _is_non_fallback_provider_error(exc)
+                        else "invalid_response"
+                    ),
+                )
+            if failure is not None and not retry:
+                raise failure.to_error()
+            if retry:
                 state.retry_budget -= 1
                 state.retry_count += 1
                 backoff_s = min(0.25 * (2 ** (state.retry_count - 1)), 1.0)

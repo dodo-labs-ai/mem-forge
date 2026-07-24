@@ -1060,7 +1060,15 @@ class SourceSyncWorker:
             if final_state.last_sync_status in {"failed", "partial"}:
                 error_message = final_state.error_message or "source sync failed"
                 failed_at = datetime.now(timezone.utc)
-                next_attempt_at = self._next_retry_at(run, failed_at)
+                # A partial result has already exhausted the document-level
+                # retry budget and committed its successful documents. Replaying
+                # the complete durable run would duplicate successful provider
+                # and lifecycle work without improving the failure boundary.
+                next_attempt_at = (
+                    self._next_retry_at(run, failed_at)
+                    if final_state.last_sync_status == "failed"
+                    else None
+                )
                 failed = await self.db.fail_source_sync_run(
                     run.run_id,
                     worker_id=self.worker_id,

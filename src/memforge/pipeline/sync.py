@@ -475,6 +475,35 @@ def summarize_failed_documents(docs_failed: int, failed_docs: list[FailedDoc]) -
     return f"{_plural(docs_failed, 'document')} could not be synced. Review the failed document details."
 
 
+_MAX_RETAINED_DOCUMENT_ERROR_CHARS = 512
+
+
+def _retained_document_error(exc: BaseException) -> str:
+    """Project an exception into bounded state without retaining its traceback."""
+
+    if len(exc.args) == 1 and isinstance(exc.args[0], str):
+        detail = exc.args[0]
+        if 0 < len(detail) <= _MAX_RETAINED_DOCUMENT_ERROR_CHARS:
+            stripped = detail.strip()
+            if stripped:
+                return stripped
+    return f"{type(exc).__name__}: error details omitted"
+
+
+def _memory_extraction_error(
+    *,
+    doc_id: str,
+    error_type: str,
+    detail: str | None,
+) -> RuntimeError:
+    message = f"memory extraction failed for {doc_id}: {error_type}"
+    if detail and len(detail) <= _MAX_RETAINED_DOCUMENT_ERROR_CHARS:
+        stripped = detail.strip()
+        if stripped:
+            message = f"{message}: {stripped}"
+    return RuntimeError(message)
+
+
 def _source_filter_summary(gene: Gene, since: datetime | None) -> str | None:
     config = getattr(gene, "config", None)
     parts: list[str] = []
@@ -921,9 +950,10 @@ class GeneSyncOrchestrator:
                     if progress_callback:
                         progress_callback(progress)
 
-                last_error: Exception | None = None
+                last_error: str | None = None
                 async with item_semaphore:
                     for attempt in range(1, MAX_RETRIES + 1):
+                        attempt_error: str | None = None
                         try:
                             item_stats = await self._process_item(
                                 gene=gene,
@@ -967,26 +997,28 @@ class GeneSyncOrchestrator:
                             )
                             stats["projection_scope_attestation"] = item_stats.get("projection_scope_attestation")
                             last_error = None
+                        except Exception as exc:
+                            attempt_error = _retained_document_error(exc)
+                        if attempt_error is None:
                             break
-                        except Exception as e:
-                            last_error = e
-                            if attempt < MAX_RETRIES:
-                                delay = 2**attempt
-                                logger.warning(
-                                    "Retry %d/%d for %s after error: %s",
-                                    attempt,
-                                    MAX_RETRIES,
-                                    item.item_id,
-                                    e,
-                                )
-                                await self._retry_sleep(delay)
-                            else:
-                                logger.error(
-                                    "Failed to process %s after %d attempts: %s",
-                                    item.item_id,
-                                    MAX_RETRIES,
-                                    e,
-                                )
+                        last_error = attempt_error
+                        if attempt < MAX_RETRIES:
+                            delay = 2**attempt
+                            logger.warning(
+                                "Retry %d/%d for %s after error: %s",
+                                attempt,
+                                MAX_RETRIES,
+                                item.item_id,
+                                attempt_error,
+                            )
+                            await self._retry_sleep(delay)
+                        else:
+                            logger.error(
+                                "Failed to process %s after %d attempts: %s",
+                                item.item_id,
+                                MAX_RETRIES,
+                                attempt_error,
+                            )
 
                 if last_error is not None:
                     stats["failed"] = True
@@ -994,7 +1026,7 @@ class GeneSyncOrchestrator:
                         FailedDoc(
                             doc_id=item.item_id,
                             title=item.title,
-                            error=str(last_error),
+                            error=last_error,
                         )
                     )
                 elif stats["processed"]:
@@ -2079,8 +2111,10 @@ class GeneSyncOrchestrator:
         raw_memories = extraction_result.memories
         if extraction_result.error_type:
             error_detail = extraction_result.error or ""
-            processing_error = RuntimeError(
-                f"memory extraction failed for {doc_id}: {extraction_result.error_type}: {error_detail}"
+            processing_error = _memory_extraction_error(
+                doc_id=doc_id,
+                error_type=extraction_result.error_type,
+                detail=error_detail,
             )
             await self._restore_document_processing_snapshot_preserving_failure(
                 doc_id=doc_id,
