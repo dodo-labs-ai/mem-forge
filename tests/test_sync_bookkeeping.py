@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import sqlite3
+import weakref
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -6580,7 +6582,7 @@ async def test_source_sync_worker_retries_failed_final_state(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_source_sync_worker_retries_partial_final_state(db: Database):
+async def test_source_sync_worker_does_not_replay_partial_final_state(db: Database):
     import memforge.runtime as runtime
 
     source_id = "src-worker-final-state-partial"
@@ -6622,7 +6624,9 @@ async def test_source_sync_worker_retries_partial_final_state(db: Database):
     sync_state = await db.get_sync_state(source_id)
 
     assert failed is not None
-    assert failed.status == "pending"
+    assert failed.status == "failed"
+    assert failed.lease_attempt_count == 1
+    assert failed.next_attempt_at is None
     assert sync_state is not None
     assert sync_state.last_sync_status == "partial"
 
@@ -8765,6 +8769,65 @@ async def test_full_document_extraction_failure_is_audited(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_document_retry_does_not_retain_failed_traceback_locals(
+    db: Database,
+):
+    source_id = "src-release-failed-traceback"
+    await db.upsert_source(
+        id=source_id,
+        type="docs",
+        name="Docs",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    retained: list[weakref.ReferenceType[object]] = []
+    private_request_detail = "data:image/png;base64," + ("x" * 65_536)
+
+    class ProviderFramePayload:
+        pass
+
+    class RaisingMemoryExtractor:
+        calls = 0
+
+        async def extract_memories(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            payload = ProviderFramePayload()
+            retained.append(weakref.ref(payload))
+            raise RuntimeError(private_request_detail)
+
+    extractor = RaisingMemoryExtractor()
+
+    async def assert_traceback_released(_delay: float) -> None:
+        gc.collect()
+        assert all(reference() is None for reference in retained)
+
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=extractor,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=assert_traceback_released,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UpdatingDocumentGene("# Design Doc\n\nDurable content."),
+        source_name="Docs",
+        source_id=source_id,
+    )
+
+    gc.collect()
+    assert extractor.calls == 3
+    assert all(reference() is None for reference in retained)
+    assert state.last_sync_status == "failed"
+    assert state.failed_docs[0].error == "RuntimeError: error details omitted"
+    assert private_request_detail not in state.failed_docs[0].error
+
+
+@pytest.mark.asyncio
 async def test_document_update_uses_diff_guided_extraction_and_audits_strategy(
     db: Database,
     tmp_path,
@@ -9296,13 +9359,14 @@ async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fail
 
     gene = UpdatingDocumentGene("# Design\n\nOne durable statement.", version="1")
     item = await anext(gene.discover())
-    with pytest.raises(StructuredLlmError, match="provider unavailable"):
+    with pytest.raises(StructuredLlmError, match="structured LLM provider request failed") as raised:
         await orchestrator._process_item(
             gene=gene,
             item=item,
             source_name="Documents",
             source_id=source_id,
         )
+    assert raised.value.error_code == "TimeoutError"
 
     audit_rows = await db.list_memory_audit_events(
         event_type="source_unit_llm_summary",

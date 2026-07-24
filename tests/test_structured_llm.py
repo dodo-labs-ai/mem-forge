@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 from time import perf_counter
+import weakref
 
 import pytest
 from pydantic import ValidationError
@@ -624,9 +626,10 @@ async def test_litellm_structured_client_rejects_ambiguous_schema_valid_json_obj
         )
     )
 
-    with pytest.raises(StructuredLlmError, match="ambiguous structured JSON objects"):
+    with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
         await client.reconcile_memories("prompt")
     assert len(calls) == 2
+    assert raised.value.error_code == "ValueError"
 
 
 @pytest.mark.asyncio
@@ -719,7 +722,7 @@ async def test_litellm_structured_client_falls_back_once_to_json_text(monkeypatc
     assert fallback_log.exc_info is None
     assert "anthropic/anthropic--claude-sonnet-latest" in fallback_log.message
     assert "MemoryExtractionResponse" in fallback_log.message
-    assert "error_type=Exception" in fallback_log.message
+    assert "error_code=Exception" in fallback_log.message
     assert "response_format unsupported" not in fallback_log.message
     assert "local-key" not in fallback_log.message
     assert "prompt" not in fallback_log.message
@@ -766,8 +769,9 @@ async def test_litellm_structured_client_fails_closed_when_litellm_rejects_schem
         )
     )
 
-    with pytest.raises(StructuredLlmError, match="response_format unsupported"):
+    with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
         await client.verify_source_support("prompt")
+    assert raised.value.error_code == "Exception"
 
 
 @pytest.mark.asyncio
@@ -785,8 +789,9 @@ async def test_litellm_structured_client_fails_closed_on_missing_content(monkeyp
         )
     )
 
-    with pytest.raises(StructuredLlmError, match="missing structured response content"):
+    with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
         await client.verify_source_support("prompt")
+    assert raised.value.error_code == "structured_llm_error"
 
 
 @pytest.mark.asyncio
@@ -959,6 +964,58 @@ async def test_litellm_structured_client_does_not_use_schema_fallback_for_provid
     assert telemetry[0].retry_count == 1
     assert telemetry[0].fallback_count == 0
     assert telemetry[0].terminal_category == "provider_error"
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_does_not_retain_provider_failure_context(
+    monkeypatch,
+):
+    retained: list[weakref.ReferenceType[object]] = []
+    private_request_detail = "data:image/png;base64," + ("x" * 65_536)
+
+    class ProviderFramePayload:
+        pass
+
+    class ProviderFailure(Exception):
+        status_code = 503
+
+    async def fake_acompletion(**kwargs):
+        del kwargs
+        payload = ProviderFramePayload()
+        retained.append(weakref.ref(payload))
+        raise ProviderFailure(private_request_detail)
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+            num_retries=0,
+        )
+    )
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await client.extract_memories(
+            "prompt",
+            max_tokens=1024,
+            images=(
+                StructuredLlmImage(
+                    source_observation_id="obs-image-1",
+                    media_type="image/png",
+                    body=b"image",
+                ),
+            ),
+        )
+
+    gc.collect()
+    assert str(raised.value) == "structured LLM provider request failed (code=ProviderFailure)"
+    assert private_request_detail not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert all(reference() is None for reference in retained)
 
 
 @pytest.mark.asyncio
