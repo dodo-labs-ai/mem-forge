@@ -61,7 +61,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.30"
+SERVER_VERSION = "0.1.31"
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
@@ -1026,10 +1026,27 @@ def _compact_memory_response(payload: dict[str, Any]) -> dict[str, Any]:
     evidence_artifacts = payload.get("evidence_artifacts")
     if isinstance(evidence_artifacts, list):
         compact["evidence_artifacts"] = [
-            artifact
+            _compact_memory_evidence_artifact(artifact)
             for artifact in evidence_artifacts
             if isinstance(artifact, dict)
         ]
+    return compact
+
+
+def _compact_memory_evidence_artifact(
+    artifact: dict[str, Any],
+) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in (
+        "summary",
+        "evidence_role",
+        "filename",
+        "content_type",
+        "size_bytes",
+        "url",
+    ):
+        if key in artifact:
+            compact[key] = artifact[key]
     return compact
 
 

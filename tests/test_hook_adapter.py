@@ -897,9 +897,9 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
-def test_packaged_plugin_version_0_1_30_is_consistent():
+def test_packaged_plugin_version_0_1_31_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.30"
+    version = "0.1.31"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
@@ -2820,7 +2820,7 @@ def test_mcp_proxy_fetches_resource_through_hosted_workspace(monkeypatch):
     assert captured["authorization"] == "Bearer token-123"
 
 
-def test_mcp_proxy_preserves_evidence_artifacts_on_get_memory(monkeypatch):
+def test_mcp_proxy_compacts_evidence_artifacts_on_get_memory(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     artifact = {
         "artifact_id": "artifact-1",
@@ -2834,6 +2834,7 @@ def test_mcp_proxy_preserves_evidence_artifacts_on_get_memory(monkeypatch):
         "content_type": "image/png",
         "size_bytes": 3,
         "sha256": "abc",
+        "summary": "Architecture diagram showing the request flow.",
         "url": "/api/source-artifacts/obsrev-1",
     }
     monkeypatch.setattr(
@@ -2849,7 +2850,16 @@ def test_mcp_proxy_preserves_evidence_artifacts_on_get_memory(monkeypatch):
 
     result = proxy._call_tool("get_memory", {"memory_id": "mem-1"})
 
-    assert result["evidence_artifacts"] == [artifact]
+    assert result["evidence_artifacts"] == [
+        {
+            "summary": "Architecture diagram showing the request flow.",
+            "evidence_role": "primary",
+            "filename": "diagram.png",
+            "content_type": "image/png",
+            "size_bytes": 3,
+            "url": "/api/source-artifacts/obsrev-1",
+        }
+    ]
 
 
 def test_mcp_proxy_returns_source_artifact_as_native_image_content(monkeypatch):

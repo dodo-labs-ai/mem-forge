@@ -591,6 +591,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
             "size_bytes": len(image),
             "sha256": digest,
             "uri": uri,
+            "summary": "Service case review screen showing the investigation areas.",
         }
     }
     await db.db.execute(
@@ -721,6 +722,9 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     assert artifact["evidence_role"] == "context"
     assert artifact["content_type"] == "image/png"
     assert artifact["sha256"] == digest
+    assert artifact["summary"] == (
+        "Service case review screen showing the investigation areas."
+    )
     assert artifact["url"] == "/api/source-artifacts/obsrev-image"
 
     await db.db.execute(

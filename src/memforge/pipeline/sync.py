@@ -68,6 +68,7 @@ from memforge.source_projection import (
     SourceProjection,
     SourceProjectionAdapter,
     SourceRelationType,
+    with_source_artifact_summaries,
 )
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
@@ -126,6 +127,7 @@ def _aggregate_extraction_metrics(
         "extraction_queue_wait_ms",
         "input_binary_bytes",
         "multimodal_calls",
+        "artifact_summary_count",
     )
     aggregated = {key: sum(int((result.metadata or {}).get(key, 0) or 0) for result in results) for key in keys}
     aggregated["max_active_multimodal"] = max(
@@ -2122,6 +2124,10 @@ class GeneSyncOrchestrator:
                 processing_error=processing_error,
             )
             raise processing_error
+        projection = with_source_artifact_summaries(
+            projection,
+            extraction_result.artifact_summaries,
+        )
         logger.debug(
             "Extracted %d raw memories from %s",
             len(raw_memories),
@@ -2566,10 +2572,12 @@ class GeneSyncOrchestrator:
         )
         llm_metrics = _aggregate_extraction_metrics(results)
         memories = []
+        artifact_summaries = []
         failures = [result for result in results if result.error_type]
         for result in results:
             if not result.error_type:
                 memories.extend(result.memories)
+                artifact_summaries.extend(result.artifact_summaries)
         if failures:
             first = failures[0]
             return MemoryExtractionResult(
@@ -2582,8 +2590,23 @@ class GeneSyncOrchestrator:
                     "extracted_count_before_failure": len(memories),
                 },
             )
+        artifact_summary_ids = [
+            item.source_observation_id for item in artifact_summaries
+        ]
+        if len(set(artifact_summary_ids)) != len(artifact_summary_ids):
+            return MemoryExtractionResult(
+                error_type="projection_batch_failure",
+                error="duplicate Source Artifact summary Observation id across batches",
+                metadata={
+                    **llm_metrics,
+                    "batch_count": len(projection_batches),
+                    "failed_batch_count": 1,
+                    "extracted_count_before_failure": len(memories),
+                },
+            )
         return MemoryExtractionResult(
             memories=memories,
+            artifact_summaries=tuple(artifact_summaries),
             metadata={
                 **llm_metrics,
                 "batch_count": len(projection_batches),

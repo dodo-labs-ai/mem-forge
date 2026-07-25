@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.llm.structured import (
+    ArtifactSelectionSummary,
     MemoryCandidate,
     MemoryExtractionResponse,
     StructuredLlmImage,
@@ -14,8 +15,13 @@ from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import plan_projection_extraction_batches
 from memforge.pipeline.source_projection_adapters import project_source_item
-from memforge.source_projection import AnchorKind, DeltaAxis, SourceAnchor
-from memforge.source_artifacts import StoredSourceArtifact
+from memforge.source_projection import (
+    AnchorKind,
+    DeltaAxis,
+    SourceAnchor,
+    with_source_artifact_summaries,
+)
+from memforge.source_artifacts import SourceArtifactSummary, StoredSourceArtifact
 
 
 def _jira_projection(comment_count: int = 3):
@@ -342,7 +348,7 @@ async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context
                         extraction_context="A7 processing context",
                         evidence_quote="A7 processing context",
                     ),
-                ]
+                ],
             )
 
     result = await MemoryExtractor(structured_llm_client=Client()).extract_projection_batch_memories(
@@ -381,7 +387,13 @@ async def test_projection_batch_extractor_accepts_only_explicit_visual_evidence(
                         memory_type="fact",
                         evidence_quote="",
                     ),
-                ]
+                ],
+                artifact_summaries=[
+                    ArtifactSelectionSummary(
+                        source_observation_id=visual_observation_id,
+                        summary="Validation result screen showing the settled outcome.",
+                    )
+                ],
             )
 
     image = StructuredLlmImage(
@@ -402,6 +414,122 @@ async def test_projection_batch_extractor_accepts_only_explicit_visual_evidence(
     assert result.memories[0].source_observation_id == visual_observation_id
     assert result.memories[0].evidence_anchor == "source_artifact"
     assert result.memories[0].evidence_quote is None
+    assert result.artifact_summaries == (
+        SourceArtifactSummary(
+            source_observation_id=visual_observation_id,
+            summary="Validation result screen showing the settled outcome.",
+        ),
+    )
+    assert result.metadata["artifact_summary_count"] == 1
+    assert result.metadata["structured_llm_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_projection_batch_extractor_rejects_missing_or_unknown_artifact_summaries() -> None:
+    projection = _jira_projection(1)
+    batch = plan_projection_extraction_batches(projection)[0]
+    visual_observation_id = batch.primary_observation_ids[-1]
+    image = StructuredLlmImage(
+        source_observation_id=visual_observation_id,
+        media_type="image/png",
+        body=b"\x89PNG",
+    )
+
+    class Client:
+        def __init__(self, observation_id: str | None) -> None:
+            self.observation_id = observation_id
+
+        async def extract_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            summaries = (
+                []
+                if self.observation_id is None
+                else [
+                    ArtifactSelectionSummary(
+                        source_observation_id=self.observation_id,
+                        summary="A bounded image selection hint.",
+                    )
+                ]
+            )
+            return MemoryExtractionResponse(
+                memories=[],
+                artifact_summaries=summaries,
+            )
+
+    missing = await MemoryExtractor(
+        structured_llm_client=Client(None)
+    ).extract_projection_batch_memories(
+        batch,
+        source_type="jira",
+        images=(image,),
+    )
+    unknown = await MemoryExtractor(
+        structured_llm_client=Client("obs-invented")
+    ).extract_projection_batch_memories(
+        batch,
+        source_type="jira",
+        images=(image,),
+    )
+
+    assert missing.error_type == "structured_llm_error"
+    assert unknown.error_type == "structured_llm_error"
+    assert missing.metadata["structured_llm_calls"] == 1
+    assert unknown.metadata["structured_llm_calls"] == 1
+
+
+def test_source_projection_attaches_summary_only_to_exact_image_revision() -> None:
+    projection = _confluence_projection_with_images(1)
+    artifact_observation = next(
+        item
+        for item in projection.observations
+        if item.observation_type == "binary_artifact"
+    )
+
+    enriched = with_source_artifact_summaries(
+        projection,
+        (
+            SourceArtifactSummary(
+                source_observation_id=artifact_observation.id,
+                summary="Architecture diagram showing the bounded request flow.",
+            ),
+        ),
+    )
+
+    revision = next(
+        item
+        for item in enriched.observation_revisions
+        if item.observation_id == artifact_observation.id
+    )
+    assert revision.id == next(
+        item.id
+        for item in projection.observation_revisions
+        if item.observation_id == artifact_observation.id
+    )
+    assert revision.metadata["source_artifact"]["summary"] == (
+        "Architecture diagram showing the bounded request flow."
+    )
+
+    primary_observation = next(
+        item
+        for item in projection.observations
+        if item.observation_type != "binary_artifact"
+    )
+    with pytest.raises(ValueError, match="non-Artifact"):
+        with_source_artifact_summaries(
+            projection,
+            (
+                SourceArtifactSummary(
+                    source_observation_id=primary_observation.id,
+                    summary="Invalid target.",
+                ),
+            ),
+        )
+    summary = SourceArtifactSummary(
+        source_observation_id=artifact_observation.id,
+        summary="Duplicate target.",
+    )
+    with pytest.raises(ValueError, match="must be unique"):
+        with_source_artifact_summaries(projection, (summary, summary))
 
 
 @pytest.mark.asyncio

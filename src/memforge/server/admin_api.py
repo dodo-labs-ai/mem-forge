@@ -511,6 +511,7 @@ class MemoryEvidenceArtifactDetail(BaseModel):
     content_type: str
     size_bytes: int
     sha256: str
+    summary: str | None = None
     url: str
 
 

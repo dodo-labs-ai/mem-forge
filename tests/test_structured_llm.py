@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from memforge.llm.structured import (
+    ArtifactSelectionSummary,
     AgentSessionAuthorityResponse,
     CandidateLedgerResponse,
     EntityValidationResponse,
@@ -268,6 +269,39 @@ def test_memory_extraction_response_accepts_memory_list():
             extraction_context="Service A uses PostgreSQL 16",
         )
     ]
+    assert response.artifact_summaries == []
+
+
+def test_memory_extraction_response_validates_and_normalizes_artifact_summaries():
+    response = MemoryExtractionResponse.model_validate(
+        {
+            "memories": [],
+            "artifact_summaries": [
+                {
+                    "source_observation_id": " obs-image-1 ",
+                    "summary": "  Architecture diagram showing the payroll request flow.  ",
+                }
+            ],
+        }
+    )
+
+    assert response.artifact_summaries == [
+        ArtifactSelectionSummary(
+            source_observation_id="obs-image-1",
+            summary="Architecture diagram showing the payroll request flow.",
+        )
+    ]
+
+    with pytest.raises(ValidationError, match="must be unique"):
+        MemoryExtractionResponse.model_validate(
+            {
+                "memories": [],
+                "artifact_summaries": [
+                    {"source_observation_id": "obs-image-1", "summary": "First"},
+                    {"source_observation_id": "obs-image-1", "summary": "Second"},
+                ],
+            }
+        )
 
 
 def test_memory_extraction_response_rejects_top_level_array():

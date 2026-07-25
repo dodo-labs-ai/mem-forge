@@ -18,6 +18,7 @@ import litellm
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from memforge.llm.providers import litellm_optional_kwargs
+from memforge.source_artifacts import MAX_SOURCE_ARTIFACT_SUMMARY_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -193,12 +194,37 @@ class MemoryCandidate(StructuredResponseModel):
     required_source_observation_ids: list[str] = Field(default_factory=list)
 
 
+class ArtifactSelectionSummary(StructuredResponseModel):
+    """Concise selection hint for one exact image supplied to extraction."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    source_observation_id: str = Field(min_length=1)
+    summary: str = Field(min_length=1, max_length=MAX_SOURCE_ARTIFACT_SUMMARY_CHARS)
+
+    @model_validator(mode="after")
+    def _normalize(self) -> ArtifactSelectionSummary:
+        self.source_observation_id = self.source_observation_id.strip()
+        self.summary = " ".join(self.summary.split())
+        if not self.source_observation_id or not self.summary:
+            raise ValueError("Artifact summary fields must contain non-whitespace text")
+        return self
+
+
 class MemoryExtractionResponse(StructuredResponseModel):
     """Schema returned by memory extraction."""
 
     model_config = ConfigDict(extra="ignore")
 
     memories: list[MemoryCandidate]
+    artifact_summaries: list[ArtifactSelectionSummary] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _artifact_summary_ids_are_unique(self) -> MemoryExtractionResponse:
+        ids = [item.source_observation_id for item in self.artifact_summaries]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Artifact summary Observation ids must be unique")
+        return self
 
 
 class CandidateLedgerDecision(StructuredResponseModel):
@@ -505,6 +531,7 @@ class SourceSupportStructuredClient(Protocol):
         *,
         max_tokens: int,
         model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
     ) -> MemoryExtractionResponse:
         """Return schema-validated extracted memory candidates."""
 

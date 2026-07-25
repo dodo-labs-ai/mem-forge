@@ -8,7 +8,7 @@ and run-scoped coverage for documents, conversations, and hybrid sources.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Mapping, Protocol, runtime_checkable
 
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         SourceArtifactEvidence,
         SourceArtifactRevision,
         StoredSourceArtifact,
+        SourceArtifactSummary,
     )
 
 
@@ -363,6 +364,45 @@ class SourceProjection:
                     or observations_by_id[mapping.observation_id].source_unit_id != delta.source_unit_id
                 ):
                     raise ValueError("Fragment Mapping current revision is not projected for its Source Unit")
+
+
+def with_source_artifact_summaries(
+    projection: SourceProjection,
+    summaries: tuple[SourceArtifactSummary, ...],
+) -> SourceProjection:
+    """Attach validated selection hints to their exact projected image revisions."""
+
+    if not summaries:
+        return projection
+    summaries_by_observation_id = {
+        item.source_observation_id: item.summary for item in summaries
+    }
+    if len(summaries_by_observation_id) != len(summaries):
+        raise ValueError("Source Artifact summary Observation ids must be unique")
+
+    remaining = set(summaries_by_observation_id)
+    revisions = []
+    for revision in projection.observation_revisions:
+        summary = summaries_by_observation_id.get(revision.observation_id)
+        if summary is None:
+            revisions.append(revision)
+            continue
+        metadata = dict(revision.metadata)
+        raw_artifact = metadata.get("source_artifact")
+        if not isinstance(raw_artifact, Mapping):
+            raise ValueError("Source Artifact summary targets a non-Artifact Observation")
+        media_type = str(raw_artifact.get("media_type") or "")
+        if not media_type.startswith("image/"):
+            raise ValueError("Source Artifact summary targets a non-image Observation")
+        metadata["source_artifact"] = {
+            **dict(raw_artifact),
+            "summary": summary,
+        }
+        revisions.append(replace(revision, metadata=metadata))
+        remaining.remove(revision.observation_id)
+    if remaining:
+        raise ValueError("Source Artifact summary targets an unknown Observation")
+    return replace(projection, observation_revisions=tuple(revisions))
 
 
 @runtime_checkable

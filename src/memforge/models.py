@@ -14,7 +14,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal
 
-from memforge.source_artifacts import RawSourceArtifact
+from memforge.source_artifacts import RawSourceArtifact, SourceArtifactSummary
 
 # ---------------------------------------------------------------------------
 # Entity name canonicalization
@@ -323,6 +323,7 @@ class DocumentRecord:
 class MemoryExtractionResult:
     """Output of Call 2 (memory extraction)."""
     memories: list[RawMemory] = field(default_factory=list)
+    artifact_summaries: tuple[SourceArtifactSummary, ...] = ()
     error_type: str | None = None
     error: str | None = None
     metadata: dict = field(default_factory=dict)

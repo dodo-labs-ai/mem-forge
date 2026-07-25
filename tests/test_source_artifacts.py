@@ -11,6 +11,8 @@ from memforge.source_artifacts import (
     RawSourceArtifact,
     SourceArtifactContractError,
     SourceArtifactDownload,
+    SourceArtifactSummary,
+    source_artifact_revision_from_metadata,
     materialize_source_artifacts,
 )
 from memforge.storage.document_store import LocalDocumentStore
@@ -48,6 +50,53 @@ def _opener(payloads: dict[str, bytes], *, transport_length_delta: int = 0):
         )
 
     return open_artifact
+
+
+def test_artifact_revision_summary_is_revision_pinned_and_legacy_optional() -> None:
+    metadata = {
+        "source_artifact": {
+            "artifact_id": "artifact-1",
+            "parent_observation_id": "obs-parent",
+            "provider_revision": "1",
+            "filename": "diagram.png",
+            "media_type": "image/png",
+            "size_bytes": 4,
+            "sha256": "a" * 64,
+            "uri": "artifact://diagram.png",
+            "inference_eligible": True,
+            "summary": "Architecture diagram showing the request flow.",
+        }
+    }
+
+    revision = source_artifact_revision_from_metadata(
+        observation_id="obs-image",
+        observation_revision_id="obsrev-image",
+        source_id="src-1",
+        source_unit_id="unit-1",
+        metadata=metadata,
+    )
+    legacy = source_artifact_revision_from_metadata(
+        observation_id="obs-image",
+        observation_revision_id="obsrev-image",
+        source_id="src-1",
+        source_unit_id="unit-1",
+        metadata={
+            "source_artifact": {
+                key: value
+                for key, value in metadata["source_artifact"].items()
+                if key != "summary"
+            }
+        },
+    )
+
+    assert revision is not None
+    assert revision.summary == "Architecture diagram showing the request flow."
+    assert revision.metadata()["summary"] == revision.summary
+    assert legacy is not None
+    assert legacy.summary is None
+    assert SourceArtifactSummary(" obs-image ", "  Visible flow   overview. ") == (
+        SourceArtifactSummary("obs-image", "Visible flow overview.")
+    )
 
 
 @pytest.mark.asyncio
