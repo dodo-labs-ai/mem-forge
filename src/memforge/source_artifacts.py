@@ -32,6 +32,7 @@ MAX_SOURCE_ARTIFACT_STORAGE_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT = 128 * 1024 * 1024
 MAX_SOURCE_ARTIFACT_INFERENCE_BYTES = 10 * 1024 * 1024
 MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH = 30 * 1024 * 1024
+MAX_SOURCE_ARTIFACT_SUMMARY_CHARS = 240
 SOURCE_ARTIFACT_STREAM_CHUNK_BYTES = 256 * 1024
 SOURCE_ARTIFACT_SPOOL_MEMORY_BYTES = 1024 * 1024
 
@@ -130,6 +131,27 @@ class StoredSourceArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceArtifactSummary:
+    """Agent selection hint produced for one supplied Artifact Observation."""
+
+    source_observation_id: str
+    summary: str
+
+    def __post_init__(self) -> None:
+        observation_id = self.source_observation_id.strip()
+        summary = " ".join(self.summary.split())
+        if not observation_id:
+            raise SourceArtifactContractError("Source Artifact summary requires an Observation id")
+        if not summary or len(summary) > MAX_SOURCE_ARTIFACT_SUMMARY_CHARS:
+            raise SourceArtifactContractError(
+                "Source Artifact summary must be between 1 and "
+                f"{MAX_SOURCE_ARTIFACT_SUMMARY_CHARS} characters"
+            )
+        object.__setattr__(self, "source_observation_id", observation_id)
+        object.__setattr__(self, "summary", summary)
+
+
+@dataclass(frozen=True, slots=True)
 class SourceArtifactRevision:
     """One immutable Artifact revision reconstructed from Source Projection."""
 
@@ -146,6 +168,7 @@ class SourceArtifactRevision:
     sha256: str
     uri: str
     inference_eligible: bool
+    summary: str | None = None
 
     @property
     def resource_url(self) -> str:
@@ -165,6 +188,7 @@ class SourceArtifactRevision:
             "size_bytes": self.size_bytes,
             "sha256": self.sha256,
             "inference_eligible": self.inference_eligible,
+            "summary": self.summary,
             "url": self.resource_url,
         }
 
@@ -209,6 +233,12 @@ def source_artifact_revision_from_metadata(
             inference_eligible = size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
         elif not isinstance(inference_eligible, bool):
             return None
+        summary_value = raw.get("summary")
+        summary = None
+        if summary_value is not None:
+            summary = " ".join(str(summary_value).split())
+            if not summary or len(summary) > MAX_SOURCE_ARTIFACT_SUMMARY_CHARS:
+                return None
         artifact = SourceArtifactRevision(
             artifact_id=str(raw["artifact_id"]),
             observation_id=observation_id,
@@ -223,6 +253,7 @@ def source_artifact_revision_from_metadata(
             sha256=str(raw["sha256"]),
             uri=str(raw["uri"]),
             inference_eligible=inference_eligible,
+            summary=summary,
         )
     except (KeyError, TypeError, ValueError):
         return None

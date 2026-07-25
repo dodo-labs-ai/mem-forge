@@ -60,7 +60,11 @@ from memforge.pipeline.sync import (
 )
 from memforge.runtime import SourceLifecycleMaintenanceError, SyncService
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
-from memforge.source_artifacts import RawSourceArtifact, SourceArtifactDownload
+from memforge.source_artifacts import (
+    RawSourceArtifact,
+    SourceArtifactDownload,
+    SourceArtifactSummary,
+)
 from memforge.config import AppConfig, SyncConfig
 from memforge.storage.database import Database
 from memforge.storage.database import MIGRATIONS
@@ -3019,6 +3023,23 @@ class ProjectionBatchCandidateExtractor(ProjectionBatchRecordingExtractor):
         )
 
 
+class ProjectionBatchArtifactSummaryExtractor(ProjectionBatchRecordingExtractor):
+    async def extract_projection_batch_memories(self, batch, **kwargs):
+        self.projection_calls.append(batch)
+        images = kwargs.get("images", ())
+        return MemoryExtractionResult(
+            memories=[],
+            artifact_summaries=tuple(
+                SourceArtifactSummary(
+                    source_observation_id=image.source_observation_id,
+                    summary="Architecture diagram showing the stable image flow.",
+                )
+                for image in images
+            ),
+            metadata={"structured_llm_calls": 1},
+        )
+
+
 @pytest.mark.asyncio
 async def test_unchanged_multi_observation_projection_skips_full_document_extraction(
     db: Database,
@@ -3290,6 +3311,51 @@ class JiraArtifactGene(BlockingFetchGene):
             media_type="image/png",
             content_length=len(payload),
         )
+
+
+@pytest.mark.asyncio
+async def test_artifact_summary_commits_with_the_same_projected_revision(db: Database) -> None:
+    source_id = "src-jira-artifact-summary"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira Artifact Summary",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    memory_engine = RecordingMemoryEngine()
+    extractor = ProjectionBatchArtifactSummaryExtractor()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=extractor,
+        memory_engine=memory_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=JiraArtifactGene(issue_id="424243", issue_key="PAY-43"),
+        source_name="Jira Artifact Summary",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    committed_projection = memory_engine.projected_lifecycle_calls[0]["projection"]
+    artifact_revision = next(
+        revision
+        for revision in committed_projection.observation_revisions
+        if "source_artifact" in revision.metadata
+    )
+    assert artifact_revision.metadata["source_artifact"]["summary"] == (
+        "Architecture diagram showing the stable image flow."
+    )
+    persisted = await db.get_source_artifact_revision(artifact_revision.id)
+    assert persisted is not None
+    assert persisted.summary == "Architecture diagram showing the stable image flow."
+    assert len(extractor.projection_calls) == 1
 
 
 @pytest.mark.asyncio

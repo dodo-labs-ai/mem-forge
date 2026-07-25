@@ -15,6 +15,10 @@ from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.document_units import ExtractionContext
 from memforge.pipeline.document_update import DEFAULT_MAX_DIFF_CHARS
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
+from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_SUMMARY_CHARS,
+    SourceArtifactSummary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +234,15 @@ text quote. Do not infer image contents from the filename, upload event, parent
 text, or metadata. Do not emit a claim for an Artifact image that was not
 supplied in this request.
 
+Also return one `artifact_summaries` item for every image supplied in this
+request. Each item must copy the exact `source_observation_id` printed before
+that image and provide one concise selection summary of its visible purpose or
+content (maximum {artifact_summary_max} characters). Do not include customer names, case numbers,
+person IDs, credentials, or other unnecessary unique identifiers. A summary is
+only a hint for deciding whether to fetch an Artifact; it is not Evidence and
+must not replace inspection of the Artifact. Return an empty
+`artifact_summaries` array when no images were supplied.
+
 Extraction emits each current durable claim once with exact evidence from a
 PRIMARY observation. Reconciliation owns historical identity and support.
 
@@ -377,6 +390,7 @@ class MemoryExtractor:
             doc_type=doc_type,
             primary_observations=batch.primary_markdown[:UNIT_MARKDOWN_CHAR_CAP],
             context_observations=batch.context_markdown[:PROJECTION_CONTEXT_CHAR_CAP],
+            artifact_summary_max=MAX_SOURCE_ARTIFACT_SUMMARY_CHARS,
         )
         result = await self._extract_with_schema(
             prompt,
@@ -440,7 +454,11 @@ class MemoryExtractor:
                 continue
             memory.required_source_observation_ids = list(required_ids)
             kept.append(memory)
-        return MemoryExtractionResult(memories=kept, metadata=result.metadata)
+        return MemoryExtractionResult(
+            memories=kept,
+            artifact_summaries=result.artifact_summaries,
+            metadata=result.metadata,
+        )
 
     async def _extract_with_schema(
         self,
@@ -464,6 +482,22 @@ class MemoryExtractor:
             if images:
                 call_kwargs["images"] = images
             response = await self.structured_llm_client.extract_memories(prompt, **call_kwargs)
+            supplied_image_ids = tuple(image.source_observation_id for image in images)
+            returned_summaries = tuple(
+                SourceArtifactSummary(
+                    source_observation_id=item.source_observation_id,
+                    summary=item.summary,
+                )
+                for item in response.artifact_summaries
+            )
+            returned_summary_ids = tuple(
+                item.source_observation_id for item in returned_summaries
+            )
+            if set(returned_summary_ids) != set(supplied_image_ids):
+                raise StructuredLlmError(
+                    "structured LLM Artifact summaries do not match the supplied images",
+                    error_code="invalid_artifact_summary_contract",
+                )
             memories = [
                 RawMemory(
                     content=memory.content,
@@ -483,8 +517,10 @@ class MemoryExtractor:
             logger.info("Extracted %d memories from document", len(memories))
             return MemoryExtractionResult(
                 memories=memories,
+                artifact_summaries=returned_summaries,
                 metadata={
                     **metrics,
+                    "artifact_summary_count": len(returned_summaries),
                     "structured_llm_elapsed_ms": max(
                         0, round((perf_counter() - started) * 1000)
                     ),
