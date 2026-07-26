@@ -8,11 +8,13 @@ from click.testing import CliRunner
 import pytest
 
 import memforge.main as main
+from memforge.api_target import build_host_target, build_target
 import memforge.local_agent.runner as local_agent_runner
 from memforge.local_agent.runner import CloudJobLeaseLost, LocalAgentRunner, _CloudJobLeaseHeartbeat
 from memforge.local_agent.source_contract import SourceSyncRunReceiptError
 from memforge.local_agent.state import LocalAgentStateStore
 from memforge.main import cli
+from memforge.tool_client import ToolClient
 
 
 def test_local_agent_state_records_result_and_daemon_heartbeat(tmp_path):
@@ -185,6 +187,83 @@ def test_local_adapter_capability_commands_include_teams():
     assert "teams.sync" in status_payload["capabilities"]
 
 
+def test_oss_local_markdown_job_uses_the_unscoped_api_client(monkeypatch):
+    client = ToolClient(
+        target=build_target(origin="http://127.0.0.1:8765", workspace_id=None),
+        api_token=None,
+    )
+    observed: dict[str, object] = {}
+
+    def push_profile(*args, **kwargs):
+        observed["client"] = kwargs["client"]
+        return {"source_id": kwargs["source_id"], "sync_started": True}
+
+    monkeypatch.setattr(main, "_push_kb_profile_to_source", push_profile)
+
+    result = main._run_cloud_local_markdown_sync_job(
+        {
+            "job_id": "laj-oss-local-markdown",
+            "attempt_count": 1,
+            "operation": "local_markdown_sync",
+            "source_id": "src-local",
+            "workspace_id": "default",
+            "payload": {
+                "root": "/workspace/notes",
+                "vault_id": "notes",
+            },
+        },
+        client,
+    )
+
+    assert result == {
+        "operation": "local_markdown_sync",
+        "source_id": "src-local",
+        "sync_started": True,
+    }
+    assert observed["client"] is client
+
+
+def test_cloud_local_agent_job_requires_and_applies_workspace_scope():
+    client = ToolClient(
+        target=build_host_target(origin="https://memforge.example.hana.ondemand.com"),
+        api_token="cloud-token",
+    )
+    job = {
+        "operation": "local_markdown_sync",
+        "source_id": "src-local",
+        "payload": {},
+    }
+
+    source_id, unscoped, error = main._local_agent_job_source_client(
+        job,
+        job["payload"],
+        operation=job["operation"],
+        client=client,
+    )
+
+    assert source_id == "src-local"
+    assert unscoped is client
+    assert error == {
+        "operation": "local_markdown_sync",
+        "source_id": "src-local",
+        "error": "workspace_id is required",
+    }
+
+    job["workspace_id"] = "workspace-a"
+    source_id, scoped, error = main._local_agent_job_source_client(
+        job,
+        job["payload"],
+        operation=job["operation"],
+        client=client,
+    )
+
+    assert source_id == "src-local"
+    assert error is None
+    assert scoped is not client
+    assert scoped.target.workspace_id == "workspace-a"
+    assert scoped.target.workspace_api_base.endswith("/api/workspaces/workspace-a/api")
+
+
 def test_teams_browse_job_reauths_when_no_local_session(monkeypatch):
     calls = {"browse": 0}
     auth_jobs: list[dict] = []
@@ -243,6 +322,11 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
         return {"operation": "teams_auth", "authenticated": True, "region": "emea", "token_count": 1}
 
     class FakeClient:
+        target = build_target(
+            origin="https://memforge.example.hana.ondemand.com",
+            workspace_id="workspace-client",
+        )
+
         def for_workspace(self, workspace_id: str):
             assert workspace_id == "workspace-a"
             return self

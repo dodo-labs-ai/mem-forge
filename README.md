@@ -184,7 +184,10 @@ For normal self-hosted use, the plugin talks to the running MemForge API at
 `http://127.0.0.1:8765`. Set `MEMFORGE_API_URL` and optional
 `MEMFORGE_API_TOKEN` only when pointing the plugin at another local or hosted
 service. Hosted multi-workspace deployments also need `MEMFORGE_WORKSPACE_ID`
-so MCP calls target the workspace-scoped API path.
+so MCP calls target the workspace-scoped API path. Self-hosted OSS does not
+support workspace routing; remove `MEMFORGE_WORKSPACE_ID` from the client
+environment or MemForge client configuration when switching from Cloud to a
+local or other self-hosted origin.
 
 ```bash
 export MEMFORGE_API_URL=https://api.example.memforge
