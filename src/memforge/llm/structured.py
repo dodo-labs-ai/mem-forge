@@ -18,6 +18,11 @@ import litellm
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from memforge.llm.providers import litellm_optional_kwargs
+from memforge.llm.structured_images import (
+    StructuredLlmImage,
+    StructuredLlmImageError,
+    prepare_structured_llm_images as _prepare_structured_llm_images,
+)
 from memforge.source_artifacts import MAX_SOURCE_ARTIFACT_SUMMARY_CHARS
 
 logger = logging.getLogger(__name__)
@@ -28,28 +33,6 @@ type StructuredLlmTerminalCategory = Literal[
     "provider_error",
     "invalid_response",
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class StructuredLlmImage:
-    """One revision-pinned image supplied to a structured logical call."""
-
-    source_observation_id: str
-    media_type: str
-    body: bytes
-
-    def __post_init__(self) -> None:
-        if not self.source_observation_id.strip():
-            raise ValueError("image source_observation_id is required")
-        if self.media_type not in {
-            "image/gif",
-            "image/jpeg",
-            "image/png",
-            "image/webp",
-        }:
-            raise ValueError(f"unsupported structured LLM image type: {self.media_type}")
-        if not self.body:
-            raise ValueError("structured LLM image body is required")
 
 
 def _structured_user_content(
@@ -65,10 +48,7 @@ def _structured_user_content(
             (
                 {
                     "type": "text",
-                    "text": (
-                        "Image evidence for Source Observation "
-                        f"{image.source_observation_id}:"
-                    ),
+                    "text": (f"Image evidence for Source Observation {image.source_observation_id}:"),
                 },
                 {
                     "type": "image_url",
@@ -448,9 +428,7 @@ class StructuredLlmMetricsCollector:
             )
             operation_counts[call.operation] = operation_counts.get(call.operation, 0) + 1
             if call.error_code is not None:
-                error_code_counts[call.error_code] = (
-                    error_code_counts.get(call.error_code, 0) + 1
-                )
+                error_code_counts[call.error_code] = error_code_counts.get(call.error_code, 0) + 1
             if call.prompt_tokens is not None and call.completion_tokens is not None and call.total_tokens is not None:
                 usage_known_calls += 1
                 reported_input_tokens += call.prompt_tokens
@@ -705,9 +683,7 @@ _SAFE_PROVIDER_ERROR_PATTERNS = (
     ),
     (
         "tls_error",
-        re.compile(
-            r"SSLError|certificate verify failed|TLSV1_ALERT", re.IGNORECASE
-        ),
+        re.compile(r"SSLError|certificate verify failed|TLSV1_ALERT", re.IGNORECASE),
     ),
     (
         "dns_error",
@@ -1151,6 +1127,24 @@ class LiteLlmStructuredClient:
         failure: _StructuredLlmFailure | None = None
         try:
             async with asyncio.timeout_at(deadline):
+                prepared_images = await asyncio.to_thread(
+                    _prepare_structured_llm_images,
+                    images,
+                )
+                if prepared_images.images:
+                    logger.info(
+                        "structured_llm_images %s",
+                        json.dumps(
+                            {
+                                "image_count": len(prepared_images.images),
+                                "normalized_count": prepared_images.normalized_count,
+                                "original_bytes": prepared_images.original_bytes,
+                                "transport_bytes": prepared_images.transport_bytes,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
                 result = await self._call_schema_with_deadline(
                     prompt=prompt,
                     response_format=response_format,
@@ -1159,7 +1153,7 @@ class LiteLlmStructuredClient:
                     retry_with_json_text=retry_with_json_text,
                     deadline=deadline,
                     state=state,
-                    images=images,
+                    images=prepared_images.images,
                 )
         except TimeoutError:
             failure = _StructuredLlmFailure(
@@ -1168,6 +1162,11 @@ class LiteLlmStructuredClient:
             )
         except StructuredLlmError as exc:
             failure = _structured_failure(exc)
+        except StructuredLlmImageError as exc:
+            failure = _StructuredLlmFailure(
+                terminal_category="invalid_response",
+                error_code=exc.error_code,
+            )
         except Exception as exc:
             failure = _structured_failure(exc)
 
@@ -1357,9 +1356,7 @@ class LiteLlmStructuredClient:
                 failure = _structured_failure(
                     exc,
                     terminal_category=(
-                        "provider_error"
-                        if _is_non_fallback_provider_error(exc)
-                        else "invalid_response"
+                        "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
                     ),
                 )
             if failure is not None and not retry:

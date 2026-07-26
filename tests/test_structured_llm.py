@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import gc
+from io import BytesIO
 import logging
 from time import perf_counter
 import weakref
 
 import litellm
 import pytest
+from PIL import Image
 from pydantic import ValidationError
 
 from memforge.llm.structured import (
@@ -32,6 +35,12 @@ from memforge.llm.structured import (
     StructuredLlmImage,
     litellm_model_name,
 )
+
+
+def _png_bytes(*, width: int = 1, height: int = 1) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (width, height), color=(20, 40, 60)).save(output, format="PNG")
+    return output.getvalue()
 
 
 class ChoiceMessage:
@@ -391,6 +400,7 @@ async def test_litellm_structured_client_uses_response_schema_for_memory_extract
 @pytest.mark.asyncio
 async def test_litellm_structured_client_sends_images_in_same_logical_extraction_call(monkeypatch):
     calls = []
+    image_body = _png_bytes()
 
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
@@ -414,7 +424,7 @@ async def test_litellm_structured_client_sends_images_in_same_logical_extraction
             StructuredLlmImage(
                 source_observation_id="obs-image-1",
                 media_type="image/png",
-                body=b"\x89PNG",
+                body=image_body,
             ),
         ),
     )
@@ -431,8 +441,114 @@ async def test_litellm_structured_client_sends_images_in_same_logical_extraction
     }
     assert content[2] == {
         "type": "image_url",
-        "image_url": {"url": "data:image/png;base64,iVBORw=="},
+        "image_url": {"url": "data:image/png;base64," + base64.b64encode(image_body).decode("ascii")},
     }
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_normalizes_oversized_images_once_per_logical_call(
+    monkeypatch,
+):
+    calls = []
+    preparations = 0
+    original_prepare = __import__(
+        "memforge.llm.structured",
+        fromlist=["_prepare_structured_llm_images"],
+    )._prepare_structured_llm_images
+
+    def counted_prepare(images):
+        nonlocal preparations
+        preparations += 1
+        return original_prepare(images)
+
+    class RetryableFailure(Exception):
+        status_code = 503
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RetryableFailure("temporary")
+        return CompletionResponse('{"memories":[]}')
+
+    monkeypatch.setattr(
+        "memforge.llm.structured._prepare_structured_llm_images",
+        counted_prepare,
+    )
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=2.0,
+            num_retries=1,
+        )
+    )
+
+    await client.extract_memories(
+        "prompt",
+        max_tokens=1024,
+        images=(
+            StructuredLlmImage(
+                source_observation_id="obs-image-1",
+                media_type="image/png",
+                body=_png_bytes(width=2100, height=10),
+            ),
+        ),
+    )
+
+    assert preparations == 1
+    assert len(calls) == 2
+    first_url = calls[0]["messages"][0]["content"][2]["image_url"]["url"]
+    second_url = calls[1]["messages"][0]["content"][2]["image_url"]["url"]
+    assert first_url == second_url
+    media_type, encoded = first_url.removeprefix("data:").split(";base64,", 1)
+    with Image.open(BytesIO(base64.b64decode(encoded))) as prepared:
+        assert media_type == "image/jpeg"
+        assert max(prepared.size) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_rejects_invalid_image_before_provider_call(
+    monkeypatch,
+):
+    calls = []
+    telemetry: list[StructuredLlmCallTelemetry] = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse('{"memories":[]}')
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=2.0,
+        ),
+        telemetry_sink=telemetry.append,
+    )
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await client.extract_memories(
+            "prompt",
+            max_tokens=1024,
+            images=(
+                StructuredLlmImage(
+                    source_observation_id="obs-image-1",
+                    media_type="image/png",
+                    body=b"not-an-image",
+                ),
+            ),
+        )
+
+    assert calls == []
+    assert raised.value.error_code == "invalid_image_evidence"
+    assert telemetry[0].attempt_count == 0
+    assert telemetry[0].terminal_category == "invalid_response"
 
 
 @pytest.mark.asyncio
@@ -903,9 +1019,7 @@ async def test_litellm_structured_client_shares_one_transport_retry_budget_acros
             raise RetryableFailure("temporary")
         if len(calls) == 2:
             return CompletionResponse("{}")
-        return CompletionResponse(
-            '{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}'
-        )
+        return CompletionResponse('{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}')
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     set_native_schema_support(monkeypatch, True)
@@ -936,9 +1050,7 @@ async def test_litellm_structured_client_aggregates_available_usage_without_esti
     monkeypatch,
 ):
     telemetry: list[StructuredLlmCallTelemetry] = []
-    response = CompletionResponse(
-        '{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}'
-    )
+    response = CompletionResponse('{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}')
     response.usage = {
         "prompt_tokens": 11,
         "completion_tokens": 7,
@@ -1044,7 +1156,7 @@ async def test_litellm_structured_client_does_not_retain_provider_failure_contex
                 StructuredLlmImage(
                     source_observation_id="obs-image-1",
                     media_type="image/png",
-                    body=b"image",
+                    body=_png_bytes(),
                 ),
             ),
         )
@@ -1068,8 +1180,7 @@ async def test_litellm_structured_client_classifies_remote_disconnect_without_le
         del kwargs
         raise litellm.APIConnectionError(
             message=(
-                "httpx.RemoteProtocolError: Server disconnected without sending a response "
-                + private_request_detail
+                "httpx.RemoteProtocolError: Server disconnected without sending a response " + private_request_detail
             ),
             llm_provider="sap",
             model="deployment",
