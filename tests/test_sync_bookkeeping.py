@@ -9353,6 +9353,7 @@ async def test_sync_gene_records_source_unit_llm_summary_for_changed_and_noop_ru
     assert payload["usage_unknown_calls"] == 0
     assert payload["terminal_category_counts"] == {"success": 1}
     assert payload["operation_counts"] == {"memory_extraction": 1}
+    assert payload["error_code_counts"] == {}
     assert payload["source_unit_elapsed_ms"] >= 0
 
     noop_state = await orchestrator.sync_gene(
@@ -9373,6 +9374,7 @@ async def test_sync_gene_records_source_unit_llm_summary_for_changed_and_noop_ru
     assert noop_payload["usage_unknown_calls"] == 0
     assert noop_payload["terminal_category_counts"] == {}
     assert noop_payload["operation_counts"] == {}
+    assert noop_payload["error_code_counts"] == {}
 
 
 @pytest.mark.asyncio
@@ -9452,6 +9454,7 @@ async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fail
     assert audit_row.payload["usage_unknown_calls"] == 1
     assert audit_row.payload["terminal_category_counts"] == {"provider_error": 1}
     assert audit_row.payload["operation_counts"] == {"memory_extraction": 1}
+    assert audit_row.payload["error_code_counts"] == {"TimeoutError": 1}
 
 
 @pytest.mark.asyncio
