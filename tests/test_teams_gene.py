@@ -21,6 +21,10 @@ from memforge.models import ConfigFieldType
 from memforge.local_agent.source_contract import local_agent_semantic_input_sha256
 from memforge.local_agent.document_identity import build_teams_doc_id
 from memforge.local_agent.teams_ledger import build_teams_window_id
+from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
+    SourceArtifactContractError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +495,27 @@ class TestBlockGrouping:
 
 
 class TestMessageParsing:
+    def test_parse_conversations_preserves_channel_team_identity(self):
+        client = _TeamsAPIClient(region="emea")
+
+        [conversation] = client._parse_conversations(
+            {
+                "conversations": [
+                    {
+                        "id": "19:channel@thread.tacv2",
+                        "threadProperties": {
+                            "topic": "Architecture",
+                            "groupId": "team-1",
+                        },
+                        "lastActivity": "2026-04-15T12:00:00Z",
+                    }
+                ]
+            }
+        )
+
+        assert conversation["type"] == "channel"
+        assert conversation["team_id"] == "team-1"
+
     @pytest.mark.asyncio
     async def test_request_raises_auth_error_without_retry_on_401(self):
         client = _TeamsAPIClient(region="emea")
@@ -575,6 +600,125 @@ class TestMessageParsing:
         assert parsed["id"] == "reply-1"
         assert parsed["rootMessageId"] == "root-1"
         assert parsed["conversationid"] == "19:channel@example"
+
+    def test_parse_message_preserves_only_official_hosted_content_ids(self):
+        client = _TeamsAPIClient(region="emea")
+
+        parsed = client._parse_message(
+            {
+                "id": "message-1",
+                "conversationid": "19:chat@example",
+                "imdisplayname": "Alice",
+                "content": (
+                    "<p>Architecture:</p>"
+                    '<img src="https://graph.microsoft.com/v1.0/chats/19:chat@example/'
+                    'messages/message-1/hostedContents/hosted-1/$value">'
+                    '<img src="../hostedContents/hosted-2/$value">'
+                    '<img src="https://example.test/unrelated.png">'
+                ),
+                "messagetype": "RichText/Html",
+                "composetime": "2026-04-15T12:00:00Z",
+            }
+        )
+
+        assert parsed is not None
+        assert parsed["hosted_content_ids"] == ["hosted-1", "hosted-2"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("conversation_type", "team_id", "root_message_id", "expected_path"),
+        [
+            (
+                "group_chat",
+                None,
+                None,
+                "/chats/19%3Achat%40example/messages/message-1/hostedContents/hosted-1/$value",
+            ),
+            (
+                "channel",
+                "team-1",
+                "message-1",
+                "/teams/team-1/channels/19%3Achannel%40example/messages/message-1/hostedContents/hosted-1/$value",
+            ),
+            (
+                "channel",
+                "team-1",
+                "root-1",
+                "/teams/team-1/channels/19%3Achannel%40example/messages/root-1/replies/message-1/"
+                "hostedContents/hosted-1/$value",
+            ),
+        ],
+    )
+    async def test_get_hosted_content_uses_exact_graph_value_route(
+        self,
+        conversation_type,
+        team_id,
+        root_message_id,
+        expected_path,
+    ):
+        client = _TeamsAPIClient(region="emea")
+        client._ensure_clients = AsyncMock()
+        client._graph_client = object()
+        client._request_bytes = AsyncMock(
+            return_value=(
+                b"\x89PNG\r\n\x1a\nhosted",
+                {"content-type": "image/png", "content-length": "14"},
+            )
+        )
+
+        content, media_type = await client.get_hosted_content(
+            conversation_id=("19:channel@example" if conversation_type == "channel" else "19:chat@example"),
+            message_id="message-1",
+            hosted_content_id="hosted-1",
+            conversation_type=conversation_type,
+            team_id=team_id,
+            root_message_id=root_message_id,
+        )
+
+        assert content == b"\x89PNG\r\n\x1a\nhosted"
+        assert media_type == "image/png"
+        client._request_bytes.assert_awaited_once_with(
+            client._graph_client,
+            expected_path,
+            max_bytes=MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
+        )
+
+    @pytest.mark.asyncio
+    async def test_request_bytes_stops_before_buffering_oversized_body(self):
+        client = _TeamsAPIClient(region="emea")
+        chunks_read = 0
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "image/png"}
+            request = httpx.Request("GET", "https://graph.microsoft.com/hosted")
+
+            async def aiter_bytes(self):
+                nonlocal chunks_read
+                for chunk in (b"1234", b"5678", b"not-read"):
+                    chunks_read += 1
+                    yield chunk
+
+            def raise_for_status(self):
+                return None
+
+        class FakeStream:
+            async def __aenter__(self):
+                return FakeResponse()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return None
+
+        class FakeClient:
+            def stream(self, method: str, url: str):
+                assert method == "GET"
+                assert url == "/hosted"
+                return FakeStream()
+
+        with pytest.raises(SourceArtifactContractError, match="storage limit"):
+            await client._request_bytes(FakeClient(), "/hosted", max_bytes=6)
+
+        assert chunks_read == 2
 
     @pytest.mark.asyncio
     async def test_get_messages_until_keeps_newer_messages_after_old_row_in_same_page(self):

@@ -15345,6 +15345,30 @@ class Database:
                 results.append(_source_sync_input_from_row(row))
         return results
 
+    async def get_source_sync_inputs_by_raw_hashes(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str = "default",
+        raw_sha256s: Sequence[str],
+    ) -> list[SourceSyncInput]:
+        """Resolve a bounded set of immutable adapter inputs in one query."""
+
+        hashes = tuple(dict.fromkeys(str(value).strip() for value in raw_sha256s if str(value).strip()))
+        if not hashes:
+            return []
+        placeholders = ", ".join("?" for _value in hashes)
+        query = f"""SELECT * FROM source_sync_inputs
+                    WHERE workspace_id = ? AND source_id = ?
+                      AND raw_sha256 IN ({placeholders})
+                    ORDER BY input_generation"""
+        params: tuple[Any, ...] = (workspace_id, source_id, *hashes)
+        results: list[SourceSyncInput] = []
+        async with self.db.execute(query, params) as cursor:
+            async for row in cursor:
+                results.append(_source_sync_input_from_row(row))
+        return results
+
     async def find_source_sync_input_attestations(
         self,
         *,

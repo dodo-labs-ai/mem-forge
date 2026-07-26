@@ -18,15 +18,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from html.parser import HTMLParser
 from collections import defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
 from memforge.genes.base import Gene
-from memforge.genes.local_adapter_packages import has_package_manifest, read_package_body
+from memforge.genes.local_adapter_packages import (
+    has_package_manifest,
+    open_packaged_source_artifact,
+    read_package_body,
+    source_artifacts_from_package,
+)
 from memforge.local_agent.teams_contract import (
     TeamsMessageEvidenceError,
     parse_teams_source_timestamp,
@@ -43,6 +50,13 @@ from memforge.models import (
     RawContent,
 )
 from memforge.pipeline.normalizer_utils import html_to_markdown
+from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
+    SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
+    SourceArtifactContractError,
+    normalize_source_artifact_media_type,
+    parse_source_artifact_content_length,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +78,39 @@ _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 _MAX_PAGE_SIZE = 200
 LOCAL_AGENT_TEAMS_PACKAGE_KIND = "teams_window_document"
+
+
+class _TeamsHostedContentHTMLParser(HTMLParser):
+    """Collect exact Graph hosted-content identities from Teams HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.ids: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "img":
+            return
+        source = next((value for key, value in attrs if key.lower() == "src"), None)
+        if not source:
+            return
+        parts = [unquote(part) for part in urlsplit(source).path.split("/") if part]
+        for index, part in enumerate(parts[:-2]):
+            if part.lower() != "hostedcontents" or parts[index + 2] != "$value":
+                continue
+            hosted_id = parts[index + 1].strip()
+            if hosted_id and hosted_id not in self.ids:
+                self.ids.append(hosted_id)
+
+
+def _teams_hosted_content_ids(content: str) -> list[str]:
+    """Return stable inline-image IDs without following arbitrary URLs."""
+
+    if "<" not in content or "hostedcontent" not in content.lower():
+        return []
+    parser = _TeamsHostedContentHTMLParser()
+    parser.feed(content)
+    parser.close()
+    return parser.ids
 
 
 # ============================================================================
@@ -199,6 +246,56 @@ class _TeamsAPIClient:
                 httpx.RemoteProtocolError,
             ),
             description=f"Teams API {method} {url}",
+        )
+
+    async def _request_bytes(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        max_bytes: int,
+    ) -> tuple[bytes, Mapping[str, str]]:
+        """Read one provider body incrementally under an explicit byte limit."""
+
+        from memforge.pipeline.retry import retry_async
+
+        async def _do_request() -> tuple[bytes, Mapping[str, str]]:
+            async with client.stream("GET", url) as response:
+                if response.status_code == 401:
+                    raise AuthenticationError("Teams session expired. Connect Teams from the source wizard.")
+                if response.status_code == 429:
+                    raise httpx.HTTPStatusError(
+                        "Rate limited",
+                        request=response.request,
+                        response=response,
+                    )
+                response.raise_for_status()
+                declared_size = parse_source_artifact_content_length(response.headers.get("content-length"))
+                if declared_size is not None and declared_size > max_bytes:
+                    raise SourceArtifactContractError("Teams hosted-content exceeds the Source Artifact storage limit")
+                content = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(content) + len(chunk) > max_bytes:
+                        raise SourceArtifactContractError(
+                            "Teams hosted-content exceeds the Source Artifact storage limit"
+                        )
+                    content.extend(chunk)
+                if declared_size is not None and declared_size != len(content):
+                    raise SourceArtifactContractError(
+                        "Teams hosted-content transport length does not match the response body"
+                    )
+                return bytes(content), dict(response.headers)
+
+        return await retry_async(
+            _do_request,
+            max_retries=3,
+            retryable_exceptions=(
+                httpx.HTTPStatusError,
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+                httpx.RemoteProtocolError,
+            ),
+            description=f"Teams API GET {url}",
         )
 
     # --- Chat API methods ---
@@ -626,6 +723,56 @@ class _TeamsAPIClient:
         resp.raise_for_status()
         return resp.json().get("value", [])
 
+    async def get_hosted_content(
+        self,
+        *,
+        conversation_id: str,
+        message_id: str,
+        hosted_content_id: str,
+        conversation_type: str,
+        team_id: str | None,
+        root_message_id: str | None = None,
+    ) -> tuple[bytes, str]:
+        """Download one exact inline image through the documented Graph route."""
+
+        await self._ensure_clients()
+        conversation = str(conversation_id or "").strip()
+        message = str(message_id or "").strip()
+        hosted = str(hosted_content_id or "").strip()
+        if not conversation or not message or not hosted:
+            raise SourceArtifactContractError("Teams hosted-content identity is incomplete")
+        if conversation_type == "channel":
+            normalized_team_id = str(team_id or "").strip()
+            if not normalized_team_id:
+                raise SourceArtifactContractError("Teams channel hosted-content requires an exact team identity")
+            normalized_root_id = str(root_message_id or "").strip()
+            message_path = f"/messages/{quote(normalized_root_id or message, safe='')}"
+            if normalized_root_id and normalized_root_id != message:
+                message_path += f"/replies/{quote(message, safe='')}"
+            path = (
+                f"/teams/{quote(normalized_team_id, safe='')}"
+                f"/channels/{quote(conversation, safe='')}"
+                f"{message_path}"
+                f"/hostedContents/{quote(hosted, safe='')}/$value"
+            )
+        else:
+            path = (
+                f"/chats/{quote(conversation, safe='')}"
+                f"/messages/{quote(message, safe='')}"
+                f"/hostedContents/{quote(hosted, safe='')}/$value"
+            )
+        content, headers = await self._request_bytes(
+            self._graph_client,
+            path,
+            max_bytes=MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
+        )
+        media_type = normalize_source_artifact_media_type(headers.get("content-type"))
+        if media_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES or not media_type.startswith("image/"):
+            raise SourceArtifactContractError(
+                f"Teams hosted-content media type is unsupported: {media_type or 'missing'}"
+            )
+        return content, media_type
+
     async def resolve_user(self, query: str) -> dict | None:
         """Resolve a user by display name via Graph API people search."""
         await self._ensure_clients()
@@ -689,6 +836,7 @@ class _TeamsAPIClient:
                     "topic": topic or "Untitled",
                     "lastActivity": last_activity,
                     "type": self._infer_conversation_type(conv_id),
+                    "team_id": str(c.get("threadProperties", {}).get("groupId") or "").strip() or None,
                     "lastMessageSender": sender_display,
                     "lastMessageSenderId": sender_id,
                     "favorite": str(c.get("properties", {}).get("favorite", "")).lower() == "true",
@@ -706,6 +854,7 @@ class _TeamsAPIClient:
             return None
 
         content = m["content"]
+        hosted_content_ids = _teams_hosted_content_ids(content)
         # Convert HTML to clean text via normalizer_utils
         if "<" in content:
             content = html_to_markdown(content).strip()
@@ -741,6 +890,7 @@ class _TeamsAPIClient:
             "parentMessageId": m.get("properties", {}).get("parentMessageId"),
             "mentions": m.get("properties", {}).get("mentions", []),
             "attachments": m.get("amsreferences", []),
+            "hosted_content_ids": hosted_content_ids,
         }
 
     @staticmethod
@@ -1034,6 +1184,7 @@ class TeamsGene(Gene):
                     if tombstone
                     else ("teams_current_collection_scope_attestation" if scope_attestation else None)
                 ),
+                artifacts=source_artifacts_from_package(package),
             )
 
         conv_id = item.extra["conversation_id"]
@@ -1073,6 +1224,7 @@ class TeamsGene(Gene):
             "title": item.title,
             "channel_name": item.extra.get("channel_name", ""),
             "team_name": item.space_or_project,
+            "team_id": item.extra.get("team_id"),
             "messages": [
                 {
                     "id": m["id"],
@@ -1081,6 +1233,7 @@ class TeamsGene(Gene):
                     "time": m["time"].isoformat() if isinstance(m["time"], datetime) else m["time"],
                     "mentions": m.get("mentions", []),
                     "attachments": m.get("attachments", []),
+                    "hosted_content_ids": m.get("hosted_content_ids", []),
                     "is_root": m["id"] == root_msg_id,
                 }
                 for m in sorted(messages, key=lambda x: x["time"])
@@ -1095,6 +1248,11 @@ class TeamsGene(Gene):
             body=json.dumps(thread_data, default=str).encode("utf-8"),
             content_type="application/json",
         )
+
+    def open_source_artifact(self, artifact):
+        """Open one service-owned Teams hosted-content input."""
+
+        return open_packaged_source_artifact(self, artifact)
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:
         """Convert Teams thread/block JSON to comprehensive markdown."""
@@ -1725,6 +1883,7 @@ class TeamsGene(Gene):
                 "root_message_id": first_msg_id,
                 "conversation_type": conv_type,
                 "channel_name": channel_name,
+                "team_id": conv_meta.get("team_id"),
                 "message_count": len(messages),
                 "is_thread": is_thread,
                 "window_id": window_id,

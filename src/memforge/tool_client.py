@@ -261,6 +261,8 @@ class ToolClient:
         sync_snapshot_id: str | None = None,
         local_agent_job_id: str | None = None,
         local_agent_attempt_count: int | None = None,
+        artifact_source_unit_key: str | None = None,
+        artifact_input_hashes: list[str] | None = None,
         submitted_by: str | None = None,
         submitted_at: str | None = None,
     ) -> dict[str, Any]:
@@ -287,6 +289,10 @@ class ToolClient:
             body["local_agent_job_id"] = local_agent_job_id
         if local_agent_attempt_count is not None:
             body["local_agent_attempt_count"] = local_agent_attempt_count
+        if artifact_source_unit_key is not None:
+            body["artifact_source_unit_key"] = artifact_source_unit_key
+        if artifact_input_hashes:
+            body["artifact_input_hashes"] = list(artifact_input_hashes)
         if submitted_by is not None:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
@@ -296,6 +302,61 @@ class ToolClient:
             f"/sources/{quote(source_id, safe='')}/adapter/packages",
             body,
         )
+
+    def push_source_artifact(
+        self,
+        *,
+        source_id: str,
+        source_unit_key: str,
+        provider_key: str,
+        provider_revision: str,
+        parent_observation_type: str,
+        parent_provider_key: str,
+        filename: str,
+        media_type: str,
+        content: bytes,
+        local_agent_job_id: str | None = None,
+        local_agent_attempt_count: int | None = None,
+    ) -> dict[str, Any]:
+        """Upload one bounded binary input without Base64 or JSON expansion."""
+
+        params: dict[str, Any] = {
+            "source_unit_key": source_unit_key,
+            "provider_key": provider_key,
+            "provider_revision": provider_revision,
+            "parent_observation_type": parent_observation_type,
+            "parent_provider_key": parent_provider_key,
+            "filename": filename,
+            "media_type": media_type,
+        }
+        if local_agent_job_id is not None:
+            params["local_agent_job_id"] = local_agent_job_id
+        if local_agent_attempt_count is not None:
+            params["local_agent_attempt_count"] = local_agent_attempt_count
+        url = self._resource_url(f"/sources/{quote(source_id, safe='')}/adapter/artifacts?{urlencode(params)}")
+        headers = self._headers()
+        headers["Content-Type"] = media_type
+        request = Request(url, data=content, headers=headers, method="POST")
+        try:
+            with build_opener(NoRedirectHandler).open(
+                request,
+                timeout=self.timeout_seconds,
+            ) as response:
+                raw = response.read()
+                return json.loads(raw.decode("utf-8")) if raw else {}
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            return {
+                "error": "MemForge API request failed",
+                "status_code": exc.code,
+                "detail": detail,
+            }
+        except (OSError, URLError, json.JSONDecodeError) as exc:
+            return {
+                "error": "MemForge API unavailable",
+                "api_url": url,
+                "detail": str(exc),
+            }
 
     def prepare_local_source_snapshot(
         self,
@@ -337,6 +398,8 @@ class ToolClient:
         sync_snapshot_id: str | None = None,
         local_agent_job_id: str | None = None,
         local_agent_attempt_count: int | None = None,
+        artifact_source_unit_key: str | None = None,
+        artifact_input_hashes: list[str] | None = None,
         submitted_by: str | None = None,
         submitted_at: str | None = None,
     ) -> dict[str, Any]:
@@ -363,6 +426,10 @@ class ToolClient:
             body["local_agent_job_id"] = local_agent_job_id
         if local_agent_attempt_count is not None:
             body["local_agent_attempt_count"] = local_agent_attempt_count
+        if artifact_source_unit_key is not None:
+            body["artifact_source_unit_key"] = artifact_source_unit_key
+        if artifact_input_hashes:
+            body["artifact_input_hashes"] = list(artifact_input_hashes)
         if submitted_by is not None:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:
@@ -389,6 +456,8 @@ class ToolClient:
         sync_snapshot_id: str | None = None,
         local_agent_job_id: str | None = None,
         local_agent_attempt_count: int | None = None,
+        artifact_source_unit_key: str | None = None,
+        artifact_input_hashes: list[str] | None = None,
         submitted_by: str | None = None,
         submitted_at: str | None = None,
     ) -> dict[str, Any]:
@@ -418,6 +487,10 @@ class ToolClient:
             body["local_agent_job_id"] = local_agent_job_id
         if local_agent_attempt_count is not None:
             body["local_agent_attempt_count"] = local_agent_attempt_count
+        if artifact_source_unit_key is not None:
+            body["artifact_source_unit_key"] = artifact_source_unit_key
+        if artifact_input_hashes:
+            body["artifact_input_hashes"] = list(artifact_input_hashes)
         if submitted_by is not None:
             body["submitted_by"] = submitted_by
         if submitted_at is not None:

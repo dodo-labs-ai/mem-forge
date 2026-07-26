@@ -21,6 +21,7 @@ from memforge.memory.lifecycle_plan import (
 )
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
+from memforge.source_artifacts import SourceArtifactContractError
 
 
 class _EmptySourceInputDatabase:
@@ -164,6 +165,7 @@ def _create_github_repo_source(
     connection_mode: str = "local_push",
     max_files: int = 500,
     exclude_paths: list[str] | None = None,
+    include_extensions: list[str] | None = None,
 ) -> dict:
     response = client.post(
         "/api/sources",
@@ -177,7 +179,7 @@ def _create_github_repo_source(
                 "ref": "main",
                 "include_paths": ["Payroll Processing/"],
                 "exclude_paths": exclude_paths or [],
-                "include_extensions": ["md"],
+                "include_extensions": include_extensions or ["md"],
                 "max_files": max_files,
             },
             "project_binding": {"mode": "fixed", "project_key": "MATTERHORN"},
@@ -1089,6 +1091,389 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
         items, normalized = asyncio.run(_read_package())
         assert items[0].extra["package_uri"] == body["package_uri"]
         assert normalized.markdown_body.startswith("# Payroll Processing")
+    finally:
+        asyncio.run(database.close())
+
+
+def test_github_repo_local_push_materializes_binary_artifact_input(tmp_path):
+    from memforge.genes.github_repo_gene import GitHubRepoGene
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    image_bytes = b"\x89PNG\r\n\x1a\nlocal-github-image"
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_github_repo_source(
+                client,
+                include_extensions=["png"],
+            )["id"]
+            artifact_response = client.post(
+                f"/api/sources/{source_id}/adapter/artifacts",
+                params={
+                    "source_unit_key": "Payroll Processing/architecture.png",
+                    "provider_key": "Payroll Processing/architecture.png",
+                    "provider_revision": "blob-image-sha",
+                    "parent_observation_type": "file_content",
+                    "parent_provider_key": "content",
+                    "filename": "architecture.png",
+                    "media_type": "image/png",
+                    "local_agent_job_id": "test-local-agent-job",
+                    "local_agent_attempt_count": 1,
+                },
+                content=image_bytes,
+                headers={"content-type": "image/png"},
+            )
+            assert artifact_response.status_code == 200, artifact_response.text
+            artifact_input_hash = artifact_response.json()["input_sha256"]
+            package_response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/architecture.png",
+                    "markdown_body": "",
+                    "content_type": "image/png",
+                    "blob_sha": "blob-image-sha",
+                    "artifact_source_unit_key": "Payroll Processing/architecture.png",
+                    "artifact_input_hashes": [artifact_input_hash],
+                },
+            )
+        assert package_response.status_code == 200, package_response.text
+
+        source = asyncio.run(database.get_source(source_id))
+        assert source is not None
+        projected = _project_source_inputs(database, source)
+        gene = GitHubRepoGene(projected["config"], source_id)
+        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
+
+        async def _read_package():
+            await gene.authenticate()
+            item = [item async for item in gene.discover(None)][0]
+            raw = await gene.fetch(item)
+            async with gene.open_source_artifact(raw.artifacts[0]) as download:
+                observed = b"".join([chunk async for chunk in download.chunks])
+            return raw, observed
+
+        raw, observed = asyncio.run(_read_package())
+        assert raw.body
+        assert raw.authoritative_empty is True
+        assert len(raw.artifacts) == 1
+        assert raw.artifacts[0].provider_revision == "blob-image-sha"
+        assert observed == image_bytes
+
+        package = json.loads(Path(package_response.json()["package_uri"]).read_text())
+        artifact_path = Path(package["source_artifacts"][0]["uri"])
+        artifact_path.write_bytes(b"x" * len(image_bytes))
+        with pytest.raises(SourceArtifactContractError, match="byte hash"):
+            asyncio.run(_read_package())
+    finally:
+        asyncio.run(database.close())
+
+
+def test_github_repo_local_push_rejects_artifact_from_prior_source_activity_epoch(
+    tmp_path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_github_repo_source(
+                client,
+                include_extensions=["png"],
+            )["id"]
+            artifact_response = client.post(
+                f"/api/sources/{source_id}/adapter/artifacts",
+                params={
+                    "source_unit_key": "Payroll Processing/architecture.png",
+                    "provider_key": "Payroll Processing/architecture.png",
+                    "provider_revision": "blob-image-sha",
+                    "parent_observation_type": "file_content",
+                    "parent_provider_key": "content",
+                    "filename": "architecture.png",
+                    "media_type": "image/png",
+                    "local_agent_job_id": "test-local-agent-job",
+                    "local_agent_attempt_count": 1,
+                },
+                content=b"\x89PNG\r\n\x1a\nprior-epoch",
+                headers={"content-type": "image/png"},
+            )
+            assert artifact_response.status_code == 200, artifact_response.text
+
+            async def _advance_source_epoch() -> None:
+                await database.db.execute(
+                    "UPDATE sources SET activity_epoch = activity_epoch + 1 WHERE id = ?",
+                    (source_id,),
+                )
+                await database.db.commit()
+
+            asyncio.run(_advance_source_epoch())
+            package_response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/architecture.png",
+                    "markdown_body": "",
+                    "content_type": "image/png",
+                    "blob_sha": "blob-image-sha",
+                    "artifact_source_unit_key": "Payroll Processing/architecture.png",
+                    "artifact_input_hashes": [
+                        artifact_response.json()["input_sha256"],
+                    ],
+                },
+            )
+
+        assert package_response.status_code == 400
+        assert (
+            package_response.json()["detail"]
+            == "local source Artifact input belongs to another source activity epoch"
+        )
+    finally:
+        asyncio.run(database.close())
+
+
+def test_local_markdown_rejects_implicit_binary_artifact_intake(tmp_path):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_local_markdown_source(client)["id"]
+            response = client.post(
+                f"/api/sources/{source_id}/adapter/artifacts",
+                params={
+                    "source_unit_key": "notes/readme.md",
+                    "provider_key": "diagram.png",
+                    "provider_revision": "sha-image",
+                    "parent_observation_type": "document_body",
+                    "parent_provider_key": "body",
+                    "filename": "diagram.png",
+                    "media_type": "image/png",
+                    "local_agent_job_id": "test-local-agent-job",
+                    "local_agent_attempt_count": 1,
+                },
+                content=b"\x89PNG\r\n\x1a\nnot-authoritative",
+                headers={"content-type": "image/png"},
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "source does not support local Artifact inputs"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_teams_local_push_materializes_hosted_image_artifact_input(tmp_path):
+    from memforge.genes.teams_gene import TeamsGene
+    from memforge.local_agent.teams_ledger import build_teams_window_id
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    image_bytes = b"\x89PNG\r\n\x1a\nteams-hosted-image"
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_teams_source(client)["id"]
+            window_id = build_teams_window_id(
+                source_id=source_id,
+                conversation_id="19:chat@example.test",
+                root_or_anchor_message_id="message-1",
+                window_type="time_block",
+            )
+            artifact_response = client.post(
+                f"/api/sources/{source_id}/adapter/artifacts",
+                params={
+                    "source_unit_key": window_id,
+                    "provider_key": "message-1/hostedContents/hosted-1",
+                    "provider_revision": "message-1:hosted-1",
+                    "parent_observation_type": "message",
+                    "parent_provider_key": "message-1",
+                    "filename": "teams-hosted-hosted-1.png",
+                    "media_type": "image/png",
+                    "local_agent_job_id": "test-local-agent-job",
+                    "local_agent_attempt_count": 1,
+                },
+                content=image_bytes,
+                headers={"content-type": "image/png"},
+            )
+            assert artifact_response.status_code == 200, artifact_response.text
+            artifact_input_hash = artifact_response.json()["input_sha256"]
+            package_response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "conversation_id": "19:chat@example.test",
+                    "window_id": window_id,
+                    "revision_hash": "rev-window-1",
+                    "root_message_id": "message-1",
+                    "window_type": "time_block",
+                    "title": "Teams image",
+                    "artifact_source_unit_key": window_id,
+                    "artifact_input_hashes": [artifact_input_hash],
+                    "raw_payload": {
+                        "conversation_id": "19:chat@example.test",
+                        "window_id": window_id,
+                        "conversation_type": "group_chat",
+                        "title": "Teams image",
+                        "messages": [
+                            {
+                                "id": "message-1",
+                                "from": "Alice",
+                                "content": "Architecture image.",
+                                "time": "2026-07-08T10:00:00+00:00",
+                                "hosted_content_ids": ["hosted-1"],
+                                "is_root": True,
+                            },
+                        ],
+                        "participants": ["Alice"],
+                        "first_message_time": "2026-07-08T10:00:00+00:00",
+                        "last_message_time": "2026-07-08T10:00:00+00:00",
+                    },
+                    "process_now": False,
+                },
+            )
+        assert package_response.status_code == 200, package_response.text
+
+        source = asyncio.run(database.get_source(source_id))
+        assert source is not None
+        projected = _project_source_inputs(database, source)
+        gene = TeamsGene(projected["config"], source_id)
+        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
+
+        async def _read_package():
+            await gene.authenticate()
+            item = [item async for item in gene.discover(None)][0]
+            raw = await gene.fetch(item)
+            async with gene.open_source_artifact(raw.artifacts[0]) as download:
+                observed = b"".join([chunk async for chunk in download.chunks])
+            return raw, observed
+
+        raw, observed = asyncio.run(_read_package())
+        assert len(raw.artifacts) == 1
+        assert raw.artifacts[0].parent_observation_type == "message"
+        assert raw.artifacts[0].parent_provider_key == "message-1"
+        assert observed == image_bytes
+    finally:
+        asyncio.run(database.close())
+
+
+def test_jira_local_push_materializes_comment_image_artifact_input(tmp_path):
+    from memforge.genes.jira_gene import JiraGene
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    image_bytes = b"\x89PNG\r\n\x1a\njira-comment-image"
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_jira_source(client)["id"]
+            artifact_response = client.post(
+                f"/api/sources/{source_id}/adapter/artifacts",
+                params={
+                    "source_unit_key": "PAY-1",
+                    "provider_key": "attachment-1",
+                    "provider_revision": "attachment-revision-1",
+                    "parent_observation_type": "comment",
+                    "parent_provider_key": "comment-1",
+                    "filename": "screenshot.png",
+                    "media_type": "image/png",
+                    "local_agent_job_id": "test-local-agent-job",
+                    "local_agent_attempt_count": 1,
+                },
+                content=image_bytes,
+                headers={"content-type": "image/png"},
+            )
+            assert artifact_response.status_code == 200, artifact_response.text
+            artifact_input_hash = artifact_response.json()["input_sha256"]
+            raw_payload = {
+                "id": "10001",
+                "key": "PAY-1",
+                "fields": {
+                    "summary": "Image in comment",
+                    "description": "",
+                    "status": {"name": "Open"},
+                    "issuetype": {"name": "Task"},
+                    "priority": {"name": "Medium"},
+                    "assignee": None,
+                    "labels": [],
+                    "resolution": None,
+                    "updated": "2026-07-10T08:00:00+00:00",
+                    "issuelinks": [],
+                    "subtasks": [],
+                    "attachment": [],
+                },
+                "_comments": [
+                    {
+                        "id": "comment-1",
+                        "body": "See screenshot.png",
+                    }
+                ],
+                "_comments_included": True,
+                "_comments_total": 1,
+                "changelog": {"startAt": 0, "histories": [], "total": 0},
+            }
+            package_response = client.post(
+                f"/api/sources/{source_id}/adapter/packages",
+                json={
+                    "base_url": "https://jira.example.test",
+                    "issue_key": "PAY-1",
+                    "source_url": "https://jira.example.test/browse/PAY-1",
+                    "title": "Image in comment",
+                    "raw_payload": raw_payload,
+                    "provider_revision": "2026-07-10T08:00:00+00:00",
+                    "artifact_source_unit_key": "PAY-1",
+                    "artifact_input_hashes": [artifact_input_hash],
+                    "process_now": False,
+                },
+            )
+        assert package_response.status_code == 200, package_response.text
+
+        source = asyncio.run(database.get_source(source_id))
+        assert source is not None
+        projected = _project_source_inputs(database, source)
+        gene = JiraGene(projected["config"], source_id)
+        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
+
+        async def _read_package():
+            await gene.authenticate()
+            item = [item async for item in gene.discover(None)][0]
+            raw = await gene.fetch(item)
+            async with gene.open_source_artifact(raw.artifacts[0]) as download:
+                observed = b"".join([chunk async for chunk in download.chunks])
+            return raw, observed
+
+        raw, observed = asyncio.run(_read_package())
+        assert len(raw.artifacts) == 1
+        assert raw.artifacts[0].parent_observation_type == "comment"
+        assert raw.artifacts[0].parent_provider_key == "comment-1"
+        assert observed == image_bytes
     finally:
         asyncio.run(database.close())
 

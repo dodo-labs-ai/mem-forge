@@ -7,6 +7,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,8 +18,10 @@ import requests
 from memforge.genes.base import Gene
 from memforge.genes.local_adapter_packages import (
     has_package_manifest,
+    open_packaged_source_artifact,
     package_manifest,
     read_package_body,
+    source_artifacts_from_package,
 )
 from memforge.genes.local_markdown_gene import _parse_dt, _to_markdown
 from memforge.github_repo_utils import (
@@ -26,6 +29,7 @@ from memforge.github_repo_utils import (
     build_github_repo_doc_id,
     decode_github_contents_payload,
     github_content_type,
+    github_content_type_is_binary,
     github_exclude_paths,
     github_extension_allowed,
     github_include_extensions,
@@ -48,6 +52,14 @@ from memforge.models import (
     RawContent,
 )
 from memforge.repo_identity import normalize_repo_identifier
+from memforge.source_artifacts import (
+    SOURCE_ARTIFACT_STREAM_CHUNK_BYTES,
+    SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
+    RawSourceArtifact,
+    SourceArtifactContractError,
+    SourceArtifactDownload,
+    parse_source_artifact_content_length,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +284,8 @@ class GitHubRepoGene(Gene):
                     "repo_ref": ref,
                     "relative_path": path,
                     "blob_sha": blob_sha,
+                    "blob_size": entry.get("size"),
+                    "repo_blob_url": _blob_url(repo_ref, blob_sha),
                     "repo_contents_url": _contents_url(repo_ref, path, ref),
                 },
             )
@@ -295,6 +309,48 @@ class GitHubRepoGene(Gene):
                     "github_repo_package_attested_empty_file"
                     if authoritative_empty
                     else None
+                ),
+                artifacts=source_artifacts_from_package(package),
+            )
+
+        if (
+            github_content_type_is_binary(item.content_type)
+            and item.content_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES
+        ):
+            raise SourceArtifactContractError(
+                f"GitHub selected file has unsupported binary media type: {item.content_type}"
+            )
+
+        if item.content_type in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
+            relative_path = str(item.extra.get("relative_path") or "").strip()
+            blob_sha = str(item.extra.get("blob_sha") or "").strip()
+            blob_url = str(item.extra.get("repo_blob_url") or "").strip()
+            if not relative_path or not blob_sha or not blob_url:
+                raise SourceArtifactContractError("GitHub binary Artifact identity is incomplete")
+            blob_size = item.extra.get("blob_size")
+            declared_size = (
+                blob_size if isinstance(blob_size, int) and not isinstance(blob_size, bool) and blob_size >= 0 else None
+            )
+            return RawContent(
+                item=item,
+                body=b"",
+                content_type=item.content_type,
+                authoritative_empty=True,
+                empty_evidence="github_binary_file_has_no_text_body",
+                artifacts=(
+                    RawSourceArtifact(
+                        provider_key=relative_path,
+                        parent_observation_type="file_content",
+                        parent_provider_key="content",
+                        provider_revision=blob_sha,
+                        filename=Path(relative_path).name,
+                        media_type=item.content_type,
+                        declared_size_bytes=declared_size,
+                        locator={
+                            "blob_sha": blob_sha,
+                            "blob_url": blob_url,
+                        },
+                    ),
                 ),
             )
 
@@ -320,6 +376,32 @@ class GitHubRepoGene(Gene):
                 else None
             ),
         )
+
+    @asynccontextmanager
+    async def open_source_artifact(self, artifact: RawSourceArtifact):
+        """Open one immutable Git blob without buffering it in the Gene."""
+
+        if artifact.locator.get("input_uri"):
+            async with open_packaged_source_artifact(self, artifact) as download:
+                yield download
+            return
+        blob_url = str(artifact.locator.get("blob_url") or "").strip()
+        blob_sha = str(artifact.locator.get("blob_sha") or "").strip()
+        if not blob_url or not blob_sha or not blob_url.rstrip("/").endswith(f"/{quote(blob_sha, safe='')}"):
+            raise SourceArtifactContractError("GitHub binary Artifact locator is incomplete")
+        async with self._client.stream(
+            blob_url,
+            headers={"Accept": "application/vnd.github.raw+json"},
+        ) as response:
+            response.raise_for_status()
+            yield SourceArtifactDownload(
+                chunks=_iter_response_chunks(response),
+                # GitHub raw blob responses may use application/octet-stream.
+                # The immutable tree descriptor supplies the scoped media type.
+                media_type=None,
+                content_length=parse_source_artifact_content_length(response.headers.get("content-length")),
+                content_encoding=response.headers.get("content-encoding"),
+            )
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:
         if raw.content_type == "application/json":
@@ -467,6 +549,20 @@ class _RequestsAsyncClient:
     async def get(self, url: str) -> requests.Response:
         return await asyncio.to_thread(self._session.get, url, timeout=self._timeout)
 
+    @asynccontextmanager
+    async def stream(self, url: str, *, headers: dict[str, str] | None = None):
+        response = await asyncio.to_thread(
+            self._session.get,
+            url,
+            headers=headers,
+            timeout=self._timeout,
+            stream=True,
+        )
+        try:
+            yield response
+        finally:
+            await asyncio.to_thread(response.close)
+
     async def aclose(self) -> None:
         await asyncio.to_thread(self._session.close)
 
@@ -502,6 +598,10 @@ def _contents_url(ref: _RepoRef, relative_path: str, repo_ref: str) -> str:
     return f"{_repo_api_url(ref)}/contents/{quote(relative_path, safe='/')}?ref={quote(repo_ref, safe='')}"
 
 
+def _blob_url(ref: _RepoRef, blob_sha: str) -> str:
+    return f"{_repo_api_url(ref)}/git/blobs/{quote(blob_sha, safe='')}"
+
+
 def _file_url(ref: _RepoRef, repo_ref: str, relative_path: str) -> str:
     return f"{ref.repo_url}/blob/{quote(repo_ref, safe='')}/{quote(relative_path, safe='/')}"
 
@@ -509,6 +609,16 @@ def _file_url(ref: _RepoRef, repo_ref: str, relative_path: str) -> str:
 def _title_from_path(relative_path: str) -> str:
     filename = relative_path.rstrip("/").rsplit("/", 1)[-1]
     return re.sub(r"\.[^.]+$", "", filename) or filename
+
+
+async def _iter_response_chunks(response: requests.Response) -> AsyncIterator[bytes]:
+    iterator = response.iter_content(chunk_size=SOURCE_ARTIFACT_STREAM_CHUNK_BYTES)
+    while True:
+        chunk = await asyncio.to_thread(next, iterator, None)
+        if chunk is None:
+            return
+        if chunk:
+            yield chunk
 
 
 def _int_config(config: dict, key: str, default: int) -> int:

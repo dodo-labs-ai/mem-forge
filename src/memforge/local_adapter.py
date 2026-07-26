@@ -45,6 +45,7 @@ from memforge.local_agent.document_identity import (
 from memforge.models import content_hash, slugify
 from memforge.storage.database import Database
 from memforge.storage.document_store import DocumentStore
+from memforge.source_artifacts import source_artifact_semantic_refs
 
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
@@ -390,6 +391,7 @@ async def submit_github_repo_document(
     submitted_at: str | None = None,
     document_store: DocumentStore | None = None,
     sync_snapshot_id: str | None = None,
+    source_artifacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate, package, and persist one GitHub repository file push."""
     if source.get("type") != GITHUB_REPO_SOURCE_TYPE:
@@ -422,7 +424,18 @@ async def submit_github_repo_document(
     if not github_extension_allowed(relative, include_extensions):
         raise ValueError("relative_path extension is outside the source's configured include_extensions")
     repo = _repo_parts(configured_repo)
-    document_hash = content_hash(markdown_body)
+    source_artifacts = list(source_artifacts or [])
+    artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
+    document_hash = (
+        _hash_json(
+            {
+                "markdown": markdown_body,
+                "source_artifacts": artifact_semantic_refs,
+            }
+        )
+        if artifact_semantic_refs
+        else content_hash(markdown_body)
+    )
     doc_id = build_github_repo_doc_id(
         source_id=source_id,
         repo_url=repo["repo_url"],
@@ -477,6 +490,7 @@ async def submit_github_repo_document(
         "submitted_at": submitted_at,
         "submitted_by": submitted_by,
         "markdown": markdown_body,
+        "source_artifacts": source_artifacts,
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
@@ -546,6 +560,7 @@ async def submit_jira_package(
     submitted_by: str | None = None,
     submitted_at: str | None = None,
     document_store: DocumentStore | None = None,
+    source_artifacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate, package, and persist one raw Jira issue captured by the local daemon."""
     if source.get("type") != JIRA_SOURCE_TYPE:
@@ -571,7 +586,18 @@ async def submit_jira_package(
     normalized_issue_key = _normalize_issue_key(issue_key or str(raw_payload.get("key") or ""))
     submitted_at = submitted_at or _now_iso()
     source_id = str(source["id"])
-    payload_hash = _hash_json(raw_payload)
+    source_artifacts = list(source_artifacts or [])
+    artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
+    payload_hash = (
+        _hash_json(
+            {
+                "raw_payload": raw_payload,
+                "source_artifacts": artifact_semantic_refs,
+            }
+        )
+        if artifact_semantic_refs
+        else _hash_json(raw_payload)
+    )
     revision = (provider_revision or "").strip() or payload_hash
     doc_id = build_jira_doc_id(source_id=source_id, issue_key=normalized_issue_key)
     doc_title = (title or "").strip() or _jira_title_from_payload(raw_payload, normalized_issue_key)
@@ -593,6 +619,7 @@ async def submit_jira_package(
         "submitted_at": submitted_at,
         "submitted_by": submitted_by,
         "raw_payload": raw_payload,
+        "source_artifacts": source_artifacts,
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)
@@ -660,6 +687,7 @@ async def submit_teams_window_package(
     submitted_at: str | None = None,
     document_store: DocumentStore | None = None,
     collection_attempt_id: str | None = None,
+    source_artifacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate, package, and persist one raw Teams window captured by the local daemon."""
     if source.get("type") != TEAMS_SOURCE_TYPE:
@@ -697,7 +725,18 @@ async def submit_teams_window_package(
         raise ValueError("Teams scope attestation collection attempt mismatch")
 
     submitted_at = submitted_at or _now_iso()
-    payload_hash = _hash_json(raw_payload)
+    source_artifacts = list(source_artifacts or [])
+    artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
+    payload_hash = (
+        _hash_json(
+            {
+                "raw_payload": raw_payload,
+                "source_artifacts": artifact_semantic_refs,
+            }
+        )
+        if artifact_semantic_refs
+        else _hash_json(raw_payload)
+    )
     doc_id = build_teams_doc_id(source_id=source_id, window_id=normalized_window_id)
     doc_title = (title or "").strip() or _teams_title_from_payload(raw_payload, normalized_window_id)
     package = {
@@ -726,6 +765,7 @@ async def submit_teams_window_package(
         "submitted_at": submitted_at,
         "submitted_by": submitted_by,
         "raw_payload": raw_payload,
+        "source_artifacts": source_artifacts,
     }
 
     payload_text = json.dumps(package, indent=2, sort_keys=True)

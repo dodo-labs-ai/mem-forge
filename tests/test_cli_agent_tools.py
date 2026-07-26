@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -144,6 +145,19 @@ class FakeToolClient:
             )
         )
         return self.response
+
+    def push_source_artifact(self, **kwargs):
+        self.calls.append(
+            (
+                "push_source_artifact",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
+        return {
+            "input_sha256": "a" * 64,
+            "content_sha256": hashlib.sha256(kwargs["content"]).hexdigest(),
+            "size_bytes": len(kwargs["content"]),
+        }
 
     def prepare_local_source_snapshot(self, **kwargs):
         self.calls.append(
@@ -985,6 +999,118 @@ def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
     ]
 
 
+def test_local_agent_cloud_github_sync_streams_selected_image_as_artifact(monkeypatch):
+    image_bytes = b"\x89PNG\r\n\x1a\nlocal-agent-image"
+
+    def fake_github_image_run(cmd, *args, **kwargs):
+        assert cmd[:2] == ["gh", "api"]
+        endpoint = cmd[2]
+        if endpoint.endswith("/commits/main"):
+            payload = {"sha": "commit-main", "commit": {"tree": {"sha": "tree-main"}}}
+        elif "/git/trees/tree-main" in endpoint:
+            payload = {
+                "truncated": False,
+                "tree": [
+                    {
+                        "path": "Payroll Processing V2/images/architecture.png",
+                        "type": "blob",
+                        "sha": "image-sha",
+                        "size": len(image_bytes),
+                    }
+                ],
+            }
+        elif endpoint.endswith("/git/blobs/image-sha"):
+            payload = {
+                "sha": "image-sha",
+                "content": base64.b64encode(image_bytes).decode(),
+                "encoding": "base64",
+                "size": len(image_bytes),
+            }
+        else:
+            raise AssertionError(f"unexpected gh endpoint: {endpoint}")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({"doc_id": "github-image-doc", "document_hash": "hash"})
+    monkeypatch.setattr(main.subprocess, "run", fake_github_image_run)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-image-sync",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-job-payload",
+            "operation": "github_repo_sync",
+            "source_id": "src-from-cloud",
+            "payload": {
+                "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                "ref": "main",
+                "include_paths": ["Payroll Processing V2/images"],
+                "include_extensions": ["png"],
+                "limit": 1,
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    assert payload["counts"]["failed"] == 0
+    [artifact_call] = [call for call in FakeToolClient.calls if call[0] == "push_source_artifact"]
+    assert artifact_call[1]["content"] == image_bytes
+    assert artifact_call[1]["media_type"] == "image/png"
+    [package_call] = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
+    assert package_call[1]["markdown_body"] == ""
+    assert package_call[1]["artifact_source_unit_key"] == ("Payroll Processing V2/images/architecture.png")
+    assert package_call[1]["artifact_input_hashes"] == ["a" * 64]
+
+
+def test_local_agent_cloud_github_rejects_oversized_image_before_blob_download(monkeypatch):
+    def fake_github_oversized_run(cmd, *args, **kwargs):
+        assert cmd[:2] == ["gh", "api"]
+        endpoint = cmd[2]
+        if endpoint.endswith("/commits/main"):
+            payload = {"sha": "commit-main", "commit": {"tree": {"sha": "tree-main"}}}
+        elif "/git/trees/tree-main" in endpoint:
+            payload = {
+                "truncated": False,
+                "tree": [
+                    {
+                        "path": "docs/oversized.png",
+                        "type": "blob",
+                        "sha": "oversized-image-sha",
+                        "size": main.MAX_SOURCE_ARTIFACT_STORAGE_BYTES + 1,
+                    }
+                ],
+            }
+        else:
+            raise AssertionError(f"oversized blob must not be downloaded: {endpoint}")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({})
+    monkeypatch.setattr(main.subprocess, "run", fake_github_oversized_run)
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-oversized-image-sync",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-job-payload",
+            "operation": "github_repo_sync",
+            "source_id": "src-from-cloud",
+            "payload": {
+                "repo_url": "https://github.wdf.sap.corp/org/repo",
+                "ref": "main",
+                "include_extensions": ["png"],
+                "limit": 1,
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    assert payload["counts"]["failed"] == 1
+    assert payload["failed"][0]["error"] == "Source Artifact exceeds storage limit"
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_source_artifact"]
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
+
+
 def test_local_agent_cloud_github_noop_uses_manifest_without_reading_or_uploading_bodies(monkeypatch):
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
     FakeToolClient.reset({})
@@ -1557,10 +1683,17 @@ def test_local_markdown_complete_scan_rejects_concurrent_membership_change(tmp_p
 
 
 def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
+    from contextlib import asynccontextmanager
     from datetime import datetime, timezone
 
     from memforge.auth import jira_capture
     from memforge.models import ContentItem, RawContent
+    from memforge.source_artifacts import (
+        RawSourceArtifact,
+        SourceArtifactDownload,
+    )
+
+    image = b"\x89PNG\r\n\x1a\njira-comment-image"
 
     class FakeJiraGene:
         def __init__(self, config, source_id):
@@ -1602,6 +1735,29 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
                     }
                 ).encode(),
                 content_type="application/json",
+                artifacts=(
+                    RawSourceArtifact(
+                        provider_key="attachment-1",
+                        parent_observation_type="comment",
+                        parent_provider_key="comment-1",
+                        provider_revision="attachment-revision-1",
+                        filename="screenshot.png",
+                        media_type="image/png",
+                        declared_size_bytes=len(image),
+                        locator={"request_path": "/attachment/1"},
+                    ),
+                ),
+            )
+
+        @asynccontextmanager
+        async def open_source_artifact(self, artifact):
+            async def chunks():
+                yield image
+
+            yield SourceArtifactDownload(
+                chunks=chunks(),
+                media_type="image/png",
+                content_length=len(image),
             )
 
     import memforge.genes.jira_gene as jira_gene
@@ -1672,6 +1828,14 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
     assert kwargs["issue_key"] == "PAY-1"
     assert kwargs["raw_payload"]["fields"]["summary"] == "Create daemon source support"
     assert kwargs["sync_snapshot_id"] == "laj-jira-sync:attempt:3"
+    [artifact_call] = [call for call in FakeToolClient.calls if call[0] == "push_source_artifact"]
+    assert artifact_call[1]["source_unit_key"] == "PAY-1"
+    assert artifact_call[1]["provider_key"] == "attachment-1"
+    assert artifact_call[1]["parent_observation_type"] == "comment"
+    assert artifact_call[1]["parent_provider_key"] == "comment-1"
+    assert artifact_call[1]["content"] == image
+    assert kwargs["artifact_source_unit_key"] == "PAY-1"
+    assert kwargs["artifact_input_hashes"] == ["a" * 64]
     assert "markdown_body" not in kwargs
     assert "process_now" not in kwargs
     process_calls = [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
@@ -2326,6 +2490,120 @@ def test_local_agent_cloud_teams_sync_pushes_window_packages(monkeypatch, tmp_pa
     assert audit_rows[-1]["sync_error"] is None
 
 
+def test_local_agent_cloud_teams_uploads_hosted_images_only_for_required_windows(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from memforge.genes import teams_gene
+    from memforge.local_agent.document_identity import build_teams_doc_id
+
+    async def fake_collect(job, *, source_id, limit, report_progress=None):
+        return [
+            {
+                "conversation_id": "19:chat@example.test",
+                "root_message_id": "message-1",
+                "window_id": "teams-block:v1:changed-window",
+                "window_type": "time_block",
+                "revision_hash": "revision-1",
+                "title": "Architecture",
+                "source_url": "https://teams.microsoft.com/l/message/19:chat@example.test/message-1",
+                "last_modified": "2026-07-08T09:24:57Z",
+                "raw_payload": {
+                    "conversation_type": "group_chat",
+                    "messages": [
+                        {
+                            "id": "message-1",
+                            "content": "Architecture image",
+                            "from": "Alice",
+                            "hosted_content_ids": ["hosted-1"],
+                        }
+                    ],
+                },
+                "raw_hash": "raw-1",
+                "message_count": 1,
+            },
+            {
+                "conversation_id": "19:chat@example.test",
+                "root_message_id": "message-2",
+                "window_id": "teams-block:v1:reused-window",
+                "window_type": "time_block",
+                "revision_hash": "revision-2",
+                "title": "Existing",
+                "source_url": "https://teams.microsoft.com/l/message/19:chat@example.test/message-2",
+                "last_modified": "2026-07-08T09:25:57Z",
+                "raw_payload": {
+                    "conversation_type": "group_chat",
+                    "messages": [
+                        {
+                            "id": "message-2",
+                            "content": "Existing image",
+                            "from": "Bob",
+                            "hosted_content_ids": ["hosted-2"],
+                        }
+                    ],
+                },
+                "raw_hash": "raw-2",
+                "message_count": 1,
+            },
+        ]
+
+    hosted_calls = []
+
+    async def fake_get_hosted_content(self, **kwargs):
+        hosted_calls.append(kwargs)
+        return b"\x89PNG\r\n\x1a\nteams-image", "image/png"
+
+    monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect)
+    monkeypatch.setattr(teams_gene._TeamsAPIClient, "get_hosted_content", fake_get_hosted_content)
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    FakeToolClient.reset({})
+    FakeToolClient.snapshot_plan_response = {
+        "required_doc_ids": [
+            build_teams_doc_id(
+                source_id="src-teams",
+                window_id="teams-block:v1:changed-window",
+            )
+        ],
+        "reused_count": 1,
+    }
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-teams-images",
+            "attempt_count": 1,
+            "workspace_id": "ws-from-cloud",
+            "operation": "teams_sync",
+            "source_id": "src-teams",
+            "payload": {
+                "conversation_ids": ["19:chat@example.test"],
+                "audit_log_path": str(tmp_path / "teams-audit.jsonl"),
+            },
+        },
+        _cloud_test_client(),
+    )
+
+    assert payload["counts"]["pushed"] == 1
+    assert hosted_calls == [
+        {
+            "conversation_id": "19:chat@example.test",
+            "message_id": "message-1",
+            "hosted_content_id": "hosted-1",
+            "conversation_type": "group_chat",
+            "team_id": None,
+            "root_message_id": "message-1",
+        }
+    ]
+    [artifact_call] = [call for call in FakeToolClient.calls if call[0] == "push_source_artifact"]
+    assert artifact_call[1]["source_unit_key"] == "teams-block:v1:changed-window"
+    assert artifact_call[1]["provider_key"] == "message-1/hostedContents/hosted-1"
+    assert artifact_call[1]["parent_observation_type"] == "message"
+    assert artifact_call[1]["parent_provider_key"] == "message-1"
+    assert artifact_call[1]["content"] == b"\x89PNG\r\n\x1a\nteams-image"
+    [package_call] = [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
+    assert package_call[1]["artifact_source_unit_key"] == "teams-block:v1:changed-window"
+    assert package_call[1]["artifact_input_hashes"] == ["a" * 64]
+
+
 def test_local_agent_cloud_teams_noop_reuses_bounded_window_without_reupload(monkeypatch, tmp_path: Path):
     async def fake_collect(job, *, source_id, limit, report_progress=None):
         return [
@@ -2372,6 +2650,7 @@ def test_local_agent_cloud_teams_noop_reuses_bounded_window_without_reupload(mon
     assert plan_call[1]["coverage"] == "bounded_delta"
     assert plan_call[1]["items"][0]["change_kind"] == "upsert"
     assert not [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_source_artifact"]
     assert payload["counts"]["skipped_existing"] == 1
     [process_call] = [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
     assert process_call[1]["sync_snapshot_id"] == "laj-teams-noop:attempt:1"

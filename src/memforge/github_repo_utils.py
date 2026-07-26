@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import base64
 import binascii
+import mimetypes
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -132,7 +133,27 @@ def github_content_type(relative_path: str) -> str:
         return "text/html"
     if extension == "json":
         return "application/json"
+    if extension == "png":
+        return "image/png"
+    if extension in {"jpg", "jpeg"}:
+        return "image/jpeg"
+    if extension == "gif":
+        return "image/gif"
+    if extension == "webp":
+        return "image/webp"
+    if extension == "pdf":
+        return "application/pdf"
+    guessed_media_type = mimetypes.guess_type(relative_path)[0]
+    if guessed_media_type and guessed_media_type.startswith("image/"):
+        return guessed_media_type
     return "text/plain"
+
+
+def github_content_type_is_binary(content_type: str) -> bool:
+    """Return whether a selected repository file requires Artifact handling."""
+
+    normalized = str(content_type or "").strip().lower()
+    return normalized == "application/pdf" or normalized.startswith("image/")
 
 
 def decode_github_base64_content(*, content: object, encoding: object, size: object, label: str) -> bytes:
