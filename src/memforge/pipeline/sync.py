@@ -480,6 +480,10 @@ def summarize_failed_documents(docs_failed: int, failed_docs: list[FailedDoc]) -
 _MAX_RETAINED_DOCUMENT_ERROR_CHARS = 512
 
 
+class MemoryExtractionFailure(RuntimeError):
+    """Extraction exhausted its own retry policy; do not replay the document."""
+
+
 def _retained_document_error(exc: BaseException) -> str:
     """Project an exception into bounded state without retaining its traceback."""
 
@@ -497,13 +501,13 @@ def _memory_extraction_error(
     doc_id: str,
     error_type: str,
     detail: str | None,
-) -> RuntimeError:
+) -> MemoryExtractionFailure:
     message = f"memory extraction failed for {doc_id}: {error_type}"
     if detail and len(detail) <= _MAX_RETAINED_DOCUMENT_ERROR_CHARS:
         stripped = detail.strip()
         if stripped:
             message = f"{message}: {stripped}"
-    return RuntimeError(message)
+    return MemoryExtractionFailure(message)
 
 
 def _source_filter_summary(gene: Gene, since: datetime | None) -> str | None:
@@ -956,6 +960,7 @@ class GeneSyncOrchestrator:
                 async with item_semaphore:
                     for attempt in range(1, MAX_RETRIES + 1):
                         attempt_error: str | None = None
+                        retry_document = True
                         try:
                             item_stats = await self._process_item(
                                 gene=gene,
@@ -1001,9 +1006,20 @@ class GeneSyncOrchestrator:
                             last_error = None
                         except Exception as exc:
                             attempt_error = _retained_document_error(exc)
+                            retry_document = not isinstance(
+                                exc,
+                                MemoryExtractionFailure,
+                            )
                         if attempt_error is None:
                             break
                         last_error = attempt_error
+                        if not retry_document:
+                            logger.error(
+                                "Failed to process %s after extraction retry exhaustion: %s",
+                                item.item_id,
+                                attempt_error,
+                            )
+                            break
                         if attempt < MAX_RETRIES:
                             delay = 2**attempt
                             logger.warning(
@@ -2118,11 +2134,17 @@ class GeneSyncOrchestrator:
                 error_type=extraction_result.error_type,
                 detail=error_detail,
             )
-            await self._restore_document_processing_snapshot_preserving_failure(
-                doc_id=doc_id,
-                existing_doc=existing_doc,
-                processing_error=processing_error,
+            snapshot_restored = (
+                await self._restore_document_processing_snapshot_preserving_failure(
+                    doc_id=doc_id,
+                    existing_doc=existing_doc,
+                    processing_error=processing_error,
+                )
             )
+            if not snapshot_restored:
+                raise RuntimeError(
+                    "document snapshot restore failed after memory extraction failure"
+                )
             raise processing_error
         projection = with_source_artifact_summaries(
             projection,
@@ -3261,7 +3283,7 @@ class GeneSyncOrchestrator:
         doc_id: str,
         existing_doc: DocumentRecord | None,
         processing_error: Exception,
-    ) -> None:
+    ) -> bool:
         try:
             await self._restore_document_processing_snapshot(
                 doc_id=doc_id,
@@ -3273,6 +3295,8 @@ class GeneSyncOrchestrator:
                 doc_id,
                 processing_error,
             )
+            return False
+        return True
 
     async def _insert_changelog(self, entry: ChangelogEntry) -> None:
         """Insert a changelog entry into the database.

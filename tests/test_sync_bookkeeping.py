@@ -3125,7 +3125,11 @@ async def test_unchanged_multi_observation_projection_skips_full_document_extrac
 
 
 class FailingMemoryExtractor(NoopMemoryExtractor):
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def extract_memories(self, **kwargs):
+        self.calls += 1
         return MemoryExtractionResult(
             memories=[],
             error_type="json_parse_error",
@@ -4265,7 +4269,7 @@ async def test_sync_memory_observer_records_lifecycle_exit_when_document_fails(d
     exits = [event for _level, event in log.records if event["stage"] == "document_lifecycle_exit"]
     assert exits
     assert all(event["ok"] is False for event in exits)
-    assert all(event["error_class"] == "RuntimeError" for event in exits)
+    assert all(event["error_class"] == "MemoryExtractionFailure" for event in exits)
 
 
 @pytest.mark.asyncio
@@ -8801,10 +8805,11 @@ async def test_full_document_extraction_failure_is_audited(db: Database):
         owner_user_id="dev",
     )
     memory_store = _audited_memory_store(db)
+    extractor = FailingMemoryExtractor()
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        memory_extractor=FailingMemoryExtractor(),
+        memory_extractor=extractor,
         memory_engine=NoopMemoryEngine(),
         memory_store=memory_store,
         max_concurrent=1,
@@ -8826,7 +8831,8 @@ async def test_full_document_extraction_failure_is_audited(db: Database):
     assert await db.count_documents(source=source_id) == 1
     assert await db.find_source_unit_by_document_id(source_id, "doc-1", current_only=True) is None
     assert await db.list_source_artifact_cleanup_tasks() == []
-    assert len(rows) == 3
+    assert extractor.calls == 1
+    assert len(rows) == 1
     assert rows[0].doc_id == "doc-1"
     assert rows[0].source_id == source_id
     assert rows[0].reason == "json_parse_error"
@@ -9578,7 +9584,7 @@ async def test_partial_unit_extraction_failure_skips_reconciliation(db: Database
     assert state.failed_docs
     assert "partial_unit_failure" in state.failed_docs[0].error
     assert len(memory_engine.projected_lifecycle_calls) == 0
-    assert len(audit_rows) == 3
+    assert len(audit_rows) == 1
     assert audit_rows[0].reason == "partial_unit_failure"
     assert audit_rows[0].payload["failed_unit_count"] == 1
     assert audit_rows[0].payload["extracted_count"] == 0
@@ -9805,6 +9811,53 @@ async def test_snapshot_restore_failure_does_not_mask_processing_failure(
     assert state.failed_docs[0].error == "lifecycle apply failed"
     assert await db.get_document("doc-1") is not None
     assert await db.find_source_unit_by_document_id(source_id, "doc-1", current_only=True) is None
+
+
+@pytest.mark.asyncio
+async def test_extraction_failure_retries_only_when_snapshot_restore_fails(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_id = "src-extraction-restore-retry"
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown="# Design Doc\n\nThe service uses PostgreSQL 14.",
+        version="1",
+    )
+    original_restore = db.restore_document_snapshot
+    restore_calls = 0
+
+    async def fail_restore_once(*args, **kwargs) -> None:
+        nonlocal restore_calls
+        restore_calls += 1
+        if restore_calls == 1:
+            raise RuntimeError("transient snapshot restore failure")
+        await original_restore(*args, **kwargs)
+
+    monkeypatch.setattr(db, "restore_document_snapshot", fail_restore_once)
+    extractor = FailingMemoryExtractor()
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=extractor,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=UpdatingDocumentGene("# Design Doc\n\nThe service uses PostgreSQL 15."),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "failed"
+    assert state.docs_failed == 1
+    assert extractor.calls == 2
+    assert restore_calls == 2
+    assert "json_parse_error" in state.failed_docs[0].error
 
 
 @pytest.mark.asyncio
