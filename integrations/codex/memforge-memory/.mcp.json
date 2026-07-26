@@ -8,10 +8,7 @@
       "cwd": ".",
       "env": {
         "MEMFORGE_MCP_CLIENT": "codex"
-      },
-      "env_vars": [
-        "CODEX_WORKSPACE_ROOT"
-      ]
+      }
     }
   }
 }

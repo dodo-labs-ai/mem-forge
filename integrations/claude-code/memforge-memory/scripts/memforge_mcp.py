@@ -15,7 +15,6 @@ import os
 from pathlib import Path
 import re
 import sys
-import subprocess
 import tempfile
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -23,22 +22,26 @@ from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 try:
-    from .repo_identity import normalize_repo_identifier
+    from .repository_context import resolve_repository_context
 except ImportError:  # pragma: no cover - copied plugin package or direct file load
     try:
-        from memforge_repo_identity import normalize_repo_identifier
+        from memforge_repository_context import resolve_repository_context
     except ImportError:
         import importlib.util
 
-        _repo_identity_path = Path(__file__).with_name("memforge_repo_identity.py")
-        if not _repo_identity_path.exists():
-            _repo_identity_path = Path(__file__).with_name("repo_identity.py")
-        _repo_identity_spec = importlib.util.spec_from_file_location("memforge_repo_identity", _repo_identity_path)
-        if _repo_identity_spec is None or _repo_identity_spec.loader is None:
+        _repository_context_path = Path(__file__).with_name("memforge_repository_context.py")
+        if not _repository_context_path.exists():
+            _repository_context_path = Path(__file__).with_name("repository_context.py")
+        _repository_context_spec = importlib.util.spec_from_file_location(
+            "memforge_repository_context",
+            _repository_context_path,
+        )
+        if _repository_context_spec is None or _repository_context_spec.loader is None:
             raise
-        _repo_identity_module = importlib.util.module_from_spec(_repo_identity_spec)
-        _repo_identity_spec.loader.exec_module(_repo_identity_module)
-        normalize_repo_identifier = _repo_identity_module.normalize_repo_identifier
+        _repository_context_module = importlib.util.module_from_spec(_repository_context_spec)
+        sys.modules[_repository_context_spec.name] = _repository_context_module
+        _repository_context_spec.loader.exec_module(_repository_context_module)
+        resolve_repository_context = _repository_context_module.resolve_repository_context
 
 try:
     from .plugin_config import configured_api_token, configured_target
@@ -61,17 +64,23 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.31"
+SERVER_VERSION = "0.1.32-rc.1"
+SERVER_INSTRUCTIONS = (
+    "Repository context is optional. For search and create_memory, when the coding host exposes "
+    "an exact current working directory, pass it as repository_context.working_directory. Never "
+    "guess or use a plugin/install directory. Omit it when unavailable; the operation must "
+    "continue. MemForge resolves the Git remote locally and never sends the local path to the service."
+)
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
-WORKSPACE_ROOT_ENV_VARS = ("CODEX_WORKSPACE_ROOT",)
 CURRENT_REPO_ONLY_DISABLED_ERROR = (
-    "current_repo_only is disabled for MCP search because repo-scoped search depends on reliable "
-    "workspace roots. Omit the filter to search all visible memories."
+    "current_repo_only is not exposed by this MCP search tool. Omit the filter "
+    "to search all visible memories."
 )
 SEARCH_ALLOWED_KEYS = frozenset(
     {
         "query",
+        "repository_context",
         "source_filter",
         "time_range",
         "top_k",
@@ -93,7 +102,27 @@ SEARCH_TOP_K_MAX = 50
 _CLIENT_SUPPORTS_ROOTS = False
 _PENDING_ROOTS_REQUEST_ID: str | None = None
 _CLIENT_ROOT_PATHS: list[str] = []
-_CLIENT_ROOTS_ERROR: str | None = None
+
+REPOSITORY_CONTEXT_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Optional agent-host context used locally to derive repository attribution. "
+        "The local path is never forwarded to MemForge."
+    ),
+    "properties": {
+        "working_directory": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "Absolute current working directory or file:// URI supplied by the coding client. "
+                "Do not guess or reuse an installation/plugin directory; omit repository_context "
+                "when the current working directory is unavailable."
+            ),
+        },
+    },
+    "required": ["working_directory"],
+    "additionalProperties": False,
+}
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -117,6 +146,7 @@ TOOLS: list[dict[str, Any]] = [
                         "is provided and the user wants a deterministic list rather than semantic ranking."
                     ),
                 },
+                "repository_context": REPOSITORY_CONTEXT_SCHEMA,
                 "source_filter": {
                     "type": "object",
                     "description": (
@@ -312,6 +342,7 @@ TOOLS: list[dict[str, Any]] = [
                     "default": "fact",
                 },
                 "confidence": {"type": "number"},
+                "repository_context": REPOSITORY_CONTEXT_SCHEMA,
                 "idempotency_key": {
                     "type": "string",
                     "description": "Optional stable key for retrying the same user-confirmed create action.",
@@ -507,6 +538,7 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | None:
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "instructions": SERVER_INSTRUCTIONS,
             }
             return _rpc_result(request_id, result)
         if method == "notifications/initialized":
@@ -573,10 +605,9 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 if not isinstance(confidence, (int, float)):
                     raise ValueError("confidence must be a number")
                 body["confidence"] = float(confidence)
-            repo_identifier = _active_repo_identifier()
-            if not repo_identifier:
-                raise ValueError(_create_memory_repo_error())
-            body["repo_identifier"] = repo_identifier
+            repo_identifier = _repository_identifier_for_tool_context(args.get("repository_context"))
+            if repo_identifier:
+                body["repo_identifier"] = repo_identifier
             idempotency_key = str(args.get("idempotency_key") or "").strip()
             if idempotency_key:
                 body["idempotency_key"] = idempotency_key
@@ -696,6 +727,7 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
             "Unsupported search parameter(s): " + ", ".join(unknown) + ". Omit unknown filters instead of guessing."
         )
     body = dict(args)
+    repository_context = body.pop("repository_context", None)
     query = str(body.get("query") or "").strip()
     has_deterministic_filter = False
     if "top_k" in body:
@@ -716,7 +748,7 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
             body["entities"] = normalized_entities
     body["include_private"] = True
     body["include_superseded"] = False
-    repo_identifier = _active_repo_identifier()
+    repo_identifier = _repository_identifier_for_tool_context(repository_context)
     if repo_identifier:
         body["active_repo_identifier"] = repo_identifier
     source_filter = body.get("source_filter")
@@ -726,7 +758,7 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "Unsupported source_filter parameter(s): "
                 + ", ".join(unknown_filter_keys)
-                + ". Omit repo-scoped facets until MCP roots are available."
+                + ". Omit repo-scoped facets instead of guessing."
             )
         source_ids = source_filter.get("source_ids")
         if source_ids is not None:
@@ -796,63 +828,21 @@ def _validate_time_range(value: Any) -> dict[str, str]:
 
 
 def _active_repo_identifier() -> str | None:
-    identifiers = _client_root_repo_identifiers()
-    if len(identifiers) == 1:
-        return next(iter(identifiers))
-    if not _CLIENT_SUPPORTS_ROOTS:
-        env_identifier = _env_workspace_repo_identifier()
-        if env_identifier:
-            return env_identifier
-    return None
+    return resolve_repository_context(root_paths=_CLIENT_ROOT_PATHS).repo_identifier
 
 
-def _create_memory_repo_error() -> str:
-    reason = _repo_roots_error_reason()
-    return f"create_memory requires exactly one git remote from MCP workspace roots; {reason}. Refusing to create an unscoped memory."
-
-
-def _repo_roots_error_reason() -> str:
-    if not _CLIENT_SUPPORTS_ROOTS:
-        if _env_workspace_root():
-            return "the MCP client did not advertise roots support and CODEX_WORKSPACE_ROOT does not resolve to a git remote"
-        return "the MCP client did not advertise roots support"
-    elif _PENDING_ROOTS_REQUEST_ID is not None:
-        return "the MCP client has not returned workspace roots yet"
-    elif _CLIENT_ROOTS_ERROR:
-        return f"the MCP client returned an error for roots/list: {_CLIENT_ROOTS_ERROR}"
-    elif not _CLIENT_ROOT_PATHS:
-        return "the MCP client did not provide workspace roots"
-    identifiers = _client_root_repo_identifiers()
-    if len(identifiers) > 1:
-        return "workspace roots resolve to multiple git remotes"
-    return "workspace roots do not resolve to a git remote"
-
-
-def _client_root_repo_identifiers() -> set[str]:
-    return {
-        repo_identifier
-        for root_path in _CLIENT_ROOT_PATHS
-        if (repo_identifier := _repo_identifier_from_cwd(root_path))
-    }
-
-
-def _env_workspace_repo_identifier() -> str | None:
-    if env_root := _env_workspace_root():
-        return _repo_identifier_from_cwd(env_root)
-    return None
-
-
-def _env_workspace_root() -> str | None:
-    for name in WORKSPACE_ROOT_ENV_VARS:
-        value = os.getenv(name, "").strip()
-        if value:
-            return value
-    return None
-
-
-def _repo_identifier_from_cwd(cwd: str | Path) -> str | None:
-    remote = _git_value(["git", "remote", "get-url", "origin"], cwd=cwd)
-    return normalize_repo_identifier(remote)
+def _repository_identifier_for_tool_context(value: Any) -> str | None:
+    if value is None:
+        return _active_repo_identifier()
+    if not isinstance(value, dict) or set(value) - {"working_directory"}:
+        return None
+    working_directory = value.get("working_directory")
+    if not isinstance(working_directory, str) or not working_directory.strip():
+        return None
+    return resolve_repository_context(
+        working_directory=working_directory,
+        root_paths=_CLIENT_ROOT_PATHS,
+    ).repo_identifier
 
 
 def _mcp_client() -> str:
@@ -862,51 +852,30 @@ def _mcp_client() -> str:
     return "codex"
 
 
-def _git_value(command: list[str], *, cwd: str | Path | None = None) -> str | None:
-    try:
-        result = subprocess.run(
-            command,
-            cwd=str(cwd or os.getcwd()),
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=2,
-        )
-    except Exception:
-        return None
-    value = result.stdout.strip()
-    return value or None
-
-
 def _record_client_capabilities(message: dict[str, Any]) -> None:
-    global _CLIENT_SUPPORTS_ROOTS, _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS, _CLIENT_ROOTS_ERROR
+    global _CLIENT_SUPPORTS_ROOTS, _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS
     params = message.get("params") if isinstance(message.get("params"), dict) else {}
     capabilities = params.get("capabilities") if isinstance(params.get("capabilities"), dict) else {}
     _CLIENT_SUPPORTS_ROOTS = isinstance(capabilities.get("roots"), dict)
     _PENDING_ROOTS_REQUEST_ID = None
     _CLIENT_ROOT_PATHS = []
-    _CLIENT_ROOTS_ERROR = None
 
 
 def _request_client_roots() -> dict[str, Any]:
-    global _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOTS_ERROR
+    global _PENDING_ROOTS_REQUEST_ID
     _PENDING_ROOTS_REQUEST_ID = ROOTS_LIST_REQUEST_ID
-    _CLIENT_ROOTS_ERROR = None
     return {"jsonrpc": "2.0", "id": ROOTS_LIST_REQUEST_ID, "method": "roots/list"}
 
 
 def _handle_rpc_response(message: dict[str, Any]) -> None:
-    global _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS, _CLIENT_ROOTS_ERROR
+    global _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS
     if message.get("id") != _PENDING_ROOTS_REQUEST_ID:
         return
     _PENDING_ROOTS_REQUEST_ID = None
     error = message.get("error")
     if isinstance(error, dict):
-        _CLIENT_ROOTS_ERROR = str(error.get("message") or error).strip()
         _CLIENT_ROOT_PATHS = []
         return
-    _CLIENT_ROOTS_ERROR = None
     result = message.get("result") if isinstance(message.get("result"), dict) else {}
     roots = result.get("roots") if isinstance(result.get("roots"), list) else []
     _CLIENT_ROOT_PATHS = [path for item in roots if (path := _root_path(item))]
