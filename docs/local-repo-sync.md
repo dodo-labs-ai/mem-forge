@@ -12,9 +12,10 @@ lifecycle reconciliation.
 3. Choose the local folder or repository through the source-specific browser.
 4. Configure include and exclude patterns, then save the source.
 
-The daemon authenticates with the user's MemForge API key. It does not require
-a workspace environment variable: each server-issued job carries the workspace
-and source selected in the UI.
+The daemon authenticates with the user's MemForge API key. Self-hosted OSS jobs
+use the unscoped local `/api` routes and do not support or require
+`MEMFORGE_WORKSPACE_ID`. Hosted jobs carry the workspace selected by the
+service, and the daemon scopes their API calls to that workspace.
 
 ## Supported file types
 

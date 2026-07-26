@@ -30,7 +30,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from memforge.api_target import MemForgeTarget, TargetConfigurationError, build_host_target, build_target
+from memforge.api_target import Edition, MemForgeTarget, TargetConfigurationError, build_host_target, build_target
 from memforge.auth import browser_session
 from memforge.config import AppConfig, load_config
 from memforge.github_repo_utils import (
@@ -2202,10 +2202,14 @@ def _run_cloud_github_sync_job(
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     profile = _github_profile_from_cloud_job(job)
-    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, client, error = _local_agent_job_source_client(
+        job,
+        payload,
+        operation=operation,
+        client=client,
+    )
     if error:
         return error
-    client = client.for_workspace(workspace_id)
     profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
     result = _push_github_profile_to_source(
         profile_name,
@@ -2256,10 +2260,14 @@ def _run_cloud_local_markdown_sync_job(
 ) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, client, error = _local_agent_job_source_client(
+        job,
+        payload,
+        operation=operation,
+        client=client,
+    )
     if error:
         return error
-    client = client.for_workspace(workspace_id)
     profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
     result = _push_kb_profile_to_source(
         profile_name,
@@ -2286,10 +2294,14 @@ def _run_cloud_jira_sync_job(
 ) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, client, error = _local_agent_job_source_client(
+        job,
+        payload,
+        operation=operation,
+        client=client,
+    )
     if error:
         return error
-    client = client.for_workspace(workspace_id)
     _report_local_agent_progress(
         report_progress,
         _sync_progress_snapshot(phase="connecting"),
@@ -2593,10 +2605,14 @@ def _run_cloud_teams_sync_job(
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, workspace_id, error = _cloud_job_source_scope(job, payload, operation=operation)
+    source_id, client, error = _local_agent_job_source_client(
+        job,
+        payload,
+        operation=operation,
+        client=client,
+    )
     if error:
         return error
-    client = client.for_workspace(workspace_id)
 
     run_id = str(job.get("job_id") or f"teams-sync-{int(time.time())}")
     sync_snapshot_id = local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count"))
@@ -3477,19 +3493,26 @@ def _kb_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
     return profile
 
 
-def _cloud_job_source_scope(
+def _local_agent_job_source_client(
     job: dict[str, Any],
     payload: dict[str, Any],
     *,
     operation: str,
-) -> tuple[str, str, dict[str, Any] | None]:
+    client: ToolClient,
+) -> tuple[str, ToolClient, dict[str, Any] | None]:
     source_id = str(job.get("source_id") or payload.get("source_id") or "").strip()
     if not source_id:
-        return "", "", {"operation": operation, "error": "source_id is required"}
+        return "", client, {"operation": operation, "error": "source_id is required"}
+    if client.target.edition is Edition.OSS:
+        return source_id, client, None
     workspace_id = str(job.get("workspace_id") or payload.get("workspace_id") or "").strip()
     if not workspace_id:
-        return source_id, "", {"operation": operation, "source_id": source_id, "error": "workspace_id is required"}
-    return source_id, workspace_id, None
+        return source_id, client, {
+            "operation": operation,
+            "source_id": source_id,
+            "error": "workspace_id is required",
+        }
+    return source_id, client.for_workspace(workspace_id), None
 
 
 async def _collect_jira_documents_from_cloud_job(
