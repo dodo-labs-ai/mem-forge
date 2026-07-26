@@ -23,6 +23,10 @@ from memforge.local_agent.source_contract import (
     TEAMS_TOMBSTONE_REASONS,
     local_agent_semantic_input_sha256,
 )
+from memforge.source_artifacts import (
+    SourceArtifactContractError,
+    source_artifact_semantic_refs,
+)
 
 
 INVALID_REPLAY_ARTIFACT = "source_lifecycle_local_replay_artifact_invalid"
@@ -151,6 +155,32 @@ class GitHubRepoReplayAdapter(_MarkdownPackageAdapter):
             relative_path=str(package.get("relative_path") or ""),
         )
 
+    def _validate_semantics(
+        self,
+        package: Mapping[str, Any],
+        package_version: str,
+    ) -> str:
+        markdown = package.get("markdown")
+        if not isinstance(markdown, str):
+            raise ValueError(INVALID_REPLAY_ARTIFACT)
+        source_artifacts = package.get("source_artifacts")
+        if source_artifacts:
+            try:
+                artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
+            except SourceArtifactContractError:
+                raise ValueError(INVALID_REPLAY_ARTIFACT)
+            semantic_hash = _semantic_json_hash(
+                {
+                    "markdown": markdown,
+                    "source_artifacts": artifact_semantic_refs,
+                }
+            )
+        else:
+            semantic_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        if not self._version_matches(package, package_version, semantic_hash):
+            raise ValueError(INVALID_REPLAY_ARTIFACT)
+        return semantic_hash
+
     def _version_matches(
         self,
         package: Mapping[str, Any],
@@ -217,7 +247,20 @@ class JiraReplayAdapter(LocalSourceReplayAdapter):
         except ValueError as exc:
             raise ValueError(INVALID_REPLAY_ARTIFACT) from exc
         issue_key = str(package.get("issue_key") or "").strip().upper()
-        semantic_hash = _semantic_json_hash(raw_payload)
+        source_artifacts = package.get("source_artifacts")
+        if source_artifacts:
+            try:
+                artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
+            except SourceArtifactContractError:
+                raise ValueError(INVALID_REPLAY_ARTIFACT)
+            semantic_hash = _semantic_json_hash(
+                {
+                    "raw_payload": raw_payload,
+                    "source_artifacts": artifact_semantic_refs,
+                }
+            )
+        else:
+            semantic_hash = _semantic_json_hash(raw_payload)
         if (
             not issue_key
             or str(raw_payload.get("key") or "").strip().upper() != issue_key
@@ -300,7 +343,20 @@ class TeamsReplayAdapter(LocalSourceReplayAdapter):
             )
         except TeamsMessageEvidenceError as exc:
             raise ValueError(INVALID_REPLAY_ARTIFACT) from exc
-        semantic_hash = _semantic_json_hash(raw_payload)
+        source_artifacts = package.get("source_artifacts")
+        if source_artifacts:
+            try:
+                artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
+            except SourceArtifactContractError:
+                raise ValueError(INVALID_REPLAY_ARTIFACT)
+            semantic_hash = _semantic_json_hash(
+                {
+                    "raw_payload": raw_payload,
+                    "source_artifacts": artifact_semantic_refs,
+                }
+            )
+        else:
+            semantic_hash = _semantic_json_hash(raw_payload)
         if (
             not str(package.get("conversation_id") or "").strip()
             or not str(package.get("window_id") or "").strip()

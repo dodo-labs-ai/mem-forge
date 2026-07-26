@@ -2036,7 +2036,7 @@ class GeneSyncOrchestrator:
                 require_configured_source=True,
             )
 
-        if empty_content:
+        if empty_content and not stored_source_artifacts:
             try:
                 memory_stats = await self.memory_engine.apply_projected_lifecycle(
                     projection=projection,

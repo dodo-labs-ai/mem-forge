@@ -38,6 +38,7 @@ from memforge.github_repo_utils import (
     build_github_repo_doc_id,
     decode_github_base64_content,
     github_content_type,
+    github_content_type_is_binary,
     github_exclude_paths,
     github_extension,
     github_include_extensions,
@@ -55,6 +56,13 @@ from memforge.local_agent.source_contract import (
     TEAMS_TOMBSTONE_REASONS,
     local_agent_sync_snapshot_id,
     source_processing_receipt,
+)
+from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
+    MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
+    MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT,
+    SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
+    read_source_artifact_bytes,
 )
 from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.storage.admin_source import (
@@ -1949,12 +1957,32 @@ def _push_github_profile_to_source(
     )
     for index, entry in enumerate(entries_to_fetch, start=1):
         relative_path = str(entry["relative_path"])
+        content_type = str(entry.get("content_type") or "text/plain")
+        is_binary = github_content_type_is_binary(content_type)
+        is_source_artifact = content_type in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES
         try:
-            raw = _github_blob(
-                repo,
-                str(entry.get("blob_sha") or ""),
-                relative_path,
-            )
+            if is_binary and not is_source_artifact:
+                raise click.ClickException(f"unsupported binary media type: {content_type}")
+            if is_source_artifact:
+                declared_size = entry.get("bytes")
+                if not isinstance(declared_size, int) or isinstance(declared_size, bool) or declared_size < 0:
+                    raise click.ClickException("GitHub tree did not return a valid blob size")
+                if declared_size > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
+                    raise click.ClickException("Source Artifact exceeds storage limit")
+                prepared.append(
+                    {
+                        "relative_path": relative_path,
+                        "markdown_body": "",
+                        "content_type": content_type,
+                        "title": relative_path,
+                        "raw_hash": None,
+                        "blob_sha": str(entry.get("blob_sha") or ""),
+                        "body_bytes": declared_size,
+                        "source_artifact": True,
+                    }
+                )
+                continue
+            raw = _github_blob(repo, str(entry.get("blob_sha") or ""), relative_path)
             text_body = raw.decode("utf-8")
         except UnicodeDecodeError:
             failed.append({"relative_path": relative_path, "error": "invalid utf-8"})
@@ -1966,11 +1994,12 @@ def _push_github_profile_to_source(
                 {
                     "relative_path": relative_path,
                     "markdown_body": text_body,
-                    "content_type": str(entry.get("content_type") or "text/plain"),
+                    "content_type": content_type,
                     "title": _github_title(text_body, relative_path),
                     "raw_hash": raw_hash,
                     "blob_sha": str(entry.get("blob_sha") or ""),
                     "body_bytes": len(raw),
+                    "source_artifact": False,
                 }
             )
         finally:
@@ -1999,6 +2028,62 @@ def _push_github_profile_to_source(
     uploaded_body_bytes = 0
     for index, doc in enumerate(prepared, start=1):
         uploaded_body_bytes += int(doc["body_bytes"])
+        artifact_input_hashes: list[str] = []
+        if bool(doc.get("source_artifact")):
+            try:
+                artifact_content = _github_blob(
+                    repo,
+                    str(doc["blob_sha"]),
+                    str(doc["relative_path"]),
+                )
+            except click.ClickException as exc:
+                failed.append({"relative_path": doc["relative_path"], "error": str(exc)})
+                continue
+            if len(artifact_content) != int(doc["body_bytes"]):
+                failed.append(
+                    {
+                        "relative_path": doc["relative_path"],
+                        "error": "GitHub blob size changed after tree discovery",
+                    }
+                )
+                continue
+            doc["raw_hash"] = hashlib.sha256(artifact_content).hexdigest()
+            artifact_response = client.push_source_artifact(
+                source_id=source_id,
+                source_unit_key=str(doc["relative_path"]),
+                provider_key=str(doc["relative_path"]),
+                provider_revision=str(doc["blob_sha"]),
+                parent_observation_type="file_content",
+                parent_provider_key="content",
+                filename=Path(str(doc["relative_path"])).name,
+                media_type=str(doc["content_type"]),
+                content=artifact_content,
+                local_agent_job_id=local_agent_job_id,
+                local_agent_attempt_count=local_agent_attempt_count,
+            )
+            _raise_if_local_agent_lease_not_current(artifact_response)
+            input_hash = str(artifact_response.get("input_sha256") or "").strip()
+            if artifact_response.get("error") or len(input_hash) != 64:
+                failed.append(
+                    {
+                        "relative_path": doc["relative_path"],
+                        "error": artifact_response.get("error") or "Source Artifact upload failed",
+                        "detail": artifact_response.get("detail"),
+                        "status_code": artifact_response.get("status_code"),
+                    }
+                )
+                _report_local_agent_progress(
+                    report_progress,
+                    _sync_progress_snapshot(
+                        phase="uploading",
+                        completed=index,
+                        total=len(prepared),
+                        unit="file",
+                        failed=len(failed),
+                    ),
+                )
+                continue
+            artifact_input_hashes.append(input_hash)
         response = client.push_github_repo_document(
             source_id=source_id,
             repo_url=repo["repo_url"],
@@ -2012,6 +2097,8 @@ def _push_github_profile_to_source(
             sync_snapshot_id=sync_snapshot_id,
             local_agent_job_id=local_agent_job_id,
             local_agent_attempt_count=local_agent_attempt_count,
+            artifact_source_unit_key=(str(doc["relative_path"]) if artifact_input_hashes else None),
+            artifact_input_hashes=artifact_input_hashes,
             submitted_by=submitted_by,
         )
         _raise_if_local_agent_lease_not_current(response)
@@ -2380,6 +2467,7 @@ def _run_cloud_jira_sync_job(
         ),
     )
     for index, doc in enumerate(documents, start=1):
+        artifact_input_hashes = [str(value) for value in doc.get("artifact_input_hashes", []) if str(value).strip()]
         response = scoped_client.push_jira_package(
             source_id=source_id,
             base_url=str(doc["base_url"]),
@@ -2393,6 +2481,8 @@ def _run_cloud_jira_sync_job(
             sync_snapshot_id=sync_snapshot_id,
             local_agent_job_id=str(job["job_id"]),
             local_agent_attempt_count=int(job["attempt_count"]),
+            artifact_source_unit_key=(str(doc["issue_key"]) if artifact_input_hashes else None),
+            artifact_input_hashes=artifact_input_hashes,
         )
         _raise_if_local_agent_lease_not_current(response)
         if isinstance(response, dict) and response.get("error"):
@@ -2779,6 +2869,25 @@ def _run_cloud_teams_sync_job(
             )
         except (KeyError, TypeError, ValueError, RuntimeError) as exc:
             inventory_error = str(exc)
+    artifact_inputs_by_window: dict[str, list[str]] = {}
+    artifact_failures_by_window: dict[str, dict[str, Any]] = {}
+    if inventory_error is None and documents_to_push:
+        try:
+            (
+                artifact_inputs_by_window,
+                artifact_failures_by_window,
+            ) = asyncio.run(
+                _upload_teams_hosted_content_inputs(
+                    documents_to_push,
+                    source_id=source_id,
+                    region=_teams_region_from_payload(payload),
+                    client=scoped_client,
+                    local_agent_job_id=str(job["job_id"]),
+                    local_agent_attempt_count=int(job["attempt_count"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            inventory_error = str(exc)
     selected_count = len(skipped_existing)
     document_iterator = iter(documents_to_push)
     while inventory_error is None:
@@ -2822,6 +2931,35 @@ def _run_cloud_teams_sync_job(
                 "message_count": doc.get("message_count"),
             },
         )
+        artifact_failure = artifact_failures_by_window.get(window_id)
+        if artifact_failure is not None:
+            failed.append(
+                {
+                    "window_id": window_id,
+                    "revision_hash": revision_hash,
+                    **artifact_failure,
+                }
+            )
+            write_teams_audit_event(
+                audit_path,
+                {
+                    "event": "teams_memory_patch",
+                    "run_id": run_id,
+                    "source_id": source_id,
+                    "window_id_hash": window_id_hash,
+                    "revision_hash": revision_hash,
+                    "patch_status": "failed",
+                    "error": artifact_failure.get("error"),
+                    "status_code": artifact_failure.get("status_code"),
+                    "claim_add": 0,
+                    "claim_update": 0,
+                    "claim_supersede": 0,
+                    "claim_noop": 0,
+                    "claim_rejected_ambiguous": 0,
+                },
+            )
+            continue
+        artifact_input_hashes = artifact_inputs_by_window.get(window_id, [])
         response = scoped_client.push_teams_window_package(
             source_id=source_id,
             conversation_id=str(doc["conversation_id"]),
@@ -2837,6 +2975,8 @@ def _run_cloud_teams_sync_job(
             sync_snapshot_id=sync_snapshot_id,
             local_agent_job_id=str(job["job_id"]),
             local_agent_attempt_count=int(job["attempt_count"]),
+            artifact_source_unit_key=window_id if artifact_input_hashes else None,
+            artifact_input_hashes=artifact_input_hashes,
         )
         if isinstance(response, dict) and response.get("error"):
             failed.append(
@@ -3019,6 +3159,136 @@ def _teams_collection_documents_and_polls(collection: Any) -> tuple[list[dict[st
     if isinstance(collection, list):
         return collection, []
     return [], []
+
+
+def _teams_hosted_content_refs(document: dict[str, Any]) -> list[dict[str, str | None]]:
+    """Return bounded exact inline-image identities from one selected window."""
+
+    raw_payload = document.get("raw_payload")
+    if not isinstance(raw_payload, dict):
+        return []
+    conversation_id = str(document.get("conversation_id") or "").strip()
+    conversation_type = str(raw_payload.get("conversation_type") or "").strip()
+    team_id = str(raw_payload.get("team_id") or "").strip() or None
+    raw_messages = raw_payload.get("messages")
+    if not conversation_id or not isinstance(raw_messages, list):
+        return []
+    refs: list[dict[str, str | None]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_message in raw_messages:
+        if not isinstance(raw_message, dict):
+            continue
+        message_id = str(raw_message.get("id") or "").strip()
+        hosted_ids = raw_message.get("hosted_content_ids")
+        if not message_id or not isinstance(hosted_ids, list):
+            continue
+        for value in hosted_ids:
+            hosted_id = str(value or "").strip()
+            identity = (message_id, hosted_id)
+            if not hosted_id or identity in seen:
+                continue
+            seen.add(identity)
+            refs.append(
+                {
+                    "conversation_id": conversation_id,
+                    "conversation_type": conversation_type,
+                    "team_id": team_id,
+                    "message_id": message_id,
+                    "root_message_id": str(raw_message.get("rootMessageId") or "").strip() or message_id,
+                    "hosted_content_id": hosted_id,
+                }
+            )
+            if len(refs) > MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT:
+                raise ValueError("Teams window exceeds the Source Artifact descriptor limit")
+    return refs
+
+
+def _teams_hosted_content_filename(hosted_content_id: str, media_type: str) -> str:
+    extension = {
+        "image/gif": ".gif",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }.get(media_type, "")
+    return f"teams-hosted-{hosted_content_id}{extension}"
+
+
+async def _upload_teams_hosted_content_inputs(
+    documents: list[dict[str, Any]],
+    *,
+    source_id: str,
+    region: str,
+    client: ToolClient,
+    local_agent_job_id: str,
+    local_agent_attempt_count: int,
+) -> tuple[dict[str, list[str]], dict[str, dict[str, Any]]]:
+    """Materialize hosted images only for manifest-selected Teams windows."""
+
+    from memforge.genes.teams_gene import _TeamsAPIClient
+
+    refs_by_window = {
+        str(document.get("window_id") or ""): _teams_hosted_content_refs(document) for document in documents
+    }
+    if not any(refs_by_window.values()):
+        return {}, {}
+
+    teams_api = _TeamsAPIClient(region=region)
+    inputs_by_window: dict[str, list[str]] = {}
+    failures_by_window: dict[str, dict[str, Any]] = {}
+    try:
+        for document in documents:
+            window_id = str(document.get("window_id") or "")
+            input_hashes: list[str] = []
+            for ref in refs_by_window.get(window_id, []):
+                try:
+                    content, media_type = await teams_api.get_hosted_content(
+                        conversation_id=str(ref["conversation_id"] or ""),
+                        message_id=str(ref["message_id"] or ""),
+                        hosted_content_id=str(ref["hosted_content_id"] or ""),
+                        conversation_type=str(ref["conversation_type"] or ""),
+                        team_id=(str(ref["team_id"]) if ref["team_id"] is not None else None),
+                        root_message_id=str(ref["root_message_id"] or ""),
+                    )
+                except Exception as exc:
+                    failures_by_window[window_id] = {
+                        "error": "Teams hosted-content download failed",
+                        "detail": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
+                    break
+                message_id = str(ref["message_id"] or "")
+                hosted_content_id = str(ref["hosted_content_id"] or "")
+                response = client.push_source_artifact(
+                    source_id=source_id,
+                    source_unit_key=window_id,
+                    provider_key=(f"{message_id}/hostedContents/{hosted_content_id}"),
+                    provider_revision=f"{message_id}:{hosted_content_id}",
+                    parent_observation_type="message",
+                    parent_provider_key=message_id,
+                    filename=_teams_hosted_content_filename(
+                        hosted_content_id,
+                        media_type,
+                    ),
+                    media_type=media_type,
+                    content=content,
+                    local_agent_job_id=local_agent_job_id,
+                    local_agent_attempt_count=local_agent_attempt_count,
+                )
+                _raise_if_local_agent_lease_not_current(response)
+                input_hash = str(response.get("input_sha256") or "").strip()
+                if response.get("error") or len(input_hash) != 64:
+                    failures_by_window[window_id] = {
+                        "error": response.get("error") or "Teams hosted-content upload failed",
+                        "detail": response.get("detail"),
+                        "status_code": response.get("status_code"),
+                    }
+                    break
+                input_hashes.append(input_hash)
+            if window_id not in failures_by_window and input_hashes:
+                inputs_by_window[window_id] = input_hashes
+    finally:
+        await teams_api.close()
+    return inputs_by_window, failures_by_window
 
 
 def _teams_scope_attestation_documents(
@@ -3617,6 +3887,39 @@ async def _collect_jira_documents_from_cloud_job(
                 raise RuntimeError(
                     f"Jira issue {issue_key} changed during materialization; retry inventory"
                 )
+            artifact_input_hashes: list[str] = []
+            remaining_artifact_bytes = MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT
+            for artifact in raw.artifacts:
+                content = await read_source_artifact_bytes(
+                    artifact=artifact,
+                    remaining_unit_bytes=remaining_artifact_bytes,
+                    open_artifact=gene.open_source_artifact,
+                )
+                remaining_artifact_bytes -= len(content)
+                artifact_response = client.push_source_artifact(
+                    source_id=source_id,
+                    source_unit_key=issue_key,
+                    provider_key=artifact.provider_key,
+                    provider_revision=artifact.provider_revision,
+                    parent_observation_type=artifact.parent_observation_type,
+                    parent_provider_key=artifact.parent_provider_key,
+                    filename=artifact.filename,
+                    media_type=artifact.media_type,
+                    content=content,
+                    local_agent_job_id=local_agent_job_id,
+                    local_agent_attempt_count=local_agent_attempt_count,
+                )
+                _raise_if_local_agent_lease_not_current(artifact_response)
+                input_hash = str(artifact_response.get("input_sha256") or "").strip()
+                if artifact_response.get("error") or len(input_hash) != 64:
+                    raise RuntimeError(
+                        str(
+                            artifact_response.get("detail")
+                            or artifact_response.get("error")
+                            or "Jira Source Artifact upload failed"
+                        )
+                    )
+                artifact_input_hashes.append(input_hash)
             raw_hash = hashlib.sha256(raw.body).hexdigest()
             documents.append(
                 {
@@ -3627,6 +3930,7 @@ async def _collect_jira_documents_from_cloud_job(
                     "provider_revision": str(item.version),
                     "raw_payload": raw_payload,
                     "raw_hash": raw_hash,
+                    "artifact_input_hashes": artifact_input_hashes,
                 }
             )
             _report_local_agent_progress(

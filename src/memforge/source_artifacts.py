@@ -64,6 +64,40 @@ def parse_source_artifact_content_length(value: object) -> int | None:
     return length
 
 
+def source_artifact_semantic_refs(value: object) -> tuple[dict[str, str], ...]:
+    """Validate and retain only fields that attest package Artifact identity."""
+
+    if value in (None, []):
+        return ()
+    if not isinstance(value, list):
+        raise SourceArtifactContractError("Source Artifact package references must be a list")
+    refs: list[dict[str, str]] = []
+    seen_provider_keys: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            raise SourceArtifactContractError("Source Artifact package reference is invalid")
+        provider_key = str(raw.get("provider_key") or "").strip()
+        provider_revision = str(raw.get("provider_revision") or "").strip()
+        content_sha256 = str(raw.get("sha256") or "").strip().lower()
+        try:
+            valid_sha256 = len(content_sha256) == 64 and int(content_sha256, 16) >= 0
+        except ValueError:
+            valid_sha256 = False
+        if not provider_key or not provider_revision or not valid_sha256:
+            raise SourceArtifactContractError("Source Artifact package reference is incomplete")
+        if provider_key in seen_provider_keys:
+            raise SourceArtifactContractError("Source Artifact package references contain duplicate identity")
+        seen_provider_keys.add(provider_key)
+        refs.append(
+            {
+                "provider_key": provider_key,
+                "provider_revision": provider_revision,
+                "sha256": content_sha256,
+            }
+        )
+    return tuple(refs)
+
+
 class SourceArtifactByteStore(Protocol):
     def store_source_artifact(
         self,
@@ -374,6 +408,28 @@ async def _download_source_artifact(
     except Exception:
         content.close()
         raise
+
+
+async def read_source_artifact_bytes(
+    *,
+    artifact: RawSourceArtifact,
+    remaining_unit_bytes: int,
+    open_artifact: Callable[
+        [RawSourceArtifact],
+        AbstractAsyncContextManager[SourceArtifactDownload],
+    ],
+) -> bytes:
+    """Validate one body through the shared spool, then return it to an API client."""
+
+    downloaded = await _download_source_artifact(
+        artifact=artifact,
+        remaining_unit_bytes=remaining_unit_bytes,
+        open_artifact=open_artifact,
+    )
+    try:
+        return downloaded.content.read()
+    finally:
+        downloaded.content.close()
 
 
 def _store_downloaded_source_artifact(

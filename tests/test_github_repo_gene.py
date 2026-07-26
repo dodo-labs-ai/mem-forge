@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from memforge.genes import GENE_REGISTRY
 from memforge.genes.github_repo_gene import GitHubRepoGene
 from memforge.github_repo_utils import build_github_repo_doc_id
+from memforge.source_artifacts import SourceArtifactContractError
 
 
 class GithubResponse:
@@ -83,6 +85,24 @@ class RepoApiClient:
 
     async def aclose(self) -> None:
         pass
+
+
+class GithubStreamResponse:
+    def __init__(self, payload: bytes, *, url: str) -> None:
+        self._payload = payload
+        self.url = url
+        self.status_code = 200
+        self.headers = {
+            "content-length": str(len(payload)),
+            "content-type": "application/octet-stream",
+        }
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_content(self, chunk_size: int):
+        for offset in range(0, len(self._payload), chunk_size):
+            yield self._payload[offset : offset + chunk_size]
 
 
 def test_github_repo_gene_is_registered_and_schema_is_repo_oriented():
@@ -168,6 +188,113 @@ async def test_cloud_pull_discovers_scoped_markdown_and_fetches_content(monkeypa
         "content_type": "text/markdown",
         "canonical_url": "https://github.example.test/payroll/architecture/blob/main/Payroll%20Processing/README.md",
     }
+
+
+@pytest.mark.asyncio
+async def test_cloud_pull_materializes_explicitly_selected_image_blob(monkeypatch):
+    image_bytes = b"\x89PNG\r\n\x1a\nstable-github-image"
+
+    class ImageRepoApiClient(RepoApiClient):
+        async def get(self, url: str):
+            self.calls.append(("GET", url))
+            if url.endswith("/api/v3/repos/payroll/architecture/git/trees/main?recursive=1"):
+                return GithubResponse(
+                    {
+                        "truncated": False,
+                        "tree": [
+                            {
+                                "path": "docs/architecture.png",
+                                "type": "blob",
+                                "sha": "image-sha",
+                                "size": len(image_bytes),
+                            }
+                        ],
+                    },
+                    url=url,
+                )
+            raise AssertionError(f"unexpected URL: {url}")
+
+        @asynccontextmanager
+        async def stream(self, url: str, *, headers=None):
+            self.calls.append(("STREAM", url))
+            assert headers == {"Accept": "application/vnd.github.raw+json"}
+            assert url.endswith("/api/v3/repos/payroll/architecture/git/blobs/image-sha")
+            yield GithubStreamResponse(image_bytes, url=url)
+
+    monkeypatch.setattr("memforge.genes.github_repo_gene._RequestsAsyncClient", ImageRepoApiClient)
+    gene = GitHubRepoGene(
+        config={
+            "connection_mode": "cloud_pull",
+            "repo_url": "https://github.example.test/payroll/architecture",
+            "ref": "main",
+            "include_extensions": ["png"],
+        },
+        source_id="src-github-repo",
+    )
+
+    await gene.authenticate()
+    item = [item async for item in gene.discover()][0]
+    raw = await gene.fetch(item)
+    normalized = await gene.normalize(raw)
+
+    assert item.content_type == "image/png"
+    assert raw.body == b""
+    assert raw.authoritative_empty is True
+    assert normalized.markdown_body == ""
+    assert len(raw.artifacts) == 1
+    artifact = raw.artifacts[0]
+    assert artifact.provider_key == "docs/architecture.png"
+    assert artifact.parent_observation_type == "file_content"
+    assert artifact.parent_provider_key == "content"
+    assert artifact.provider_revision == "image-sha"
+    assert artifact.declared_size_bytes == len(image_bytes)
+
+    async with gene.open_source_artifact(artifact) as download:
+        observed = b"".join([chunk async for chunk in download.chunks])
+
+    assert observed == image_bytes
+    assert all("/contents/" not in url for _, url in gene._client.calls)
+
+
+@pytest.mark.asyncio
+async def test_cloud_pull_rejects_explicitly_selected_unsupported_image(monkeypatch):
+    class SvgRepoApiClient(RepoApiClient):
+        async def get(self, url: str):
+            self.calls.append(("GET", url))
+            if url.endswith("/api/v3/repos/payroll/architecture/git/trees/main?recursive=1"):
+                return GithubResponse(
+                    {
+                        "truncated": False,
+                        "tree": [
+                            {
+                                "path": "docs/architecture.svg",
+                                "type": "blob",
+                                "sha": "svg-sha",
+                                "size": 128,
+                            }
+                        ],
+                    },
+                    url=url,
+                )
+            raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr("memforge.genes.github_repo_gene._RequestsAsyncClient", SvgRepoApiClient)
+    gene = GitHubRepoGene(
+        config={
+            "connection_mode": "cloud_pull",
+            "repo_url": "https://github.example.test/payroll/architecture",
+            "ref": "main",
+            "include_extensions": ["svg"],
+        },
+        source_id="src-github-repo",
+    )
+
+    await gene.authenticate()
+    item = [item async for item in gene.discover()][0]
+
+    assert item.content_type == "image/svg+xml"
+    with pytest.raises(SourceArtifactContractError, match="unsupported binary media type"):
+        await gene.fetch(item)
 
 
 def test_normalize_config_canonicalizes_repository_scope() -> None:

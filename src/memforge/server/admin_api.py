@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 import unicodedata
 import uuid
@@ -82,6 +83,14 @@ from memforge.models import (
     canonicalize_entity_name,
 )
 from memforge.sync_progress import normalize_sync_progress_snapshot
+from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
+    MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
+    SOURCE_ARTIFACT_SPOOL_MEMORY_BYTES,
+    SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
+    normalize_source_artifact_media_type,
+    parse_source_artifact_content_length,
+)
 from memforge.provenance import (
     DocumentArtifactStore,
     document_content_url,
@@ -1153,8 +1162,68 @@ class LocalSourcePackageRequest(BaseModel):
     sync_snapshot_id: str | None = None
     local_agent_job_id: str | None = None
     local_agent_attempt_count: int | None = Field(default=None, ge=1)
+    artifact_source_unit_key: str | None = None
+    artifact_input_hashes: list[str] = Field(
+        default_factory=list,
+        max_length=MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
+    )
     submitted_by: str | None = None
     submitted_at: str | None = None
+
+
+async def _resolve_local_source_artifact_inputs(
+    db: Database,
+    *,
+    source_id: str,
+    workspace_id: str,
+    input_hashes: list[str],
+    expected_source_unit_key: str,
+    expected_source_activity_epoch: int,
+) -> list[dict[str, Any]]:
+    """Resolve only attested raw inputs owned by this Source Unit."""
+
+    requested = tuple(dict.fromkeys(str(value).strip() for value in input_hashes if str(value).strip()))
+    if not requested:
+        return []
+    if any(len(value) != 64 for value in requested):
+        raise ValueError("local source Artifact input hash is invalid")
+    inputs = await db.get_source_sync_inputs_by_raw_hashes(
+        source_id=source_id,
+        workspace_id=workspace_id,
+        raw_sha256s=requested,
+    )
+    by_hash = {item.raw_sha256: item for item in inputs}
+    if set(by_hash) != set(requested):
+        raise ValueError("local source Artifact input was not found for this source")
+    resolved: list[dict[str, Any]] = []
+    for input_hash in requested:
+        source_input = by_hash[input_hash]
+        metadata = source_input.metadata.get("local_source_artifact")
+        if not isinstance(metadata, Mapping):
+            raise ValueError("local source Artifact input metadata is invalid")
+        if str(metadata.get("source_unit_key") or "") != expected_source_unit_key:
+            raise ValueError("local source Artifact input belongs to another Source Unit")
+        source_activity_epoch = metadata.get("source_activity_epoch")
+        if (
+            not isinstance(source_activity_epoch, int)
+            or isinstance(source_activity_epoch, bool)
+            or source_activity_epoch != expected_source_activity_epoch
+        ):
+            raise ValueError("local source Artifact input belongs to another source activity epoch")
+        resolved.append(
+            {
+                "provider_key": str(metadata.get("provider_key") or ""),
+                "parent_observation_type": str(metadata.get("parent_observation_type") or ""),
+                "parent_provider_key": str(metadata.get("parent_provider_key") or ""),
+                "provider_revision": str(metadata.get("provider_revision") or ""),
+                "filename": str(metadata.get("filename") or ""),
+                "media_type": str(metadata.get("media_type") or ""),
+                "size_bytes": int(metadata.get("size_bytes") or 0),
+                "sha256": str(metadata.get("content_sha256") or ""),
+                "uri": source_input.raw_uri,
+            }
+        )
+    return resolved
 
 
 class LocalSourceManifestItemRequest(BaseModel):
@@ -5662,6 +5731,150 @@ def create_admin_app(
         )
         return {"ok": True, "source_id": source_id}
 
+    @source_router.post("/{source_id}/adapter/artifacts")
+    async def push_local_source_artifact(
+        source_id: str,
+        request: Request,
+        source_unit_key: str,
+        provider_key: str,
+        provider_revision: str,
+        parent_observation_type: str,
+        parent_provider_key: str,
+        filename: str,
+        media_type: str,
+        local_agent_job_id: str | None = None,
+        local_agent_attempt_count: int | None = None,
+        db: Database = Depends(get_db),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Receive one bounded binary input for a later local-source package."""
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        if source.get("type") not in {
+            "github_repo",
+            "jira",
+            "teams",
+        }:
+            raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
+        _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
+        lease_payload = await _require_current_local_agent_lease(
+            request,
+            db,
+            source=source,
+            job_id=local_agent_job_id,
+            attempt_count=local_agent_attempt_count,
+        )
+        normalized_media_type = normalize_source_artifact_media_type(media_type)
+        request_media_type = normalize_source_artifact_media_type(request.headers.get("content-type"))
+        if normalized_media_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
+            raise HTTPException(status_code=400, detail="unsupported Source Artifact media type")
+        if request_media_type != normalized_media_type:
+            raise HTTPException(status_code=400, detail="Source Artifact Content-Type mismatch")
+        required_values = {
+            "source_unit_key": source_unit_key,
+            "provider_key": provider_key,
+            "provider_revision": provider_revision,
+            "parent_observation_type": parent_observation_type,
+            "parent_provider_key": parent_provider_key,
+            "filename": filename,
+        }
+        if any(not str(value).strip() for value in required_values.values()):
+            raise HTTPException(status_code=400, detail="Source Artifact identity is incomplete")
+        try:
+            declared_length = parse_source_artifact_content_length(request.headers.get("content-length"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if declared_length is not None and declared_length > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
+            raise HTTPException(status_code=413, detail="Source Artifact exceeds storage limit")
+
+        content = tempfile.SpooledTemporaryFile(
+            max_size=SOURCE_ARTIFACT_SPOOL_MEMORY_BYTES,
+            mode="w+b",
+        )
+        digest = hashlib.sha256()
+        observed_size = 0
+        try:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                observed_size += len(chunk)
+                if observed_size > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
+                    raise HTTPException(status_code=413, detail="Source Artifact exceeds storage limit")
+                digest.update(chunk)
+                content.write(chunk)
+            if declared_length is not None and observed_size != declared_length:
+                raise HTTPException(status_code=400, detail="Source Artifact transport length mismatch")
+            content_sha256 = digest.hexdigest()
+            descriptor = {
+                **{key: str(value).strip() for key, value in required_values.items()},
+                "media_type": normalized_media_type,
+                "size_bytes": observed_size,
+                "content_sha256": content_sha256,
+                "source_activity_epoch": int(lease_payload["source_activity_epoch"]),
+            }
+            input_sha256 = hashlib.sha256(
+                json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            existing = await db.get_source_sync_inputs_by_raw_hashes(
+                source_id=source_id,
+                workspace_id=workspace_id,
+                raw_sha256s=(input_sha256,),
+            )
+            if existing:
+                return {
+                    "input_sha256": input_sha256,
+                    "content_sha256": content_sha256,
+                    "size_bytes": observed_size,
+                }
+            content.seek(0)
+            artifact_uri = await asyncio.to_thread(
+                artifact_store.store_source_artifact,
+                source_id=source_id,
+                artifact_id=f"local-input-{input_sha256[:24]}",
+                filename=str(filename).strip(),
+                content=content,
+                content_type=normalized_media_type,
+                size_bytes=observed_size,
+                sha256=content_sha256,
+            )
+            try:
+                retained = await db.create_source_sync_input(
+                    source_id=source_id,
+                    workspace_id=workspace_id,
+                    raw_uri=artifact_uri,
+                    raw_sha256=input_sha256,
+                    raw_content_type=normalized_media_type,
+                    metadata={"local_source_artifact": descriptor},
+                    expected_activity_epoch=int(lease_payload["source_activity_epoch"]),
+                )
+            except Exception:
+                raced = await db.get_source_sync_inputs_by_raw_hashes(
+                    source_id=source_id,
+                    workspace_id=workspace_id,
+                    raw_sha256s=(input_sha256,),
+                )
+                if not raced or raced[0].raw_uri != artifact_uri:
+                    await db.enqueue_source_artifact_cleanup_task(
+                        source_id=source_id,
+                        artifact_uri=artifact_uri,
+                    )
+                    await SourceArtifactCleanupService(
+                        db,
+                        artifact_store,
+                    ).run_pending(limit=1)
+                raise
+            return {
+                "input_sha256": retained.raw_sha256,
+                "content_sha256": content_sha256,
+                "size_bytes": observed_size,
+            }
+        finally:
+            content.close()
+
     @source_router.post("/{source_id}/adapter/packages")
     async def push_local_source_package(
         source_id: str,
@@ -5705,7 +5918,7 @@ def create_admin_app(
             )
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
-        await _require_current_local_agent_lease(
+        lease_payload = await _require_current_local_agent_lease(
             request,
             db,
             source=source,
@@ -5731,6 +5944,18 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         try:
+            source_artifacts = await _resolve_local_source_artifact_inputs(
+                db,
+                source_id=source_id,
+                workspace_id=workspace_id,
+                input_hashes=req.artifact_input_hashes,
+                expected_source_unit_key=str(req.artifact_source_unit_key or "").strip(),
+                expected_source_activity_epoch=int(lease_payload["source_activity_epoch"]),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
             if source_type == GITHUB_REPO_SOURCE_TYPE:
                 result = await submit_github_repo_document(
                     db=db,
@@ -5748,6 +5973,7 @@ def create_admin_app(
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,
                     sync_snapshot_id=input_snapshot_id,
+                    source_artifacts=source_artifacts,
                 )
             elif source_type == JIRA_SOURCE_TYPE:
                 result = await submit_jira_package(
@@ -5764,6 +5990,7 @@ def create_admin_app(
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,
+                    source_artifacts=source_artifacts,
                 )
             elif source_type == TEAMS_SOURCE_TYPE:
                 result = await submit_teams_window_package(
@@ -5783,6 +6010,7 @@ def create_admin_app(
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,
                     collection_attempt_id=input_snapshot_id,
+                    source_artifacts=source_artifacts,
                 )
             else:
                 result = await submit_local_markdown_document(

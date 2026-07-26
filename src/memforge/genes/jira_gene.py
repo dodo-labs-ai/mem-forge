@@ -29,8 +29,10 @@ from memforge.genes.atlassian_auth import (
 from memforge.genes.base import Gene
 from memforge.genes.local_adapter_packages import (
     has_package_manifest,
+    open_packaged_source_artifact,
     package_manifest,
     read_package_body,
+    source_artifacts_from_package,
 )
 from memforge.local_agent.jira_contract import validate_jira_observation_identities
 from memforge.models import (
@@ -600,10 +602,13 @@ class JiraGene(Gene):
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full issue data with comments and links."""
         if item.extra.get("package_uri") or item.extra.get("package_path"):
+            body = read_package_body(self, item, source_label="Jira")
+            package = json.loads(body.decode("utf-8"))
             return RawContent(
                 item=item,
-                body=read_package_body(self, item, source_label="Jira"),
+                body=body,
                 content_type="application/json",
+                artifacts=source_artifacts_from_package(package),
             )
 
         key = item.extra.get("issue_key", item.item_id.replace("jira-", ""))
@@ -740,6 +745,10 @@ class JiraGene(Gene):
     async def open_source_artifact(self, artifact: RawSourceArtifact):
         """Open one Jira attachment without buffering its body."""
 
+        if artifact.locator.get("input_uri"):
+            async with open_packaged_source_artifact(self, artifact) as download:
+                yield download
+            return
         request_path = str(artifact.locator.get("request_path") or "").strip()
         if not request_path:
             raise SourceArtifactContractError("Jira attachment locator is incomplete")

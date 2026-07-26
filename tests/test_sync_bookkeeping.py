@@ -3317,6 +3317,71 @@ class JiraArtifactGene(BlockingFetchGene):
         )
 
 
+class ImageOnlyGitHubArtifactGene(JiraArtifactGene):
+    @classmethod
+    def metadata(cls):
+        return GeneMetadata(
+            name="github_repo",
+            display_name="GitHub Repository",
+            description="",
+            default_sync_interval_minutes=60,
+            auth_method="pat",
+            data_shape="document",
+        )
+
+    async def discover(self, since=None):
+        del since
+        yield ContentItem(
+            item_id="github-image-architecture",
+            title="architecture.png",
+            source_url="https://github.example/repo/blob/main/architecture.png",
+            last_modified=datetime(2026, 7, 22, tzinfo=timezone.utc),
+            content_type="image/png",
+            space_or_project="example/repo",
+            version="blob-sha-1",
+            extra={
+                "repo_owner": "example",
+                "repo_name": "repo",
+                "repo_ref": "main",
+                "relative_path": "architecture.png",
+            },
+        )
+
+    async def fetch(self, item):
+        payload = b"\x89PNG\r\n\x1a\nstable-image"
+        return RawContent(
+            item=item,
+            body=b"",
+            content_type="image/png",
+            authoritative_empty=True,
+            empty_evidence="github_binary_file_has_no_text_body",
+            artifacts=(
+                RawSourceArtifact(
+                    provider_key="architecture.png",
+                    parent_observation_type="file_content",
+                    parent_provider_key="content",
+                    provider_revision="blob-sha-1",
+                    filename="architecture.png",
+                    media_type="image/png",
+                    declared_size_bytes=len(payload),
+                    locator={"blob_sha": "blob-sha-1"},
+                ),
+            ),
+        )
+
+    async def normalize(self, raw):
+        return NormalizedContent(
+            item=raw.item,
+            markdown_body="",
+            source_semantics={
+                "repo_owner": "example",
+                "repo_name": "repo",
+                "repo_ref": "main",
+                "relative_path": "architecture.png",
+            },
+        )
+
+
 @pytest.mark.asyncio
 async def test_artifact_summary_commits_with_the_same_projected_revision(db: Database) -> None:
     source_id = "src-jira-artifact-summary"
@@ -3360,6 +3425,46 @@ async def test_artifact_summary_commits_with_the_same_projected_revision(db: Dat
     assert persisted is not None
     assert persisted.summary == "Architecture diagram showing the stable image flow."
     assert len(extractor.projection_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_artifact_only_source_unit_enters_multimodal_extraction(db: Database) -> None:
+    source_id = "src-github-image-only"
+    await db.upsert_source(
+        id=source_id,
+        type="github_repo",
+        name="GitHub Image Only",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    memory_engine = RecordingMemoryEngine()
+    extractor = ProjectionBatchArtifactSummaryExtractor()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=extractor,
+        memory_engine=memory_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=ImageOnlyGitHubArtifactGene(issue_id="unused", issue_key="UNUSED-1"),
+        source_name="GitHub Image Only",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert len(extractor.projection_calls) == 1
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    committed_projection = memory_engine.projected_lifecycle_calls[0]["projection"]
+    artifact_revision = next(
+        revision for revision in committed_projection.observation_revisions if "source_artifact" in revision.metadata
+    )
+    assert artifact_revision.metadata["source_artifact"]["summary"] == (
+        "Architecture diagram showing the stable image flow."
+    )
 
 
 @pytest.mark.asyncio
