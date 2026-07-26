@@ -2,7 +2,7 @@
 
 This plugin connects Codex lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.31`.
+The packaged runtime and plugin version is `0.1.32`.
 
 With no routing variables, the plugin targets local OSS at
 `http://127.0.0.1:8765/api`. Otherwise set the target in `~/.codex/config.toml`.
@@ -36,6 +36,12 @@ so returned `local_path` values point to the agent machine.
 Codex MCP stdio -> plugin-local proxy -> HTTP(S) MemForge API
 get_resource(mode=file) -> ~/.memforge-agent/artifacts -> local_path
 ```
+
+For `search` and `create_memory`, Codex may pass its exact current working
+directory through the optional MCP `repository_context` argument. The local
+proxy converts it to a normalized Git remote and discards the path before
+calling OSS or Cloud. No workspace environment variable is required; when
+context is unavailable, the operation remains valid and unscoped.
 
 Install from GitHub (no checkout required):
 

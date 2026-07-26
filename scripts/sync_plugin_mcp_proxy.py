@@ -26,10 +26,16 @@ REPO_IDENTITY_GENERATED_COPIES = (
     ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_repo_identity.py",
     ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_repo_identity.py",
 )
+REPOSITORY_CONTEXT_CANONICAL = ROOT / "src" / "memforge" / "repository_context.py"
+REPOSITORY_CONTEXT_GENERATED_COPIES = (
+    ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_repository_context.py",
+    ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_repository_context.py",
+)
 PLUGIN_RUNTIME_FILES = (
     (CANONICAL, GENERATED_COPIES),
     (HOOK_CANONICAL, HOOK_GENERATED_COPIES),
     (REPO_IDENTITY_CANONICAL, REPO_IDENTITY_GENERATED_COPIES),
+    (REPOSITORY_CONTEXT_CANONICAL, REPOSITORY_CONTEXT_GENERATED_COPIES),
 )
 
 

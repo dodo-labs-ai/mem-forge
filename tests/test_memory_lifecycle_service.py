@@ -514,17 +514,22 @@ async def test_create_memory_route_audits_request_principal_and_client(db: Datab
                 "provenance": "User confirmed this after validating the payroll smoke flow.",
                 "memory_type": "fact",
                 "client": "codex",
-                "repo_identifier": "github.com/shno-labs/mem-forge",
             },
+        )
+        payload = response.json()
+        detail_response = client.get(
+            f"/api/memories/{payload['memory_id']}?include_private=true"
         )
 
     assert response.status_code == 200, response.text
-    payload = response.json()
+    assert detail_response.status_code == 200, detail_response.text
+    assert detail_response.json()["id"] == payload["memory_id"]
     stored = await db.get_memory(payload["memory_id"])
     assert payload["status"] == "inserted"
     assert stored is not None
     assert stored.owner_user_id == "andrew.sun01@sap.com"
     assert stored.visibility == "private"
+    assert stored.repo_identifier is None
     assert stored.extraction_context == "User confirmed this after validating the payroll smoke flow."
     audit_rows = await db.list_memory_audit_events(
         memory_id=payload["memory_id"],

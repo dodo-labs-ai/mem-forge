@@ -14,6 +14,11 @@ keeps every project_key untouched and the ranker handles affinity weighting.
 In ``project`` mode the workspace branch narrows upstream to the active project
 plus SHARED: UNSORTED and other projects are pruned at the predicate, never
 returned.
+
+Configured Source access is an additional support predicate. Direct
+user-lifecycle provenance (`user_memory` and `user_correction`) is virtual and
+does not correspond to a configured Source row, so it remains governed by the
+Memory owner/visibility branch rather than configured-source availability.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from typing import Any, Iterable, Mapping
 
 from memforge.models import (
     SHARED_PROJECT_KEY,
+    VIRTUAL_DOCUMENT_SOURCE_IDS,
     Visibility,
 )
 from memforge.storage.adapters.context import AccessScope
@@ -85,12 +91,19 @@ def visible_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:
         params.append(scope.user_id)
 
     parts.append("(" + " OR ".join(branches) + ")")
+    virtual_source_placeholders = ",".join("?" for _ in VIRTUAL_DOCUMENT_SOURCE_IDS)
     parts.append(
         f"""(
             NOT EXISTS (
                 SELECT 1
                 FROM memory_sources source_access_support
                 WHERE source_access_support.memory_id = {alias}.id
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM memory_sources virtual_support
+                WHERE virtual_support.memory_id = {alias}.id
+                  AND virtual_support.source_id IN ({virtual_source_placeholders})
             )
             OR EXISTS (
                 SELECT 1
@@ -119,6 +132,7 @@ def visible_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:
             )
         )"""
     )
+    params.extend(sorted(VIRTUAL_DOCUMENT_SOURCE_IDS))
     params.extend([scope.user_id, scope.user_id, scope.user_id])
     return "(" + " AND ".join(parts) + ")", params
 
