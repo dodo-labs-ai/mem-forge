@@ -6,6 +6,7 @@ import logging
 from time import perf_counter
 import weakref
 
+import litellm
 import pytest
 from pydantic import ValidationError
 
@@ -59,6 +60,7 @@ def test_structured_llm_metrics_collector_summarizes_known_and_unknown_usage():
             final_mode="native_schema",
             elapsed_ms=80,
             terminal_category="success",
+            error_code=None,
             prompt_tokens=10,
             completion_tokens=5,
             total_tokens=15,
@@ -73,6 +75,7 @@ def test_structured_llm_metrics_collector_summarizes_known_and_unknown_usage():
             final_mode="json_text",
             elapsed_ms=40,
             terminal_category="deadline_exceeded",
+            error_code="logical_deadline_exceeded",
             prompt_tokens=None,
             completion_tokens=None,
             total_tokens=None,
@@ -99,6 +102,7 @@ def test_structured_llm_metrics_collector_summarizes_known_and_unknown_usage():
             "entity_batch_validation": 1,
             "memory_extraction": 1,
         },
+        error_code_counts={"logical_deadline_exceeded": 1},
     )
 
 
@@ -875,6 +879,7 @@ async def test_litellm_structured_client_bounds_native_and_json_fallback_by_one_
             final_mode="json_text",
             elapsed_ms=pytest.approx(50, abs=40),
             terminal_category="deadline_exceeded",
+            error_code="logical_deadline_exceeded",
             prompt_tokens=None,
             completion_tokens=None,
             total_tokens=None,
@@ -1050,6 +1055,45 @@ async def test_litellm_structured_client_does_not_retain_provider_failure_contex
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert all(reference() is None for reference in retained)
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_classifies_remote_disconnect_without_leaking_request(
+    monkeypatch,
+):
+    telemetry: list[StructuredLlmCallTelemetry] = []
+    private_request_detail = "data:image/png;base64,private-request"
+
+    async def fake_acompletion(**kwargs):
+        del kwargs
+        raise litellm.APIConnectionError(
+            message=(
+                "httpx.RemoteProtocolError: Server disconnected without sending a response "
+                + private_request_detail
+            ),
+            llm_provider="sap",
+            model="deployment",
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+            num_retries=0,
+        ),
+        telemetry_sink=telemetry.append,
+    )
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await client.extract_memories("prompt", max_tokens=1024)
+
+    assert raised.value.error_code == "APIConnectionError.remote_disconnect"
+    assert private_request_detail not in str(raised.value)
+    assert telemetry[0].error_code == "APIConnectionError.remote_disconnect"
 
 
 @pytest.mark.asyncio

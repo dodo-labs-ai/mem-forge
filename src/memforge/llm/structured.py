@@ -376,6 +376,7 @@ class StructuredLlmCallTelemetry:
     final_mode: Literal["native_schema", "json_text"]
     elapsed_ms: int
     terminal_category: StructuredLlmTerminalCategory
+    error_code: str | None
     prompt_tokens: int | None
     completion_tokens: int | None
     total_tokens: int | None
@@ -398,6 +399,7 @@ class StructuredLlmMetricsSummary:
     source_unit_elapsed_ms: int
     terminal_category_counts: Mapping[str, int]
     operation_counts: Mapping[str, int]
+    error_code_counts: Mapping[str, int]
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -414,6 +416,7 @@ class StructuredLlmMetricsSummary:
             "source_unit_elapsed_ms": self.source_unit_elapsed_ms,
             "terminal_category_counts": dict(self.terminal_category_counts),
             "operation_counts": dict(self.operation_counts),
+            "error_code_counts": dict(self.error_code_counts),
         }
 
 
@@ -434,6 +437,7 @@ class StructuredLlmMetricsCollector:
 
         terminal_category_counts: dict[str, int] = {}
         operation_counts: dict[str, int] = {}
+        error_code_counts: dict[str, int] = {}
         reported_input_tokens = 0
         reported_output_tokens = 0
         reported_total_tokens = 0
@@ -443,6 +447,10 @@ class StructuredLlmMetricsCollector:
                 terminal_category_counts.get(call.terminal_category, 0) + 1
             )
             operation_counts[call.operation] = operation_counts.get(call.operation, 0) + 1
+            if call.error_code is not None:
+                error_code_counts[call.error_code] = (
+                    error_code_counts.get(call.error_code, 0) + 1
+                )
             if call.prompt_tokens is not None and call.completion_tokens is not None and call.total_tokens is not None:
                 usage_known_calls += 1
                 reported_input_tokens += call.prompt_tokens
@@ -463,6 +471,7 @@ class StructuredLlmMetricsCollector:
             source_unit_elapsed_ms=max(0, int(source_unit_elapsed_ms)),
             terminal_category_counts=dict(sorted(terminal_category_counts.items())),
             operation_counts=dict(sorted(operation_counts.items())),
+            error_code_counts=dict(sorted(error_code_counts.items())),
         )
 
 
@@ -500,6 +509,7 @@ class _StructuredCallState:
         *,
         elapsed_ms: int,
         terminal_category: StructuredLlmTerminalCategory,
+        error_code: str | None = None,
     ) -> StructuredLlmCallTelemetry:
         usage_known = self.usage_complete and self.usage_seen
         return StructuredLlmCallTelemetry(
@@ -510,6 +520,7 @@ class _StructuredCallState:
             final_mode=self.final_mode,
             elapsed_ms=elapsed_ms,
             terminal_category=terminal_category,
+            error_code=error_code,
             prompt_tokens=self.prompt_tokens if usage_known else None,
             completion_tokens=self.completion_tokens if usage_known else None,
             total_tokens=self.total_tokens if usage_known else None,
@@ -667,6 +678,77 @@ class _StructuredLlmFailure:
         )
 
 
+_SAFE_PROVIDER_ERROR_PATTERNS = (
+    (
+        "payload_too_large",
+        re.compile(
+            r"status(?:_code)?[=: ]+413|HTTP/\S+ 413|request entity too large|"
+            r"payload too large|body too large",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "remote_disconnect",
+        re.compile(
+            r"RemoteProtocolError|server disconnected|peer closed|connection reset|"
+            r"connection closed|unexpected EOF",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "connect_timeout",
+        re.compile(r"ConnectTimeout|connect timeout", re.IGNORECASE),
+    ),
+    (
+        "read_timeout",
+        re.compile(r"ReadTimeout|read timeout|timed out while reading", re.IGNORECASE),
+    ),
+    (
+        "tls_error",
+        re.compile(
+            r"SSLError|certificate verify failed|TLSV1_ALERT", re.IGNORECASE
+        ),
+    ),
+    (
+        "dns_error",
+        re.compile(
+            r"gaierror|name resolution|name or service not known|"
+            r"nodename nor servname",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _safe_provider_error_code(exc: BaseException) -> str:
+    """Return a bounded content-free provider failure code."""
+
+    outer_code = type(exc).__name__
+    if outer_code != "APIConnectionError":
+        return outer_code
+
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    for _ in range(4):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        type_name = type(current).__name__
+        for detail, pattern in _SAFE_PROVIDER_ERROR_PATTERNS:
+            if pattern.search(type_name):
+                return f"{outer_code}.{detail}"
+        current = current.__cause__ or current.__context__
+
+    # LiteLLM 1.86 flattens many transport exceptions into the outer message
+    # without preserving a cause. Inspect only a bounded prefix and persist
+    # only the matched category, never the provider text itself.
+    message_prefix = str(exc)[:2048]
+    for detail, pattern in _SAFE_PROVIDER_ERROR_PATTERNS:
+        if pattern.search(message_prefix):
+            return f"{outer_code}.{detail}"
+    return outer_code
+
+
 def _structured_failure(
     exc: BaseException,
     *,
@@ -682,7 +764,7 @@ def _structured_failure(
         category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
     return _StructuredLlmFailure(
         terminal_category=category,
-        error_code=type(exc).__name__,
+        error_code=_safe_provider_error_code(exc),
     )
 
 
@@ -1094,6 +1176,7 @@ class LiteLlmStructuredClient:
                 state.telemetry(
                     elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
                     terminal_category=failure.terminal_category,
+                    error_code=failure.error_code,
                 )
             )
             raise failure.to_error(timeout_s=self.config.timeout_s)
@@ -1300,6 +1383,7 @@ class LiteLlmStructuredClient:
             "final_mode": telemetry.final_mode,
             "elapsed_ms": telemetry.elapsed_ms,
             "terminal_category": telemetry.terminal_category,
+            "error_code": telemetry.error_code,
             "prompt_tokens": telemetry.prompt_tokens,
             "completion_tokens": telemetry.completion_tokens,
             "total_tokens": telemetry.total_tokens,
