@@ -72,7 +72,7 @@ MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.31"
+PLUGIN_VERSION = "0.1.32-rc.1"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -82,8 +82,9 @@ SESSION_START_USAGE_GUIDANCE = (
     "accidentally hide relevant memories.\n"
     "- Use source filters only when the user or task gives a clear facet. Use "
     "`clients` only when the user names Codex or Claude Code. Do not send "
-    "`current_repo_only`; repo-scoped MCP search is disabled until workspace "
-    "roots are reliable. When the user names a "
+    "`current_repo_only`; exact repo filtering is not exposed by the MCP tool. "
+    "Pass `repository_context` only when the exact current working directory "
+    "is known; never guess or use a plugin directory. When the user names a "
     "configured knowledge source, call `list_sources` first and pass exact "
     "`source_ids` from that result; do not guess source ids from source names "
     "or source types.\n"
