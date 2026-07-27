@@ -252,22 +252,49 @@ class ProjectionMemoryExtractionResponse(StructuredResponseModel):
 
 
 class CandidateLedgerDecision(StructuredResponseModel):
-    """One uniqueness decision for a transient extracted candidate."""
+    """One ordered uniqueness judgment for a transient extracted candidate."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
-    index: int = Field(ge=0)
     action: Literal["KEEP", "DROP_REDUNDANT"]
     canonical_index: int | None = Field(default=None, ge=0)
     reason: str = Field(default="", max_length=1000)
 
 
 class CandidateLedgerResponse(StructuredResponseModel):
-    """Complete within-revision uniqueness ledger for extracted candidates."""
+    """Fixed-slot response for one bounded candidate-ledger batch."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
-    decisions: list[CandidateLedgerDecision]
+    slot_00: CandidateLedgerDecision | None
+    slot_01: CandidateLedgerDecision | None
+    slot_02: CandidateLedgerDecision | None
+    slot_03: CandidateLedgerDecision | None
+    slot_04: CandidateLedgerDecision | None
+    slot_05: CandidateLedgerDecision | None
+    slot_06: CandidateLedgerDecision | None
+    slot_07: CandidateLedgerDecision | None
+    slot_08: CandidateLedgerDecision | None
+    slot_09: CandidateLedgerDecision | None
+    slot_10: CandidateLedgerDecision | None
+    slot_11: CandidateLedgerDecision | None
+    slot_12: CandidateLedgerDecision | None
+    slot_13: CandidateLedgerDecision | None
+    slot_14: CandidateLedgerDecision | None
+    slot_15: CandidateLedgerDecision | None
+    slot_16: CandidateLedgerDecision | None
+    slot_17: CandidateLedgerDecision | None
+    slot_18: CandidateLedgerDecision | None
+    slot_19: CandidateLedgerDecision | None
+    slot_20: CandidateLedgerDecision | None
+    slot_21: CandidateLedgerDecision | None
+    slot_22: CandidateLedgerDecision | None
+    slot_23: CandidateLedgerDecision | None
+
+    def ordered_slots(self) -> tuple[CandidateLedgerDecision | None, ...]:
+        """Return all protocol slots in their deterministic request order."""
+
+        return tuple(getattr(self, f"slot_{index:02d}") for index in range(24))
 
 
 class ReconciliationDecision(StructuredResponseModel):

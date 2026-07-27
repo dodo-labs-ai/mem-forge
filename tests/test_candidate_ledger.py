@@ -25,6 +25,19 @@ def _candidate(
     )
 
 
+def _ledger_response(
+    *decisions: CandidateLedgerDecision | None,
+) -> CandidateLedgerResponse:
+    return CandidateLedgerResponse(
+        **{
+            f"slot_{index:02d}": (
+                decisions[index] if index < len(decisions) else None
+            )
+            for index in range(24)
+        }
+    )
+
+
 class _LedgerClient:
     def __init__(self, *responses: CandidateLedgerResponse) -> None:
         self.responses = list(responses)
@@ -41,12 +54,10 @@ async def test_candidate_ledger_retries_once_when_decision_coverage_is_incomplet
     first = _candidate("The trigger remained OPEN.", observation_id="obs-1")
     second = _candidate("The trigger was not processed.", observation_id="obs-2")
     client = _LedgerClient(
-        CandidateLedgerResponse(decisions=[CandidateLedgerDecision(index=0, action="KEEP")]),
-        CandidateLedgerResponse(
-            decisions=[
-                CandidateLedgerDecision(index=0, action="KEEP"),
-                CandidateLedgerDecision(index=1, action="KEEP"),
-            ]
+        _ledger_response(CandidateLedgerDecision(action="KEEP")),
+        _ledger_response(
+            CandidateLedgerDecision(action="KEEP"),
+            CandidateLedgerDecision(action="KEEP"),
         ),
     )
 
@@ -71,7 +82,7 @@ async def test_candidate_ledger_fails_closed_after_second_incomplete_ledger():
         _candidate("The trigger remained OPEN.", observation_id="obs-1"),
         _candidate("The trigger was not processed.", observation_id="obs-2"),
     ]
-    incomplete = CandidateLedgerResponse(decisions=[CandidateLedgerDecision(index=0, action="KEEP")])
+    incomplete = _ledger_response(CandidateLedgerDecision(action="KEEP"))
     client = _LedgerClient(incomplete, incomplete)
 
     with pytest.raises(CandidateLedgerError, match="complete candidate ledger") as exc_info:
@@ -170,8 +181,8 @@ async def test_candidate_ledger_composes_bounded_decision_batches():
     ]
     client = _LedgerClient(
         *(
-            CandidateLedgerResponse(
-                decisions=[CandidateLedgerDecision(index=index, action="KEEP") for index in range(start, stop)]
+            _ledger_response(
+                *(CandidateLedgerDecision(action="KEEP") for _ in range(start, stop))
             )
             for start, stop in ((0, 24), (24, 48), (48, 55))
         )
@@ -186,9 +197,10 @@ async def test_candidate_ledger_composes_bounded_decision_batches():
     assert result.candidates == tuple(candidates)
     assert result.structured_llm_calls == 3
     assert len(client.prompts) == 3
-    assert "<decision_indices>\n[0, 1, 2" in client.prompts[0]
-    assert "<decision_indices>\n[24, 25, 26" in client.prompts[1]
-    assert "<decision_indices>\n[48, 49, 50" in client.prompts[2]
+    assert '"slot_00":0' in client.prompts[0]
+    assert '"slot_00":24' in client.prompts[1]
+    assert '"slot_00":48' in client.prompts[2]
+    assert '"slot_07":null' in client.prompts[2]
     assert '"index":54' in client.prompts[0]
 
 
@@ -198,20 +210,16 @@ async def test_candidate_ledger_normalizes_lower_index_canonical_chains():
     middle = _candidate("A durable fact with details.", observation_id="obs-2")
     shortest = _candidate("A durable fact.", observation_id="obs-3")
     client = _LedgerClient(
-        CandidateLedgerResponse(
-            decisions=[
-                CandidateLedgerDecision(index=0, action="KEEP"),
-                CandidateLedgerDecision(
-                    index=1,
-                    action="DROP_REDUNDANT",
-                    canonical_index=0,
-                ),
-                CandidateLedgerDecision(
-                    index=2,
-                    action="DROP_REDUNDANT",
-                    canonical_index=1,
-                ),
-            ]
+        _ledger_response(
+            CandidateLedgerDecision(action="KEEP"),
+            CandidateLedgerDecision(
+                action="DROP_REDUNDANT",
+                canonical_index=0,
+            ),
+            CandidateLedgerDecision(
+                action="DROP_REDUNDANT",
+                canonical_index=1,
+            ),
         )
     )
 
@@ -228,23 +236,19 @@ async def test_candidate_ledger_normalizes_lower_index_canonical_chains():
 @pytest.mark.asyncio
 async def test_candidate_ledger_normalizes_canonical_chain_across_batches():
     candidates = [_candidate("X" * (100 - index), observation_id=f"obs-{index}") for index in range(26)]
-    first_batch = [CandidateLedgerDecision(index=index, action="KEEP") for index in range(24)]
+    first_batch = [CandidateLedgerDecision(action="KEEP") for _ in range(24)]
     first_batch[1] = CandidateLedgerDecision(
-        index=1,
         action="DROP_REDUNDANT",
         canonical_index=0,
     )
     client = _LedgerClient(
-        CandidateLedgerResponse(decisions=first_batch),
-        CandidateLedgerResponse(
-            decisions=[
-                CandidateLedgerDecision(
-                    index=24,
-                    action="DROP_REDUNDANT",
-                    canonical_index=1,
-                ),
-                CandidateLedgerDecision(index=25, action="KEEP"),
-            ]
+        _ledger_response(*first_batch),
+        _ledger_response(
+            CandidateLedgerDecision(
+                action="DROP_REDUNDANT",
+                canonical_index=1,
+            ),
+            CandidateLedgerDecision(action="KEEP"),
         ),
     )
 
