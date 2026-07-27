@@ -67,7 +67,11 @@ and the updated document content.
 {changed_hunks}
 </changed_hunks>
 
-For each new extraction, decide ONE action:
+<ledger_contract>
+{ledger_contract}
+</ledger_contract>
+
+For each new extraction listed for this phase, decide ONE action:
 
 - ADD: Genuinely new information not covered by any existing memory.
 - UPDATE: An existing memory covers the same durable claim, but the new evidence
@@ -85,8 +89,9 @@ For each new extraction, decide ONE action:
   wording variance. Preserve the incumbent memory ID even when the source text
   or the newly extracted candidate is worded differently.
 
-Also audit EVERY existing memory in this batch against the updated document.
-You MUST return exactly one explicit decision for every existing memory ID:
+When the ledger contract requests an incumbent audit, audit EVERY existing memory
+in the batch against the updated document and return exactly one explicit decision
+for every existing memory ID:
 - NOOP when it remains supported or is disjoint from the changed evidence.
 - DELETE when this source unit no longer supports it and there is no replacement.
 - UPDATE or SUPERSEDE, with a new-extraction index, when a candidate replaces it.
@@ -123,8 +128,8 @@ the updated document excerpt may be incomplete.
 </existing_memories>
 
 Rules:
-1. Each new extraction gets EXACTLY ONE action.
-2. Each existing memory ID gets EXACTLY ONE explicit action; use NOOP to keep it.
+1. Cover exactly the candidate indices and incumbent IDs required by the ledger contract.
+2. Never emit a decision for an index or incumbent outside this batch.
 3. For UPDATE and SUPERSEDE, specify which existing memory ID is affected.
 4. For UPDATE, provide the merged current text as "updated_content".
 5. If uncertain between UPDATE and SUPERSEDE, prefer SUPERSEDE when the old meaning is materially wrong.
@@ -160,7 +165,28 @@ Return ONLY the JSON object."""
 
 
 RECONCILIATION_INCUMBENT_BATCH_SIZE = 30
+RECONCILIATION_CANDIDATE_BATCH_SIZE = 24
 RECONCILIATION_BATCH_VALIDATION_ATTEMPTS = 2
+
+_COMBINED_LEDGER_CONTRACT = """Close both ledgers in this bounded batch:
+- Return exactly one indexed decision for every listed new extraction.
+- Return exactly one explicit final disposition for every listed incumbent ID.
+  An indexed decision with that memory_id closes both ledgers."""
+
+_CANDIDATE_RELATION_CONTRACT = """This is one cell of a complete candidate-by-incumbent
+relation matrix:
+- Return exactly one indexed decision for every listed new extraction.
+- Compare each candidate only with the listed incumbents.
+- Use ADD when the candidate does not match an incumbent in this cell; the deterministic
+  reducer will authorize a global ADD only after every incumbent cell is complete.
+- Include memory_id only for a candidate-to-incumbent NOOP, UPDATE, or SUPERSEDE relation.
+- Do not emit unindexed incumbent lifecycle decisions and do not use DELETE."""
+
+_INCUMBENT_AUDIT_CONTRACT = """This is the independent incumbent-support audit:
+- There are no new extractions in this phase.
+- Return exactly one unindexed NOOP or DELETE decision for every listed incumbent ID.
+- Decide only whether the updated Source Unit still supports the incumbent.
+- Do not emit ADD, UPDATE, or SUPERSEDE."""
 
 
 async def reconcile_memories(
@@ -206,103 +232,99 @@ async def reconcile_memories(
             include_metadata=include_metadata,
         )
 
-    # Format for the prompt. Incumbents are processed in bounded model batches,
-    # but every batch must explicitly close its entire incumbent ledger. The
-    # merged result is rejected if a candidate destructively matches incumbents
-    # in more than one batch; that ambiguity belongs in review, not mutation.
-    new_json = json.dumps(
-        [
-            {
-                "index": i,
-                "content": raw.content,
-                "memory_type": raw.memory_type,
-                "confidence": raw.confidence,
-                "entity_refs": raw.entity_refs,
-            }
-            for i, raw in enumerate(new_extractions)
-        ],
-        indent=2,
-    )
+    indexed_extractions = list(enumerate(new_extractions))
+    candidate_batches = [
+        indexed_extractions[offset : offset + RECONCILIATION_CANDIDATE_BATCH_SIZE]
+        for offset in range(0, len(indexed_extractions), RECONCILIATION_CANDIDATE_BATCH_SIZE)
+    ]
 
     try:
         decisions: list[dict] = []
-        for offset in range(0, len(existing_memories), RECONCILIATION_INCUMBENT_BATCH_SIZE):
-            model_batch_count += 1
-            batch = existing_memories[offset : offset + RECONCILIATION_INCUMBENT_BATCH_SIZE]
-            existing_json = json.dumps(
-                [
-                    {
-                        "id": mem.id,
-                        "content": mem.content,
-                        "memory_type": mem.memory_type,
-                        "confidence": mem.confidence,
-                        "corroboration_count": mem.corroboration_count,
-                    }
-                    for mem in batch
-                ],
-                indent=2,
-            )
-            prompt = RECONCILIATION_PROMPT.format(
-                update_mode=update_mode,
-                diff_stats=json.dumps(update_plan_stats or {}, indent=2),
-                changed_hunks=(changed_hunks or "")[:40_000],
-                doc_type=doc_type,
-                updated_document=(updated_document or "")[:100_000],
-                new_extractions=new_json,
-                existing_memories=existing_json,
-            )
-            batch_decisions: list[dict] = []
-            for validation_attempt in range(RECONCILIATION_BATCH_VALIDATION_ATTEMPTS):
-                structured_llm_calls += 1
-                llm_started = perf_counter()
-                try:
-                    response = await structured_llm_client.reconcile_memories(
-                        prompt,
-                        max_tokens=4096,
-                        model=llm_model,
+        incumbent_batches = [
+            existing_memories[offset : offset + RECONCILIATION_INCUMBENT_BATCH_SIZE]
+            for offset in range(0, len(existing_memories), RECONCILIATION_INCUMBENT_BATCH_SIZE)
+        ]
+        if len(candidate_batches) <= 1:
+            candidate_batch = candidate_batches[0] if candidate_batches else []
+            for incumbent_batch in incumbent_batches:
+                batch_decisions, calls, elapsed = await _run_reconciliation_batch(
+                    structured_llm_client=structured_llm_client,
+                    llm_model=llm_model,
+                    prompt=_render_reconciliation_prompt(
+                        ledger_contract=_COMBINED_LEDGER_CONTRACT,
+                        indexed_extractions=candidate_batch,
+                        incumbents=incumbent_batch,
+                        doc_type=doc_type,
+                        updated_document=updated_document,
+                        update_mode=update_mode,
+                        changed_hunks=changed_hunks,
+                        update_plan_stats=update_plan_stats,
+                    ),
+                    expected_indices={index for index, _ in candidate_batch},
+                    incumbents=incumbent_batch,
+                    require_incumbent_coverage=True,
+                    allow_unindexed_incumbents=True,
+                    allow_deferred_replacement=True,
+                )
+                model_batch_count += 1
+                structured_llm_calls += calls
+                structured_llm_elapsed_seconds += elapsed
+                decisions.extend(batch_decisions)
+        else:
+            # Completeness is a composed proof, not a single oversized response:
+            # every candidate crosses every incumbent batch, then each incumbent
+            # receives one independent support audit. Only the merged ledger can
+            # authorize the later atomic Lifecycle Plan.
+            for incumbent_batch in incumbent_batches:
+                for candidate_batch in candidate_batches:
+                    batch_decisions, calls, elapsed = await _run_reconciliation_batch(
+                        structured_llm_client=structured_llm_client,
+                        llm_model=llm_model,
+                        prompt=_render_reconciliation_prompt(
+                            ledger_contract=_CANDIDATE_RELATION_CONTRACT,
+                            indexed_extractions=candidate_batch,
+                            incumbents=incumbent_batch,
+                            doc_type=doc_type,
+                            updated_document=updated_document,
+                            update_mode=update_mode,
+                            changed_hunks=changed_hunks,
+                            update_plan_stats=update_plan_stats,
+                        ),
+                        expected_indices={index for index, _ in candidate_batch},
+                        incumbents=incumbent_batch,
+                        require_incumbent_coverage=False,
+                        allow_unindexed_incumbents=False,
+                        allow_deferred_replacement=False,
                     )
-                finally:
-                    structured_llm_elapsed_seconds += perf_counter() - llm_started
-                batch_decisions = [decision.model_dump() for decision in response.decisions]
-                try:
-                    _validate_complete_reconciliation_batch(
-                        batch_decisions,
-                        batch,
-                        new_extraction_count=len(new_extractions),
-                    )
-                except ValueError as exc:
-                    if validation_attempt + 1 >= RECONCILIATION_BATCH_VALIDATION_ATTEMPTS:
-                        deferred_decisions = _defer_unresolved_replacements_to_review(
-                            batch_decisions,
-                            batch,
-                        )
-                        if deferred_decisions == batch_decisions:
-                            raise
-                        _validate_complete_reconciliation_batch(
-                            deferred_decisions,
-                            batch,
-                            new_extraction_count=len(new_extractions),
-                        )
-                        logger.warning(
-                            "Reconciliation replacement remained incomplete: %s — "
-                            "deferring the unresolved incumbent to review",
-                            exc,
-                        )
-                        batch_decisions = deferred_decisions
-                        break
-                    logger.warning(
-                        "Reconciliation batch validation failed: %s — retrying only this batch",
-                        exc,
-                    )
-                    prompt = (
-                        f"{prompt}\n\n<validation_feedback>\n"
-                        f"The previous response was rejected: {exc}. "
-                        "Return a complete corrected decisions ledger that satisfies every rule.\n"
-                        "</validation_feedback>"
-                    )
-                    continue
-                break
-            decisions.extend(batch_decisions)
+                    model_batch_count += 1
+                    structured_llm_calls += calls
+                    structured_llm_elapsed_seconds += elapsed
+                    decisions.extend(batch_decisions)
+
+                audit_decisions, calls, elapsed = await _run_reconciliation_batch(
+                    structured_llm_client=structured_llm_client,
+                    llm_model=llm_model,
+                    prompt=_render_reconciliation_prompt(
+                        ledger_contract=_INCUMBENT_AUDIT_CONTRACT,
+                        indexed_extractions=[],
+                        incumbents=incumbent_batch,
+                        doc_type=doc_type,
+                        updated_document=updated_document,
+                        update_mode=update_mode,
+                        changed_hunks=changed_hunks,
+                        update_plan_stats=update_plan_stats,
+                    ),
+                    expected_indices=set(),
+                    incumbents=incumbent_batch,
+                    require_incumbent_coverage=True,
+                    allow_unindexed_incumbents=True,
+                    allow_deferred_replacement=False,
+                    incumbent_audit=True,
+                )
+                model_batch_count += 1
+                structured_llm_calls += calls
+                structured_llm_elapsed_seconds += elapsed
+                decisions.extend(audit_decisions)
 
         return _return_result(
             _merge_complete_batch_decisions(decisions, new_extractions, existing_memories),
@@ -328,6 +350,131 @@ async def reconcile_memories(
             metrics=metrics(),
             include_metadata=include_metadata,
         )
+
+
+def _render_reconciliation_prompt(
+    *,
+    ledger_contract: str,
+    indexed_extractions: list[tuple[int, RawMemory]],
+    incumbents: list[Memory],
+    doc_type: str,
+    updated_document: str | None,
+    update_mode: str,
+    changed_hunks: str | None,
+    update_plan_stats: dict | None,
+) -> str:
+    new_json = json.dumps(
+        [
+            {
+                "index": index,
+                "content": raw.content,
+                "memory_type": raw.memory_type,
+                "confidence": raw.confidence,
+                "entity_refs": raw.entity_refs,
+            }
+            for index, raw in indexed_extractions
+        ],
+        indent=2,
+    )
+    existing_json = json.dumps(
+        [
+            {
+                "id": memory.id,
+                "content": memory.content,
+                "memory_type": memory.memory_type,
+                "confidence": memory.confidence,
+                "corroboration_count": memory.corroboration_count,
+            }
+            for memory in incumbents
+        ],
+        indent=2,
+    )
+    return RECONCILIATION_PROMPT.format(
+        ledger_contract=ledger_contract,
+        update_mode=update_mode,
+        diff_stats=json.dumps(update_plan_stats or {}, indent=2),
+        changed_hunks=(changed_hunks or "")[:40_000],
+        doc_type=doc_type,
+        updated_document=(updated_document or "")[:100_000],
+        new_extractions=new_json,
+        existing_memories=existing_json,
+    )
+
+
+async def _run_reconciliation_batch(
+    *,
+    structured_llm_client,
+    llm_model: str,
+    prompt: str,
+    expected_indices: set[int],
+    incumbents: list[Memory],
+    require_incumbent_coverage: bool,
+    allow_unindexed_incumbents: bool,
+    allow_deferred_replacement: bool,
+    incumbent_audit: bool = False,
+) -> tuple[list[dict], int, float]:
+    calls = 0
+    elapsed_seconds = 0.0
+    batch_decisions: list[dict] = []
+    for validation_attempt in range(RECONCILIATION_BATCH_VALIDATION_ATTEMPTS):
+        calls += 1
+        llm_started = perf_counter()
+        try:
+            response = await structured_llm_client.reconcile_memories(
+                prompt,
+                max_tokens=4096,
+                model=llm_model,
+            )
+        finally:
+            elapsed_seconds += perf_counter() - llm_started
+        batch_decisions = [decision.model_dump() for decision in response.decisions]
+        try:
+            _validate_complete_reconciliation_batch(
+                batch_decisions,
+                incumbents,
+                expected_indices=expected_indices,
+                require_incumbent_coverage=require_incumbent_coverage,
+                allow_unindexed_incumbents=allow_unindexed_incumbents,
+                incumbent_audit=incumbent_audit,
+            )
+        except ValueError as exc:
+            if validation_attempt + 1 >= RECONCILIATION_BATCH_VALIDATION_ATTEMPTS:
+                if not allow_deferred_replacement:
+                    raise
+                deferred_decisions = _defer_unresolved_replacements_to_review(
+                    batch_decisions,
+                    incumbents,
+                )
+                if deferred_decisions == batch_decisions:
+                    raise
+                _validate_complete_reconciliation_batch(
+                    deferred_decisions,
+                    incumbents,
+                    expected_indices=expected_indices,
+                    require_incumbent_coverage=require_incumbent_coverage,
+                    allow_unindexed_incumbents=allow_unindexed_incumbents,
+                    incumbent_audit=incumbent_audit,
+                )
+                logger.warning(
+                    "Reconciliation replacement remained incomplete: %s — "
+                    "deferring the unresolved incumbent to review",
+                    exc,
+                )
+                batch_decisions = deferred_decisions
+                break
+            logger.warning(
+                "Reconciliation batch validation failed: %s — retrying only this batch",
+                exc,
+            )
+            prompt = (
+                f"{prompt}\n\n<validation_feedback>\n"
+                f"The previous response was rejected: {exc}. "
+                "Return a complete corrected decisions ledger that satisfies every rule.\n"
+                "</validation_feedback>"
+            )
+            continue
+        break
+    return batch_decisions, calls, elapsed_seconds
 
 
 def _return_result(
@@ -502,15 +649,27 @@ def _validate_complete_reconciliation_batch(
     decisions: list[dict],
     incumbents: list[Memory],
     *,
-    new_extraction_count: int,
+    expected_indices: set[int],
+    require_incumbent_coverage: bool,
+    allow_unindexed_incumbents: bool,
+    incumbent_audit: bool = False,
 ) -> None:
-    expected_indices = set(range(new_extraction_count))
     indices = [
         decision.get("index")
         for decision in decisions
         if isinstance(decision.get("index"), int)
-        and 0 <= int(decision["index"]) < new_extraction_count
+        and int(decision["index"]) in expected_indices
     ]
+    unexpected_indices = sorted(
+        {
+            int(decision["index"])
+            for decision in decisions
+            if isinstance(decision.get("index"), int)
+            and int(decision["index"]) not in expected_indices
+        }
+    )
+    if unexpected_indices:
+        raise ValueError(f"unexpected new extraction decisions: {unexpected_indices}")
     duplicate_indices = sorted({index for index in indices if indices.count(index) > 1})
     if duplicate_indices:
         raise ValueError(f"duplicate new extraction decisions: {duplicate_indices}")
@@ -519,17 +678,62 @@ def _validate_complete_reconciliation_batch(
         raise ValueError(f"missing new extraction decisions: {missing_indices}")
 
     expected = {memory.id for memory in incumbents}
+    unknown_incumbents = sorted(
+        {
+            str(decision["memory_id"])
+            for decision in decisions
+            if decision.get("memory_id") is not None
+            and decision.get("memory_id") not in expected
+        }
+    )
+    if unknown_incumbents:
+        raise ValueError(f"unexpected incumbent decisions: {unknown_incumbents}")
+    if not allow_unindexed_incumbents:
+        unindexed = [
+            str(decision.get("memory_id"))
+            for decision in decisions
+            if not isinstance(decision.get("index"), int)
+        ]
+        if unindexed:
+            raise ValueError(
+                f"candidate relation batch emitted unindexed incumbent decisions: {unindexed}"
+            )
+        deleted_candidates = sorted(
+            int(decision["index"])
+            for decision in decisions
+            if str(decision.get("action", "")).upper() == "DELETE"
+            and isinstance(decision.get("index"), int)
+        )
+        if deleted_candidates:
+            raise ValueError(
+                f"candidate relation batch emitted DELETE decisions: {deleted_candidates}"
+            )
     seen = {
         str(decision["memory_id"])
         for decision in decisions
         if decision.get("memory_id") in expected
     }
-    missing = sorted(expected.difference(seen))
+    missing = sorted(expected.difference(seen)) if require_incumbent_coverage else []
     if missing:
         raise ValueError(f"missing incumbent decisions: {missing}")
 
+    if incumbent_audit:
+        invalid_actions = sorted(
+            {
+                str(decision.get("action", "")).upper()
+                for decision in decisions
+                if str(decision.get("action", "")).upper() not in {"NOOP", "DELETE"}
+            }
+        )
+        if invalid_actions:
+            raise ValueError(
+                f"incumbent support audit emitted invalid actions: {invalid_actions}"
+            )
+
     for memory_id in sorted(expected):
         group = [item for item in decisions if item.get("memory_id") == memory_id]
+        if not group:
+            continue
         dispositions = {_incumbent_disposition(item) for item in group}
         if None in dispositions:
             raise ValueError(f"invalid incumbent decision for {memory_id}")
