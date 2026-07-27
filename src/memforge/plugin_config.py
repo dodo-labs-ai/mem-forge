@@ -36,12 +36,12 @@ def configured_api_token() -> str:
 
 
 def _configured_workspace_id(repository_paths: Iterable[str | os.PathLike[str]]) -> str | None:
-    process_value = os.getenv("MEMFORGE_WORKSPACE_ID")
-    if process_value:
-        return process_value.strip() or None
     repository_value = _repository_workspace_id(repository_paths)
     if repository_value is not None:
         return repository_value
+    process_value = os.getenv("MEMFORGE_WORKSPACE_ID")
+    if process_value:
+        return process_value.strip() or None
     return _codex_memforge_config().get("MEMFORGE_WORKSPACE_ID", "").strip() or None
 
 

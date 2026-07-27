@@ -38,12 +38,12 @@ workspace_id = "repository_workspace"
 ```
 
 The repository file is ignored by Git and only selects the workspace; API
-origins and credentials remain user- or process-level settings. A process
-`MEMFORGE_WORKSPACE_ID` has highest priority, followed by this repository
-override and then the user-level default. Missing or invalid repository
-configuration leaves the user default unchanged. The bundled MCP uses the host
-repository root and the hooks use the hook workspace, so both resolve the same
-override.
+origins and credentials retain their process-then-user precedence. For workspace
+selection, a valid repository override has highest priority, followed by a
+process `MEMFORGE_WORKSPACE_ID` such as the top-level `env` default. Missing or
+invalid repository configuration leaves that process default unchanged. The
+bundled MCP uses the host repository root and the hooks use the hook workspace,
+so both resolve the same override.
 
 Do not add a manual MCP server block for MemForge. The plugin's `.mcp.json`
 registers the MCP server; duplicating it in config can pin the agent to a stale

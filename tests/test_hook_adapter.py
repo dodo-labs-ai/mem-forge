@@ -1094,6 +1094,7 @@ MEMFORGE_WORKSPACE_ID = "user_workspace"
         encoding="utf-8",
     )
     monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(user_config))
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "process_workspace")
     monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
     _provide_mcp_roots(plugin_mcp_proxy, repository)
 

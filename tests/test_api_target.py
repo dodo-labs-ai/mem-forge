@@ -229,7 +229,7 @@ MEMFORGE_WORKSPACE_ID = "user_workspace"
     )
 
 
-def test_process_workspace_overrides_repository_and_user_defaults(monkeypatch, tmp_path):
+def test_repository_workspace_overrides_process_and_user_defaults(monkeypatch, tmp_path):
     from memforge import plugin_config
 
     repository = tmp_path / "repository"
@@ -237,6 +237,39 @@ def test_process_workspace_overrides_repository_and_user_defaults(monkeypatch, t
     local_config = repository / ".memforge" / "config.toml"
     local_config.parent.mkdir()
     local_config.write_text('[memforge]\nworkspace_id = "repository_workspace"\n', encoding="utf-8")
+    user_config = tmp_path / "codex-config.toml"
+    user_config.write_text(
+        """
+[memforge]
+MEMFORGE_API_URL = "https://memforge.example.hana.ondemand.com"
+MEMFORGE_WORKSPACE_ID = "user_workspace"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "process_workspace")
+    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(user_config))
+    monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
+
+    assert configured_target([repository]).workspace_id == "repository_workspace"
+
+
+@pytest.mark.parametrize(
+    "local_content",
+    [
+        None,
+        '[memforge]\nworkspace_id = "\\q"\n',
+    ],
+)
+def test_missing_or_malformed_repository_workspace_retains_process_default(monkeypatch, tmp_path, local_content):
+    from memforge import plugin_config
+
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    if local_content is not None:
+        local_config = repository / ".memforge" / "config.toml"
+        local_config.parent.mkdir()
+        local_config.write_text(local_content, encoding="utf-8")
     user_config = tmp_path / "codex-config.toml"
     user_config.write_text(
         """
