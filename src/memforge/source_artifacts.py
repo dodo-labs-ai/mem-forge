@@ -16,6 +16,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import BinaryIO, Mapping, Protocol
 
+from PIL import Image, UnidentifiedImageError
+
 
 SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES = frozenset(
     {
@@ -26,17 +28,25 @@ SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES = frozenset(
         "image/webp",
     }
 )
-MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT = 200
-MAX_SOURCE_ARTIFACTS_PER_UNIT = 100
 MAX_SOURCE_ARTIFACT_STORAGE_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT = 128 * 1024 * 1024
 MAX_SOURCE_ARTIFACT_INFERENCE_BYTES = 10 * 1024 * 1024
+MAX_SOURCE_ARTIFACT_IMAGE_PIXELS = 40_000_000
 # Base64 and request framing expand the provider payload. Bound the original
 # batch so the prepared wire request retains cross-endpoint headroom.
 MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH = 15 * 1024 * 1024
 MAX_SOURCE_ARTIFACT_SUMMARY_CHARS = 240
 SOURCE_ARTIFACT_STREAM_CHUNK_BYTES = 256 * 1024
 SOURCE_ARTIFACT_SPOOL_MEMORY_BYTES = 1024 * 1024
+SOURCE_ARTIFACT_INELIGIBILITY_REASONS = frozenset(
+    {
+        "inference_byte_limit",
+        "invalid_image_structure",
+        "image_decompression_limit",
+        "image_encoding_mismatch",
+        "unsupported_inference_media_type",
+    }
+)
 
 
 class SourceArtifactContractError(ValueError):
@@ -163,7 +173,23 @@ class StoredSourceArtifact:
     sha256: str
     uri: str
     inference_eligible: bool
+    inference_ineligible_reason: str | None = None
     locator: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.inference_eligible:
+            if self.inference_ineligible_reason is not None:
+                raise SourceArtifactContractError(
+                    "inference-eligible Source Artifact cannot have an ineligibility reason"
+                )
+            return
+        if (
+            self.inference_ineligible_reason
+            not in SOURCE_ARTIFACT_INELIGIBILITY_REASONS
+        ):
+            raise SourceArtifactContractError(
+                "inference-ineligible Source Artifact requires a deterministic reason"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +230,7 @@ class SourceArtifactRevision:
     sha256: str
     uri: str
     inference_eligible: bool
+    inference_ineligible_reason: str | None = None
     summary: str | None = None
 
     @property
@@ -224,6 +251,7 @@ class SourceArtifactRevision:
             "size_bytes": self.size_bytes,
             "sha256": self.sha256,
             "inference_eligible": self.inference_eligible,
+            "inference_ineligible_reason": self.inference_ineligible_reason,
             "summary": self.summary,
             "url": self.resource_url,
         }
@@ -264,10 +292,22 @@ def source_artifact_revision_from_metadata(
     try:
         size_bytes = int(raw["size_bytes"])
         inference_eligible = raw.get("inference_eligible")
-        if inference_eligible is None:
-            # A missing decision is safe only within the inference budget.
-            inference_eligible = size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
-        elif not isinstance(inference_eligible, bool):
+        if not isinstance(inference_eligible, bool):
+            return None
+        raw_ineligible_reason = raw.get("inference_ineligible_reason")
+        inference_ineligible_reason = (
+            str(raw_ineligible_reason)
+            if raw_ineligible_reason is not None
+            else None
+        )
+        if inference_ineligible_reason not in (
+            None,
+            *SOURCE_ARTIFACT_INELIGIBILITY_REASONS,
+        ):
+            return None
+        if inference_eligible and inference_ineligible_reason is not None:
+            return None
+        if not inference_eligible and inference_ineligible_reason is None:
             return None
         summary_value = raw.get("summary")
         summary = None
@@ -289,6 +329,7 @@ def source_artifact_revision_from_metadata(
             sha256=str(raw["sha256"]),
             uri=str(raw["uri"]),
             inference_eligible=inference_eligible,
+            inference_ineligible_reason=inference_ineligible_reason,
             summary=summary,
         )
     except (KeyError, TypeError, ValueError):
@@ -456,6 +497,9 @@ def _store_downloaded_source_artifact(
         size_bytes=artifact.size_bytes,
         sha256=artifact.sha256,
     )
+    inference_ineligible_reason = _artifact_inference_ineligible_reason(
+        artifact
+    )
     return StoredSourceArtifact(
         id=artifact_id,
         provider_key=descriptor.provider_key,
@@ -467,7 +511,8 @@ def _store_downloaded_source_artifact(
         size_bytes=artifact.size_bytes,
         sha256=artifact.sha256,
         uri=uri,
-        inference_eligible=artifact.size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES,
+        inference_eligible=inference_ineligible_reason is None,
+        inference_ineligible_reason=inference_ineligible_reason,
         locator=dict(descriptor.locator),
     )
 
@@ -485,8 +530,6 @@ async def materialize_source_artifacts(
 ) -> tuple[StoredSourceArtifact, ...]:
     """Validate one bounded descriptor set, spool it, then persist exact bodies."""
 
-    if len(artifacts) > MAX_SOURCE_ARTIFACTS_PER_UNIT:
-        raise SourceArtifactContractError(f"Source Unit exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} Artifact limit")
     provider_keys = [artifact.provider_key for artifact in artifacts]
     if len(set(provider_keys)) != len(provider_keys):
         raise SourceArtifactContractError("Source Unit contains duplicate Artifact provider identity")
@@ -500,31 +543,67 @@ async def materialize_source_artifacts(
             "Source Unit Artifacts exceed "
             f"{MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT} byte storage aggregate limit"
         )
-    downloaded: list[_DownloadedSourceArtifact] = []
-    try:
-        total_bytes = 0
-        for descriptor in artifacts:
-            item = await _download_source_artifact(
-                artifact=descriptor,
-                remaining_unit_bytes=(
-                    MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT - total_bytes
-                ),
-                open_artifact=open_artifact,
-            )
-            downloaded.append(item)
-            total_bytes += item.size_bytes
-        return tuple(
-            _store_downloaded_source_artifact(
-                source_id=source_id,
-                source_unit_key=source_unit_key,
-                artifact=artifact,
-                store=store,
-            )
-            for artifact in downloaded
+    stored: list[StoredSourceArtifact] = []
+    total_bytes = 0
+    for descriptor in artifacts:
+        downloaded = await _download_source_artifact(
+            artifact=descriptor,
+            remaining_unit_bytes=(
+                MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT - total_bytes
+            ),
+            open_artifact=open_artifact,
         )
+        try:
+            stored.append(
+                _store_downloaded_source_artifact(
+                    source_id=source_id,
+                    source_unit_key=source_unit_key,
+                    artifact=downloaded,
+                    store=store,
+                )
+            )
+            total_bytes += downloaded.size_bytes
+        finally:
+            downloaded.content.close()
+    return tuple(stored)
+
+
+def _artifact_inference_ineligible_reason(
+    artifact: _DownloadedSourceArtifact,
+) -> str | None:
+    if artifact.size_bytes > MAX_SOURCE_ARTIFACT_INFERENCE_BYTES:
+        return "inference_byte_limit"
+    if not artifact.media_type.startswith("image/"):
+        return "unsupported_inference_media_type"
+    expected_formats = {
+        "image/gif": "GIF",
+        "image/jpeg": "JPEG",
+        "image/png": "PNG",
+        "image/webp": "WEBP",
+    }
+    expected_format = expected_formats.get(artifact.media_type)
+    if expected_format is None:
+        return "unsupported_inference_media_type"
+    try:
+        artifact.content.seek(0)
+        with Image.open(artifact.content) as image:
+            width, height = image.size
+            if (
+                width <= 0
+                or height <= 0
+                or width * height > MAX_SOURCE_ARTIFACT_IMAGE_PIXELS
+            ):
+                return "image_decompression_limit"
+            if image.format != expected_format:
+                return "image_encoding_mismatch"
+            image.verify()
+    except Image.DecompressionBombError:
+        return "image_decompression_limit"
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError):
+        return "invalid_image_structure"
     finally:
-        for artifact in downloaded:
-            artifact.content.close()
+        artifact.content.seek(0)
+    return None
 
 
 def extension_for_media_type(media_type: str) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
@@ -74,6 +75,7 @@ from memforge.models import (
     ContentItem,
     DocumentRecord,
     Memory,
+    MemoryExtractionResult,
     MemorySource,
     NormalizedContent,
     RawContent,
@@ -84,11 +86,20 @@ from memforge.models import (
     content_hash,
 )
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
+from memforge.pipeline.projection_context import ProjectionExtractionBatch
 from memforge.pipeline.source_projection_adapters import (
     project_source_item,
     project_source_unit_tombstone,
 )
 from memforge.source_projection import AnchorKind, SourceAnchor, SourceProjection
+from memforge.source_artifacts import StoredSourceArtifact
+from memforge.source_derivation import (
+    SourceUnitDerivationRequest,
+    SourceUnitDerivationContext,
+    SourceUnitDeriver,
+    safe_derivation_error,
+    source_derivation_manifest,
+)
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
 
@@ -154,6 +165,60 @@ def _projection(
         item=item,
         raw=raw,
         normalized=normalized,
+        prior_unit_revision=prior,
+        prior_observation_revisions=prior_observations,
+    )
+
+
+def _projection_with_artifact(
+    *,
+    run_id: str,
+    payload: bytes,
+    provider_revision: str,
+    inference_eligible: bool,
+    prior=None,
+    prior_observations=None,
+) -> SourceProjection:
+    item = ContentItem(
+        item_id="confluence-123",
+        title="Page",
+        source_url="https://example.test/123",
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        version=provider_revision,
+        extra={"page_id": "123", "space_key": "ENG"},
+    )
+    body = "# Page"
+    return project_source_item(
+        source_id="src-1",
+        source_type="confluence",
+        run_id=run_id,
+        item=item,
+        raw=RawContent(
+            item=item,
+            body=body.encode(),
+            content_type="text/html",
+        ),
+        normalized=NormalizedContent(item=item, markdown_body=body),
+        artifacts=(
+            StoredSourceArtifact(
+                id="artifact-diagram",
+                provider_key="attachment-1",
+                parent_observation_type="page_body",
+                parent_provider_key="123:body",
+                provider_revision=provider_revision,
+                filename="diagram.png",
+                media_type="image/png",
+                size_bytes=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                uri=f"artifact://diagram-{provider_revision}.png",
+                inference_eligible=inference_eligible,
+                inference_ineligible_reason=(
+                    None
+                    if inference_eligible
+                    else "invalid_image_structure"
+                ),
+            ),
+        ),
         prior_unit_revision=prior,
         prior_observation_revisions=prior_observations,
     )
@@ -272,6 +337,117 @@ class _UnexpectedReconciliationClient:
     async def reconcile_memories(self, prompt: str, **kwargs):
         del prompt, kwargs
         raise AssertionError("proven-disjoint incumbent must not require LLM reconciliation")
+
+
+@pytest.mark.asyncio
+async def test_inference_ineligible_artifact_revision_preserves_incumbent_support(
+    db: Database,
+) -> None:
+    first = _projection_with_artifact(
+        run_id="projection-artifact-valid",
+        payload=b"valid-image-revision",
+        provider_revision="1",
+        inference_eligible=True,
+    )
+    artifact_observation_id = next(
+        observation.id
+        for observation in first.observations
+        if observation.observation_type == "binary_artifact"
+    )
+    page_observation_id = next(
+        observation.id
+        for observation in first.observations
+        if observation.observation_type == "page_body"
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+    await engine.apply_projected_lifecycle(
+        projection=first,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content=(
+                    "The architecture diagram establishes that A7 remains enabled."
+                ),
+                memory_type="decision",
+                evidence_quote="# Page",
+                evidence_anchor="projection_batch",
+                source_observation_id=page_observation_id,
+                required_source_observation_ids=(
+                    artifact_observation_id,
+                ),
+            )
+        ],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="# Page",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    [incumbent] = await db.list_memories()
+    previous_support = (
+        await db.get_active_memory_support_reference_ids(incumbent.id)
+    )
+    observation_ids = (
+        await db.get_active_memory_support_observation_ids_many(
+            (incumbent.id,),
+            source_id="src-1",
+        )
+    )
+    assert artifact_observation_id in observation_ids[incumbent.id]
+    assert page_observation_id in observation_ids[incumbent.id]
+
+    second = _projection_with_artifact(
+        run_id="projection-artifact-invalid",
+        payload=b"invalid-image-revision",
+        provider_revision="2",
+        inference_eligible=False,
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    protected_engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_UnexpectedReconciliationClient(),
+    )
+    stats = await protected_engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="# Page",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        protected_source_observation_ids=(artifact_observation_id,),
+    )
+
+    current = await db.get_memory(incumbent.id)
+    current_support = (
+        await db.get_active_memory_support_reference_ids(incumbent.id)
+    )
+    assert current is not None and current.status == "active"
+    assert stats["pending_review"] == 1
+    assert current_support == previous_support
+    assert second.source_unit_revisions[0].id == (
+        await db.get_current_source_unit_revision(
+            second.source_units[0].id
+        )
+    ).id
 
 
 class _RecordingAddClient:
@@ -836,6 +1012,365 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
 
 
 @pytest.mark.asyncio
+async def test_atomic_projection_lifecycle_commits_document_and_derivation(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-derivation-atomic-1",
+        body="A7 is removed.",
+    )
+    await db.record_source_projection(first)
+    second = _projection(
+        run_id="projection-derivation-atomic-2",
+        body="A7 remains removed.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    original_document = await db.get_document("confluence-123")
+    assert original_document is not None
+    staged_document = replace(
+        original_document,
+        title="Atomically updated page",
+        content_hash=content_hash("A7 remains removed."),
+    )
+    context = SourceUnitDerivationContext(
+        document=staged_document,
+        doc_type="confluence",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="A7 remains removed.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=None,
+        user_id=None,
+        source_activity_epoch=None,
+    )
+    attempt = await db.stage_source_derivation(
+        source_derivation_manifest(
+            second,
+            (),
+            context=context,
+        )
+    )
+    assert attempt.context.document == staged_document
+    delta = second.deltas[0]
+    scope = ReconciliationScope(
+        id="scope-derivation-atomic",
+        source_id="src-1",
+        source_unit_id=delta.source_unit_id,
+        base_unit_revision_id=delta.previous_unit_revision_id,
+        target_unit_revision_id=delta.current_unit_revision_id,
+    )
+    plan = build_lifecycle_plan(
+        plan_id="plan-derivation-atomic",
+        scope=scope,
+        gate_state=LifecycleGateState.GATED,
+        operations=(),
+        incumbents={},
+        source_support_reference_ids={},
+        all_active_support_reference_ids={},
+        support_set_hashes={},
+        observation_revision_ids=tuple(
+            revision.id for revision in second.observation_revisions
+        ),
+        new_evidence_reference_ids=(),
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+            doc_id="confluence-123",
+            source_type="confluence",
+            access_context_hash="workspace-eng",
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="projection identity mismatch",
+    ):
+        await db.apply_source_projection_lifecycle(
+            replace(second, source_type="jira"),
+            plan,
+            document=staged_document,
+            derivation_id=attempt.id,
+            derivation_context_identity_hash=(
+                attempt.context_identity_hash
+            ),
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="context identity mismatch",
+    ):
+        await db.apply_source_projection_lifecycle(
+            second,
+            plan,
+            document=staged_document,
+            derivation_id=attempt.id,
+            derivation_context_identity_hash="wrong-context",
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="Document identity mismatch",
+    ):
+        await db.apply_source_projection_lifecycle(
+            second,
+            plan,
+            document=replace(staged_document, title="Unstaged title"),
+            derivation_id=attempt.id,
+            derivation_context_identity_hash=(
+                attempt.context_identity_hash
+            ),
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="requires its staged Document",
+    ):
+        await db.apply_source_projection_lifecycle(
+            second,
+            plan,
+            derivation_id=attempt.id,
+        )
+
+    await db.apply_source_projection_lifecycle(
+        second,
+        plan,
+        document=staged_document,
+        derivation_id=attempt.id,
+        derivation_context_identity_hash=(
+            attempt.context_identity_hash
+        ),
+    )
+
+    committed_document = await db.get_document("confluence-123")
+    [committed_attempt] = await db.list_source_derivation_attempts(
+        source_id="src-1"
+    )
+    current_unit = await db.get_current_source_unit_revision(
+        second.source_units[0].id
+    )
+    assert committed_document is not None
+    assert committed_document.title == "Atomically updated page"
+    assert current_unit is not None
+    assert current_unit.id == second.source_unit_revisions[0].id
+    assert committed_attempt.status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_source_deriver_persists_completed_batch_before_later_worker_failure(
+    db: Database,
+) -> None:
+    projection = _projection(
+        run_id="projection-durable-batch-progress",
+        body="A7 remains removed.",
+    )
+    document = await db.get_document("confluence-123")
+    assert document is not None
+    observation_ids = tuple(
+        observation.id for observation in projection.observations
+    )
+    batches = (
+        ProjectionExtractionBatch(
+            id="batch-first",
+            source_unit_id=projection.source_units[0].id,
+            primary_image_bytes=0,
+            primary_observation_ids=(observation_ids[0],),
+            primary_content_by_observation_id=(
+                (observation_ids[0], "first"),
+            ),
+            context_observation_ids=(),
+            context_observation_ids_by_primary=(
+                (observation_ids[0], ()),
+            ),
+            primary_markdown="first",
+            context_markdown="",
+        ),
+        ProjectionExtractionBatch(
+            id="batch-second",
+            source_unit_id=projection.source_units[0].id,
+            primary_image_bytes=0,
+            primary_observation_ids=(observation_ids[-1],),
+            primary_content_by_observation_id=(
+                (observation_ids[-1], "second"),
+            ),
+            context_observation_ids=(),
+            context_observation_ids_by_primary=(
+                (observation_ids[-1], ()),
+            ),
+            primary_markdown="second",
+            context_markdown="",
+        ),
+    )
+
+    async def extract(batch):
+        if batch.id == "batch-second":
+            raise RuntimeError("worker interrupted")
+        return MemoryExtractionResult()
+
+    with pytest.raises(RuntimeError, match="worker interrupted"):
+        await SourceUnitDeriver(
+            db,
+            plan_batches=lambda _projection: batches,
+        ).derive(
+            SourceUnitDerivationRequest(
+                projection=projection,
+                context=SourceUnitDerivationContext(
+                    document=document,
+                    doc_type="confluence",
+                    project_key="ENG",
+                    repo_identifier=None,
+                    document_content="A7 remains removed.",
+                    update_mode="full_document",
+                    changed_hunks=None,
+                    update_plan_stats=None,
+                    source_updated_at=None,
+                    user_id=None,
+                    source_activity_epoch=None,
+                ),
+                extract_batch=extract,
+                max_concurrent=1,
+            )
+        )
+
+    [attempt] = await db.list_source_derivation_attempts(
+        source_id="src-1"
+    )
+    assert {
+        batch.batch_id: batch.status for batch in attempt.batches
+    } == {
+        "batch-first": "completed",
+        "batch-second": "pending",
+    }
+
+
+@pytest.mark.asyncio
+async def test_source_derivation_separates_exact_payload_hash_from_stable_identity(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-identity-first",
+        body="A7 remains removed.",
+    )
+    second = replace(
+        first,
+        run_id="projection-identity-retry",
+        checkpoint={"cursor": "later-operational-cursor"},
+        observation_revisions=tuple(
+            replace(
+                revision,
+                observed_at="2026-07-27T12:00:00+00:00",
+            )
+            for revision in first.observation_revisions
+        ),
+        source_unit_revisions=tuple(
+            replace(
+                revision,
+                observed_at="2026-07-27T12:00:00+00:00",
+            )
+            for revision in first.source_unit_revisions
+        ),
+    )
+    document = await db.get_document("confluence-123")
+    assert document is not None
+    context = SourceUnitDerivationContext(
+        document=document,
+        doc_type="confluence",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="A7 remains removed.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=None,
+        user_id=None,
+        source_activity_epoch=None,
+    )
+    first_manifest = source_derivation_manifest(
+        first,
+        (),
+        context=context,
+    )
+    second_manifest = source_derivation_manifest(
+        second,
+        (),
+        context=context,
+    )
+
+    assert first_manifest.id == second_manifest.id
+    assert (
+        first_manifest.projection_identity_hash
+        == second_manifest.projection_identity_hash
+    )
+    assert (
+        first_manifest.projection_payload_hash
+        != second_manifest.projection_payload_hash
+    )
+    assert first_manifest.projection_payload_hash == hashlib.sha256(
+        json.dumps(
+            first_manifest.projection_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    first_attempt = await db.stage_source_derivation(first_manifest)
+    retry_attempt = await db.stage_source_derivation(second_manifest)
+    next_epoch_manifest = source_derivation_manifest(
+        second,
+        (),
+        context=replace(context, source_activity_epoch=2),
+    )
+    next_epoch_attempt = await db.stage_source_derivation(
+        next_epoch_manifest
+    )
+
+    assert retry_attempt.id == first_attempt.id
+    assert (
+        retry_attempt.projection_payload_hash
+        == first_manifest.projection_payload_hash
+    )
+    assert retry_attempt.projection.run_id == first.run_id
+    assert next_epoch_attempt.id != first_attempt.id
+    assert next_epoch_attempt.target_unit_revision_id == (
+        first_attempt.target_unit_revision_id
+    )
+    assert next_epoch_attempt.context.source_activity_epoch == 2
+
+
+def test_source_derivation_diagnostics_reject_content_and_bound_field_count() -> None:
+    error_type, error_code, fields = safe_derivation_error(
+        MemoryExtractionResult(
+            error_type="structured_llm_error",
+            metadata={
+                "safe_error_code": "secret response content",
+                "safe_validation_fields": [
+                    {
+                        "location": f"memories.{index}.memory_type",
+                        "type": "literal_error",
+                    }
+                    for index in range(40)
+                ],
+            },
+        )
+    )
+
+    assert error_type == "structured_llm_error"
+    assert error_code is None
+    assert len(fields) == 32
+    assert fields[0] == (
+        "memories.0.memory_type",
+        "literal_error",
+    )
+
+
+@pytest.mark.asyncio
 async def test_noop_without_current_evidence_rolls_back_stale_support(db: Database) -> None:
     first = _projection(run_id="projection-stale-1", body="A7 is removed.")
     await db.record_source_projection(first)
@@ -844,6 +1379,8 @@ async def test_noop_without_current_evidence_rolls_back_stale_support(db: Databa
     assert incumbent is not None
     await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    original_document = await db.get_document("confluence-123")
+    assert original_document is not None
     second = _projection(
         run_id="projection-stale-2",
         body="A7 is retained.",
@@ -885,14 +1422,53 @@ async def test_noop_without_current_evidence_rolls_back_stale_support(db: Databa
             access_context_hash="workspace-eng",
         ),
     )
+    staged_document = replace(
+        original_document,
+        title="Must roll back",
+        content_hash=content_hash("A7 is retained."),
+    )
+    attempt = await db.stage_source_derivation(
+        source_derivation_manifest(
+            second,
+            (),
+            context=SourceUnitDerivationContext(
+                document=staged_document,
+                doc_type="confluence",
+                project_key="ENG",
+                repo_identifier=None,
+                document_content="A7 is retained.",
+                update_mode="full_document",
+                changed_hunks=None,
+                update_plan_stats=None,
+                source_updated_at=None,
+                user_id=None,
+                source_activity_epoch=None,
+            ),
+        )
+    )
 
     with pytest.raises(ValueError, match="stale or ambiguous source support"):
-        await db.apply_source_projection_lifecycle(second, plan)
+        await db.apply_source_projection_lifecycle(
+            second,
+            plan,
+            document=staged_document,
+            derivation_id=attempt.id,
+            derivation_context_identity_hash=(
+                attempt.context_identity_hash
+            ),
+        )
 
     current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
     assert current_unit is not None
     assert current_unit.id == first.source_unit_revisions[0].id
     assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+    assert (await db.get_document("confluence-123")).title == (
+        original_document.title
+    )
+    [rolled_back_attempt] = await db.list_source_derivation_attempts(
+        source_id="src-1"
+    )
+    assert rolled_back_attempt.status == "completed"
 
 
 @pytest.mark.asyncio

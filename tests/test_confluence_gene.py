@@ -8,7 +8,7 @@ import pytest
 
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
 from memforge.models import ContentItem
-from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
+from memforge.source_artifacts import RawSourceArtifact
 
 
 def test_confluence_schema_hides_runtime_transport_fields_from_ui():
@@ -476,7 +476,7 @@ async def test_fetch_does_not_count_unsupported_confluence_attachments_against_i
 
 
 @pytest.mark.asyncio
-async def test_confluence_attachment_descriptor_scan_is_bounded_before_download():
+async def test_confluence_attachment_inventory_is_not_rejected_by_descriptor_count():
     gene = ConfluenceGene(
         config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
         source_id="src-confluence",
@@ -501,8 +501,10 @@ async def test_confluence_attachment_descriptor_scan_is_bounded_before_download(
         "_links": {},
     }
 
-    with pytest.raises(SourceArtifactContractError, match="descriptor scan limit"):
-        await gene._fetch_source_artifacts("123", first_page=first_page)
+    assert await gene._fetch_source_artifacts(
+        "123",
+        first_page=first_page,
+    ) == ()
 
 
 @pytest.mark.asyncio

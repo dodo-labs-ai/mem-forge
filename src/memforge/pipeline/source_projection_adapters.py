@@ -281,6 +281,9 @@ def project_source_item(
                     "sha256": artifact.sha256,
                     "uri": artifact.uri,
                     "inference_eligible": artifact.inference_eligible,
+                    "inference_ineligible_reason": (
+                        artifact.inference_ineligible_reason
+                    ),
                     "parent_observation_id": _stable_id(
                         "obs",
                         unit_id,

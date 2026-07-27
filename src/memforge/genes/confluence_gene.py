@@ -36,8 +36,6 @@ from memforge.models import (
 )
 from memforge.pipeline.normalizer_utils import html_to_markdown, strip_boilerplate
 from memforge.source_artifacts import (
-    MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
-    MAX_SOURCE_ARTIFACTS_PER_UNIT,
     RawSourceArtifact,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
     SourceArtifactContractError,
@@ -576,19 +574,14 @@ class ConfluenceGene(Gene):
         *,
         first_page: dict,
     ) -> tuple[RawSourceArtifact, ...]:
-        """Return bounded provider attachment descriptors."""
+        """Enumerate the complete provider attachment inventory."""
 
         descriptors: list[dict] = []
-        descriptor_count = 0
+        seen_next_links: set[str] = set()
         start = 0
         payload = first_page
         while True:
             results = self._validated_attachment_results(payload, expected_start=start)
-            descriptor_count += len(results)
-            if descriptor_count > MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT:
-                raise SourceArtifactContractError(
-                    "Confluence page exceeds the Source Artifact descriptor scan limit"
-                )
             descriptors.extend(
                 descriptor
                 for descriptor in results
@@ -601,12 +594,14 @@ class ConfluenceGene(Gene):
                 )
                 in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES
             )
-            if len(descriptors) > MAX_SOURCE_ARTIFACTS_PER_UNIT:
-                raise SourceArtifactContractError(
-                    f"Confluence page exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} supported Artifact limit"
-                )
             if not self._has_next_page(payload):
                 break
+            next_link = str(payload["_links"]["next"]).strip()
+            if next_link in seen_next_links:
+                raise SourceArtifactContractError(
+                    "Confluence attachment pagination contains a cursor cycle"
+                )
+            seen_next_links.add(next_link)
             start += len(results)
             response = await self._get(
                 f"{self._api_prefix}/rest/api/content/{page_id}/child/attachment",
