@@ -56,6 +56,7 @@ from memforge.pipeline.sync import (
     ExtractionWorkPool,
     GeneSyncOrchestrator,
     SourceSyncMode,
+    _aggregate_extraction_metrics,
     summarize_failed_documents,
 )
 from memforge.runtime import SourceLifecycleMaintenanceError, SyncService
@@ -83,6 +84,21 @@ async def db(tmp_path):
 
 async def _skip_retry_delay(_delay: float) -> None:
     """Preserve retry attempts without turning contract tests into wall-clock tests."""
+
+
+def test_projection_fanout_aggregates_discarded_orphan_summary_metric() -> None:
+    metrics = _aggregate_extraction_metrics(
+        [
+            MemoryExtractionResult(
+                metadata={"discarded_orphan_artifact_summary_count": 1}
+            ),
+            MemoryExtractionResult(
+                metadata={"discarded_orphan_artifact_summary_count": 2}
+            ),
+        ]
+    )
+
+    assert metrics["discarded_orphan_artifact_summary_count"] == 3
 
 
 @pytest.mark.asyncio

@@ -199,13 +199,6 @@ class MemoryExtractionResponse(StructuredResponseModel):
     memories: list[MemoryCandidate]
     artifact_summaries: list[ArtifactSelectionSummary] = Field(default_factory=list)
 
-    @model_validator(mode="after")
-    def _artifact_summary_ids_are_unique(self) -> MemoryExtractionResponse:
-        ids = [item.source_observation_id for item in self.artifact_summaries]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Artifact summary Observation ids must be unique")
-        return self
-
 
 class CandidateLedgerDecision(StructuredResponseModel):
     """One uniqueness decision for a transient extracted candidate."""

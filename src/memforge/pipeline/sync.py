@@ -128,6 +128,7 @@ def _aggregate_extraction_metrics(
         "input_binary_bytes",
         "multimodal_calls",
         "artifact_summary_count",
+        "discarded_orphan_artifact_summary_count",
     )
     aggregated = {key: sum(int((result.metadata or {}).get(key, 0) or 0) for result in results) for key in keys}
     aggregated["max_active_multimodal"] = max(

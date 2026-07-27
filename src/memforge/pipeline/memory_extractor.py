@@ -490,10 +490,17 @@ class MemoryExtractor:
                 )
                 for item in response.artifact_summaries
             )
+            discarded_orphan_summary_count = 0
+            if not supplied_image_ids:
+                discarded_orphan_summary_count = len(returned_summaries)
+                returned_summaries = ()
             returned_summary_ids = tuple(
                 item.source_observation_id for item in returned_summaries
             )
-            if set(returned_summary_ids) != set(supplied_image_ids):
+            if (
+                len(returned_summary_ids) != len(supplied_image_ids)
+                or set(returned_summary_ids) != set(supplied_image_ids)
+            ):
                 raise StructuredLlmError(
                     "structured LLM Artifact summaries do not match the supplied images",
                     error_code="invalid_artifact_summary_contract",
@@ -521,6 +528,9 @@ class MemoryExtractor:
                 metadata={
                     **metrics,
                     "artifact_summary_count": len(returned_summaries),
+                    "discarded_orphan_artifact_summary_count": (
+                        discarded_orphan_summary_count
+                    ),
                     "structured_llm_elapsed_ms": max(
                         0, round((perf_counter() - started) * 1000)
                     ),

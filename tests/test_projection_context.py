@@ -477,6 +477,94 @@ async def test_projection_batch_extractor_rejects_missing_or_unknown_artifact_su
     assert unknown.metadata["structured_llm_calls"] == 1
 
 
+@pytest.mark.asyncio
+async def test_projection_batch_extractor_discards_orphan_summaries_without_images() -> None:
+    projection = _jira_projection(1)
+    batch = plan_projection_extraction_batches(projection)[0]
+    source_observation_id, primary_content = batch.primary_content_by_observation_id[0]
+    evidence_quote = primary_content.strip()
+
+    class Client:
+        async def extract_memories(self, prompt: str, **kwargs):
+            del prompt
+            assert "images" not in kwargs
+            return MemoryExtractionResponse(
+                memories=[
+                    MemoryCandidate(
+                        content="The primary text states a durable rule.",
+                        memory_type="fact",
+                        evidence_quote=evidence_quote,
+                        source_observation_id=source_observation_id,
+                    )
+                ],
+                artifact_summaries=[
+                    ArtifactSelectionSummary(
+                        source_observation_id="obs-invented",
+                        summary="First model-invented image selection hint.",
+                    ),
+                    ArtifactSelectionSummary(
+                        source_observation_id="obs-invented",
+                        summary="Duplicate model-invented image selection hint.",
+                    ),
+                ],
+            )
+
+    result = await MemoryExtractor(
+        structured_llm_client=Client()
+    ).extract_projection_batch_memories(
+        batch,
+        source_type="teams",
+    )
+
+    assert result.error_type is None
+    assert [item.content for item in result.memories] == [
+        "The primary text states a durable rule."
+    ]
+    assert result.artifact_summaries == ()
+    assert result.metadata["artifact_summary_count"] == 0
+    assert result.metadata["discarded_orphan_artifact_summary_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_projection_batch_extractor_rejects_duplicate_summary_for_supplied_image() -> None:
+    projection = _jira_projection(1)
+    batch = plan_projection_extraction_batches(projection)[0]
+    visual_observation_id = batch.primary_observation_ids[-1]
+    image = StructuredLlmImage(
+        source_observation_id=visual_observation_id,
+        media_type="image/png",
+        body=b"\x89PNG",
+    )
+
+    class Client:
+        async def extract_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return MemoryExtractionResponse(
+                memories=[],
+                artifact_summaries=[
+                    ArtifactSelectionSummary(
+                        source_observation_id=visual_observation_id,
+                        summary="First bounded image selection hint.",
+                    ),
+                    ArtifactSelectionSummary(
+                        source_observation_id=visual_observation_id,
+                        summary="Duplicate bounded image selection hint.",
+                    ),
+                ],
+            )
+
+    result = await MemoryExtractor(
+        structured_llm_client=Client()
+    ).extract_projection_batch_memories(
+        batch,
+        source_type="jira",
+        images=(image,),
+    )
+
+    assert result.error_type == "structured_llm_error"
+    assert result.metadata["structured_llm_calls"] == 1
+
+
 def test_source_projection_attaches_summary_only_to_exact_image_revision() -> None:
     projection = _confluence_projection_with_images(1)
     artifact_observation = next(
