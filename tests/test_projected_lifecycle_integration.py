@@ -12,11 +12,13 @@ import pytest_asyncio
 from memforge.llm.structured import (
     CandidateLedgerDecision,
     CandidateLedgerResponse,
+    CandidateRelationDecision,
+    CandidateRelationResponse,
+    IncumbentSupportAuditDecision,
+    IncumbentSupportAuditResponse,
     MemoryRelationDecision,
     MemoryRelationResponse,
     MemorySupportValidationResponse,
-    ReconciliationDecision,
-    ReconciliationResponse,
 )
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
@@ -281,21 +283,53 @@ def _jira_projection(
     )
 
 
+def _candidate_response(
+    *decisions: CandidateRelationDecision | None,
+) -> CandidateRelationResponse:
+    return CandidateRelationResponse.model_validate(
+        {
+            f"slot_{index:02d}": (
+                decisions[index] if index < len(decisions) else None
+            )
+            for index in range(24)
+        }
+    )
+
+
+def _audit_response(
+    *decisions: IncumbentSupportAuditDecision | None,
+) -> IncumbentSupportAuditResponse:
+    return IncumbentSupportAuditResponse.model_validate(
+        {
+            f"slot_{index:02d}": (
+                decisions[index] if index < len(decisions) else None
+            )
+            for index in range(30)
+        }
+    )
+
+
 class _ReplacementClient:
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
 
-    async def reconcile_memories(self, prompt: str, **kwargs):
+    async def reconcile_candidate_relations(self, prompt: str, **kwargs):
         del prompt, kwargs
-        return ReconciliationResponse(
-            decisions=[
-                ReconciliationDecision(
-                    index=0,
-                    action="SUPERSEDE",
-                    memory_id=self.incumbent_id,
-                    reason="The source now retains A7.",
-                )
-            ]
+        return _candidate_response(
+            CandidateRelationDecision(
+                action="SUPERSEDE",
+                incumbent_slot=0,
+                reason="The source now retains A7.",
+            )
+        )
+
+    async def audit_incumbent_support(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return _audit_response(
+            IncumbentSupportAuditDecision(
+                action="DELETE",
+                reason="The old claim is replaced.",
+            )
         )
 
 
@@ -303,16 +337,13 @@ class _NoopClient:
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
 
-    async def reconcile_memories(self, prompt: str, **kwargs):
+    async def audit_incumbent_support(self, prompt: str, **kwargs):
         del prompt, kwargs
-        return ReconciliationResponse(
-            decisions=[
-                ReconciliationDecision(
-                    action="NOOP",
-                    memory_id=self.incumbent_id,
-                    reason="The exact claim remains in the revised page.",
-                )
-            ]
+        return _audit_response(
+            IncumbentSupportAuditDecision(
+                action="NOOP",
+                reason="The exact claim remains in the revised page.",
+            )
         )
 
 
@@ -320,21 +351,22 @@ class _DeleteClient:
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
 
-    async def reconcile_memories(self, prompt: str, **kwargs):
+    async def audit_incumbent_support(self, prompt: str, **kwargs):
         del prompt, kwargs
-        return ReconciliationResponse(
-            decisions=[
-                ReconciliationDecision(
-                    action="DELETE",
-                    memory_id=self.incumbent_id,
-                    reason="The incomplete rendering appears to omit the claim.",
-                )
-            ]
+        return _audit_response(
+            IncumbentSupportAuditDecision(
+                action="DELETE",
+                reason="The incomplete rendering appears to omit the claim.",
+            )
         )
 
 
 class _UnexpectedReconciliationClient:
-    async def reconcile_memories(self, prompt: str, **kwargs):
+    async def reconcile_candidate_relations(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        raise AssertionError("proven-disjoint incumbent must not require LLM reconciliation")
+
+    async def audit_incumbent_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         raise AssertionError("proven-disjoint incumbent must not require LLM reconciliation")
 
@@ -455,42 +487,34 @@ class _RecordingAddClient:
         self.incumbent_id = incumbent_id
         self.prompts: list[str] = []
 
-    async def reconcile_memories(self, prompt: str, **kwargs):
+    async def reconcile_candidate_relations(self, prompt: str, **kwargs):
         del kwargs
         self.prompts.append(prompt)
-        return ReconciliationResponse(
-            decisions=[
-                ReconciliationDecision(
-                    index=0,
-                    action="ADD",
-                    reason="The changed observation states a separate durable claim.",
-                ),
-                ReconciliationDecision(
-                    action="NOOP",
-                    memory_id=self.incumbent_id,
-                    reason="The unchanged incumbent remains supported.",
-                ),
-            ]
+        return _candidate_response(
+            CandidateRelationDecision(
+                action="ADD",
+                reason="The changed observation states a separate durable claim.",
+            )
         )
 
+    async def audit_incumbent_support(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return _audit_response(
+            IncumbentSupportAuditDecision(
+                action="NOOP",
+                reason="The unchanged incumbent remains supported.",
+            )
+        )
 
-class _PersistentlyIndexlessReplacementClient:
+class _PersistentlyIncompleteAuditClient:
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
         self.calls = 0
 
-    async def reconcile_memories(self, prompt: str, **kwargs):
+    async def audit_incumbent_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         self.calls += 1
-        return ReconciliationResponse(
-            decisions=[
-                ReconciliationDecision(
-                    action="SUPERSEDE",
-                    memory_id=self.incumbent_id,
-                    reason="The incumbent appears stale but no replacement candidate was selected.",
-                )
-            ]
-        )
+        return _audit_response()
 
 
 class _OutboxDrainer:
@@ -796,9 +820,15 @@ class _SemanticEquivalentClient:
     def __init__(self) -> None:
         self.relation_calls = 0
 
-    async def reconcile_memories(self, prompt: str, **kwargs):
+    async def reconcile_candidate_relations(self, prompt: str, **kwargs):
         del prompt, kwargs
-        return ReconciliationResponse(decisions=[ReconciliationDecision(action="ADD", index=0)])
+        return _candidate_response(CandidateRelationDecision(action="ADD"))
+
+    async def audit_incumbent_support(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return _audit_response(
+            IncumbentSupportAuditDecision(action="NOOP", reason="still supported")
+        )
 
     async def classify_memory_relations(self, prompt: str, **kwargs):
         del kwargs
@@ -2323,7 +2353,7 @@ async def test_incremental_noop_invalidated_primary_creates_review(
 
 
 @pytest.mark.asyncio
-async def test_persistent_indexless_replacement_creates_review_without_mutating_incumbent(
+async def test_persistent_incomplete_incumbent_audit_fails_closed_without_mutating_incumbent(
     db: Database,
 ) -> None:
     first = _projection(
@@ -2339,7 +2369,7 @@ async def test_persistent_indexless_replacement_creates_review_without_mutating_
         prior=first.source_unit_revisions[0],
         prior_observations={first.observations[0].id: first.observation_revisions[0]},
     )
-    client = _PersistentlyIndexlessReplacementClient(incumbent.id)
+    client = _PersistentlyIncompleteAuditClient(incumbent.id)
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
@@ -2348,28 +2378,30 @@ async def test_persistent_indexless_replacement_creates_review_without_mutating_
         structured_llm_client=client,
     )
 
-    stats = await engine.apply_projected_lifecycle(
-        projection=second,
-        doc_id="confluence-123",
-        raw_memories=[],
-        doc_type="design-doc",
-        project_key="ENG",
-        repo_identifier=None,
-        document_content=second.observation_revisions[0].content,
-        update_mode="diff_guided",
-        changed_hunks="removed -> retained",
-        update_plan_stats=None,
-        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
-    )
+    with pytest.raises(
+        RuntimeError,
+        match="incumbent audit slot 0 must not be null",
+    ):
+        await engine.apply_projected_lifecycle(
+            projection=second,
+            doc_id="confluence-123",
+            raw_memories=[],
+            doc_type="design-doc",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content=second.observation_revisions[0].content,
+            update_mode="diff_guided",
+            changed_hunks="removed -> retained",
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+        )
 
     assert client.calls == 2
-    assert stats["pending_review"] == 1
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
     assert await db.get_active_memory_support_reference_ids(incumbent.id)
     reviews = await db.list_lifecycle_reviews("src-1")
-    assert len(reviews) == 1
-    assert reviews[0].incumbent_memory_id == incumbent.id
+    assert reviews == []
 
 
 @pytest.mark.asyncio
@@ -2642,8 +2674,8 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
     assert sample["reconciliation_incumbent_count"] == 1
     assert sample["reconciliation_model_incumbent_count"] == 1
     assert sample["reconciliation_disjoint_keep_count"] == 0
-    assert sample["reconciliation_llm_batch_count"] == 1
-    assert sample["reconciliation_llm_call_count"] == 1
+    assert sample["reconciliation_llm_batch_count"] == 2
+    assert sample["reconciliation_llm_call_count"] == 2
     assert len(client.prompts) == 1
     assert incumbent.content in client.prompts[0]
 

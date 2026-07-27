@@ -27,7 +27,6 @@ from memforge.llm.structured import (
     MemoryRelationResponse,
     MemorySupportValidationResponse,
     ProjectionMemoryExtractionResponse,
-    ReconciliationResponse,
     RerankResponse,
     SourceSupportDecision,
     SourceSupportResponse,
@@ -778,13 +777,11 @@ async def test_litellm_structured_client_repairs_invalid_json_backslash_escapes(
     [
         (
             "Looking at the updated document, this memory should be removed.\n"
-            '{"decisions":[{"action":"DELETE","memory_id":"mem-1",'
-            '"reason":"unsupported","flag_for_review":false}]}'
+            '{"supported":true,"reason":"still entailed"}'
         ),
         (
             "Here is the corrected ledger:\n```json\n"
-            '{"decisions":[{"action":"DELETE","memory_id":"mem-1",'
-            '"reason":"unsupported","flag_for_review":false}]}\n```'
+            '{"supported":true,"reason":"still entailed"}\n```'
         ),
     ],
 )
@@ -810,10 +807,9 @@ async def test_litellm_structured_client_accepts_one_schema_valid_json_object_wi
         )
     )
 
-    response = await client.reconcile_memories("prompt")
+    response = await client.validate_memory_support("prompt")
 
-    assert response.decisions[0].action == "DELETE"
-    assert response.decisions[0].memory_id == "mem-1"
+    assert response.supported is True
     assert len(calls) == 1
     assert any("recovered exactly one schema-valid JSON object" in record.message for record in caplog.records)
 
@@ -821,7 +817,7 @@ async def test_litellm_structured_client_accepts_one_schema_valid_json_object_wi
 @pytest.mark.asyncio
 async def test_litellm_structured_client_rejects_ambiguous_schema_valid_json_objects(monkeypatch):
     calls = []
-    decision = '{"decisions":[{"action":"DELETE","memory_id":"mem-1","reason":"unsupported","flag_for_review":false}]}'
+    decision = '{"supported":true,"reason":"still entailed"}'
 
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
@@ -839,7 +835,7 @@ async def test_litellm_structured_client_rejects_ambiguous_schema_valid_json_obj
     )
 
     with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
-        await client.reconcile_memories("prompt")
+        await client.validate_memory_support("prompt")
     assert len(calls) == 2
     assert raised.value.error_code == "ValueError"
 
@@ -887,12 +883,32 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         schema = kwargs["response_format"]
-        if schema is ReconciliationResponse:
-            return CompletionResponse('{"decisions":[{"action":"ADD","index":0,"reason":"new"}]}')
         if schema is CandidateRelationResponse:
-            return CompletionResponse('{"decisions":[{"action":"ADD","index":0,"reason":"new"}]}')
+            return CompletionResponse(
+                json.dumps(
+                    {
+                        f"slot_{index:02d}": (
+                            {"action": "ADD", "reason": "new"}
+                            if index == 0
+                            else None
+                        )
+                        for index in range(24)
+                    }
+                )
+            )
         if schema is IncumbentSupportAuditResponse:
-            return CompletionResponse('{"decisions":[{"action":"NOOP","memory_id":"mem-1","reason":"supported"}]}')
+            return CompletionResponse(
+                json.dumps(
+                    {
+                        f"slot_{index:02d}": (
+                            {"action": "NOOP", "reason": "supported"}
+                            if index == 0
+                            else None
+                        )
+                        for index in range(30)
+                    }
+                )
+            )
         if schema is CandidateLedgerResponse:
             return CompletionResponse(
                 json.dumps(
@@ -931,9 +947,12 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     assert (
         await client.select_memory_candidates("prompt")
     ).ordered_slots()[0].action == "KEEP"
-    assert (await client.reconcile_memories("prompt")).decisions[0].action == "ADD"
-    assert (await client.reconcile_candidate_relations("prompt")).decisions[0].index == 0
-    assert (await client.audit_incumbent_support("prompt")).decisions[0].memory_id == "mem-1"
+    assert (
+        await client.reconcile_candidate_relations("prompt")
+    ).ordered_slots()[0].action == "ADD"
+    assert (
+        await client.audit_incumbent_support("prompt")
+    ).ordered_slots()[0].action == "NOOP"
     assert (await client.classify_memory_relations("prompt")).decisions[0].direction == "challenger_to_candidate"
     assert (await client.validate_memory_support("prompt")).supported is True
     assert (await client.validate_entity_match("prompt")).matched_id == 7
@@ -941,7 +960,6 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
 
     assert [call["response_format"] for call in calls] == [
         CandidateLedgerResponse,
-        ReconciliationResponse,
         CandidateRelationResponse,
         IncumbentSupportAuditResponse,
         MemoryRelationResponse,
@@ -952,40 +970,39 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
 
 
 def test_composed_reconciliation_schemas_reject_cross_phase_decisions() -> None:
-    with pytest.raises(ValidationError):
-        CandidateRelationResponse.model_validate(
-            {
-                "decisions": [
-                    {
-                        "action": "NOOP",
-                        "memory_id": "mem-1",
-                        "reason": "unindexed incumbent audit row",
-                    }
-                ]
-            }
-        )
-
-    with pytest.raises(ValidationError):
-        IncumbentSupportAuditResponse.model_validate(
-            {
-                "decisions": [
-                    {
-                        "action": "ADD",
-                        "index": 0,
-                        "reason": "candidate row in incumbent audit",
-                    }
-                ]
-            }
-        )
-
-
-def test_candidate_ledger_schema_rejects_model_owned_candidate_index() -> None:
-    payload = {
+    candidate_payload = {
         f"slot_{index:02d}": (
-            {"index": 0, "action": "KEEP"} if index == 0 else None
+            {
+                "action": "NOOP",
+                "memory_id": "mem-1",
+                "reason": "model-owned datastore identity",
+            }
+            if index == 0
+            else None
         )
         for index in range(24)
     }
+    with pytest.raises(ValidationError):
+        CandidateRelationResponse.model_validate(candidate_payload)
+
+    audit_payload = {
+        f"slot_{index:02d}": (
+            {
+                "action": "ADD",
+                "index": 0,
+                "reason": "candidate row in incumbent audit",
+            }
+            if index == 0
+            else None
+        )
+        for index in range(30)
+    }
+    with pytest.raises(ValidationError):
+        IncumbentSupportAuditResponse.model_validate(audit_payload)
+
+
+def test_candidate_ledger_schema_rejects_model_owned_candidate_index() -> None:
+    payload = {f"slot_{index:02d}": ({"index": 0, "action": "KEEP"} if index == 0 else None) for index in range(24)}
 
     with pytest.raises(ValidationError):
         CandidateLedgerResponse.model_validate(payload)
