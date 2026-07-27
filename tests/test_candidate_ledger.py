@@ -41,9 +41,7 @@ async def test_candidate_ledger_retries_once_when_decision_coverage_is_incomplet
     first = _candidate("The trigger remained OPEN.", observation_id="obs-1")
     second = _candidate("The trigger was not processed.", observation_id="obs-2")
     client = _LedgerClient(
-        CandidateLedgerResponse(
-            decisions=[CandidateLedgerDecision(index=0, action="KEEP")]
-        ),
+        CandidateLedgerResponse(decisions=[CandidateLedgerDecision(index=0, action="KEEP")]),
         CandidateLedgerResponse(
             decisions=[
                 CandidateLedgerDecision(index=0, action="KEEP"),
@@ -73,9 +71,7 @@ async def test_candidate_ledger_fails_closed_after_second_incomplete_ledger():
         _candidate("The trigger remained OPEN.", observation_id="obs-1"),
         _candidate("The trigger was not processed.", observation_id="obs-2"),
     ]
-    incomplete = CandidateLedgerResponse(
-        decisions=[CandidateLedgerDecision(index=0, action="KEEP")]
-    )
+    incomplete = CandidateLedgerResponse(decisions=[CandidateLedgerDecision(index=0, action="KEEP")])
     client = _LedgerClient(incomplete, incomplete)
 
     with pytest.raises(CandidateLedgerError, match="complete candidate ledger") as exc_info:
@@ -128,10 +124,7 @@ async def test_candidate_ledger_does_not_exact_collapse_case_sensitive_identifie
 
 @pytest.mark.asyncio
 async def test_candidate_ledger_rejects_oversized_semantic_input_before_calling_llm():
-    candidates = [
-        _candidate(f"Durable fact number {index}.", observation_id=f"obs-{index}")
-        for index in range(3)
-    ]
+    candidates = [_candidate(f"Durable fact number {index}.", observation_id=f"obs-{index}") for index in range(3)]
     client = _LedgerClient()
 
     with pytest.raises(CandidateLedgerError, match="candidate count") as exc_info:
@@ -164,3 +157,102 @@ async def test_candidate_ledger_rejects_oversized_context_before_calling_llm():
 
     assert exc_info.value.error_type == "budget_exceeded"
     assert client.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_composes_bounded_decision_batches():
+    candidates = [
+        _candidate(
+            f"Durable candidate {index:02d} with distinct content.",
+            observation_id=f"obs-{index}",
+        )
+        for index in range(55)
+    ]
+    client = _LedgerClient(
+        *(
+            CandidateLedgerResponse(
+                decisions=[CandidateLedgerDecision(index=index, action="KEEP") for index in range(start, stop)]
+            )
+            for start, stop in ((0, 24), (24, 48), (48, 55))
+        )
+    )
+
+    result = await select_unique_memory_candidates(
+        candidates,
+        structured_llm_client=client,
+        llm_model=None,
+    )
+
+    assert result.candidates == tuple(candidates)
+    assert result.structured_llm_calls == 3
+    assert len(client.prompts) == 3
+    assert "<decision_indices>\n[0, 1, 2" in client.prompts[0]
+    assert "<decision_indices>\n[24, 25, 26" in client.prompts[1]
+    assert "<decision_indices>\n[48, 49, 50" in client.prompts[2]
+    assert '"index":54' in client.prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_normalizes_lower_index_canonical_chains():
+    longest = _candidate("A specific durable fact with details.", observation_id="obs-1")
+    middle = _candidate("A durable fact with details.", observation_id="obs-2")
+    shortest = _candidate("A durable fact.", observation_id="obs-3")
+    client = _LedgerClient(
+        CandidateLedgerResponse(
+            decisions=[
+                CandidateLedgerDecision(index=0, action="KEEP"),
+                CandidateLedgerDecision(
+                    index=1,
+                    action="DROP_REDUNDANT",
+                    canonical_index=0,
+                ),
+                CandidateLedgerDecision(
+                    index=2,
+                    action="DROP_REDUNDANT",
+                    canonical_index=1,
+                ),
+            ]
+        )
+    )
+
+    result = await select_unique_memory_candidates(
+        [shortest, longest, middle],
+        structured_llm_client=client,
+        llm_model=None,
+    )
+
+    assert result.candidates == (longest,)
+    assert {drop.canonical_candidate.content for drop in result.drops} == {longest.content}
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_normalizes_canonical_chain_across_batches():
+    candidates = [_candidate("X" * (100 - index), observation_id=f"obs-{index}") for index in range(26)]
+    first_batch = [CandidateLedgerDecision(index=index, action="KEEP") for index in range(24)]
+    first_batch[1] = CandidateLedgerDecision(
+        index=1,
+        action="DROP_REDUNDANT",
+        canonical_index=0,
+    )
+    client = _LedgerClient(
+        CandidateLedgerResponse(decisions=first_batch),
+        CandidateLedgerResponse(
+            decisions=[
+                CandidateLedgerDecision(
+                    index=24,
+                    action="DROP_REDUNDANT",
+                    canonical_index=1,
+                ),
+                CandidateLedgerDecision(index=25, action="KEEP"),
+            ]
+        ),
+    )
+
+    result = await select_unique_memory_candidates(
+        candidates,
+        structured_llm_client=client,
+        llm_model=None,
+    )
+
+    assert result.candidates == tuple(candidate for index, candidate in enumerate(candidates) if index not in {1, 24})
+    assert {drop.canonical_candidate.content for drop in result.drops} == {candidates[0].content}
