@@ -684,6 +684,76 @@ class TestMessageParsing:
         )
 
     @pytest.mark.asyncio
+    async def test_get_hosted_content_requires_graph_capability_before_network_request(
+        self,
+        monkeypatch,
+    ):
+        from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
+
+        monkeypatch.setattr(
+            TeamsAuthenticator,
+            "load_tokens",
+            staticmethod(
+                lambda: {
+                    CHAT_API_AUDIENCE: {
+                        "token": "chat-token",
+                        "expiresAt": 4_102_444_800,
+                    }
+                }
+            ),
+        )
+        client = _TeamsAPIClient(region="emea")
+        client._request_bytes = AsyncMock(
+            side_effect=AssertionError(
+                "hosted-content retrieval must not send a Chat token to Microsoft Graph"
+            )
+        )
+
+        with pytest.raises(
+            AuthenticationError,
+            match="requires Microsoft Graph access",
+        ):
+            await client.get_hosted_content(
+                conversation_id="19:chat@example",
+                message_id="message-1",
+                hosted_content_id="hosted-1",
+                conversation_type="group_chat",
+                team_id=None,
+            )
+
+        client._request_bytes.assert_not_awaited()
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_graph_only_resolution_requires_graph_capability(
+        self,
+        monkeypatch,
+    ):
+        from memforge.auth.teams_auth import CHAT_API_AUDIENCE, TeamsAuthenticator
+
+        monkeypatch.setattr(
+            TeamsAuthenticator,
+            "load_tokens",
+            staticmethod(
+                lambda: {
+                    CHAT_API_AUDIENCE: {
+                        "token": "chat-token",
+                        "expiresAt": 4_102_444_800,
+                    }
+                }
+            ),
+        )
+        client = _TeamsAPIClient(region="emea")
+
+        with pytest.raises(
+            AuthenticationError,
+            match="Team resolution requires Microsoft Graph access",
+        ):
+            await client.get_joined_teams()
+
+        await client.close()
+
+    @pytest.mark.asyncio
     async def test_request_bytes_stops_before_buffering_oversized_body(self):
         client = _TeamsAPIClient(region="emea")
         chunks_read = 0
