@@ -193,6 +193,34 @@ async def test_materialization_streams_exact_bytes_and_identity(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_materialization_does_not_read_stream_after_store_takes_ownership() -> None:
+    class ClosingStore:
+        def __init__(self) -> None:
+            self.body: bytes | None = None
+
+        def store_source_artifact(self, **kwargs) -> str:
+            content = kwargs["content"]
+            self.body = content.read()
+            content.close()
+            return "artifact://stored"
+
+    payload = _png_bytes()
+    store = ClosingStore()
+
+    (artifact,) = await materialize_source_artifacts(
+        source_id="source-a",
+        source_unit_key="page-1",
+        artifacts=(_artifact("image", payload),),
+        store=store,
+        open_artifact=_opener({"image": payload}),
+    )
+
+    assert store.body == payload
+    assert artifact.inference_eligible is True
+    assert artifact.uri == "artifact://stored"
+
+
+@pytest.mark.asyncio
 async def test_invalid_image_is_stored_but_excluded_from_inference(tmp_path) -> None:
     payload = b"\x89PNG\r\n\x1a\nnot-a-decodable-image"
 
