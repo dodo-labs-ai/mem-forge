@@ -13,8 +13,6 @@ from memforge.llm.structured import (
     CandidateRelationResponse,
     IncumbentSupportAuditDecision,
     IncumbentSupportAuditResponse,
-    ReconciliationDecision,
-    ReconciliationResponse,
     StructuredLlmError,
 )
 from memforge.models import Memory, RawMemory, ReconcileAction, content_hash
@@ -33,6 +31,32 @@ def _memory(mem_id: str, content: str, *, corroboration_count: int = 1) -> Memor
         created_at=now,
         updated_at=now,
         status="active",
+    )
+
+
+def _candidate_response(
+    *decisions: CandidateRelationDecision | None,
+) -> CandidateRelationResponse:
+    return CandidateRelationResponse.model_validate(
+        {
+            f"slot_{index:02d}": (
+                decisions[index] if index < len(decisions) else None
+            )
+            for index in range(24)
+        }
+    )
+
+
+def _audit_response(
+    *decisions: IncumbentSupportAuditDecision | None,
+) -> IncumbentSupportAuditResponse:
+    return IncumbentSupportAuditResponse.model_validate(
+        {
+            f"slot_{index:02d}": (
+                decisions[index] if index < len(decisions) else None
+            )
+            for index in range(30)
+        }
     )
 
 
@@ -113,7 +137,7 @@ def test_parse_decisions_can_remove_an_incumbent_without_a_new_candidate(index) 
 @pytest.mark.asyncio
 async def test_classifier_failure_with_incumbents_fails_closed() -> None:
     class FailingClient:
-        async def reconcile_memories(self, prompt: str, **kwargs):
+        async def reconcile_candidate_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
             raise StructuredLlmError("structured unavailable")
 
@@ -140,20 +164,24 @@ async def test_more_than_thirty_incumbents_use_bounded_batches_and_close_one_led
             self.offset = 0
             self.batch_sizes: list[int] = []
 
-        async def reconcile_memories(self, prompt: str, **kwargs):
-            del prompt, kwargs
-            batch = incumbents[self.offset : self.offset + 30]
+        async def audit_incumbent_support(self, prompt: str, **kwargs):
+            del kwargs
+            batch = json.loads(
+                re.search(
+                    r"<existing_memories>\n(.*?)\n</existing_memories>",
+                    prompt,
+                    re.DOTALL,
+                ).group(1)
+            )
             self.offset += len(batch)
             self.batch_sizes.append(len(batch))
-            return ReconciliationResponse(
-                decisions=[
-                    ReconciliationDecision(
-                        index=None,
+            return _audit_response(
+                *[
+                    IncumbentSupportAuditDecision(
                         action="NOOP",
-                        memory_id=memory.id,
                         reason="still supported",
                     )
-                    for memory in batch
+                    for _ in batch
                 ]
             )
 
@@ -204,14 +232,13 @@ async def test_many_new_candidates_compose_relation_cells_and_incumbent_audit() 
                 ).group(1)
             )
             self.candidate_batch_sizes.append(len(candidate_payload))
-            return CandidateRelationResponse(
-                decisions=[
+            return _candidate_response(
+                *[
                     CandidateRelationDecision(
-                        index=item["index"],
                         action="ADD",
                         reason="no incumbent match in this relation cell",
                     )
-                    for item in candidate_payload
+                    for _ in candidate_payload
                 ]
             )
 
@@ -225,14 +252,13 @@ async def test_many_new_candidates_compose_relation_cells_and_incumbent_audit() 
                 ).group(1)
             )
             self.audit_calls += 1
-            return IncumbentSupportAuditResponse(
-                decisions=[
+            return _audit_response(
+                *[
                     IncumbentSupportAuditDecision(
                         action="NOOP",
-                        memory_id=item["id"],
                         reason="still supported",
                     )
-                    for item in incumbent_payload
+                    for _ in incumbent_payload
                 ]
             )
 
@@ -278,28 +304,24 @@ async def test_incomplete_candidate_relation_cell_invalidates_composed_ledger() 
                 ).group(1)
             )
             if len(candidate_payload) == 1:
-                return CandidateRelationResponse(decisions=[])
-            return CandidateRelationResponse(
-                decisions=[
+                return _candidate_response()
+            return _candidate_response(
+                *[
                     CandidateRelationDecision(
-                        index=item["index"],
                         action="ADD",
                         reason="no incumbent match in this relation cell",
                     )
-                    for item in candidate_payload
+                    for _ in candidate_payload
                 ]
             )
 
         async def audit_incumbent_support(self, prompt: str, **kwargs):
             del prompt, kwargs
-            return IncumbentSupportAuditResponse(
-                decisions=[
-                    IncumbentSupportAuditDecision(
-                        action="NOOP",
-                        memory_id=incumbent.id,
-                        reason="still supported",
-                    )
-                ]
+            return _audit_response(
+                IncumbentSupportAuditDecision(
+                    action="NOOP",
+                    reason="still supported",
+                )
             )
 
     result = await reconcile_memories(
@@ -313,7 +335,7 @@ async def test_incomplete_candidate_relation_cell_invalidates_composed_ledger() 
 
     assert result.operations == []
     assert result.failure is not None
-    assert "missing new extraction decisions: [24]" in result.failure.error
+    assert "candidate relation slot 0 must not be null" in result.failure.error
 
 
 @pytest.mark.asyncio
@@ -324,23 +346,26 @@ async def test_any_incomplete_batch_invalidates_the_entire_ledger() -> None:
         def __init__(self) -> None:
             self.offset = 0
 
-        async def reconcile_memories(self, prompt: str, **kwargs):
-            del prompt, kwargs
-            batch = incumbents[self.offset : self.offset + 30]
-            self.offset += len(batch)
-            if len(batch) == 1:
-                batch = []
-            return ReconciliationResponse(
-                decisions=[
-                    ReconciliationDecision(
-                        index=None,
-                        action="NOOP",
-                        memory_id=memory.id,
-                        reason="still supported",
-                    )
-                    for memory in batch
-                ]
+        async def audit_incumbent_support(self, prompt: str, **kwargs):
+            del kwargs
+            batch = json.loads(
+                re.search(
+                    r"<existing_memories>\n(.*?)\n</existing_memories>",
+                    prompt,
+                    re.DOTALL,
+                ).group(1)
             )
+            self.offset += len(batch)
+            decisions = [
+                IncumbentSupportAuditDecision(
+                    action="NOOP",
+                    reason="still supported",
+                )
+                for _ in batch
+            ]
+            if len(batch) == 1:
+                decisions = []
+            return _audit_response(*decisions)
 
     result = await reconcile_memories(
         new_extractions=[],
@@ -353,7 +378,7 @@ async def test_any_incomplete_batch_invalidates_the_entire_ledger() -> None:
 
     assert result.operations == []
     assert result.failure is not None
-    assert "missing incumbent decisions" in result.failure.error
+    assert "incumbent audit slot 0 must not be null" in result.failure.error
 
 
 @pytest.mark.asyncio
@@ -361,19 +386,20 @@ async def test_multiple_new_extractions_each_produce_one_merged_operation() -> N
     incumbent = _memory("mem-existing", "Service uses PostgreSQL 15.")
 
     class CompleteClient:
-        async def reconcile_memories(self, prompt: str, **kwargs):
+        async def reconcile_candidate_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
-            return ReconciliationResponse(
-                decisions=[
-                    ReconciliationDecision(
-                        index=0,
-                        action="SUPERSEDE",
-                        memory_id=incumbent.id,
-                        reason="Version changed",
-                    ),
-                    ReconciliationDecision(index=1, action="ADD", reason="New backup policy"),
-                ]
+            return _candidate_response(
+                CandidateRelationDecision(
+                    action="SUPERSEDE",
+                    incumbent_slot=0,
+                    reason="Version changed",
+                ),
+                CandidateRelationDecision(action="ADD", reason="New backup policy"),
             )
+
+        async def audit_incumbent_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return _audit_response(IncumbentSupportAuditDecision(action="DELETE", reason="replaced"))
 
     result = await reconcile_memories(
         new_extractions=[
@@ -398,29 +424,24 @@ async def test_compatible_duplicate_noops_normalize_to_one_incumbent_keep() -> N
     incumbent = _memory("mem-existing", "Retries use exponential backoff.")
 
     class DuplicateNoopClient:
-        async def reconcile_memories(self, prompt: str, **kwargs):
+        async def reconcile_candidate_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
-            return ReconciliationResponse(
-                decisions=[
-                    ReconciliationDecision(
-                        index=0,
-                        action="NOOP",
-                        memory_id=incumbent.id,
-                        reason="Already captured",
-                    ),
-                    ReconciliationDecision(
-                        index=1,
-                        action="NOOP",
-                        memory_id=incumbent.id,
-                        reason="Same durable rule",
-                    ),
-                    ReconciliationDecision(
-                        action="NOOP",
-                        memory_id=incumbent.id,
-                        reason="Still supported",
-                    ),
-                ]
+            return _candidate_response(
+                CandidateRelationDecision(
+                    action="NOOP",
+                    incumbent_slot=0,
+                    reason="Already captured",
+                ),
+                CandidateRelationDecision(
+                    action="NOOP",
+                    incumbent_slot=0,
+                    reason="Same durable rule",
+                ),
             )
+
+        async def audit_incumbent_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return _audit_response(IncumbentSupportAuditDecision(action="NOOP", reason="Still supported"))
 
     result = await reconcile_memories(
         new_extractions=[
@@ -434,9 +455,7 @@ async def test_compatible_duplicate_noops_normalize_to_one_incumbent_keep() -> N
     )
 
     assert result.failure is None
-    incumbent_operations = [
-        operation for operation in result.operations if operation.memory_id == incumbent.id
-    ]
+    incumbent_operations = [operation for operation in result.operations if operation.memory_id == incumbent.id]
     assert len(incumbent_operations) == 1
     assert incumbent_operations[0].action is ReconcileAction.NOOP
     assert len(result.operations) == 2
@@ -449,23 +468,19 @@ async def test_conflicting_duplicate_incumbent_decisions_fail_closed() -> None:
     incumbent = _memory("mem-existing", "Service uses PostgreSQL 15.")
 
     class ConflictingClient:
-        async def reconcile_memories(self, prompt: str, **kwargs):
+        async def reconcile_candidate_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
-            return ReconciliationResponse(
-                decisions=[
-                    ReconciliationDecision(
-                        index=0,
-                        action="SUPERSEDE",
-                        memory_id=incumbent.id,
-                        reason="Version changed",
-                    ),
-                    ReconciliationDecision(
-                        action="NOOP",
-                        memory_id=incumbent.id,
-                        reason="Still supported",
-                    ),
-                ]
+            return _candidate_response(
+                CandidateRelationDecision(
+                    action="SUPERSEDE",
+                    incumbent_slot=0,
+                    reason="Version changed",
+                )
             )
+
+        async def audit_incumbent_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return _audit_response(IncumbentSupportAuditDecision(action="NOOP", reason="Still supported"))
 
     result = await reconcile_memories(
         new_extractions=[RawMemory(content="Service uses PostgreSQL 16.", memory_type="fact")],
@@ -485,17 +500,13 @@ async def test_missing_new_extraction_decision_invalidates_batch() -> None:
     incumbent = _memory("mem-existing", "Stable claim")
 
     class MissingCandidateClient:
-        async def reconcile_memories(self, prompt: str, **kwargs):
+        async def reconcile_candidate_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
-            return ReconciliationResponse(
-                decisions=[
-                    ReconciliationDecision(
-                        action="NOOP",
-                        memory_id=incumbent.id,
-                        reason="Still supported",
-                    )
-                ]
-            )
+            return _candidate_response()
+
+        async def audit_incumbent_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return _audit_response(IncumbentSupportAuditDecision(action="NOOP", reason="Still supported"))
 
     result = await reconcile_memories(
         new_extractions=[RawMemory(content="New claim", memory_type="fact")],
@@ -507,11 +518,11 @@ async def test_missing_new_extraction_decision_invalidates_batch() -> None:
 
     assert result.operations == []
     assert result.failure is not None
-    assert "missing new extraction decisions" in result.failure.error
+    assert "candidate relation slot 0 must not be null" in result.failure.error
 
 
 @pytest.mark.asyncio
-async def test_invalid_replacement_without_candidate_index_retries_only_reconciliation_batch() -> None:
+async def test_inactive_incumbent_slot_retries_only_candidate_relation_batch() -> None:
     incumbent = _memory("mem-existing", "Service uses PostgreSQL 15.")
 
     class CorrectingClient:
@@ -519,41 +530,33 @@ async def test_invalid_replacement_without_candidate_index_retries_only_reconcil
             self.calls = 0
             self.prompts: list[str] = []
 
-        async def reconcile_memories(self, prompt: str, **kwargs):
+        async def reconcile_candidate_relations(self, prompt: str, **kwargs):
             del kwargs
             self.calls += 1
             self.prompts.append(prompt)
             if self.calls == 1:
-                return ReconciliationResponse(
-                    decisions=[
-                        ReconciliationDecision(
-                            index=0,
-                            action="ADD",
-                            reason="New version claim",
-                        ),
-                        ReconciliationDecision(
-                            action="SUPERSEDE",
-                            memory_id=incumbent.id,
-                            reason="Version changed",
-                        ),
-                    ]
-                )
-            return ReconciliationResponse(
-                decisions=[
-                    ReconciliationDecision(
-                        index=0,
+                return _candidate_response(
+                    CandidateRelationDecision(
                         action="SUPERSEDE",
-                        memory_id=incumbent.id,
+                        incumbent_slot=1,
                         reason="Version changed",
                     )
-                ]
+                )
+            return _candidate_response(
+                CandidateRelationDecision(
+                    action="SUPERSEDE",
+                    incumbent_slot=0,
+                    reason="Version changed",
+                )
             )
+
+        async def audit_incumbent_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return _audit_response(IncumbentSupportAuditDecision(action="DELETE", reason="replaced"))
 
     client = CorrectingClient()
     result = await reconcile_memories(
-        new_extractions=[
-            RawMemory(content="Service uses PostgreSQL 16.", memory_type="fact")
-        ],
+        new_extractions=[RawMemory(content="Service uses PostgreSQL 16.", memory_type="fact")],
         existing_memories=[incumbent],
         doc_type="design",
         structured_llm_client=client,
@@ -563,43 +566,32 @@ async def test_invalid_replacement_without_candidate_index_retries_only_reconcil
 
     assert result.failure is None
     assert client.calls == 2
-    assert "replacement decision for incumbent mem-existing requires a new extraction index" in client.prompts[1]
-    assert [operation.action for operation in result.operations] == [
-        ReconcileAction.SUPERSEDE
-    ]
+    assert "selected an inactive incumbent slot" in client.prompts[1]
+    assert [operation.action for operation in result.operations] == [ReconcileAction.SUPERSEDE]
 
 
 @pytest.mark.asyncio
-async def test_persistent_replacement_without_candidate_is_deferred_to_review() -> None:
+async def test_persistent_inactive_incumbent_slot_fails_closed() -> None:
     incumbent = _memory("mem-existing", "Service uses PostgreSQL 15.")
 
     class PersistentlyInvalidClient:
         def __init__(self) -> None:
             self.calls = 0
 
-        async def reconcile_memories(self, prompt: str, **kwargs):
+        async def reconcile_candidate_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
             self.calls += 1
-            return ReconciliationResponse(
-                decisions=[
-                    ReconciliationDecision(
-                        index=0,
-                        action="ADD",
-                        reason="New version claim",
-                    ),
-                    ReconciliationDecision(
-                        action="SUPERSEDE",
-                        memory_id=incumbent.id,
-                        reason="Version changed but no candidate was selected",
-                    ),
-                ]
+            return _candidate_response(
+                CandidateRelationDecision(
+                    action="SUPERSEDE",
+                    incumbent_slot=1,
+                    reason="Version changed",
+                )
             )
 
     client = PersistentlyInvalidClient()
     result = await reconcile_memories(
-        new_extractions=[
-            RawMemory(content="Service uses PostgreSQL 16.", memory_type="fact")
-        ],
+        new_extractions=[RawMemory(content="Service uses PostgreSQL 16.", memory_type="fact")],
         existing_memories=[incumbent],
         doc_type="design",
         structured_llm_client=client,
@@ -607,13 +599,7 @@ async def test_persistent_replacement_without_candidate_is_deferred_to_review() 
         include_metadata=True,
     )
 
-    assert result.failure is None
+    assert result.failure is not None
     assert client.calls == 2
-    assert [operation.action for operation in result.operations] == [
-        ReconcileAction.ADD,
-        ReconcileAction.DELETE,
-    ]
-    review_operation = result.operations[1]
-    assert review_operation.memory_id == incumbent.id
-    assert review_operation.flag_for_review is True
-    assert "unresolved replacement without a candidate" in review_operation.reason
+    assert result.operations == []
+    assert "selected an inactive incumbent slot" in result.failure.error

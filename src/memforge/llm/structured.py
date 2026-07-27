@@ -297,46 +297,52 @@ class CandidateLedgerResponse(StructuredResponseModel):
         return tuple(getattr(self, f"slot_{index:02d}") for index in range(24))
 
 
-class ReconciliationDecision(StructuredResponseModel):
-    """One same-document memory reconciliation decision."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    action: Literal["ADD", "UPDATE", "SUPERSEDE", "DELETE", "NOOP"]
-    index: int | None = None
-    memory_id: str | None = None
-    updated_content: str | None = None
-    reason: str | None = None
-    flag_for_review: bool = False
-
-
-class ReconciliationResponse(StructuredResponseModel):
-    """Schema returned by same-document memory reconciliation."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    decisions: list[ReconciliationDecision]
-
-
 class CandidateRelationDecision(StructuredResponseModel):
     """One candidate disposition inside a bounded incumbent relation cell."""
 
     model_config = ConfigDict(extra="forbid")
 
-    index: int = Field(ge=0)
     action: Literal["ADD", "UPDATE", "SUPERSEDE", "NOOP"]
-    memory_id: str | None = None
+    incumbent_slot: int | None = Field(default=None, ge=0, le=29)
     updated_content: str | None = None
     reason: str | None = None
     flag_for_review: bool = False
 
 
 class CandidateRelationResponse(StructuredResponseModel):
-    """Candidate-only side of a composed reconciliation ledger."""
+    """Fixed-slot candidate side of a composed reconciliation ledger."""
 
     model_config = ConfigDict(extra="forbid")
 
-    decisions: list[CandidateRelationDecision]
+    slot_00: CandidateRelationDecision | None
+    slot_01: CandidateRelationDecision | None
+    slot_02: CandidateRelationDecision | None
+    slot_03: CandidateRelationDecision | None
+    slot_04: CandidateRelationDecision | None
+    slot_05: CandidateRelationDecision | None
+    slot_06: CandidateRelationDecision | None
+    slot_07: CandidateRelationDecision | None
+    slot_08: CandidateRelationDecision | None
+    slot_09: CandidateRelationDecision | None
+    slot_10: CandidateRelationDecision | None
+    slot_11: CandidateRelationDecision | None
+    slot_12: CandidateRelationDecision | None
+    slot_13: CandidateRelationDecision | None
+    slot_14: CandidateRelationDecision | None
+    slot_15: CandidateRelationDecision | None
+    slot_16: CandidateRelationDecision | None
+    slot_17: CandidateRelationDecision | None
+    slot_18: CandidateRelationDecision | None
+    slot_19: CandidateRelationDecision | None
+    slot_20: CandidateRelationDecision | None
+    slot_21: CandidateRelationDecision | None
+    slot_22: CandidateRelationDecision | None
+    slot_23: CandidateRelationDecision | None
+
+    def ordered_slots(self) -> tuple[CandidateRelationDecision | None, ...]:
+        """Return candidate judgments in datastore-bound request order."""
+
+        return tuple(getattr(self, f"slot_{index:02d}") for index in range(24))
 
 
 class IncumbentSupportAuditDecision(StructuredResponseModel):
@@ -345,17 +351,50 @@ class IncumbentSupportAuditDecision(StructuredResponseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: Literal["DELETE", "NOOP"]
-    memory_id: str = Field(min_length=1)
     reason: str | None = None
     flag_for_review: bool = False
 
 
 class IncumbentSupportAuditResponse(StructuredResponseModel):
-    """Incumbent-only side of a composed reconciliation ledger."""
+    """Fixed-slot incumbent side of a composed reconciliation ledger."""
 
     model_config = ConfigDict(extra="forbid")
 
-    decisions: list[IncumbentSupportAuditDecision]
+    slot_00: IncumbentSupportAuditDecision | None
+    slot_01: IncumbentSupportAuditDecision | None
+    slot_02: IncumbentSupportAuditDecision | None
+    slot_03: IncumbentSupportAuditDecision | None
+    slot_04: IncumbentSupportAuditDecision | None
+    slot_05: IncumbentSupportAuditDecision | None
+    slot_06: IncumbentSupportAuditDecision | None
+    slot_07: IncumbentSupportAuditDecision | None
+    slot_08: IncumbentSupportAuditDecision | None
+    slot_09: IncumbentSupportAuditDecision | None
+    slot_10: IncumbentSupportAuditDecision | None
+    slot_11: IncumbentSupportAuditDecision | None
+    slot_12: IncumbentSupportAuditDecision | None
+    slot_13: IncumbentSupportAuditDecision | None
+    slot_14: IncumbentSupportAuditDecision | None
+    slot_15: IncumbentSupportAuditDecision | None
+    slot_16: IncumbentSupportAuditDecision | None
+    slot_17: IncumbentSupportAuditDecision | None
+    slot_18: IncumbentSupportAuditDecision | None
+    slot_19: IncumbentSupportAuditDecision | None
+    slot_20: IncumbentSupportAuditDecision | None
+    slot_21: IncumbentSupportAuditDecision | None
+    slot_22: IncumbentSupportAuditDecision | None
+    slot_23: IncumbentSupportAuditDecision | None
+    slot_24: IncumbentSupportAuditDecision | None
+    slot_25: IncumbentSupportAuditDecision | None
+    slot_26: IncumbentSupportAuditDecision | None
+    slot_27: IncumbentSupportAuditDecision | None
+    slot_28: IncumbentSupportAuditDecision | None
+    slot_29: IncumbentSupportAuditDecision | None
+
+    def ordered_slots(self) -> tuple[IncumbentSupportAuditDecision | None, ...]:
+        """Return incumbent judgments in datastore-bound request order."""
+
+        return tuple(getattr(self, f"slot_{index:02d}") for index in range(30))
 
 
 class MemoryRelationDecision(StructuredResponseModel):
@@ -653,15 +692,6 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> CandidateLedgerResponse:
         """Return a complete within-revision candidate uniqueness ledger."""
-
-    async def reconcile_memories(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 4096,
-        model: str | None = None,
-    ) -> ReconciliationResponse:
-        """Return schema-validated same-document reconciliation decisions."""
 
     async def reconcile_candidate_relations(
         self,
@@ -1156,20 +1186,6 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=CandidateLedgerResponse,
-            max_tokens=max_tokens,
-            model=model,
-        )
-
-    async def reconcile_memories(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 4096,
-        model: str | None = None,
-    ) -> ReconciliationResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=ReconciliationResponse,
             max_tokens=max_tokens,
             model=model,
         )
