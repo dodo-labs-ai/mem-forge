@@ -40,8 +40,15 @@ from memforge.memory.relation_classifier import (
     StructuredMemoryPairClassifier,
 )
 from memforge.memory.relation_discovery_contract import PreclassifiedRelationDecision
-from memforge.source_access import memory_visibility_for_document
+from memforge.source_access import (
+    memory_visibility_for_document,
+    memory_visibility_for_source_id,
+)
 from memforge.source_projection import ImpactResult, ProjectionCoverage, resolve_anchor_impact
+from memforge.source_derivation import (
+    SourceUnitDerivationContext,
+    source_derivation_context_identity_hash,
+)
 from memforge.storage.adapters.protocols import EntityResolutionScope
 from memforge.models import (
     Memory,
@@ -55,6 +62,7 @@ from memforge.models import (
 
 if TYPE_CHECKING:
     from memforge.memory.store import MemoryStore
+    from memforge.models import DocumentRecord
     from memforge.source_projection import SourceProjection
     from memforge.storage.database import Database
 
@@ -223,6 +231,32 @@ class MemoryEngine:
             for operation in operations
         )
 
+    async def _derivation_protected_incumbents(
+        self,
+        *,
+        source_id: str,
+        incumbent_ids: frozenset[str],
+        protected_source_observation_ids: frozenset[str],
+    ) -> frozenset[str]:
+        """Keep incumbents whose current Support could not be re-derived."""
+
+        if not incumbent_ids or not protected_source_observation_ids:
+            return frozenset()
+        observation_ids_by_memory_id = (
+            await self.db.get_active_memory_support_observation_ids_many(
+                tuple(sorted(incumbent_ids)),
+                source_id=source_id,
+            )
+        )
+        return frozenset(
+            memory_id
+            for memory_id, observation_ids
+            in observation_ids_by_memory_id.items()
+            if protected_source_observation_ids.intersection(
+                observation_ids
+            )
+        )
+
     async def _rebind_noop_evidence_to_current_revision(
         self,
         *,
@@ -230,6 +264,7 @@ class MemoryEngine:
         incumbents: dict[str, Memory],
         unit_support: Mapping[str, tuple[str, ...]],
         projection: SourceProjection,
+        protected_memory_ids: frozenset[str] = frozenset(),
     ) -> tuple[ReconcileOperation, ...]:
         """Carry an exact, still-present claim forward without re-extracting it.
 
@@ -247,6 +282,7 @@ class MemoryEngine:
                 operation.action is not ReconcileAction.NOOP
                 or operation.memory_id is None
                 or operation.memory is not None
+                or operation.memory_id in protected_memory_ids
             ):
                 rebound.append(operation)
                 continue
@@ -376,6 +412,9 @@ class MemoryEngine:
         update_plan_stats: dict[str, Any] | None,
         source_updated_at: datetime | None,
         user_id: str | None = None,
+        protected_source_observation_ids: tuple[str, ...] = (),
+        document: DocumentRecord | None = None,
+        derivation_id: str | None = None,
         expected_source_activity_epoch: int | None = None,
     ) -> dict[str, int]:
         """Reconcile a complete Source Unit ledger and atomically apply one plan."""
@@ -456,6 +495,17 @@ class MemoryEngine:
             doc_id=doc_id,
             source_unit_id=scope.source_unit_id,
         )
+        derivation_protected_ids = (
+            await self._derivation_protected_incumbents(
+                source_id=projection.source_id,
+                incumbent_ids=frozenset(
+                    memory.id for memory in incumbents
+                ),
+                protected_source_observation_ids=frozenset(
+                    protected_source_observation_ids
+                ),
+            )
+        )
         incumbent_impacts: dict[str, ImpactResult] = {}
         needs_incumbent_impacts = projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION or (
             not filtered_memories and bool(document_content.strip())
@@ -477,21 +527,38 @@ class MemoryEngine:
                 ReconcileOperation(
                     action=ReconcileAction.DELETE,
                     memory_id=memory.id,
-                    reason="source observation is explicitly empty",
+                    reason=(
+                        "current Source Artifact revision is not inference eligible"
+                        if memory.id in derivation_protected_ids
+                        else "source observation is explicitly empty"
+                    ),
+                    flag_for_review=(
+                        memory.id in derivation_protected_ids
+                    ),
                 )
                 for memory in sorted(incumbents, key=lambda item: item.id)
             )
         else:
-            deterministic_keep_ids = (
+            deterministic_disjoint_ids = (
                 frozenset(
                     memory_id for memory_id, impact in incumbent_impacts.items() if impact is ImpactResult.DISJOINT
                 )
                 if not filtered_memories
                 else frozenset()
             )
-            model_incumbents = [memory for memory in incumbents if memory.id not in deterministic_keep_ids]
+            model_incumbents = [
+                memory
+                for memory in incumbents
+                if memory.id
+                not in (
+                    deterministic_disjoint_ids
+                    | derivation_protected_ids
+                )
+            ]
             model_incumbent_count = len(model_incumbents)
-            deterministic_disjoint_keep_count = len(deterministic_keep_ids)
+            deterministic_disjoint_keep_count = len(
+                deterministic_disjoint_ids
+            )
             if model_incumbents and not self.structured_llm_client:
                 raise RuntimeError("complete lifecycle reconciliation requires an LLM client")
             result = await reconcile_memories(
@@ -521,9 +588,22 @@ class MemoryEngine:
                 ReconcileOperation(
                     action=ReconcileAction.NOOP,
                     memory_id=memory_id,
-                    reason="Revision Delta proves the incumbent evidence is disjoint",
+                    reason=(
+                        "Revision Delta proves the incumbent evidence is disjoint"
+                    ),
                 )
-                for memory_id in sorted(deterministic_keep_ids)
+                for memory_id in sorted(deterministic_disjoint_ids)
+            )
+            operations += tuple(
+                ReconcileOperation(
+                    action=ReconcileAction.DELETE,
+                    memory_id=memory_id,
+                    reason=(
+                        "current Source Artifact revision is not inference eligible"
+                    ),
+                    flag_for_review=True,
+                )
+                for memory_id in sorted(derivation_protected_ids)
             )
         protected_memory_ids = self._partial_projection_protected_incumbents(
             projection=projection,
@@ -579,6 +659,7 @@ class MemoryEngine:
             incumbents=incumbents_by_id,
             unit_support=unit_support,
             projection=projection,
+            protected_memory_ids=derivation_protected_ids,
         )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
         incumbent_support_states = await self.db.get_active_memory_support_states(
@@ -592,7 +673,10 @@ class MemoryEngine:
             memory_id: state.support_set_hash
             for memory_id, state in incumbent_support_states.items()
         }
-        visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
+        visibility, owner_user_id = await memory_visibility_for_source_id(
+            self.db,
+            source_id=projection.source_id,
+        )
         if visibility == "private" and user_id is not None and user_id != owner_user_id:
             raise PermissionError("private projected lifecycle actor does not own the document")
         access_context_hash = lifecycle_access_context_hash(
@@ -778,6 +862,33 @@ class MemoryEngine:
         await self.db.apply_source_projection_lifecycle(
             projection,
             plan,
+            document=document,
+            derivation_id=derivation_id,
+            derivation_context_identity_hash=(
+                source_derivation_context_identity_hash(
+                    SourceUnitDerivationContext(
+                        document=document,
+                        doc_type=doc_type,
+                        project_key=project_key,
+                        repo_identifier=repo_identifier,
+                        document_content=document_content,
+                        update_mode=update_mode,
+                        changed_hunks=changed_hunks,
+                        update_plan_stats=update_plan_stats,
+                        source_updated_at=(
+                            source_updated_at.isoformat()
+                            if source_updated_at is not None
+                            else None
+                        ),
+                        user_id=user_id,
+                        source_activity_epoch=(
+                            expected_source_activity_epoch
+                        ),
+                    )
+                )
+                if derivation_id is not None and document is not None
+                else None
+            ),
             expected_source_activity_epoch=expected_source_activity_epoch,
         )
         delivery = await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)

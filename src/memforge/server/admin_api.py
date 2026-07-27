@@ -84,7 +84,6 @@ from memforge.models import (
 )
 from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.source_artifacts import (
-    MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
     SOURCE_ARTIFACT_SPOOL_MEMORY_BYTES,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
@@ -1163,10 +1162,7 @@ class LocalSourcePackageRequest(BaseModel):
     local_agent_job_id: str | None = None
     local_agent_attempt_count: int | None = Field(default=None, ge=1)
     artifact_source_unit_key: str | None = None
-    artifact_input_hashes: list[str] = Field(
-        default_factory=list,
-        max_length=MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
-    )
+    artifact_input_hashes: list[str] = Field(default_factory=list)
     submitted_by: str | None = None
     submitted_at: str | None = None
 

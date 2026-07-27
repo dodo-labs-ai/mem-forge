@@ -23,6 +23,7 @@ from memforge.llm.structured import (
     MemoryExtractionResponse,
     MemoryRelationResponse,
     MemorySupportValidationResponse,
+    ProjectionMemoryExtractionResponse,
     ReconciliationResponse,
     RerankResponse,
     SourceSupportDecision,
@@ -305,6 +306,30 @@ def test_memory_extraction_response_validates_and_normalizes_artifact_summaries(
         )
     ]
 
+
+def test_artifact_summary_schema_stays_typed_while_invalid_values_are_isolated():
+    schema = ArtifactSelectionSummary.model_json_schema()
+    response = MemoryExtractionResponse.model_validate(
+        {
+            "memories": [],
+            "artifact_summaries": [
+                {
+                    "source_observation_id": 42,
+                    "summary": ["not", "text"],
+                }
+            ],
+        }
+    )
+
+    assert schema["properties"]["source_observation_id"]["type"] == (
+        "string"
+    )
+    assert schema["properties"]["summary"]["type"] == "string"
+    assert response.artifact_summaries == [
+        ArtifactSelectionSummary()
+    ]
+
+
 def test_memory_extraction_response_rejects_top_level_array():
     with pytest.raises(ValidationError):
         MemoryExtractionResponse.model_validate([{"content": "Fact", "memory_type": "fact"}])
@@ -383,6 +408,48 @@ async def test_litellm_structured_client_uses_response_schema_for_memory_extract
     assert "tools" not in calls[0]
     assert "tool_choice" not in calls[0]
     assert calls[0]["max_tokens"] == 8192
+
+
+@pytest.mark.asyncio
+async def test_projection_extraction_schema_excludes_datastore_owned_anchor_fields(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(
+            '{"memories":[{"content":"A7 remains enabled.","memory_type":"decision",'
+            '"evidence_quote":"retain A7","source_observation_id":"obs-1",'
+            '"evidence_anchor":"source_artifact","extraction_context":"invented"}]}'
+        )
+
+    monkeypatch.setattr(
+        "memforge.llm.structured.litellm.acompletion",
+        fake_acompletion,
+    )
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url="http://localhost:6655/anthropic",
+            api_key="local-key",
+            timeout_s=120.0,
+        )
+    )
+
+    response = await client.extract_projection_memories(
+        "prompt",
+        max_tokens=8192,
+    )
+
+    schema = calls[0]["response_format"].model_json_schema()
+    candidate_properties = schema["$defs"]["ProjectionMemoryCandidate"][
+        "properties"
+    ]
+    assert calls[0]["response_format"] is ProjectionMemoryExtractionResponse
+    assert "evidence_anchor" not in candidate_properties
+    assert "extraction_context" not in candidate_properties
+    assert response.memories[0].evidence_anchor == "unknown"
+    assert response.memories[0].extraction_context is None
 
 
 @pytest.mark.asyncio
@@ -772,6 +839,42 @@ async def test_litellm_structured_client_rejects_ambiguous_schema_valid_json_obj
         await client.reconcile_memories("prompt")
     assert len(calls) == 2
     assert raised.value.error_code == "ValueError"
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_reports_content_free_validation_fields(
+    monkeypatch,
+):
+    async def fake_acompletion(**kwargs):
+        return CompletionResponse(
+            '{"memories":[{"content":"secret source text",'
+            '"memory_type":"unsupported","confidence":2.0,'
+            '"entity_refs":[]}]}'
+        )
+
+    monkeypatch.setattr(
+        "memforge.llm.structured.litellm.acompletion",
+        fake_acompletion,
+    )
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+        )
+    )
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await client.extract_memories("prompt", max_tokens=1024)
+
+    assert raised.value.error_code == "ValidationError"
+    assert raised.value.validation_fields == (
+        ("memories.0.memory_type", "literal_error"),
+        ("memories.0.confidence", "less_than_equal"),
+    )
+    assert "secret source text" not in str(raised.value)
 
 
 @pytest.mark.asyncio

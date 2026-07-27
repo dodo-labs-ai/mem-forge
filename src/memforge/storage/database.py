@@ -56,6 +56,7 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
+    MemoryExtractionResult,
     MemoryReview,
     MemoryReviewRelatedChallenger,
     MemorySource,
@@ -146,6 +147,23 @@ from memforge.memory.review_contract import (
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
 from memforge.source_access import infer_legacy_source_access
+from memforge.source_derivation import (
+    SOURCE_DERIVATION_BATCH_COMPLETED,
+    SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE,
+    SOURCE_DERIVATION_COMPLETED,
+    SOURCE_DERIVATION_PENDING,
+    SOURCE_DERIVATION_RETRYABLE_FAILURE,
+    SourceDerivationAttempt,
+    SourceDerivationBatchRecord,
+    SourceDerivationManifest,
+    memory_extraction_output_payload,
+    memory_extraction_result_from_output_payload,
+    output_payload_hash,
+    safe_derivation_error,
+    source_derivation_document_identity_hash,
+    source_derivation_projection_identity_hash,
+    source_unit_derivation_context_from_payload,
+)
 from memforge.source_projection import (
     AnchorKind,
     ProjectionCoverage,
@@ -954,6 +972,53 @@ CREATE TABLE IF NOT EXISTS source_revision_deltas (
     payload_json      TEXT NOT NULL,
     PRIMARY KEY (projection_run_id, delta_index)
 );
+
+CREATE TABLE IF NOT EXISTS source_derivation_attempts (
+    id                          TEXT PRIMARY KEY,
+    source_id                   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    source_unit_id              TEXT NOT NULL,
+    base_unit_revision_id       TEXT,
+    target_unit_revision_id     TEXT NOT NULL,
+    projection_payload_json     TEXT NOT NULL,
+    projection_payload_hash     TEXT NOT NULL,
+    projection_identity_hash    TEXT NOT NULL,
+    context_payload_json        TEXT NOT NULL,
+    context_payload_hash        TEXT NOT NULL,
+    context_identity_hash       TEXT NOT NULL,
+    extraction_contract_version TEXT NOT NULL,
+    status                      TEXT NOT NULL CHECK (
+        status IN ('pending', 'retryable_failure', 'completed', 'applied', 'superseded')
+    ),
+    created_at                  TEXT NOT NULL,
+    updated_at                  TEXT NOT NULL,
+    completed_at                TEXT,
+    applied_at                  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_source_derivation_attempts_source_status
+    ON source_derivation_attempts(source_id, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS source_derivation_batches (
+    derivation_id                TEXT NOT NULL
+        REFERENCES source_derivation_attempts(id) ON DELETE CASCADE,
+    batch_id                     TEXT NOT NULL,
+    input_payload_hash           TEXT NOT NULL,
+    primary_observation_ids_json TEXT NOT NULL,
+    status                       TEXT NOT NULL CHECK (
+        status IN ('pending', 'completed', 'retryable_failure')
+    ),
+    output_payload_json          TEXT,
+    output_payload_hash          TEXT,
+    error_type                   TEXT,
+    error_code                   TEXT,
+    error_fields_json            TEXT NOT NULL DEFAULT '[]',
+    attempt_count                INTEGER NOT NULL DEFAULT 0,
+    created_at                   TEXT NOT NULL,
+    updated_at                   TEXT NOT NULL,
+    completed_at                 TEXT,
+    PRIMARY KEY (derivation_id, batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_source_derivation_batches_status
+    ON source_derivation_batches(derivation_id, status, updated_at);
 
 CREATE TABLE IF NOT EXISTS source_lifecycle_gates (
     source_id   TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
@@ -3057,6 +3122,57 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                   AND ea.source IN ('manual', 'admin_manual', 'deterministic')""",
         ],
     ),
+    (
+        71,
+        "Stage recoverable Source Unit derivation batches",
+        [
+            """CREATE TABLE IF NOT EXISTS source_derivation_attempts (
+                id                          TEXT PRIMARY KEY,
+                source_id                   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                source_unit_id              TEXT NOT NULL,
+                base_unit_revision_id       TEXT,
+                target_unit_revision_id     TEXT NOT NULL,
+                projection_payload_json     TEXT NOT NULL,
+                projection_payload_hash     TEXT NOT NULL,
+                projection_identity_hash    TEXT NOT NULL,
+                context_payload_json        TEXT NOT NULL,
+                context_payload_hash        TEXT NOT NULL,
+                context_identity_hash       TEXT NOT NULL,
+                extraction_contract_version TEXT NOT NULL,
+                status                      TEXT NOT NULL CHECK (
+                    status IN ('pending', 'retryable_failure', 'completed', 'applied', 'superseded')
+                ),
+                created_at                  TEXT NOT NULL,
+                updated_at                  TEXT NOT NULL,
+                completed_at                TEXT,
+                applied_at                  TEXT
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_source_derivation_attempts_source_status
+               ON source_derivation_attempts(source_id, status, updated_at)""",
+            """CREATE TABLE IF NOT EXISTS source_derivation_batches (
+                derivation_id                TEXT NOT NULL
+                    REFERENCES source_derivation_attempts(id) ON DELETE CASCADE,
+                batch_id                     TEXT NOT NULL,
+                input_payload_hash           TEXT NOT NULL,
+                primary_observation_ids_json TEXT NOT NULL,
+                status                       TEXT NOT NULL CHECK (
+                    status IN ('pending', 'completed', 'retryable_failure')
+                ),
+                output_payload_json          TEXT,
+                output_payload_hash          TEXT,
+                error_type                   TEXT,
+                error_code                   TEXT,
+                error_fields_json            TEXT NOT NULL DEFAULT '[]',
+                attempt_count                INTEGER NOT NULL DEFAULT 0,
+                created_at                   TEXT NOT NULL,
+                updated_at                   TEXT NOT NULL,
+                completed_at                 TEXT,
+                PRIMARY KEY (derivation_id, batch_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_source_derivation_batches_status
+               ON source_derivation_batches(derivation_id, status, updated_at)""",
+        ],
+    ),
 ]
 
 
@@ -3555,49 +3671,7 @@ class Database:
                     doc.source,
                     source_activity,
                 )
-                await self.db.execute(
-                    """INSERT INTO documents (
-                    doc_id, source, source_url, title, space_or_project,
-                    author, last_modified, labels, version, content_hash,
-                    token_count, raw_content_uri, raw_content_type,
-                    normalized_content_uri, pdf_content_uri, last_synced,
-                    client, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(doc_id) DO UPDATE SET
-                    source=excluded.source, source_url=excluded.source_url,
-                    title=excluded.title, space_or_project=excluded.space_or_project,
-                    author=excluded.author, last_modified=excluded.last_modified,
-                    labels=excluded.labels, version=excluded.version,
-                    content_hash=excluded.content_hash, token_count=excluded.token_count,
-                    raw_content_uri=excluded.raw_content_uri,
-                    raw_content_type=excluded.raw_content_type,
-                    normalized_content_uri=excluded.normalized_content_uri,
-                    pdf_content_uri=excluded.pdf_content_uri,
-                    last_synced=excluded.last_synced,
-                    client=COALESCE(excluded.client, documents.client),
-                    updated_at=excluded.updated_at""",
-                    (
-                        doc.doc_id,
-                        doc.source,
-                        doc.source_url,
-                        doc.title,
-                        doc.space_or_project,
-                        doc.author,
-                        doc.last_modified.isoformat(),
-                        json.dumps(doc.labels),
-                        doc.version,
-                        doc.content_hash,
-                        doc.token_count,
-                        doc.raw_content_uri,
-                        doc.raw_content_type,
-                        doc.normalized_content_uri,
-                        doc.pdf_content_uri,
-                        doc.last_synced.isoformat(),
-                        doc.client,
-                        _now_iso(),
-                    ),
-                )
-                await self._refresh_metadata_fts_for_doc_unlocked(doc.doc_id)
+                await self._upsert_document_unlocked(doc)
                 await self._assert_source_activity_fence_unlocked(
                     doc.source,
                     source_activity,
@@ -3606,6 +3680,54 @@ class Database:
             except Exception:
                 await self.db.rollback()
                 raise
+
+    async def _upsert_document_unlocked(
+        self,
+        doc: DocumentRecord,
+    ) -> None:
+        await self.db.execute(
+            """INSERT INTO documents (
+            doc_id, source, source_url, title, space_or_project,
+            author, last_modified, labels, version, content_hash,
+            token_count, raw_content_uri, raw_content_type,
+            normalized_content_uri, pdf_content_uri, last_synced,
+            client, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id) DO UPDATE SET
+            source=excluded.source, source_url=excluded.source_url,
+            title=excluded.title, space_or_project=excluded.space_or_project,
+            author=excluded.author, last_modified=excluded.last_modified,
+            labels=excluded.labels, version=excluded.version,
+            content_hash=excluded.content_hash, token_count=excluded.token_count,
+            raw_content_uri=excluded.raw_content_uri,
+            raw_content_type=excluded.raw_content_type,
+            normalized_content_uri=excluded.normalized_content_uri,
+            pdf_content_uri=excluded.pdf_content_uri,
+            last_synced=excluded.last_synced,
+            client=COALESCE(excluded.client, documents.client),
+            updated_at=excluded.updated_at""",
+            (
+                doc.doc_id,
+                doc.source,
+                doc.source_url,
+                doc.title,
+                doc.space_or_project,
+                doc.author,
+                doc.last_modified.isoformat(),
+                json.dumps(doc.labels),
+                doc.version,
+                doc.content_hash,
+                doc.token_count,
+                doc.raw_content_uri,
+                doc.raw_content_type,
+                doc.normalized_content_uri,
+                doc.pdf_content_uri,
+                doc.last_synced.isoformat(),
+                doc.client,
+                _now_iso(),
+            ),
+        )
+        await self._refresh_metadata_fts_for_doc_unlocked(doc.doc_id)
 
     async def get_document(self, doc_id: str) -> DocumentRecord | None:
         async with self.db.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)) as cursor:
@@ -4397,6 +4519,478 @@ class Database:
     # ==================================================================
     # Source Projection lineage
     # ==================================================================
+
+    async def stage_source_derivation(
+        self,
+        manifest: SourceDerivationManifest,
+    ) -> SourceDerivationAttempt:
+        """Persist one immutable target projection and its batch manifest."""
+
+        projection_payload_json = json.dumps(
+            manifest.projection_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        context_payload_json = json.dumps(
+            manifest.context_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        now = _now_iso()
+        initial_status = (
+            SOURCE_DERIVATION_COMPLETED
+            if not manifest.batches
+            else SOURCE_DERIVATION_PENDING
+        )
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    """SELECT * FROM source_derivation_attempts
+                       WHERE id = ?""",
+                    (manifest.id,),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing is None:
+                    await self.db.execute(
+                        """INSERT INTO source_derivation_attempts (
+                            id, source_id, source_unit_id,
+                            base_unit_revision_id, target_unit_revision_id,
+                            projection_payload_json, projection_payload_hash,
+                            projection_identity_hash, context_payload_json,
+                            context_payload_hash, context_identity_hash,
+                            extraction_contract_version, status,
+                            created_at, updated_at, completed_at, applied_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+                        (
+                            manifest.id,
+                            manifest.source_id,
+                            manifest.source_unit_id,
+                            manifest.base_unit_revision_id,
+                            manifest.target_unit_revision_id,
+                            projection_payload_json,
+                            manifest.projection_payload_hash,
+                            manifest.projection_identity_hash,
+                            context_payload_json,
+                            manifest.context_payload_hash,
+                            manifest.context_identity_hash,
+                            manifest.extraction_contract_version,
+                            initial_status,
+                            now,
+                            now,
+                            now if initial_status == SOURCE_DERIVATION_COMPLETED else None,
+                        ),
+                    )
+                    for batch in manifest.batches:
+                        await self.db.execute(
+                            """INSERT INTO source_derivation_batches (
+                                derivation_id, batch_id, input_payload_hash,
+                                primary_observation_ids_json, status,
+                                output_payload_json, output_payload_hash,
+                                error_type, error_code, error_fields_json,
+                                attempt_count, created_at, updated_at, completed_at
+                            ) VALUES (?, ?, ?, ?, 'pending', NULL, NULL,
+                                      NULL, NULL, '[]', 0, ?, ?, NULL)""",
+                            (
+                                manifest.id,
+                                batch.batch_id,
+                                batch.input_payload_hash,
+                                json.dumps(
+                                    list(batch.primary_observation_ids),
+                                    separators=(",", ":"),
+                                ),
+                                now,
+                                now,
+                            ),
+                        )
+                else:
+                    immutable_values = {
+                        "source_id": manifest.source_id,
+                        "source_unit_id": manifest.source_unit_id,
+                        "base_unit_revision_id": manifest.base_unit_revision_id,
+                        "target_unit_revision_id": manifest.target_unit_revision_id,
+                        "projection_identity_hash": (
+                            manifest.projection_identity_hash
+                        ),
+                        "context_identity_hash": (
+                            manifest.context_identity_hash
+                        ),
+                        "extraction_contract_version": (
+                            manifest.extraction_contract_version
+                        ),
+                    }
+                    mismatched_columns = tuple(
+                        column
+                        for column, value in immutable_values.items()
+                        if existing[column] != value
+                    )
+                    if mismatched_columns:
+                        raise ValueError(
+                            "Source derivation retry payload mismatch: "
+                            + ", ".join(mismatched_columns)
+                        )
+                    existing_id = str(existing["id"])
+                    batch_rows = await self.db.execute_fetchall(
+                        """SELECT batch_id, input_payload_hash,
+                                  primary_observation_ids_json
+                           FROM source_derivation_batches
+                           WHERE derivation_id = ?
+                           ORDER BY batch_id""",
+                        (existing_id,),
+                    )
+                    expected_batches = sorted(
+                        (
+                            batch.batch_id,
+                            batch.input_payload_hash,
+                            json.dumps(
+                                list(batch.primary_observation_ids),
+                                separators=(",", ":"),
+                            ),
+                        )
+                        for batch in manifest.batches
+                    )
+                    actual_batches = [
+                        (
+                            row["batch_id"],
+                            row["input_payload_hash"],
+                            row["primary_observation_ids_json"],
+                        )
+                        for row in batch_rows
+                    ]
+                    if actual_batches != expected_batches:
+                        raise ValueError(
+                            "Source derivation retry batch manifest mismatch"
+                        )
+                await self.db.commit()
+                return await self._source_derivation_attempt_unlocked(
+                    str(existing["id"]) if existing is not None else manifest.id
+                )
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def record_source_derivation_batch_result(
+        self,
+        *,
+        derivation_id: str,
+        batch_id: str,
+        result: MemoryExtractionResult,
+    ) -> SourceDerivationAttempt:
+        """Persist one validated batch output or safe retryable failure."""
+
+        now = _now_iso()
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    """SELECT status, output_payload_hash
+                       FROM source_derivation_batches
+                       WHERE derivation_id = ? AND batch_id = ?""",
+                    (derivation_id, batch_id),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing is None:
+                    raise ValueError("unknown Source derivation batch")
+
+                if result.error_type:
+                    if existing["status"] != SOURCE_DERIVATION_BATCH_COMPLETED:
+                        error_type, error_code, error_fields = (
+                            safe_derivation_error(result)
+                        )
+                        await self.db.execute(
+                            """UPDATE source_derivation_batches
+                               SET status = ?, output_payload_json = NULL,
+                                   output_payload_hash = NULL,
+                                   error_type = ?, error_code = ?,
+                                   error_fields_json = ?,
+                                   attempt_count = attempt_count + 1,
+                                   updated_at = ?, completed_at = NULL
+                               WHERE derivation_id = ? AND batch_id = ?""",
+                            (
+                                SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE,
+                                error_type,
+                                error_code,
+                                json.dumps(
+                                    [
+                                        {"location": location, "type": kind}
+                                        for location, kind in error_fields
+                                    ],
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                                now,
+                                derivation_id,
+                                batch_id,
+                            ),
+                        )
+                else:
+                    output_payload = memory_extraction_output_payload(result)
+                    output_payload_json = json.dumps(
+                        output_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    payload_hash = output_payload_hash(output_payload)
+                    if existing["status"] == SOURCE_DERIVATION_BATCH_COMPLETED:
+                        if existing["output_payload_hash"] != payload_hash:
+                            raise ValueError(
+                                "Source derivation completed batch output mismatch"
+                            )
+                    else:
+                        await self.db.execute(
+                            """UPDATE source_derivation_batches
+                               SET status = ?, output_payload_json = ?,
+                                   output_payload_hash = ?,
+                                   error_type = NULL, error_code = NULL,
+                                   error_fields_json = '[]',
+                                   attempt_count = attempt_count + 1,
+                                   updated_at = ?, completed_at = ?
+                               WHERE derivation_id = ? AND batch_id = ?""",
+                            (
+                                SOURCE_DERIVATION_BATCH_COMPLETED,
+                                output_payload_json,
+                                payload_hash,
+                                now,
+                                now,
+                                derivation_id,
+                                batch_id,
+                            ),
+                        )
+
+                counts = await self.db.execute_fetchall(
+                    """SELECT status, COUNT(*) AS count
+                       FROM source_derivation_batches
+                       WHERE derivation_id = ?
+                       GROUP BY status""",
+                    (derivation_id,),
+                )
+                status_counts = {
+                    str(row["status"]): int(row["count"]) for row in counts
+                }
+                if status_counts.get(SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE, 0):
+                    attempt_status = SOURCE_DERIVATION_RETRYABLE_FAILURE
+                    completed_at = None
+                elif status_counts.get(SOURCE_DERIVATION_PENDING, 0):
+                    attempt_status = SOURCE_DERIVATION_PENDING
+                    completed_at = None
+                else:
+                    attempt_status = SOURCE_DERIVATION_COMPLETED
+                    completed_at = now
+                await self.db.execute(
+                    """UPDATE source_derivation_attempts
+                       SET status = ?, updated_at = ?, completed_at = ?
+                       WHERE id = ? AND status NOT IN ('applied', 'superseded')""",
+                    (
+                        attempt_status,
+                        now,
+                        completed_at,
+                        derivation_id,
+                    ),
+                )
+                await self.db.commit()
+                return await self._source_derivation_attempt_unlocked(
+                    derivation_id
+                )
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def list_source_derivation_attempts(
+        self,
+        *,
+        source_id: str,
+        statuses: tuple[str, ...] | None = None,
+    ) -> tuple[SourceDerivationAttempt, ...]:
+        """Return staged derivations for one configured Source."""
+
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            rows = await self.db.execute_fetchall(
+                f"""SELECT id FROM source_derivation_attempts
+                    WHERE source_id = ?
+                      AND status IN ({placeholders})
+                    ORDER BY created_at, id""",
+                (source_id, *statuses),
+            )
+        else:
+            rows = await self.db.execute_fetchall(
+                """SELECT id FROM source_derivation_attempts
+                   WHERE source_id = ?
+                   ORDER BY created_at, id""",
+                (source_id,),
+            )
+        return tuple(
+            [
+                await self._source_derivation_attempt_unlocked(str(row["id"]))
+                for row in rows
+            ]
+        )
+
+    async def supersede_source_derivation(
+        self,
+        derivation_id: str,
+    ) -> None:
+        now = _now_iso()
+        async with self._write_lock:
+            await self.db.execute(
+                """UPDATE source_derivation_attempts
+                   SET status = 'superseded', updated_at = ?
+                   WHERE id = ?
+                     AND status IN (
+                         'pending', 'retryable_failure', 'completed'
+                     )""",
+                (now, derivation_id),
+            )
+            await self.db.commit()
+
+    async def get_completed_source_derivation_batch_results(
+        self,
+        *,
+        derivation_id: str,
+    ) -> Mapping[str, MemoryExtractionResult]:
+        """Load validated completed outputs for idempotent derivation resume."""
+
+        rows = await self.db.execute_fetchall(
+            """SELECT batch_id, output_payload_json, output_payload_hash
+               FROM source_derivation_batches
+               WHERE derivation_id = ? AND status = 'completed'
+               ORDER BY batch_id""",
+            (derivation_id,),
+        )
+        results: dict[str, MemoryExtractionResult] = {}
+        for row in rows:
+            payload_json = row["output_payload_json"]
+            if not isinstance(payload_json, str):
+                raise ValueError(
+                    "completed Source derivation batch lacks output payload"
+                )
+            payload = json.loads(payload_json)
+            if not isinstance(payload, Mapping):
+                raise ValueError("Source derivation output payload is invalid")
+            if output_payload_hash(payload) != row["output_payload_hash"]:
+                raise ValueError("Source derivation output payload hash mismatch")
+            result = memory_extraction_result_from_output_payload(payload)
+            result.metadata = {
+                "structured_llm_calls": 0,
+                "reused_derivation_batch_count": 1,
+            }
+            results[str(row["batch_id"])] = result
+        return results
+
+    async def _source_derivation_attempt_unlocked(
+        self,
+        derivation_id: str,
+    ) -> SourceDerivationAttempt:
+        async with self.db.execute(
+            "SELECT * FROM source_derivation_attempts WHERE id = ?",
+            (derivation_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise ValueError("unknown Source derivation")
+        projection_payload = json.loads(row["projection_payload_json"])
+        context_payload = json.loads(row["context_payload_json"])
+        if (
+            hashlib.sha256(
+                json.dumps(
+                    projection_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            != row["projection_payload_hash"]
+        ):
+            raise ValueError("Source derivation projection payload hash mismatch")
+        if (
+            hashlib.sha256(
+                json.dumps(
+                    context_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            != row["context_payload_hash"]
+        ):
+            raise ValueError("Source derivation context payload hash mismatch")
+        batch_rows = await self.db.execute_fetchall(
+            """SELECT * FROM source_derivation_batches
+               WHERE derivation_id = ?
+               ORDER BY batch_id""",
+            (derivation_id,),
+        )
+        batches = []
+        for batch in batch_rows:
+            raw_fields = json.loads(batch["error_fields_json"] or "[]")
+            batches.append(
+                SourceDerivationBatchRecord(
+                    batch_id=str(batch["batch_id"]),
+                    input_payload_hash=str(batch["input_payload_hash"]),
+                    primary_observation_ids=tuple(
+                        str(value)
+                        for value in json.loads(
+                            batch["primary_observation_ids_json"]
+                        )
+                    ),
+                    status=str(batch["status"]),
+                    output_payload_hash=(
+                        str(batch["output_payload_hash"])
+                        if batch["output_payload_hash"] is not None
+                        else None
+                    ),
+                    error_type=(
+                        str(batch["error_type"])
+                        if batch["error_type"] is not None
+                        else None
+                    ),
+                    error_code=(
+                        str(batch["error_code"])
+                        if batch["error_code"] is not None
+                        else None
+                    ),
+                    error_fields=tuple(
+                        (
+                            str(value.get("location") or ""),
+                            str(value.get("type") or ""),
+                        )
+                        for value in raw_fields
+                        if isinstance(value, Mapping)
+                    ),
+                    attempt_count=int(batch["attempt_count"]),
+                )
+            )
+        return SourceDerivationAttempt(
+            id=str(row["id"]),
+            source_id=str(row["source_id"]),
+            source_unit_id=str(row["source_unit_id"]),
+            base_unit_revision_id=(
+                str(row["base_unit_revision_id"])
+                if row["base_unit_revision_id"] is not None
+                else None
+            ),
+            target_unit_revision_id=str(row["target_unit_revision_id"]),
+            projection=source_projection_from_payload(
+                projection_payload
+            ),
+            projection_payload_hash=str(row["projection_payload_hash"]),
+            projection_identity_hash=str(
+                row["projection_identity_hash"]
+            ),
+            context=source_unit_derivation_context_from_payload(
+                context_payload
+            ),
+            context_payload_hash=str(row["context_payload_hash"]),
+            context_identity_hash=str(row["context_identity_hash"]),
+            extraction_contract_version=str(
+                row["extraction_contract_version"]
+            ),
+            status=str(row["status"]),
+            batches=tuple(batches),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+            completed_at=(
+                str(row["completed_at"])
+                if row["completed_at"] is not None
+                else None
+            ),
+        )
 
     async def record_source_projection(
         self,
@@ -6596,6 +7190,56 @@ class Database:
                 )
         return {memory_id: tuple(grouped[memory_id]) for memory_id in ids}
 
+    async def get_active_memory_support_observation_ids_many(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        source_id: str,
+    ) -> Mapping[str, tuple[str, ...]]:
+        """Return every Observation in actively supported Evidence bundles."""
+
+        ids = tuple(
+            dict.fromkeys(
+                str(memory_id)
+                for memory_id in memory_ids
+                if memory_id
+            )
+        )
+        grouped: dict[str, set[str]] = {
+            memory_id: set() for memory_id in ids
+        }
+        for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = await self.db.execute_fetchall(
+                f"""SELECT DISTINCT msa.memory_id,
+                           bundle_er.observation_id
+                    FROM memory_support_assertions msa
+                    JOIN evidence_references supported_er
+                      ON supported_er.id = msa.evidence_reference_id
+                    JOIN evidence_units eu
+                      ON eu.id = supported_er.evidence_unit_id
+                     AND eu.source_id = msa.source_id
+                     AND eu.access_context_hash =
+                         msa.access_context_hash
+                    JOIN evidence_references bundle_er
+                      ON bundle_er.evidence_unit_id = eu.id
+                    WHERE msa.memory_id IN ({placeholders})
+                      AND msa.active = 1
+                      AND msa.source_id = ?
+                    ORDER BY msa.memory_id,
+                             bundle_er.observation_id""",
+                (*chunk, source_id),
+            )
+            for row in rows:
+                grouped[str(row["memory_id"])].add(
+                    str(row["observation_id"])
+                )
+        return {
+            memory_id: tuple(sorted(grouped[memory_id]))
+            for memory_id in ids
+        }
+
     async def get_source_unit_support_reference_ids(
         self,
         source_unit_id: str,
@@ -6649,12 +7293,19 @@ class Database:
         projection: SourceProjection,
         plan: LifecyclePlan,
         *,
+        document: DocumentRecord | None = None,
+        derivation_id: str | None = None,
+        derivation_context_identity_hash: str | None = None,
         expected_source_activity_epoch: int | None = None,
     ) -> None:
         """Advance Source Projection and Memory lifecycle in one transaction."""
 
         if projection.source_id != plan.scope.source_id:
             raise ValueError("projection and lifecycle plan belong to different sources")
+        if document is not None and document.source != projection.source_id:
+            raise ValueError(
+                "Document snapshot and projection belong to different sources"
+            )
         if len(projection.deltas) != 1:
             raise ValueError("atomic projected lifecycle requires exactly one Revision Delta")
         delta = projection.deltas[0]
@@ -6665,6 +7316,70 @@ class Database:
             raise ValueError("projection and lifecycle plan target different Source Unit revisions")
         async with self._write_lock:
             try:
+                if derivation_id is not None:
+                    if document is None:
+                        raise ValueError(
+                            "Source derivation lifecycle commit requires its staged Document"
+                        )
+                    if derivation_context_identity_hash is None:
+                        raise ValueError(
+                            "Source derivation lifecycle commit requires its context identity"
+                        )
+                    async with self.db.execute(
+                        """SELECT source_id, source_unit_id,
+                                  target_unit_revision_id, status,
+                                  projection_identity_hash,
+                                  context_payload_json,
+                                  context_identity_hash
+                           FROM source_derivation_attempts
+                           WHERE id = ?""",
+                        (derivation_id,),
+                    ) as cursor:
+                        derivation = await cursor.fetchone()
+                    if derivation is None:
+                        raise ValueError("unknown Source derivation")
+                    if (
+                        derivation["source_id"] != projection.source_id
+                        or derivation["source_unit_id"]
+                        != delta.source_unit_id
+                        or derivation["target_unit_revision_id"]
+                        != delta.current_unit_revision_id
+                        or derivation["status"]
+                        not in {
+                            SOURCE_DERIVATION_COMPLETED,
+                            "applied",
+                        }
+                    ):
+                        raise ValueError(
+                            "Source derivation is not ready for lifecycle commit"
+                        )
+                    if derivation["projection_identity_hash"] != (
+                        source_derivation_projection_identity_hash(projection)
+                    ):
+                        raise ValueError(
+                            "Source derivation projection identity mismatch"
+                        )
+                    if derivation["context_identity_hash"] != (
+                        derivation_context_identity_hash
+                    ):
+                        raise ValueError(
+                            "Source derivation context identity mismatch"
+                        )
+                    staged_context = source_unit_derivation_context_from_payload(
+                        json.loads(derivation["context_payload_json"])
+                    )
+                    if source_derivation_document_identity_hash(
+                        staged_context.document
+                    ) != source_derivation_document_identity_hash(document):
+                        raise ValueError(
+                            "Source derivation Document identity mismatch"
+                        )
+                if document is not None:
+                    await self._assert_document_source_writable_unlocked(
+                        document.source,
+                        require_configured_source=True,
+                    )
+                    await self._upsert_document_unlocked(document)
                 await self.record_source_projection(
                     projection,
                     expected_source_activity_epoch=expected_source_activity_epoch,
@@ -6675,6 +7390,15 @@ class Database:
                     _manage_transaction=False,
                     claim_identity_policy=ClaimIdentityPolicy.ORDINARY_EXTRACTION,
                 )
+                if derivation_id is not None:
+                    now = _now_iso()
+                    await self.db.execute(
+                        """UPDATE source_derivation_attempts
+                           SET status = 'applied', updated_at = ?,
+                               applied_at = COALESCE(applied_at, ?)
+                           WHERE id = ?""",
+                        (now, now, derivation_id),
+                    )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -13949,6 +14673,19 @@ class Database:
                        WHERE projection_run_id IN (
                            SELECT id FROM source_projection_runs WHERE source_id = ?
                        )""",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    """DELETE FROM source_derivation_batches
+                       WHERE derivation_id IN (
+                           SELECT id FROM source_derivation_attempts
+                           WHERE source_id = ?
+                       )""",
+                    (source_id,),
+                )
+                await self.db.execute(
+                    """DELETE FROM source_derivation_attempts
+                       WHERE source_id = ?""",
                     (source_id,),
                 )
                 await self.db.execute(

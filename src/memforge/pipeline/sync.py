@@ -57,7 +57,6 @@ from memforge.pipeline.source_projection_adapters import (
     project_source_unit_tombstone,
     source_run_projection_coverage,
 )
-from memforge.pipeline.projection_context import plan_projection_extraction_batches
 from memforge.memory.lifecycle_plan import AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON
 from memforge.memory.project_resolver import resolve_project_key
 from memforge.source_projection import (
@@ -74,6 +73,12 @@ from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
     StoredSourceArtifact,
     materialize_source_artifacts,
+    source_artifact_revision_from_metadata,
+)
+from memforge.source_derivation import (
+    SourceUnitDerivationContext,
+    SourceUnitDerivationRequest,
+    SourceUnitDeriver,
 )
 from memforge.source_projection_config import canonical_projection_scope
 
@@ -750,6 +755,17 @@ class GeneSyncOrchestrator:
         total_item_count = 0
 
         try:
+            if execution_mode is SourceSyncMode.NORMAL:
+                recovered = await self._resume_source_derivations(
+                    source_id=source_id,
+                    source_activity_epoch=source_activity_epoch,
+                )
+                docs_updated += recovered["updated"]
+                memories_extracted += recovered["memories_extracted"]
+                memories_corroborated += recovered[
+                    "memories_corroborated"
+                ]
+
             # ----------------------------------------------------------
             # Step 0: Authenticate
             # ----------------------------------------------------------
@@ -1365,6 +1381,106 @@ class GeneSyncOrchestrator:
         )
 
         return sync_state
+
+    async def _resume_source_derivations(
+        self,
+        *,
+        source_id: str,
+        source_activity_epoch: int | None,
+    ) -> dict[str, int]:
+        """Resume durable Source Unit work before reading the provider."""
+
+        stats = {
+            "processed": 0,
+            "updated": 0,
+            "memories_extracted": 0,
+            "memories_corroborated": 0,
+        }
+        attempts = await self.db.list_source_derivation_attempts(
+            source_id=source_id,
+            statuses=(
+                "pending",
+                "retryable_failure",
+                "completed",
+            ),
+        )
+        for attempt in attempts:
+            context = attempt.context
+            if context.source_activity_epoch != source_activity_epoch:
+                await self.db.supersede_source_derivation(attempt.id)
+                continue
+            current_revision = (
+                await self.db.get_current_source_unit_revision(
+                    attempt.source_unit_id
+                )
+            )
+            current_revision_id = (
+                current_revision.id
+                if current_revision is not None
+                else None
+            )
+            if current_revision_id not in {
+                attempt.base_unit_revision_id,
+                attempt.target_unit_revision_id,
+            }:
+                await self.db.supersede_source_derivation(attempt.id)
+                continue
+            projection = attempt.projection
+            extraction = await self._extract_projection_batches(
+                projection=projection,
+                source_type=projection.source_type,
+                doc_type=context.doc_type,
+                source_id=source_id,
+                derivation_context=context,
+            )
+            if extraction.error_type:
+                continue
+            projection = with_source_artifact_summaries(
+                projection,
+                extraction.artifact_summaries,
+            )
+            source_updated_at = (
+                datetime.fromisoformat(context.source_updated_at)
+                if context.source_updated_at is not None
+                else None
+            )
+            lifecycle_stats = (
+                await self.memory_engine.apply_projected_lifecycle(
+                    projection=projection,
+                    doc_id=context.document.doc_id,
+                    raw_memories=extraction.memories,
+                    doc_type=context.doc_type,
+                    project_key=context.project_key,
+                    repo_identifier=context.repo_identifier,
+                    document_content=context.document_content,
+                    update_mode=context.update_mode,
+                    changed_hunks=context.changed_hunks,
+                    update_plan_stats=(
+                        dict(context.update_plan_stats)
+                        if context.update_plan_stats is not None
+                        else None
+                    ),
+                    source_updated_at=source_updated_at,
+                    user_id=context.user_id,
+                    protected_source_observation_ids=(
+                        extraction.protected_source_observation_ids
+                    ),
+                    document=context.document,
+                    derivation_id=attempt.id,
+                    expected_source_activity_epoch=(
+                        source_activity_epoch
+                    ),
+                )
+            )
+            stats["processed"] += 1
+            stats["updated"] += 1
+            stats["memories_extracted"] += int(
+                lifecycle_stats.get("added", 0)
+            )
+            stats["memories_corroborated"] += int(
+                lifecycle_stats.get("updated", 0)
+            )
+        return stats
 
     # ==================================================================
     # Private: _process_item
@@ -2028,48 +2144,38 @@ class GeneSyncOrchestrator:
                 current_hash=new_hash,
             )
 
-        # ------------------------------------------------------------------
-        # 5. Store document record before expensive enrichment/memory work
-        # ------------------------------------------------------------------
-        async with self._db_lock:
-            await self.db.upsert_document(
-                doc_record,
-                require_configured_source=True,
-            )
-
         if empty_content and not stored_source_artifacts:
-            try:
-                memory_stats = await self.memory_engine.apply_projected_lifecycle(
-                    projection=projection,
-                    doc_id=doc_id,
-                    raw_memories=[],
-                    doc_type=f"{source_type}_empty",
-                    project_key=project_key,
-                    repo_identifier=normalized.source_semantics.get("repo_identifier"),
-                    document_content="",
-                    update_mode=update_plan.mode if update_plan else "full_document",
-                    changed_hunks=(update_plan.changed_hunks if update_plan else None),
-                    update_plan_stats=self._document_update_plan_stats(update_plan),
-                    source_updated_at=_source_updated_at_for_item(
-                        item,
-                        normalized.source_semantics,
-                    ),
-                    user_id=(
-                        str(normalized.source_semantics.get("uploader_user_id")).strip()
-                        if normalized.source_semantics.get("uploader_user_id")
-                        else None
-                    ),
-                    expected_source_activity_epoch=expected_source_activity_epoch,
-                )
-            except Exception as processing_error:
-                await self._restore_document_processing_snapshot_preserving_failure(
-                    doc_id=doc_id,
-                    existing_doc=existing_doc,
-                    processing_error=processing_error,
-                )
-                raise
-            await self.db.record_source_projection(
-                projection,
+            memory_stats = await self.memory_engine.apply_projected_lifecycle(
+                projection=projection,
+                doc_id=doc_id,
+                raw_memories=[],
+                doc_type=f"{source_type}_empty",
+                project_key=project_key,
+                repo_identifier=normalized.source_semantics.get(
+                    "repo_identifier"
+                ),
+                document_content="",
+                update_mode=(
+                    update_plan.mode if update_plan else "full_document"
+                ),
+                changed_hunks=(
+                    update_plan.changed_hunks if update_plan else None
+                ),
+                update_plan_stats=self._document_update_plan_stats(
+                    update_plan
+                ),
+                source_updated_at=_source_updated_at_for_item(
+                    item,
+                    normalized.source_semantics,
+                ),
+                user_id=(
+                    str(
+                        normalized.source_semantics.get("uploader_user_id")
+                    ).strip()
+                    if normalized.source_semantics.get("uploader_user_id")
+                    else None
+                ),
+                document=doc_record,
                 expected_source_activity_epoch=expected_source_activity_epoch,
             )
             stats["memories_extracted"] = memory_stats.get("added", 0)
@@ -2110,12 +2216,47 @@ class GeneSyncOrchestrator:
             return stats
 
         repo_identifier = normalized.source_semantics.get("repo_identifier")
+        source_updated_at = _source_updated_at_for_item(
+            item,
+            normalized.source_semantics,
+        )
+        uploader_user_id = normalized.source_semantics.get(
+            "uploader_user_id"
+        )
+        actor_user_id = (
+            str(uploader_user_id).strip()
+            if isinstance(uploader_user_id, str)
+            and uploader_user_id.strip()
+            else None
+        )
+        derivation_context = SourceUnitDerivationContext(
+            document=doc_record,
+            doc_type=source_type,
+            project_key=project_key,
+            repo_identifier=(
+                str(repo_identifier)
+                if repo_identifier is not None
+                else None
+            ),
+            document_content=markdown_body,
+            update_mode=(
+                update_plan.mode if update_plan else "full_document"
+            ),
+            changed_hunks=(
+                update_plan.changed_hunks if update_plan else None
+            ),
+            update_plan_stats=self._document_update_plan_stats(
+                update_plan
+            ),
+            source_updated_at=source_updated_at.isoformat(),
+            user_id=actor_user_id,
+            source_activity_epoch=expected_source_activity_epoch,
+        )
         # Extraction owns the only document-content model call. Historical
         # cross-document/cross-source discovery remains post-commit Relation
         # work; same-source incumbents are loaded by exact lifecycle lineage.
         extraction_result = await self._extract_for_document_update(
             projection=projection,
-            source_artifacts=stored_source_artifacts,
             update_plan=update_plan,
             markdown_body=markdown_body,
             source_type=source_type,
@@ -2125,28 +2266,17 @@ class GeneSyncOrchestrator:
             run_id=run_id,
             document_title=item.title,
             document_url=item.source_url,
+            derivation_context=derivation_context,
         )
 
         raw_memories = extraction_result.memories
         if extraction_result.error_type:
             error_detail = extraction_result.error or ""
-            processing_error = _memory_extraction_error(
+            raise _memory_extraction_error(
                 doc_id=doc_id,
                 error_type=extraction_result.error_type,
                 detail=error_detail,
             )
-            snapshot_restored = (
-                await self._restore_document_processing_snapshot_preserving_failure(
-                    doc_id=doc_id,
-                    existing_doc=existing_doc,
-                    processing_error=processing_error,
-                )
-            )
-            if not snapshot_restored:
-                raise RuntimeError(
-                    "document snapshot restore failed after memory extraction failure"
-                )
-            raise processing_error
         projection = with_source_artifact_summaries(
             projection,
             extraction_result.artifact_summaries,
@@ -2177,42 +2307,24 @@ class GeneSyncOrchestrator:
         # 8. Bind claims to revision-pinned evidence and apply one complete,
         # stale-guarded Lifecycle Plan for this Source Unit.
         # ------------------------------------------------------------------
-        source_updated_at = _source_updated_at_for_item(item, normalized.source_semantics)
-        uploader_user_id = normalized.source_semantics.get("uploader_user_id")
-        actor_user_id = (
-            str(uploader_user_id).strip() if isinstance(uploader_user_id, str) and uploader_user_id.strip() else None
-        )
-        try:
-            memory_stats = await self.memory_engine.apply_projected_lifecycle(
-                projection=projection,
-                doc_id=doc_id,
-                raw_memories=raw_memories,
-                doc_type=source_type,
-                project_key=project_key,
-                repo_identifier=repo_identifier,
-                document_content=markdown_body,
-                update_mode=update_plan.mode if update_plan else "full_document",
-                changed_hunks=update_plan.changed_hunks if update_plan else None,
-                update_plan_stats=self._document_update_plan_stats(update_plan),
-                source_updated_at=source_updated_at,
-                user_id=actor_user_id,
-                expected_source_activity_epoch=expected_source_activity_epoch,
-            )
-        except Exception as processing_error:
-            # Projection and lifecycle roll back together. Existing Documents
-            # restore their prior snapshot; new Documents remain staged. In
-            # both cases the missing target projection requires retry work.
-            await self._restore_document_processing_snapshot_preserving_failure(
-                doc_id=doc_id,
-                existing_doc=existing_doc,
-                processing_error=processing_error,
-            )
-            raise
-        # The production engine commits this projection with its Lifecycle
-        # Plan. The idempotent write also keeps narrow test/custom engines on
-        # the same success-only projection contract.
-        await self.db.record_source_projection(
-            projection,
+        memory_stats = await self.memory_engine.apply_projected_lifecycle(
+            projection=projection,
+            doc_id=doc_id,
+            raw_memories=raw_memories,
+            doc_type=source_type,
+            project_key=project_key,
+            repo_identifier=repo_identifier,
+            document_content=markdown_body,
+            update_mode=update_plan.mode if update_plan else "full_document",
+            changed_hunks=update_plan.changed_hunks if update_plan else None,
+            update_plan_stats=self._document_update_plan_stats(update_plan),
+            source_updated_at=source_updated_at,
+            user_id=actor_user_id,
+            protected_source_observation_ids=(
+                extraction_result.protected_source_observation_ids
+            ),
+            document=doc_record,
+            derivation_id=extraction_result.derivation_id,
             expected_source_activity_epoch=expected_source_activity_epoch,
         )
         stats["memories_extracted"] = memory_stats.get("added", 0)
@@ -2331,7 +2443,6 @@ class GeneSyncOrchestrator:
         self,
         *,
         projection: SourceProjection,
-        source_artifacts: tuple[StoredSourceArtifact, ...],
         update_plan: DocumentUpdatePlan | None,
         markdown_body: str,
         source_type: str,
@@ -2341,15 +2452,9 @@ class GeneSyncOrchestrator:
         run_id: str | None,
         document_title: str,
         document_url: str,
+        derivation_context: SourceUnitDerivationContext | None = None,
     ) -> MemoryExtractionResult:
         """Run full extraction or diff-guided extraction for a document."""
-        projection_batches = plan_projection_extraction_batches(projection)
-        prefer_single_observation_diff = (
-            len(projection.observations) == 1
-            and update_plan is not None
-            and update_plan.mode == "diff_guided"
-            and hasattr(self.memory_extractor, "extract_memory_changes")
-        )
         changed_observation_ids = {
             anchor.observation_id
             for delta in projection.deltas
@@ -2360,7 +2465,7 @@ class GeneSyncOrchestrator:
             for delta in projection.deltas
             for observation_id in delta.added_observation_ids
         )
-        if not projection_batches and not changed_observation_ids:
+        if not changed_observation_ids:
             result = MemoryExtractionResult(
                 memories=[],
                 metadata={"projection_changed_observation_count": 0},
@@ -2375,19 +2480,20 @@ class GeneSyncOrchestrator:
                 extraction_metadata=result.metadata,
             )
             return result
-        if (
-            (len(projection.observations) > 1 or len(projection_batches) > 1)
-            and not prefer_single_observation_diff
-            and projection_batches
-            and hasattr(self.memory_extractor, "extract_projection_batch_memories")
+        if changed_observation_ids and hasattr(
+            self.memory_extractor,
+            "extract_projection_batch_memories",
         ):
+            if derivation_context is None:
+                raise ValueError(
+                    "projection batch extraction requires a durable derivation context"
+                )
             result = await self._extract_projection_batches(
-                projection_batches=projection_batches,
                 projection=projection,
-                source_artifacts=source_artifacts,
                 source_type=source_type,
                 doc_type=doc_type,
                 source_id=source_id,
+                derivation_context=derivation_context,
             )
             await self._record_memory_extraction_result(
                 mode="projection_batches",
@@ -2553,12 +2659,11 @@ class GeneSyncOrchestrator:
     async def _extract_projection_batches(
         self,
         *,
-        projection_batches,
         projection: SourceProjection,
-        source_artifacts: tuple[StoredSourceArtifact, ...],
         source_type: str,
         doc_type: str,
         source_id: str,
+        derivation_context: SourceUnitDerivationContext,
     ) -> MemoryExtractionResult:
         """Execute all transient Observation batches as one extraction outcome."""
 
@@ -2570,7 +2675,6 @@ class GeneSyncOrchestrator:
             ) as admission:
                 batch_images = self._projection_images(
                     projection=projection,
-                    source_artifacts=source_artifacts,
                     observation_ids=primary_ids,
                 )
                 result = await self.memory_extractor.extract_projection_batch_memories(
@@ -2588,79 +2692,46 @@ class GeneSyncOrchestrator:
                 }
                 return result
 
-        results = await collect_bounded(
-            projection_batches,
-            extract_one,
-            max_concurrent=self._source_parallelism_limit(),
-        )
-        llm_metrics = _aggregate_extraction_metrics(results)
-        memories = []
-        artifact_summaries = []
-        failures = [result for result in results if result.error_type]
-        for result in results:
-            if not result.error_type:
-                memories.extend(result.memories)
-                artifact_summaries.extend(result.artifact_summaries)
-        if failures:
-            first = failures[0]
-            return MemoryExtractionResult(
-                error_type="projection_batch_failure",
-                error=first.error or first.error_type,
-                metadata={
-                    **llm_metrics,
-                    "batch_count": len(projection_batches),
-                    "failed_batch_count": len(failures),
-                    "extracted_count_before_failure": len(memories),
-                },
+        result = await SourceUnitDeriver(self.db).derive(
+            SourceUnitDerivationRequest(
+                projection=projection,
+                context=derivation_context,
+                extract_batch=extract_one,
+                max_concurrent=self._source_parallelism_limit(),
             )
-        artifact_summary_ids = [
-            item.source_observation_id for item in artifact_summaries
-        ]
-        if len(set(artifact_summary_ids)) != len(artifact_summary_ids):
-            return MemoryExtractionResult(
-                error_type="projection_batch_failure",
-                error="duplicate Source Artifact summary Observation id across batches",
-                metadata={
-                    **llm_metrics,
-                    "batch_count": len(projection_batches),
-                    "failed_batch_count": 1,
-                    "extracted_count_before_failure": len(memories),
-                },
-            )
-        return MemoryExtractionResult(
-            memories=memories,
-            artifact_summaries=tuple(artifact_summaries),
-            metadata={
-                **llm_metrics,
-                "batch_count": len(projection_batches),
-                "failed_batch_count": 0,
-            },
         )
+        result.extraction.derivation_id = result.derivation.id
+        return result.extraction
 
     def _projection_images(
         self,
         *,
         projection: SourceProjection,
-        source_artifacts: tuple[StoredSourceArtifact, ...],
         observation_ids: set[str],
     ) -> tuple[StructuredLlmImage, ...]:
         """Load exact stored bytes for image Artifact Observations only."""
 
-        artifacts_by_id = {artifact.id: artifact for artifact in source_artifacts}
         images = []
         total_bytes = 0
+        source_unit_id = projection.source_units[0].id
         for revision in projection.observation_revisions:
             if revision.observation_id not in observation_ids:
                 continue
-            raw = revision.metadata.get("source_artifact")
-            if not isinstance(raw, dict):
+            if "source_artifact" not in revision.metadata:
                 continue
-            media_type = str(raw.get("media_type") or "")
-            if not media_type.startswith("image/"):
-                continue
-            artifact = artifacts_by_id.get(str(raw.get("artifact_id") or ""))
+            artifact = source_artifact_revision_from_metadata(
+                observation_id=revision.observation_id,
+                observation_revision_id=revision.id,
+                source_id=projection.source_id,
+                source_unit_id=source_unit_id,
+                metadata=revision.metadata,
+            )
             if artifact is None:
-                raise RuntimeError("projected image Artifact is unavailable for extraction")
+                raise RuntimeError(
+                    "projected Source Artifact metadata is invalid"
+                )
+            if not artifact.media_type.startswith("image/"):
+                continue
             if not artifact.inference_eligible:
                 continue
             total_bytes += artifact.size_bytes
@@ -3260,44 +3331,6 @@ class GeneSyncOrchestrator:
         ) as cursor:
             row = await cursor.fetchone()
             return int(row[0] if row else 0)
-
-    async def _restore_document_processing_snapshot(
-        self,
-        *,
-        doc_id: str,
-        existing_doc: DocumentRecord | None,
-    ) -> None:
-        # A new Document is a durable content read model, not lifecycle
-        # authority. Keep that stage so the retry can reuse its artifacts and
-        # let the still-missing Source Projection require semantic work.
-        if existing_doc is None:
-            return
-        async with self._db_lock:
-            await self.db.restore_document_snapshot(
-                existing_doc,
-                require_configured_source=True,
-            )
-
-    async def _restore_document_processing_snapshot_preserving_failure(
-        self,
-        *,
-        doc_id: str,
-        existing_doc: DocumentRecord | None,
-        processing_error: Exception,
-    ) -> bool:
-        try:
-            await self._restore_document_processing_snapshot(
-                doc_id=doc_id,
-                existing_doc=existing_doc,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to restore staged Document %s after processing error: %s",
-                doc_id,
-                processing_error,
-            )
-            return False
-        return True
 
     async def _insert_changelog(self, entry: ChangelogEntry) -> None:
         """Insert a changelog entry into the database.

@@ -23,7 +23,6 @@ from memforge.llm.structured_images import (
     StructuredLlmImageError,
     prepare_structured_llm_images as _prepare_structured_llm_images,
 )
-from memforge.source_artifacts import MAX_SOURCE_ARTIFACT_SUMMARY_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -175,19 +174,38 @@ class MemoryCandidate(StructuredResponseModel):
 
 
 class ArtifactSelectionSummary(StructuredResponseModel):
-    """Concise selection hint for one exact image supplied to extraction."""
+    """Untrusted optional selection hint validated independently from Memories."""
 
     model_config = ConfigDict(extra="ignore")
 
-    source_observation_id: str = Field(min_length=1)
-    summary: str = Field(min_length=1, max_length=MAX_SOURCE_ARTIFACT_SUMMARY_CHARS)
+    # Keep the provider schema simple and typed. The pre-validator isolates
+    # malformed optional values as empty entries so they cannot invalidate
+    # schema-valid Memory judgments in the same response.
+    source_observation_id: str = ""
+    summary: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _isolate_invalid_entry(cls, value: object) -> Mapping[str, object]:
+        if not isinstance(value, Mapping):
+            return {}
+        return {
+            "source_observation_id": (
+                value.get("source_observation_id")
+                if isinstance(value.get("source_observation_id"), str)
+                else ""
+            ),
+            "summary": (
+                value.get("summary")
+                if isinstance(value.get("summary"), str)
+                else ""
+            ),
+        }
 
     @model_validator(mode="after")
     def _normalize(self) -> ArtifactSelectionSummary:
         self.source_observation_id = self.source_observation_id.strip()
         self.summary = " ".join(self.summary.split())
-        if not self.source_observation_id or not self.summary:
-            raise ValueError("Artifact summary fields must contain non-whitespace text")
         return self
 
 
@@ -197,6 +215,39 @@ class MemoryExtractionResponse(StructuredResponseModel):
     model_config = ConfigDict(extra="ignore")
 
     memories: list[MemoryCandidate]
+    artifact_summaries: list[ArtifactSelectionSummary] = Field(default_factory=list)
+
+
+class ProjectionMemoryCandidate(StructuredResponseModel):
+    """Model judgments for one projection candidate; anchors are derived locally."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    content: str = Field(min_length=1)
+    memory_type: Literal["fact", "decision", "convention", "procedure"]
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    entity_refs: list[str] = Field(default_factory=list)
+    valid_from: str | None = None
+    valid_until: str | None = None
+    evidence_quote: str | None = None
+    source_observation_id: str | None = None
+    required_source_observation_ids: list[str] = Field(default_factory=list)
+
+    @property
+    def extraction_context(self) -> None:
+        return None
+
+    @property
+    def evidence_anchor(self) -> Literal["unknown"]:
+        return "unknown"
+
+
+class ProjectionMemoryExtractionResponse(StructuredResponseModel):
+    """Projection extraction schema containing model judgments only."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    memories: list[ProjectionMemoryCandidate]
     artifact_summaries: list[ArtifactSelectionSummary] = Field(default_factory=list)
 
 
@@ -517,6 +568,16 @@ class SourceSupportStructuredClient(Protocol):
     ) -> MemoryExtractionResponse:
         """Return schema-validated extracted memory candidates."""
 
+    async def extract_projection_memories(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> ProjectionMemoryExtractionResponse:
+        """Return projection judgments without datastore-owned anchor fields."""
+
     async def select_memory_candidates(
         self,
         prompt: str,
@@ -617,10 +678,12 @@ class StructuredLlmError(RuntimeError):
         *,
         terminal_category: StructuredLlmTerminalCategory = "invalid_response",
         error_code: str = "structured_llm_error",
+        validation_fields: tuple[tuple[str, str], ...] = (),
     ) -> None:
         super().__init__(message)
         self.terminal_category = terminal_category
         self.error_code = error_code
+        self.validation_fields = validation_fields
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,6 +692,7 @@ class _StructuredLlmFailure:
 
     terminal_category: StructuredLlmTerminalCategory
     error_code: str
+    validation_fields: tuple[tuple[str, str], ...] = ()
 
     def to_error(self, *, timeout_s: float | None = None) -> StructuredLlmError:
         if self.terminal_category == "deadline_exceeded":
@@ -646,6 +710,7 @@ class _StructuredLlmFailure:
             message,
             terminal_category=self.terminal_category,
             error_code=self.error_code,
+            validation_fields=self.validation_fields,
         )
 
 
@@ -727,6 +792,7 @@ def _structured_failure(
         return _StructuredLlmFailure(
             terminal_category=terminal_category or exc.terminal_category,
             error_code=exc.error_code,
+            validation_fields=exc.validation_fields,
         )
     category = terminal_category
     if category is None:
@@ -734,7 +800,29 @@ def _structured_failure(
     return _StructuredLlmFailure(
         terminal_category=category,
         error_code=_safe_provider_error_code(exc),
+        validation_fields=_safe_validation_fields(exc),
     )
+
+
+def _safe_validation_fields(
+    exc: BaseException,
+) -> tuple[tuple[str, str], ...]:
+    """Return only schema field paths and rule types from Pydantic failures."""
+
+    if not isinstance(exc, ValidationError):
+        return ()
+    fields: list[tuple[str, str]] = []
+    for error in exc.errors(include_url=False, include_context=False, include_input=False):
+        location_parts = [
+            str(part)
+            for part in error.get("loc", ())
+            if isinstance(part, (str, int))
+        ]
+        location = ".".join(location_parts) or "$"
+        rule_type = str(error.get("type") or "").strip()
+        if rule_type:
+            fields.append((location, rule_type))
+    return tuple(fields)
 
 
 def _message_content(response) -> object:
@@ -952,6 +1040,22 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=MemoryExtractionResponse,
+            max_tokens=max_tokens,
+            model=model,
+            images=images,
+        )
+
+    async def extract_projection_memories(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> ProjectionMemoryExtractionResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=ProjectionMemoryExtractionResponse,
             max_tokens=max_tokens,
             model=model,
             images=images,
