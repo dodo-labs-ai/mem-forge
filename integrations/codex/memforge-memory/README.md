@@ -114,4 +114,9 @@ The bundled MCP proxy exposes tools such as `search`, `get_memory`, and
 `MEMFORGE_API_URL`; in `file` mode it writes the artifact to
 `~/.memforge-agent/artifacts`.
 
+For guided workspace setup, ask Codex to use **MemForge Setup** to configure a
+global default, manage the current repository override, or inspect the
+effective selection. The skill previews and validates changes before asking for
+confirmation.
+
 Hooks do not write canonical memories directly.
