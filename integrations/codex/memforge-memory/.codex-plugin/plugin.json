@@ -9,6 +9,7 @@
   "keywords": ["memory", "hooks", "codex", "memforge"],
   "hooks": "./hooks/hooks.json",
   "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
   "interface": {
     "displayName": "MemForge Memory",
     "shortDescription": "Connects Codex to MemForge hooks and MCP memory tools.",
