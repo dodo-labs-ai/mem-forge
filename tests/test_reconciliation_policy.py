@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, timezone
 
 import pytest
@@ -173,6 +175,138 @@ async def test_more_than_thirty_incumbents_use_bounded_batches_and_close_one_led
         operation.action is ReconcileAction.NOOP
         for operation in result.operations
     )
+
+
+@pytest.mark.asyncio
+async def test_many_new_candidates_compose_relation_cells_and_incumbent_audit() -> None:
+    candidates = [
+        RawMemory(content=f"New durable claim {index}", memory_type="fact")
+        for index in range(55)
+    ]
+    incumbent = _memory("mem-existing", "Existing durable claim")
+
+    class ComposedLedgerClient:
+        def __init__(self) -> None:
+            self.candidate_batch_sizes: list[int] = []
+            self.audit_calls = 0
+
+        async def reconcile_memories(self, prompt: str, **kwargs):
+            del kwargs
+            candidate_payload = json.loads(
+                re.search(
+                    r"<new_extractions>\n(.*?)\n</new_extractions>",
+                    prompt,
+                    re.DOTALL,
+                ).group(1)
+            )
+            incumbent_payload = json.loads(
+                re.search(
+                    r"<existing_memories>\n(.*?)\n</existing_memories>",
+                    prompt,
+                    re.DOTALL,
+                ).group(1)
+            )
+            if "independent incumbent-support audit" in prompt:
+                self.audit_calls += 1
+                assert candidate_payload == []
+                return ReconciliationResponse(
+                    decisions=[
+                        ReconciliationDecision(
+                            action="NOOP",
+                            memory_id=item["id"],
+                            reason="still supported",
+                        )
+                        for item in incumbent_payload
+                    ]
+                )
+            self.candidate_batch_sizes.append(len(candidate_payload))
+            return ReconciliationResponse(
+                decisions=[
+                    ReconciliationDecision(
+                        index=item["index"],
+                        action="ADD",
+                        reason="no incumbent match in this relation cell",
+                    )
+                    for item in candidate_payload
+                ]
+            )
+
+    client = ComposedLedgerClient()
+    result = await reconcile_memories(
+        new_extractions=candidates,
+        existing_memories=[incumbent],
+        doc_type="design",
+        structured_llm_client=client,
+        updated_document="# Current design",
+        include_metadata=True,
+    )
+
+    assert result.failure is None
+    assert client.candidate_batch_sizes == [24, 24, 7]
+    assert client.audit_calls == 1
+    assert result.metrics.model_batch_count == 4
+    assert result.metrics.structured_llm_calls == 4
+    assert len(result.operations) == 56
+    assert sum(
+        operation.action is ReconcileAction.ADD for operation in result.operations
+    ) == 55
+    assert result.operations[-1].memory_id == incumbent.id
+    assert result.operations[-1].action is ReconcileAction.NOOP
+
+
+@pytest.mark.asyncio
+async def test_incomplete_candidate_relation_cell_invalidates_composed_ledger() -> None:
+    candidates = [
+        RawMemory(content=f"New durable claim {index}", memory_type="fact")
+        for index in range(25)
+    ]
+    incumbent = _memory("mem-existing", "Existing durable claim")
+
+    class IncompleteCellClient:
+        async def reconcile_memories(self, prompt: str, **kwargs):
+            del kwargs
+            candidate_payload = json.loads(
+                re.search(
+                    r"<new_extractions>\n(.*?)\n</new_extractions>",
+                    prompt,
+                    re.DOTALL,
+                ).group(1)
+            )
+            if "independent incumbent-support audit" in prompt:
+                return ReconciliationResponse(
+                    decisions=[
+                        ReconciliationDecision(
+                            action="NOOP",
+                            memory_id=incumbent.id,
+                            reason="still supported",
+                        )
+                    ]
+                )
+            if len(candidate_payload) == 1:
+                return ReconciliationResponse(decisions=[])
+            return ReconciliationResponse(
+                decisions=[
+                    ReconciliationDecision(
+                        index=item["index"],
+                        action="ADD",
+                        reason="no incumbent match in this relation cell",
+                    )
+                    for item in candidate_payload
+                ]
+            )
+
+    result = await reconcile_memories(
+        new_extractions=candidates,
+        existing_memories=[incumbent],
+        doc_type="design",
+        structured_llm_client=IncompleteCellClient(),
+        updated_document="# Current design",
+        include_metadata=True,
+    )
+
+    assert result.operations == []
+    assert result.failure is not None
+    assert "missing new extraction decisions: [24]" in result.failure.error
 
 
 @pytest.mark.asyncio
