@@ -20,7 +20,7 @@ admin-ui/node_modules/
 admin-ui/dist/
 admin-ui/.tmp-test/
 
-# Local runtime data
+# Local runtime data and repository workspace configuration
 data/
 *.db
 *.db-wal

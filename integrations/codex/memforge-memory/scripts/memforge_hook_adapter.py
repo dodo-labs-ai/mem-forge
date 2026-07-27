@@ -194,8 +194,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.mode == "worker-run-once":
+        try:
+            run_agent_window_worker_once(timeout=args.timeout)
+            return 0
+        except Exception as exc:  # Hooks must not crash the coding session.
+            print(
+                json.dumps(
+                    {
+                        "continue": True,
+                        "systemMessage": f"MemForge hook skipped: {_safe_exception_message(exc)}",
+                    }
+                ),
+            )
+            return 0
+
     try:
-        configured_target()
+        try:
+            payload = _read_hook_payload()
+        except OSError:
+            payload = {}
+        configured_target(_target_repository_paths(payload))
     except ValueError as exc:
         print(
             json.dumps(
@@ -208,10 +227,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        if args.mode == "worker-run-once":
-            run_agent_window_worker_once(timeout=args.timeout)
-            return 0
-        payload = _read_hook_payload()
         if args.mode == "context":
             return _run_context(payload, client=args.client, timeout=args.timeout)
         return _run_submit_session(payload, client=args.client, timeout=args.timeout)
@@ -788,7 +803,7 @@ def _agent_worker_timeout() -> float:
 
 
 def _post_json(path: str, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
-    url = _resource_url(path)
+    url = _resource_url(path, repository_paths=_target_repository_paths(payload))
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     api_token = configured_api_token()
@@ -814,8 +829,15 @@ def _post_json(path: str, payload: dict[str, Any], *, timeout: float) -> dict[st
     return data
 
 
-def _resource_url(path: str) -> str:
-    return configured_target().resource_url(path)
+def _resource_url(path: str, *, repository_paths: tuple[str, ...] = ()) -> str:
+    return configured_target(repository_paths).resource_url(path)
+
+
+def _target_repository_paths(payload: dict[str, Any]) -> tuple[str, ...]:
+    workspace = payload.get("cwd") or payload.get("workspace")
+    if isinstance(workspace, str) and workspace.strip():
+        return (workspace,)
+    return ()
 
 
 def _event_name(payload: dict[str, Any]) -> str:

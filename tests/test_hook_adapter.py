@@ -1075,6 +1075,36 @@ def test_mcp_and_hook_share_cloud_resource_url(monkeypatch):
     )
 
 
+def test_mcp_roots_and_hook_workspace_share_repository_workspace_override(monkeypatch, tmp_path):
+    from memforge import hook_adapter, plugin_config, plugin_mcp_proxy
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / ".git").mkdir()
+    local_config = repository / ".memforge" / "config.toml"
+    local_config.parent.mkdir()
+    local_config.write_text('[memforge]\nworkspace_id = "repository_workspace"\n', encoding="utf-8")
+    user_config = tmp_path / "codex-config.toml"
+    user_config.write_text(
+        """
+[memforge]
+MEMFORGE_API_URL = "https://cloud.example.hana.ondemand.com"
+MEMFORGE_WORKSPACE_ID = "user_workspace"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(user_config))
+    monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
+    _provide_mcp_roots(plugin_mcp_proxy, repository)
+
+    assert plugin_mcp_proxy._resource_url("/sources") == (
+        "https://cloud.example.hana.ondemand.com/api/workspaces/repository_workspace/api/sources"
+    )
+    assert hook_adapter._resource_url("/hooks/receipts", repository_paths=(str(repository),)) == (
+        "https://cloud.example.hana.ondemand.com/api/workspaces/repository_workspace/api/hooks/receipts"
+    )
+
+
 def test_invalid_hook_target_fails_before_urlopen(monkeypatch):
     from memforge import hook_adapter
 
