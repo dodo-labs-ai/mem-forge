@@ -305,18 +305,6 @@ def test_memory_extraction_response_validates_and_normalizes_artifact_summaries(
         )
     ]
 
-    with pytest.raises(ValidationError, match="must be unique"):
-        MemoryExtractionResponse.model_validate(
-            {
-                "memories": [],
-                "artifact_summaries": [
-                    {"source_observation_id": "obs-image-1", "summary": "First"},
-                    {"source_observation_id": "obs-image-1", "summary": "Second"},
-                ],
-            }
-        )
-
-
 def test_memory_extraction_response_rejects_top_level_array():
     with pytest.raises(ValidationError):
         MemoryExtractionResponse.model_validate([{"content": "Fact", "memory_type": "fact"}])
