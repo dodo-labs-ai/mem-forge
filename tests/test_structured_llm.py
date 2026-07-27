@@ -17,7 +17,9 @@ from memforge.llm.structured import (
     ArtifactSelectionSummary,
     AgentSessionAuthorityResponse,
     CandidateLedgerResponse,
+    CandidateRelationResponse,
     EntityValidationResponse,
+    IncumbentSupportAuditResponse,
     LiteLlmStructuredClient,
     MemoryCandidate,
     MemoryExtractionResponse,
@@ -886,6 +888,12 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         schema = kwargs["response_format"]
         if schema is ReconciliationResponse:
             return CompletionResponse('{"decisions":[{"action":"ADD","index":0,"reason":"new"}]}')
+        if schema is CandidateRelationResponse:
+            return CompletionResponse('{"decisions":[{"action":"ADD","index":0,"reason":"new"}]}')
+        if schema is IncumbentSupportAuditResponse:
+            return CompletionResponse(
+                '{"decisions":[{"action":"NOOP","memory_id":"mem-1","reason":"supported"}]}'
+            )
         if schema is CandidateLedgerResponse:
             return CompletionResponse('{"decisions":[{"index":0,"action":"KEEP"}]}')
         if schema is MemoryRelationResponse:
@@ -914,6 +922,8 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
 
     assert (await client.select_memory_candidates("prompt")).decisions[0].action == "KEEP"
     assert (await client.reconcile_memories("prompt")).decisions[0].action == "ADD"
+    assert (await client.reconcile_candidate_relations("prompt")).decisions[0].index == 0
+    assert (await client.audit_incumbent_support("prompt")).decisions[0].memory_id == "mem-1"
     assert (await client.classify_memory_relations("prompt")).decisions[0].direction == "challenger_to_candidate"
     assert (await client.validate_memory_support("prompt")).supported is True
     assert (await client.validate_entity_match("prompt")).matched_id == 7
@@ -922,11 +932,41 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     assert [call["response_format"] for call in calls] == [
         CandidateLedgerResponse,
         ReconciliationResponse,
+        CandidateRelationResponse,
+        IncumbentSupportAuditResponse,
         MemoryRelationResponse,
         MemorySupportValidationResponse,
         EntityValidationResponse,
         RerankResponse,
     ]
+
+
+def test_composed_reconciliation_schemas_reject_cross_phase_decisions() -> None:
+    with pytest.raises(ValidationError):
+        CandidateRelationResponse.model_validate(
+            {
+                "decisions": [
+                    {
+                        "action": "NOOP",
+                        "memory_id": "mem-1",
+                        "reason": "unindexed incumbent audit row",
+                    }
+                ]
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        IncumbentSupportAuditResponse.model_validate(
+            {
+                "decisions": [
+                    {
+                        "action": "ADD",
+                        "index": 0,
+                        "reason": "candidate row in incumbent audit",
+                    }
+                ]
+            }
+        )
 
 
 @pytest.mark.asyncio

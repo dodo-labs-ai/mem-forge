@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.llm.structured import (
+    CandidateRelationDecision,
+    CandidateRelationResponse,
+    IncumbentSupportAuditDecision,
+    IncumbentSupportAuditResponse,
     ReconciliationDecision,
     ReconciliationResponse,
     StructuredLlmError,
@@ -190,7 +194,7 @@ async def test_many_new_candidates_compose_relation_cells_and_incumbent_audit() 
             self.candidate_batch_sizes: list[int] = []
             self.audit_calls = 0
 
-        async def reconcile_memories(self, prompt: str, **kwargs):
+        async def reconcile_candidate_relations(self, prompt: str, **kwargs):
             del kwargs
             candidate_payload = json.loads(
                 re.search(
@@ -199,6 +203,20 @@ async def test_many_new_candidates_compose_relation_cells_and_incumbent_audit() 
                     re.DOTALL,
                 ).group(1)
             )
+            self.candidate_batch_sizes.append(len(candidate_payload))
+            return CandidateRelationResponse(
+                decisions=[
+                    CandidateRelationDecision(
+                        index=item["index"],
+                        action="ADD",
+                        reason="no incumbent match in this relation cell",
+                    )
+                    for item in candidate_payload
+                ]
+            )
+
+        async def audit_incumbent_support(self, prompt: str, **kwargs):
+            del kwargs
             incumbent_payload = json.loads(
                 re.search(
                     r"<existing_memories>\n(.*?)\n</existing_memories>",
@@ -206,28 +224,15 @@ async def test_many_new_candidates_compose_relation_cells_and_incumbent_audit() 
                     re.DOTALL,
                 ).group(1)
             )
-            if "independent incumbent-support audit" in prompt:
-                self.audit_calls += 1
-                assert candidate_payload == []
-                return ReconciliationResponse(
-                    decisions=[
-                        ReconciliationDecision(
-                            action="NOOP",
-                            memory_id=item["id"],
-                            reason="still supported",
-                        )
-                        for item in incumbent_payload
-                    ]
-                )
-            self.candidate_batch_sizes.append(len(candidate_payload))
-            return ReconciliationResponse(
+            self.audit_calls += 1
+            return IncumbentSupportAuditResponse(
                 decisions=[
-                    ReconciliationDecision(
-                        index=item["index"],
-                        action="ADD",
-                        reason="no incumbent match in this relation cell",
+                    IncumbentSupportAuditDecision(
+                        action="NOOP",
+                        memory_id=item["id"],
+                        reason="still supported",
                     )
-                    for item in candidate_payload
+                    for item in incumbent_payload
                 ]
             )
 
@@ -263,7 +268,7 @@ async def test_incomplete_candidate_relation_cell_invalidates_composed_ledger() 
     incumbent = _memory("mem-existing", "Existing durable claim")
 
     class IncompleteCellClient:
-        async def reconcile_memories(self, prompt: str, **kwargs):
+        async def reconcile_candidate_relations(self, prompt: str, **kwargs):
             del kwargs
             candidate_payload = json.loads(
                 re.search(
@@ -272,26 +277,28 @@ async def test_incomplete_candidate_relation_cell_invalidates_composed_ledger() 
                     re.DOTALL,
                 ).group(1)
             )
-            if "independent incumbent-support audit" in prompt:
-                return ReconciliationResponse(
-                    decisions=[
-                        ReconciliationDecision(
-                            action="NOOP",
-                            memory_id=incumbent.id,
-                            reason="still supported",
-                        )
-                    ]
-                )
             if len(candidate_payload) == 1:
-                return ReconciliationResponse(decisions=[])
-            return ReconciliationResponse(
+                return CandidateRelationResponse(decisions=[])
+            return CandidateRelationResponse(
                 decisions=[
-                    ReconciliationDecision(
+                    CandidateRelationDecision(
                         index=item["index"],
                         action="ADD",
                         reason="no incumbent match in this relation cell",
                     )
                     for item in candidate_payload
+                ]
+            )
+
+        async def audit_incumbent_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return IncumbentSupportAuditResponse(
+                decisions=[
+                    IncumbentSupportAuditDecision(
+                        action="NOOP",
+                        memory_id=incumbent.id,
+                        reason="still supported",
+                    )
                 ]
             )
 
