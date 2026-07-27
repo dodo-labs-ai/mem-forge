@@ -554,6 +554,19 @@ class _CandidateLedgerClient:
         return self.response
 
 
+def _candidate_ledger_response(
+    *decisions: CandidateLedgerDecision | None,
+) -> CandidateLedgerResponse:
+    return CandidateLedgerResponse(
+        **{
+            f"slot_{index:02d}": (
+                decisions[index] if index < len(decisions) else None
+            )
+            for index in range(24)
+        }
+    )
+
+
 class _FailingOutboxDrainer(_OutboxDrainer):
     async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id: str) -> LifecycleVectorDeliveryResult:
         del lifecycle_plan_id
@@ -716,7 +729,7 @@ async def test_incomplete_candidate_ledger_is_audited_and_writes_no_memory(
     )
     observation_id = projection.observations[0].id
     client = _CandidateLedgerClient(
-        CandidateLedgerResponse(decisions=[CandidateLedgerDecision(index=0, action="KEEP")])
+        _candidate_ledger_response(CandidateLedgerDecision(action="KEEP"))
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import gc
 from io import BytesIO
+import json
 import logging
 from time import perf_counter
 import weakref
@@ -891,11 +892,18 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         if schema is CandidateRelationResponse:
             return CompletionResponse('{"decisions":[{"action":"ADD","index":0,"reason":"new"}]}')
         if schema is IncumbentSupportAuditResponse:
-            return CompletionResponse(
-                '{"decisions":[{"action":"NOOP","memory_id":"mem-1","reason":"supported"}]}'
-            )
+            return CompletionResponse('{"decisions":[{"action":"NOOP","memory_id":"mem-1","reason":"supported"}]}')
         if schema is CandidateLedgerResponse:
-            return CompletionResponse('{"decisions":[{"index":0,"action":"KEEP"}]}')
+            return CompletionResponse(
+                json.dumps(
+                    {
+                        f"slot_{index:02d}": (
+                            {"action": "KEEP"} if index == 0 else None
+                        )
+                        for index in range(24)
+                    }
+                )
+            )
         if schema is MemoryRelationResponse:
             return CompletionResponse(
                 '{"decisions":[{"pair_index":0,"classification":"refines",'
@@ -920,7 +928,9 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         )
     )
 
-    assert (await client.select_memory_candidates("prompt")).decisions[0].action == "KEEP"
+    assert (
+        await client.select_memory_candidates("prompt")
+    ).ordered_slots()[0].action == "KEEP"
     assert (await client.reconcile_memories("prompt")).decisions[0].action == "ADD"
     assert (await client.reconcile_candidate_relations("prompt")).decisions[0].index == 0
     assert (await client.audit_incumbent_support("prompt")).decisions[0].memory_id == "mem-1"
@@ -967,6 +977,18 @@ def test_composed_reconciliation_schemas_reject_cross_phase_decisions() -> None:
                 ]
             }
         )
+
+
+def test_candidate_ledger_schema_rejects_model_owned_candidate_index() -> None:
+    payload = {
+        f"slot_{index:02d}": (
+            {"index": 0, "action": "KEEP"} if index == 0 else None
+        )
+        for index in range(24)
+    }
+
+    with pytest.raises(ValidationError):
+        CandidateLedgerResponse.model_validate(payload)
 
 
 @pytest.mark.asyncio
