@@ -483,6 +483,13 @@ def _store_downloaded_source_artifact(
     """Store one fully validated spooled body without materializing it in memory."""
 
     descriptor = artifact.descriptor
+    # Eligibility is a property of the downloaded revision and must be derived
+    # before handing the stream to storage.  A byte-store implementation may
+    # consume and close the file object (for example, an S3 transfer manager);
+    # after this ownership boundary the shared layer must not read it again.
+    inference_ineligible_reason = _artifact_inference_ineligible_reason(
+        artifact
+    )
     artifact_id = source_artifact_identity(
         source_id=source_id,
         source_unit_key=source_unit_key,
@@ -496,9 +503,6 @@ def _store_downloaded_source_artifact(
         content_type=artifact.media_type,
         size_bytes=artifact.size_bytes,
         sha256=artifact.sha256,
-    )
-    inference_ineligible_reason = _artifact_inference_ineligible_reason(
-        artifact
     )
     return StoredSourceArtifact(
         id=artifact_id,
