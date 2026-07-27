@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import re
+import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Mapping
 
@@ -20,11 +22,12 @@ else:  # pragma: no cover - direct file load used by packaged integrations
 
 
 _CONFIG_CACHE: dict[str, str] | None = None
+_REPOSITORY_CONFIG_PATH = Path(".memforge") / "config.toml"
 
 
-def configured_target() -> MemForgeTarget:
+def configured_target(repository_paths: Iterable[str | os.PathLike[str]] = ()) -> MemForgeTarget:
     origin = _configured_value("MEMFORGE_API_URL", "").strip() or None
-    workspace = _configured_value("MEMFORGE_WORKSPACE_ID", "").strip() or None
+    workspace = _configured_workspace_id(repository_paths)
     return build_target(origin=origin, workspace_id=workspace)
 
 
@@ -32,11 +35,65 @@ def configured_api_token() -> str:
     return _configured_value("MEMFORGE_API_TOKEN", "").strip()
 
 
+def _configured_workspace_id(repository_paths: Iterable[str | os.PathLike[str]]) -> str | None:
+    process_value = os.getenv("MEMFORGE_WORKSPACE_ID")
+    if process_value:
+        return process_value.strip() or None
+    repository_value = _repository_workspace_id(repository_paths)
+    if repository_value is not None:
+        return repository_value
+    return _codex_memforge_config().get("MEMFORGE_WORKSPACE_ID", "").strip() or None
+
+
 def _configured_value(name: str, default: str) -> str:
     value = os.getenv(name)
     if value:
         return value
     return _codex_memforge_config().get(name, default)
+
+
+def _repository_workspace_id(repository_paths: Iterable[str | os.PathLike[str]]) -> str | None:
+    workspace_ids: set[str] = set()
+    repository_roots: set[Path] = set()
+    for raw_path in repository_paths:
+        repository_root = _repository_root(raw_path)
+        if repository_root is None:
+            return None
+        if repository_root in repository_roots:
+            continue
+        repository_roots.add(repository_root)
+        config_path = repository_root / _REPOSITORY_CONFIG_PATH
+        try:
+            text = config_path.read_text(encoding="utf-8")
+            document = tomllib.loads(text)
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return None
+        values = document.get("memforge")
+        if not isinstance(values, dict):
+            return None
+        configured_workspace = values.get("workspace_id")
+        if not isinstance(configured_workspace, str):
+            return None
+        workspace_id = configured_workspace.strip()
+        if not workspace_id:
+            return None
+        workspace_ids.add(workspace_id)
+    if repository_roots and len(workspace_ids) == 1:
+        return next(iter(workspace_ids))
+    return None
+
+
+def _repository_root(raw_path: str | os.PathLike[str]) -> Path | None:
+    try:
+        candidate = Path(raw_path).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if candidate.is_file():
+        candidate = candidate.parent
+    for directory in (candidate, *candidate.parents):
+        if (directory / ".git").exists():
+            return directory
+    return None
 
 
 def _codex_memforge_config() -> Mapping[str, str]:

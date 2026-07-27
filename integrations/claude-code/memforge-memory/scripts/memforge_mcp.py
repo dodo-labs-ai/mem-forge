@@ -1037,7 +1037,11 @@ def _compact_memory_source(source: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resource_url(path: str) -> str:
-    return configured_target().resource_url(path)
+    return _configured_target().resource_url(path)
+
+
+def _configured_target():
+    return configured_target(_CLIENT_ROOT_PATHS)
 
 
 def _api_headers(*, json_body: bool = False) -> dict[str, str]:
@@ -1070,7 +1074,7 @@ def _http_json(method: str, path: str, body: dict[str, Any] | None) -> dict[str,
     except (OSError, URLError, json.JSONDecodeError) as exc:
         return {
             "error": "MemForge API unavailable",
-            "api_url": configured_target().workspace_api_base,
+            "api_url": _configured_target().workspace_api_base,
             "detail": str(exc),
         }
 
@@ -1087,7 +1091,7 @@ def _handle_get_resource(args: dict[str, Any]) -> dict[str, Any]:
     if isinstance(max_chars, dict):
         return max_chars
 
-    target = _parse_resource_url(str(args.get("url") or "").strip(), configured_target().origin)
+    target = _parse_resource_url(str(args.get("url") or "").strip(), _configured_target().origin)
     if target is None:
         return {
             "error": "unsupported resource URL",
