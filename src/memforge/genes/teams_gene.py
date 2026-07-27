@@ -132,7 +132,7 @@ class _TeamsAPIClient:
         self._graph_client: httpx.AsyncClient | None = None
         self._poll_audits: dict[str, dict] = {}
 
-    async def _load_tokens(self) -> tuple[str, str]:
+    async def _load_tokens(self) -> tuple[str, str | None]:
         """Load chat and graph tokens.
 
         The collection path is read-only and never starts authentication UI.
@@ -166,16 +166,11 @@ class _TeamsAPIClient:
 
         if not chat_token:
             raise AuthenticationError("Teams session expired. Connect Teams from the source wizard.")
-        if not graph_token:
-            # Graph is optional — some operations work without it
-            logger.warning("Graph API token not found — team/channel resolution may fail")
-            graph_token = chat_token  # fallback: use chat token (may fail for Graph calls)
-
         return chat_token, graph_token
 
     async def _ensure_clients(self) -> None:
         """Create HTTP clients if not already initialized."""
-        if self._chat_client and self._graph_client:
+        if self._chat_client:
             return
 
         chat_token, graph_token = await self._load_tokens()
@@ -185,11 +180,20 @@ class _TeamsAPIClient:
             headers={"Authorization": f"Bearer {chat_token}"},
             timeout=30.0,
         )
-        self._graph_client = httpx.AsyncClient(
-            base_url=_GRAPH_BASE,
-            headers={"Authorization": f"Bearer {graph_token}"},
-            timeout=30.0,
-        )
+        if graph_token:
+            self._graph_client = httpx.AsyncClient(
+                base_url=_GRAPH_BASE,
+                headers={"Authorization": f"Bearer {graph_token}"},
+                timeout=30.0,
+            )
+
+    def _require_graph_client(self, capability: str) -> httpx.AsyncClient:
+        if self._graph_client is None:
+            raise AuthenticationError(
+                f"{capability} requires Microsoft Graph access. "
+                "Reconnect Teams after Graph API access is available."
+            )
+        return self._graph_client
 
     async def validate(self) -> None:
         """Verify tokens are valid with a lightweight probe."""
@@ -712,14 +716,16 @@ class _TeamsAPIClient:
     async def get_joined_teams(self) -> list[dict]:
         """List teams the authenticated user belongs to."""
         await self._ensure_clients()
-        resp = await self._graph_client.get("/me/joinedTeams")
+        graph_client = self._require_graph_client("Team resolution")
+        resp = await graph_client.get("/me/joinedTeams")
         resp.raise_for_status()
         return resp.json().get("value", [])
 
     async def get_team_channels(self, team_id: str) -> list[dict]:
         """List channels in a team."""
         await self._ensure_clients()
-        resp = await self._graph_client.get(f"/teams/{team_id}/channels")
+        graph_client = self._require_graph_client("Channel resolution")
+        resp = await graph_client.get(f"/teams/{team_id}/channels")
         resp.raise_for_status()
         return resp.json().get("value", [])
 
@@ -736,6 +742,7 @@ class _TeamsAPIClient:
         """Download one exact inline image through the documented Graph route."""
 
         await self._ensure_clients()
+        graph_client = self._require_graph_client("Teams hosted-content")
         conversation = str(conversation_id or "").strip()
         message = str(message_id or "").strip()
         hosted = str(hosted_content_id or "").strip()
@@ -762,7 +769,7 @@ class _TeamsAPIClient:
                 f"/hostedContents/{quote(hosted, safe='')}/$value"
             )
         content, headers = await self._request_bytes(
-            self._graph_client,
+            graph_client,
             path,
             max_bytes=MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
         )
