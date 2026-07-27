@@ -291,6 +291,46 @@ class ReconciliationResponse(StructuredResponseModel):
     decisions: list[ReconciliationDecision]
 
 
+class CandidateRelationDecision(StructuredResponseModel):
+    """One candidate disposition inside a bounded incumbent relation cell."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int = Field(ge=0)
+    action: Literal["ADD", "UPDATE", "SUPERSEDE", "NOOP"]
+    memory_id: str | None = None
+    updated_content: str | None = None
+    reason: str | None = None
+    flag_for_review: bool = False
+
+
+class CandidateRelationResponse(StructuredResponseModel):
+    """Candidate-only side of a composed reconciliation ledger."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[CandidateRelationDecision]
+
+
+class IncumbentSupportAuditDecision(StructuredResponseModel):
+    """One incumbent's support disposition independent of candidate matching."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["DELETE", "NOOP"]
+    memory_id: str = Field(min_length=1)
+    reason: str | None = None
+    flag_for_review: bool = False
+
+
+class IncumbentSupportAuditResponse(StructuredResponseModel):
+    """Incumbent-only side of a composed reconciliation ledger."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[IncumbentSupportAuditDecision]
+
+
 class MemoryRelationDecision(StructuredResponseModel):
     """One exact pair classification with explicit refinement direction."""
 
@@ -595,6 +635,24 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> ReconciliationResponse:
         """Return schema-validated same-document reconciliation decisions."""
+
+    async def reconcile_candidate_relations(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 4096,
+        model: str | None = None,
+    ) -> CandidateRelationResponse:
+        """Return candidate-only decisions for one relation-matrix cell."""
+
+    async def audit_incumbent_support(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 4096,
+        model: str | None = None,
+    ) -> IncumbentSupportAuditResponse:
+        """Return one support disposition for every incumbent in an audit batch."""
 
     async def classify_memory_relations(
         self,
@@ -1085,6 +1143,34 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=ReconciliationResponse,
+            max_tokens=max_tokens,
+            model=model,
+        )
+
+    async def reconcile_candidate_relations(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 4096,
+        model: str | None = None,
+    ) -> CandidateRelationResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=CandidateRelationResponse,
+            max_tokens=max_tokens,
+            model=model,
+        )
+
+    async def audit_incumbent_support(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 4096,
+        model: str | None = None,
+    ) -> IncumbentSupportAuditResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=IncumbentSupportAuditResponse,
             max_tokens=max_tokens,
             model=model,
         )

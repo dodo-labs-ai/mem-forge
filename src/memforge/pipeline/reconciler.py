@@ -248,7 +248,7 @@ async def reconcile_memories(
             candidate_batch = candidate_batches[0] if candidate_batches else []
             for incumbent_batch in incumbent_batches:
                 batch_decisions, calls, elapsed = await _run_reconciliation_batch(
-                    structured_llm_client=structured_llm_client,
+                    structured_llm_method=structured_llm_client.reconcile_memories,
                     llm_model=llm_model,
                     prompt=_render_reconciliation_prompt(
                         ledger_contract=_COMBINED_LEDGER_CONTRACT,
@@ -278,7 +278,9 @@ async def reconcile_memories(
             for incumbent_batch in incumbent_batches:
                 for candidate_batch in candidate_batches:
                     batch_decisions, calls, elapsed = await _run_reconciliation_batch(
-                        structured_llm_client=structured_llm_client,
+                        structured_llm_method=(
+                            structured_llm_client.reconcile_candidate_relations
+                        ),
                         llm_model=llm_model,
                         prompt=_render_reconciliation_prompt(
                             ledger_contract=_CANDIDATE_RELATION_CONTRACT,
@@ -302,7 +304,9 @@ async def reconcile_memories(
                     decisions.extend(batch_decisions)
 
                 audit_decisions, calls, elapsed = await _run_reconciliation_batch(
-                    structured_llm_client=structured_llm_client,
+                    structured_llm_method=(
+                        structured_llm_client.audit_incumbent_support
+                    ),
                     llm_model=llm_model,
                     prompt=_render_reconciliation_prompt(
                         ledger_contract=_INCUMBENT_AUDIT_CONTRACT,
@@ -403,7 +407,7 @@ def _render_reconciliation_prompt(
 
 async def _run_reconciliation_batch(
     *,
-    structured_llm_client,
+    structured_llm_method,
     llm_model: str,
     prompt: str,
     expected_indices: set[int],
@@ -420,7 +424,7 @@ async def _run_reconciliation_batch(
         calls += 1
         llm_started = perf_counter()
         try:
-            response = await structured_llm_client.reconcile_memories(
+            response = await structured_llm_method(
                 prompt,
                 max_tokens=4096,
                 model=llm_model,
