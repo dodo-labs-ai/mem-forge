@@ -315,6 +315,35 @@ async def test_github_pat_discovers_and_fetches_repository_markdown_for_page_url
 
 
 @pytest.mark.asyncio
+async def test_github_pat_supports_enterprise_pages_subdomain_isolation(monkeypatch):
+    RepoApiClient.instances.clear()
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RepoApiClient)
+
+    gene = GitHubPagesGene(
+        config={
+            "auth_mode": "github_pat",
+            "pat": "github-secret",
+            "sync_mode": "single_page",
+            "page_url": "https://pages.github.example.test/org/repo/cloud-native-platform/process-tracking/",
+        },
+        source_id="src-pages",
+    )
+
+    await gene.authenticate()
+    items = [item async for item in gene.discover()]
+    normalized = await gene.normalize(await gene.fetch(items[0]))
+
+    assert items[0].source_url == (
+        "https://pages.github.example.test/org/repo/cloud-native-platform/process-tracking"
+    )
+    assert items[0].extra["repo_api_url"].startswith(
+        "https://github.example.test/api/v3/repos/org/repo/"
+    )
+    assert normalized.source_semantics["site_url"] == "https://pages.github.example.test/org/repo"
+    assert normalized.source_semantics["repo_identifier"] == "github.example.test/org/repo"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "payload",
     [
@@ -406,6 +435,43 @@ async def test_github_pat_subtree_discovers_repository_markdown_without_crawling
     ]
     assert all(item.version.endswith("-sha") for item in items)
     assert not any("/sitemap.xml" in url for _, url in RunbooksRepoApiClient.instances[-1].calls)
+
+
+@pytest.mark.asyncio
+async def test_github_pat_subtree_preserves_enterprise_pages_subdomain_urls(monkeypatch):
+    RunbooksRepoApiClient.instances.clear()
+    monkeypatch.setattr("memforge.genes.github_pages_gene._RequestsAsyncClient", RunbooksRepoApiClient)
+
+    gene = GitHubPagesGene(
+        config={
+            "auth_mode": "github_pat",
+            "pat": "github-secret",
+            "sync_mode": "subtree",
+            "root_url": (
+                "https://pages.github.example.test/example-org/runbooks/"
+                "runbooks/Process%20Tracking"
+            ),
+        },
+        source_id="src-pages",
+    )
+
+    await gene.authenticate()
+    items = [item async for item in gene.discover()]
+
+    assert [item.source_url for item in items] == [
+        (
+            "https://pages.github.example.test/example-org/runbooks/"
+            "runbooks/Process%20Tracking/stuck-lock"
+        ),
+        (
+            "https://pages.github.example.test/example-org/runbooks/"
+            "runbooks/Process%20Tracking/timed-out-process-instance"
+        ),
+    ]
+    assert any(
+        url.startswith("https://github.example.test/api/v3/repos/example-org/runbooks/")
+        for _, url in RunbooksRepoApiClient.instances[-1].calls
+    )
 
 
 @pytest.mark.asyncio

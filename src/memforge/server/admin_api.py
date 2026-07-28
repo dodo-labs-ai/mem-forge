@@ -1830,6 +1830,9 @@ def _github_pages_site_root_from_url(url: str) -> str:
     if len(path_parts) >= 3 and path_parts[0] == "pages":
         root_path = "/" + "/".join(path_parts[:3])
         return urlunsplit((parts.scheme, parts.netloc, root_path, "", ""))
+    if len(path_parts) >= 2 and (parts.hostname or "").lower().startswith("pages."):
+        root_path = "/" + "/".join(path_parts[:2])
+        return urlunsplit((parts.scheme, parts.netloc, root_path, "", ""))
     return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
 
 

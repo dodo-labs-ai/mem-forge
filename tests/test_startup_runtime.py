@@ -2316,6 +2316,24 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
                 "project_binding": _project_binding(),
             },
         )
+        valid_subdomain_isolation = client.post(
+            "/api/sources",
+            json={
+                "name": "Enterprise Pages Docs",
+                "type": "github_pages",
+                "access_policy": "private",
+                "config": {
+                    "auth_mode": "none",
+                    "sync_mode": "subtree",
+                    "root_url": (
+                        "https://pages.github.example.test/org/repo/"
+                        "cloud-native-platform/process-tracking/"
+                    ),
+                },
+                "project_binding": _project_binding(),
+            },
+        )
+        sources = client.get("/api/sources")
         wrong_site_path = client.post(
             "/api/sources",
             json={
@@ -2348,6 +2366,13 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
     assert missing_page.status_code == 400
     assert "Page URL is required" in missing_page.json()["detail"]
     assert valid.status_code == 200
+    assert valid_subdomain_isolation.status_code == 200
+    subdomain_source = next(
+        source
+        for source in sources.json()["data"]
+        if source["id"] == valid_subdomain_isolation.json()["id"]
+    )
+    assert subdomain_source["config"]["base_url"] == "https://pages.github.example.test/org/repo"
     assert wrong_site_path.status_code == 400
     assert "configured site path" in wrong_site_path.json()["detail"]
     assert missing_pat.status_code == 400
