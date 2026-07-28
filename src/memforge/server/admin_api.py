@@ -188,6 +188,7 @@ SOURCE_PAUSED_STATUS = "paused"
 LOCAL_AGENT_STATUS_STALE_SECONDS = 90
 LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES = {
     "github_repo_preview_tree": "github_repo",
+    "jira_auth": "jira",
     "local_markdown_pick_root": "local_markdown",
     "local_markdown_preview_tree": "local_markdown",
     "teams_auth": "teams",
@@ -6842,6 +6843,7 @@ def create_admin_app(
         req: LocalAgentJobCreateRequest,
         request: Request,
         db: Database = Depends(get_db),
+        current_workspace_id: str = Depends(get_workspace_id),
     ):
         requester = resolve_request_principal(request)
         source_id = req.source_id.strip()
@@ -6874,7 +6876,7 @@ def create_admin_app(
         payload.pop("created_by_user_id", None)
         payload.pop("execution_owner_user_id", None)
         job_id = f"laj-{uuid.uuid4().hex}"
-        workspace_id = (req.workspace_id or "default").strip() or "default"
+        workspace_id = (req.workspace_id or current_workspace_id or "default").strip() or "default"
         if req.operation in LOCAL_AGENT_SYNC_OPERATIONS:
             job_id, created = await _enqueue_sync_local_agent_job(
                 request,
