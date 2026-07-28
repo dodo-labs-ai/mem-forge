@@ -9,7 +9,7 @@ import pytest
 
 from memforge.genes.jira_gene import JiraGene
 from memforge.models import ContentItem
-from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
+from memforge.source_artifacts import RawSourceArtifact
 
 
 def _search_page(issues: list[dict], *, total: int | None = None, start_at: int = 0) -> dict:
@@ -696,7 +696,7 @@ async def test_fetch_does_not_count_unsupported_jira_attachments_against_image_b
 
 
 @pytest.mark.asyncio
-async def test_jira_attachment_descriptor_scan_is_bounded_before_download():
+async def test_jira_attachment_inventory_is_not_rejected_by_descriptor_count():
     gene = JiraGene(
         config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
         source_id="src-jira",
@@ -719,8 +719,7 @@ async def test_jira_attachment_descriptor_scan_is_bounded_before_download():
         },
     )
 
-    with pytest.raises(SourceArtifactContractError, match="descriptor scan limit"):
-        await gene._fetch_source_artifacts(issue)
+    assert await gene._fetch_source_artifacts(issue) == ()
 
 
 @pytest.mark.asyncio

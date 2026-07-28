@@ -12,6 +12,9 @@ from memforge.source_artifacts import (
 from memforge.source_projection import SourceProjection
 
 
+PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v2"
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectionExtractionBatch:
     """Transient token-bounded work partition inside one Source Unit."""
@@ -53,7 +56,12 @@ def plan_projection_extraction_batches(
 
     if len(projection.source_units) != 1:
         raise ValueError("projection context planning requires exactly one Source Unit")
+    if len(projection.source_unit_revisions) != 1:
+        raise ValueError(
+            "projection context planning requires exactly one Source Unit revision"
+        )
     unit = projection.source_units[0]
+    target_unit_revision_id = projection.source_unit_revisions[0].id
     revisions = {item.observation_id: item for item in projection.observation_revisions}
     observations = {item.id: item for item in projection.observations}
     ordered_ids = tuple(item.id for item in projection.observations if item.id in revisions)
@@ -190,7 +198,11 @@ def plan_projection_extraction_batches(
             f"{segment.observation_id}:{segment.start}:{segment.end}" for segment in group
         )
         digest = hashlib.sha256(
-            f"{projection.run_id}\x1f{unit.id}\x1f{index}\x1f{segment_identity}".encode()
+            (
+                f"{PROJECTION_EXTRACTION_CONTRACT_VERSION}\x1f"
+                f"{target_unit_revision_id}\x1f{unit.id}\x1f"
+                f"{index}\x1f{segment_identity}"
+            ).encode()
         ).hexdigest()[:16]
         batches.append(
             ProjectionExtractionBatch(
@@ -222,8 +234,6 @@ def observation_is_inference_eligible(
         return False
     size_bytes = _observation_binary_size(metadata)
     inference_eligible = raw.get("inference_eligible")
-    if inference_eligible is None:
-        inference_eligible = size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
     if not isinstance(inference_eligible, bool):
         return False
     return inference_eligible and size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES

@@ -589,11 +589,13 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
             "filename": "diagram\u202foverview.png",
             "media_type": "image/png",
             "size_bytes": len(image),
-            "sha256": digest,
-            "uri": uri,
-            "summary": "Service case review screen showing the investigation areas.",
+                "sha256": digest,
+                "uri": uri,
+                "inference_eligible": True,
+                "inference_ineligible_reason": None,
+                "summary": "Service case review screen showing the investigation areas.",
+            }
         }
-    }
     await db.db.execute(
         """INSERT INTO source_units
            (id, source_id, unit_type, provider_key, locator_json, current_revision_id, updated_at)

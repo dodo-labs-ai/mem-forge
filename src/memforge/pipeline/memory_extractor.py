@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from time import perf_counter
+from typing import Any
 from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
@@ -302,7 +304,11 @@ class MemoryExtractor:
             quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
 
-        return await self._extract_with_schema(prompt, label="memory extraction")
+        return await self._extract_with_schema(
+            prompt,
+            label="memory extraction",
+            invoke=self.structured_llm_client.extract_memories,
+        )
 
     async def extract_memory_changes(
         self,
@@ -328,7 +334,11 @@ class MemoryExtractor:
             quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
 
-        return await self._extract_with_schema(prompt, label="memory change extraction")
+        return await self._extract_with_schema(
+            prompt,
+            label="memory change extraction",
+            invoke=self.structured_llm_client.extract_memories,
+        )
 
     async def extract_unit_memories(
         self,
@@ -355,7 +365,11 @@ class MemoryExtractor:
             unit_markdown=context.unit.unit_markdown[:UNIT_MARKDOWN_CHAR_CAP],
             quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
-        result = await self._extract_with_schema(prompt, label="unit memory extraction")
+        result = await self._extract_with_schema(
+            prompt,
+            label="unit memory extraction",
+            invoke=self.structured_llm_client.extract_memories,
+        )
         if result.error_type:
             return result
 
@@ -395,6 +409,7 @@ class MemoryExtractor:
         result = await self._extract_with_schema(
             prompt,
             label="projection batch extraction",
+            invoke=self.structured_llm_client.extract_projection_memories,
             images=images,
         )
         if result.error_type:
@@ -465,6 +480,7 @@ class MemoryExtractor:
         prompt: str,
         *,
         label: str,
+        invoke: Callable[..., Awaitable[Any]],
         images: tuple[StructuredLlmImage, ...] = (),
     ) -> MemoryExtractionResult:
         started = perf_counter()
@@ -481,30 +497,40 @@ class MemoryExtractor:
             }
             if images:
                 call_kwargs["images"] = images
-            response = await self.structured_llm_client.extract_memories(prompt, **call_kwargs)
+            response = await invoke(prompt, **call_kwargs)
             supplied_image_ids = tuple(image.source_observation_id for image in images)
-            returned_summaries = tuple(
-                SourceArtifactSummary(
-                    source_observation_id=item.source_observation_id,
-                    summary=item.summary,
-                )
-                for item in response.artifact_summaries
-            )
             discarded_orphan_summary_count = 0
+            discarded_invalid_summary_count = 0
             if not supplied_image_ids:
-                discarded_orphan_summary_count = len(returned_summaries)
-                returned_summaries = ()
-            returned_summary_ids = tuple(
-                item.source_observation_id for item in returned_summaries
-            )
-            if (
-                len(returned_summary_ids) != len(supplied_image_ids)
-                or set(returned_summary_ids) != set(supplied_image_ids)
-            ):
-                raise StructuredLlmError(
-                    "structured LLM Artifact summaries do not match the supplied images",
-                    error_code="invalid_artifact_summary_contract",
+                discarded_orphan_summary_count = len(
+                    response.artifact_summaries
                 )
+                returned_summaries = ()
+            else:
+                supplied_image_id_set = set(supplied_image_ids)
+                valid_summaries: dict[str, SourceArtifactSummary] = {}
+                for item in response.artifact_summaries:
+                    observation_id = item.source_observation_id
+                    summary_text = item.summary
+                    if (
+                        not isinstance(observation_id, str)
+                        or not isinstance(summary_text, str)
+                        or not observation_id
+                        or not summary_text
+                        or len(summary_text)
+                        > MAX_SOURCE_ARTIFACT_SUMMARY_CHARS
+                        or observation_id not in supplied_image_id_set
+                        or observation_id in valid_summaries
+                    ):
+                        discarded_invalid_summary_count += 1
+                        continue
+                    valid_summaries[observation_id] = (
+                        SourceArtifactSummary(
+                            source_observation_id=observation_id,
+                            summary=summary_text,
+                        )
+                    )
+                returned_summaries = tuple(valid_summaries.values())
             memories = [
                 RawMemory(
                     content=memory.content,
@@ -531,6 +557,9 @@ class MemoryExtractor:
                     "discarded_orphan_artifact_summary_count": (
                         discarded_orphan_summary_count
                     ),
+                    "discarded_invalid_artifact_summary_count": (
+                        discarded_invalid_summary_count
+                    ),
                     "structured_llm_elapsed_ms": max(
                         0, round((perf_counter() - started) * 1000)
                     ),
@@ -543,6 +572,11 @@ class MemoryExtractor:
                 error=str(e),
                 metadata={
                     **metrics,
+                    "safe_error_code": e.error_code,
+                    "safe_validation_fields": [
+                        {"location": location, "type": rule_type}
+                        for location, rule_type in e.validation_fields
+                    ],
                     "structured_llm_elapsed_ms": max(
                         0, round((perf_counter() - started) * 1000)
                     ),

@@ -198,6 +198,40 @@ async def test_sqlite_active_support_evidence_chunks_and_preserves_empty_memory_
     assert all(items == () for items in evidence.values())
 
 
+@pytest.mark.asyncio
+async def test_sqlite_active_support_bundle_observations_are_bounded(
+    db: Database,
+    monkeypatch,
+) -> None:
+    calls = 0
+    original = db.db.execute_fetchall
+
+    async def execute_fetchall(sql, parameters=None):
+        nonlocal calls
+        if (
+            "FROM memory_support_assertions msa" in sql
+            and "JOIN evidence_references bundle_er" in sql
+        ):
+            calls += 1
+        return await original(sql, parameters)
+
+    monkeypatch.setattr(db.db, "execute_fetchall", execute_fetchall)
+    memory_ids = tuple(
+        f"mem-bundle-{index}" for index in range(501)
+    )
+
+    observations = await SqliteRelationalStore(
+        db
+    ).get_active_memory_support_observation_ids_many(
+        memory_ids,
+        source_id="src-1",
+    )
+
+    assert calls == 2
+    assert tuple(observations) == memory_ids
+    assert all(items == () for items in observations.values())
+
+
 def _memory(
     mem_id: str,
     status: str = "active",

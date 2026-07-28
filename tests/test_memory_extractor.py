@@ -72,7 +72,15 @@ async def test_memory_extractor_uses_structured_schema_client():
 
 @pytest.mark.asyncio
 async def test_memory_extractor_reports_structured_output_failure():
-    client = RecordingStructuredMemoryClient(error=StructuredLlmError("response_format unsupported"))
+    client = RecordingStructuredMemoryClient(
+        error=StructuredLlmError(
+            "response_format unsupported",
+            error_code="ValidationError",
+            validation_fields=(
+                ("memories.0.memory_type", "literal_error"),
+            ),
+        )
+    )
     extractor = MemoryExtractor(structured_llm_client=client)
 
     result = await extractor.extract_memories(content="Durable content")
@@ -81,3 +89,10 @@ async def test_memory_extractor_reports_structured_output_failure():
     assert result.error_type == "structured_llm_error"
     assert result.error == "response_format unsupported"
     assert result.metadata["structured_llm_calls"] == 1
+    assert result.metadata["safe_error_code"] == "ValidationError"
+    assert result.metadata["safe_validation_fields"] == [
+        {
+            "location": "memories.0.memory_type",
+            "type": "literal_error",
+        }
+    ]
