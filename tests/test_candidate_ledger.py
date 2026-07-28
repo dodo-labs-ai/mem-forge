@@ -354,6 +354,28 @@ async def test_candidate_ledger_drops_only_explicit_low_value_admission_decision
 
 
 @pytest.mark.asyncio
+async def test_candidate_ledger_ignores_canonical_index_outside_redundant_action():
+    first = _candidate("A durable fact with details.", observation_id="obs-1")
+    second = _candidate("A different durable fact.", observation_id="obs-2")
+    client = _LedgerClient(
+        _ledger_response(
+            CandidateLedgerDecision(action="KEEP"),
+            CandidateLedgerDecision(action="KEEP", canonical_index=0),
+        )
+    )
+
+    result = await select_unique_memory_candidates(
+        [first, second],
+        structured_llm_client=client,
+        llm_model=None,
+    )
+
+    assert result.candidates == (first, second)
+    assert result.structured_llm_calls == 1
+    assert result.validation_retries == 0
+
+
+@pytest.mark.asyncio
 async def test_candidate_ledger_rejects_canonical_target_outside_visible_batch():
     candidates = [_candidate("X" * (100 - index), observation_id=f"obs-{index}") for index in range(26)]
     first_batch = [CandidateLedgerDecision(action="KEEP") for _ in range(24)]
