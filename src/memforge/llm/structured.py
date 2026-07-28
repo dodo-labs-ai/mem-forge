@@ -256,7 +256,7 @@ class CandidateLedgerDecision(StructuredResponseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["KEEP", "DROP_REDUNDANT"]
+    action: Literal["KEEP", "DROP_REDUNDANT", "DROP_LOW_VALUE"]
     canonical_index: int | None = Field(default=None, ge=0)
     reason: str = Field(default="", max_length=1000)
 
@@ -691,7 +691,7 @@ class SourceSupportStructuredClient(Protocol):
         max_tokens: int = 8192,
         model: str | None = None,
     ) -> CandidateLedgerResponse:
-        """Return a complete within-revision candidate uniqueness ledger."""
+        """Return one bounded candidate-admission ledger batch."""
 
     async def reconcile_candidate_relations(
         self,

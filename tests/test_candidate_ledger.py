@@ -29,12 +29,7 @@ def _ledger_response(
     *decisions: CandidateLedgerDecision | None,
 ) -> CandidateLedgerResponse:
     return CandidateLedgerResponse(
-        **{
-            f"slot_{index:02d}": (
-                decisions[index] if index < len(decisions) else None
-            )
-            for index in range(24)
-        }
+        **{f"slot_{index:02d}": (decisions[index] if index < len(decisions) else None) for index in range(24)}
     )
 
 
@@ -134,20 +129,44 @@ async def test_candidate_ledger_does_not_exact_collapse_case_sensitive_identifie
 
 
 @pytest.mark.asyncio
-async def test_candidate_ledger_rejects_oversized_semantic_input_before_calling_llm():
-    candidates = [_candidate(f"Durable fact number {index}.", observation_id=f"obs-{index}") for index in range(3)]
-    client = _LedgerClient()
-
-    with pytest.raises(CandidateLedgerError, match="candidate count") as exc_info:
-        await select_unique_memory_candidates(
-            candidates,
-            structured_llm_client=client,
-            llm_model=None,
-            max_candidates=2,
+async def test_candidate_ledger_bounds_calls_independently_from_source_unit_cardinality():
+    candidates = [
+        _candidate(
+            f"Durable candidate {index:03d} with distinct content.",
+            observation_id=f"obs-{index}",
         )
+        for index in range(205)
+    ]
+    client = _LedgerClient(
+        *(
+            _ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in range(start, stop)))
+            for start, stop in (
+                (0, 24),
+                (24, 48),
+                (48, 72),
+                (72, 96),
+                (96, 120),
+                (120, 144),
+                (144, 168),
+                (168, 192),
+                (192, 205),
+            )
+        )
+    )
 
-    assert exc_info.value.error_type == "budget_exceeded"
-    assert client.prompts == []
+    result = await select_unique_memory_candidates(
+        candidates,
+        structured_llm_client=client,
+        llm_model=None,
+    )
+
+    assert result.candidates == tuple(candidates)
+    assert result.structured_llm_calls == 9
+    assert len(client.prompts) == 9
+    assert '"slot_00":0' in client.prompts[0]
+    assert '"slot_00":192' in client.prompts[-1]
+    assert '"index":204' not in client.prompts[0]
+    assert '"index":204' in client.prompts[-1]
 
 
 @pytest.mark.asyncio
@@ -171,6 +190,30 @@ async def test_candidate_ledger_rejects_oversized_context_before_calling_llm():
 
 
 @pytest.mark.asyncio
+async def test_candidate_ledger_shrinks_request_batch_to_context_budget():
+    first = _candidate("A" * 800, observation_id="obs-1")
+    second = _candidate("B" * 800, observation_id="obs-2")
+    client = _LedgerClient(
+        _ledger_response(CandidateLedgerDecision(action="KEEP")),
+        _ledger_response(CandidateLedgerDecision(action="KEEP")),
+    )
+
+    result = await select_unique_memory_candidates(
+        [first, second],
+        structured_llm_client=client,
+        llm_model=None,
+        max_context_chars=3_000,
+    )
+
+    assert result.candidates == (first, second)
+    assert len(client.prompts) == 2
+    assert all(len(prompt) <= 3_000 for prompt in client.prompts)
+    assert '"index":0' in client.prompts[0]
+    assert '"index":1' not in client.prompts[0]
+    assert '"index":1' in client.prompts[1]
+
+
+@pytest.mark.asyncio
 async def test_candidate_ledger_composes_bounded_decision_batches():
     candidates = [
         _candidate(
@@ -181,9 +224,7 @@ async def test_candidate_ledger_composes_bounded_decision_batches():
     ]
     client = _LedgerClient(
         *(
-            _ledger_response(
-                *(CandidateLedgerDecision(action="KEEP") for _ in range(start, stop))
-            )
+            _ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in range(start, stop)))
             for start, stop in ((0, 24), (24, 48), (48, 55))
         )
     )
@@ -201,7 +242,8 @@ async def test_candidate_ledger_composes_bounded_decision_batches():
     assert '"slot_00":24' in client.prompts[1]
     assert '"slot_00":48' in client.prompts[2]
     assert '"slot_07":null' in client.prompts[2]
-    assert '"index":54' in client.prompts[0]
+    assert '"index":54' not in client.prompts[0]
+    assert '"index":54' in client.prompts[2]
 
 
 @pytest.mark.asyncio
@@ -234,7 +276,39 @@ async def test_candidate_ledger_normalizes_lower_index_canonical_chains():
 
 
 @pytest.mark.asyncio
-async def test_candidate_ledger_normalizes_canonical_chain_across_batches():
+async def test_candidate_ledger_drops_only_explicit_low_value_admission_decisions():
+    durable = _candidate(
+        "Enable the reduction toggle only after the compatibility suite passes.",
+        observation_id="obs-1",
+        memory_type="procedure",
+    )
+    instance_output = _candidate(
+        "Test case 17 returned 204 rows in this run.",
+        observation_id="obs-2",
+    )
+    client = _LedgerClient(
+        _ledger_response(
+            CandidateLedgerDecision(action="KEEP"),
+            CandidateLedgerDecision(action="DROP_LOW_VALUE"),
+        )
+    )
+
+    result = await select_unique_memory_candidates(
+        [durable, instance_output],
+        structured_llm_client=client,
+        llm_model=None,
+    )
+
+    assert result.candidates == (durable,)
+    assert result.dropped_low_value_count == 1
+    [drop] = result.drops
+    assert drop.candidate is instance_output
+    assert drop.canonical_candidate is None
+    assert drop.method == "structured_quality"
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_rejects_canonical_target_outside_visible_batch():
     candidates = [_candidate("X" * (100 - index), observation_id=f"obs-{index}") for index in range(26)]
     first_batch = [CandidateLedgerDecision(action="KEEP") for _ in range(24)]
     first_batch[1] = CandidateLedgerDecision(
@@ -250,13 +324,21 @@ async def test_candidate_ledger_normalizes_canonical_chain_across_batches():
             ),
             CandidateLedgerDecision(action="KEEP"),
         ),
+        _ledger_response(
+            CandidateLedgerDecision(
+                action="DROP_REDUNDANT",
+                canonical_index=1,
+            ),
+            CandidateLedgerDecision(action="KEEP"),
+        ),
     )
 
-    result = await select_unique_memory_candidates(
-        candidates,
-        structured_llm_client=client,
-        llm_model=None,
-    )
+    with pytest.raises(CandidateLedgerError, match="complete candidate ledger"):
+        await select_unique_memory_candidates(
+            candidates,
+            structured_llm_client=client,
+            llm_model=None,
+        )
 
-    assert result.candidates == tuple(candidate for index, candidate in enumerate(candidates) if index not in {1, 24})
-    assert {drop.canonical_candidate.content for drop in result.drops} == {candidates[0].content}
+    assert len(client.prompts) == 3
+    assert "<validation_feedback>" in client.prompts[-1]
