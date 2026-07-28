@@ -899,9 +899,9 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
-def test_packaged_plugin_version_0_1_33_is_consistent():
+def test_packaged_plugin_version_0_1_34_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.33"
+    version = "0.1.34"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
@@ -1168,6 +1168,48 @@ def test_mcp_proxy_starts_without_memforge_executable():
     assert response["result"]["serverInfo"]["name"] == "memforge"
     assert response["result"]["serverInfo"]["version"] == manifest["version"]
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
+
+
+@pytest.mark.parametrize("client", ["codex", "claude-code"])
+def test_packaged_mcp_proxy_starts_when_tomllib_is_unavailable(client):
+    root = Path(__file__).resolve().parents[1]
+    proxy = root / "integrations" / client / "memforge-memory" / "scripts" / "memforge_mcp.py"
+    request = _mcp_initialize_request()
+    frame = b"Content-Length: " + str(len(request)).encode() + b"\r\n\r\n" + request
+    launcher = """
+import builtins
+import os
+import runpy
+import sys
+
+original_import = builtins.__import__
+
+
+def import_without_tomllib(name, *args, **kwargs):
+    if name == "tomllib":
+        raise ModuleNotFoundError("No module named 'tomllib'")
+    return original_import(name, *args, **kwargs)
+
+
+builtins.__import__ = import_without_tomllib
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+runpy.run_path(sys.argv[1], run_name="__main__")
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", launcher, str(proxy)],
+        input=frame,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == b""
+    _, payload = result.stdout.split(b"\r\n\r\n", 1)
+    response = json.loads(payload)
+    assert response["result"]["serverInfo"]["name"] == "memforge"
 
 
 def test_mcp_proxy_supports_json_line_stdio():

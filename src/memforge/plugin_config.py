@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import re
-import tomllib
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Mapping
@@ -23,6 +22,9 @@ else:  # pragma: no cover - direct file load used by packaged integrations
 
 _CONFIG_CACHE: dict[str, str] | None = None
 _REPOSITORY_CONFIG_PATH = Path(".memforge") / "config.toml"
+_BASIC_TOML_STRING = re.compile(
+    r'(?:[^"\\\x00-\x1f]|\\(?:["\\btnfr]|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}))*\Z'
+)
 
 
 def configured_target(repository_paths: Iterable[str | os.PathLike[str]] = ()) -> MemForgeTarget:
@@ -65,14 +67,10 @@ def _repository_workspace_id(repository_paths: Iterable[str | os.PathLike[str]])
         config_path = repository_root / _REPOSITORY_CONFIG_PATH
         try:
             text = config_path.read_text(encoding="utf-8")
-            document = tomllib.loads(text)
-        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        except (OSError, UnicodeError):
             return None
-        values = document.get("memforge")
-        if not isinstance(values, dict):
-            return None
-        configured_workspace = values.get("workspace_id")
-        if not isinstance(configured_workspace, str):
+        configured_workspace = _parse_toml_string_table(text, "memforge").get("workspace_id")
+        if configured_workspace is None:
             return None
         workspace_id = configured_workspace.strip()
         if not workspace_id:
@@ -142,9 +140,14 @@ def _parse_toml_string_table(text: str, table_name: str) -> dict[str, str]:
             continue
         match = re.match(r"([A-Za-z0-9_]+)\s*=\s*\"(.*)\"\s*$", line)
         if match:
-            values[match.group(1)] = _unescape_basic_toml_string(match.group(2))
+            try:
+                values[match.group(1)] = _unescape_basic_toml_string(match.group(2))
+            except (UnicodeDecodeError, ValueError):
+                continue
     return values
 
 
 def _unescape_basic_toml_string(value: str) -> str:
+    if _BASIC_TOML_STRING.fullmatch(value) is None:
+        raise ValueError("invalid TOML basic string")
     return bytes(value, "utf-8").decode("unicode_escape")
