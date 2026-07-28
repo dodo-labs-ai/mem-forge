@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
 
 from memforge.memory.identity_resolver import (
+    IdentityResolutionPolicy,
     IdentityResolutionRequest,
     IdentityResolver,
 )
@@ -86,12 +87,20 @@ async def test_structured_classifier_reports_usage_when_a_later_batch_fails() ->
 class _CandidateStore:
     exact_by_challenger: dict[str, Memory]
     semantic_by_challenger: dict[str, tuple[Memory, ...]]
+    candidate_batch_sizes: list[int] = field(default_factory=list)
 
     async def find_access_compatible_exact_candidate(self, challenger, **_kwargs):
         return self.exact_by_challenger.get(challenger.id)
 
     async def find_access_compatible_equivalence_candidates(self, challenger, **_kwargs):
         return self.semantic_by_challenger.get(challenger.id, ())
+
+    async def find_access_compatible_equivalence_candidates_batch(self, queries):
+        self.candidate_batch_sizes.append(len(queries))
+        return tuple(
+            self.semantic_by_challenger.get(query.memory.id, ())
+            for query in queries
+        )
 
 
 class _PairClassifier:
@@ -136,6 +145,51 @@ class _PairClassifier:
             llm_calls=1,
             prompt_chars=0,
         )
+
+
+@pytest.mark.asyncio
+async def test_identity_resolver_bounds_candidate_recall_and_classification_workset() -> None:
+    challengers = tuple(
+        _memory(f"mem-new-{index}", f"Current claim {index}")
+        for index in range(5)
+    )
+    candidates = tuple(
+        _memory(f"mem-existing-{index}", f"Existing related claim {index}")
+        for index in range(5)
+    )
+    store = _CandidateStore(
+        exact_by_challenger={},
+        semantic_by_challenger={
+            challenger.id: (candidate,)
+            for challenger, candidate in zip(challengers, candidates, strict=True)
+        },
+    )
+    classifier = _PairClassifier(
+        {
+            (challenger.id, candidate.id): MemoryRelationType.UNRELATED
+            for challenger, candidate in zip(challengers, candidates, strict=True)
+        }
+    )
+    resolver = IdentityResolver(
+        memory_store=store,
+        pair_classifier=classifier,
+        llm_model="test-model",
+        policy=IdentityResolutionPolicy(max_requests_per_batch=2),
+    )
+
+    batch = await resolver.resolve(
+        tuple(
+            IdentityResolutionRequest(challenger, f"doc-{index}")
+            for index, challenger in enumerate(challengers)
+        )
+    )
+
+    assert store.candidate_batch_sizes == [2, 2, 1]
+    assert [len(call) for call in classifier.calls] == [2, 2, 1]
+    assert [resolution.challenger for resolution in batch.resolutions] == list(challengers)
+    assert all(resolution.target is None for resolution in batch.resolutions)
+    assert batch.metrics.pair_count == 5
+    assert batch.metrics.llm_calls == 3
 
 
 @pytest.mark.asyncio

@@ -954,6 +954,20 @@ class SourceSyncWorker:
             await self._process_relation_discovery_once()
             return None
 
+        if run.lease_attempt_count > self.config.sync.worker_max_attempts:
+            failed = await self.db.fail_source_sync_run(
+                run.run_id,
+                worker_id=self.worker_id,
+                lease_attempt_count=run.lease_attempt_count,
+                error_message="source sync execution attempt budget exhausted",
+                retryable=False,
+            )
+            if not failed:
+                raise SourceSyncLeaseLost(
+                    f"source sync lease lost before exhausted-attempt update for run {run.run_id}"
+                )
+            return run
+
         source: dict | None = None
         try:
             source = await self.db.get_source(run.source_id)

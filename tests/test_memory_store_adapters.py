@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from memforge.memory.identity_resolver import IdentityCandidateQuery
 from memforge.memory.store import MemoryStore
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
@@ -98,6 +99,49 @@ async def test_collection_property_points_at_the_vector_handle(db):
         embed_cfg={},
     )
     assert store.collection is collection
+
+
+@pytest.mark.asyncio
+async def test_identity_candidate_batch_embeds_unresolved_claims_in_one_transport(
+    db,
+    monkeypatch,
+):
+    collection = RecordingCollection()
+    adapters = build_sqlite_adapters(db, collection)
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={
+            "base_url": "https://embedding.invalid/v1",
+            "api_key": "test-key",
+            "model": "test-model",
+        },
+    )
+    embedded_batches: list[list[str]] = []
+
+    def fake_embed_texts(texts, *_args):
+        embedded_batches.append(list(texts))
+        return [[float(index)] for index, _ in enumerate(texts)]
+
+    monkeypatch.setattr("memforge.memory.store.embed_texts", fake_embed_texts)
+    requests = tuple(
+        IdentityCandidateQuery(
+            memory=_memory(f"new-{index}", f"Claim {index}"),
+            doc_id="doc1",
+            entity_ids=(),
+            excluded_memory_ids=frozenset(),
+        )
+        for index in range(3)
+    )
+
+    candidates = await store.find_access_compatible_equivalence_candidates_batch(
+        requests
+    )
+
+    assert candidates == ((), (), ())
+    assert len(embedded_batches) == 1
+    assert len(embedded_batches[0]) == 3
 
 
 @pytest.mark.asyncio

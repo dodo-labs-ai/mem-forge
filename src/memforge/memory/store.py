@@ -33,6 +33,7 @@ from memforge.memory.index_payloads import (
     embedding_text_hash,
     memory_embedding_text,
 )
+from memforge.memory.identity_resolver import IdentityCandidateQuery
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.memory.lifecycle_plan import (
     LifecyclePlan,
@@ -639,6 +640,50 @@ class MemoryStore:
         must still prove exact or semantic equivalence before reusing an identity.
         """
 
+        embedding = await self._embed(_memory_embedding_text(memory))
+        return await self._find_access_compatible_equivalence_candidates_with_embedding(
+            memory,
+            embedding=embedding,
+            excluded_memory_ids=excluded_memory_ids,
+            scope=scope,
+            doc_id=doc_id,
+            entity_ids=entity_ids,
+        )
+
+    async def find_access_compatible_equivalence_candidates_batch(
+        self,
+        queries: Sequence[IdentityCandidateQuery],
+    ) -> tuple[tuple[Memory, ...], ...]:
+        """Recall identity candidates while sharing one bounded embedding transport."""
+
+        if not queries:
+            return ()
+        embeddings = await self._embed_many(
+            [_memory_embedding_text(query.memory) for query in queries]
+        )
+        candidates: list[tuple[Memory, ...]] = []
+        for query, embedding in zip(queries, embeddings, strict=True):
+            candidates.append(
+                await self._find_access_compatible_equivalence_candidates_with_embedding(
+                    query.memory,
+                    embedding=embedding,
+                    excluded_memory_ids=query.excluded_memory_ids,
+                    doc_id=query.doc_id,
+                    entity_ids=query.entity_ids,
+                )
+            )
+        return tuple(candidates)
+
+    async def _find_access_compatible_equivalence_candidates_with_embedding(
+        self,
+        memory: Memory,
+        *,
+        embedding: list[float],
+        excluded_memory_ids: set[str] | frozenset[str] = frozenset(),
+        scope: AccessScope | None = None,
+        doc_id: str | None = None,
+        entity_ids: Sequence[int] = (),
+    ) -> tuple[Memory, ...]:
         compatible: list[Memory] = []
         compatible_ids: set[str] = set()
         candidate_access = lifecycle_access_context_hash(
@@ -674,7 +719,6 @@ class MemoryStore:
         )
         add_candidate(reactivation_candidate)
 
-        embedding = await self._embed(_memory_embedding_text(memory))
         vector_hits = await self.vector.query(
             embedding,
             scope or _writer_access_scope(memory),
@@ -2564,3 +2608,41 @@ class MemoryStore:
         embedding = vectors[0]
         self._embedding_cache.put(text, embedding)
         return embedding
+
+    async def _embed_many(self, texts: Sequence[str]) -> list[list[float]]:
+        """Embed cache misses together and restore caller order."""
+
+        embeddings: list[list[float] | None] = [None] * len(texts)
+        missing_indices: dict[str, list[int]] = {}
+        for index, text in enumerate(texts):
+            cached = self._embedding_cache.get(text)
+            if cached is not None:
+                embeddings[index] = cached
+            else:
+                missing_indices.setdefault(text, []).append(index)
+
+        missing_texts = list(missing_indices)
+        if missing_texts:
+            missing_embeddings = await asyncio.to_thread(
+                embed_texts,
+                missing_texts,
+                self.embed_cfg["base_url"],
+                self.embed_cfg["api_key"],
+                self.embed_cfg["model"],
+            )
+            for text, embedding in zip(
+                missing_texts,
+                missing_embeddings,
+                strict=True,
+            ):
+                self._embedding_cache.put(text, embedding)
+                for index in missing_indices[text]:
+                    embeddings[index] = embedding
+
+        if any(embedding is None for embedding in embeddings):
+            raise RuntimeError("embedding batch did not cover every input")
+        return [
+            embedding
+            for embedding in embeddings
+            if embedding is not None
+        ]

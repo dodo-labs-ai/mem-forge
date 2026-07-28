@@ -7016,6 +7016,53 @@ async def test_source_sync_worker_delays_retryable_failure(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_source_sync_worker_terminalizes_expired_run_after_execution_budget_is_exhausted(
+    db: Database,
+):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-expired-attempt-budget"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Expired Attempt Budget",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    first = await db.lease_next_source_sync_run(
+        worker_id="crashed-worker",
+        lease_seconds=1,
+        now=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    assert first is not None
+    assert first.lease_attempt_count == 1
+
+    class MustNotRunProvider:
+        async def build_sync_runtime(self, *args, **kwargs):
+            raise AssertionError("exhausted recovery must not construct a sync runtime")
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(sync=SyncConfig(worker_max_attempts=1)),
+        runtime_provider=MustNotRunProvider(),
+        worker_id="recovery-worker",
+    )
+
+    recovered = await worker.run_once()
+    failed = await db.get_source_sync_run(enqueued.run_id)
+
+    assert recovered is not None
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.lease_attempt_count == 2
+    assert failed.recovery_count == 1
+    assert failed.next_attempt_at is None
+    assert failed.error_message == "source sync execution attempt budget exhausted"
+
+
+@pytest.mark.asyncio
 async def test_source_sync_worker_retries_failed_final_state(db: Database):
     import memforge.runtime as runtime
 
@@ -9093,6 +9140,9 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         async def find_access_compatible_equivalence_candidates(self, *args, **kwargs):
             del args, kwargs
             return ()
+
+        async def find_access_compatible_equivalence_candidates_batch(self, queries):
+            return tuple(() for _query in queries)
 
         async def find_access_compatible_exact_candidate(
             self,
