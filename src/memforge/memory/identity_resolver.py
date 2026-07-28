@@ -28,6 +28,23 @@ class IdentityResolutionRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class IdentityCandidateQuery:
+    memory: Memory
+    doc_id: str
+    entity_ids: tuple[int, ...]
+    excluded_memory_ids: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityResolutionPolicy:
+    max_requests_per_batch: int = 32
+
+    def __post_init__(self) -> None:
+        if self.max_requests_per_batch < 1:
+            raise ValueError("max_requests_per_batch must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class IdentityResolution:
     challenger: Memory
     target: Memory | None
@@ -60,22 +77,56 @@ class IdentityResolver:
         memory_store: MemoryStore,
         pair_classifier: MemoryPairClassifier | None,
         llm_model: str,
+        policy: IdentityResolutionPolicy | None = None,
     ) -> None:
         self._memory_store = memory_store
         self._pair_classifier = pair_classifier
         self._llm_model = llm_model
+        self._policy = policy or IdentityResolutionPolicy()
 
     async def resolve(
         self,
         requests: tuple[IdentityResolutionRequest, ...],
     ) -> IdentityResolutionBatch:
-        """Resolve requests in order while coalescing all semantic pairs."""
+        """Resolve requests in order with a bounded candidate and pair workset."""
 
         started = perf_counter()
+        resolutions: list[IdentityResolution | None] = [None] * len(requests)
+        pair_count = llm_calls = prompt_chars = 0
+        for start in range(0, len(requests), self._policy.max_requests_per_batch):
+            request_batch = requests[start : start + self._policy.max_requests_per_batch]
+            batch_resolutions, batch_pair_count, batch_llm_calls, batch_prompt_chars = (
+                await self._resolve_batch(request_batch)
+            )
+            resolutions[start : start + len(request_batch)] = batch_resolutions
+            pair_count += batch_pair_count
+            llm_calls += batch_llm_calls
+            prompt_chars += batch_prompt_chars
+
+        if any(resolution is None for resolution in resolutions):
+            raise RuntimeError("identity resolution did not cover every request")
+        return IdentityResolutionBatch(
+            resolutions=tuple(
+                resolution
+                for resolution in resolutions
+                if resolution is not None
+            ),
+            metrics=IdentityResolutionMetrics(
+                pair_count=pair_count,
+                llm_calls=llm_calls,
+                prompt_chars=prompt_chars,
+                elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
+            ),
+        )
+
+    async def _resolve_batch(
+        self,
+        requests: tuple[IdentityResolutionRequest, ...],
+    ) -> tuple[list[IdentityResolution], int, int, int]:
         pending: dict[int, tuple[MemoryPair, ...]] = {}
         resolved: dict[int, IdentityResolution] = {}
         all_pairs: list[MemoryPair] = []
-
+        unresolved: list[tuple[int, IdentityResolutionRequest]] = []
         for index, request in enumerate(requests):
             challenger = request.challenger
             exact = await self._memory_store.find_access_compatible_exact_candidate(
@@ -98,13 +149,30 @@ class IdentityResolver:
                     classified_pairs=(),
                 )
                 continue
+            unresolved.append((index, request))
 
-            candidates = await self._memory_store.find_access_compatible_equivalence_candidates(
-                challenger,
-                excluded_memory_ids=request.excluded_memory_ids,
-                doc_id=request.doc_id,
-                entity_ids=request.entity_ids,
+        candidate_batches = await self._memory_store.find_access_compatible_equivalence_candidates_batch(
+            tuple(
+                IdentityCandidateQuery(
+                    memory=request.challenger,
+                    doc_id=request.doc_id,
+                    entity_ids=request.entity_ids,
+                    excluded_memory_ids=request.excluded_memory_ids,
+                )
+                for _, request in unresolved
             )
+        )
+        if len(candidate_batches) != len(unresolved):
+            raise RuntimeError(
+                "identity candidate batch coverage invalid: "
+                f"expected_count={len(unresolved)}, actual_count={len(candidate_batches)}"
+            )
+        for (index, request), candidates in zip(
+            unresolved,
+            candidate_batches,
+            strict=True,
+        ):
+            challenger = request.challenger
             exact_candidate = next(
                 (
                     candidate
@@ -192,13 +260,9 @@ class IdentityResolver:
                     ),
                     classified_pairs=pair_decisions,
                 )
-
-        return IdentityResolutionBatch(
-            resolutions=tuple(resolved[index] for index in range(len(requests))),
-            metrics=IdentityResolutionMetrics(
-                pair_count=len(all_pairs),
-                llm_calls=llm_calls,
-                prompt_chars=prompt_chars,
-                elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
-            ),
+        return (
+            [resolved[index] for index in range(len(requests))],
+            len(all_pairs),
+            llm_calls,
+            prompt_chars,
         )

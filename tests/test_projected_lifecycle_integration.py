@@ -747,6 +747,19 @@ class _OutboxDrainer:
         )
         return (candidate,) if candidate is not None else ()
 
+    async def find_access_compatible_equivalence_candidates_batch(self, queries):
+        candidates = []
+        for query in queries:
+            candidates.append(
+                await self.find_access_compatible_equivalence_candidates(
+                    query.memory,
+                    excluded_memory_ids=query.excluded_memory_ids,
+                    doc_id=query.doc_id,
+                    entity_ids=query.entity_ids,
+                )
+            )
+        return tuple(candidates)
+
     async def find_access_compatible_exact_candidate(
         self,
         memory: Memory,
@@ -825,6 +838,19 @@ class _EquivalentMemoryStore(_OutboxDrainer):
     ) -> tuple[Memory, ...]:
         del memory, excluded_memory_ids, scope, doc_id, entity_ids
         return (self.target,)
+
+    async def find_access_compatible_equivalence_candidates_batch(self, queries):
+        candidates = []
+        for query in queries:
+            candidates.append(
+                await self.find_access_compatible_equivalence_candidates(
+                    query.memory,
+                    excluded_memory_ids=query.excluded_memory_ids,
+                    doc_id=query.doc_id,
+                    entity_ids=query.entity_ids,
+                )
+            )
+        return tuple(candidates)
 
 
 @pytest.mark.asyncio
