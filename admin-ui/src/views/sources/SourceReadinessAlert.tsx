@@ -1,11 +1,13 @@
 import {
   CircleAlert,
   LogIn,
+  Loader2,
   MonitorCheck,
   TriangleAlert,
 } from "lucide-react";
 import type { SourceConnectionStatus } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useLocalAgentDaemonStatus } from "./localAgentDaemonStatusQuery";
 import {
@@ -17,6 +19,8 @@ import {
 interface SourceReadinessAlertProps {
   localExecution: boolean;
   connectionStatus?: SourceConnectionStatus | null;
+  onSignIn?: () => void;
+  isSigningIn?: boolean;
 }
 
 const ALERT_PRESENTATION: Partial<Record<SourceReadiness, {
@@ -49,6 +53,8 @@ const ALERT_PRESENTATION: Partial<Record<SourceReadiness, {
 export function SourceReadinessAlert({
   localExecution,
   connectionStatus,
+  onSignIn,
+  isSigningIn = false,
 }: SourceReadinessAlertProps) {
   const query = useLocalAgentDaemonStatus(localExecution);
   const daemon: LocalDaemonReadiness | undefined = localExecution
@@ -63,6 +69,26 @@ export function SourceReadinessAlert({
   if (!presentation) return null;
 
   const Icon = presentation.icon;
+  if (readiness === "sign_in_required" && onSignIn) {
+    return (
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        disabled={isSigningIn}
+        onClick={onSignIn}
+        className={cn("h-6 gap-1.5 rounded-full px-2.5 text-xs shadow-none", presentation.className)}
+      >
+        {isSigningIn ? (
+          <Loader2 className="size-3 animate-spin" aria-hidden="true" />
+        ) : (
+          <Icon className="size-3" aria-hidden="true" />
+        )}
+        {isSigningIn ? "Waiting for sign-in…" : "Sign in required"}
+      </Button>
+    );
+  }
+
   return (
     <Badge variant="outline" className={cn("gap-1.5", presentation.className)}>
       <Icon className="size-3" aria-hidden="true" />

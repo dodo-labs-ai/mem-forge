@@ -161,6 +161,16 @@ assert.match(
   /Local sync unavailable[\s\S]*Sign in required[\s\S]*Finish setup[\s\S]*Account mismatch/,
   "Source rows should retain readiness states that require user action",
 );
+assert.match(
+  readinessAlertSource,
+  /readiness === "sign_in_required"[\s\S]*onSignIn[\s\S]*Waiting for sign-in[\s\S]*Sign in required/,
+  "Sign-in readiness should become an explicit action while preserving its status label",
+);
+assert.match(
+  sourcesPageSource,
+  /operation:\s*"jira_auth"[\s\S]*base_url:[\s\S]*auth_mode:\s*"browser_cookie"/,
+  "Jira sign-in should use the existing target-aware local-agent job interface",
+);
 
 // --- Configure dialog ----------------------------------------------------
 

@@ -2215,6 +2215,77 @@ def test_local_agent_cloud_teams_auth_captures_session(monkeypatch):
     assert FakeToolClient.calls == []
 
 
+def test_local_agent_cloud_jira_auth_opens_interactive_browser_and_uploads_session(monkeypatch):
+    from memforge.auth import jira_capture
+
+    captured: dict[str, object] = {}
+
+    async def fake_capture(
+        base_url,
+        *,
+        browser=None,
+        tls_config=None,
+        interactive=False,
+    ):
+        captured.update(
+            {
+                "base_url": base_url,
+                "browser": browser,
+                "tls_config": tls_config,
+                "interactive": interactive,
+            }
+        )
+        return jira_capture.JiraCaptureResult(
+            origin=base_url,
+            cookie_header="SESSION=interactive",
+            browser="MemForge Chrome profile",
+            principal={"accountId": "jira-user"},
+        )
+
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+    FakeToolClient.reset(
+        {
+            "provider": "jira",
+            "origin": "https://jira.example.test",
+            "status": "active",
+        }
+    )
+
+    payload = main._run_cloud_local_agent_job(
+        {
+            "job_id": "laj-jira-auth",
+            "workspace_id": "mount_tai",
+            "operation": "jira_auth",
+            "source_type": "jira",
+            "source_id": "src-jira",
+            "payload": {
+                "base_url": "https://jira.example.test",
+                "auth_mode": "browser_cookie",
+            },
+        },
+        _cloud_test_client(),
+        browser="chrome",
+    )
+
+    assert payload == {
+        "operation": "jira_auth",
+        "source_id": "src-jira",
+        "authenticated": True,
+        "origin": "https://jira.example.test",
+    }
+    assert captured["base_url"] == "https://jira.example.test"
+    assert captured["browser"] == "chrome"
+    assert captured["interactive"] is True
+    assert captured["tls_config"] == {
+        "base_url": "https://jira.example.test",
+        "auth_mode": "browser_cookie",
+        "sync_mode": "cloud",
+    }
+    upload = next(call for name, call in FakeToolClient.calls if name == "upload_jira_session")
+    assert upload["workspace_id"] == "mount_tai"
+    assert upload["cookie_header"] == "SESSION=interactive"
+
+
 def test_local_agent_cloud_teams_auth_check_uses_daemon_token_status(monkeypatch):
     import memforge.local_agent.teams_browse as teams_browse
 

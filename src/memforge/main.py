@@ -2192,6 +2192,7 @@ def _run_cloud_local_agent_job(
         "local_markdown_pick_root": lambda: _run_cloud_pick_root_job(job),
         "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
         "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client, report_progress=report_progress),
+        "jira_auth": lambda: _run_cloud_jira_auth_job(job, client, browser=browser),
         "jira_sync": lambda: _run_cloud_jira_sync_job(job, client, browser=browser, report_progress=report_progress),
         "teams_auth_check": lambda: _run_cloud_teams_auth_check_job(job),
         "teams_auth": lambda: _run_cloud_teams_auth_job(job),
@@ -2209,6 +2210,73 @@ def _run_cloud_local_agent_job(
             "error": f"unsupported cloud local-agent job operation: {operation or '<empty>'}",
         }
     return handler()
+
+
+def _run_cloud_jira_auth_job(
+    job: dict[str, Any],
+    client: ToolClient,
+    *,
+    browser: str | None,
+) -> dict[str, Any]:
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    source_id, client, error = _local_agent_job_source_client(
+        job,
+        payload,
+        operation=operation,
+        client=client,
+    )
+    if error:
+        return {**error, "retryable": False}
+
+    try:
+        from memforge.auth.jira_capture import capture_and_prevalidate
+
+        session_config = _jira_cloud_config_from_job_payload(payload)
+        captured = asyncio.run(
+            capture_and_prevalidate(
+                str(session_config["base_url"]),
+                browser=browser,
+                tls_config=session_config,
+                interactive=True,
+            )
+        )
+        uploaded_session = client.upload_jira_session(
+            base_url=captured.origin,
+            cookie_header=captured.cookie_header,
+            browser=captured.browser,
+        )
+        if uploaded_session.get("status_code") == 409:
+            return {
+                "operation": operation,
+                "source_id": source_id,
+                **_principal_change_payload(uploaded_session),
+                "error_type": "JiraPrincipalChangedError",
+                "retryable": False,
+            }
+        if uploaded_session.get("error"):
+            return {
+                "operation": operation,
+                "source_id": source_id,
+                "error": "Unable to store the renewed Jira browser session",
+                "error_type": "JiraSessionUploadError",
+                "retryable": False,
+            }
+    except Exception as exc:
+        return {
+            "operation": operation,
+            "source_id": source_id,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "retryable": False,
+        }
+
+    return {
+        "operation": operation,
+        "source_id": source_id,
+        "authenticated": True,
+        "origin": captured.origin,
+    }
 
 
 def _local_agent_lease_not_current(response: object) -> bool:

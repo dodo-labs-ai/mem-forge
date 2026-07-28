@@ -72,6 +72,8 @@ export function SourceRow({
   isPinPending = false,
   onRetryAccess,
   onRevertAccess,
+  onSignIn,
+  isSigningIn = false,
 }: {
   source: Source;
   perGroupMemoryCount: number;
@@ -94,11 +96,15 @@ export function SourceRow({
   isPinPending?: boolean;
   onRetryAccess?: () => void;
   onRevertAccess?: () => void;
+  onSignIn?: () => void;
+  isSigningIn?: boolean;
 }) {
   const isPaused = source.status === "paused";
   const capabilities = source.capabilities ?? DEFAULT_CAPABILITIES;
   const localExecution = isLocalAgentBackedSource(source);
   const connectionRequiresAction = source.connection_status?.state === "action_required";
+  const signInRequired = connectionRequiresAction
+    && source.connection_status?.reason === "authentication";
   const showReadinessAlert = !isPaused
     && capabilities.can_sync
     && (localExecution || connectionRequiresAction);
@@ -147,6 +153,8 @@ export function SourceRow({
                 <SourceReadinessAlert
                   localExecution={localExecution}
                   connectionStatus={source.connection_status}
+                  onSignIn={onSignIn}
+                  isSigningIn={isSigningIn}
                 />
               )}
             </div>
@@ -168,7 +176,9 @@ export function SourceRow({
               {source.sync_schedule?.enabled && (
                 <span>
                   Auto sync: {formatScheduleInterval(source.sync_schedule.interval_minutes)}
-                  {source.sync_schedule.next_run_at
+                  {signInRequired
+                    ? ", waiting for sign-in"
+                    : source.sync_schedule.next_run_at
                     ? `, next ${formatRelativeFuture(source.sync_schedule.next_run_at)}`
                     : ""}
                 </span>

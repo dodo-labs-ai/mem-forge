@@ -54,7 +54,7 @@ def _workspace_role(request: Request) -> str:
     return request.headers.get("x-test-workspace-role", "member")
 
 
-def _app(tmp_path: Path, database: Database):
+def _app(tmp_path: Path, database: Database, *, workspace_id: str = "default"):
     from memforge.server.admin_api import create_admin_app
 
     return create_admin_app(
@@ -62,6 +62,7 @@ def _app(tmp_path: Path, database: Database):
         config=_config(tmp_path),
         principal_resolver=_principal,
         workspace_role_resolver=_workspace_role,
+        workspace_id=workspace_id,
     )
 
 
@@ -1233,6 +1234,37 @@ def test_local_agent_setup_job_allows_member_but_forbids_viewer(tmp_path):
         assert accepted.status_code == 201, accepted.text
         assert forbidden.status_code == 403, forbidden.text
         assert leased.json()["jobs"][0]["execution_owner_user_id"] == "member-a"
+    finally:
+        asyncio.run(database.close())
+
+
+def test_jira_auth_job_uses_the_current_workspace(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database, workspace_id="mount_tai")
+        body = {
+            "source_id": "src-jira",
+            "source_type": "jira",
+            "operation": "jira_auth",
+            "payload": {
+                "base_url": "https://jira.example.test",
+                "auth_mode": "browser_cookie",
+            },
+        }
+        headers = {"x-test-user": "member-a", "x-test-workspace-role": "member"}
+        with TestClient(app) as client:
+            accepted = client.post("/api/cloud/local-agent/jobs", headers=headers, json=body)
+            leased = client.post(
+                "/api/cloud/local-agent/jobs/lease",
+                headers=headers,
+                json={"limit": 5, "lease_seconds": 60},
+            )
+
+        assert accepted.status_code == 201, accepted.text
+        [job] = leased.json()["jobs"]
+        assert job["workspace_id"] == "mount_tai"
+        assert job["source_id"] == "src-jira"
+        assert job["operation"] == "jira_auth"
     finally:
         asyncio.run(database.close())
 

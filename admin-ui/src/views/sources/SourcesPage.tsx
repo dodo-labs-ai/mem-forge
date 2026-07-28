@@ -108,6 +108,7 @@ const LOCAL_AGENT_TIMEOUT_MESSAGE =
   "Local daemon did not pick up this job. Start it with `memforge adapter daemon run` and try again.";
 const LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE = "Configure a folder path before syncing this local source.";
 const LOCAL_AGENT_SYNC_FAILED_MESSAGE = "Local daemon could not sync this source.";
+const JIRA_SIGN_IN_FAILED_MESSAGE = "Jira sign-in failed.";
 const LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS = 30_000;
 
 function safeSourceErrorMessage(error: unknown): string | null {
@@ -118,6 +119,7 @@ function safeSourceErrorMessage(error: unknown): string | null {
     || error.message === LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE
     || error.message === LOCAL_AGENT_SYNC_FAILED_MESSAGE
     || error.message.startsWith(`${LOCAL_AGENT_SYNC_FAILED_MESSAGE} `)
+    || error.message.startsWith(`${JIRA_SIGN_IN_FAILED_MESSAGE} `)
   ) {
     return error.message;
   }
@@ -145,6 +147,14 @@ function cleanLocalAgentJobError(value: string): string {
     return "Sign in to Teams in Chrome, then retry sync.";
   }
   return text;
+}
+
+function jiraSignInJobErrorMessage(status: LocalAgentJobStatusResponse): string {
+  const result = status.result as { error?: unknown } | null;
+  const detail = typeof result?.error === "string" && result.error.trim()
+    ? result.error.trim()
+    : status.last_error?.trim();
+  return detail ? `${JIRA_SIGN_IN_FAILED_MESSAGE} ${detail}` : JIRA_SIGN_IN_FAILED_MESSAGE;
 }
 
 async function createLocalAgentSyncJob(
@@ -310,7 +320,10 @@ export function SourcesPage() {
 
   const currentLocalJobBySource = Object.fromEntries(
     (currentLocalJobsQuery.data ?? [])
-      .filter((job): job is LocalAgentJobStatusResponse & { source_id: string } => Boolean(job.source_id))
+      .filter(
+        (job): job is LocalAgentJobStatusResponse & { source_id: string } =>
+          Boolean(job.source_id) && Boolean(job.operation?.endsWith("_sync")),
+      )
       .map((job) => [job.source_id, job]),
   );
 
@@ -367,6 +380,35 @@ export function SourcesPage() {
         next.delete(variables.source.id);
         return next;
       });
+    },
+  });
+
+  const signInJira = useMutation({
+    mutationFn: async (source: Source) => {
+      const baseUrl = typeof source.config.base_url === "string"
+        ? source.config.base_url.trim()
+        : "";
+      if (!baseUrl) throw new Error(`${JIRA_SIGN_IN_FAILED_MESSAGE} Jira URL is missing.`);
+
+      const created = await createLocalAgentJob({
+        sourceId: source.id,
+        sourceType: source.type,
+        operation: "jira_auth",
+        payload: {
+          base_url: baseUrl,
+          auth_mode: "browser_cookie",
+        },
+      });
+      const status = await pollLocalAgentSyncJob(created.job_id, {});
+      if (status.status === "failed") throw new Error(jiraSignInJobErrorMessage(status));
+      return status;
+    },
+    onError: (error) => handleAuthorityError(error, JIRA_SIGN_IN_FAILED_MESSAGE),
+    onSettled: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["sources"] }),
+        queryClient.invalidateQueries({ queryKey: ["currentLocalAgentJobs"] }),
+      ]);
     },
   });
 
@@ -769,6 +811,16 @@ export function SourcesPage() {
                           if (!capabilities.can_sync || source.status === "paused") return;
                           syncSource.mutate({ source });
                         }}
+                        onSignIn={
+                          source.type === "jira"
+                          && source.connection_status?.reason === "authentication"
+                          && capabilities.can_configure_connection
+                            ? () => signInJira.mutate(source)
+                            : undefined
+                        }
+                        isSigningIn={
+                          signInJira.isPending && signInJira.variables?.id === source.id
+                        }
                         onResume={() =>
                           setSourceStatus.mutate({ sourceId: source.id, status: "active" })
                         }
