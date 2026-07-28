@@ -57,7 +57,11 @@ from memforge.pipeline.source_projection_adapters import (
     project_source_unit_tombstone,
     source_run_projection_coverage,
 )
-from memforge.memory.lifecycle_plan import AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON
+from memforge.memory.lifecycle_plan import (
+    AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON,
+    ReconciliationScope,
+)
+from memforge.memory.lifecycle_planner import lifecycle_plan_id
 from memforge.memory.project_resolver import resolve_project_key
 from memforge.source_projection import (
     ProjectionCoverage,
@@ -1426,6 +1430,26 @@ class GeneSyncOrchestrator:
                 await self.db.supersede_source_derivation(attempt.id)
                 continue
             projection = attempt.projection
+            delta = projection.deltas[0]
+            plan_id = lifecycle_plan_id(
+                ReconciliationScope(
+                    id=f"scope:{projection.run_id}",
+                    source_id=projection.source_id,
+                    source_unit_id=delta.source_unit_id,
+                    base_unit_revision_id=delta.previous_unit_revision_id,
+                    target_unit_revision_id=delta.current_unit_revision_id,
+                )
+            )
+            if await self.db.get_lifecycle_plan_payload(plan_id) is not None:
+                await self.db.supersede_source_derivation(attempt.id)
+                logger.info(
+                    "Superseded Source derivation %s because lifecycle plan %s "
+                    "already applied for Source Unit %s",
+                    attempt.id,
+                    plan_id,
+                    attempt.source_unit_id,
+                )
+                continue
             extraction = await self._extract_projection_batches(
                 projection=projection,
                 source_type=projection.source_type,

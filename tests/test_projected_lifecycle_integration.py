@@ -333,6 +333,27 @@ class _ReplacementClient:
         )
 
 
+class _ConflictingReplacementClient:
+    async def reconcile_candidate_relations(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return _candidate_response(
+            CandidateRelationDecision(
+                action="SUPERSEDE",
+                incumbent_slot=0,
+                reason="The candidate appears to replace the incumbent.",
+            )
+        )
+
+    async def audit_incumbent_support(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return _audit_response(
+            IncumbentSupportAuditDecision(
+                action="NOOP",
+                reason="The incumbent still appears supported.",
+            )
+        )
+
+
 class _NoopClient:
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
@@ -369,6 +390,97 @@ class _UnexpectedReconciliationClient:
     async def audit_incumbent_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         raise AssertionError("proven-disjoint incumbent must not require LLM reconciliation")
+
+
+@pytest.mark.asyncio
+async def test_conflicting_reconciliation_judgments_commit_pending_review(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-conflict-review-1",
+        body="Service uses PostgreSQL 15.",
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+    await engine.apply_projected_lifecycle(
+        projection=first,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content="Service uses PostgreSQL 15.",
+                memory_type="fact",
+            )
+        ],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="Service uses PostgreSQL 15.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    [incumbent] = await db.list_memories()
+    previous_support = await db.get_active_memory_support_reference_ids(
+        incumbent.id
+    )
+
+    second = _projection(
+        run_id="projection-conflict-review-2",
+        body="Service uses PostgreSQL 16.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    reviewing_engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_ConflictingReplacementClient(),
+    )
+
+    stats = await reviewing_engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content="Service uses PostgreSQL 16.",
+                memory_type="fact",
+            )
+        ],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="Service uses PostgreSQL 16.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    assert stats["pending_review"] == 1
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "active"
+    assert await db.get_active_memory_support_reference_ids(
+        incumbent.id
+    ) == previous_support
+    assert [memory.id for memory in await db.list_memories()] == [incumbent.id]
+    [review] = await db.list_lifecycle_reviews(
+        "src-1",
+        status=LifecycleReviewStatus.PENDING,
+    )
+    assert review.incumbent_memory_id == incumbent.id
+    assert second.source_unit_revisions[0].id == (
+        await db.get_current_source_unit_revision(
+            second.source_units[0].id
+        )
+    ).id
 
 
 @pytest.mark.asyncio
