@@ -44,6 +44,23 @@ class _LedgerClient:
         return self.responses.pop(0)
 
 
+class _IntermittentLedgerClient:
+    def __init__(
+        self,
+        *outcomes: CandidateLedgerResponse | Exception,
+    ) -> None:
+        self.outcomes = list(outcomes)
+        self.prompts: list[str] = []
+
+    async def select_memory_candidates(self, prompt: str, **kwargs) -> CandidateLedgerResponse:
+        del kwargs
+        self.prompts.append(prompt)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
 @pytest.mark.asyncio
 async def test_candidate_ledger_retries_once_when_decision_coverage_is_incomplete():
     first = _candidate("The trigger remained OPEN.", observation_id="obs-1")
@@ -244,6 +261,35 @@ async def test_candidate_ledger_composes_bounded_decision_batches():
     assert '"slot_07":null' in client.prompts[2]
     assert '"index":54' not in client.prompts[0]
     assert '"index":54' in client.prompts[2]
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_keeps_failed_admission_batch_and_continues():
+    candidates = [
+        _candidate(
+            f"Durable candidate {index:02d} with distinct content.",
+            observation_id=f"obs-{index}",
+        )
+        for index in range(55)
+    ]
+    client = _IntermittentLedgerClient(
+        _ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in range(24))),
+        RuntimeError("provider returned invalid structured output"),
+        _ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in range(48, 55))),
+    )
+
+    result = await select_unique_memory_candidates(
+        candidates,
+        structured_llm_client=client,
+        llm_model=None,
+    )
+
+    assert result.candidates == tuple(candidates)
+    assert result.structured_llm_calls == 3
+    assert result.fallback_batch_count == 1
+    assert result.fallback_candidate_count == 24
+    assert len(client.prompts) == 3
+    assert '"slot_00":48' in client.prompts[-1]
 
 
 @pytest.mark.asyncio
