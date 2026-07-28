@@ -292,6 +292,24 @@ class MemoryEngine:
             )
             scoped_reference_ids = frozenset(unit_support.get(operation.memory_id, ()))
             support = tuple(item for item in source_support if item.reference_id in scoped_reference_ids)
+            missing_dependencies = [
+                item
+                for item in support
+                if item.anchor.observation_id not in current_revisions
+            ]
+            if missing_dependencies and projection.coverage.proves_absence:
+                rebound.append(
+                    ReconcileOperation(
+                        action=ReconcileAction.DELETE,
+                        memory_id=operation.memory_id,
+                        reason=(
+                            "current Source Projection removed an exact "
+                            "supporting Observation"
+                        ),
+                        flag_for_review=True,
+                    )
+                )
+                continue
             stale = [
                 item
                 for item in support
@@ -301,9 +319,6 @@ class MemoryEngine:
             if not stale:
                 rebound.append(operation)
                 continue
-            missing_dependencies = [item for item in support if item.anchor.observation_id not in current_revisions]
-            if missing_dependencies and projection.coverage.proves_absence:
-                raise RuntimeError(f"NOOP incumbent has a removed evidence dependency: {operation.memory_id}")
             primary = [item for item in support if item.role is EvidenceRole.PRIMARY]
             if len(primary) != 1:
                 raise RuntimeError(f"NOOP incumbent lacks exactly one PRIMARY dependency: {operation.memory_id}")

@@ -482,6 +482,101 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
     ).id
 
 
+@pytest.mark.asyncio
+async def test_removed_artifact_dependency_commits_projection_with_pending_review(
+    db: Database,
+) -> None:
+    first = _projection_with_artifact(
+        run_id="projection-artifact-present",
+        payload=b"current-body-image",
+        provider_revision="1",
+        inference_eligible=True,
+    )
+    artifact_observation_id = next(
+        observation.id
+        for observation in first.observations
+        if observation.observation_type == "binary_artifact"
+    )
+    page_observation_id = next(
+        observation.id
+        for observation in first.observations
+        if observation.observation_type == "page_body"
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+    await engine.apply_projected_lifecycle(
+        projection=first,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content="The diagram records that A7 remains enabled.",
+                memory_type="decision",
+                evidence_quote="# Page",
+                source_observation_id=page_observation_id,
+                required_source_observation_ids=(artifact_observation_id,),
+            )
+        ],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="# Page",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    [incumbent] = await db.list_memories()
+    previous_support = await db.get_active_memory_support_reference_ids(
+        incumbent.id
+    )
+    second = _projection(
+        run_id="projection-artifact-removed",
+        body="# Page",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    reviewing_engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_NoopClient(incumbent.id),
+    )
+
+    stats = await reviewing_engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="# Page",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    current = await db.get_memory(incumbent.id)
+    current_support = await db.get_active_memory_support_reference_ids(
+        incumbent.id
+    )
+    assert current is not None and current.status == "active"
+    assert stats["pending_review"] == 1
+    assert current_support == previous_support
+    assert second.source_unit_revisions[0].id == (
+        await db.get_current_source_unit_revision(
+            second.source_units[0].id
+        )
+    ).id
+
+
 class _RecordingAddClient:
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
