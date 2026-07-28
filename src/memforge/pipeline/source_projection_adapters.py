@@ -354,15 +354,35 @@ def project_source_item(
         membership_hash,
         access_hash,
     )
-    unit_revision = SourceUnitRevision(
+    projected_unit_revision = SourceUnitRevision(
         id=unit_revision_id,
         source_unit_id=unit_id,
         semantic_hash=semantic_hash,
         location_hash=location_hash,
         membership_hash=membership_hash,
         access_hash=access_hash,
-        observation_revision_ids=tuple(item.id for item in revisions),
+        observation_revision_ids=tuple(sorted(item.id for item in revisions)),
         observed_at=item.last_modified.isoformat(),
+    )
+    unit_revision = (
+        prior_unit_revision
+        if (
+            prior_unit_revision is not None
+            and prior_unit_revision.id == projected_unit_revision.id
+            and prior_unit_revision.source_unit_id
+            == projected_unit_revision.source_unit_id
+            and prior_unit_revision.semantic_hash
+            == projected_unit_revision.semantic_hash
+            and prior_unit_revision.location_hash
+            == projected_unit_revision.location_hash
+            and prior_unit_revision.membership_hash
+            == projected_unit_revision.membership_hash
+            and prior_unit_revision.access_hash
+            == projected_unit_revision.access_hash
+            and tuple(sorted(prior_unit_revision.observation_revision_ids))
+            == projected_unit_revision.observation_revision_ids
+        )
+        else projected_unit_revision
     )
     axes: set[DeltaAxis] = set()
     previous_id = prior_unit_revision.id if prior_unit_revision else None
