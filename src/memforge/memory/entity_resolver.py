@@ -22,6 +22,8 @@ from memforge.storage.adapters.protocols import (
 
 logger = logging.getLogger(__name__)
 
+_ENTITY_ADJUDICATION_SLOT_COUNT = 32
+
 __all__ = [
     "EntityResolutionBatch",
     "EntityResolutionContext",
@@ -75,6 +77,11 @@ class EntityResolutionPolicy:
         ):
             if value < 1:
                 raise ValueError(f"{name} must be positive")
+        if self.adjudication_batch_size > _ENTITY_ADJUDICATION_SLOT_COUNT:
+            raise ValueError(
+                "adjudication_batch_size cannot exceed fixed response slot capacity "
+                f"({_ENTITY_ADJUDICATION_SLOT_COUNT})"
+            )
 
 
 def validate_alias(alias_name: str, canonical_name: str) -> bool:
@@ -96,7 +103,11 @@ def validate_alias(alias_name: str, canonical_name: str) -> bool:
 
 _ENTITY_BATCH_PROMPT = """Resolve each entity mention against only its supplied candidates.
 
-Mentions and candidate IDs:
+Each case is assigned to a datastore-owned response slot. Return the judgment
+for each active case in its matching slot. Every unused slot must be null.
+Do not repeat or rewrite the mention.
+
+Response slots, mentions, and candidate IDs:
 {cases_json}
 
 Document context:
@@ -256,25 +267,26 @@ class EntityResolver:
                     model=self.llm_model,
                 )
                 structured_llm_calls += 1
-                batch_decisions: dict[str, object] = {}
-                duplicates: set[str] = set()
-                for decision in response.decisions:
-                    mention = canonicalize_entity_name(decision.mention)
-                    if mention in batch_decisions:
-                        duplicates.add(mention)
-                    batch_decisions[mention] = decision
-                expected_mentions = {str(case["mention"]) for case in case_batch}
-                actual_mentions = set(batch_decisions)
-                if duplicates or actual_mentions != expected_mentions:
+                ordered_slots = response.ordered_slots()
+                active_slots = ordered_slots[: len(case_batch)]
+                unused_slots = ordered_slots[len(case_batch) :]
+                missing_active = sum(decision is None for decision in active_slots)
+                non_null_unused = sum(decision is not None for decision in unused_slots)
+                if missing_active or non_null_unused:
                     raise RuntimeError(
-                        "entity adjudication coverage invalid: "
-                        f"expected_count={len(expected_mentions)}, "
-                        f"actual_count={len(actual_mentions)}, "
-                        f"missing_count={len(expected_mentions - actual_mentions)}, "
-                        f"duplicate_count={len(duplicates)}, "
-                        f"unexpected_count={len(actual_mentions - expected_mentions)}"
+                        "entity adjudication slot coverage invalid: "
+                        f"active_count={len(case_batch)}, "
+                        f"missing_active_count={missing_active}, "
+                        f"non_null_unused_count={non_null_unused}"
                     )
-                decisions.update(batch_decisions)
+                decisions.update(
+                    (
+                        str(case["mention"]),
+                        decision,
+                    )
+                    for case, decision in zip(case_batch, active_slots, strict=True)
+                    if decision is not None
+                )
             for mention, candidates in ambiguous.items():
                 decision = decisions.get(mention)
                 assert decision is not None
@@ -355,8 +367,9 @@ class EntityResolver:
         *,
         context: str,
     ) -> str:
+        slotted_cases = tuple({"slot": f"slot_{index:02d}", **case} for index, case in enumerate(cases))
         return _ENTITY_BATCH_PROMPT.format(
-            cases_json=json.dumps(cases, ensure_ascii=False, sort_keys=True),
+            cases_json=json.dumps(slotted_cases, ensure_ascii=False, sort_keys=True),
             context=context,
         )
 
