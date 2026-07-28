@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from html import unescape
 from html.parser import HTMLParser
 
 from memforge.source_artifacts import (
@@ -167,6 +168,12 @@ class _StorageArtifactReferenceParser(HTMLParser):
         )
 
 
+def _normalized_attachment_title(descriptor: dict) -> str:
+    """Match Confluence titles using the XHTML entity semantics of storage bodies."""
+
+    return unescape(str(descriptor.get("title") or ""))
+
+
 def _gallery_filenames(
     *,
     parameters: dict[str, str],
@@ -214,12 +221,12 @@ def resolve_current_confluence_artifacts(
     descriptors_by_title: dict[str, list[dict]] = {}
     for descriptor in attachment_descriptors:
         descriptors_by_title.setdefault(
-            str(descriptor.get("title") or ""),
+            _normalized_attachment_title(descriptor),
             [],
         ).append(descriptor)
 
     gallery_image_filenames = tuple(
-        str(descriptor.get("title") or "")
+        _normalized_attachment_title(descriptor)
         for descriptor in attachment_descriptors
         if normalize_source_artifact_media_type(
             (

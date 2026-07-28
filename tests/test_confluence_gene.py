@@ -558,6 +558,45 @@ async def test_fetch_materializes_only_attachments_referenced_as_current_body_im
 
 
 @pytest.mark.asyncio
+async def test_fetch_matches_body_filename_to_entity_encoded_attachment_title():
+    raw = await _fetch_current_page(
+        (
+            '<ac:image><ri:attachment '
+            'ri:filename="Screenshot at 1.44.11&#8239;PM.png" /></ac:image>'
+        ),
+        (
+            _attachment(
+                "att-current",
+                "Screenshot at 1.44.11&#8239;PM.png",
+            ),
+        ),
+    )
+
+    assert [artifact.provider_key for artifact in raw.artifacts] == ["att-current"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_attachment_titles_that_collide_after_entity_decoding():
+    with pytest.raises(SourceArtifactContractError, match="cannot be resolved"):
+        await _fetch_current_page(
+            (
+                '<ac:image><ri:attachment '
+                'ri:filename="Screenshot at 1.44.11&#8239;PM.png" /></ac:image>'
+            ),
+            (
+                _attachment(
+                    "att-encoded",
+                    "Screenshot at 1.44.11&#8239;PM.png",
+                ),
+                _attachment(
+                    "att-unicode",
+                    "Screenshot at 1.44.11\u202fPM.png",
+                ),
+            ),
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "attachment_results",
     [
