@@ -143,3 +143,14 @@ async def memory_visibility_for_document(
     if source is None:
         raise ValueError(f"Source {source_id!r} has no access policy")
     return memory_visibility_for_source(source)
+
+
+async def memory_visibility_for_source_id(
+    database: Any,
+    *,
+    source_id: str,
+) -> tuple[str, str | None]:
+    source = await database.get_source(source_id)
+    if source is None:
+        raise ValueError(f"Source {source_id!r} has no access policy")
+    return memory_visibility_for_source(source)

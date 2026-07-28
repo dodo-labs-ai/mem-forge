@@ -913,6 +913,19 @@ class SqliteRelationalStore:
             source_id=source_id,
         )
 
+    async def get_active_memory_support_observation_ids_many(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        source_id: str,
+    ) -> Mapping[str, tuple[str, ...]]:
+        return (
+            await self._db.get_active_memory_support_observation_ids_many(
+                memory_ids,
+                source_id=source_id,
+            )
+        )
+
     async def get_source_unit_support_reference_ids(
         self,
         source_unit_id: str,
@@ -924,11 +937,19 @@ class SqliteRelationalStore:
         projection: SourceProjection,
         plan: LifecyclePlan,
         *,
+        document: DocumentRecord | None = None,
+        derivation_id: str | None = None,
+        derivation_context_identity_hash: str | None = None,
         expected_source_activity_epoch: int | None = None,
     ) -> None:
         await self._db.apply_source_projection_lifecycle(
             projection,
             plan,
+            document=document,
+            derivation_id=derivation_id,
+            derivation_context_identity_hash=(
+                derivation_context_identity_hash
+            ),
             expected_source_activity_epoch=expected_source_activity_epoch,
         )
 

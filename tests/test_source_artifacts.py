@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 from contextlib import asynccontextmanager
+from io import BytesIO
 
 import pytest
+from PIL import Image
 
 from memforge import source_artifacts
 from memforge.source_artifacts import (
-    MAX_SOURCE_ARTIFACTS_PER_UNIT,
     RawSourceArtifact,
     SourceArtifactContractError,
     SourceArtifactDownload,
@@ -31,6 +32,15 @@ def _artifact(provider_key: str, payload: bytes, **overrides) -> RawSourceArtifa
     }
     values.update(overrides)
     return RawSourceArtifact(**values)
+
+
+def _png_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (1, 1), color=(10, 20, 30)).save(
+        output,
+        format="PNG",
+    )
+    return output.getvalue()
 
 
 def _opener(payloads: dict[str, bytes], *, transport_length_delta: int = 0):
@@ -99,10 +109,55 @@ def test_artifact_revision_summary_is_revision_pinned_and_legacy_optional() -> N
     )
 
 
+def test_artifact_revision_requires_materialized_inference_eligibility() -> None:
+    revision = source_artifact_revision_from_metadata(
+        observation_id="obs-image",
+        observation_revision_id="obsrev-image",
+        source_id="src-1",
+        source_unit_id="unit-1",
+        metadata={
+            "source_artifact": {
+                "artifact_id": "artifact-1",
+                "parent_observation_id": "obs-parent",
+                "provider_revision": "1",
+                "filename": "diagram.png",
+                "media_type": "image/png",
+                "size_bytes": 4,
+                "sha256": "a" * 64,
+                "uri": "artifact://diagram.png",
+            }
+        },
+    )
+
+    assert revision is None
+
+    unexplained_ineligible = source_artifact_revision_from_metadata(
+        observation_id="obs-image",
+        observation_revision_id="obsrev-image",
+        source_id="src-1",
+        source_unit_id="unit-1",
+        metadata={
+            "source_artifact": {
+                "artifact_id": "artifact-1",
+                "parent_observation_id": "obs-parent",
+                "provider_revision": "1",
+                "filename": "diagram.png",
+                "media_type": "image/png",
+                "size_bytes": 4,
+                "sha256": "a" * 64,
+                "uri": "artifact://diagram.png",
+                "inference_eligible": False,
+            }
+        },
+    )
+
+    assert unexplained_ineligible is None
+
+
 @pytest.mark.asyncio
 async def test_materialization_streams_exact_bytes_and_identity(tmp_path) -> None:
     store = LocalDocumentStore(str(tmp_path))
-    payload = b"\x89PNG\r\n\x1a\nknown-image-bytes"
+    payload = _png_bytes()
 
     (artifact,) = await materialize_source_artifacts(
         source_id="source-a",
@@ -118,7 +173,12 @@ async def test_materialization_streams_exact_bytes_and_identity(tmp_path) -> Non
     assert artifact.inference_eligible is True
     assert store.read_artifact(artifact.uri) == payload
 
-    replacement = b"\x89PNG\r\n\x1a\nrevised-image-bytes"
+    replacement_output = BytesIO()
+    Image.new("RGB", (1, 1), color=(30, 20, 10)).save(
+        replacement_output,
+        format="PNG",
+    )
+    replacement = replacement_output.getvalue()
     (revised,) = await materialize_source_artifacts(
         source_id="source-a",
         source_unit_key="issue-10",
@@ -130,6 +190,51 @@ async def test_materialization_streams_exact_bytes_and_identity(tmp_path) -> Non
     assert revised.uri != artifact.uri
     assert store.read_artifact(artifact.uri) == payload
     assert store.read_artifact(revised.uri) == replacement
+
+
+@pytest.mark.asyncio
+async def test_materialization_does_not_read_stream_after_store_takes_ownership() -> None:
+    class ClosingStore:
+        def __init__(self) -> None:
+            self.body: bytes | None = None
+
+        def store_source_artifact(self, **kwargs) -> str:
+            content = kwargs["content"]
+            self.body = content.read()
+            content.close()
+            return "artifact://stored"
+
+    payload = _png_bytes()
+    store = ClosingStore()
+
+    (artifact,) = await materialize_source_artifacts(
+        source_id="source-a",
+        source_unit_key="page-1",
+        artifacts=(_artifact("image", payload),),
+        store=store,
+        open_artifact=_opener({"image": payload}),
+    )
+
+    assert store.body == payload
+    assert artifact.inference_eligible is True
+    assert artifact.uri == "artifact://stored"
+
+
+@pytest.mark.asyncio
+async def test_invalid_image_is_stored_but_excluded_from_inference(tmp_path) -> None:
+    payload = b"\x89PNG\r\n\x1a\nnot-a-decodable-image"
+
+    (artifact,) = await materialize_source_artifacts(
+        source_id="source-a",
+        source_unit_key="page-1",
+        artifacts=(_artifact("invalid-image", payload),),
+        store=LocalDocumentStore(str(tmp_path)),
+        open_artifact=_opener({"invalid-image": payload}),
+    )
+
+    assert artifact.inference_eligible is False
+    assert artifact.inference_ineligible_reason == "invalid_image_structure"
+    assert LocalDocumentStore(str(tmp_path)).read_artifact(artifact.uri) == payload
 
 
 @pytest.mark.asyncio
@@ -200,21 +305,67 @@ async def test_materialization_validates_the_set_before_persistence(tmp_path) ->
 
 
 @pytest.mark.asyncio
-async def test_materialization_rejects_count_and_storage_limits(
+async def test_materialization_persists_each_exact_artifact_before_next_download(
+    tmp_path,
+) -> None:
+    class RecordingStore(LocalDocumentStore):
+        def __init__(self, root: str) -> None:
+            super().__init__(root)
+            self.uris: list[str] = []
+
+        def store_source_artifact(self, **kwargs) -> str:
+            uri = super().store_source_artifact(**kwargs)
+            self.uris.append(uri)
+            return uri
+
+    payloads = {"one": _png_bytes(), "two": _png_bytes()}
+    base_opener = _opener(payloads)
+
+    @asynccontextmanager
+    async def fail_second(artifact: RawSourceArtifact):
+        if artifact.provider_key == "two":
+            raise RuntimeError("provider interrupted")
+        async with base_opener(artifact) as download:
+            yield download
+
+    store = RecordingStore(str(tmp_path))
+    with pytest.raises(RuntimeError, match="provider interrupted"):
+        await materialize_source_artifacts(
+            source_id="source-a",
+            source_unit_key="page-1",
+            artifacts=(
+                _artifact("one", payloads["one"]),
+                _artifact("two", payloads["two"]),
+            ),
+            store=store,
+            open_artifact=fail_second,
+        )
+
+    assert len(store.uris) == 1
+    assert store.read_artifact(store.uris[0]) == payloads["one"]
+
+
+@pytest.mark.asyncio
+async def test_materialization_bounds_bytes_without_rejecting_source_cardinality(
     tmp_path,
     monkeypatch,
 ) -> None:
     payload = b"12345"
-    with pytest.raises(SourceArtifactContractError, match="Artifact limit"):
-        await materialize_source_artifacts(
-            source_id="source-a",
-            source_unit_key="page-1",
-            artifacts=tuple(
-                _artifact(f"attachment-{index}", payload) for index in range(MAX_SOURCE_ARTIFACTS_PER_UNIT + 1)
-            ),
-            store=LocalDocumentStore(str(tmp_path)),
-            open_artifact=_opener({}),
-        )
+    many_payloads = {
+        f"attachment-{index}": payload
+        for index in range(125)
+    }
+    many = await materialize_source_artifacts(
+        source_id="source-a",
+        source_unit_key="page-1",
+        artifacts=tuple(
+            _artifact(provider_key, body)
+            for provider_key, body in many_payloads.items()
+        ),
+        store=LocalDocumentStore(str(tmp_path)),
+        open_artifact=_opener(many_payloads),
+    )
+    assert len(many) == 125
 
     monkeypatch.setattr(source_artifacts, "MAX_SOURCE_ARTIFACT_STORAGE_BYTES", 4)
     with pytest.raises(SourceArtifactContractError, match="storage limit"):

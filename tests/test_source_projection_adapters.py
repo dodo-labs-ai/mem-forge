@@ -208,6 +208,56 @@ def test_binary_artifact_revision_is_bound_to_parent_observation_and_exact_hash(
     assert artifact_revision.metadata["source_artifact"]["inference_eligible"] is True
 
 
+def test_unchanged_unit_revision_preserves_prior_observation_revision_order() -> None:
+    item = _item(
+        item_id="confluence-123",
+        extra={"page_id": "123", "space_key": "ENG"},
+    )
+    raw, normalized = _inputs(item, b"<p>See diagrams.</p>")
+    artifacts = tuple(
+        StoredSourceArtifact(
+            id=f"artifact-{provider_key}",
+            provider_key=provider_key,
+            parent_observation_type="page_body",
+            parent_provider_key="123:body",
+            provider_revision="1",
+            filename=f"{provider_key}.png",
+            media_type="image/png",
+            size_bytes=4,
+            sha256=sha256,
+            uri=f"/store/artifact-{provider_key}/{provider_key}.png",
+            inference_eligible=True,
+        )
+        for provider_key, sha256 in (("a", "a" * 64), ("b", "b" * 64))
+    )
+    initial = project_source_item(
+        source_id="src-c",
+        source_type="confluence",
+        run_id="run-order-initial",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+        artifacts=artifacts,
+    )
+
+    retry = project_source_item(
+        source_id="src-c",
+        source_type="confluence",
+        run_id="run-order-retry",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+        artifacts=tuple(reversed(artifacts)),
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in initial.observation_revisions
+        },
+    )
+
+    assert retry.source_unit_revisions[0] == initial.source_unit_revisions[0]
+
+
 def test_binary_artifact_retry_edit_and_removal_follow_observation_lifecycle() -> None:
     item = _item(
         item_id="confluence-123",
