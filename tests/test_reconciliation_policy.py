@@ -464,7 +464,7 @@ async def test_compatible_duplicate_noops_normalize_to_one_incumbent_keep() -> N
 
 
 @pytest.mark.asyncio
-async def test_conflicting_duplicate_incumbent_decisions_fail_closed() -> None:
+async def test_conflicting_incumbent_judgments_route_replacement_to_review() -> None:
     incumbent = _memory("mem-existing", "Service uses PostgreSQL 15.")
 
     class ConflictingClient:
@@ -490,9 +490,63 @@ async def test_conflicting_duplicate_incumbent_decisions_fail_closed() -> None:
         include_metadata=True,
     )
 
-    assert result.operations == []
-    assert result.failure is not None
-    assert "conflicting incumbent decisions" in result.failure.error
+    assert result.failure is None
+    assert len(result.operations) == 1
+    [operation] = result.operations
+    assert operation.action is ReconcileAction.SUPERSEDE
+    assert operation.memory_id == incumbent.id
+    assert operation.memory == RawMemory(
+        content="Service uses PostgreSQL 16.",
+        memory_type="fact",
+    )
+    assert operation.flag_for_review is True
+
+
+@pytest.mark.asyncio
+async def test_conflicting_incumbent_judgments_route_support_removal_to_review() -> None:
+    incumbent = _memory("mem-existing", "Service uses PostgreSQL 15.")
+
+    class ConflictingClient:
+        async def reconcile_candidate_relations(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return _candidate_response(
+                CandidateRelationDecision(
+                    action="NOOP",
+                    incumbent_slot=0,
+                    reason="The candidate repeats the incumbent.",
+                )
+            )
+
+        async def audit_incumbent_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return _audit_response(
+                IncumbentSupportAuditDecision(
+                    action="DELETE",
+                    reason="The incumbent is no longer supported.",
+                )
+            )
+
+    result = await reconcile_memories(
+        new_extractions=[
+            RawMemory(
+                content="Service uses PostgreSQL 15.",
+                memory_type="fact",
+            )
+        ],
+        existing_memories=[incumbent],
+        doc_type="ticket",
+        structured_llm_client=ConflictingClient(),
+        include_metadata=True,
+    )
+
+    assert result.failure is None
+    [review_operation] = [
+        operation
+        for operation in result.operations
+        if operation.memory_id == incumbent.id
+    ]
+    assert review_operation.action is ReconcileAction.DELETE
+    assert review_operation.flag_for_review is True
 
 
 @pytest.mark.asyncio

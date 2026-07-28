@@ -6,6 +6,7 @@ import json
 import sqlite3
 import weakref
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from memforge.llm.structured import (
 )
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
+from memforge.memory.lifecycle_planner import lifecycle_plan_id
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
@@ -76,6 +78,7 @@ from memforge.source_artifacts import (
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
     source_derivation_context_identity_hash,
+    source_derivation_manifest,
 )
 from memforge.config import AppConfig, SyncConfig
 from memforge.storage.database import Database
@@ -2891,9 +2894,17 @@ class NoopMemoryEngine:
         if self.db is None:
             raise RuntimeError("NoopMemoryEngine requires the test Database")
         empty_plan = LifecyclePlan(
-            id=f"test-plan-{projection.run_id}",
+            id=lifecycle_plan_id(
+                ReconciliationScope(
+                    id=f"scope:{projection.run_id}",
+                    source_id=projection.source_id,
+                    source_unit_id=delta.source_unit_id,
+                    base_unit_revision_id=delta.previous_unit_revision_id,
+                    target_unit_revision_id=delta.current_unit_revision_id,
+                )
+            ),
             scope=ReconciliationScope(
-                id=f"test-scope-{projection.run_id}",
+                id=f"scope:{projection.run_id}",
                 source_id=projection.source_id,
                 source_unit_id=delta.source_unit_id,
                 base_unit_revision_id=delta.previous_unit_revision_id,
@@ -4439,6 +4450,65 @@ async def test_failed_projection_batch_stages_target_and_preserves_completed_sib
     )
     [lifecycle_call] = memory_engine.projected_lifecycle_calls
     assert len(lifecycle_call["raw_memories"]) == len(extractor.projection_calls)
+
+
+@pytest.mark.asyncio
+async def test_sync_supersedes_completed_derivation_when_its_lifecycle_plan_is_applied(
+    db: Database,
+) -> None:
+    source_id = "src-completed-derivation-after-applied-plan"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Applied lifecycle recovery",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    body = "The current design keeps disputed lifecycle changes in Review."
+    memory_engine = RecordingMemoryEngine()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=ProjectionBatchCandidateExtractor(),
+        memory_engine=memory_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    first = await orchestrator.sync_gene(
+        gene=LargeConfluenceGene(body),
+        source_name="Applied lifecycle recovery",
+        source_id=source_id,
+    )
+
+    assert first.last_sync_status == "success"
+    [applied] = await db.list_source_derivation_attempts(source_id=source_id)
+    assert applied.status == "applied"
+    stale = await db.stage_source_derivation(
+        source_derivation_manifest(
+            applied.projection,
+            (),
+            context=replace(
+                applied.context,
+                user_id="stale-completed-attempt",
+            ),
+        )
+    )
+    assert stale.id != applied.id
+    assert stale.status == "completed"
+
+    second = await orchestrator.sync_gene(
+        gene=LargeConfluenceGene(body),
+        source_name="Applied lifecycle recovery",
+        source_id=source_id,
+    )
+
+    assert second.last_sync_status == "success"
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    attempts = await db.list_source_derivation_attempts(source_id=source_id)
+    recovered = next(attempt for attempt in attempts if attempt.id == stale.id)
+    assert recovered.status == "superseded"
 
 
 @pytest.mark.asyncio
