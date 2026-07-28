@@ -22,11 +22,17 @@ __all__ = [
 _CANDIDATE_LEDGER_PROMPT = """Select the non-redundant durable Memory candidates extracted from one
 Source Unit revision.
 
-Return exactly one decision for every candidate index:
-- KEEP when the candidate has any material truth condition not fully captured by another kept candidate.
-- DROP_REDUNDANT only when one kept candidate fully entails this candidate. Set canonical_index to that KEEP.
+Return exactly one judgment in every named field in <decision_slots>:
+- when a field maps to a candidate index, return that candidate's judgment in the field;
+- when a field maps to null, return null;
+- do not return the candidate index inside the judgment. The datastore owns candidate identity.
 
-Prefer the most specific self-contained candidate as canonical. Different wording, evidence events, or
+For each mapped candidate:
+- KEEP when the candidate has any material truth condition not fully captured by another kept candidate.
+- DROP_REDUNDANT only when a lower-index candidate fully entails this candidate. Set canonical_index to
+  that lower index. Lower indices are deterministic canonical precedence; never point forward.
+
+Candidates are ordered by deterministic specificity precedence. Different wording, evidence events, or
 Observation ids do not make claims distinct. Keep candidates that only partially overlap, add a condition,
 record a different outcome, or preserve a distinct durable fact. Do not rewrite or merge candidate content.
 
@@ -34,12 +40,17 @@ record a different outcome, or preserve a distinct durable fact. Do not rewrite 
 {candidates_json}
 </candidates>
 
-Return only a JSON object with a decisions array."""
+<decision_slots>
+{decision_slots_json}
+</decision_slots>
+
+Return only the fixed-slot JSON object required by the response schema."""
 
 _VALIDATION_ATTEMPTS = 2
 _DEFAULT_MAX_CANDIDATES = 200
 _DEFAULT_MAX_CONTEXT_CHARS = 100_000
 _DEFAULT_MAX_OUTPUT_TOKENS = 8192
+_CANDIDATE_LEDGER_DECISION_BATCH_SIZE = 24
 
 
 @dataclass(frozen=True)
@@ -49,6 +60,16 @@ class CandidateLedgerDrop:
     candidate: RawMemory
     canonical_candidate: RawMemory
     method: Literal["exact_content", "structured_ledger"]
+    reason: str
+
+
+@dataclass(frozen=True)
+class _IndexedLedgerDecision:
+    """Datastore-bound judgment after a response slot receives its index."""
+
+    index: int
+    action: Literal["KEEP", "DROP_REDUNDANT"]
+    canonical_index: int | None
     reason: str
 
 
@@ -111,10 +132,7 @@ async def select_unique_memory_candidates(
     if semantic_count > max_candidates:
         raise CandidateLedgerError(
             "budget_exceeded",
-            (
-                f"candidate count {semantic_count} exceeds the complete-ledger "
-                f"budget of {max_candidates}"
-            ),
+            (f"candidate count {semantic_count} exceeds the complete-ledger budget of {max_candidates}"),
             input_count=len(original),
             semantic_input_count=semantic_count,
         )
@@ -132,6 +150,18 @@ async def select_unique_memory_candidates(
             drops=exact_drops,
         )
 
+    ordered_candidates = tuple(
+        candidate
+        for _, candidate in sorted(
+            enumerate(exact_unique),
+            key=lambda item: (
+                -len(re.sub(r"\s+", " ", item[1].content.strip())),
+                item[1].memory_type,
+                item[1].content,
+                item[0],
+            ),
+        )
+    )
     payload = [
         {
             "index": index,
@@ -139,22 +169,13 @@ async def select_unique_memory_candidates(
             "content": candidate.content,
             "source_observation_id": candidate.source_observation_id,
         }
-        for index, candidate in enumerate(exact_unique)
+        for index, candidate in enumerate(ordered_candidates)
     ]
-    prompt = _CANDIDATE_LEDGER_PROMPT.format(
-        candidates_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    candidates_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
-    if len(prompt) > max_context_chars:
-        raise CandidateLedgerError(
-            "budget_exceeded",
-            (
-                f"candidate ledger context {len(prompt)} chars exceeds the "
-                f"budget of {max_context_chars}"
-            ),
-            input_count=len(original),
-            semantic_input_count=semantic_count,
-        )
-
     selector = getattr(structured_llm_client, "select_memory_candidates", None)
     if selector is None:
         raise CandidateLedgerError(
@@ -164,84 +185,120 @@ async def select_unique_memory_candidates(
             semantic_input_count=semantic_count,
         )
 
-    decisions_by_index: dict[int, CandidateLedgerDecision] | None = None
-    validation_error: ValueError | None = None
+    decisions_by_index: dict[int, _IndexedLedgerDecision] = {}
     structured_llm_calls = 0
     structured_llm_elapsed_ms = 0
     validation_retries = 0
     prompt_chars = 0
-    for attempt in range(_VALIDATION_ATTEMPTS):
-        prompt_chars += len(prompt)
-        call_started = perf_counter()
-        try:
-            structured_llm_calls += 1
-            response = await selector(
-                prompt,
-                max_tokens=_DEFAULT_MAX_OUTPUT_TOKENS,
-                model=llm_model,
+    for offset in range(
+        0,
+        semantic_count,
+        _CANDIDATE_LEDGER_DECISION_BATCH_SIZE,
+    ):
+        expected_indices = tuple(
+            range(
+                offset,
+                min(
+                    semantic_count,
+                    offset + _CANDIDATE_LEDGER_DECISION_BATCH_SIZE,
+                ),
             )
-        except Exception as exc:
-            structured_llm_elapsed_ms += max(
-                0, round((perf_counter() - call_started) * 1000)
+        )
+        slot_map = {
+            f"slot_{slot_index:02d}": (
+                expected_indices[slot_index]
+                if slot_index < len(expected_indices)
+                else None
             )
+            for slot_index in range(_CANDIDATE_LEDGER_DECISION_BATCH_SIZE)
+        }
+        prompt = _CANDIDATE_LEDGER_PROMPT.format(
+            candidates_json=candidates_json,
+            decision_slots_json=json.dumps(slot_map, separators=(",", ":")),
+        )
+        if len(prompt) > max_context_chars:
             raise CandidateLedgerError(
-                "structured_llm_error",
-                f"candidate ledger structured call failed: {exc}",
+                "budget_exceeded",
+                (f"candidate ledger context {len(prompt)} chars exceeds the budget of {max_context_chars}"),
+                input_count=len(original),
+                semantic_input_count=semantic_count,
+            )
+        validation_error: ValueError | None = None
+        batch_decisions: dict[int, _IndexedLedgerDecision] | None = None
+        for attempt in range(_VALIDATION_ATTEMPTS):
+            prompt_chars += len(prompt)
+            call_started = perf_counter()
+            try:
+                structured_llm_calls += 1
+                response = await selector(
+                    prompt,
+                    max_tokens=_DEFAULT_MAX_OUTPUT_TOKENS,
+                    model=llm_model,
+                )
+            except Exception as exc:
+                structured_llm_elapsed_ms += max(0, round((perf_counter() - call_started) * 1000))
+                raise CandidateLedgerError(
+                    "structured_llm_error",
+                    f"candidate ledger structured call failed: {exc}",
+                    input_count=len(original),
+                    semantic_input_count=semantic_count,
+                    structured_llm_calls=structured_llm_calls,
+                    structured_llm_elapsed_ms=structured_llm_elapsed_ms,
+                    validation_retries=validation_retries,
+                    prompt_chars=prompt_chars,
+                ) from exc
+            structured_llm_elapsed_ms += max(0, round((perf_counter() - call_started) * 1000))
+            try:
+                batch_decisions = _validate_ledger_batch(
+                    response.ordered_slots(),
+                    expected_indices=expected_indices,
+                )
+                break
+            except ValueError as exc:
+                validation_error = exc
+                if attempt + 1 >= _VALIDATION_ATTEMPTS:
+                    break
+                validation_retries += 1
+                prompt = (
+                    f"{prompt}\n\n<validation_feedback>\n"
+                    f"The previous response was rejected: {exc}. Return exactly one valid "
+                    "judgment in every mapped slot and null in every unused slot.\n"
+                    "</validation_feedback>"
+                )
+        if batch_decisions is None:
+            raise CandidateLedgerError(
+                "invalid_ledger",
+                f"complete candidate ledger validation failed: {validation_error}",
                 input_count=len(original),
                 semantic_input_count=semantic_count,
                 structured_llm_calls=structured_llm_calls,
                 structured_llm_elapsed_ms=structured_llm_elapsed_ms,
                 validation_retries=validation_retries,
                 prompt_chars=prompt_chars,
-            ) from exc
-        structured_llm_elapsed_ms += max(
-            0, round((perf_counter() - call_started) * 1000)
-        )
-        try:
-            decisions_by_index = _validate_complete_ledger(
-                response.decisions,
-                candidate_count=semantic_count,
             )
-            break
-        except ValueError as exc:
-            validation_error = exc
-            if attempt + 1 >= _VALIDATION_ATTEMPTS:
-                break
-            validation_retries += 1
-            prompt = (
-                f"{prompt}\n\n<validation_feedback>\n"
-                f"The previous response was rejected: {exc}. Return a complete candidate ledger "
-                "with one valid decision per index.\n"
-                "</validation_feedback>"
-            )
+        decisions_by_index.update(batch_decisions)
 
-    if decisions_by_index is None:
-        raise CandidateLedgerError(
-            "invalid_ledger",
-            f"complete candidate ledger validation failed: {validation_error}",
-            input_count=len(original),
-            semantic_input_count=semantic_count,
-            structured_llm_calls=structured_llm_calls,
-            structured_llm_elapsed_ms=structured_llm_elapsed_ms,
-            validation_retries=validation_retries,
-            prompt_chars=prompt_chars,
-        )
-
-    selected = tuple(
-        candidate
-        for index, candidate in enumerate(exact_unique)
-        if decisions_by_index[index].action == "KEEP"
+    decisions_by_index = _normalize_ledger_canonicals(decisions_by_index)
+    _validate_complete_ledger(
+        tuple(decisions_by_index.values()),
+        candidate_count=semantic_count,
     )
+
+    selected_ids = {
+        id(candidate)
+        for index, candidate in enumerate(ordered_candidates)
+        if decisions_by_index[index].action == "KEEP"
+    }
+    selected = tuple(candidate for candidate in exact_unique if id(candidate) in selected_ids)
     semantic_drops = tuple(
         CandidateLedgerDrop(
-            candidate=exact_unique[index],
-            canonical_candidate=exact_unique[decision.canonical_index],
+            candidate=ordered_candidates[index],
+            canonical_candidate=ordered_candidates[decision.canonical_index],
             method="structured_ledger",
             reason=decision.reason,
         )
         for index, decision in decisions_by_index.items()
-        if decision.action == "DROP_REDUNDANT"
-        and decision.canonical_index is not None
+        if decision.action == "DROP_REDUNDANT" and decision.canonical_index is not None
     )
     return CandidateLedgerResult(
         candidates=selected,
@@ -282,11 +339,11 @@ def _collapse_exact_duplicates(
 
 
 def _validate_complete_ledger(
-    decisions: Sequence[CandidateLedgerDecision],
+    decisions: Sequence[_IndexedLedgerDecision],
     *,
     candidate_count: int,
-) -> dict[int, CandidateLedgerDecision]:
-    by_index: dict[int, CandidateLedgerDecision] = {}
+) -> dict[int, _IndexedLedgerDecision]:
+    by_index: dict[int, _IndexedLedgerDecision] = {}
     for decision in decisions:
         index = decision.index
         if index in by_index:
@@ -300,9 +357,7 @@ def _validate_complete_ledger(
     if missing:
         raise ValueError(f"missing candidate indices {missing}")
 
-    kept_indices = {
-        index for index, decision in by_index.items() if decision.action == "KEEP"
-    }
+    kept_indices = {index for index, decision in by_index.items() if decision.action == "KEEP"}
     if not kept_indices:
         raise ValueError("at least one candidate must be kept")
 
@@ -317,8 +372,61 @@ def _validate_complete_ledger(
         if canonical_index == index:
             raise ValueError(f"candidate index {index} cannot be canonical for itself")
         if canonical_index not in kept_indices:
-            raise ValueError(
-                f"DROP_REDUNDANT index {index} must target a KEEP decision"
-            )
+            raise ValueError(f"DROP_REDUNDANT index {index} must target a KEEP decision")
 
     return by_index
+
+
+def _validate_ledger_batch(
+    slots: Sequence[CandidateLedgerDecision | None],
+    *,
+    expected_indices: tuple[int, ...],
+) -> dict[int, _IndexedLedgerDecision]:
+    if len(slots) != _CANDIDATE_LEDGER_DECISION_BATCH_SIZE:
+        raise ValueError(
+            "candidate ledger response does not contain the fixed protocol slots"
+        )
+    by_index: dict[int, _IndexedLedgerDecision] = {}
+    for slot_index, judgment in enumerate(slots):
+        if slot_index >= len(expected_indices):
+            if judgment is not None:
+                raise ValueError(f"unused decision slot {slot_index} must be null")
+            continue
+        index = expected_indices[slot_index]
+        if judgment is None:
+            raise ValueError(
+                f"decision slot {slot_index} for candidate index {index} must not be null"
+            )
+        if judgment.action == "DROP_REDUNDANT" and (
+            judgment.canonical_index is None or judgment.canonical_index >= index
+        ):
+            raise ValueError(f"DROP_REDUNDANT index {index} must target a lower index")
+        by_index[index] = _IndexedLedgerDecision(
+            index=index,
+            action=judgment.action,
+            canonical_index=judgment.canonical_index,
+            reason=judgment.reason,
+        )
+    return by_index
+
+
+def _normalize_ledger_canonicals(
+    decisions: dict[int, _IndexedLedgerDecision],
+) -> dict[int, _IndexedLedgerDecision]:
+    normalized = dict(decisions)
+    for index, decision in decisions.items():
+        if decision.action == "KEEP":
+            continue
+        canonical_index = decision.canonical_index
+        while canonical_index is not None:
+            canonical = decisions[canonical_index]
+            if canonical.action == "KEEP":
+                break
+            canonical_index = canonical.canonical_index
+        normalized[index] = _IndexedLedgerDecision(
+            index=index,
+            action=decision.action,
+            canonical_index=canonical_index,
+            reason=decision.reason,
+        )
+    return normalized

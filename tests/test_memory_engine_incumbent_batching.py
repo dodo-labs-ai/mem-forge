@@ -72,6 +72,17 @@ class _IncumbentStore:
     async def get_active_memory_support_evidence(self, memory_id: str, *, source_id=None):
         raise AssertionError(f"support evidence must not be loaded one at a time: {memory_id}")
 
+    async def get_active_memory_support_observation_ids_many(
+        self,
+        memory_ids,
+        *,
+        source_id,
+    ):
+        return {
+            memory_id: ("obs-1",)
+            for memory_id in memory_ids
+        }
+
 
 @pytest.mark.asyncio
 async def test_projected_incumbent_loading_and_impact_keep_complete_large_coverage_batched() -> None:

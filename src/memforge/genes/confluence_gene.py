@@ -23,6 +23,7 @@ from memforge.genes.atlassian_auth import (
     tls_verify,
 )
 from memforge.genes.base import Gene
+from memforge.genes.confluence_artifacts import resolve_current_confluence_artifacts
 from memforge.genes.confluence_pdf import export_confluence_page_pdf
 from memforge.models import (
     ConfigField,
@@ -36,10 +37,7 @@ from memforge.models import (
 )
 from memforge.pipeline.normalizer_utils import html_to_markdown, strip_boilerplate
 from memforge.source_artifacts import (
-    MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
-    MAX_SOURCE_ARTIFACTS_PER_UNIT,
     RawSourceArtifact,
-    SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
     SourceArtifactContractError,
     SourceArtifactDownload,
     normalize_source_artifact_media_type,
@@ -555,7 +553,13 @@ class ConfluenceGene(Gene):
             raise SourceArtifactContractError(
                 f"Confluence page {page_id} response is missing attachment membership"
             )
-        artifacts = await self._fetch_source_artifacts(str(page_id), first_page=attachment_page)
+        artifacts = await self._fetch_source_artifacts(
+            str(page_id),
+            first_page=attachment_page,
+            body_html=body_html,
+            page_title=str(data.get("title") or item.title),
+            space_key=item.extra["space_key"],
+        )
 
         return RawContent(
             item=item,
@@ -575,38 +579,27 @@ class ConfluenceGene(Gene):
         page_id: str,
         *,
         first_page: dict,
+        body_html: str,
+        page_title: str,
+        space_key: str,
     ) -> tuple[RawSourceArtifact, ...]:
-        """Return bounded provider attachment descriptors."""
+        """Resolve current body references against complete attachment inventory."""
 
         descriptors: list[dict] = []
-        descriptor_count = 0
+        seen_next_links: set[str] = set()
         start = 0
         payload = first_page
         while True:
             results = self._validated_attachment_results(payload, expected_start=start)
-            descriptor_count += len(results)
-            if descriptor_count > MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT:
-                raise SourceArtifactContractError(
-                    "Confluence page exceeds the Source Artifact descriptor scan limit"
-                )
-            descriptors.extend(
-                descriptor
-                for descriptor in results
-                if normalize_source_artifact_media_type(
-                    (
-                        descriptor.get("extensions")
-                        if isinstance(descriptor.get("extensions"), dict)
-                        else {}
-                    ).get("mediaType")
-                )
-                in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES
-            )
-            if len(descriptors) > MAX_SOURCE_ARTIFACTS_PER_UNIT:
-                raise SourceArtifactContractError(
-                    f"Confluence page exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} supported Artifact limit"
-                )
+            descriptors.extend(results)
             if not self._has_next_page(payload):
                 break
+            next_link = str(payload["_links"]["next"]).strip()
+            if next_link in seen_next_links:
+                raise SourceArtifactContractError(
+                    "Confluence attachment pagination contains a cursor cycle"
+                )
+            seen_next_links.add(next_link)
             start += len(results)
             response = await self._get(
                 f"{self._api_prefix}/rest/api/content/{page_id}/child/attachment",
@@ -618,8 +611,16 @@ class ConfluenceGene(Gene):
             )
             payload = self._json_response(response, f"listing attachments for page {page_id}")
 
+        selected_descriptors = resolve_current_confluence_artifacts(
+            body_html=body_html,
+            page_id=page_id,
+            page_title=page_title,
+            space_key=space_key,
+            attachment_descriptors=tuple(descriptors),
+        )
+
         artifacts: list[RawSourceArtifact] = []
-        for descriptor in descriptors:
+        for descriptor in selected_descriptors:
             extensions = descriptor.get("extensions") if isinstance(descriptor.get("extensions"), dict) else {}
             media_type = normalize_source_artifact_media_type(extensions.get("mediaType"))
             attachment_id = str(descriptor.get("id") or "").strip()

@@ -46,8 +46,6 @@ from memforge.models import (
     RawContent,
 )
 from memforge.source_artifacts import (
-    MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
-    MAX_SOURCE_ARTIFACTS_PER_UNIT,
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT,
     RawSourceArtifact,
@@ -673,15 +671,11 @@ class JiraGene(Gene):
         )
 
     async def _fetch_source_artifacts(self, issue: dict) -> tuple[RawSourceArtifact, ...]:
-        """Return bounded issue attachment descriptors."""
+        """Return the complete supported issue attachment inventory."""
 
         fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
         raw_descriptors = fields.get("attachment")
         provider_descriptors = raw_descriptors if isinstance(raw_descriptors, list) else []
-        if len(provider_descriptors) > MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT:
-            raise SourceArtifactContractError(
-                "Jira issue exceeds the Source Artifact descriptor scan limit"
-            )
         descriptors: list[tuple[dict, str]] = []
         for descriptor in provider_descriptors:
             if not isinstance(descriptor, dict):
@@ -691,10 +685,6 @@ class JiraGene(Gene):
             media_type = normalize_source_artifact_media_type(descriptor.get("mimeType"))
             if media_type in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
                 descriptors.append((descriptor, media_type))
-        if len(descriptors) > MAX_SOURCE_ARTIFACTS_PER_UNIT:
-            raise SourceArtifactContractError(
-                f"Jira issue exceeds {MAX_SOURCE_ARTIFACTS_PER_UNIT} supported Artifact limit"
-            )
         comments = issue.get("_comments") if isinstance(issue.get("_comments"), list) else []
         issue_id = str(issue.get("id") or "").strip()
         artifacts: list[RawSourceArtifact] = []

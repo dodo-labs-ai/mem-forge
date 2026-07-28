@@ -324,6 +324,8 @@ class MemoryExtractionResult:
     """Output of Call 2 (memory extraction)."""
     memories: list[RawMemory] = field(default_factory=list)
     artifact_summaries: tuple[SourceArtifactSummary, ...] = ()
+    protected_source_observation_ids: tuple[str, ...] = ()
+    derivation_id: str | None = None
     error_type: str | None = None
     error: str | None = None
     metadata: dict = field(default_factory=dict)
