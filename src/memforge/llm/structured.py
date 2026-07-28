@@ -23,7 +23,6 @@ from memforge.llm.structured_images import (
     StructuredLlmImageError,
     prepare_structured_llm_images as _prepare_structured_llm_images,
 )
-from memforge.source_artifacts import MAX_SOURCE_ARTIFACT_SUMMARY_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -175,19 +174,38 @@ class MemoryCandidate(StructuredResponseModel):
 
 
 class ArtifactSelectionSummary(StructuredResponseModel):
-    """Concise selection hint for one exact image supplied to extraction."""
+    """Untrusted optional selection hint validated independently from Memories."""
 
     model_config = ConfigDict(extra="ignore")
 
-    source_observation_id: str = Field(min_length=1)
-    summary: str = Field(min_length=1, max_length=MAX_SOURCE_ARTIFACT_SUMMARY_CHARS)
+    # Keep the provider schema simple and typed. The pre-validator isolates
+    # malformed optional values as empty entries so they cannot invalidate
+    # schema-valid Memory judgments in the same response.
+    source_observation_id: str = ""
+    summary: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _isolate_invalid_entry(cls, value: object) -> Mapping[str, object]:
+        if not isinstance(value, Mapping):
+            return {}
+        return {
+            "source_observation_id": (
+                value.get("source_observation_id")
+                if isinstance(value.get("source_observation_id"), str)
+                else ""
+            ),
+            "summary": (
+                value.get("summary")
+                if isinstance(value.get("summary"), str)
+                else ""
+            ),
+        }
 
     @model_validator(mode="after")
     def _normalize(self) -> ArtifactSelectionSummary:
         self.source_observation_id = self.source_observation_id.strip()
         self.summary = " ".join(self.summary.split())
-        if not self.source_observation_id or not self.summary:
-            raise ValueError("Artifact summary fields must contain non-whitespace text")
         return self
 
 
@@ -200,44 +218,183 @@ class MemoryExtractionResponse(StructuredResponseModel):
     artifact_summaries: list[ArtifactSelectionSummary] = Field(default_factory=list)
 
 
-class CandidateLedgerDecision(StructuredResponseModel):
-    """One uniqueness decision for a transient extracted candidate."""
+class ProjectionMemoryCandidate(StructuredResponseModel):
+    """Model judgments for one projection candidate; anchors are derived locally."""
 
     model_config = ConfigDict(extra="ignore")
 
-    index: int = Field(ge=0)
+    content: str = Field(min_length=1)
+    memory_type: Literal["fact", "decision", "convention", "procedure"]
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    entity_refs: list[str] = Field(default_factory=list)
+    valid_from: str | None = None
+    valid_until: str | None = None
+    evidence_quote: str | None = None
+    source_observation_id: str | None = None
+    required_source_observation_ids: list[str] = Field(default_factory=list)
+
+    @property
+    def extraction_context(self) -> None:
+        return None
+
+    @property
+    def evidence_anchor(self) -> Literal["unknown"]:
+        return "unknown"
+
+
+class ProjectionMemoryExtractionResponse(StructuredResponseModel):
+    """Projection extraction schema containing model judgments only."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    memories: list[ProjectionMemoryCandidate]
+    artifact_summaries: list[ArtifactSelectionSummary] = Field(default_factory=list)
+
+
+class CandidateLedgerDecision(StructuredResponseModel):
+    """One ordered uniqueness judgment for a transient extracted candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
     action: Literal["KEEP", "DROP_REDUNDANT"]
     canonical_index: int | None = Field(default=None, ge=0)
     reason: str = Field(default="", max_length=1000)
 
 
 class CandidateLedgerResponse(StructuredResponseModel):
-    """Complete within-revision uniqueness ledger for extracted candidates."""
+    """Fixed-slot response for one bounded candidate-ledger batch."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
-    decisions: list[CandidateLedgerDecision]
+    slot_00: CandidateLedgerDecision | None
+    slot_01: CandidateLedgerDecision | None
+    slot_02: CandidateLedgerDecision | None
+    slot_03: CandidateLedgerDecision | None
+    slot_04: CandidateLedgerDecision | None
+    slot_05: CandidateLedgerDecision | None
+    slot_06: CandidateLedgerDecision | None
+    slot_07: CandidateLedgerDecision | None
+    slot_08: CandidateLedgerDecision | None
+    slot_09: CandidateLedgerDecision | None
+    slot_10: CandidateLedgerDecision | None
+    slot_11: CandidateLedgerDecision | None
+    slot_12: CandidateLedgerDecision | None
+    slot_13: CandidateLedgerDecision | None
+    slot_14: CandidateLedgerDecision | None
+    slot_15: CandidateLedgerDecision | None
+    slot_16: CandidateLedgerDecision | None
+    slot_17: CandidateLedgerDecision | None
+    slot_18: CandidateLedgerDecision | None
+    slot_19: CandidateLedgerDecision | None
+    slot_20: CandidateLedgerDecision | None
+    slot_21: CandidateLedgerDecision | None
+    slot_22: CandidateLedgerDecision | None
+    slot_23: CandidateLedgerDecision | None
+
+    def ordered_slots(self) -> tuple[CandidateLedgerDecision | None, ...]:
+        """Return all protocol slots in their deterministic request order."""
+
+        return tuple(getattr(self, f"slot_{index:02d}") for index in range(24))
 
 
-class ReconciliationDecision(StructuredResponseModel):
-    """One same-document memory reconciliation decision."""
+class CandidateRelationDecision(StructuredResponseModel):
+    """One candidate disposition inside a bounded incumbent relation cell."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
-    action: Literal["ADD", "UPDATE", "SUPERSEDE", "DELETE", "NOOP"]
-    index: int | None = None
-    memory_id: str | None = None
+    action: Literal["ADD", "UPDATE", "SUPERSEDE", "NOOP"]
+    incumbent_slot: int | None = Field(default=None, ge=0, le=29)
     updated_content: str | None = None
     reason: str | None = None
     flag_for_review: bool = False
 
 
-class ReconciliationResponse(StructuredResponseModel):
-    """Schema returned by same-document memory reconciliation."""
+class CandidateRelationResponse(StructuredResponseModel):
+    """Fixed-slot candidate side of a composed reconciliation ledger."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
-    decisions: list[ReconciliationDecision]
+    slot_00: CandidateRelationDecision | None
+    slot_01: CandidateRelationDecision | None
+    slot_02: CandidateRelationDecision | None
+    slot_03: CandidateRelationDecision | None
+    slot_04: CandidateRelationDecision | None
+    slot_05: CandidateRelationDecision | None
+    slot_06: CandidateRelationDecision | None
+    slot_07: CandidateRelationDecision | None
+    slot_08: CandidateRelationDecision | None
+    slot_09: CandidateRelationDecision | None
+    slot_10: CandidateRelationDecision | None
+    slot_11: CandidateRelationDecision | None
+    slot_12: CandidateRelationDecision | None
+    slot_13: CandidateRelationDecision | None
+    slot_14: CandidateRelationDecision | None
+    slot_15: CandidateRelationDecision | None
+    slot_16: CandidateRelationDecision | None
+    slot_17: CandidateRelationDecision | None
+    slot_18: CandidateRelationDecision | None
+    slot_19: CandidateRelationDecision | None
+    slot_20: CandidateRelationDecision | None
+    slot_21: CandidateRelationDecision | None
+    slot_22: CandidateRelationDecision | None
+    slot_23: CandidateRelationDecision | None
+
+    def ordered_slots(self) -> tuple[CandidateRelationDecision | None, ...]:
+        """Return candidate judgments in datastore-bound request order."""
+
+        return tuple(getattr(self, f"slot_{index:02d}") for index in range(24))
+
+
+class IncumbentSupportAuditDecision(StructuredResponseModel):
+    """One incumbent's support disposition independent of candidate matching."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["DELETE", "NOOP"]
+    reason: str | None = None
+    flag_for_review: bool = False
+
+
+class IncumbentSupportAuditResponse(StructuredResponseModel):
+    """Fixed-slot incumbent side of a composed reconciliation ledger."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    slot_00: IncumbentSupportAuditDecision | None
+    slot_01: IncumbentSupportAuditDecision | None
+    slot_02: IncumbentSupportAuditDecision | None
+    slot_03: IncumbentSupportAuditDecision | None
+    slot_04: IncumbentSupportAuditDecision | None
+    slot_05: IncumbentSupportAuditDecision | None
+    slot_06: IncumbentSupportAuditDecision | None
+    slot_07: IncumbentSupportAuditDecision | None
+    slot_08: IncumbentSupportAuditDecision | None
+    slot_09: IncumbentSupportAuditDecision | None
+    slot_10: IncumbentSupportAuditDecision | None
+    slot_11: IncumbentSupportAuditDecision | None
+    slot_12: IncumbentSupportAuditDecision | None
+    slot_13: IncumbentSupportAuditDecision | None
+    slot_14: IncumbentSupportAuditDecision | None
+    slot_15: IncumbentSupportAuditDecision | None
+    slot_16: IncumbentSupportAuditDecision | None
+    slot_17: IncumbentSupportAuditDecision | None
+    slot_18: IncumbentSupportAuditDecision | None
+    slot_19: IncumbentSupportAuditDecision | None
+    slot_20: IncumbentSupportAuditDecision | None
+    slot_21: IncumbentSupportAuditDecision | None
+    slot_22: IncumbentSupportAuditDecision | None
+    slot_23: IncumbentSupportAuditDecision | None
+    slot_24: IncumbentSupportAuditDecision | None
+    slot_25: IncumbentSupportAuditDecision | None
+    slot_26: IncumbentSupportAuditDecision | None
+    slot_27: IncumbentSupportAuditDecision | None
+    slot_28: IncumbentSupportAuditDecision | None
+    slot_29: IncumbentSupportAuditDecision | None
+
+    def ordered_slots(self) -> tuple[IncumbentSupportAuditDecision | None, ...]:
+        """Return incumbent judgments in datastore-bound request order."""
+
+        return tuple(getattr(self, f"slot_{index:02d}") for index in range(30))
 
 
 class MemoryRelationDecision(StructuredResponseModel):
@@ -517,6 +674,16 @@ class SourceSupportStructuredClient(Protocol):
     ) -> MemoryExtractionResponse:
         """Return schema-validated extracted memory candidates."""
 
+    async def extract_projection_memories(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> ProjectionMemoryExtractionResponse:
+        """Return projection judgments without datastore-owned anchor fields."""
+
     async def select_memory_candidates(
         self,
         prompt: str,
@@ -526,14 +693,23 @@ class SourceSupportStructuredClient(Protocol):
     ) -> CandidateLedgerResponse:
         """Return a complete within-revision candidate uniqueness ledger."""
 
-    async def reconcile_memories(
+    async def reconcile_candidate_relations(
         self,
         prompt: str,
         *,
         max_tokens: int = 4096,
         model: str | None = None,
-    ) -> ReconciliationResponse:
-        """Return schema-validated same-document reconciliation decisions."""
+    ) -> CandidateRelationResponse:
+        """Return candidate-only decisions for one relation-matrix cell."""
+
+    async def audit_incumbent_support(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 4096,
+        model: str | None = None,
+    ) -> IncumbentSupportAuditResponse:
+        """Return one support disposition for every incumbent in an audit batch."""
 
     async def classify_memory_relations(
         self,
@@ -617,10 +793,12 @@ class StructuredLlmError(RuntimeError):
         *,
         terminal_category: StructuredLlmTerminalCategory = "invalid_response",
         error_code: str = "structured_llm_error",
+        validation_fields: tuple[tuple[str, str], ...] = (),
     ) -> None:
         super().__init__(message)
         self.terminal_category = terminal_category
         self.error_code = error_code
+        self.validation_fields = validation_fields
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,6 +807,7 @@ class _StructuredLlmFailure:
 
     terminal_category: StructuredLlmTerminalCategory
     error_code: str
+    validation_fields: tuple[tuple[str, str], ...] = ()
 
     def to_error(self, *, timeout_s: float | None = None) -> StructuredLlmError:
         if self.terminal_category == "deadline_exceeded":
@@ -646,6 +825,7 @@ class _StructuredLlmFailure:
             message,
             terminal_category=self.terminal_category,
             error_code=self.error_code,
+            validation_fields=self.validation_fields,
         )
 
 
@@ -727,6 +907,7 @@ def _structured_failure(
         return _StructuredLlmFailure(
             terminal_category=terminal_category or exc.terminal_category,
             error_code=exc.error_code,
+            validation_fields=exc.validation_fields,
         )
     category = terminal_category
     if category is None:
@@ -734,7 +915,29 @@ def _structured_failure(
     return _StructuredLlmFailure(
         terminal_category=category,
         error_code=_safe_provider_error_code(exc),
+        validation_fields=_safe_validation_fields(exc),
     )
+
+
+def _safe_validation_fields(
+    exc: BaseException,
+) -> tuple[tuple[str, str], ...]:
+    """Return only schema field paths and rule types from Pydantic failures."""
+
+    if not isinstance(exc, ValidationError):
+        return ()
+    fields: list[tuple[str, str]] = []
+    for error in exc.errors(include_url=False, include_context=False, include_input=False):
+        location_parts = [
+            str(part)
+            for part in error.get("loc", ())
+            if isinstance(part, (str, int))
+        ]
+        location = ".".join(location_parts) or "$"
+        rule_type = str(error.get("type") or "").strip()
+        if rule_type:
+            fields.append((location, rule_type))
+    return tuple(fields)
 
 
 def _message_content(response) -> object:
@@ -957,6 +1160,22 @@ class LiteLlmStructuredClient:
             images=images,
         )
 
+    async def extract_projection_memories(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> ProjectionMemoryExtractionResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=ProjectionMemoryExtractionResponse,
+            max_tokens=max_tokens,
+            model=model,
+            images=images,
+        )
+
     async def select_memory_candidates(
         self,
         prompt: str,
@@ -971,16 +1190,30 @@ class LiteLlmStructuredClient:
             model=model,
         )
 
-    async def reconcile_memories(
+    async def reconcile_candidate_relations(
         self,
         prompt: str,
         *,
         max_tokens: int = 4096,
         model: str | None = None,
-    ) -> ReconciliationResponse:
+    ) -> CandidateRelationResponse:
         return await self._call_schema(
             prompt=prompt,
-            response_format=ReconciliationResponse,
+            response_format=CandidateRelationResponse,
+            max_tokens=max_tokens,
+            model=model,
+        )
+
+    async def audit_incumbent_support(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 4096,
+        model: str | None = None,
+    ) -> IncumbentSupportAuditResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=IncumbentSupportAuditResponse,
             max_tokens=max_tokens,
             model=model,
         )

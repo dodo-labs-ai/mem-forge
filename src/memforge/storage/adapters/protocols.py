@@ -542,6 +542,12 @@ class RelationalStore(Protocol):
     ) -> Mapping[str, tuple[ActiveSupportEvidence, ...]]:
         """Map every requested id to active Evidence using adapter-bounded chunks."""
         ...
+    async def get_active_memory_support_observation_ids_many(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        source_id: str,
+    ) -> Mapping[str, tuple[str, ...]]: ...
     async def get_source_unit_support_reference_ids(
         self,
         source_unit_id: str,
@@ -551,6 +557,9 @@ class RelationalStore(Protocol):
         projection: SourceProjection,
         plan: LifecyclePlan,
         *,
+        document: DocumentRecord | None = None,
+        derivation_id: str | None = None,
+        derivation_context_identity_hash: str | None = None,
         expected_source_activity_epoch: int | None = None,
     ) -> None: ...
     async def apply_agent_claim_source_projection_lifecycle(

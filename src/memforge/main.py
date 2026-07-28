@@ -58,7 +58,6 @@ from memforge.local_agent.source_contract import (
     source_processing_receipt,
 )
 from memforge.source_artifacts import (
-    MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT,
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
@@ -3198,8 +3197,6 @@ def _teams_hosted_content_refs(document: dict[str, Any]) -> list[dict[str, str |
                     "hosted_content_id": hosted_id,
                 }
             )
-            if len(refs) > MAX_SOURCE_ARTIFACT_DESCRIPTORS_PER_UNIT:
-                raise ValueError("Teams window exceeds the Source Artifact descriptor limit")
     return refs
 
 

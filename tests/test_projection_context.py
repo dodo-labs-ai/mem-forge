@@ -21,7 +21,11 @@ from memforge.source_projection import (
     SourceAnchor,
     with_source_artifact_summaries,
 )
-from memforge.source_artifacts import SourceArtifactSummary, StoredSourceArtifact
+from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_SUMMARY_CHARS,
+    SourceArtifactSummary,
+    StoredSourceArtifact,
+)
 
 
 def _jira_projection(comment_count: int = 3):
@@ -111,9 +115,14 @@ def _confluence_projection_with_images(
             media_type=media_type,
             size_bytes=artifact_size,
             sha256=f"{index:064x}",
-            uri=f"source-artifacts/src-c/artifact-{index}.png",
-            inference_eligible=inference_eligible,
-        )
+                uri=f"source-artifacts/src-c/artifact-{index}.png",
+                inference_eligible=inference_eligible,
+                inference_ineligible_reason=(
+                    None
+                    if inference_eligible
+                    else "invalid_image_structure"
+                ),
+            )
         for index in range(image_count)
     )
     return project_source_item(
@@ -328,7 +337,7 @@ async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context
     )[2]
 
     class Client:
-        async def extract_memories(self, prompt: str, **kwargs):
+        async def extract_projection_memories(self, prompt: str, **kwargs):
             del prompt, kwargs
             return MemoryExtractionResponse(
                 memories=[
@@ -370,7 +379,7 @@ async def test_projection_batch_extractor_accepts_only_explicit_visual_evidence(
     observed_images = ()
 
     class Client:
-        async def extract_memories(self, prompt: str, **kwargs):
+        async def extract_projection_memories(self, prompt: str, **kwargs):
             nonlocal observed_images
             del prompt
             observed_images = kwargs["images"]
@@ -425,7 +434,7 @@ async def test_projection_batch_extractor_accepts_only_explicit_visual_evidence(
 
 
 @pytest.mark.asyncio
-async def test_projection_batch_extractor_rejects_missing_or_unknown_artifact_summaries() -> None:
+async def test_projection_batch_extractor_keeps_memories_when_optional_summaries_are_missing_or_unknown() -> None:
     projection = _jira_projection(1)
     batch = plan_projection_extraction_batches(projection)[0]
     visual_observation_id = batch.primary_observation_ids[-1]
@@ -439,7 +448,7 @@ async def test_projection_batch_extractor_rejects_missing_or_unknown_artifact_su
         def __init__(self, observation_id: str | None) -> None:
             self.observation_id = observation_id
 
-        async def extract_memories(self, prompt: str, **kwargs):
+        async def extract_projection_memories(self, prompt: str, **kwargs):
             del prompt, kwargs
             summaries = (
                 []
@@ -452,7 +461,14 @@ async def test_projection_batch_extractor_rejects_missing_or_unknown_artifact_su
                 ]
             )
             return MemoryExtractionResponse(
-                memories=[],
+                memories=[
+                    MemoryCandidate(
+                        content="The screenshot shows a durable validation result.",
+                        memory_type="fact",
+                        evidence_quote="",
+                        source_observation_id=visual_observation_id,
+                    )
+                ],
                 artifact_summaries=summaries,
             )
 
@@ -471,10 +487,75 @@ async def test_projection_batch_extractor_rejects_missing_or_unknown_artifact_su
         images=(image,),
     )
 
-    assert missing.error_type == "structured_llm_error"
-    assert unknown.error_type == "structured_llm_error"
+    assert missing.error_type is None
+    assert unknown.error_type is None
+    assert len(missing.memories) == 1
+    assert len(unknown.memories) == 1
+    assert missing.artifact_summaries == ()
+    assert unknown.artifact_summaries == ()
     assert missing.metadata["structured_llm_calls"] == 1
     assert unknown.metadata["structured_llm_calls"] == 1
+    assert missing.metadata["discarded_invalid_artifact_summary_count"] == 0
+    assert unknown.metadata["discarded_invalid_artifact_summary_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_projection_batch_extractor_discards_malformed_optional_summaries_without_losing_memories() -> None:
+    projection = _jira_projection(1)
+    batch = plan_projection_extraction_batches(projection)[0]
+    visual_observation_id = batch.primary_observation_ids[-1]
+    image = StructuredLlmImage(
+        source_observation_id=visual_observation_id,
+        media_type="image/png",
+        body=b"\x89PNG",
+    )
+
+    class Client:
+        async def extract_projection_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return MemoryExtractionResponse.model_validate(
+                {
+                    "memories": [
+                        {
+                            "content": (
+                                "The screenshot shows a durable validation "
+                                "result."
+                            ),
+                            "memory_type": "fact",
+                            "evidence_quote": "",
+                            "source_observation_id": visual_observation_id,
+                        }
+                    ],
+                    "artifact_summaries": [
+                        {
+                            "source_observation_id": visual_observation_id,
+                            "summary": "x"
+                            * (MAX_SOURCE_ARTIFACT_SUMMARY_CHARS + 1),
+                        },
+                        {
+                            "source_observation_id": 42,
+                            "summary": ["not", "text"],
+                        },
+                    ],
+                }
+            )
+
+    result = await MemoryExtractor(
+        structured_llm_client=Client()
+    ).extract_projection_batch_memories(
+        batch,
+        source_type="jira",
+        images=(image,),
+    )
+
+    assert result.error_type is None
+    assert [item.content for item in result.memories] == [
+        "The screenshot shows a durable validation result."
+    ]
+    assert result.artifact_summaries == ()
+    assert result.metadata[
+        "discarded_invalid_artifact_summary_count"
+    ] == 2
 
 
 @pytest.mark.asyncio
@@ -485,7 +566,7 @@ async def test_projection_batch_extractor_discards_orphan_summaries_without_imag
     evidence_quote = primary_content.strip()
 
     class Client:
-        async def extract_memories(self, prompt: str, **kwargs):
+        async def extract_projection_memories(self, prompt: str, **kwargs):
             del prompt
             assert "images" not in kwargs
             return MemoryExtractionResponse(
@@ -526,7 +607,7 @@ async def test_projection_batch_extractor_discards_orphan_summaries_without_imag
 
 
 @pytest.mark.asyncio
-async def test_projection_batch_extractor_rejects_duplicate_summary_for_supplied_image() -> None:
+async def test_projection_batch_extractor_keeps_one_optional_summary_for_supplied_image() -> None:
     projection = _jira_projection(1)
     batch = plan_projection_extraction_batches(projection)[0]
     visual_observation_id = batch.primary_observation_ids[-1]
@@ -537,7 +618,7 @@ async def test_projection_batch_extractor_rejects_duplicate_summary_for_supplied
     )
 
     class Client:
-        async def extract_memories(self, prompt: str, **kwargs):
+        async def extract_projection_memories(self, prompt: str, **kwargs):
             del prompt, kwargs
             return MemoryExtractionResponse(
                 memories=[],
@@ -561,7 +642,14 @@ async def test_projection_batch_extractor_rejects_duplicate_summary_for_supplied
         images=(image,),
     )
 
-    assert result.error_type == "structured_llm_error"
+    assert result.error_type is None
+    assert result.artifact_summaries == (
+        SourceArtifactSummary(
+            source_observation_id=visual_observation_id,
+            summary="First bounded image selection hint.",
+        ),
+    )
+    assert result.metadata["discarded_invalid_artifact_summary_count"] == 1
     assert result.metadata["structured_llm_calls"] == 1
 
 
@@ -630,7 +718,7 @@ async def test_projection_batch_extractor_preserves_declared_required_context() 
     required_id = batch.context_observation_ids[0]
 
     class Client:
-        async def extract_memories(self, prompt: str, **kwargs):
+        async def extract_projection_memories(self, prompt: str, **kwargs):
             del prompt, kwargs
             return MemoryExtractionResponse(
                 memories=[
@@ -688,7 +776,7 @@ async def test_projection_batch_rejects_context_that_belongs_only_to_another_pri
     assert context_for_other_primary_id in batch.context_observation_ids
 
     class Client:
-        async def extract_memories(self, prompt: str, **kwargs):
+        async def extract_projection_memories(self, prompt: str, **kwargs):
             del prompt, kwargs
             return MemoryExtractionResponse(
                 memories=[
@@ -731,7 +819,7 @@ async def test_projection_batch_extractor_uses_explicit_observation_for_duplicat
     duplicate_quote = "retain A7"
 
     class Client:
-        async def extract_memories(self, prompt: str, **kwargs):
+        async def extract_projection_memories(self, prompt: str, **kwargs):
             del prompt, kwargs
             return MemoryExtractionResponse(
                 memories=[
@@ -772,7 +860,7 @@ async def test_teams_batch_preserves_message_observation_anchor() -> None:
     target_id = batch.primary_observation_ids[1]
 
     class Client:
-        async def extract_memories(self, prompt: str, **kwargs):
+        async def extract_projection_memories(self, prompt: str, **kwargs):
             del prompt, kwargs
             return MemoryExtractionResponse(
                 memories=[
