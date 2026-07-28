@@ -498,6 +498,12 @@ class MemoryEngine:
                 "candidate_ledger_validation_retries": (
                     candidate_ledger.validation_retries
                 ),
+                "candidate_ledger_fallback_batch_count": (
+                    candidate_ledger.fallback_batch_count
+                ),
+                "candidate_ledger_fallback_candidate_count": (
+                    candidate_ledger.fallback_candidate_count
+                ),
                 "candidate_ledger_prompt_chars": candidate_ledger.prompt_chars,
             }
         )
@@ -939,7 +945,7 @@ class MemoryEngine:
         doc_id: str,
         candidates: list[RawMemory],
     ) -> CandidateLedgerResult:
-        """Select one complete within-revision candidate ledger before writes."""
+        """Select bounded within-revision candidate admission before writes."""
 
         try:
             result = await select_unique_memory_candidates(
@@ -973,7 +979,11 @@ class MemoryEngine:
                 projection=projection,
                 doc_id=doc_id,
                 status="committed",
-                reason="complete_candidate_ledger",
+                reason=(
+                    "candidate_admission_with_fallback"
+                    if result.fallback_batch_count
+                    else "complete_candidate_ledger"
+                ),
                 payload=_candidate_ledger_audit_payload(result),
             )
         return result
@@ -1220,6 +1230,8 @@ def _candidate_ledger_audit_payload(result: CandidateLedgerResult) -> dict[str, 
         "structured_llm_calls": result.structured_llm_calls,
         "structured_llm_elapsed_ms": result.structured_llm_elapsed_ms,
         "validation_retries": result.validation_retries,
+        "fallback_batch_count": result.fallback_batch_count,
+        "fallback_candidate_count": result.fallback_candidate_count,
         "prompt_chars": result.prompt_chars,
         "drops": [
             {

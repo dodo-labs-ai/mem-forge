@@ -89,6 +89,8 @@ class CandidateLedgerResult:
     structured_llm_calls: int
     structured_llm_elapsed_ms: int
     validation_retries: int
+    fallback_batch_count: int
+    fallback_candidate_count: int
     prompt_chars: int
     drops: tuple[CandidateLedgerDrop, ...]
 
@@ -143,6 +145,8 @@ async def select_unique_memory_candidates(
             structured_llm_calls=0,
             structured_llm_elapsed_ms=0,
             validation_retries=0,
+            fallback_batch_count=0,
+            fallback_candidate_count=0,
             prompt_chars=0,
             drops=exact_drops,
         )
@@ -172,6 +176,8 @@ async def select_unique_memory_candidates(
     structured_llm_calls = 0
     structured_llm_elapsed_ms = 0
     validation_retries = 0
+    fallback_batch_count = 0
+    fallback_candidate_count = 0
     prompt_chars = 0
     offset = 0
     while offset < semantic_count:
@@ -231,18 +237,20 @@ async def select_unique_memory_candidates(
                     max_tokens=_DEFAULT_MAX_OUTPUT_TOKENS,
                     model=llm_model,
                 )
-            except Exception as exc:
+            except Exception:
                 structured_llm_elapsed_ms += max(0, round((perf_counter() - call_started) * 1000))
-                raise CandidateLedgerError(
-                    "structured_llm_error",
-                    f"candidate ledger structured call failed: {exc}",
-                    input_count=len(original),
-                    semantic_input_count=semantic_count,
-                    structured_llm_calls=structured_llm_calls,
-                    structured_llm_elapsed_ms=structured_llm_elapsed_ms,
-                    validation_retries=validation_retries,
-                    prompt_chars=prompt_chars,
-                ) from exc
+                batch_decisions = {
+                    index: _IndexedLedgerDecision(
+                        index=index,
+                        action="KEEP",
+                        canonical_index=None,
+                        reason="structured_admission_unavailable",
+                    )
+                    for index in expected_indices
+                }
+                fallback_batch_count += 1
+                fallback_candidate_count += len(expected_indices)
+                break
             structured_llm_elapsed_ms += max(0, round((perf_counter() - call_started) * 1000))
             try:
                 batch_decisions = _validate_ledger_batch(
@@ -319,6 +327,8 @@ async def select_unique_memory_candidates(
         structured_llm_calls=structured_llm_calls,
         structured_llm_elapsed_ms=structured_llm_elapsed_ms,
         validation_retries=validation_retries,
+        fallback_batch_count=fallback_batch_count,
+        fallback_candidate_count=fallback_candidate_count,
         prompt_chars=prompt_chars,
         drops=exact_drops + redundant_drops + low_value_drops,
     )

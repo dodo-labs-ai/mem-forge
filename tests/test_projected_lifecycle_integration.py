@@ -894,6 +894,8 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
         "structured_llm_calls": 0,
         "structured_llm_elapsed_ms": 0,
         "validation_retries": 0,
+        "fallback_batch_count": 0,
+        "fallback_candidate_count": 0,
         "prompt_chars": 0,
         "drops": [
             {
