@@ -421,7 +421,11 @@ def _validate_ledger_batch(
         by_index[index] = _IndexedLedgerDecision(
             index=index,
             action=judgment.action,
-            canonical_index=judgment.canonical_index,
+            canonical_index=(
+                judgment.canonical_index
+                if judgment.action == "DROP_REDUNDANT"
+                else None
+            ),
             reason=judgment.reason,
         )
     return by_index
