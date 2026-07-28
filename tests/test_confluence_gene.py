@@ -8,7 +8,7 @@ import pytest
 
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
 from memforge.models import ContentItem
-from memforge.source_artifacts import RawSourceArtifact
+from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 
 
 def test_confluence_schema_hides_runtime_transport_fields_from_ui():
@@ -219,6 +219,61 @@ def _page_batch(results: list[dict], *, start: int = 0, next_link: str | None = 
     return {"results": results, "start": start, "size": len(results), "_links": links}
 
 
+def _attachment(
+    attachment_id: str,
+    filename: str,
+    *,
+    media_type: str = "image/png",
+) -> dict:
+    return {
+        "id": attachment_id,
+        "title": filename,
+        "version": {"number": 1},
+        "extensions": {"mediaType": media_type},
+        "_links": {"download": f"/download/attachments/123/{attachment_id}"},
+    }
+
+
+async def _fetch_current_page(
+    body_html: str,
+    attachments: tuple[dict, ...],
+):
+    gene = ConfluenceGene(
+        config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
+        source_id="src-confluence",
+    )
+    gene._api_prefix = "/wiki"
+    gene._get = AsyncMock(
+        return_value=JsonResponse(
+            {
+                "id": "123",
+                "version": {"number": 7},
+                "body": {"storage": {"value": body_html}},
+                "ancestors": [],
+                "space": {"key": "PAY"},
+                "children": {
+                    "attachment": {
+                        "results": list(attachments),
+                        "start": 0,
+                        "size": len(attachments),
+                        "_links": {},
+                    }
+                },
+            }
+        )
+    )
+    item = ContentItem(
+        item_id="confluence-123",
+        title="Page",
+        source_url="https://wiki.example.test/wiki/pages/123",
+        last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        space_or_project="PAY",
+        version="7",
+        extra={"page_id": "123"},
+    )
+    return await gene.fetch(item)
+
+
 @pytest.mark.asyncio
 async def test_semantically_empty_confluence_page_stays_empty_after_normalization():
     gene = ConfluenceGene(
@@ -315,7 +370,14 @@ async def test_fetch_does_not_promote_confluence_reported_size_to_exact_byte_con
                 {
                     "id": "123",
                     "version": {"number": 7},
-                    "body": {"storage": {"value": "<p>See diagram.</p>"}},
+                    "body": {
+                        "storage": {
+                            "value": (
+                                "<p>See diagram.</p>"
+                                '<ac:image><ri:attachment ri:filename="diagram.png" /></ac:image>'
+                            )
+                        }
+                    },
                     "ancestors": [],
                     "space": {"key": "PAY"},
                     "children": {
@@ -444,7 +506,14 @@ async def test_fetch_does_not_count_unsupported_confluence_attachments_against_i
                 {
                     "id": "123",
                     "version": {"number": 7},
-                    "body": {"storage": {"value": "<p>See diagram.</p>"}},
+                    "body": {
+                        "storage": {
+                            "value": (
+                                "<p>See diagram.</p>"
+                                '<ac:image><ri:attachment ri:filename="diagram.png" /></ac:image>'
+                            )
+                        }
+                    },
                     "ancestors": [],
                     "space": {"key": "PAY"},
                     "children": {
@@ -476,6 +545,157 @@ async def test_fetch_does_not_count_unsupported_confluence_attachments_against_i
 
 
 @pytest.mark.asyncio
+async def test_fetch_materializes_only_attachments_referenced_as_current_body_images():
+    raw = await _fetch_current_page(
+        '<ac:image><ri:attachment ri:filename="current.png" /></ac:image>',
+        (
+            _attachment("att-current", "current.png"),
+            _attachment("att-residue", "removed-from-body.png"),
+        ),
+    )
+
+    assert [artifact.provider_key for artifact in raw.artifacts] == ["att-current"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attachment_results",
+    [
+        (),
+        (
+            _attachment("att-1", "missing.png"),
+            _attachment("att-2", "missing.png"),
+        ),
+    ],
+)
+async def test_fetch_rejects_an_unresolved_current_body_image_reference(
+    attachment_results,
+):
+    with pytest.raises(SourceArtifactContractError, match="cannot be resolved"):
+        await _fetch_current_page(
+            '<ac:image><ri:attachment ri:filename="missing.png" /></ac:image>',
+            attachment_results,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_does_not_bind_an_explicit_other_page_image_to_local_inventory():
+    raw = await _fetch_current_page(
+        (
+            '<ac:image><ri:attachment ri:filename="local.png" /></ac:image>'
+            '<ac:image><ri:attachment ri:filename="same-name.png">'
+            '<ri:page ri:space-key="PAY" ri:content-title="Other Page" />'
+            "</ri:attachment></ac:image>"
+        ),
+        (
+            _attachment("att-local", "local.png"),
+            _attachment("att-wrong-parent", "same-name.png"),
+        ),
+    )
+
+    assert [artifact.provider_key for artifact in raw.artifacts] == ["att-local"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "container_markup",
+    [
+        '<ri:content-entity ri:content-id="123" />',
+        '<ri:page ri:space-key="PAY" ri:content-title="Page" />',
+    ],
+)
+async def test_fetch_accepts_an_attachment_with_the_current_page_as_explicit_container(
+    container_markup,
+):
+    raw = await _fetch_current_page(
+        (
+            '<ac:image><ri:attachment ri:filename="current.png">'
+            f"{container_markup}"
+            "</ri:attachment></ac:image>"
+        ),
+        (_attachment("att-current", "current.png"),),
+    )
+
+    assert [artifact.provider_key for artifact in raw.artifacts] == ["att-current"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_resolves_a_local_default_gallery_to_current_image_inventory():
+    raw = await _fetch_current_page(
+        '<ac:structured-macro ac:name="gallery" />',
+        (
+            _attachment("att-image", "gallery.png"),
+            _attachment("att-pdf", "linked.pdf", media_type="application/pdf"),
+        ),
+    )
+
+    assert [artifact.provider_key for artifact in raw.artifacts] == ["att-image"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_applies_gallery_include_and_exclude_membership_parameters():
+    raw = await _fetch_current_page(
+        (
+            '<ac:structured-macro ac:name="gallery">'
+            '<ac:parameter ac:name="include">'
+            'keep.png, "also,keep.png", drop.png'
+            "</ac:parameter>"
+            '<ac:parameter ac:name="exclude">drop.png</ac:parameter>'
+            "</ac:structured-macro>"
+        ),
+        tuple(
+            _attachment(f"att-{index}", filename)
+            for index, filename in enumerate(
+                ("keep.png", "also,keep.png", "drop.png", "other.png")
+            )
+        ),
+    )
+
+    assert [artifact.provider_key for artifact in raw.artifacts] == ["att-0", "att-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [
+        ("page", "Other Page"),
+        ("includeLabel", "architecture"),
+        ("excludeLabel", "obsolete"),
+    ],
+)
+async def test_fetch_rejects_gallery_membership_that_needs_provider_metadata(
+    parameter,
+    value,
+):
+    with pytest.raises(SourceArtifactContractError, match="provider metadata"):
+        await _fetch_current_page(
+            (
+                '<ac:structured-macro ac:name="gallery">'
+                f'<ac:parameter ac:name="{parameter}">{value}</ac:parameter>'
+                "</ac:structured-macro>"
+            ),
+            (),
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_materializes_a_current_body_attachment_link_but_not_inventory_residue():
+    raw = await _fetch_current_page(
+        (
+            '<ac:link><ri:attachment ri:filename="current.pdf" />'
+            "<ac:plain-text-link-body>Current PDF</ac:plain-text-link-body>"
+            "</ac:link>"
+        ),
+        (
+            _attachment("att-current-pdf", "current.pdf", media_type="application/pdf"),
+            _attachment("att-residue-pdf", "residue.pdf", media_type="application/pdf"),
+        ),
+    )
+
+    assert [artifact.provider_key for artifact in raw.artifacts] == ["att-current-pdf"]
+
+
+@pytest.mark.asyncio
 async def test_confluence_attachment_inventory_is_not_rejected_by_descriptor_count():
     gene = ConfluenceGene(
         config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"},
@@ -504,6 +724,9 @@ async def test_confluence_attachment_inventory_is_not_rejected_by_descriptor_cou
     assert await gene._fetch_source_artifacts(
         "123",
         first_page=first_page,
+        body_html="",
+        page_title="Page",
+        space_key="PAY",
     ) == ()
 
 
