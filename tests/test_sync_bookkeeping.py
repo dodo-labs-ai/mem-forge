@@ -7063,6 +7063,64 @@ async def test_source_sync_worker_terminalizes_expired_run_after_execution_budge
 
 
 @pytest.mark.asyncio
+async def test_source_sync_worker_persists_initial_progress_before_provider_work(
+    db: Database,
+):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-initial-progress"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Initial Progress",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    provider_entered = asyncio.Event()
+    provider_release = asyncio.Event()
+
+    class PausingRuntimeProvider:
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            provider_entered.set()
+            await provider_release.wait()
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=PausingRuntimeProvider(),
+        worker_id="worker-initial-progress",
+    )
+
+    worker_task = asyncio.create_task(worker.run_once())
+    try:
+        await provider_entered.wait()
+        running = await db.get_source_sync_run(enqueued.run_id)
+    finally:
+        provider_release.set()
+        await worker_task
+
+    assert running is not None
+    assert running.status == "running"
+    assert running.progress == {
+        "schema_version": 1,
+        "phase": "discovering",
+        "progress": {"completed": 0, "unit": "issue"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_source_sync_worker_retries_failed_final_state(db: Database):
     import memforge.runtime as runtime
 
