@@ -889,12 +889,13 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
         "semantic_input_count": 1,
         "selected_count": 1,
         "dropped_exact_count": 1,
-            "dropped_redundant_count": 0,
-            "structured_llm_calls": 0,
-            "structured_llm_elapsed_ms": 0,
-            "validation_retries": 0,
-            "prompt_chars": 0,
-            "drops": [
+        "dropped_redundant_count": 0,
+        "dropped_low_value_count": 0,
+        "structured_llm_calls": 0,
+        "structured_llm_elapsed_ms": 0,
+        "validation_retries": 0,
+        "prompt_chars": 0,
+        "drops": [
             {
                 "candidate_content_hash": content_hash(duplicate.content),
                 "candidate_source_observation_id": observation_id,
@@ -905,6 +906,72 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
             }
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_projected_lifecycle_records_low_value_admission_without_content(
+    db: Database,
+) -> None:
+    durable_content = "Enable the reduction toggle only after the compatibility suite passes."
+    instance_content = "Test case 17 returned 204 rows in this run."
+    projection = _projection(
+        run_id="projection-candidate-quality",
+        body=f"{durable_content}\n\n{instance_content}",
+    )
+    observation_id = projection.observations[0].id
+    durable = RawMemory(
+        content=durable_content,
+        memory_type="procedure",
+        evidence_quote=durable_content,
+        source_observation_id=observation_id,
+    )
+    instance_output = RawMemory(
+        content=instance_content,
+        memory_type="fact",
+        evidence_quote=instance_content,
+        source_observation_id=observation_id,
+    )
+    client = _CandidateLedgerClient(
+        _candidate_ledger_response(
+            CandidateLedgerDecision(action="KEEP"),
+            CandidateLedgerDecision(
+                action="DROP_LOW_VALUE",
+                reason=f"Do not persist: {instance_content}",
+            ),
+        )
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_AuditedOutboxDrainer(db),
+        structured_llm_client=client,
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[durable, instance_output],
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=projection.observation_revisions[0].content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    memories = await db.list_memories()
+    [event] = await db.list_memory_audit_events(event_type="candidate_ledger_completed")
+
+    assert [memory.content for memory in memories] == [durable_content]
+    assert stats["candidate_ledger_dropped_low_value_count"] == 1
+    assert event.payload["dropped_low_value_count"] == 1
+    [drop] = event.payload["drops"]
+    assert drop["method"] == "structured_quality"
+    assert drop["reason"] == "low_value_admission"
+    assert instance_content not in str(event.payload)
 
 
 @pytest.mark.asyncio

@@ -488,12 +488,9 @@ class MemoryEngine:
             {
                 "candidate_ledger_input_count": candidate_ledger.input_count,
                 "candidate_ledger_selected_count": len(candidate_ledger.candidates),
-                "candidate_ledger_dropped_exact_count": (
-                    candidate_ledger.dropped_exact_count
-                ),
-                "candidate_ledger_dropped_redundant_count": (
-                    candidate_ledger.dropped_redundant_count
-                ),
+                "candidate_ledger_dropped_exact_count": (candidate_ledger.dropped_exact_count),
+                "candidate_ledger_dropped_redundant_count": (candidate_ledger.dropped_redundant_count),
+                "candidate_ledger_dropped_low_value_count": (candidate_ledger.dropped_low_value_count),
                 "candidate_ledger_llm_calls": candidate_ledger.structured_llm_calls,
                 "candidate_ledger_llm_elapsed_ms": (
                     candidate_ledger.structured_llm_elapsed_ms
@@ -1219,6 +1216,7 @@ def _candidate_ledger_audit_payload(result: CandidateLedgerResult) -> dict[str, 
         "selected_count": len(result.candidates),
         "dropped_exact_count": result.dropped_exact_count,
         "dropped_redundant_count": result.dropped_redundant_count,
+        "dropped_low_value_count": result.dropped_low_value_count,
         "structured_llm_calls": result.structured_llm_calls,
         "structured_llm_elapsed_ms": result.structured_llm_elapsed_ms,
         "validation_retries": result.validation_retries,
@@ -1227,8 +1225,12 @@ def _candidate_ledger_audit_payload(result: CandidateLedgerResult) -> dict[str, 
             {
                 "candidate_content_hash": content_hash(drop.candidate.content),
                 "candidate_source_observation_id": drop.candidate.source_observation_id,
-                "canonical_content_hash": content_hash(drop.canonical_candidate.content),
-                "canonical_source_observation_id": (drop.canonical_candidate.source_observation_id),
+                "canonical_content_hash": (
+                    content_hash(drop.canonical_candidate.content) if drop.canonical_candidate is not None else None
+                ),
+                "canonical_source_observation_id": (
+                    drop.canonical_candidate.source_observation_id if drop.canonical_candidate is not None else None
+                ),
                 "method": drop.method,
                 "reason": drop.reason[:240],
             }
