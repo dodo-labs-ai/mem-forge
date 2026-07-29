@@ -225,7 +225,6 @@ async def select_unique_memory_candidates(
                 validation_retries=validation_retries,
                 prompt_chars=prompt_chars,
             )
-        validation_error: ValueError | None = None
         batch_decisions: dict[int, _IndexedLedgerDecision] | None = None
         for attempt in range(_VALIDATION_ATTEMPTS):
             prompt_chars += len(prompt)
@@ -239,15 +238,10 @@ async def select_unique_memory_candidates(
                 )
             except Exception:
                 structured_llm_elapsed_ms += max(0, round((perf_counter() - call_started) * 1000))
-                batch_decisions = {
-                    index: _IndexedLedgerDecision(
-                        index=index,
-                        action="KEEP",
-                        canonical_index=None,
-                        reason="structured_admission_unavailable",
-                    )
-                    for index in expected_indices
-                }
+                batch_decisions = _keep_batch(
+                    expected_indices,
+                    reason="structured_admission_unavailable",
+                )
                 fallback_batch_count += 1
                 fallback_candidate_count += len(expected_indices)
                 break
@@ -259,7 +253,6 @@ async def select_unique_memory_candidates(
                 )
                 break
             except ValueError as exc:
-                validation_error = exc
                 if attempt + 1 >= _VALIDATION_ATTEMPTS:
                     break
                 validation_retries += 1
@@ -270,16 +263,12 @@ async def select_unique_memory_candidates(
                     "</validation_feedback>"
                 )
         if batch_decisions is None:
-            raise CandidateLedgerError(
-                "invalid_ledger",
-                f"complete candidate ledger validation failed: {validation_error}",
-                input_count=len(original),
-                semantic_input_count=semantic_count,
-                structured_llm_calls=structured_llm_calls,
-                structured_llm_elapsed_ms=structured_llm_elapsed_ms,
-                validation_retries=validation_retries,
-                prompt_chars=prompt_chars,
+            batch_decisions = _keep_batch(
+                expected_indices,
+                reason="structured_admission_invalid",
             )
+            fallback_batch_count += 1
+            fallback_candidate_count += len(expected_indices)
         decisions_by_index.update(batch_decisions)
         offset = stop
 
@@ -356,6 +345,22 @@ def _collapse_exact_duplicates(
         canonical_by_content[normalized] = candidate
         unique.append(candidate)
     return tuple(unique), tuple(drops)
+
+
+def _keep_batch(
+    expected_indices: tuple[int, ...],
+    *,
+    reason: str,
+) -> dict[int, _IndexedLedgerDecision]:
+    return {
+        index: _IndexedLedgerDecision(
+            index=index,
+            action="KEEP",
+            canonical_index=None,
+            reason=reason,
+        )
+        for index in expected_indices
+    }
 
 
 def _validate_complete_ledger(

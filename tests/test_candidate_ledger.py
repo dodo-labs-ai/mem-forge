@@ -89,7 +89,7 @@ async def test_candidate_ledger_retries_once_when_decision_coverage_is_incomplet
 
 
 @pytest.mark.asyncio
-async def test_candidate_ledger_fails_closed_after_second_incomplete_ledger():
+async def test_candidate_ledger_keeps_batch_after_second_invalid_ledger():
     candidates = [
         _candidate("The trigger remained OPEN.", observation_id="obs-1"),
         _candidate("The trigger was not processed.", observation_id="obs-2"),
@@ -97,17 +97,18 @@ async def test_candidate_ledger_fails_closed_after_second_incomplete_ledger():
     incomplete = _ledger_response(CandidateLedgerDecision(action="KEEP"))
     client = _LedgerClient(incomplete, incomplete)
 
-    with pytest.raises(CandidateLedgerError, match="complete candidate ledger") as exc_info:
-        await select_unique_memory_candidates(
-            candidates,
-            structured_llm_client=client,
-            llm_model=None,
-        )
+    result = await select_unique_memory_candidates(
+        candidates,
+        structured_llm_client=client,
+        llm_model=None,
+    )
 
-    assert exc_info.value.error_type == "invalid_ledger"
-    assert exc_info.value.structured_llm_calls == 2
-    assert exc_info.value.validation_retries == 1
-    assert exc_info.value.prompt_chars == sum(len(prompt) for prompt in client.prompts)
+    assert result.candidates == tuple(candidates)
+    assert result.structured_llm_calls == 2
+    assert result.validation_retries == 1
+    assert result.fallback_batch_count == 1
+    assert result.fallback_candidate_count == 2
+    assert result.prompt_chars == sum(len(prompt) for prompt in client.prompts)
     assert len(client.prompts) == 2
 
 
@@ -376,7 +377,7 @@ async def test_candidate_ledger_ignores_canonical_index_outside_redundant_action
 
 
 @pytest.mark.asyncio
-async def test_candidate_ledger_rejects_canonical_target_outside_visible_batch():
+async def test_candidate_ledger_keeps_batch_when_canonical_target_stays_outside_visible_batch():
     candidates = [_candidate("X" * (100 - index), observation_id=f"obs-{index}") for index in range(26)]
     first_batch = [CandidateLedgerDecision(action="KEEP") for _ in range(24)]
     first_batch[1] = CandidateLedgerDecision(
@@ -401,12 +402,14 @@ async def test_candidate_ledger_rejects_canonical_target_outside_visible_batch()
         ),
     )
 
-    with pytest.raises(CandidateLedgerError, match="complete candidate ledger"):
-        await select_unique_memory_candidates(
-            candidates,
-            structured_llm_client=client,
-            llm_model=None,
-        )
+    result = await select_unique_memory_candidates(
+        candidates,
+        structured_llm_client=client,
+        llm_model=None,
+    )
 
+    assert result.candidates == tuple(candidate for index, candidate in enumerate(candidates) if index != 1)
+    assert result.fallback_batch_count == 1
+    assert result.fallback_candidate_count == 2
     assert len(client.prompts) == 3
     assert "<validation_feedback>" in client.prompts[-1]
