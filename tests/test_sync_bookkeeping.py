@@ -4417,6 +4417,7 @@ async def test_failed_projection_batch_stages_target_and_preserves_completed_sib
             recovery_order.append("provider_authenticate")
 
     retry_extractor = OrderedRetryExtractor()
+    admission = DocumentLifecycleAdmission(max_active=1)
     retry = GeneSyncOrchestrator(
         db=db,
         doc_store=orchestrator.doc_store,
@@ -4424,15 +4425,41 @@ async def test_failed_projection_batch_stages_target_and_preserves_completed_sib
         memory_engine=memory_engine,
         memory_store=None,
         max_concurrent=2,
+        document_lifecycle_admission=admission,
         retry_sleep=_skip_retry_delay,
     )
-    retry_state = await retry.sync_gene(
-        gene=OrderedRetryGene(body),
-        source_name="Recoverable Confluence",
-        source_id=source_id,
-    )
+    progress: list[dict] = []
+    async with admission.slot("src-other", "doc-other"):
+        retry_task = asyncio.create_task(
+            retry.sync_gene(
+                gene=OrderedRetryGene(body),
+                source_name="Recoverable Confluence",
+                source_id=source_id,
+                progress_callback=progress.append,
+            )
+        )
+        for _ in range(100):
+            if progress or recovery_order or retry_task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert recovery_order == []
+        assert progress == [
+            {
+                "phase": "reconciling",
+                "current": 0,
+                "total": 1,
+                "title": None,
+            }
+        ]
+    retry_state = await retry_task
 
     assert retry_state.last_sync_status == "success"
+    assert {
+        "phase": "reconciling",
+        "current": 1,
+        "total": 1,
+        "title": None,
+    } in progress
     assert {batch.id for batch in retry_extractor.projection_calls} == set(
         extractor.failed_batch_ids
     )
