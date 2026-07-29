@@ -272,7 +272,9 @@ class MemoryEngine:
         for an incumbent therefore may not contain a new candidate. If its
         supporting Observation was revised, prove the old exact excerpt still
         exists in that same stable Observation and stage a current-revision
-        reference. Missing or ambiguous evidence fails closed.
+        reference. Missing or ambiguous evidence fails closed through the
+        existing lifecycle Review gate rather than failing the whole Source
+        Unit.
         """
 
         current_revisions = {revision.observation_id: revision for revision in projection.observation_revisions}
@@ -386,11 +388,18 @@ class MemoryEngine:
                 if primary_needs_validation:
                     current_primary_quote = str(getattr(validation, "evidence_quote", "") or "").strip()
                     if not current_primary_quote or current_primary_quote not in current_primary.content:
-                        raise RuntimeError(
-                            "NOOP incumbent support validation lacks exact current "
-                            "PRIMARY evidence: "
-                            f"{operation.memory_id}"
+                        rebound.append(
+                            ReconcileOperation(
+                                action=ReconcileAction.DELETE,
+                                memory_id=operation.memory_id,
+                                reason=(
+                                    "revised PRIMARY evidence could not be "
+                                    "exactly re-anchored"
+                                ),
+                                flag_for_review=True,
+                            )
                         )
+                        continue
             rebound.append(
                 ReconcileOperation(
                     action=operation.action,
