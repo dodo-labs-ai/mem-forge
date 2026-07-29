@@ -235,6 +235,12 @@ export function presentSourceSyncActivity(
     }
     case "processing":
       return withProgress(`Creating memories from ${label}`, snapshot, fallbackItems);
+    case "recovering_derivations":
+      return withIndeterminateWorkset(
+        "Resuming memory creation",
+        snapshot,
+        fallbackItems,
+      );
     case "reconciling":
       return withProgress(`Checking removed ${label}`, snapshot, fallbackItems);
   }
@@ -262,6 +268,20 @@ function withProgress(
     presentation.total = progress.total;
   }
   return presentation;
+}
+
+function withIndeterminateWorkset(
+  message: string,
+  snapshot: SyncProgressSnapshot,
+  fallbackItems: string,
+): SourceSyncPresentation {
+  const presentation = withProgress(message, snapshot, fallbackItems);
+  return {
+    message: presentation.message,
+    detail: presentation.detail === "Working"
+      ? presentation.detail
+      : `${presentation.detail} · Working`,
+  };
 }
 
 function progressLabel(unit: SyncProgressUnit | undefined, fallback: string): string {

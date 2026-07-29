@@ -19,6 +19,7 @@ from memforge.llm.structured import (
     MemoryRelationDecision,
     MemoryRelationResponse,
     MemorySupportValidationResponse,
+    StructuredLlmError,
 )
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
@@ -747,6 +748,19 @@ class _OutboxDrainer:
         )
         return (candidate,) if candidate is not None else ()
 
+    async def find_access_compatible_equivalence_candidates_batch(self, queries):
+        candidates = []
+        for query in queries:
+            candidates.append(
+                await self.find_access_compatible_equivalence_candidates(
+                    query.memory,
+                    excluded_memory_ids=query.excluded_memory_ids,
+                    doc_id=query.doc_id,
+                    entity_ids=query.entity_ids,
+                )
+            )
+        return tuple(candidates)
+
     async def find_access_compatible_exact_candidate(
         self,
         memory: Memory,
@@ -759,6 +773,17 @@ class _OutboxDrainer:
             owner_user_id=memory.owner_user_id,
             repo_identifier=memory.repo_identifier,
             excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
+        )
+
+    async def find_access_compatible_exact_candidates_batch(self, requests):
+        return tuple(
+            [
+                await self.find_access_compatible_exact_candidate(
+                    request.challenger,
+                    excluded_memory_ids=request.excluded_memory_ids,
+                )
+                for request in requests
+            ]
         )
 
 
@@ -826,6 +851,19 @@ class _EquivalentMemoryStore(_OutboxDrainer):
         del memory, excluded_memory_ids, scope, doc_id, entity_ids
         return (self.target,)
 
+    async def find_access_compatible_equivalence_candidates_batch(self, queries):
+        candidates = []
+        for query in queries:
+            candidates.append(
+                await self.find_access_compatible_equivalence_candidates(
+                    query.memory,
+                    excluded_memory_ids=query.excluded_memory_ids,
+                    doc_id=query.doc_id,
+                    entity_ids=query.entity_ids,
+                )
+            )
+        return tuple(candidates)
+
 
 @pytest.mark.asyncio
 async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
@@ -889,12 +927,15 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
         "semantic_input_count": 1,
         "selected_count": 1,
         "dropped_exact_count": 1,
-            "dropped_redundant_count": 0,
-            "structured_llm_calls": 0,
-            "structured_llm_elapsed_ms": 0,
-            "validation_retries": 0,
-            "prompt_chars": 0,
-            "drops": [
+        "dropped_redundant_count": 0,
+        "dropped_low_value_count": 0,
+        "structured_llm_calls": 0,
+        "structured_llm_elapsed_ms": 0,
+        "validation_retries": 0,
+        "fallback_batch_count": 0,
+        "fallback_candidate_count": 0,
+        "prompt_chars": 0,
+        "drops": [
             {
                 "candidate_content_hash": content_hash(duplicate.content),
                 "candidate_source_observation_id": observation_id,
@@ -905,6 +946,72 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
             }
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_projected_lifecycle_records_low_value_admission_without_content(
+    db: Database,
+) -> None:
+    durable_content = "Enable the reduction toggle only after the compatibility suite passes."
+    instance_content = "Test case 17 returned 204 rows in this run."
+    projection = _projection(
+        run_id="projection-candidate-quality",
+        body=f"{durable_content}\n\n{instance_content}",
+    )
+    observation_id = projection.observations[0].id
+    durable = RawMemory(
+        content=durable_content,
+        memory_type="procedure",
+        evidence_quote=durable_content,
+        source_observation_id=observation_id,
+    )
+    instance_output = RawMemory(
+        content=instance_content,
+        memory_type="fact",
+        evidence_quote=instance_content,
+        source_observation_id=observation_id,
+    )
+    client = _CandidateLedgerClient(
+        _candidate_ledger_response(
+            CandidateLedgerDecision(action="KEEP"),
+            CandidateLedgerDecision(
+                action="DROP_LOW_VALUE",
+                reason=f"Do not persist: {instance_content}",
+            ),
+        )
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_AuditedOutboxDrainer(db),
+        structured_llm_client=client,
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[durable, instance_output],
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=projection.observation_revisions[0].content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    memories = await db.list_memories()
+    [event] = await db.list_memory_audit_events(event_type="candidate_ledger_completed")
+
+    assert [memory.content for memory in memories] == [durable_content]
+    assert stats["candidate_ledger_dropped_low_value_count"] == 1
+    assert event.payload["dropped_low_value_count"] == 1
+    [drop] = event.payload["drops"]
+    assert drop["method"] == "structured_quality"
+    assert drop["reason"] == "low_value_admission"
+    assert instance_content not in str(event.payload)
 
 
 @pytest.mark.asyncio
@@ -951,7 +1058,7 @@ async def test_projected_create_persists_validity_as_dates(db: Database) -> None
 
 
 @pytest.mark.asyncio
-async def test_incomplete_candidate_ledger_is_audited_and_writes_no_memory(
+async def test_incomplete_candidate_ledger_is_audited_as_fallback_and_keeps_memories(
     db: Database,
 ) -> None:
     projection = _projection(
@@ -970,57 +1077,47 @@ async def test_incomplete_candidate_ledger_is_audited_and_writes_no_memory(
         structured_llm_client=client,
     )
 
-    with pytest.raises(RuntimeError, match="candidate ledger failed closed: invalid_ledger"):
-        await engine.apply_projected_lifecycle(
-            projection=projection,
-            doc_id="confluence-123",
-            raw_memories=[
-                RawMemory(
-                    content="The trigger remained OPEN.",
-                    memory_type="fact",
-                    evidence_quote="The trigger remained OPEN.",
-                    source_observation_id=observation_id,
-                ),
-                RawMemory(
-                    content="The trigger was not processed.",
-                    memory_type="fact",
-                    evidence_quote="The trigger was not processed.",
-                    source_observation_id=observation_id,
-                ),
-            ],
-            doc_type="ticket",
-            project_key="ENG",
-            repo_identifier=None,
-            document_content=projection.observation_revisions[0].content,
-            update_mode="full_document",
-            changed_hunks=None,
-            update_plan_stats=None,
-            source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
-        )
+    await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content="The trigger remained OPEN.",
+                memory_type="fact",
+                evidence_quote="The trigger remained OPEN.",
+                source_observation_id=observation_id,
+            ),
+            RawMemory(
+                content="The trigger was not processed.",
+                memory_type="fact",
+                evidence_quote="The trigger was not processed.",
+                source_observation_id=observation_id,
+            ),
+        ],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=projection.observation_revisions[0].content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
 
     async with db.db.execute("SELECT COUNT(*) AS total FROM memories") as cursor:
         row = await cursor.fetchone()
-    events = await db.list_memory_audit_events(event_type="candidate_ledger_failed")
+    events = await db.list_memory_audit_events(event_type="candidate_ledger_completed")
 
-    assert row["total"] == 0
+    assert row["total"] == 2
     assert client.calls == 2
     assert len(events) == 1
-    assert events[0].status == "failed"
-    assert events[0].reason == "invalid_ledger"
+    assert events[0].status == "committed"
+    assert events[0].reason == "candidate_admission_with_fallback"
     assert events[0].payload["input_count"] == 2
     assert events[0].payload["semantic_input_count"] == 2
-    assert events[0].payload["selected_count"] == 0
-    assert events[0].payload["fingerprints_truncated"] is False
-    assert events[0].payload["candidate_fingerprints"] == [
-        {
-            "content_hash": content_hash("The trigger remained OPEN."),
-            "source_observation_id": observation_id,
-        },
-        {
-            "content_hash": content_hash("The trigger was not processed."),
-            "source_observation_id": observation_id,
-        },
-    ]
+    assert events[0].payload["selected_count"] == 2
+    assert events[0].payload["fallback_batch_count"] == 1
+    assert events[0].payload["fallback_candidate_count"] == 2
 
 
 class _SemanticEquivalentClient:
@@ -1084,6 +1181,15 @@ class _SupportValidatingNoopClient(_NoopClient):
                 if self.supported
                 else "The applicability changed from regular to off-cycle payroll."
             ),
+        )
+
+
+class _UnavailableSupportValidatingNoopClient(_NoopClient):
+    async def validate_memory_support(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        raise StructuredLlmError(
+            "structured LLM returned an invalid response",
+            error_code="ValidationError",
         )
 
 
@@ -2464,7 +2570,7 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
 
 
 @pytest.mark.asyncio
-async def test_incremental_noop_reworded_primary_requires_exact_current_quote(
+async def test_incremental_noop_inexact_current_quote_creates_review(
     db: Database,
 ) -> None:
     first = _projection(
@@ -2492,23 +2598,71 @@ async def test_incremental_noop_reworded_primary_requires_exact_current_quote(
         ),
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="support validation lacks exact current PRIMARY evidence",
-    ):
-        await engine.apply_projected_lifecycle(
-            projection=second,
-            doc_id="confluence-123",
-            raw_memories=[],
-            doc_type="design-doc",
-            project_key="ENG",
-            repo_identifier=None,
-            document_content=second.observation_revisions[0].content,
-            update_mode="diff_guided",
-            changed_hunks="primary wording changed",
-            update_plan_stats=None,
-            source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
-        )
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=second.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="primary wording changed",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["pending_review"] == 1
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "active"
+    assert await db.get_active_memory_support_reference_ids(incumbent.id)
+
+
+@pytest.mark.asyncio
+async def test_incremental_noop_unavailable_support_validation_creates_review(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-primary-validation-unavailable-1",
+        body="A7 is removed.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    await db.enable_lifecycle_gate("src-1")
+    second = _projection(
+        run_id="projection-primary-validation-unavailable-2",
+        body="The A7 slot remains excluded.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_UnavailableSupportValidatingNoopClient(
+            incumbent.id,
+        ),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=second.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="primary wording changed",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["pending_review"] == 1
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "active"
+    assert await db.get_active_memory_support_reference_ids(incumbent.id)
 
 
 @pytest.mark.asyncio

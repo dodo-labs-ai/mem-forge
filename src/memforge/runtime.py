@@ -527,6 +527,7 @@ async def build_search_engine(
                 base_url=llm.enrichment_base_url or None,
                 api_key=llm.enrichment_api_key or None,
                 timeout_s=llm.request_timeout_s,
+                max_concurrent=config.llm.enrichment_max_concurrent,
             )
         )
     adapters = build_sqlite_adapters(db, memory_collection, audit_logger=audit_logger)
@@ -556,6 +557,7 @@ async def build_sync_runtime(
                 base_url=llm.enrichment_base_url or None,
                 api_key=llm.enrichment_api_key or None,
                 timeout_s=llm.request_timeout_s,
+                max_concurrent=config.llm.enrichment_max_concurrent,
             )
         )
     doc_store = LocalDocumentStore(config.storage.docs_path)
@@ -954,6 +956,20 @@ class SourceSyncWorker:
             await self._process_relation_discovery_once()
             return None
 
+        if run.lease_attempt_count > self.config.sync.worker_max_attempts:
+            failed = await self.db.fail_source_sync_run(
+                run.run_id,
+                worker_id=self.worker_id,
+                lease_attempt_count=run.lease_attempt_count,
+                error_message="source sync execution attempt budget exhausted",
+                retryable=False,
+            )
+            if not failed:
+                raise SourceSyncLeaseLost(
+                    f"source sync lease lost before exhausted-attempt update for run {run.run_id}"
+                )
+            return run
+
         source: dict | None = None
         try:
             source = await self.db.get_source(run.source_id)
@@ -992,6 +1008,30 @@ class SourceSyncWorker:
                 and local_agent_source_config_revision(source) != run.source_config_revision
             ):
                 raise SourceSyncBoundaryError("source config revision changed before sync execution")
+
+            if run.progress is None:
+                initial_progress = source_sync_progress_from_pipeline(
+                    {"phase": "discovering", "current": 0, "total": 0},
+                    source_type=str(source.get("type") or ""),
+                )
+                if initial_progress is not None:
+                    try:
+                        stored = await self.db.report_source_sync_run_progress(
+                            run.run_id,
+                            worker_id=self.worker_id,
+                            lease_attempt_count=run.lease_attempt_count,
+                            progress=initial_progress,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Initial source sync progress update failed for run %s",
+                            run.run_id,
+                        )
+                    else:
+                        if not stored:
+                            raise SourceSyncLeaseLost(
+                                f"source sync lease lost before initial progress update for run {run.run_id}"
+                            )
 
             inputs = await self.db.list_source_sync_inputs(
                 source_id=run.source_id,

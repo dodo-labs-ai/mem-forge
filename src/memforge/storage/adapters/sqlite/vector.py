@@ -8,6 +8,8 @@ duplicate decision.
 from __future__ import annotations
 
 import asyncio
+import json
+from collections import defaultdict
 from typing import Any, Sequence
 
 from memforge.retrieval.access_predicate import visible_chroma_where
@@ -49,19 +51,52 @@ class SqliteVectorStore:
         memory_types: list[str] | None,
         limit: int,
     ) -> list[tuple[str, float]]:
-        where = visible_chroma_where(scope, memory_types)
-        params: dict[str, Any] = {
-            "query_embeddings": [list(embedding)],
-            "n_results": limit,
-        }
-        if where:
-            params["where"] = where
-        results = await asyncio.to_thread(lambda: self.collection.query(**params))
-        if not results or not results.get("ids") or not results["ids"][0]:
+        return (
+            await self.query_many(
+                (embedding,),
+                (scope,),
+                (memory_types,),
+                limit,
+            )
+        )[0]
+
+    async def query_many(
+        self,
+        embeddings: Sequence[Sequence[float]],
+        scopes: Sequence[AccessScope],
+        memory_types: Sequence[list[str] | None],
+        limit: int,
+    ) -> list[list[tuple[str, float]]]:
+        if not (len(embeddings) == len(scopes) == len(memory_types)):
+            raise ValueError("vector query batch inputs must have equal length")
+        if not embeddings:
             return []
-        ids = results["ids"][0]
-        distances = results["distances"][0] if results.get("distances") else [0.0] * len(ids)
-        return [(mid, self.similarity(dist)) for mid, dist in zip(ids, distances)]
+
+        groups: dict[str, list[int]] = defaultdict(list)
+        where_by_key: dict[str, dict[str, Any] | None] = {}
+        for index, (scope, types) in enumerate(zip(scopes, memory_types, strict=True)):
+            where = visible_chroma_where(scope, types)
+            key = json.dumps(where, sort_keys=True, separators=(",", ":"))
+            groups[key].append(index)
+            where_by_key[key] = where
+
+        output: list[list[tuple[str, float]]] = [[] for _ in embeddings]
+        for key, indices in groups.items():
+            params: dict[str, Any] = {
+                "query_embeddings": [list(embeddings[index]) for index in indices],
+                "n_results": limit,
+            }
+            where = where_by_key[key]
+            if where:
+                params["where"] = where
+            results = await asyncio.to_thread(lambda: self.collection.query(**params))
+            result_ids = (results or {}).get("ids") or []
+            result_distances = (results or {}).get("distances") or []
+            for local_index, output_index in enumerate(indices):
+                ids = result_ids[local_index] if local_index < len(result_ids) else []
+                distances = result_distances[local_index] if local_index < len(result_distances) else [0.0] * len(ids)
+                output[output_index] = [(mid, self.similarity(dist)) for mid, dist in zip(ids, distances, strict=True)]
+        return output
 
     async def upsert(
         self,
