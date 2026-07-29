@@ -52,6 +52,7 @@ DEFAULT_MAX_PAGES = 200
 @dataclass(frozen=True)
 class _RepoRef:
     origin: str
+    pages_root: str
     owner: str
     repo: str
     page_path: str
@@ -115,8 +116,8 @@ class GitHubPagesGene(Gene):
                     label="Page URL",
                     field_type=ConfigFieldType.URL,
                     required=False,
-                    placeholder="https://github.example.com/pages/org/repo/path/to/page/",
-                    help_text="Single documentation page to sync.",
+                    placeholder="https://pages.github.example.com/org/repo/path/to/page/",
+                    help_text="Published GitHub Pages URL for one documentation page.",
                     group="scope",
                     order=1,
                 ),
@@ -125,8 +126,8 @@ class GitHubPagesGene(Gene):
                     label="Subtree Root URL",
                     field_type=ConfigFieldType.URL,
                     required=False,
-                    placeholder="https://github.example.com/pages/org/repo/cloud-native-platform/",
-                    help_text="Only pages under this URL path are discovered.",
+                    placeholder="https://pages.github.example.com/org/repo/cloud-native-platform/",
+                    help_text="Only published pages under this URL path are discovered.",
                     group="scope",
                     order=2,
                 ),
@@ -439,7 +440,7 @@ class GitHubPagesGene(Gene):
     async def _repo_file_item_for_url(self, canonical_url: str) -> ContentItem:
         ref = _repo_ref_from_pages_url(canonical_url)
         if ref is None:
-            raise ValueError("GitHub Pages URL must use /pages/<owner>/<repo>/... for PAT-backed fetch")
+            raise ValueError(_repository_backed_pages_url_error())
         branch = str(self.config.get("branch") or "").strip()
         if not branch:
             branch = await self._default_branch(ref)
@@ -461,7 +462,7 @@ class GitHubPagesGene(Gene):
         root_url = self._require_in_site(str(self.config.get("root_url") or ""))
         ref = _repo_ref_from_pages_url(root_url)
         if ref is None:
-            raise ValueError("GitHub Pages URL must use /pages/<owner>/<repo>/... for PAT-backed fetch")
+            raise ValueError(_repository_backed_pages_url_error())
         branch = str(self.config.get("branch") or "").strip()
         if not branch:
             branch = await self._default_branch(ref)
@@ -725,6 +726,9 @@ def _site_root_from_pages_url(url: str) -> str:
     if len(path_parts) >= 3 and path_parts[0] == "pages":
         root_path = "/" + "/".join(path_parts[:3])
         return urlunsplit((parts.scheme, parts.netloc, root_path, "", ""))
+    if len(path_parts) >= 2 and (parts.hostname or "").lower().startswith("pages."):
+        root_path = "/" + "/".join(path_parts[:2])
+        return urlunsplit((parts.scheme, parts.netloc, root_path, "", ""))
     return canonical
 
 
@@ -732,13 +736,34 @@ def _repo_ref_from_pages_url(url: str) -> _RepoRef | None:
     canonical = _canonicalize_url(url)
     parts = urlsplit(canonical)
     path_parts = [part for part in parts.path.split("/") if part]
-    if len(path_parts) < 3 or path_parts[0] != "pages":
+    pages_origin = _origin_for_url(canonical)
+    if len(path_parts) >= 3 and path_parts[0] == "pages":
+        owner_index = 1
+        api_origin = pages_origin
+    elif len(path_parts) >= 2 and (parts.hostname or "").lower().startswith("pages."):
+        owner_index = 0
+        api_hostname = (parts.hostname or "")[len("pages."):]
+        api_netloc = api_hostname if parts.port is None else f"{api_hostname}:{parts.port}"
+        api_origin = urlunsplit((parts.scheme, api_netloc, "", "", ""))
+    else:
         return None
+    owner = path_parts[owner_index]
+    repo = path_parts[owner_index + 1]
+    page_root_path = "/" + "/".join(path_parts[:owner_index + 2])
     return _RepoRef(
-        origin=_origin_for_url(canonical),
-        owner=path_parts[1],
-        repo=path_parts[2],
-        page_path="/".join(path_parts[3:]).strip("/"),
+        origin=api_origin,
+        pages_root=urlunsplit((parts.scheme, parts.netloc, page_root_path, "", "")),
+        owner=owner,
+        repo=repo,
+        page_path="/".join(path_parts[owner_index + 2:]).strip("/"),
+    )
+
+
+def _repository_backed_pages_url_error() -> str:
+    return (
+        "Personal access token mode requires a standard GitHub Enterprise Pages URL: "
+        "https://pages.<github-host>/<owner>/<repo>/... or "
+        "https://<github-host>/pages/<owner>/<repo>/...."
     )
 
 
@@ -749,7 +774,7 @@ def _repo_identifier_for_item(item: ContentItem) -> str | None:
         return None
     ref = _repo_ref_from_pages_url(item.source_url)
     if ref is None:
-        raise ValueError("Repository-backed GitHub Pages content requires /pages/<owner>/<repo>/...")
+        raise ValueError(_repository_backed_pages_url_error())
     identifier = normalize_repo_identifier(f"{ref.origin}/{ref.owner}/{ref.repo}")
     if identifier is None:
         raise ValueError("Repository-backed GitHub Pages content is missing repository identity")
@@ -822,7 +847,7 @@ def _page_path_is_under(page_path: str, root_page: str) -> bool:
 
 def _pages_url_for_repo_markdown(ref: _RepoRef, repo_path: str) -> str:
     page_path = _page_path_from_repo_markdown(repo_path)
-    return f"{ref.origin}/pages/{ref.owner}/{ref.repo}/{quote(page_path, safe='/')}"
+    return f"{ref.pages_root}/{quote(page_path, safe='/')}"
 
 
 def _page_path_from_repo_markdown(repo_path: str) -> str:

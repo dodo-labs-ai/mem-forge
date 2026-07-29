@@ -80,6 +80,7 @@ from memforge.source_artifacts import (
     source_artifact_revision_from_metadata,
 )
 from memforge.source_derivation import (
+    SourceDerivationAttempt,
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
     SourceUnitDeriver,
@@ -763,6 +764,8 @@ class GeneSyncOrchestrator:
                 recovered = await self._resume_source_derivations(
                     source_id=source_id,
                     source_activity_epoch=source_activity_epoch,
+                    run_id=run_id,
+                    progress_callback=progress_callback,
                 )
                 docs_updated += recovered["updated"]
                 memories_extracted += recovered["memories_extracted"]
@@ -1391,6 +1394,8 @@ class GeneSyncOrchestrator:
         *,
         source_id: str,
         source_activity_epoch: int | None,
+        run_id: str,
+        progress_callback: Callable[[dict], None] | None = None,
     ) -> dict[str, int]:
         """Resume durable Source Unit work before reading the provider."""
 
@@ -1408,94 +1413,92 @@ class GeneSyncOrchestrator:
                 "completed",
             ),
         )
+        latest_by_projection: dict[
+            tuple[int | None, str, str, str],
+            SourceDerivationAttempt,
+        ] = {}
+        superseded_attempts: list[SourceDerivationAttempt] = []
         for attempt in attempts:
-            context = attempt.context
-            if context.source_activity_epoch != source_activity_epoch:
-                await self.db.supersede_source_derivation(attempt.id)
+            if attempt.context.source_activity_epoch != source_activity_epoch:
+                superseded_attempts.append(attempt)
                 continue
-            current_revision = (
-                await self.db.get_current_source_unit_revision(
-                    attempt.source_unit_id
-                )
-            )
-            current_revision_id = (
-                current_revision.id
-                if current_revision is not None
-                else None
-            )
-            if current_revision_id not in {
-                attempt.base_unit_revision_id,
+            projection_scope = (
+                attempt.context.source_activity_epoch,
+                attempt.source_unit_id,
                 attempt.target_unit_revision_id,
-            }:
-                await self.db.supersede_source_derivation(attempt.id)
-                continue
-            projection = attempt.projection
-            delta = projection.deltas[0]
-            plan_id = lifecycle_plan_id(
-                ReconciliationScope(
-                    id=f"scope:{projection.run_id}",
-                    source_id=projection.source_id,
-                    source_unit_id=delta.source_unit_id,
-                    base_unit_revision_id=delta.previous_unit_revision_id,
-                    target_unit_revision_id=delta.current_unit_revision_id,
+                attempt.projection_identity_hash,
+            )
+            previous = latest_by_projection.get(projection_scope)
+            if previous is not None:
+                superseded_attempts.append(previous)
+            latest_by_projection[projection_scope] = attempt
+        for attempt in superseded_attempts:
+            await self.db.supersede_source_derivation(attempt.id)
+        if superseded_attempts:
+            logger.info(
+                "Superseded %d stale or older Source derivation context(s) "
+                "before recovery for source %s",
+                len(superseded_attempts),
+                source_id,
+            )
+        attempts = tuple(
+            sorted(
+                latest_by_projection.values(),
+                key=lambda attempt: (attempt.created_at, attempt.id),
+            )
+        )
+        if attempts and progress_callback:
+            progress_callback(
+                {
+                    "phase": "recovering_derivations",
+                    "current": 0,
+                    "total": len(attempts),
+                    "title": None,
+                }
+            )
+        for index, attempt in enumerate(attempts):
+            doc_id = attempt.context.document.doc_id
+            recovery_error: Exception | None = None
+            async with self._document_lifecycle_slot(
+                source_id,
+                doc_id,
+            ) as document_queue_wait_ms:
+                self._memory_sample(
+                    "derivation_recovery_lifecycle_enter",
+                    source_id=source_id,
+                    run_id=run_id,
+                    doc_id=doc_id,
+                    document_queue_wait_ms=document_queue_wait_ms,
                 )
-            )
-            if await self.db.get_lifecycle_plan_payload(plan_id) is not None:
-                await self.db.supersede_source_derivation(attempt.id)
-                logger.info(
-                    "Superseded Source derivation %s because lifecycle plan %s "
-                    "already applied for Source Unit %s",
-                    attempt.id,
-                    plan_id,
-                    attempt.source_unit_id,
+                try:
+                    lifecycle_stats = await self._resume_source_derivation_attempt(
+                        attempt=attempt,
+                        source_id=source_id,
+                        source_activity_epoch=source_activity_epoch,
+                    )
+                except Exception as exc:
+                    recovery_error = exc
+                    raise
+                finally:
+                    self._memory_sample(
+                        "derivation_recovery_lifecycle_exit",
+                        source_id=source_id,
+                        run_id=run_id,
+                        doc_id=doc_id,
+                        ok=recovery_error is None,
+                        error=recovery_error,
+                    )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "recovering_derivations",
+                        "current": index + 1,
+                        "total": len(attempts),
+                        "title": None,
+                    }
                 )
+            if lifecycle_stats is None:
                 continue
-            extraction = await self._extract_projection_batches(
-                projection=projection,
-                source_type=projection.source_type,
-                doc_type=context.doc_type,
-                source_id=source_id,
-                derivation_context=context,
-            )
-            if extraction.error_type:
-                continue
-            projection = with_source_artifact_summaries(
-                projection,
-                extraction.artifact_summaries,
-            )
-            source_updated_at = (
-                datetime.fromisoformat(context.source_updated_at)
-                if context.source_updated_at is not None
-                else None
-            )
-            lifecycle_stats = (
-                await self.memory_engine.apply_projected_lifecycle(
-                    projection=projection,
-                    doc_id=context.document.doc_id,
-                    raw_memories=extraction.memories,
-                    doc_type=context.doc_type,
-                    project_key=context.project_key,
-                    repo_identifier=context.repo_identifier,
-                    document_content=context.document_content,
-                    update_mode=context.update_mode,
-                    changed_hunks=context.changed_hunks,
-                    update_plan_stats=(
-                        dict(context.update_plan_stats)
-                        if context.update_plan_stats is not None
-                        else None
-                    ),
-                    source_updated_at=source_updated_at,
-                    user_id=context.user_id,
-                    protected_source_observation_ids=(
-                        extraction.protected_source_observation_ids
-                    ),
-                    document=context.document,
-                    derivation_id=attempt.id,
-                    expected_source_activity_epoch=(
-                        source_activity_epoch
-                    ),
-                )
-            )
             stats["processed"] += 1
             stats["updated"] += 1
             stats["memories_extracted"] += int(
@@ -1505,6 +1508,97 @@ class GeneSyncOrchestrator:
                 lifecycle_stats.get("updated", 0)
             )
         return stats
+
+    async def _resume_source_derivation_attempt(
+        self,
+        *,
+        attempt: SourceDerivationAttempt,
+        source_id: str,
+        source_activity_epoch: int | None,
+    ) -> dict | None:
+        """Resume one derivation inside the process document admission."""
+
+        context = attempt.context
+        if context.source_activity_epoch != source_activity_epoch:
+            await self.db.supersede_source_derivation(attempt.id)
+            return None
+        current_revision = await self.db.get_current_source_unit_revision(
+            attempt.source_unit_id
+        )
+        current_revision_id = (
+            current_revision.id
+            if current_revision is not None
+            else None
+        )
+        if current_revision_id not in {
+            attempt.base_unit_revision_id,
+            attempt.target_unit_revision_id,
+        }:
+            await self.db.supersede_source_derivation(attempt.id)
+            return None
+        projection = attempt.projection
+        delta = projection.deltas[0]
+        plan_id = lifecycle_plan_id(
+            ReconciliationScope(
+                id=f"scope:{projection.run_id}",
+                source_id=projection.source_id,
+                source_unit_id=delta.source_unit_id,
+                base_unit_revision_id=delta.previous_unit_revision_id,
+                target_unit_revision_id=delta.current_unit_revision_id,
+            )
+        )
+        if await self.db.get_lifecycle_plan_payload(plan_id) is not None:
+            await self.db.supersede_source_derivation(attempt.id)
+            logger.info(
+                "Superseded Source derivation %s because lifecycle plan %s "
+                "already applied for Source Unit %s",
+                attempt.id,
+                plan_id,
+                attempt.source_unit_id,
+            )
+            return None
+        extraction = await self._extract_projection_batches(
+            projection=projection,
+            source_type=projection.source_type,
+            doc_type=context.doc_type,
+            source_id=source_id,
+            derivation_context=context,
+        )
+        if extraction.error_type:
+            return None
+        projection = with_source_artifact_summaries(
+            projection,
+            extraction.artifact_summaries,
+        )
+        source_updated_at = (
+            datetime.fromisoformat(context.source_updated_at)
+            if context.source_updated_at is not None
+            else None
+        )
+        return await self.memory_engine.apply_projected_lifecycle(
+            projection=projection,
+            doc_id=context.document.doc_id,
+            raw_memories=extraction.memories,
+            doc_type=context.doc_type,
+            project_key=context.project_key,
+            repo_identifier=context.repo_identifier,
+            document_content=context.document_content,
+            update_mode=context.update_mode,
+            changed_hunks=context.changed_hunks,
+            update_plan_stats=(
+                dict(context.update_plan_stats)
+                if context.update_plan_stats is not None
+                else None
+            ),
+            source_updated_at=source_updated_at,
+            user_id=context.user_id,
+            protected_source_observation_ids=(
+                extraction.protected_source_observation_ids
+            ),
+            document=context.document,
+            derivation_id=attempt.id,
+            expected_source_activity_epoch=source_activity_epoch,
+        )
 
     # ==================================================================
     # Private: _process_item

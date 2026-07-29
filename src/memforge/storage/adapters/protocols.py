@@ -276,6 +276,15 @@ class RelationalStore(Protocol):
         repo_identifier: str | None,
         excluded_memory_ids: Sequence[str] = (),
     ) -> Memory | None: ...
+    async def find_active_exact_claim_candidates(
+        self,
+        content_hashes: Sequence[str],
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+        excluded_memory_ids: Sequence[str] = (),
+    ) -> list[Memory]: ...
     async def list_active_ordinary_claim_memories(
         self,
         memory_ids: Sequence[str],
@@ -300,6 +309,14 @@ class RelationalStore(Protocol):
         owner_user_id: str | None,
         repo_identifier: str | None,
     ) -> Memory | None: ...
+    async def find_rebaseline_reactivation_candidates(
+        self,
+        content_hashes: Sequence[str],
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+    ) -> list[Memory]: ...
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]: ...
     async def upsert_document(
         self,
@@ -813,4 +830,11 @@ class VectorStore(Protocol):
         memory_types: list[str] | None,
         limit: int,
     ) -> list[tuple[str, float]]: ...
+    async def query_many(
+        self,
+        embeddings: Sequence[Sequence[float]],
+        scopes: Sequence[AccessScope],
+        memory_types: Sequence[list[str] | None],
+        limit: int,
+    ) -> list[list[tuple[str, float]]]: ...
     async def get_record(self, memory_id: str) -> dict[str, Any] | None: ...

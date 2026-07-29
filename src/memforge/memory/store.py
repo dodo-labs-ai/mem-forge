@@ -33,6 +33,10 @@ from memforge.memory.index_payloads import (
     embedding_text_hash,
     memory_embedding_text,
 )
+from memforge.memory.identity_resolver import (
+    IdentityCandidateQuery,
+    IdentityResolutionRequest,
+)
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.memory.lifecycle_plan import (
     LifecyclePlan,
@@ -622,6 +626,42 @@ class MemoryStore:
             excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
         )
 
+    async def find_access_compatible_exact_candidates_batch(
+        self,
+        requests: Sequence[IdentityResolutionRequest],
+    ) -> tuple[Memory | None, ...]:
+        """Resolve exact identities through one adapter batch per access context."""
+
+        if not requests:
+            return ()
+        groups: dict[
+            tuple[str, str | None, str | None, tuple[str, ...]],
+            list[int],
+        ] = {}
+        for index, request in enumerate(requests):
+            challenger = request.challenger
+            key = (
+                challenger.visibility,
+                challenger.owner_user_id,
+                challenger.repo_identifier,
+                tuple(sorted(request.excluded_memory_ids)),
+            )
+            groups.setdefault(key, []).append(index)
+
+        output: list[Memory | None] = [None] * len(requests)
+        for (visibility, owner_user_id, repo_identifier, exclusions), indices in groups.items():
+            candidates = await self.relational.find_active_exact_claim_candidates(
+                tuple(requests[index].challenger.content_hash for index in indices),
+                visibility=visibility,
+                owner_user_id=owner_user_id,
+                repo_identifier=repo_identifier,
+                excluded_memory_ids=exclusions,
+            )
+            by_hash = {candidate.content_hash: candidate for candidate in candidates}
+            for index in indices:
+                output[index] = by_hash.get(requests[index].challenger.content_hash)
+        return tuple(output)
+
     async def find_access_compatible_equivalence_candidates(
         self,
         memory: Memory,
@@ -639,6 +679,157 @@ class MemoryStore:
         must still prove exact or semantic equivalence before reusing an identity.
         """
 
+        embedding = await self._embed(_memory_embedding_text(memory))
+        return await self._find_access_compatible_equivalence_candidates_with_embedding(
+            memory,
+            embedding=embedding,
+            excluded_memory_ids=excluded_memory_ids,
+            scope=scope,
+            doc_id=doc_id,
+            entity_ids=entity_ids,
+        )
+
+    async def find_access_compatible_equivalence_candidates_batch(
+        self,
+        queries: Sequence[IdentityCandidateQuery],
+    ) -> tuple[tuple[Memory, ...], ...]:
+        """Recall identity candidates with bounded embedding and vector transports."""
+
+        if not queries:
+            return ()
+        embeddings = await self._embed_many([_memory_embedding_text(query.memory) for query in queries])
+        scopes = tuple(_writer_access_scope(query.memory) for query in queries)
+        vector_hit_batches = await self.vector.query_many(
+            embeddings,
+            scopes,
+            (None,) * len(queries),
+            DEDUP_CANDIDATE_LIMIT,
+        )
+        if len(vector_hit_batches) != len(queries):
+            raise RuntimeError("vector query batch did not cover every identity query")
+
+        reactivation_candidates: list[Memory | None] = [None] * len(queries)
+        reactivation_groups: dict[
+            tuple[str, str | None, str | None],
+            list[int],
+        ] = {}
+        for index, query in enumerate(queries):
+            memory = query.memory
+            reactivation_groups.setdefault(
+                (
+                    memory.visibility,
+                    memory.owner_user_id,
+                    memory.repo_identifier,
+                ),
+                [],
+            ).append(index)
+        for (
+            visibility,
+            owner_user_id,
+            repo_identifier,
+        ), indices in reactivation_groups.items():
+            candidates = await self.relational.find_rebaseline_reactivation_candidates(
+                tuple(queries[index].memory.content_hash for index in indices),
+                visibility=visibility,
+                owner_user_id=owner_user_id,
+                repo_identifier=repo_identifier,
+            )
+            by_hash = {candidate.content_hash: candidate for candidate in candidates}
+            for index in indices:
+                reactivation_candidates[index] = by_hash.get(queries[index].memory.content_hash)
+        vector_candidate_ids = tuple(
+            dict.fromkeys(
+                memory_id
+                for query, hits in zip(queries, vector_hit_batches, strict=True)
+                for memory_id, score in hits
+                if memory_id not in query.excluded_memory_ids
+                and self.vector.within_dedup_threshold(self.dedup_threshold, score)
+            )
+        )
+        ordinary_by_id = {
+            candidate.id: candidate
+            for candidate in await self.relational.list_active_ordinary_claim_memories(vector_candidate_ids)
+        }
+        entity_candidate_batches: list[Sequence[Memory]] = []
+        for query in queries:
+            if query.doc_id and query.entity_ids:
+                entity_candidate_batches.append(
+                    await self.relational.find_active_ordinary_claim_memories_by_entities(
+                        query.entity_ids,
+                        visibility=query.memory.visibility,
+                        owner_user_id=query.memory.owner_user_id,
+                        repo_identifier=query.memory.repo_identifier,
+                        project_key=query.memory.project_key,
+                        excluded_memory_ids=tuple(sorted(query.excluded_memory_ids)),
+                        excluded_doc_id=query.doc_id,
+                        limit=DEDUP_CANDIDATE_LIMIT,
+                    )
+                )
+            else:
+                entity_candidate_batches.append(())
+
+        output: list[tuple[Memory, ...]] = []
+        for query, reactivation, vector_hits, entity_candidates in zip(
+            queries,
+            reactivation_candidates,
+            vector_hit_batches,
+            entity_candidate_batches,
+            strict=True,
+        ):
+            memory = query.memory
+            compatible: list[Memory] = []
+            compatible_ids: set[str] = set()
+            candidate_access = lifecycle_access_context_hash(
+                visibility=memory.visibility,
+                owner_user_id=memory.owner_user_id,
+                project_key=memory.project_key,
+                repo_identifier=memory.repo_identifier,
+            )
+
+            def add_candidate(candidate: Memory | None) -> None:
+                if (
+                    candidate is None
+                    or candidate.id in query.excluded_memory_ids
+                    or candidate.id in compatible_ids
+                    or len(compatible) >= DEDUP_CANDIDATE_LIMIT
+                    or lifecycle_access_context_hash(
+                        visibility=candidate.visibility,
+                        owner_user_id=candidate.owner_user_id,
+                        project_key=candidate.project_key,
+                        repo_identifier=candidate.repo_identifier,
+                    )
+                    != candidate_access
+                ):
+                    return
+                compatible.append(candidate)
+                compatible_ids.add(candidate.id)
+
+            add_candidate(reactivation)
+            vector_candidates = (
+                ordinary_by_id.get(memory_id)
+                for memory_id, score in vector_hits
+                if memory_id not in query.excluded_memory_ids
+                and self.vector.within_dedup_threshold(self.dedup_threshold, score)
+            )
+            for vector_candidate, entity_candidate in zip_longest(
+                vector_candidates,
+                entity_candidates,
+            ):
+                add_candidate(vector_candidate)
+                add_candidate(entity_candidate)
+            output.append(tuple(compatible))
+        return tuple(output)
+
+    async def _find_access_compatible_equivalence_candidates_with_embedding(
+        self,
+        memory: Memory,
+        *,
+        embedding: list[float],
+        excluded_memory_ids: set[str] | frozenset[str] = frozenset(),
+        scope: AccessScope | None = None,
+        doc_id: str | None = None,
+        entity_ids: Sequence[int] = (),
+    ) -> tuple[Memory, ...]:
         compatible: list[Memory] = []
         compatible_ids: set[str] = set()
         candidate_access = lifecycle_access_context_hash(
@@ -674,7 +865,6 @@ class MemoryStore:
         )
         add_candidate(reactivation_candidate)
 
-        embedding = await self._embed(_memory_embedding_text(memory))
         vector_hits = await self.vector.query(
             embedding,
             scope or _writer_access_scope(memory),
@@ -2564,3 +2754,41 @@ class MemoryStore:
         embedding = vectors[0]
         self._embedding_cache.put(text, embedding)
         return embedding
+
+    async def _embed_many(self, texts: Sequence[str]) -> list[list[float]]:
+        """Embed cache misses together and restore caller order."""
+
+        embeddings: list[list[float] | None] = [None] * len(texts)
+        missing_indices: dict[str, list[int]] = {}
+        for index, text in enumerate(texts):
+            cached = self._embedding_cache.get(text)
+            if cached is not None:
+                embeddings[index] = cached
+            else:
+                missing_indices.setdefault(text, []).append(index)
+
+        missing_texts = list(missing_indices)
+        if missing_texts:
+            missing_embeddings = await asyncio.to_thread(
+                embed_texts,
+                missing_texts,
+                self.embed_cfg["base_url"],
+                self.embed_cfg["api_key"],
+                self.embed_cfg["model"],
+            )
+            for text, embedding in zip(
+                missing_texts,
+                missing_embeddings,
+                strict=True,
+            ):
+                self._embedding_cache.put(text, embedding)
+                for index in missing_indices[text]:
+                    embeddings[index] = embedding
+
+        if any(embedding is None for embedding in embeddings):
+            raise RuntimeError("embedding batch did not cover every input")
+        return [
+            embedding
+            for embedding in embeddings
+            if embedding is not None
+        ]

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
+from memforge.llm.structured import StructuredLlmError
 from memforge.memory.candidate_ledger import (
     CandidateLedgerError,
     CandidateLedgerResult,
@@ -272,7 +273,9 @@ class MemoryEngine:
         for an incumbent therefore may not contain a new candidate. If its
         supporting Observation was revised, prove the old exact excerpt still
         exists in that same stable Observation and stage a current-revision
-        reference. Missing or ambiguous evidence fails closed.
+        reference. Missing or ambiguous evidence fails closed through the
+        existing lifecycle Review gate rather than failing the whole Source
+        Unit.
         """
 
         current_revisions = {revision.observation_id: revision for revision in projection.observation_revisions}
@@ -347,24 +350,39 @@ class MemoryEngine:
                     raise RuntimeError(
                         f"NOOP incumbent current PRIMARY observation is unavailable: {operation.memory_id}"
                     )
-                validation = await validator(
-                    MEMORY_SUPPORT_VALIDATION_PROMPT.format(
-                        case_json=json.dumps(
-                            {
-                                "memory_claim": incumbent.content,
-                                "previous_primary_quote": selected.excerpt,
-                                "primary": current_primary.content,
-                                "required": [
-                                    current_revisions[item.anchor.observation_id].content for item in stale_required
-                                ],
-                            },
-                            ensure_ascii=False,
-                            sort_keys=True,
+                try:
+                    validation = await validator(
+                        MEMORY_SUPPORT_VALIDATION_PROMPT.format(
+                            case_json=json.dumps(
+                                {
+                                    "memory_claim": incumbent.content,
+                                    "previous_primary_quote": selected.excerpt,
+                                    "primary": current_primary.content,
+                                    "required": [
+                                        current_revisions[item.anchor.observation_id].content
+                                        for item in stale_required
+                                    ],
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                        ),
+                        max_tokens=512,
+                        model=self.llm_model,
+                    )
+                except StructuredLlmError:
+                    rebound.append(
+                        ReconcileOperation(
+                            action=ReconcileAction.DELETE,
+                            memory_id=operation.memory_id,
+                            reason=(
+                                "revised evidence support could not be "
+                                "structurally validated"
+                            ),
+                            flag_for_review=True,
                         )
-                    ),
-                    max_tokens=512,
-                    model=self.llm_model,
-                )
+                    )
+                    continue
                 support_validation = {
                     "method": "structured_classifier",
                     "model": self.llm_model,
@@ -386,11 +404,18 @@ class MemoryEngine:
                 if primary_needs_validation:
                     current_primary_quote = str(getattr(validation, "evidence_quote", "") or "").strip()
                     if not current_primary_quote or current_primary_quote not in current_primary.content:
-                        raise RuntimeError(
-                            "NOOP incumbent support validation lacks exact current "
-                            "PRIMARY evidence: "
-                            f"{operation.memory_id}"
+                        rebound.append(
+                            ReconcileOperation(
+                                action=ReconcileAction.DELETE,
+                                memory_id=operation.memory_id,
+                                reason=(
+                                    "revised PRIMARY evidence could not be "
+                                    "exactly re-anchored"
+                                ),
+                                flag_for_review=True,
+                            )
                         )
+                        continue
             rebound.append(
                 ReconcileOperation(
                     action=operation.action,
@@ -488,18 +513,21 @@ class MemoryEngine:
             {
                 "candidate_ledger_input_count": candidate_ledger.input_count,
                 "candidate_ledger_selected_count": len(candidate_ledger.candidates),
-                "candidate_ledger_dropped_exact_count": (
-                    candidate_ledger.dropped_exact_count
-                ),
-                "candidate_ledger_dropped_redundant_count": (
-                    candidate_ledger.dropped_redundant_count
-                ),
+                "candidate_ledger_dropped_exact_count": (candidate_ledger.dropped_exact_count),
+                "candidate_ledger_dropped_redundant_count": (candidate_ledger.dropped_redundant_count),
+                "candidate_ledger_dropped_low_value_count": (candidate_ledger.dropped_low_value_count),
                 "candidate_ledger_llm_calls": candidate_ledger.structured_llm_calls,
                 "candidate_ledger_llm_elapsed_ms": (
                     candidate_ledger.structured_llm_elapsed_ms
                 ),
                 "candidate_ledger_validation_retries": (
                     candidate_ledger.validation_retries
+                ),
+                "candidate_ledger_fallback_batch_count": (
+                    candidate_ledger.fallback_batch_count
+                ),
+                "candidate_ledger_fallback_candidate_count": (
+                    candidate_ledger.fallback_candidate_count
                 ),
                 "candidate_ledger_prompt_chars": candidate_ledger.prompt_chars,
             }
@@ -778,7 +806,7 @@ class MemoryEngine:
                 memory_id
                 for resolution in identity_resolutions
                 for memory_id in (
-                    *(decision.pair.candidate.id for decision in resolution.classified_pairs),
+                    *(decision.candidate_memory_id for decision in resolution.classified_pairs),
                     *((resolution.target.id,) if resolution.target is not None else ()),
                 )
             )
@@ -796,18 +824,18 @@ class MemoryEngine:
             equivalence_proof = resolution.equivalence_proof
             preclassified_relations[claim_hash] = tuple(
                 PreclassifiedRelationDecision(
-                    candidate_memory_id=decision.pair.candidate.id,
-                    expected_candidate_content_hash=decision.pair.candidate.content_hash,
+                    candidate_memory_id=decision.candidate_memory_id,
+                    expected_candidate_content_hash=decision.candidate_content_hash,
                     expected_candidate_support_set_hash=(
                         classified_candidate_support[
-                            decision.pair.candidate.id
+                            decision.candidate_memory_id
                         ].current_support_set_hash
                     ),
                     expected_candidate_access_context_hash=lifecycle_access_context_hash(
-                        visibility=decision.pair.candidate.visibility,
-                        owner_user_id=decision.pair.candidate.owner_user_id,
-                        project_key=decision.pair.candidate.project_key,
-                        repo_identifier=decision.pair.candidate.repo_identifier,
+                        visibility=decision.candidate_visibility,
+                        owner_user_id=decision.candidate_owner_user_id,
+                        project_key=decision.candidate_project_key,
+                        repo_identifier=decision.candidate_repo_identifier,
                     ),
                     expected_challenger_access_context_hash=access_context_hash,
                     relation_type=decision.relation_type,
@@ -942,7 +970,7 @@ class MemoryEngine:
         doc_id: str,
         candidates: list[RawMemory],
     ) -> CandidateLedgerResult:
-        """Select one complete within-revision candidate ledger before writes."""
+        """Select bounded within-revision candidate admission before writes."""
 
         try:
             result = await select_unique_memory_candidates(
@@ -976,7 +1004,11 @@ class MemoryEngine:
                 projection=projection,
                 doc_id=doc_id,
                 status="committed",
-                reason="complete_candidate_ledger",
+                reason=(
+                    "candidate_admission_with_fallback"
+                    if result.fallback_batch_count
+                    else "complete_candidate_ledger"
+                ),
                 payload=_candidate_ledger_audit_payload(result),
             )
         return result
@@ -1219,16 +1251,23 @@ def _candidate_ledger_audit_payload(result: CandidateLedgerResult) -> dict[str, 
         "selected_count": len(result.candidates),
         "dropped_exact_count": result.dropped_exact_count,
         "dropped_redundant_count": result.dropped_redundant_count,
+        "dropped_low_value_count": result.dropped_low_value_count,
         "structured_llm_calls": result.structured_llm_calls,
         "structured_llm_elapsed_ms": result.structured_llm_elapsed_ms,
         "validation_retries": result.validation_retries,
+        "fallback_batch_count": result.fallback_batch_count,
+        "fallback_candidate_count": result.fallback_candidate_count,
         "prompt_chars": result.prompt_chars,
         "drops": [
             {
                 "candidate_content_hash": content_hash(drop.candidate.content),
                 "candidate_source_observation_id": drop.candidate.source_observation_id,
-                "canonical_content_hash": content_hash(drop.canonical_candidate.content),
-                "canonical_source_observation_id": (drop.canonical_candidate.source_observation_id),
+                "canonical_content_hash": (
+                    content_hash(drop.canonical_candidate.content) if drop.canonical_candidate is not None else None
+                ),
+                "canonical_source_observation_id": (
+                    drop.canonical_candidate.source_observation_id if drop.canonical_candidate is not None else None
+                ),
                 "method": drop.method,
                 "reason": drop.reason[:240],
             }

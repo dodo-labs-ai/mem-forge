@@ -61,6 +61,49 @@ class CompletionResponse:
         self.choices = [Choice(content)]
 
 
+@pytest.mark.asyncio
+async def test_structured_llm_admission_is_shared_across_client_instances(
+    monkeypatch,
+):
+    set_native_schema_support(monkeypatch, False)
+    active = 0
+    max_active = 0
+    two_admitted = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_acompletion(**_kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        if active == 2:
+            two_admitted.set()
+        try:
+            await release.wait()
+            return CompletionResponse('{"decisions":[]}')
+        finally:
+            active -= 1
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    config = StructuredLlmConfig(
+        model="anthropic--claude-sonnet-latest",
+        base_url=None,
+        api_key=None,
+        timeout_s=1.0,
+        max_concurrent=2,
+    )
+    clients = (LiteLlmStructuredClient(config), LiteLlmStructuredClient(config))
+    tasks = [asyncio.create_task(clients[index % 2].verify_source_support(f"prompt-{index}")) for index in range(6)]
+
+    await asyncio.wait_for(two_admitted.wait(), timeout=0.5)
+    await asyncio.sleep(0)
+    observed_max_active = max_active
+    release.set()
+    await asyncio.gather(*tasks)
+
+    assert observed_max_active == 2
+    assert max_active == 2
+
+
 def test_structured_llm_metrics_collector_summarizes_known_and_unknown_usage():
     collector = StructuredLlmMetricsCollector()
     collector.record(

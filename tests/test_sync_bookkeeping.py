@@ -4417,6 +4417,7 @@ async def test_failed_projection_batch_stages_target_and_preserves_completed_sib
             recovery_order.append("provider_authenticate")
 
     retry_extractor = OrderedRetryExtractor()
+    admission = DocumentLifecycleAdmission(max_active=1)
     retry = GeneSyncOrchestrator(
         db=db,
         doc_store=orchestrator.doc_store,
@@ -4424,15 +4425,41 @@ async def test_failed_projection_batch_stages_target_and_preserves_completed_sib
         memory_engine=memory_engine,
         memory_store=None,
         max_concurrent=2,
+        document_lifecycle_admission=admission,
         retry_sleep=_skip_retry_delay,
     )
-    retry_state = await retry.sync_gene(
-        gene=OrderedRetryGene(body),
-        source_name="Recoverable Confluence",
-        source_id=source_id,
-    )
+    progress: list[dict] = []
+    async with admission.slot("src-other", "doc-other"):
+        retry_task = asyncio.create_task(
+            retry.sync_gene(
+                gene=OrderedRetryGene(body),
+                source_name="Recoverable Confluence",
+                source_id=source_id,
+                progress_callback=progress.append,
+            )
+        )
+        for _ in range(100):
+            if progress or recovery_order or retry_task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert recovery_order == []
+        assert progress == [
+            {
+                "phase": "recovering_derivations",
+                "current": 0,
+                "total": 1,
+                "title": None,
+            }
+        ]
+    retry_state = await retry_task
 
     assert retry_state.last_sync_status == "success"
+    assert {
+        "phase": "recovering_derivations",
+        "current": 1,
+        "total": 1,
+        "title": None,
+    } in progress
     assert {batch.id for batch in retry_extractor.projection_calls} == set(
         extractor.failed_batch_ids
     )
@@ -7016,6 +7043,111 @@ async def test_source_sync_worker_delays_retryable_failure(db: Database):
 
 
 @pytest.mark.asyncio
+async def test_source_sync_worker_terminalizes_expired_run_after_execution_budget_is_exhausted(
+    db: Database,
+):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-expired-attempt-budget"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Expired Attempt Budget",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    first = await db.lease_next_source_sync_run(
+        worker_id="crashed-worker",
+        lease_seconds=1,
+        now=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    assert first is not None
+    assert first.lease_attempt_count == 1
+
+    class MustNotRunProvider:
+        async def build_sync_runtime(self, *args, **kwargs):
+            raise AssertionError("exhausted recovery must not construct a sync runtime")
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(sync=SyncConfig(worker_max_attempts=1)),
+        runtime_provider=MustNotRunProvider(),
+        worker_id="recovery-worker",
+    )
+
+    recovered = await worker.run_once()
+    failed = await db.get_source_sync_run(enqueued.run_id)
+
+    assert recovered is not None
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.lease_attempt_count == 2
+    assert failed.recovery_count == 1
+    assert failed.next_attempt_at is None
+    assert failed.error_message == "source sync execution attempt budget exhausted"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_persists_initial_progress_before_provider_work(
+    db: Database,
+):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-initial-progress"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Initial Progress",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    provider_entered = asyncio.Event()
+    provider_release = asyncio.Event()
+
+    class PausingRuntimeProvider:
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            provider_entered.set()
+            await provider_release.wait()
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=PausingRuntimeProvider(),
+        worker_id="worker-initial-progress",
+    )
+
+    worker_task = asyncio.create_task(worker.run_once())
+    try:
+        await provider_entered.wait()
+        running = await db.get_source_sync_run(enqueued.run_id)
+    finally:
+        provider_release.set()
+        await worker_task
+
+    assert running is not None
+    assert running.status == "running"
+    assert running.progress == {
+        "schema_version": 1,
+        "phase": "discovering",
+        "progress": {"completed": 0, "unit": "issue"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_source_sync_worker_retries_failed_final_state(db: Database):
     import memforge.runtime as runtime
 
@@ -7323,6 +7455,35 @@ def test_reconciliation_without_measurable_work_is_indeterminate():
         {"phase": "detecting_deletions", "current": 0, "total": 0},
         source_type="confluence",
     ) == {"schema_version": 1, "phase": "reconciling"}
+
+
+def test_derivation_recovery_progress_is_distinct_from_removed_item_reconciliation():
+    from memforge.sync_progress import source_sync_progress_from_pipeline
+
+    assert source_sync_progress_from_pipeline(
+        {
+            "phase": "recovering_derivations",
+            "current": 0,
+            "total": 1,
+        },
+        source_type="github_repo",
+    ) == {
+        "schema_version": 1,
+        "phase": "recovering_derivations",
+        "progress": {"completed": 0, "total": 1, "unit": "file"},
+    }
+    assert source_sync_progress_from_pipeline(
+        {
+            "phase": "detecting_deletions",
+            "current": 0,
+            "total": 1,
+        },
+        source_type="github_repo",
+    ) == {
+        "schema_version": 1,
+        "phase": "reconciling",
+        "progress": {"completed": 0, "total": 1, "unit": "file"},
+    }
 
 
 def test_recovered_source_sync_progress_preserves_run_level_work():
@@ -9094,6 +9255,9 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
             del args, kwargs
             return ()
 
+        async def find_access_compatible_equivalence_candidates_batch(self, queries):
+            return tuple(() for _query in queries)
+
         async def find_access_compatible_exact_candidate(
             self,
             memory,
@@ -9106,6 +9270,17 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
                 owner_user_id=memory.owner_user_id,
                 repo_identifier=memory.repo_identifier,
                 excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
+            )
+
+        async def find_access_compatible_exact_candidates_batch(self, requests):
+            return tuple(
+                [
+                    await self.find_access_compatible_exact_candidate(
+                        request.challenger,
+                        excluded_memory_ids=request.excluded_memory_ids,
+                    )
+                    for request in requests
+                ]
             )
 
         async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id: str):
@@ -10243,6 +10418,88 @@ async def test_lifecycle_failure_never_attempts_document_snapshot_restore(
     assert state.failed_docs[0].error == "lifecycle apply failed"
     assert await db.get_document("doc-1") is not None
     assert await db.find_source_unit_by_document_id(source_id, "doc-1", current_only=True) is None
+
+
+@pytest.mark.asyncio
+async def test_derivation_recovery_uses_latest_context_for_one_projection_scope(
+    db: Database,
+) -> None:
+    source_id = "src-latest-derivation-context"
+    previous_markdown = "# Design Doc\n\nThe service uses PostgreSQL 14."
+    doc_store = StubDocumentStore()
+    previous_uri = doc_store.store_normalized(
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=previous_markdown,
+    )
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=previous_markdown,
+        version="1",
+        normalized_content_uri=previous_uri,
+    )
+    updated_markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
+    failed = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        memory_extractor=ProjectionBatchCandidateExtractor(),
+        memory_engine=FailingProjectedMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=UpdatingDocumentGene(updated_markdown),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert failed.last_sync_status == "failed"
+    attempts = await db.list_source_derivation_attempts(
+        source_id=source_id,
+    )
+    assert [attempt.context.update_mode for attempt in attempts] == [
+        "diff_guided",
+        "full_document",
+    ]
+    assert len({attempt.projection_identity_hash for attempt in attempts}) == 1
+
+    engine = RecordingMemoryEngine()
+    progress: list[dict] = []
+    recovered = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        memory_extractor=ProjectionBatchCandidateExtractor(),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=UpdatingDocumentGene(updated_markdown),
+        source_name="Documents",
+        source_id=source_id,
+        progress_callback=progress.append,
+    )
+
+    assert recovered.last_sync_status == "success"
+    assert len(engine.projected_lifecycle_calls) == 1
+    assert engine.projected_lifecycle_calls[0]["update_mode"] == "full_document"
+    assert {
+        "phase": "recovering_derivations",
+        "current": 0,
+        "total": 1,
+        "title": None,
+    } in progress
+    active_attempts = await db.list_source_derivation_attempts(
+        source_id=source_id,
+    )
+    assert [attempt.status for attempt in active_attempts] == [
+        "superseded",
+        "applied",
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
 
 from memforge.memory.identity_resolver import (
+    IdentityResolutionPolicy,
     IdentityResolutionRequest,
     IdentityResolver,
 )
@@ -40,6 +42,64 @@ def test_equivalent_identity_prompt_preserves_normative_modality() -> None:
     assert "normative requirement" in prompt
     assert "descriptive state" in prompt
     assert "different truth conditions" in prompt
+
+
+@pytest.mark.asyncio
+async def test_structured_classifier_runs_independent_batches_with_bounded_concurrency() -> None:
+    class ConcurrentClient:
+        max_concurrent = 2
+
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.two_admitted = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def classify_memory_relations(self, prompt: str, **_kwargs):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.active == 2:
+                self.two_admitted.set()
+            try:
+                await self.release.wait()
+                payload = json.loads(
+                    prompt.split("<memory_pair_groups>\n", 1)[1].split(
+                        "\n</memory_pair_groups>",
+                        1,
+                    )[0]
+                )
+                return SimpleNamespace(
+                    decisions=[
+                        SimpleNamespace(
+                            pair_index=item["pair_index"],
+                            classification="unrelated",
+                            direction="symmetric",
+                            reason="fixture",
+                        )
+                        for group in payload
+                        for item in group["candidates"]
+                    ]
+                )
+            finally:
+                self.active -= 1
+
+    challenger = _memory("challenger", "Current claim")
+    pairs = tuple(MemoryPair(challenger, _memory(f"candidate-{index}", f"Candidate {index}")) for index in range(3))
+    client = ConcurrentClient()
+    classifier = StructuredMemoryPairClassifier(
+        client=client,
+        model="test-model",
+        policy=MemoryPairClassificationPolicy(max_pairs_per_call=1),
+    )
+    classification = asyncio.create_task(classifier.classify(pairs))
+
+    await asyncio.wait_for(client.two_admitted.wait(), timeout=0.5)
+    client.release.set()
+    result = await classification
+
+    assert tuple(decision.pair for decision in result.decisions) == pairs
+    assert result.llm_calls == 3
+    assert client.max_active == 2
 
 
 @pytest.mark.asyncio
@@ -86,12 +146,22 @@ async def test_structured_classifier_reports_usage_when_a_later_batch_fails() ->
 class _CandidateStore:
     exact_by_challenger: dict[str, Memory]
     semantic_by_challenger: dict[str, tuple[Memory, ...]]
+    exact_batch_sizes: list[int] = field(default_factory=list)
+    candidate_batch_sizes: list[int] = field(default_factory=list)
 
     async def find_access_compatible_exact_candidate(self, challenger, **_kwargs):
         return self.exact_by_challenger.get(challenger.id)
 
+    async def find_access_compatible_exact_candidates_batch(self, requests):
+        self.exact_batch_sizes.append(len(requests))
+        return tuple(self.exact_by_challenger.get(request.challenger.id) for request in requests)
+
     async def find_access_compatible_equivalence_candidates(self, challenger, **_kwargs):
         return self.semantic_by_challenger.get(challenger.id, ())
+
+    async def find_access_compatible_equivalence_candidates_batch(self, queries):
+        self.candidate_batch_sizes.append(len(queries))
+        return tuple(self.semantic_by_challenger.get(query.memory.id, ()) for query in queries)
 
 
 class _PairClassifier:
@@ -136,6 +206,58 @@ class _PairClassifier:
             llm_calls=1,
             prompt_chars=0,
         )
+
+
+@pytest.mark.asyncio
+async def test_identity_resolver_bounds_candidate_recall_and_classification_workset() -> None:
+    challengers = tuple(
+        _memory(f"mem-new-{index}", f"Current claim {index}")
+        for index in range(5)
+    )
+    candidates = tuple(
+        _memory(f"mem-existing-{index}", f"Existing related claim {index}")
+        for index in range(5)
+    )
+    store = _CandidateStore(
+        exact_by_challenger={},
+        semantic_by_challenger={
+            challenger.id: (candidate,)
+            for challenger, candidate in zip(challengers, candidates, strict=True)
+        },
+    )
+    classifier = _PairClassifier(
+        {
+            (challenger.id, candidate.id): MemoryRelationType.UNRELATED
+            for challenger, candidate in zip(challengers, candidates, strict=True)
+        }
+    )
+    resolver = IdentityResolver(
+        memory_store=store,
+        pair_classifier=classifier,
+        llm_model="test-model",
+        policy=IdentityResolutionPolicy(max_requests_per_batch=2),
+    )
+
+    batch = await resolver.resolve(
+        tuple(IdentityResolutionRequest(challenger, f"doc-{index}") for index, challenger in enumerate(challengers))
+    )
+
+    assert store.exact_batch_sizes == [2, 2, 1]
+    assert store.candidate_batch_sizes == [2, 2, 1]
+    assert [len(call) for call in classifier.calls] == [2, 2, 1]
+    assert [resolution.challenger for resolution in batch.resolutions] == list(challengers)
+    assert all(resolution.target is None for resolution in batch.resolutions)
+    for resolution, candidate in zip(batch.resolutions, candidates, strict=True):
+        [decision] = resolution.classified_pairs
+        assert decision.candidate_memory_id == candidate.id
+        assert decision.candidate_content_hash == candidate.content_hash
+        assert decision.candidate_visibility == candidate.visibility
+        assert decision.candidate_owner_user_id == candidate.owner_user_id
+        assert decision.candidate_project_key == candidate.project_key
+        assert decision.candidate_repo_identifier == candidate.repo_identifier
+        assert not hasattr(decision, "pair")
+    assert batch.metrics.pair_count == 5
+    assert batch.metrics.llm_calls == 3
 
 
 @pytest.mark.asyncio
