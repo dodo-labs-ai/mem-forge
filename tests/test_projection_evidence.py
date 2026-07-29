@@ -85,6 +85,105 @@ def _jira_projection():
     )
 
 
+def _github_projection(body: str):
+    item = ContentItem(
+        item_id="github-repo-docs-large",
+        title="large.md",
+        source_url="https://github.example/acme/repo/blob/main/docs/large.md",
+        last_modified=datetime(2026, 7, 29, tzinfo=timezone.utc),
+        version="blob-1",
+        extra={
+            "repo_owner": "acme",
+            "repo_name": "repo",
+            "relative_path": "docs/large.md",
+            "repo_ref": "main",
+        },
+    )
+    return project_source_item(
+        source_id="src-github",
+        source_type="github_repo",
+        run_id="projection-github-large",
+        item=item,
+        raw=RawContent(
+            item=item,
+            body=body.encode(),
+            content_type="text/markdown",
+        ),
+        normalized=NormalizedContent(item=item, markdown_body=body),
+    )
+
+
+def test_large_observation_is_not_copied_into_each_claim_evidence_unit() -> None:
+    first_quote = "The retry budget is three attempts."
+    second_quote = "Conflicting memories require review."
+    body = f"# Large document\n\n{first_quote}\n\n{'context ' * 20_000}\n\n{second_quote}"
+    projection = _github_projection(body)
+    observation_id = projection.observations[0].id
+    raw_memories = (
+        RawMemory(
+            content="Retries are limited to three attempts.",
+            memory_type="fact",
+            evidence_quote=first_quote,
+            source_observation_id=observation_id,
+        ),
+        RawMemory(
+            content="Conflicting memories are sent to review.",
+            memory_type="decision",
+            evidence_quote=second_quote,
+            source_observation_id=observation_id,
+        ),
+    )
+
+    staged = build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=raw_memories,
+        doc_id="github-repo-docs-large",
+        source_type="github_repo",
+        project_key=None,
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier="acme/repo",
+        access_context_hash="workspace-repo",
+        extractor_run_id="sync-large",
+    )
+
+    assert len(staged.units) == 2
+    assert {unit.content for unit in staged.units} == {first_quote, second_quote}
+    assert all(unit.evidence_provenance.value == "source_excerpt" for unit in staged.units)
+    assert sum(len(unit.content) for unit in staged.units) < len(body)
+    assert {
+        reference.anchor.observation_revision_id
+        for reference in staged.references
+        if reference.role.value == "primary"
+    } == {projection.observation_revisions[0].id}
+
+
+def test_unlocalized_claim_does_not_claim_or_copy_a_source_excerpt() -> None:
+    body = "# Single observation\n\nOnly the revision reference is authoritative."
+    projection = _github_projection(body)
+    raw = RawMemory(
+        content="A claim without localized source text.",
+        memory_type="fact",
+    )
+
+    staged = build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=(raw,),
+        doc_id="github-repo-docs-large",
+        source_type="github_repo",
+        project_key=None,
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier="acme/repo",
+        access_context_hash="workspace-repo",
+        extractor_run_id="sync-no-excerpt",
+    )
+
+    assert staged.units[0].content == ""
+    assert staged.units[0].excerpt is None
+    assert staged.units[0].evidence_provenance.value == "no_excerpt"
+
+
 @pytest.mark.asyncio
 async def test_short_jira_comment_is_primary_with_adjacent_context_only(db: Database) -> None:
     projection = _jira_projection()
