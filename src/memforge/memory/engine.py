@@ -781,7 +781,7 @@ class MemoryEngine:
                 memory_id
                 for resolution in identity_resolutions
                 for memory_id in (
-                    *(decision.pair.candidate.id for decision in resolution.classified_pairs),
+                    *(decision.candidate_memory_id for decision in resolution.classified_pairs),
                     *((resolution.target.id,) if resolution.target is not None else ()),
                 )
             )
@@ -799,18 +799,18 @@ class MemoryEngine:
             equivalence_proof = resolution.equivalence_proof
             preclassified_relations[claim_hash] = tuple(
                 PreclassifiedRelationDecision(
-                    candidate_memory_id=decision.pair.candidate.id,
-                    expected_candidate_content_hash=decision.pair.candidate.content_hash,
+                    candidate_memory_id=decision.candidate_memory_id,
+                    expected_candidate_content_hash=decision.candidate_content_hash,
                     expected_candidate_support_set_hash=(
                         classified_candidate_support[
-                            decision.pair.candidate.id
+                            decision.candidate_memory_id
                         ].current_support_set_hash
                     ),
                     expected_candidate_access_context_hash=lifecycle_access_context_hash(
-                        visibility=decision.pair.candidate.visibility,
-                        owner_user_id=decision.pair.candidate.owner_user_id,
-                        project_key=decision.pair.candidate.project_key,
-                        repo_identifier=decision.pair.candidate.repo_identifier,
+                        visibility=decision.candidate_visibility,
+                        owner_user_id=decision.candidate_owner_user_id,
+                        project_key=decision.candidate_project_key,
+                        repo_identifier=decision.candidate_repo_identifier,
                     ),
                     expected_challenger_access_context_hash=access_context_hash,
                     relation_type=decision.relation_type,

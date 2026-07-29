@@ -188,6 +188,15 @@ async def test_identity_resolver_bounds_candidate_recall_and_classification_work
     assert [len(call) for call in classifier.calls] == [2, 2, 1]
     assert [resolution.challenger for resolution in batch.resolutions] == list(challengers)
     assert all(resolution.target is None for resolution in batch.resolutions)
+    for resolution, candidate in zip(batch.resolutions, candidates, strict=True):
+        [decision] = resolution.classified_pairs
+        assert decision.candidate_memory_id == candidate.id
+        assert decision.candidate_content_hash == candidate.content_hash
+        assert decision.candidate_visibility == candidate.visibility
+        assert decision.candidate_owner_user_id == candidate.owner_user_id
+        assert decision.candidate_project_key == candidate.project_key
+        assert decision.candidate_repo_identifier == candidate.repo_identifier
+        assert not hasattr(decision, "pair")
     assert batch.metrics.pair_count == 5
     assert batch.metrics.llm_calls == 3
 
