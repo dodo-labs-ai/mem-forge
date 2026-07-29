@@ -102,6 +102,48 @@ assert.deepEqual(
   },
 );
 
+assert.deepEqual(
+  presentSourceSyncActivity(
+    {
+      kind: "sync",
+      state: "active",
+      progress: {
+        schema_version: 1,
+        phase: "recovering_derivations",
+        progress: { completed: 0, total: 1, unit: "file" },
+      },
+    },
+    "GitHub Repository",
+    "files",
+  ),
+  {
+    message: "Resuming memory creation",
+    detail: "0 of 1 files · Working",
+  },
+);
+
+assert.deepEqual(
+  presentSourceSyncActivity(
+    {
+      kind: "sync",
+      state: "active",
+      progress: {
+        schema_version: 1,
+        phase: "reconciling",
+        progress: { completed: 0, total: 1, unit: "file" },
+      },
+    },
+    "GitHub Repository",
+    "files",
+  ),
+  {
+    message: "Checking removed files",
+    detail: "0 of 1 files",
+    completed: 0,
+    total: 1,
+  },
+);
+
 const activeServerRun: SyncStatus = {
   status: "running",
   started_at: "2026-07-08T09:00:00+00:00",
