@@ -4445,7 +4445,7 @@ async def test_failed_projection_batch_stages_target_and_preserves_completed_sib
         assert recovery_order == []
         assert progress == [
             {
-                "phase": "reconciling",
+                "phase": "recovering_derivations",
                 "current": 0,
                 "total": 1,
                 "title": None,
@@ -4455,7 +4455,7 @@ async def test_failed_projection_batch_stages_target_and_preserves_completed_sib
 
     assert retry_state.last_sync_status == "success"
     assert {
-        "phase": "reconciling",
+        "phase": "recovering_derivations",
         "current": 1,
         "total": 1,
         "title": None,
@@ -7455,6 +7455,35 @@ def test_reconciliation_without_measurable_work_is_indeterminate():
         {"phase": "detecting_deletions", "current": 0, "total": 0},
         source_type="confluence",
     ) == {"schema_version": 1, "phase": "reconciling"}
+
+
+def test_derivation_recovery_progress_is_distinct_from_removed_item_reconciliation():
+    from memforge.sync_progress import source_sync_progress_from_pipeline
+
+    assert source_sync_progress_from_pipeline(
+        {
+            "phase": "recovering_derivations",
+            "current": 0,
+            "total": 1,
+        },
+        source_type="github_repo",
+    ) == {
+        "schema_version": 1,
+        "phase": "recovering_derivations",
+        "progress": {"completed": 0, "total": 1, "unit": "file"},
+    }
+    assert source_sync_progress_from_pipeline(
+        {
+            "phase": "detecting_deletions",
+            "current": 0,
+            "total": 1,
+        },
+        source_type="github_repo",
+    ) == {
+        "schema_version": 1,
+        "phase": "reconciling",
+        "progress": {"completed": 0, "total": 1, "unit": "file"},
+    }
 
 
 def test_recovered_source_sync_progress_preserves_run_level_work():

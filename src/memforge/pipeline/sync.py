@@ -1416,7 +1416,7 @@ class GeneSyncOrchestrator:
         if attempts and progress_callback:
             progress_callback(
                 {
-                    "phase": "reconciling",
+                    "phase": "recovering_derivations",
                     "current": 0,
                     "total": len(attempts),
                     "title": None,
@@ -1457,7 +1457,7 @@ class GeneSyncOrchestrator:
             if progress_callback:
                 progress_callback(
                     {
-                        "phase": "reconciling",
+                        "phase": "recovering_derivations",
                         "current": index + 1,
                         "total": len(attempts),
                         "title": None,

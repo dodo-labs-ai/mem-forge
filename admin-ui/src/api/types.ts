@@ -110,6 +110,7 @@ export type SyncProgressPhase =
   | "fetching"
   | "uploading"
   | "processing"
+  | "recovering_derivations"
   | "reconciling";
 
 export type SyncProgressUnit = "item" | "page" | "file" | "issue" | "message" | "conversation";

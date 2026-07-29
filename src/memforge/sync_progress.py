@@ -14,6 +14,7 @@ SYNC_PROGRESS_PHASES = frozenset(
         "fetching",
         "uploading",
         "processing",
+        "recovering_derivations",
         "reconciling",
     }
 )
@@ -45,7 +46,12 @@ def source_sync_progress_from_pipeline(
         phase = "reconciling"
     if phase == "complete":
         return None
-    if phase not in {"discovering", "processing", "reconciling"}:
+    if phase not in {
+        "discovering",
+        "processing",
+        "recovering_derivations",
+        "reconciling",
+    }:
         return None
     snapshot: dict[str, Any] = {"schema_version": 1, "phase": phase}
     completed = _non_negative_int(value.get("current", 0), "progress.completed")
