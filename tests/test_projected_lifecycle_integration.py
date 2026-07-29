@@ -1046,7 +1046,7 @@ async def test_projected_create_persists_validity_as_dates(db: Database) -> None
 
 
 @pytest.mark.asyncio
-async def test_incomplete_candidate_ledger_is_audited_and_writes_no_memory(
+async def test_incomplete_candidate_ledger_is_audited_as_fallback_and_keeps_memories(
     db: Database,
 ) -> None:
     projection = _projection(
@@ -1065,57 +1065,47 @@ async def test_incomplete_candidate_ledger_is_audited_and_writes_no_memory(
         structured_llm_client=client,
     )
 
-    with pytest.raises(RuntimeError, match="candidate ledger failed closed: invalid_ledger"):
-        await engine.apply_projected_lifecycle(
-            projection=projection,
-            doc_id="confluence-123",
-            raw_memories=[
-                RawMemory(
-                    content="The trigger remained OPEN.",
-                    memory_type="fact",
-                    evidence_quote="The trigger remained OPEN.",
-                    source_observation_id=observation_id,
-                ),
-                RawMemory(
-                    content="The trigger was not processed.",
-                    memory_type="fact",
-                    evidence_quote="The trigger was not processed.",
-                    source_observation_id=observation_id,
-                ),
-            ],
-            doc_type="ticket",
-            project_key="ENG",
-            repo_identifier=None,
-            document_content=projection.observation_revisions[0].content,
-            update_mode="full_document",
-            changed_hunks=None,
-            update_plan_stats=None,
-            source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
-        )
+    await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content="The trigger remained OPEN.",
+                memory_type="fact",
+                evidence_quote="The trigger remained OPEN.",
+                source_observation_id=observation_id,
+            ),
+            RawMemory(
+                content="The trigger was not processed.",
+                memory_type="fact",
+                evidence_quote="The trigger was not processed.",
+                source_observation_id=observation_id,
+            ),
+        ],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=projection.observation_revisions[0].content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
 
     async with db.db.execute("SELECT COUNT(*) AS total FROM memories") as cursor:
         row = await cursor.fetchone()
-    events = await db.list_memory_audit_events(event_type="candidate_ledger_failed")
+    events = await db.list_memory_audit_events(event_type="candidate_ledger_completed")
 
-    assert row["total"] == 0
+    assert row["total"] == 2
     assert client.calls == 2
     assert len(events) == 1
-    assert events[0].status == "failed"
-    assert events[0].reason == "invalid_ledger"
+    assert events[0].status == "committed"
+    assert events[0].reason == "candidate_admission_with_fallback"
     assert events[0].payload["input_count"] == 2
     assert events[0].payload["semantic_input_count"] == 2
-    assert events[0].payload["selected_count"] == 0
-    assert events[0].payload["fingerprints_truncated"] is False
-    assert events[0].payload["candidate_fingerprints"] == [
-        {
-            "content_hash": content_hash("The trigger remained OPEN."),
-            "source_observation_id": observation_id,
-        },
-        {
-            "content_hash": content_hash("The trigger was not processed."),
-            "source_observation_id": observation_id,
-        },
-    ]
+    assert events[0].payload["selected_count"] == 2
+    assert events[0].payload["fallback_batch_count"] == 1
+    assert events[0].payload["fallback_candidate_count"] == 2
 
 
 class _SemanticEquivalentClient:
