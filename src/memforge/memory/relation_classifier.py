@@ -8,8 +8,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
 
+from memforge.llm.structured import structured_llm_max_concurrent
 from memforge.memory.evidence import RelationDirection
 from memforge.models import Memory
+from memforge.pipeline.bounded_work import collect_bounded
 
 
 class MemoryPairClassificationError(RuntimeError):
@@ -201,14 +203,16 @@ class StructuredMemoryPairClassifier:
     ) -> MemoryPairClassification:
         if not pairs:
             return MemoryPairClassification(decisions=(), llm_calls=0, prompt_chars=0)
-        attempted_pairs = llm_calls = prompt_chars = 0
+        batches = self._batches(pairs)
+        attempted_pairs = sum(len(indexed_pairs) for indexed_pairs, _ in batches)
+        llm_calls = len(batches)
+        prompt_chars = sum(len(prompt) for _, prompt in batches)
         try:
-            decisions_by_index: dict[int, MemoryPairDecision] = {}
-            batches = self._batches(pairs)
-            for indexed_pairs, prompt in batches:
-                attempted_pairs += len(indexed_pairs)
-                llm_calls += 1
-                prompt_chars += len(prompt)
+
+            async def classify_batch(
+                batch: tuple[tuple[tuple[int, MemoryPair], ...], str],
+            ) -> tuple[tuple[int, MemoryPairDecision], ...]:
+                indexed_pairs, prompt = batch
                 response = await self._client.classify_memory_relations(
                     prompt,
                     max_tokens=self._policy.max_output_tokens,
@@ -218,14 +222,30 @@ class StructuredMemoryPairClassifier:
                 batch_indices = tuple(index for index, _ in indexed_pairs)
                 self._validate_coverage(raw_decisions, expected_indices=batch_indices)
                 by_index = {int(decision.pair_index): decision for decision in raw_decisions}
-                for pair_index, pair in indexed_pairs:
-                    decision = by_index[pair_index]
-                    decisions_by_index[pair_index] = MemoryPairDecision(
-                        pair=pair,
-                        relation_type=MemoryRelationType(decision.classification),
-                        direction=RelationDirection(decision.direction),
-                        reason=str(decision.reason or ""),
+                return tuple(
+                    (
+                        pair_index,
+                        MemoryPairDecision(
+                            pair=pair,
+                            relation_type=MemoryRelationType(by_index[pair_index].classification),
+                            direction=RelationDirection(by_index[pair_index].direction),
+                            reason=str(by_index[pair_index].reason or ""),
+                        ),
                     )
+                    for pair_index, pair in indexed_pairs
+                )
+
+            batch_decisions = await collect_bounded(
+                batches,
+                classify_batch,
+                max_concurrent=structured_llm_max_concurrent(self._client),
+            )
+            decisions_by_index: dict[int, MemoryPairDecision] = {}
+            for decisions in batch_decisions:
+                for pair_index, decision in decisions:
+                    if pair_index in decisions_by_index:
+                        raise MemoryPairClassificationError(f"duplicate decision for pair index {pair_index}")
+                    decisions_by_index[pair_index] = decision
             return MemoryPairClassification(
                 decisions=tuple(decisions_by_index[index] for index in range(len(pairs))),
                 llm_calls=llm_calls,

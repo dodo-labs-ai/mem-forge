@@ -17,9 +17,15 @@ class RecordingCollection:
     def __init__(self) -> None:
         self.upserted: dict[str, dict] = {}
         self.deleted: list[str] = []
+        self.query_calls: list[dict] = []
 
     def query(self, **kwargs):
-        return {"ids": [[]], "distances": [[]]}
+        self.query_calls.append(kwargs)
+        count = len(kwargs.get("query_embeddings") or ())
+        return {
+            "ids": [[] for _ in range(count)],
+            "distances": [[] for _ in range(count)],
+        }
 
     def upsert(self, *, ids, embeddings=None, metadatas=None, documents=None):
         for index, record_id in enumerate(ids):
@@ -135,13 +141,13 @@ async def test_identity_candidate_batch_embeds_unresolved_claims_in_one_transpor
         for index in range(3)
     )
 
-    candidates = await store.find_access_compatible_equivalence_candidates_batch(
-        requests
-    )
+    candidates = await store.find_access_compatible_equivalence_candidates_batch(requests)
 
     assert candidates == ((), (), ())
     assert len(embedded_batches) == 1
     assert len(embedded_batches[0]) == 3
+    assert len(collection.query_calls) == 1
+    assert len(collection.query_calls[0]["query_embeddings"]) == 3
 
 
 @pytest.mark.asyncio

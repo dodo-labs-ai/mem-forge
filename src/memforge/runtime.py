@@ -527,6 +527,7 @@ async def build_search_engine(
                 base_url=llm.enrichment_base_url or None,
                 api_key=llm.enrichment_api_key or None,
                 timeout_s=llm.request_timeout_s,
+                max_concurrent=config.llm.enrichment_max_concurrent,
             )
         )
     adapters = build_sqlite_adapters(db, memory_collection, audit_logger=audit_logger)
@@ -556,6 +557,7 @@ async def build_sync_runtime(
                 base_url=llm.enrichment_base_url or None,
                 api_key=llm.enrichment_api_key or None,
                 timeout_s=llm.request_timeout_s,
+                max_concurrent=config.llm.enrichment_max_concurrent,
             )
         )
     doc_store = LocalDocumentStore(config.storage.docs_path)

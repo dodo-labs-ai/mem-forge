@@ -272,9 +272,16 @@ class RelationalStoreContract:
             owner_user_id="owner-c",
             repo_identifier=exact.repo_identifier,
         )
+        batch_candidates = await store.find_active_exact_claim_candidates(
+            (exact.content_hash, "missing-hash"),
+            visibility=exact.visibility,
+            owner_user_id=exact.owner_user_id,
+            repo_identifier=exact.repo_identifier,
+        )
 
         assert candidate is not None
         assert candidate.id == exact.id
+        assert [memory.id for memory in batch_candidates] == [exact.id]
         assert excluded is not None
         assert excluded.id == different_project.id
         assert private_candidate is not None
@@ -421,9 +428,16 @@ class RelationalStoreContract:
             owner_user_id=exact.owner_user_id,
             repo_identifier=exact.repo_identifier,
         )
+        batch_candidates = await store.find_rebaseline_reactivation_candidates(
+            (exact.content_hash, "missing-hash"),
+            visibility=exact.visibility,
+            owner_user_id=exact.owner_user_id,
+            repo_identifier=exact.repo_identifier,
+        )
 
         assert candidate is not None
         assert candidate.id == exact.id
+        assert [memory.id for memory in batch_candidates] == [exact.id]
 
     # -- Visibility filtering ----------------------------------------------
 

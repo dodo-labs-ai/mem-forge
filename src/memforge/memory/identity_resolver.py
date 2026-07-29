@@ -142,12 +142,11 @@ class IdentityResolver:
         resolved: dict[int, IdentityResolution] = {}
         all_pairs: list[MemoryPair] = []
         unresolved: list[tuple[int, IdentityResolutionRequest]] = []
-        for index, request in enumerate(requests):
+        exact_candidates = await self._memory_store.find_access_compatible_exact_candidates_batch(requests)
+        if len(exact_candidates) != len(requests):
+            raise RuntimeError("exact identity batch did not cover every request")
+        for index, (request, exact) in enumerate(zip(requests, exact_candidates, strict=True)):
             challenger = request.challenger
-            exact = await self._memory_store.find_access_compatible_exact_candidate(
-                challenger,
-                excluded_memory_ids=request.excluded_memory_ids,
-            )
             if (
                 exact is not None
                 and exact.content_hash == challenger.content_hash

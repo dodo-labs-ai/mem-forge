@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import re
+
 import pytest
 
 from memforge.llm.structured import CandidateLedgerDecision, CandidateLedgerResponse
@@ -59,6 +62,56 @@ class _IntermittentLedgerClient:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+class _ConcurrentLedgerClient:
+    max_concurrent = 2
+
+    def __init__(self) -> None:
+        self.active = 0
+        self.max_active = 0
+        self.two_admitted = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def select_memory_candidates(self, prompt: str, **kwargs) -> CandidateLedgerResponse:
+        del kwargs
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if self.active == 2:
+            self.two_admitted.set()
+        try:
+            await self.release.wait()
+            mapped = re.findall(r'"slot_\d{2}":(\d+|null)', prompt)
+            return _ledger_response(*(CandidateLedgerDecision(action="KEEP") for value in mapped if value != "null"))
+        finally:
+            self.active -= 1
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_runs_independent_batches_with_bounded_concurrency():
+    candidates = [
+        _candidate(
+            f"Durable candidate {index:02d} with distinct content.",
+            observation_id=f"obs-{index}",
+        )
+        for index in range(55)
+    ]
+    client = _ConcurrentLedgerClient()
+    selection = asyncio.create_task(
+        select_unique_memory_candidates(
+            candidates,
+            structured_llm_client=client,
+            llm_model=None,
+        )
+    )
+
+    await asyncio.wait_for(client.two_admitted.wait(), timeout=0.5)
+    client.release.set()
+    result = await selection
+
+    assert result.candidates == tuple(candidates)
+    assert result.structured_llm_calls == 3
+    assert client.max_active == 2
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,9 @@ from math import sqrt
 from time import perf_counter
 from typing import Any
 
+from memforge.llm.structured import structured_llm_max_concurrent
 from memforge.models import Entity, EntityAlias, canonicalize_entity_name
+from memforge.pipeline.bounded_work import collect_bounded
 from memforge.storage.adapters.protocols import (
     EntityResolutionContext,
     EntityResolutionScope,
@@ -250,23 +252,23 @@ class EntityResolver:
             cases = tuple(
                 {
                     "mention": mention,
-                    "candidates": [
-                        {"id": candidate.id, "name": candidate.canonical_name}
-                        for candidate in candidates
-                    ],
+                    "candidates": [{"id": candidate.id, "name": candidate.canonical_name} for candidate in candidates],
                 }
                 for mention, candidates in ambiguous.items()
             )
             decisions: dict[str, object] = {}
             context_text = (doc_context or "")[:2000]
-            for case_batch in self._adjudication_batches(cases, context=context_text):
+            case_batches = self._adjudication_batches(cases, context=context_text)
+
+            async def adjudicate_batch(
+                case_batch: tuple[dict[str, object], ...],
+            ) -> tuple[tuple[str, object], ...]:
                 prompt = self._render_adjudication_prompt(case_batch, context=context_text)
                 response = await self.structured_llm_client.validate_entity_batch(
                     prompt,
                     max_tokens=max(512, min(4096, len(case_batch) * 256)),
                     model=self.llm_model,
                 )
-                structured_llm_calls += 1
                 ordered_slots = response.ordered_slots()
                 active_slots = ordered_slots[: len(case_batch)]
                 unused_slots = ordered_slots[len(case_batch) :]
@@ -279,7 +281,7 @@ class EntityResolver:
                         f"missing_active_count={missing_active}, "
                         f"non_null_unused_count={non_null_unused}"
                     )
-                decisions.update(
+                return tuple(
                     (
                         str(case["mention"]),
                         decision,
@@ -287,6 +289,15 @@ class EntityResolver:
                     for case, decision in zip(case_batch, active_slots, strict=True)
                     if decision is not None
                 )
+
+            batch_decisions = await collect_bounded(
+                case_batches,
+                adjudicate_batch,
+                max_concurrent=structured_llm_max_concurrent(self.structured_llm_client),
+            )
+            structured_llm_calls += len(case_batches)
+            for adjudicated in batch_decisions:
+                decisions.update(adjudicated)
             for mention, candidates in ambiguous.items():
                 decision = decisions.get(mention)
                 assert decision is not None
