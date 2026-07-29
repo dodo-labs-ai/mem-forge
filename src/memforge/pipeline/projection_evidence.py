@@ -115,6 +115,7 @@ def build_projected_claim_evidence(
             raw.evidence_anchor == "source_artifact"
             and primary_id in artifact_observation_ids
         )
+        evidence_content = "" if artifact_evidence else quote
         evidence_unit_id = _stable_id(
             "eu-projected",
             projection.run_id,
@@ -134,12 +135,16 @@ def build_projected_claim_evidence(
             visibility=visibility,
             owner_user_id=owner_user_id,
             repo_identifier=repo_identifier,
-            content=primary_revision.content,
+            content=evidence_content,
             excerpt=quote or None,
             evidence_provenance=(
                 EvidenceContentProvenance.SOURCE_ARTIFACT
                 if artifact_evidence
-                else EvidenceContentProvenance.SOURCE_EXCERPT
+                else (
+                    EvidenceContentProvenance.SOURCE_EXCERPT
+                    if quote
+                    else EvidenceContentProvenance.NO_EXCERPT
+                )
             ),
             source_metadata={
                 "projection_run_id": projection.run_id,
