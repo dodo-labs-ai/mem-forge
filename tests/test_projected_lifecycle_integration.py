@@ -774,6 +774,17 @@ class _OutboxDrainer:
             excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
         )
 
+    async def find_access_compatible_exact_candidates_batch(self, requests):
+        return tuple(
+            [
+                await self.find_access_compatible_exact_candidate(
+                    request.challenger,
+                    excluded_memory_ids=request.excluded_memory_ids,
+                )
+                for request in requests
+            ]
+        )
+
 
 class _AuditedOutboxDrainer(_OutboxDrainer):
     def __init__(self, database: Database) -> None:

@@ -9272,6 +9272,17 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
                 excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
             )
 
+        async def find_access_compatible_exact_candidates_batch(self, requests):
+            return tuple(
+                [
+                    await self.find_access_compatible_exact_candidate(
+                        request.challenger,
+                        excluded_memory_ids=request.excluded_memory_ids,
+                    )
+                    for request in requests
+                ]
+            )
+
         async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id: str):
             from memforge.memory.lifecycle_plan import (
                 LifecycleVectorDeliveryResult,

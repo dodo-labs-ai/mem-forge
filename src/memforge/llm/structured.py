@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from threading import Lock
 from time import perf_counter
 from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, get_args, get_origin
+from weakref import WeakKeyDictionary
 
 import litellm
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -32,6 +33,51 @@ type StructuredLlmTerminalCategory = Literal[
     "provider_error",
     "invalid_response",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class _StructuredLlmAdmission:
+    max_concurrent: int
+    semaphore: asyncio.Semaphore
+
+
+_STRUCTURED_LLM_ADMISSION_LOCK = Lock()
+_STRUCTURED_LLM_ADMISSIONS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    _StructuredLlmAdmission,
+] = WeakKeyDictionary()
+
+
+def _process_structured_llm_admission(max_concurrent: int) -> _StructuredLlmAdmission:
+    """Return the shared structured-call admission for the process event loop."""
+
+    loop = asyncio.get_running_loop()
+    requested_limit = max(1, int(max_concurrent))
+    with _STRUCTURED_LLM_ADMISSION_LOCK:
+        admission = _STRUCTURED_LLM_ADMISSIONS.get(loop)
+        if admission is None:
+            admission = _StructuredLlmAdmission(
+                max_concurrent=requested_limit,
+                semaphore=asyncio.Semaphore(requested_limit),
+            )
+            _STRUCTURED_LLM_ADMISSIONS[loop] = admission
+            return admission
+        if admission.max_concurrent != requested_limit:
+            logger.warning(
+                "Ignoring structured LLM concurrency limit %d because event-loop limit %d is already active",
+                requested_limit,
+                admission.max_concurrent,
+            )
+        return admission
+
+
+def structured_llm_max_concurrent(client: object) -> int:
+    """Return a client's safe phase fan-out; unknown test/provider clients are serial."""
+
+    try:
+        return max(1, int(getattr(client, "max_concurrent", 1)))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _structured_user_content(
@@ -528,6 +574,9 @@ class StructuredLlmConfig:
     # failures. The adapter owns these retries so fallback shares the same
     # deadline and attempt telemetry remains exact.
     num_retries: int = 2
+    # Every client in the worker event loop shares this logical-call admission.
+    # Callers that do not opt in remain conservatively serial.
+    max_concurrent: int = 1
 
 
 @dataclass(frozen=True)
@@ -1153,6 +1202,12 @@ class LiteLlmStructuredClient:
             default=None,
         )
 
+    @property
+    def max_concurrent(self) -> int:
+        """Maximum phase fan-out; final admission is shared across all clients."""
+
+        return max(1, int(self.config.max_concurrent))
+
     @contextmanager
     def metrics_scope(
         self,
@@ -1376,6 +1431,27 @@ class LiteLlmStructuredClient:
         model: str | None = None,
         retry_with_json_text: bool = True,
         images: tuple[StructuredLlmImage, ...] = (),
+    ):
+        admission = _process_structured_llm_admission(self.config.max_concurrent)
+        async with admission.semaphore:
+            return await self._call_schema_admitted(
+                prompt=prompt,
+                response_format=response_format,
+                max_tokens=max_tokens,
+                model=model,
+                retry_with_json_text=retry_with_json_text,
+                images=images,
+            )
+
+    async def _call_schema_admitted(
+        self,
+        *,
+        prompt: str,
+        response_format: type[BaseModel],
+        max_tokens: int,
+        model: str | None,
+        retry_with_json_text: bool,
+        images: tuple[StructuredLlmImage, ...],
     ):
         model_name = litellm_model_name(model or self.config.model)
         started = perf_counter()

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+
 import pytest
 
 from memforge.llm.structured import EntityBatchValidationDecision, EntityBatchValidationResponse
@@ -173,6 +176,42 @@ class SequencedBatchEntityClient:
         response = self.responses[self.calls]
         self.calls += 1
         return _entity_batch_response(response)
+
+
+class ConcurrentBatchEntityClient:
+    max_concurrent = 2
+
+    def __init__(self) -> None:
+        self.active = 0
+        self.max_active = 0
+        self.two_admitted = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def validate_entity_batch(self, prompt, *, max_tokens, model):
+        del max_tokens, model
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if self.active == 2:
+            self.two_admitted.set()
+        try:
+            await self.release.wait()
+            cases = json.loads(
+                prompt.split("Response slots, mentions, and candidate IDs:\n", 1)[1].split(
+                    "\n\nDocument context:",
+                    1,
+                )[0]
+            )
+            return _entity_batch_response(
+                [
+                    EntityBatchValidationDecision(
+                        matched_id=case["candidates"][0]["id"],
+                        confidence=0.99,
+                    )
+                    for case in cases
+                ]
+            )
+        finally:
+            self.active -= 1
 
 
 def _entity_batch_response(
@@ -383,6 +422,48 @@ async def test_resolve_many_bounds_context_and_adjudication_batches(monkeypatch)
     assert all(len(prompt) <= 32_000 for prompt in client.prompts)
     assert result.metrics.structured_llm_calls == 3
     assert result.metrics.new_entities == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_many_runs_independent_adjudication_batches_concurrently(monkeypatch):
+    mentions = tuple(f"service {index}" for index in range(5))
+    candidates = {
+        mention: (
+            Entity(
+                id=index + 1,
+                canonical_name=f"canonical {index}",
+                display_name=f"Canonical {index}",
+            ),
+        )
+        for index, mention in enumerate(mentions)
+    }
+    store = FakeEntityStore(
+        EntityResolutionContext(
+            exact_matches={},
+            alias_matches={},
+            candidates=candidates,
+        )
+    )
+    client = ConcurrentBatchEntityClient()
+    monkeypatch.setattr(
+        "memforge.retrieval.embeddings.embed_texts",
+        lambda texts, *_args: [[1.0, 0.0] for _ in texts],
+    )
+    resolver = EntityResolver(
+        store=store,  # type: ignore[arg-type]
+        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        structured_llm_client=client,
+        policy=EntityResolutionPolicy(adjudication_batch_size=2),
+    )
+    resolution = asyncio.create_task(resolver.resolve_many(mentions, scope=_SCOPE))
+
+    await asyncio.wait_for(client.two_admitted.wait(), timeout=0.5)
+    client.release.set()
+    result = await resolution
+
+    assert tuple(result.entity_id(mention) for mention in mentions) == (1, 2, 3, 4, 5)
+    assert result.metrics.structured_llm_calls == 3
+    assert client.max_active == 2
 
 
 def test_adjudication_batch_rejects_single_case_over_final_prompt_limit():

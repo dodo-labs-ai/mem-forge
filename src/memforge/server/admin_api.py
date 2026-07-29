@@ -2508,6 +2508,7 @@ async def _build_agent_session_window_client(db: Database, config: AppConfig):
             base_url=llm.enrichment_base_url or None,
             api_key=llm.enrichment_api_key or None,
             timeout_s=llm.request_timeout_s,
+            max_concurrent=config.llm.enrichment_max_concurrent,
         )
     )
 

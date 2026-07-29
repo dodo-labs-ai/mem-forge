@@ -10155,6 +10155,59 @@ class Database:
             row = await cursor.fetchone()
         return self._row_to_memory(row) if row else None
 
+    async def find_active_exact_claim_candidates(
+        self,
+        memory_content_hashes: Sequence[str],
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+        excluded_memory_ids: Sequence[str] = (),
+    ) -> list[Memory]:
+        """Return one canonical active exact claim per requested hash."""
+
+        ordered_hashes = tuple(dict.fromkeys(memory_content_hashes))
+        if not ordered_hashes:
+            return []
+        exclusions = tuple(dict.fromkeys(excluded_memory_ids))
+        by_hash: dict[str, Memory] = {}
+        for offset in range(0, len(ordered_hashes), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ordered_hashes[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            hash_placeholders = ", ".join("?" for _ in chunk)
+            exclusion_clause = ""
+            params: list[Any] = [
+                *chunk,
+                visibility,
+                owner_user_id,
+                repo_identifier,
+            ]
+            if exclusions:
+                exclusion_clause = (
+                    " AND m.id NOT IN ("
+                    + ", ".join("?" for _ in exclusions)
+                    + ")"
+                )
+                params.extend(exclusions)
+            async with self.db.execute(
+                f"""SELECT m.* FROM memories AS m
+                    WHERE m.content_hash IN ({hash_placeholders})
+                      AND m.status = 'active'
+                      AND m.visibility = ?
+                      AND m.owner_user_id IS ?
+                      AND m.repo_identifier IS ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agent_claims AS ac
+                          WHERE ac.memory_id = m.id
+                      )"""
+                + exclusion_clause
+                + " ORDER BY m.content_hash, m.created_at, m.id",
+                params,
+            ) as cursor:
+                async for row in cursor:
+                    memory = self._row_to_memory(row)
+                    by_hash.setdefault(memory.content_hash, memory)
+        return [by_hash[content_hash] for content_hash in ordered_hashes if content_hash in by_hash]
+
     async def list_active_ordinary_claim_memories(
         self,
         memory_ids: Sequence[str],
@@ -10271,6 +10324,47 @@ class Database:
         ) as cursor:
             row = await cursor.fetchone()
         return self._row_to_memory(row) if row else None
+
+    async def find_rebaseline_reactivation_candidates(
+        self,
+        memory_content_hashes: Sequence[str],
+        *,
+        visibility: str,
+        owner_user_id: str | None,
+        repo_identifier: str | None,
+    ) -> list[Memory]:
+        """Return one rebaseline-retired exact claim per requested hash."""
+
+        ordered_hashes = tuple(dict.fromkeys(memory_content_hashes))
+        if not ordered_hashes:
+            return []
+        by_hash: dict[str, Memory] = {}
+        for offset in range(0, len(ordered_hashes), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ordered_hashes[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            async with self.db.execute(
+                f"""SELECT m.* FROM memories AS m
+                    WHERE m.content_hash IN ({placeholders})
+                      AND m.status = 'retired'
+                      AND m.retirement_reason = 'source_rebaseline'
+                      AND m.visibility = ?
+                      AND m.owner_user_id IS ?
+                      AND m.repo_identifier IS ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agent_claims AS ac
+                          WHERE ac.memory_id = m.id
+                      )
+                    ORDER BY m.content_hash, m.created_at, m.id""",
+                (*chunk, visibility, owner_user_id, repo_identifier),
+            ) as cursor:
+                async for row in cursor:
+                    memory = self._row_to_memory(row)
+                    by_hash.setdefault(memory.content_hash, memory)
+        return [
+            by_hash[content_hash]
+            for content_hash in ordered_hashes
+            if content_hash in by_hash
+        ]
 
     async def get_memories_by_source_doc(
         self,

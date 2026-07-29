@@ -8,8 +8,12 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Literal, Sequence
 
-from memforge.llm.structured import CandidateLedgerDecision
+from memforge.llm.structured import (
+    CandidateLedgerDecision,
+    structured_llm_max_concurrent,
+)
 from memforge.models import RawMemory
+from memforge.pipeline.bounded_work import collect_bounded
 
 __all__ = [
     "CandidateLedgerError",
@@ -74,6 +78,23 @@ class _IndexedLedgerDecision:
     action: Literal["KEEP", "DROP_REDUNDANT", "DROP_LOW_VALUE"]
     canonical_index: int | None
     reason: str
+
+
+@dataclass(frozen=True)
+class _CandidateLedgerBatchPlan:
+    expected_indices: tuple[int, ...]
+    prompt: str
+
+
+@dataclass(frozen=True)
+class _CandidateLedgerBatchResult:
+    decisions: dict[int, _IndexedLedgerDecision]
+    structured_llm_calls: int
+    structured_llm_elapsed_ms: int
+    validation_retries: int
+    fallback_batch_count: int
+    fallback_candidate_count: int
+    prompt_chars: int
 
 
 @dataclass(frozen=True)
@@ -172,13 +193,7 @@ async def select_unique_memory_candidates(
             semantic_input_count=semantic_count,
         )
 
-    decisions_by_index: dict[int, _IndexedLedgerDecision] = {}
-    structured_llm_calls = 0
-    structured_llm_elapsed_ms = 0
-    validation_retries = 0
-    fallback_batch_count = 0
-    fallback_candidate_count = 0
-    prompt_chars = 0
+    plans: list[_CandidateLedgerBatchPlan] = []
     offset = 0
     while offset < semantic_count:
         stop = min(
@@ -220,12 +235,24 @@ async def select_unique_memory_candidates(
                 (f"one candidate ledger request exceeds the context budget of {max_context_chars} chars"),
                 input_count=len(original),
                 semantic_input_count=semantic_count,
-                structured_llm_calls=structured_llm_calls,
-                structured_llm_elapsed_ms=structured_llm_elapsed_ms,
-                validation_retries=validation_retries,
-                prompt_chars=prompt_chars,
             )
+        plans.append(
+            _CandidateLedgerBatchPlan(
+                expected_indices=expected_indices,
+                prompt=prompt,
+            )
+        )
+        offset = stop
+
+    async def select_batch(plan: _CandidateLedgerBatchPlan) -> _CandidateLedgerBatchResult:
+        prompt = plan.prompt
         batch_decisions: dict[int, _IndexedLedgerDecision] | None = None
+        structured_llm_calls = 0
+        structured_llm_elapsed_ms = 0
+        validation_retries = 0
+        fallback_batch_count = 0
+        fallback_candidate_count = 0
+        prompt_chars = 0
         for attempt in range(_VALIDATION_ATTEMPTS):
             prompt_chars += len(prompt)
             call_started = perf_counter()
@@ -239,17 +266,17 @@ async def select_unique_memory_candidates(
             except Exception:
                 structured_llm_elapsed_ms += max(0, round((perf_counter() - call_started) * 1000))
                 batch_decisions = _keep_batch(
-                    expected_indices,
+                    plan.expected_indices,
                     reason="structured_admission_unavailable",
                 )
                 fallback_batch_count += 1
-                fallback_candidate_count += len(expected_indices)
+                fallback_candidate_count += len(plan.expected_indices)
                 break
             structured_llm_elapsed_ms += max(0, round((perf_counter() - call_started) * 1000))
             try:
                 batch_decisions = _validate_ledger_batch(
                     response.ordered_slots(),
-                    expected_indices=expected_indices,
+                    expected_indices=plan.expected_indices,
                 )
                 break
             except ValueError as exc:
@@ -264,13 +291,35 @@ async def select_unique_memory_candidates(
                 )
         if batch_decisions is None:
             batch_decisions = _keep_batch(
-                expected_indices,
+                plan.expected_indices,
                 reason="structured_admission_invalid",
             )
             fallback_batch_count += 1
-            fallback_candidate_count += len(expected_indices)
-        decisions_by_index.update(batch_decisions)
-        offset = stop
+            fallback_candidate_count += len(plan.expected_indices)
+        return _CandidateLedgerBatchResult(
+            decisions=batch_decisions,
+            structured_llm_calls=structured_llm_calls,
+            structured_llm_elapsed_ms=structured_llm_elapsed_ms,
+            validation_retries=validation_retries,
+            fallback_batch_count=fallback_batch_count,
+            fallback_candidate_count=fallback_candidate_count,
+            prompt_chars=prompt_chars,
+        )
+
+    batch_results = await collect_bounded(
+        plans,
+        select_batch,
+        max_concurrent=structured_llm_max_concurrent(structured_llm_client),
+    )
+    decisions_by_index: dict[int, _IndexedLedgerDecision] = {}
+    for batch_result in batch_results:
+        decisions_by_index.update(batch_result.decisions)
+    structured_llm_calls = sum(result.structured_llm_calls for result in batch_results)
+    structured_llm_elapsed_ms = sum(result.structured_llm_elapsed_ms for result in batch_results)
+    validation_retries = sum(result.validation_retries for result in batch_results)
+    fallback_batch_count = sum(result.fallback_batch_count for result in batch_results)
+    fallback_candidate_count = sum(result.fallback_candidate_count for result in batch_results)
+    prompt_chars = sum(result.prompt_chars for result in batch_results)
 
     decisions_by_index = _normalize_ledger_canonicals(decisions_by_index)
     _validate_complete_ledger(
