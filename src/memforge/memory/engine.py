@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
+from memforge.llm.structured import StructuredLlmError
 from memforge.memory.candidate_ledger import (
     CandidateLedgerError,
     CandidateLedgerResult,
@@ -349,24 +350,39 @@ class MemoryEngine:
                     raise RuntimeError(
                         f"NOOP incumbent current PRIMARY observation is unavailable: {operation.memory_id}"
                     )
-                validation = await validator(
-                    MEMORY_SUPPORT_VALIDATION_PROMPT.format(
-                        case_json=json.dumps(
-                            {
-                                "memory_claim": incumbent.content,
-                                "previous_primary_quote": selected.excerpt,
-                                "primary": current_primary.content,
-                                "required": [
-                                    current_revisions[item.anchor.observation_id].content for item in stale_required
-                                ],
-                            },
-                            ensure_ascii=False,
-                            sort_keys=True,
+                try:
+                    validation = await validator(
+                        MEMORY_SUPPORT_VALIDATION_PROMPT.format(
+                            case_json=json.dumps(
+                                {
+                                    "memory_claim": incumbent.content,
+                                    "previous_primary_quote": selected.excerpt,
+                                    "primary": current_primary.content,
+                                    "required": [
+                                        current_revisions[item.anchor.observation_id].content
+                                        for item in stale_required
+                                    ],
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                        ),
+                        max_tokens=512,
+                        model=self.llm_model,
+                    )
+                except StructuredLlmError:
+                    rebound.append(
+                        ReconcileOperation(
+                            action=ReconcileAction.DELETE,
+                            memory_id=operation.memory_id,
+                            reason=(
+                                "revised evidence support could not be "
+                                "structurally validated"
+                            ),
+                            flag_for_review=True,
                         )
-                    ),
-                    max_tokens=512,
-                    model=self.llm_model,
-                )
+                    )
+                    continue
                 support_validation = {
                     "method": "structured_classifier",
                     "model": self.llm_model,
