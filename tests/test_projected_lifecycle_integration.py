@@ -19,6 +19,7 @@ from memforge.llm.structured import (
     MemoryRelationDecision,
     MemoryRelationResponse,
     MemorySupportValidationResponse,
+    StructuredLlmError,
 )
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
@@ -1180,6 +1181,15 @@ class _SupportValidatingNoopClient(_NoopClient):
                 if self.supported
                 else "The applicability changed from regular to off-cycle payroll."
             ),
+        )
+
+
+class _UnavailableSupportValidatingNoopClient(_NoopClient):
+    async def validate_memory_support(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        raise StructuredLlmError(
+            "structured LLM returned an invalid response",
+            error_code="ValidationError",
         )
 
 
@@ -2585,6 +2595,53 @@ async def test_incremental_noop_inexact_current_quote_creates_review(
             incumbent.id,
             supported=True,
             evidence_quote="A quote that is not in the current source.",
+        ),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=second.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="primary wording changed",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["pending_review"] == 1
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "active"
+    assert await db.get_active_memory_support_reference_ids(incumbent.id)
+
+
+@pytest.mark.asyncio
+async def test_incremental_noop_unavailable_support_validation_creates_review(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-primary-validation-unavailable-1",
+        body="A7 is removed.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    await db.enable_lifecycle_gate("src-1")
+    second = _projection(
+        run_id="projection-primary-validation-unavailable-2",
+        body="The A7 slot remains excluded.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_UnavailableSupportValidatingNoopClient(
+            incumbent.id,
         ),
     )
 
