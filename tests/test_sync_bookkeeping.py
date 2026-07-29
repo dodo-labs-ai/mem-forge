@@ -10421,6 +10421,88 @@ async def test_lifecycle_failure_never_attempts_document_snapshot_restore(
 
 
 @pytest.mark.asyncio
+async def test_derivation_recovery_uses_latest_context_for_one_projection_scope(
+    db: Database,
+) -> None:
+    source_id = "src-latest-derivation-context"
+    previous_markdown = "# Design Doc\n\nThe service uses PostgreSQL 14."
+    doc_store = StubDocumentStore()
+    previous_uri = doc_store.store_normalized(
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=previous_markdown,
+    )
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=previous_markdown,
+        version="1",
+        normalized_content_uri=previous_uri,
+    )
+    updated_markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
+    failed = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        memory_extractor=ProjectionBatchCandidateExtractor(),
+        memory_engine=FailingProjectedMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=UpdatingDocumentGene(updated_markdown),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert failed.last_sync_status == "failed"
+    attempts = await db.list_source_derivation_attempts(
+        source_id=source_id,
+    )
+    assert [attempt.context.update_mode for attempt in attempts] == [
+        "diff_guided",
+        "full_document",
+    ]
+    assert len({attempt.projection_identity_hash for attempt in attempts}) == 1
+
+    engine = RecordingMemoryEngine()
+    progress: list[dict] = []
+    recovered = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        memory_extractor=ProjectionBatchCandidateExtractor(),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=UpdatingDocumentGene(updated_markdown),
+        source_name="Documents",
+        source_id=source_id,
+        progress_callback=progress.append,
+    )
+
+    assert recovered.last_sync_status == "success"
+    assert len(engine.projected_lifecycle_calls) == 1
+    assert engine.projected_lifecycle_calls[0]["update_mode"] == "full_document"
+    assert {
+        "phase": "recovering_derivations",
+        "current": 0,
+        "total": 1,
+        "title": None,
+    } in progress
+    active_attempts = await db.list_source_derivation_attempts(
+        source_id=source_id,
+    )
+    assert [attempt.status for attempt in active_attempts] == [
+        "superseded",
+        "applied",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_extraction_failure_never_requires_document_snapshot_restore(
     db: Database,
     monkeypatch: pytest.MonkeyPatch,

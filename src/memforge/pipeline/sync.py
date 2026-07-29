@@ -1413,6 +1413,40 @@ class GeneSyncOrchestrator:
                 "completed",
             ),
         )
+        latest_by_projection: dict[
+            tuple[int | None, str, str, str],
+            SourceDerivationAttempt,
+        ] = {}
+        superseded_attempts: list[SourceDerivationAttempt] = []
+        for attempt in attempts:
+            if attempt.context.source_activity_epoch != source_activity_epoch:
+                superseded_attempts.append(attempt)
+                continue
+            projection_scope = (
+                attempt.context.source_activity_epoch,
+                attempt.source_unit_id,
+                attempt.target_unit_revision_id,
+                attempt.projection_identity_hash,
+            )
+            previous = latest_by_projection.get(projection_scope)
+            if previous is not None:
+                superseded_attempts.append(previous)
+            latest_by_projection[projection_scope] = attempt
+        for attempt in superseded_attempts:
+            await self.db.supersede_source_derivation(attempt.id)
+        if superseded_attempts:
+            logger.info(
+                "Superseded %d stale or older Source derivation context(s) "
+                "before recovery for source %s",
+                len(superseded_attempts),
+                source_id,
+            )
+        attempts = tuple(
+            sorted(
+                latest_by_projection.values(),
+                key=lambda attempt: (attempt.created_at, attempt.id),
+            )
+        )
         if attempts and progress_callback:
             progress_callback(
                 {
