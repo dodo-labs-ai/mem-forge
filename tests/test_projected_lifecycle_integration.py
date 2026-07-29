@@ -2560,7 +2560,7 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
 
 
 @pytest.mark.asyncio
-async def test_incremental_noop_reworded_primary_requires_exact_current_quote(
+async def test_incremental_noop_inexact_current_quote_creates_review(
     db: Database,
 ) -> None:
     first = _projection(
@@ -2588,23 +2588,24 @@ async def test_incremental_noop_reworded_primary_requires_exact_current_quote(
         ),
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="support validation lacks exact current PRIMARY evidence",
-    ):
-        await engine.apply_projected_lifecycle(
-            projection=second,
-            doc_id="confluence-123",
-            raw_memories=[],
-            doc_type="design-doc",
-            project_key="ENG",
-            repo_identifier=None,
-            document_content=second.observation_revisions[0].content,
-            update_mode="diff_guided",
-            changed_hunks="primary wording changed",
-            update_plan_stats=None,
-            source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
-        )
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=second.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="primary wording changed",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["pending_review"] == 1
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "active"
+    assert await db.get_active_memory_support_reference_ids(incumbent.id)
 
 
 @pytest.mark.asyncio
