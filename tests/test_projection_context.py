@@ -134,7 +134,18 @@ def _confluence_projection_with_images(
         normalized=NormalizedContent(item=item, markdown_body="Visual design."),
         artifacts=artifacts,
     )
-def _teams_projection():
+
+
+def _teams_projection(
+    message_contents: tuple[str, str] = (
+        "Decision: keep A7",
+        "Acknowledged: keep A7",
+    ),
+    *,
+    run_id: str = "run-teams",
+    prior_unit_revision=None,
+    prior_observation_revisions=None,
+):
     item = ContentItem(
         item_id="teams-window-1",
         title="PCC Agent Dev",
@@ -151,18 +162,30 @@ def _teams_projection():
 
     messages = {
         "messages": [
-            {"id": "msg-1", "content": "Decision: keep A7", "time": "2026-07-15T10:00:00Z"},
-            {"id": "msg-2", "content": "Acknowledged: keep A7", "time": "2026-07-15T10:01:00Z"},
+            {
+                "id": "msg-1",
+                "content": message_contents[0],
+                "time": "2026-07-15T10:00:00Z",
+            },
+            {
+                "id": "msg-2",
+                "content": message_contents[1],
+                "time": "2026-07-15T10:01:00Z",
+            },
         ]
     }
     return project_source_item(
         source_id="src-teams",
         source_type="teams",
-        run_id="run-teams",
+        run_id=run_id,
         item=item,
         raw=RawContent(item=item, body=json.dumps(messages).encode(), content_type="application/json"),
         normalized=NormalizedContent(item=item, markdown_body="normalized Teams window"),
+        prior_unit_revision=prior_unit_revision,
+        prior_observation_revisions=prior_observation_revisions,
     )
+
+
 def test_jira_short_comments_are_batched_with_core_and_adjacent_context() -> None:
     projection = _jira_projection(3)
 
@@ -879,4 +902,61 @@ async def test_teams_batch_preserves_message_observation_anchor() -> None:
     )
 
     assert len(result.memories) == 1
+    assert result.memories[0].source_observation_id == target_id
+
+
+@pytest.mark.asyncio
+async def test_teams_projection_batch_keeps_language_authority_on_changed_primary() -> None:
+    initial = _teams_projection(("旧决定：A7 暂停。", "English context stays unchanged."))
+    projection = _teams_projection(
+        ("决定：A7 保持启用。", "English context stays unchanged."),
+        run_id="run-teams-language-change",
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in initial.observation_revisions
+        },
+    )
+    batch = plan_projection_extraction_batches(projection)[0]
+    primary_content = dict(batch.primary_content_by_observation_id)
+    target_id = next(
+        observation_id
+        for observation_id, content in primary_content.items()
+        if "决定：A7 保持启用。" in content
+    )
+
+    class Client:
+        async def extract_projection_memories(self, prompt: str, **kwargs):
+            del kwargs
+            assert "OWNED EVIDENCE SETS THE LANGUAGE" in prompt
+            primary_prompt = prompt.split(
+                "<primary_observations>",
+                maxsplit=1,
+            )[1].split("</primary_observations>", maxsplit=1)[0]
+            context_prompt = prompt.split(
+                "<context_observations>",
+                maxsplit=1,
+            )[1].split("</context_observations>", maxsplit=1)[0]
+            assert "决定：A7 保持启用。" in primary_prompt
+            assert "English context stays unchanged." not in primary_prompt
+            assert "English context stays unchanged." in context_prompt
+            return MemoryExtractionResponse(
+                memories=[
+                    MemoryCandidate(
+                        content="A7 保持启用。",
+                        memory_type="decision",
+                        evidence_quote="决定：A7 保持启用。",
+                        source_observation_id=target_id,
+                    )
+                ]
+            )
+
+    result = await MemoryExtractor(
+        structured_llm_client=Client()
+    ).extract_projection_batch_memories(
+        batch,
+        source_type="teams",
+    )
+
+    assert [item.content for item in result.memories] == ["A7 保持启用。"]
     assert result.memories[0].source_observation_id == target_id
