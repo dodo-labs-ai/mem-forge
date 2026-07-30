@@ -581,7 +581,7 @@ async def test_litellm_structured_client_normalizes_oversized_images_once_per_lo
             model="anthropic--claude-sonnet-latest",
             base_url=None,
             api_key=None,
-            timeout_s=2.0,
+            timeout_s=120.0,
             num_retries=1,
         )
     )
@@ -627,7 +627,7 @@ async def test_litellm_structured_client_rejects_invalid_image_before_provider_c
             model="anthropic--claude-sonnet-latest",
             base_url=None,
             api_key=None,
-            timeout_s=2.0,
+            timeout_s=120.0,
         ),
         telemetry_sink=telemetry.append,
     )
