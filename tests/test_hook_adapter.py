@@ -899,9 +899,9 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
-def test_packaged_plugin_version_0_1_34_is_consistent():
+def test_packaged_plugin_version_0_1_35_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.34"
+    version = "0.1.35"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
