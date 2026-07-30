@@ -18,7 +18,7 @@ jobs:
       - run: uv sync --extra dev
       - run: uv run python scripts/sync_plugin_mcp_proxy.py --check
       - run: uv run ruff check src tests scripts/sync_plugin_mcp_proxy.py
-      - run: uv run pytest -q
+      - run: uv run pytest -q -n 4 --dist worksteal --durations=25 --durations-min=0.2
 
   admin-ui:
     runs-on: ubuntu-latest
