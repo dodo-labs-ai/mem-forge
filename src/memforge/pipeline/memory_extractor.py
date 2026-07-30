@@ -41,6 +41,22 @@ GLOSSARY_APPENDIX_CHAR_CAP = 2_000
 UNIT_MARKDOWN_CHAR_CAP = 80_000
 PROJECTION_CONTEXT_CHAR_CAP = 20_000
 
+_DURABLE_MEMORY_QUALITY_RULES = """Top rules (apply these first; reject candidates that fail any of them):
+
+0. PREFER EMPTY. Returning {{"memories": []}} is the default. The bar for emitting a Memory is high: it must teach a future developer something they would otherwise miss six months from now, after the implementation has been refactored. Routine work, mechanical detail, transient output, and meta-discussion produce zero Memories.
+
+1. CODE-RECOVERABLE FACTS ARE NOT MEMORIES. Reject any candidate a developer could verify by reading the current code, schema, types, configuration, or by running `grep` / `git log -p` in under a minute. Specifically, do not emit Memories that merely restate function or method names, class names, type signatures, parameter lists, ID or constant values, file paths, schema columns, migration numbers, generated query text, or "X passes Y to Z" wiring. Keep a candidate only when it states a reusable constraint, reason, rule, invariant, conclusion, or procedure that survives a future refactor.
+
+2. ONE CLAIM, ONE MEMORY. Pick the single most general accurate phrasing for each underlying claim; do not emit reworded duplicates.
+
+3. FOLD REJECTED ALTERNATIVES INTO THE CHOSEN DECISION. Emit one "picked A over B because <reason>" decision rather than separate Memories for rejected alternatives.
+
+4. FUTURE USEFULNESS CHECK. Skip claims that will be obvious after the next refactor, self-resolve within days, or preserve only one generated or observed instance rather than reusable knowledge.
+
+5. NO META-MEMORIES. Do not emit Memories about the act of working: commit structure, diff splitting, tools used, validation output, work-in-progress state, or whether a project rule was followed. Memory is about the project's durable domain knowledge, not the editing process.
+
+"""
+
 # ---------------------------------------------------------------------------
 # Memory extraction prompt (Call 2)
 # ---------------------------------------------------------------------------
@@ -62,21 +78,7 @@ Extract durable atomic knowledge units justified by the document. Returning an e
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "extraction_context": exact quote from the document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix (e.g. "**Alice** (10:05): the actual message content")
 
-Top rules (apply these first; reject candidates that fail any of them):
-
-0. PREFER EMPTY. Returning {{"memories": []}} is the default. The bar for emitting a memory is high: it must teach a future developer something they would otherwise miss, six months from now, after the code has been refactored. Sessions full of routine work, mechanical edits, debugging detours, version-control bookkeeping, conversational exchanges, and meta-discussion of the work itself produce ZERO memories — that is the expected outcome, not a failure.
-
-1. CODE-RECOVERABLE FACTS ARE NOT MEMORIES. Reject any candidate a developer could verify by reading the current code, schema, types, configuration, or running `grep` / `git log -p` in under a minute. Specifically, do not emit memories that restate function or method names, class names, type signatures, prop names, parameter lists, ID or constant string values, file paths, schema column names, migration numbers, framework configuration values, or "X passes Y to Z" wiring sentences. Keep a candidate only when it states a constraint, reason, rule, or invariant that survives a future refactor and is NOT visible in any single file.
-
-2. ONE CLAIM, ONE MEMORY. If the document restates the same underlying claim more than once (e.g., "X must be populated for icons" and "without X, icons fall back to dots"), pick the single most general phrasing and emit one memory. Do not emit reworded duplicates of the same fact, decision, or procedure.
-
-3. FOLD REJECTED ALTERNATIVES INTO THE CHOSEN DECISION. When a discussion records that path A was picked over B and C, emit ONE decision memory of the form "picked A over B and C because <reason>". Do not emit B and C as their own "rejected" memories.
-
-4. FUTURE USEFULNESS CHECK. Before emitting any memory, ask: "Will a developer six months from now act better because this memory exists, after the code has been refactored?" If the answer is no — for example, the claim is true only because of how the code is currently written, or the claim self-resolves within days (a not-yet-validated risk, a temporary caveat) — skip it.
-
-5. NO META-MEMORIES. Do NOT emit memories about the act of working: how a commit was structured, how a diff was split, that a procedure was followed, that a tool was used, that a test failure was pre-existing, that work was in progress at session end, that a rule from a project guidance file was respected. The session log, git history, and the guidance file itself already record all of this. Memory is about the project's domain, not the meta-process of editing it.
-
-Standard rules:
+""" + _DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
 - Each memory must be SELF-CONTAINED (understandable without the source document).
 - Extraction does not decide novelty against historical Memory rows. Emit each
   durable claim once with exact current evidence; lifecycle reconciliation owns
@@ -122,21 +124,7 @@ For changed durable knowledge, return JSON objects with:
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "extraction_context": exact quote from the updated document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix from the updated document.
 
-Top rules (apply these first; reject candidates that fail any of them):
-
-0. PREFER EMPTY. Returning {{"memories": []}} is the default. The bar for emitting a memory is high. Routine refactors, formatting changes, dependency bumps, mechanical renames, and metadata-only edits produce ZERO memories — that is the expected outcome.
-
-1. CODE-RECOVERABLE FACTS ARE NOT MEMORIES. Reject any candidate a developer could verify by reading the current code, schema, types, configuration, or running `grep` / `git log -p` in under a minute (function/class names, type signatures, prop names, ID/constant values, file paths, schema columns, migration numbers, "X passes Y to Z" wiring). Keep a candidate only when it states a constraint, reason, rule, or invariant that survives a future refactor.
-
-2. ONE CLAIM, ONE MEMORY. Pick the single most general phrasing and emit one memory; do not output reworded duplicates of the same claim.
-
-3. FOLD REJECTED ALTERNATIVES INTO THE CHOSEN DECISION. Emit one "picked A over B and C because <reason>" decision memory rather than separate "rejected B" / "rejected C" memories.
-
-4. FUTURE USEFULNESS CHECK. Skip claims that will be obvious after the next refactor, or that self-resolve within days (a not-yet-validated risk, a temporary caveat).
-
-5. NO META-MEMORIES. Do not emit memories about the editing process itself: commit structure, diff splitting, that a guidance-file rule was followed, that a test failure was pre-existing, that work was in progress. Memory is about the project's domain, not the meta-process.
-
-Standard rules:
+""" + _DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
 - Focus ONLY on durable memory changes caused by <changed_hunks>.
 - Use <updated_document> only to understand context and copy exact quotes; do not extract unaffected facts elsewhere in it.
 - Extract the current durable claims changed by <changed_hunks>; lifecycle
@@ -185,21 +173,7 @@ Each memory must be a JSON object with:
 - "evidence_quote": exact quote copied from <unit_markdown>
 - "evidence_anchor": "unit"
 
-Top rules (apply these first; reject candidates that fail any of them):
-
-0. PREFER EMPTY. Returning {{"memories": []}} is the default. Most units do not contain durable team knowledge worth keeping; emit zero rather than weak memories.
-
-1. CODE-RECOVERABLE FACTS ARE NOT MEMORIES. Reject any candidate a developer could verify by reading the current code, schema, types, configuration, or running `grep` / `git log -p` in under a minute. Keep a candidate only when it states a constraint, reason, rule, or invariant that survives a future refactor.
-
-2. ONE CLAIM, ONE MEMORY. Pick the most general phrasing for each underlying claim; do not output reworded duplicates.
-
-3. FOLD REJECTED ALTERNATIVES INTO THE CHOSEN DECISION. Emit one "picked A over B because <reason>" decision rather than separate "rejected" memories.
-
-4. FUTURE USEFULNESS CHECK. Skip claims that self-resolve within days or that will be obvious after the next refactor.
-
-5. NO META-MEMORIES. Do not emit memories about the editing process itself: commit structure, diff splitting, that a guidance-file rule was followed, that a test failure was pre-existing, that work was in progress.
-
-Standard rules:
+""" + _DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
 - Extract only durable team knowledge grounded in <unit_markdown>.
 - Extraction emits each current durable claim once with exact evidence.
   Reconciliation owns historical identity and support decisions.
@@ -226,7 +200,7 @@ The following observations are CONTEXT only. Use them to resolve references and 
 {context_observations}
 </context_observations>
 
-Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
+""" + _DURABLE_MEMORY_QUALITY_RULES + """Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
 
 For a PRIMARY `binary_artifact` observation with separately supplied image
 evidence, inspect the image itself. A claim grounded in that image must set
