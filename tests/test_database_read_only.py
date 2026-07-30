@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
+import aiosqlite
 import pytest
 
 from memforge.storage.database import Database
@@ -47,3 +48,37 @@ async def test_non_migrating_connect_does_not_create_missing_database(tmp_path) 
 
     assert not path.exists()
     assert not path.parent.exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_connect_drains_aiosqlite_worker_before_raising(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class Worker:
+        joined = False
+
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self) -> None:
+            self.joined = True
+
+    class FailedConnectionAttempt:
+        def __init__(self) -> None:
+            self._thread = Worker()
+
+        def __await__(self):
+            async def fail():
+                raise sqlite3.OperationalError("unable to open database file")
+
+            return fail().__await__()
+
+    attempt = FailedConnectionAttempt()
+    monkeypatch.setattr(aiosqlite, "connect", lambda *args, **kwargs: attempt)
+    database = Database(str(tmp_path / "missing.sqlite"))
+
+    with pytest.raises(sqlite3.OperationalError, match="unable to open database"):
+        await database.connect(run_migrations=False)
+
+    assert attempt._thread.joined
