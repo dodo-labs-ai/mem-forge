@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from memforge.server.admin_api import MemorySearchRequest
+from memforge.server.admin_api import MemorySearchRequest, RecentMemoryListRequest
 
 
 def test_project_first_without_active_project_coerces_to_workspace():
@@ -142,6 +142,57 @@ def test_time_range_defaults_to_source_updated_at_and_converts_end_date_half_ope
     assert converted.date_type == "source_updated_at"
     assert converted.after is None
     assert converted.before == datetime(2026, 6, 27, tzinfo=timezone.utc)
+
+
+def test_recent_memory_request_resolves_timezone_qualified_half_open_window_to_utc():
+    req = RecentMemoryListRequest(
+        source_ids=["src-jira"],
+        memory_types=["decision"],
+        time_range={
+            "date_type": "source_updated_at",
+            "start_at": "2026-07-21T00:00:00+08:00",
+            "end_at": "2026-07-28T00:00:00+08:00",
+        },
+        page_size=25,
+    )
+
+    resolved = req.time_range.to_time_range()
+
+    assert resolved.date_type == "source_updated_at"
+    assert resolved.after == datetime(2026, 7, 20, 16, tzinfo=timezone.utc)
+    assert resolved.before == datetime(2026, 7, 27, 16, tzinfo=timezone.utc)
+    assert req.source_ids == ["src-jira"]
+    assert req.memory_types == ["decision"]
+    assert req.page_size == 25
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "time_range": {
+                "start_at": "2026-07-21T00:00:00",
+                "end_at": "2026-07-28T00:00:00+08:00",
+            }
+        },
+        {
+            "time_range": {
+                "start_at": "2026-07-28T00:00:00+08:00",
+                "end_at": "2026-07-21T00:00:00+08:00",
+            }
+        },
+        {
+            "query": "updates",
+            "time_range": {
+                "start_at": "2026-07-21T00:00:00+08:00",
+                "end_at": "2026-07-28T00:00:00+08:00",
+            },
+        },
+    ],
+)
+def test_recent_memory_request_rejects_ambiguous_window_or_semantic_query(payload):
+    with pytest.raises(Exception):
+        RecentMemoryListRequest(**payload)
 
 
 @pytest.mark.parametrize(

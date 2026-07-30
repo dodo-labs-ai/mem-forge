@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -48,11 +49,12 @@ def _memory(
     content: str,
     status: str = "active",
     repo_identifier: str | None = None,
+    memory_type: str = "fact",
 ) -> Memory:
     now = datetime.now(timezone.utc)
     return Memory(
         id=mem_id,
-        memory_type="fact",
+        memory_type=memory_type,
         content=content,
         content_hash=content_hash(content),
         confidence=0.9,
@@ -1070,3 +1072,188 @@ async def test_queryless_source_id_time_range_uses_relational_listing_only(db, m
     assert [r.memory_id for r in result["results"]] == ["m-newer", "m-older"]
     assert result["total_candidates"] == 2
     assert result["query_analysis"]["strategies_used"] == ["source_time_listing"]
+
+
+@pytest.mark.asyncio
+async def test_queryless_search_compatibility_applies_memory_types_before_pagination(db):
+    decision = _memory("m-queryless-decision", "Decision", memory_type="decision")
+    fact = _memory("m-queryless-fact", "Fact")
+    for memory in (decision, fact):
+        await db.insert_memory(memory)
+        await _document(db, f"doc-{memory.id}", "src-jira")
+        await db.add_memory_source(
+            memory.id,
+            f"doc-{memory.id}",
+            "jira",
+            None,
+            source_updated_at=datetime(2026, 7, 25, tzinfo=timezone.utc),
+        )
+    adapters = build_sqlite_adapters(db, FakeCollection([]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+
+    result = await engine.search(
+        "",
+        memory_types=["decision"],
+        source_filter=MemorySourceFilter(source_ids=("src-jira",)),
+        time_range=MemoryTimeRange(
+            after=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            before=datetime(2026, 7, 28, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        ),
+        top_k=1,
+    )
+
+    assert [item.memory_id for item in result["results"]] == ["m-queryless-decision"]
+    assert result["total_candidates"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_memory_listing_pages_with_a_request_bound_keyset_cursor(db):
+    newer = _memory("m-newer-recent", "Newer decision", memory_type="decision")
+    older = _memory("m-older-recent", "Older decision", memory_type="decision")
+    excluded_type = _memory("m-fact-recent", "Fact in the same source")
+    for memory in (newer, older, excluded_type):
+        await db.insert_memory(memory)
+        await _document(db, f"doc-{memory.id}", "src-jira")
+    await db.add_memory_source(
+        newer.id,
+        f"doc-{newer.id}",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+    await db.add_memory_source(
+        older.id,
+        f"doc-{older.id}",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
+    )
+    await db.add_memory_source(
+        excluded_type.id,
+        f"doc-{excluded_type.id}",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 7, 26, tzinfo=timezone.utc),
+    )
+
+    adapters = build_sqlite_adapters(db, FakeCollection([]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    source_filter = MemorySourceFilter(source_ids=("src-jira",))
+    window = MemoryTimeRange(
+        after=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        before=datetime(2026, 7, 28, tzinfo=timezone.utc),
+        date_type="source_updated_at",
+    )
+
+    first = await engine.list_recent_memories(
+        source_filter=source_filter,
+        time_range=window,
+        memory_types=["decision"],
+        page_size=1,
+    )
+    second = await engine.list_recent_memories(
+        source_filter=source_filter,
+        time_range=window,
+        memory_types=["decision"],
+        page_size=1,
+        cursor=first["next_cursor"],
+    )
+
+    assert [result["memory_id"] for result in first["results"]] == ["m-newer-recent"]
+    assert [result["memory_id"] for result in second["results"]] == ["m-older-recent"]
+    assert first["results"][0]["matched_at"] == "2026-07-25T00:00:00+00:00"
+    assert second["results"][0]["matched_at"] == "2026-07-24T00:00:00+00:00"
+    assert "relevance_score" not in first["results"][0]
+    assert first["result_kind"] == "current_memories"
+    assert first["is_changelog"] is False
+    assert first["candidate_count_kind"] == "exact"
+    assert first["count_scope"] == "current_page_read"
+    assert first["total_candidates"] == 2
+    assert first["has_more"] is True
+    assert first["next_cursor"]
+    assert second["has_more"] is False
+    assert second["next_cursor"] is None
+    assert first["listing_watermark"] == second["listing_watermark"]
+    assert first["cursor_kind"] == "keyset"
+    assert first["consistency"] == "request_bound_watermark_not_mvcc_snapshot"
+    assert "snapshot_watermark" not in first
+
+
+@pytest.mark.asyncio
+async def test_recent_memory_cursor_is_opaque_and_bound_to_the_original_filters(db):
+    memory = _memory("m-cursor-bound", "Cursor-bound decision", memory_type="decision")
+    second_memory = _memory("m-cursor-bound-2", "Second decision", memory_type="decision")
+    for item, source_updated_at in (
+        (memory, datetime(2026, 7, 25, tzinfo=timezone.utc)),
+        (second_memory, datetime(2026, 7, 24, tzinfo=timezone.utc)),
+    ):
+        await db.insert_memory(item)
+        await _document(db, f"doc-{item.id}", "src-jira")
+        await db.add_memory_source(
+            item.id,
+            f"doc-{item.id}",
+            "jira",
+            None,
+            source_updated_at=source_updated_at,
+        )
+    adapters = build_sqlite_adapters(db, FakeCollection([]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    source_filter = MemorySourceFilter(source_ids=("src-jira",))
+    window = MemoryTimeRange(
+        after=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        before=datetime(2026, 7, 28, tzinfo=timezone.utc),
+        date_type="source_updated_at",
+    )
+    first = await engine.list_recent_memories(
+        source_filter=source_filter,
+        time_range=window,
+        memory_types=["decision"],
+        page_size=1,
+    )
+    cursor = first["next_cursor"]
+    assert isinstance(cursor, str)
+
+    with pytest.raises(ValueError, match="does not match"):
+        await engine.list_recent_memories(
+            source_filter=source_filter,
+            time_range=window,
+            memory_types=["fact"],
+            page_size=1,
+            cursor=cursor,
+        )
+    with pytest.raises(ValueError, match="invalid"):
+        await engine.list_recent_memories(
+            source_filter=source_filter,
+            time_range=window,
+            memory_types=["decision"],
+            page_size=1,
+            cursor="not-a-valid-cursor",
+        )
+    non_object_cursor = base64.urlsafe_b64encode(b"[]").rstrip(b"=").decode("ascii")
+    with pytest.raises(ValueError, match="invalid"):
+        await engine.list_recent_memories(
+            source_filter=source_filter,
+            time_range=window,
+            memory_types=["decision"],
+            page_size=1,
+            cursor=non_object_cursor,
+        )

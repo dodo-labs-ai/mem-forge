@@ -1005,6 +1005,265 @@ async def test_list_ids_by_source_and_time_excludes_user_disabled_sources(db):
 
 
 @pytest.mark.asyncio
+async def test_recent_memory_listing_excludes_paused_sources_before_pagination(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-paused"))
+    await store.insert_memory(_memory("m-active-source"))
+    await db.upsert_source(
+        "src-paused",
+        "jira",
+        "Paused Jira",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+        status="active",
+    )
+    await db.upsert_source(
+        "src-active",
+        "jira",
+        "Active Jira",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+        status="active",
+    )
+    await _document(db, "doc-paused", source="src-paused")
+    await _document(db, "doc-active-source", source="src-active")
+    await store.add_memory_source(
+        "m-paused",
+        "doc-paused",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+    await store.add_memory_source(
+        "m-active-source",
+        "doc-active-source",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
+    )
+    await db.upsert_source(
+        "src-paused",
+        "jira",
+        "Paused Jira",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+        status="paused",
+    )
+
+    page = await store.list_recent_memory_ids(
+        MemorySourceFilter(),
+        MemoryTimeRange(
+            after=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            before=datetime(2026, 7, 28, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        ),
+        _scope(),
+        memory_types=(),
+        listing_watermark=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        after=None,
+        limit=10,
+    )
+    compatibility_ids, compatibility_total = await store.list_ids_by_source_and_time(
+        None,
+        MemoryTimeRange(
+            after=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            before=datetime(2026, 7, 28, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        ),
+        _scope(),
+        limit=10,
+        offset=0,
+    )
+
+    assert [item.memory_id for item in page.items] == ["m-active-source"]
+    assert page.total_count == 1
+    assert compatibility_ids == ["m-active-source"]
+    assert compatibility_total == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_memory_listing_source_and_time_match_the_same_provenance_row(db):
+    store = SqliteRelationalStore(db)
+    await store.insert_memory(_memory("m-overlapping-sources"))
+    for source_id in ("src-old", "src-recent"):
+        await db.upsert_source(
+            source_id,
+            "jira",
+            source_id,
+            "{}",
+            access_policy="workspace",
+            owner_user_id="dev",
+        )
+        await _document(db, f"doc-{source_id}", source=source_id)
+    await store.add_memory_source(
+        "m-overlapping-sources",
+        "doc-src-old",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+    )
+    await store.add_memory_source(
+        "m-overlapping-sources",
+        "doc-src-recent",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+
+    page = await store.list_recent_memory_ids(
+        MemorySourceFilter(source_ids=("src-old",)),
+        MemoryTimeRange(
+            after=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            before=datetime(2026, 7, 28, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        ),
+        _scope(),
+        memory_types=(),
+        listing_watermark=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        after=None,
+        limit=10,
+    )
+
+    assert page.items == ()
+    assert page.total_count == 0
+
+
+@pytest.mark.asyncio
+async def test_recent_memory_listing_uses_memory_id_as_stable_tie_breaker(db):
+    store = SqliteRelationalStore(db)
+    await db.upsert_source(
+        "src-tie",
+        "jira",
+        "Tie Source",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    timestamp = datetime(2026, 7, 25, tzinfo=timezone.utc)
+    for memory_id in ("m-tie-a", "m-tie-z"):
+        await store.insert_memory(_memory(memory_id))
+        await _document(db, f"doc-{memory_id}", source="src-tie")
+        await store.add_memory_source(
+            memory_id,
+            f"doc-{memory_id}",
+            "jira",
+            None,
+            source_updated_at=timestamp,
+        )
+    window = MemoryTimeRange(
+        after=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        before=datetime(2026, 7, 28, tzinfo=timezone.utc),
+        date_type="source_updated_at",
+    )
+
+    first = await store.list_recent_memory_ids(
+        MemorySourceFilter(source_ids=("src-tie",)),
+        window,
+        _scope(),
+        memory_types=(),
+        listing_watermark=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        after=None,
+        limit=1,
+    )
+    second = await store.list_recent_memory_ids(
+        MemorySourceFilter(source_ids=("src-tie",)),
+        window,
+        _scope(),
+        memory_types=(),
+        listing_watermark=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        after=first.items[-1],
+        limit=1,
+    )
+
+    assert [item.memory_id for item in first.items] == ["m-tie-z"]
+    assert [item.memory_id for item in second.items] == ["m-tie-a"]
+    assert first.has_more is True
+    assert second.has_more is False
+
+
+@pytest.mark.asyncio
+async def test_recent_memory_updated_listing_includes_current_manual_memories(db):
+    store = SqliteRelationalStore(db)
+    manual = _memory("m-manual-current")
+    manual.updated_at = datetime(2026, 7, 25, tzinfo=timezone.utc)
+    await store.insert_memory(manual)
+
+    page = await store.list_recent_memory_ids(
+        MemorySourceFilter(),
+        MemoryTimeRange(
+            after=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            before=datetime(2026, 7, 28, tzinfo=timezone.utc),
+            date_type="memory_updated_at",
+        ),
+        _scope(),
+        memory_types=(),
+        listing_watermark=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        after=None,
+        limit=10,
+    )
+
+    assert [item.memory_id for item in page.items] == ["m-manual-current"]
+    assert page.total_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_memory_updated_listing_excludes_paused_source_only_memories(db):
+    store = SqliteRelationalStore(db)
+    paused = _memory("m-paused-current")
+    paused.updated_at = datetime(2026, 7, 26, tzinfo=timezone.utc)
+    manual = _memory("m-manual-current")
+    manual.updated_at = datetime(2026, 7, 25, tzinfo=timezone.utc)
+    await store.insert_memory(paused)
+    await store.insert_memory(manual)
+    await db.upsert_source(
+        "src-paused",
+        "jira",
+        "Paused Jira",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+        status="active",
+    )
+    await _document(db, "doc-paused-current", source="src-paused")
+    await store.add_memory_source(
+        paused.id,
+        "doc-paused-current",
+        "jira",
+        None,
+        source_updated_at=datetime(2026, 7, 26, tzinfo=timezone.utc),
+    )
+    await db.upsert_source(
+        "src-paused",
+        "jira",
+        "Paused Jira",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+        status="paused",
+    )
+
+    page = await store.list_recent_memory_ids(
+        MemorySourceFilter(),
+        MemoryTimeRange(
+            after=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            before=datetime(2026, 7, 28, tzinfo=timezone.utc),
+            date_type="memory_updated_at",
+        ),
+        _scope(),
+        memory_types=(),
+        listing_watermark=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        after=None,
+        limit=10,
+    )
+
+    assert [item.memory_id for item in page.items] == [manual.id]
+    assert page.total_count == 1
+
+
+@pytest.mark.asyncio
 async def test_count_source_memories_uses_canonical_memory_source_id(db):
     await db.insert_memory(_memory("m1"))
     await db.insert_memory(_memory("m-retired", status="retired"))

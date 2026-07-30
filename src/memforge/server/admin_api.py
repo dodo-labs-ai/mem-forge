@@ -705,6 +705,74 @@ class MemoryTimeRangeRequest(BaseModel):
         return MemoryTimeRange(after=after, before=before, date_type=self.date_type)
 
 
+class RecentMemoryTimeRangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    date_type: Literal["source_updated_at", "memory_updated_at"] = "source_updated_at"
+    start_at: datetime
+    end_at: datetime
+
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def _require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("recent-memory time bounds require an explicit UTC offset")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_half_open_window(self) -> "RecentMemoryTimeRangeRequest":
+        if self.start_at >= self.end_at:
+            raise ValueError("time_range.start_at must be before end_at")
+        return self
+
+    def to_time_range(self) -> MemoryTimeRange:
+        return MemoryTimeRange(
+            after=self.start_at.astimezone(timezone.utc),
+            before=self.end_at.astimezone(timezone.utc),
+            date_type=self.date_type,
+        )
+
+
+class RecentMemoryListRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_ids: list[str] | None = None
+    time_range: RecentMemoryTimeRangeRequest
+    memory_types: list[str] | None = None
+    page_size: int = Field(default=50, ge=1, le=50)
+    cursor: str | None = None
+    include_private: bool = False
+
+    @field_validator("source_ids")
+    @classmethod
+    def _validate_source_ids(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        if not value or any(not item.strip() for item in value):
+            raise ValueError("source_ids must be a non-empty list")
+        return list(dict.fromkeys(item.strip() for item in value))
+
+    @field_validator("memory_types")
+    @classmethod
+    def _validate_memory_types(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        allowed = {item.value for item in MemoryType}
+        if not value or any(item not in allowed for item in value):
+            raise ValueError("memory_types must exactly match supported memory types")
+        return list(dict.fromkeys(value))
+
+    @field_validator("cursor")
+    @classmethod
+    def _validate_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("cursor must not be empty")
+        return normalized
+
+
 class MemorySearchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -3163,6 +3231,50 @@ def create_admin_app(
         total = await db.count_memories()
 
         return MemoryStatsResponse(by_type=by_type, by_status=by_status, total=total)
+
+    @memory_router.post("/recent")
+    async def list_recent_memories(
+        req: RecentMemoryListRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        """List current Memories in one resolved half-open time window."""
+        from memforge.storage.adapters.context import AccessScope
+
+        try:
+            engine = await get_search_engine(request, db, config)
+            user_id = resolve_request_principal(request)
+            if req.source_ids:
+                available = await db.list_searchable_source_ids_for_user(req.source_ids, user_id)
+                if any(source_id not in available for source_id in req.source_ids):
+                    raise HTTPException(status_code=400, detail="unknown_or_unavailable_source_id")
+            result = await engine.list_recent_memories(
+                source_filter=(
+                    MemorySourceFilter(source_ids=tuple(req.source_ids))
+                    if req.source_ids
+                    else None
+                ),
+                time_range=req.time_range.to_time_range(),
+                memory_types=req.memory_types,
+                page_size=req.page_size,
+                cursor=req.cursor,
+                request_scope=AccessScope(
+                    user_id=user_id,
+                    include_private=req.include_private,
+                    allowed_statuses=("active",),
+                    active_project=None,
+                    scope_mode="workspace",
+                ),
+            )
+            return _json_ready(result)
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.warning("Recent-memory listing failed: %s", exc, exc_info=True)
+            raise HTTPException(status_code=503, detail=f"Recent-memory listing unavailable: {exc}") from exc
 
     @memory_router.post("/search")
     async def search_memories(

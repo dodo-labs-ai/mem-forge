@@ -9,6 +9,7 @@ must not be edited independently.
 from __future__ import annotations
 
 import base64
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -64,7 +65,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.36"
+SERVER_VERSION = "0.1.37"
 SERVER_INSTRUCTIONS = (
     "Repository context is optional. For search and create_memory, when the coding host exposes "
     "an exact current working directory, pass it as repository_context.working_directory. Never "
@@ -99,6 +100,16 @@ TIME_RANGE_ALLOWED_KEYS = frozenset({"date_type", "start_date", "end_date"})
 DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SEARCH_TOP_K_MIN = 1
 SEARCH_TOP_K_MAX = 50
+RECENT_MEMORY_ALLOWED_KEYS = frozenset(
+    {
+        "source_ids",
+        "time_range",
+        "memory_types",
+        "page_size",
+        "cursor",
+    }
+)
+RECENT_MEMORY_TYPES = frozenset({"fact", "decision", "convention", "procedure"})
 MAX_DEFERRED_TOOL_CALLS = 32
 _CLIENT_SUPPORTS_ROOTS = False
 _PENDING_ROOTS_REQUEST_ID: str | None = None
@@ -131,12 +142,12 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "search",
         "description": (
-            "Search memories visible to the current principal. For source-specific requests, "
-            "call list_sources first and pass its exact source_ids. For broad or cross-source "
-            "requests, omit source_filter; use time_range only when explicitly requested. Never "
-            "guess source IDs. Omit query only for deterministic source/time listings, and "
-            "paginate those with total_candidates and offset. Ranked queries are not exhaustive. "
-            "Call get_memory for provenance and source evidence."
+            "Search visible Memories. For source-specific requests, call list_sources first and "
+            "pass exact source_ids; never guess IDs. For broad or cross-source requests, omit "
+            "source_filter; use time_range only when explicitly requested. Use list_recent_memories "
+            "for deterministic source/time listings. Queryless compatibility uses total_candidates "
+            "and offset; never invent filler queries like 'updates'. Ranked queries are not "
+            "exhaustive. Call get_memory for provenance."
         ),
         "inputSchema": {
             "type": "object",
@@ -242,6 +253,80 @@ TOOLS: list[dict[str, Any]] = [
                     ),
                 },
             },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "list_recent_memories",
+        "description": (
+            "List current Memories deterministically within an explicit half-open time window. "
+            "This is a current-state view, not a source changelog: it does not report deleted or "
+            "superseded historical states. Do not supply or invent a query. Resolve named sources "
+            "with list_sources, pass timezone-qualified timestamps, and follow next_cursor."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "items": {"type": "string", "minLength": 1},
+                    "description": (
+                        "Optional exact source IDs returned by list_sources. Omit for all visible active sources."
+                    ),
+                },
+                "time_range": {
+                    "type": "object",
+                    "description": (
+                        "Required half-open [start_at, end_at) window. Timestamps must include "
+                        "an explicit UTC offset; the response reports the resolved UTC window."
+                    ),
+                    "properties": {
+                        "date_type": {
+                            "type": "string",
+                            "enum": ["source_updated_at", "memory_updated_at"],
+                            "default": "source_updated_at",
+                        },
+                        "start_at": {
+                            "type": "string",
+                            "format": "date-time",
+                            "description": "Inclusive RFC 3339 timestamp with an explicit UTC offset.",
+                        },
+                        "end_at": {
+                            "type": "string",
+                            "format": "date-time",
+                            "description": "Exclusive RFC 3339 timestamp with an explicit UTC offset.",
+                        },
+                    },
+                    "required": ["start_at", "end_at"],
+                    "additionalProperties": False,
+                },
+                "memory_types": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "enum": ["fact", "decision", "convention", "procedure"],
+                    },
+                    "description": "Optional exact current Memory types.",
+                },
+                "page_size": {
+                    "type": "integer",
+                    "default": 50,
+                    "minimum": 1,
+                    "maximum": 50,
+                },
+                "cursor": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "Opaque continuation cursor from the preceding page. Reuse the same filters and window."
+                    ),
+                },
+            },
+            "required": ["time_range"],
             "additionalProperties": False,
         },
     },
@@ -595,6 +680,12 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         except ValueError as exc:
             return {"error": str(exc)}
         return _compact_search_response(_http_json("POST", "/memories/search", body))
+    if name == "list_recent_memories":
+        try:
+            body = _recent_memory_args(args)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return _compact_recent_memories_response(_http_json("POST", "/memories/recent", body))
     if name == "list_sources":
         if args:
             return {"error": "list_sources does not accept parameters"}
@@ -798,6 +889,69 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
+def _recent_memory_args(args: dict[str, Any]) -> dict[str, Any]:
+    unknown = sorted(set(args) - RECENT_MEMORY_ALLOWED_KEYS)
+    if unknown:
+        raise ValueError("Unsupported list_recent_memories parameter(s): " + ", ".join(unknown))
+    body = dict(args)
+    source_ids = body.get("source_ids")
+    if source_ids is not None:
+        if not isinstance(source_ids, list) or not source_ids or not all(
+            isinstance(source_id, str) and source_id.strip() for source_id in source_ids
+        ):
+            raise ValueError("source_ids must be a non-empty array of source IDs from list_sources")
+        body["source_ids"] = list(dict.fromkeys(source_id.strip() for source_id in source_ids))
+    memory_types = body.get("memory_types")
+    if memory_types is not None:
+        if not isinstance(memory_types, list) or not memory_types or not all(
+            isinstance(memory_type, str) and memory_type in RECENT_MEMORY_TYPES
+            for memory_type in memory_types
+        ):
+            raise ValueError("memory_types must contain fact, decision, convention, or procedure")
+        body["memory_types"] = list(dict.fromkeys(memory_types))
+    if "page_size" in body:
+        body["page_size"] = _required_bounded_int_arg(
+            body,
+            "page_size",
+            minimum=SEARCH_TOP_K_MIN,
+            maximum=SEARCH_TOP_K_MAX,
+        )
+    if "cursor" in body:
+        body["cursor"] = _required_string_arg(body, "cursor")
+    body["time_range"] = _validate_recent_time_range(body.get("time_range"))
+    body["include_private"] = True
+    return body
+
+
+def _validate_recent_time_range(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("time_range is required")
+    unknown = sorted(set(value) - {"date_type", "start_at", "end_at"})
+    if unknown:
+        raise ValueError("Unsupported time_range parameter(s): " + ", ".join(unknown))
+    date_type = value.get("date_type", "source_updated_at")
+    if date_type not in {"source_updated_at", "memory_updated_at"}:
+        raise ValueError("time_range.date_type must be source_updated_at or memory_updated_at")
+    parsed: dict[str, datetime] = {}
+    normalized: dict[str, str] = {"date_type": date_type}
+    for key in ("start_at", "end_at"):
+        item = value.get(key)
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"time_range.{key} is required")
+        text = item.strip()
+        try:
+            instant = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"time_range.{key} must be an RFC 3339 timestamp") from exc
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError(f"time_range.{key} must include an explicit UTC offset")
+        parsed[key] = instant
+        normalized[key] = text
+    if parsed["start_at"] >= parsed["end_at"]:
+        raise ValueError("time_range.start_at must be before end_at")
+    return normalized
+
+
 def _validate_search_entities(entities: Any) -> list[str]:
     error = "entities must be an array of 1-8 strings, each 1-128 characters after trimming"
     if not isinstance(entities, list):
@@ -974,6 +1128,45 @@ def _compact_search_response(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(total, int) and isinstance(limit, int) and isinstance(offset, int):
             compact["has_more"] = offset + limit < total
 
+    return compact
+
+
+def _compact_recent_memories_response(payload: dict[str, Any]) -> dict[str, Any]:
+    if "error" in payload:
+        return payload
+    compact: dict[str, Any] = {}
+    results = payload.get("results")
+    if isinstance(results, list):
+        compact["results"] = [
+            _compact_recent_memory_result(result)
+            for result in results
+            if isinstance(result, dict)
+        ]
+    for key in (
+        "result_kind",
+        "is_changelog",
+        "time_field",
+        "resolved_window",
+        "listing_watermark",
+        "cursor_kind",
+        "consistency",
+        "total_candidates",
+        "candidate_count_kind",
+        "count_scope",
+        "limit",
+        "has_more",
+        "next_cursor",
+    ):
+        if key in payload:
+            compact[key] = payload[key]
+    return compact
+
+
+def _compact_recent_memory_result(result: dict[str, Any]) -> dict[str, Any]:
+    compact = _compact_search_result(result)
+    compact.pop("relevance_score", None)
+    if "matched_at" in result:
+        compact["matched_at"] = result["matched_at"]
     return compact
 
 

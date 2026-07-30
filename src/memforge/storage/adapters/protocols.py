@@ -80,6 +80,23 @@ class KeywordCandidate:
     matched_text: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class RecentMemoryItem:
+    """One deterministically ordered current Memory in a recent listing."""
+
+    memory_id: str
+    sort_at: datetime
+
+
+@dataclass(frozen=True)
+class RecentMemoryPage:
+    """Exact current-Memory page below one retrieval-owned watermark."""
+
+    items: tuple[RecentMemoryItem, ...]
+    total_count: int
+    has_more: bool
+
+
 @dataclass(frozen=True, slots=True)
 class ActiveMemorySupportState:
     """All active assertions plus the current-revision subset."""
@@ -692,7 +709,19 @@ class RelationalStore(Protocol):
         *,
         limit: int,
         offset: int,
+        memory_types: Sequence[str] = (),
     ) -> tuple[list[str], int]: ...
+    async def list_recent_memory_ids(
+        self,
+        source_filter: MemorySourceFilter,
+        time_range: MemoryTimeRange,
+        scope: AccessScope,
+        *,
+        memory_types: Sequence[str],
+        listing_watermark: datetime,
+        after: RecentMemoryItem | None,
+        limit: int,
+    ) -> RecentMemoryPage: ...
     async def fetch_ranking_metadata(self, ids: Sequence[str]) -> Mapping[str, RankingMetadata]: ...
     async def graph_search(
         self,
