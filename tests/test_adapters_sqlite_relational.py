@@ -1066,9 +1066,22 @@ async def test_recent_memory_listing_excludes_paused_sources_before_pagination(d
         after=None,
         limit=10,
     )
+    compatibility_ids, compatibility_total = await store.list_ids_by_source_and_time(
+        None,
+        MemoryTimeRange(
+            after=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            before=datetime(2026, 7, 28, tzinfo=timezone.utc),
+            date_type="source_updated_at",
+        ),
+        _scope(),
+        limit=10,
+        offset=0,
+    )
 
     assert [item.memory_id for item in page.items] == ["m-active-source"]
     assert page.total_count == 1
+    assert compatibility_ids == ["m-active-source"]
+    assert compatibility_total == 1
 
 
 @pytest.mark.asyncio

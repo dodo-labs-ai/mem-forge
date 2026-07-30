@@ -3109,6 +3109,21 @@ class ProjectionBatchRecordingExtractor(RecordingMemoryExtractor):
         return MemoryExtractionResult(memories=[])
 
 
+class FailingDiffThenStructuralExtractor(ProjectionBatchRecordingExtractor):
+    def __init__(self, *, raise_error: bool) -> None:
+        super().__init__()
+        self.raise_error = raise_error
+
+    async def extract_memory_changes(self, **kwargs):
+        self.change_calls.append(kwargs)
+        if self.raise_error:
+            raise RuntimeError("provider unavailable")
+        return MemoryExtractionResult(
+            error_type="structured_llm_error",
+            metadata={"safe_error_code": "invalid_response"},
+        )
+
+
 class ProjectionBatchCandidateExtractor(ProjectionBatchRecordingExtractor):
     async def extract_projection_batch_memories(self, batch, **kwargs):
         del kwargs
@@ -9725,6 +9740,66 @@ async def test_single_observation_small_diff_uses_diff_guided_derivation_with_pr
     assert extractor.projection_calls == []
     assert extractor.full_calls == []
     assert extractor.unit_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raise_error", [False, True])
+async def test_failed_diff_guided_derivation_falls_back_to_durable_structural_work(
+    db: Database,
+    raise_error: bool,
+) -> None:
+    source_id = f"src-diff-derivation-fallback-{raise_error}"
+    old_markdown = "# Design Doc\n\nThe service uses PostgreSQL 14."
+    new_markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
+    doc_store = StubDocumentStore()
+    normalized_content_uri = doc_store.store_normalized(
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=old_markdown,
+    )
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=old_markdown,
+        version="1",
+        normalized_content_uri=normalized_content_uri,
+    )
+    extractor = FailingDiffThenStructuralExtractor(raise_error=raise_error)
+    memory_engine = RecordingMemoryEngine()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        memory_extractor=extractor,
+        memory_engine=memory_engine,
+        memory_store=_audited_memory_store(db),
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UpdatingDocumentGene(new_markdown),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    attempts = await db.list_source_derivation_attempts(source_id=source_id)
+    assert state.last_sync_status == "success"
+    assert len(extractor.change_calls) == 1
+    assert len(extractor.unit_calls) == 1
+    assert extractor.projection_calls == []
+    assert extractor.full_calls == []
+    assert [attempt.context.work_strategy for attempt in attempts] == [
+        "auto",
+        "structural",
+    ]
+    assert [attempt.status for attempt in attempts] == [
+        "superseded",
+        "applied",
+    ]
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    assert memory_engine.projected_lifecycle_calls[0]["update_mode"] == "diff_guided"
 
 
 @pytest.mark.asyncio

@@ -1382,19 +1382,22 @@ class SqliteRelationalStore:
             clauses=clauses,
             params=params,
         )
+        if has_source_row_join:
+            joins.append("JOIN sources s ON s.id = ms.source_id AND s.status = 'active'")
         if memory_types:
             placeholders = ", ".join("?" for _ in memory_types)
             clauses.append(f"m.memory_type IN ({placeholders})")
             params.extend(memory_types)
         if has_source_row_join and disabled_source_ids:
             placeholders = ", ".join("?" for _ in disabled_source_ids)
-            clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({placeholders}))")
+            clauses.append(f"ms.source_id NOT IN ({placeholders})")
             params.extend(disabled_source_ids)
-        else:
-            source_visibility_sql, source_visibility_params = _enabled_source_visibility_condition(disabled_source_ids)
-            if source_visibility_sql:
-                clauses.append(source_visibility_sql)
-                params.extend(source_visibility_params)
+        elif not has_source_row_join:
+            source_visibility_sql, source_visibility_params = _current_source_visibility_condition(
+                disabled_source_ids
+            )
+            clauses.append(source_visibility_sql)
+            params.extend(source_visibility_params)
         join_sql = " ".join(joins)
         where_sql = " AND ".join(clauses)
         group_sql = "GROUP BY m.id" if joins else ""
