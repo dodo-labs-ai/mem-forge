@@ -775,6 +775,40 @@ class SourceSyncWorker:
         max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
         self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
         self._relation_runtime: SyncRuntime | None = None
+        self._vector_runtime: SyncRuntime | None = None
+
+    async def process_lifecycle_vector_delivery_once(self) -> bool:
+        """Process one bounded durable vector-outbox slice while the worker is idle."""
+
+        try:
+            from memforge.memory.store import LIFECYCLE_VECTOR_DELIVERY_MAX_ATTEMPTS
+
+            pending = await self.db.list_ready_lifecycle_vector_tasks(
+                limit=1,
+                max_attempts=LIFECYCLE_VECTOR_DELIVERY_MAX_ATTEMPTS,
+            )
+            if not pending:
+                return False
+            if self._vector_runtime is None:
+                self._vector_runtime = await self.runtime_provider.build_sync_runtime(
+                    self.db,
+                    self.config,
+                    extraction_pool=self._extraction_pool,
+                    document_lifecycle_admission=self._document_lifecycle_admission,
+                )
+            result = await self._vector_runtime.memory_store.attempt_lifecycle_vector_delivery()
+            if result.attempted_tasks:
+                logger.info(
+                    "Lifecycle vector slice attempted=%d delivered=%d failed=%d pending=%s",
+                    result.attempted_tasks,
+                    result.delivered_tasks,
+                    result.failed_tasks,
+                    result.pending,
+                )
+            return bool(result.attempted_tasks)
+        except Exception:
+            logger.exception("Lifecycle vector worker slice failed")
+            return False
 
     async def _process_relation_discovery_once(self) -> bool:
         try:
@@ -953,6 +987,7 @@ class SourceSyncWorker:
             lease_seconds=self.lease_seconds,
         )
         if run is None:
+            await self.process_lifecycle_vector_delivery_once()
             await self._process_relation_discovery_once()
             return None
 
@@ -1174,6 +1209,7 @@ class SourceSyncWorker:
             if run is not None:
                 # Fairly interleave one bounded non-destructive slice even while
                 # source-sync work remains continuously available.
+                await self.process_lifecycle_vector_delivery_once()
                 await self._process_relation_discovery_once()
             await asyncio.sleep(0 if run is not None else interval)
 

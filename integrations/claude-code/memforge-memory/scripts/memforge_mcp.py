@@ -64,7 +64,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.35"
+SERVER_VERSION = "0.1.36"
 SERVER_INSTRUCTIONS = (
     "Repository context is optional. For search and create_memory, when the coding host exposes "
     "an exact current working directory, pass it as repository_context.working_directory. Never "
@@ -99,9 +99,11 @@ TIME_RANGE_ALLOWED_KEYS = frozenset({"date_type", "start_date", "end_date"})
 DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SEARCH_TOP_K_MIN = 1
 SEARCH_TOP_K_MAX = 50
+MAX_DEFERRED_TOOL_CALLS = 32
 _CLIENT_SUPPORTS_ROOTS = False
 _PENDING_ROOTS_REQUEST_ID: str | None = None
 _CLIENT_ROOT_PATHS: list[str] = []
+_DEFERRED_TOOL_CALLS: list[tuple[Any, str, dict[str, Any]]] = []
 
 REPOSITORY_CONTEXT_SCHEMA = {
     "type": "object",
@@ -521,17 +523,18 @@ def main() -> int:
             return 0
         message, transport = envelope
         response = _handle_rpc_message(message)
-        if response is not None:
-            _write_message(response, transport)
+        responses = response if isinstance(response, list) else [response]
+        for item in responses:
+            if item is not None:
+                _write_message(item, transport)
 
 
-def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | None:
+def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | list[dict[str, Any]] | None:
     method = message.get("method")
     request_id = message.get("id")
     try:
         if method is None:
-            _handle_rpc_response(message)
-            return None
+            return _handle_rpc_response(message)
         if method == "initialize":
             _record_client_capabilities(message)
             result = {
@@ -558,14 +561,30 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | None:
             params = message.get("params") if isinstance(message.get("params"), dict) else {}
             name = str(params.get("name") or "")
             arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-            payload = _call_tool(name, arguments)
-            return _rpc_result(request_id, _tool_result(payload))
+            if _PENDING_ROOTS_REQUEST_ID is not None:
+                if len(_DEFERRED_TOOL_CALLS) >= MAX_DEFERRED_TOOL_CALLS:
+                    return _rpc_error(
+                        request_id,
+                        -32001,
+                        "Workspace context is still resolving; retry the tool call.",
+                    )
+                _DEFERRED_TOOL_CALLS.append((request_id, name, arguments))
+                return None
+            return _tool_call_response(request_id, name, arguments)
         if request_id is None:
             return None
         return _rpc_error(request_id, -32601, f"Method not found: {method}")
     except Exception as exc:  # pragma: no cover - defensive MCP boundary
         if request_id is None:
             return None
+        return _rpc_error(request_id, -32603, f"Internal error: {exc}")
+
+
+def _tool_call_response(request_id: Any, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        payload = _call_tool(name, arguments)
+        return _rpc_result(request_id, _tool_result(payload))
+    except Exception as exc:  # pragma: no cover - defensive MCP boundary
         return _rpc_error(request_id, -32603, f"Internal error: {exc}")
 
 
@@ -859,6 +878,7 @@ def _record_client_capabilities(message: dict[str, Any]) -> None:
     _CLIENT_SUPPORTS_ROOTS = isinstance(capabilities.get("roots"), dict)
     _PENDING_ROOTS_REQUEST_ID = None
     _CLIENT_ROOT_PATHS = []
+    _DEFERRED_TOOL_CALLS.clear()
 
 
 def _request_client_roots() -> dict[str, Any]:
@@ -867,18 +887,24 @@ def _request_client_roots() -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": ROOTS_LIST_REQUEST_ID, "method": "roots/list"}
 
 
-def _handle_rpc_response(message: dict[str, Any]) -> None:
+def _handle_rpc_response(message: dict[str, Any]) -> list[dict[str, Any]] | None:
     global _PENDING_ROOTS_REQUEST_ID, _CLIENT_ROOT_PATHS
     if message.get("id") != _PENDING_ROOTS_REQUEST_ID:
-        return
+        return None
     _PENDING_ROOTS_REQUEST_ID = None
     error = message.get("error")
     if isinstance(error, dict):
         _CLIENT_ROOT_PATHS = []
-        return
-    result = message.get("result") if isinstance(message.get("result"), dict) else {}
-    roots = result.get("roots") if isinstance(result.get("roots"), list) else []
-    _CLIENT_ROOT_PATHS = [path for item in roots if (path := _root_path(item))]
+    else:
+        result = message.get("result") if isinstance(message.get("result"), dict) else {}
+        roots = result.get("roots") if isinstance(result.get("roots"), list) else []
+        _CLIENT_ROOT_PATHS = [path for item in roots if (path := _root_path(item))]
+    deferred = tuple(_DEFERRED_TOOL_CALLS)
+    _DEFERRED_TOOL_CALLS.clear()
+    return [
+        _tool_call_response(request_id, name, arguments)
+        for request_id, name, arguments in deferred
+    ] or None
 
 
 def _root_path(item: Any) -> str | None:

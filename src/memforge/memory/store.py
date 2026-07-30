@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from itertools import zip_longest
 from typing import Any, Sequence
@@ -68,6 +68,10 @@ DEDUP_CANDIDATE_LIMIT = 10
 AGENT_CLAIM_RECONCILE_LIMIT = 10
 AGENT_CLAIM_RECONCILE_SIMILARITY_FLOOR = 0.85
 LIFECYCLE_VECTOR_DELIVERY_BATCH_SIZE = 100
+LIFECYCLE_VECTOR_DELIVERY_MAX_ATTEMPTS = 5
+LIFECYCLE_VECTOR_RETRY_BASE_SECONDS = 5.0
+LIFECYCLE_VECTOR_RETRY_MAX_SECONDS = 300.0
+LIFECYCLE_VECTOR_TARGET_STABILITY_ATTEMPTS = 3
 
 
 def _writer_access_scope(memory: Memory) -> AccessScope:
@@ -317,10 +321,11 @@ class MemoryStore:
 
         scope = lifecycle_plan_id or source_id or "all"
         try:
-            tasks = await self.relational.list_lifecycle_vector_tasks(
+            tasks = await self.relational.list_ready_lifecycle_vector_tasks(
                 source_id=source_id,
                 lifecycle_plan_id=lifecycle_plan_id,
                 limit=LIFECYCLE_VECTOR_DELIVERY_BATCH_SIZE + 1,
+                max_attempts=LIFECYCLE_VECTOR_DELIVERY_MAX_ATTEMPTS,
             )
         except Exception as exc:
             logger.warning(
@@ -340,34 +345,24 @@ class MemoryStore:
         error_types: list[str] = []
         for task in selected_tasks:
             try:
-                if task.operation is LifecycleVectorOperation.DELETE:
-                    await self.vector.delete([task.memory_id])
-                else:
-                    memory = await self.relational.get_memory(task.memory_id)
-                    if memory is None or memory.status != MemoryStatus.ACTIVE.value:
-                        raise ValueError(f"active lifecycle Memory missing: {task.memory_id}")
-                    indexed_text = await self._canonical_memory_embedding_text(memory)
-                    indexed_embedding = await self._embed(indexed_text)
-                    sources = await self.relational.get_memory_sources(memory.id)
-                    await self.vector.upsert(
-                        ids=[memory.id],
-                        embeddings=[indexed_embedding],
-                        metadatas=[
-                            _memory_metadata(
-                                memory,
-                                embedding_text_hash=embedding_text_hash(indexed_text),
-                                extra={
-                                    "source_doc_id": sources[0].doc_id if sources else "",
-                                },
-                            )
-                        ],
-                    )
+                await self._reconcile_lifecycle_vector_target(task.memory_id)
                 await self.relational.complete_lifecycle_vector_task(task.id)
                 delivered_tasks += 1
             except Exception as exc:
                 error_types.append(type(exc).__name__)
+                retry_delay = min(
+                    LIFECYCLE_VECTOR_RETRY_MAX_SECONDS,
+                    LIFECYCLE_VECTOR_RETRY_BASE_SECONDS * (2 ** max(0, task.attempts)),
+                )
+                next_attempt_at = (
+                    datetime.now(timezone.utc) + timedelta(seconds=retry_delay)
+                ).isoformat()
                 try:
-                    await self.relational.fail_lifecycle_vector_task(task.id, str(exc))
+                    await self.relational.fail_lifecycle_vector_task(
+                        task.id,
+                        str(exc),
+                        next_attempt_at=next_attempt_at,
+                    )
                 except Exception as persistence_exc:
                     error_types.append(type(persistence_exc).__name__)
                     logger.warning(
@@ -419,6 +414,46 @@ class MemoryStore:
             failed_tasks=failed_tasks,
             error_types=tuple(dict.fromkeys(error_types)),
         )
+
+    async def _current_lifecycle_vector_projection(
+        self,
+        memory_id: str,
+    ) -> tuple[str, str | None, dict[str, Any] | None]:
+        """Describe the vector projection required by current relational truth."""
+
+        memory = await self.relational.get_memory(memory_id)
+        if memory is None or memory.status != MemoryStatus.ACTIVE.value:
+            return (LifecycleVectorOperation.DELETE.value, None, None)
+        indexed_text = await self._canonical_memory_embedding_text(memory)
+        sources = await self.relational.get_memory_sources(memory.id)
+        return (
+            LifecycleVectorOperation.UPSERT.value,
+            indexed_text,
+            _memory_metadata(
+                memory,
+                embedding_text_hash=embedding_text_hash(indexed_text),
+                extra={"source_doc_id": sources[0].doc_id if sources else ""},
+            ),
+        )
+
+    async def _reconcile_lifecycle_vector_target(self, memory_id: str) -> None:
+        """Materialize one Memory from current truth and close transition races."""
+
+        for _ in range(LIFECYCLE_VECTOR_TARGET_STABILITY_ATTEMPTS):
+            projection = await self._current_lifecycle_vector_projection(memory_id)
+            operation, indexed_text, metadata = projection
+            if operation == LifecycleVectorOperation.DELETE.value:
+                await self.vector.delete([memory_id])
+            else:
+                assert indexed_text is not None and metadata is not None
+                await self.vector.upsert(
+                    ids=[memory_id],
+                    embeddings=[await self._embed(indexed_text)],
+                    metadatas=[metadata],
+                )
+            if await self._current_lifecycle_vector_projection(memory_id) == projection:
+                return
+        raise RuntimeError("lifecycle vector target changed during bounded delivery")
 
     # -------------------------------------------------------------------
     # Core: Deduplicate and Insert
