@@ -1079,11 +1079,38 @@ class SqliteRelationalStore:
             limit=limit,
         )
 
+    async def list_ready_lifecycle_vector_tasks(
+        self,
+        *,
+        source_id: str | None = None,
+        lifecycle_plan_id: str | None = None,
+        limit: int = 100,
+        max_attempts: int,
+        now: str | None = None,
+    ) -> list[LifecycleVectorTask]:
+        return await self._db.list_ready_lifecycle_vector_tasks(
+            source_id=source_id,
+            lifecycle_plan_id=lifecycle_plan_id,
+            limit=limit,
+            max_attempts=max_attempts,
+            now=now,
+        )
+
     async def complete_lifecycle_vector_task(self, task_id: str) -> None:
         await self._db.complete_lifecycle_vector_task(task_id)
 
-    async def fail_lifecycle_vector_task(self, task_id: str, error: str) -> None:
-        await self._db.fail_lifecycle_vector_task(task_id, error)
+    async def fail_lifecycle_vector_task(
+        self,
+        task_id: str,
+        error: str,
+        *,
+        next_attempt_at: str | None = None,
+    ) -> None:
+        await self._db.fail_lifecycle_vector_task(
+            task_id,
+            error,
+            next_attempt_at=next_attempt_at,
+        )
 
     async def lease_relation_discovery_work(
         self,
