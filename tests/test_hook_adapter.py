@@ -899,9 +899,9 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
-def test_packaged_plugin_version_0_1_34_is_consistent():
+def test_packaged_plugin_version_0_1_35_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.34"
+    version = "0.1.35"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
@@ -2941,6 +2941,7 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
                 "content_url": "/api/documents/jira-SFPAY-179397/content",
                 "pdf_url": None,
                 "source_updated_at": "2026-07-02T03:50:32+00:00",
+                "excerpt": "large excerpt",
             }
         ],
     }
@@ -3153,7 +3154,7 @@ def test_mcp_proxy_fetches_resource_through_hosted_workspace(monkeypatch):
     assert captured["authorization"] == "Bearer token-123"
 
 
-def test_mcp_proxy_compacts_evidence_artifacts_on_get_memory(monkeypatch):
+def test_mcp_proxy_preserves_claim_local_evidence_on_get_memory(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     artifact = {
         "artifact_id": "artifact-1",
@@ -3177,12 +3178,32 @@ def test_mcp_proxy_compacts_evidence_artifacts_on_get_memory(monkeypatch):
             "id": "mem-1",
             "memory_type": "fact",
             "content": "A visual claim",
+            "sources": [
+                {
+                    "doc_id": "doc-1",
+                    "source_type": "github",
+                    "support_kind": "extracted",
+                    "doc_title": "Architecture",
+                    "excerpt": "The request flow is gateway then worker.",
+                    "content_url": "/api/documents/doc-1/content",
+                }
+            ],
             "evidence_artifacts": [artifact],
         },
     )
 
     result = proxy._call_tool("get_memory", {"memory_id": "mem-1"})
 
+    assert result["sources"] == [
+        {
+            "doc_id": "doc-1",
+            "source_type": "github",
+            "support_kind": "extracted",
+            "doc_title": "Architecture",
+            "excerpt": "The request flow is gateway then worker.",
+            "content_url": "/api/documents/doc-1/content",
+        }
+    ]
     assert result["evidence_artifacts"] == [
         {
             "summary": "Architecture diagram showing the request flow.",
