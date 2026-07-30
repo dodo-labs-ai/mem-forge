@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Literal, Protocol
 
@@ -121,6 +121,7 @@ class SourceUnitDerivationContext:
     user_id: str | None
     source_activity_epoch: int | None
     current_changed_ranges: tuple[tuple[int, int], ...] = ()
+    work_strategy: Literal["auto", "structural"] = "auto"
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +169,11 @@ class SourceDerivationStore(Protocol):
         batch_id: str,
         result: MemoryExtractionResult,
     ) -> SourceDerivationAttempt: ...
+
+    async def supersede_source_derivation(
+        self,
+        derivation_id: str,
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,7 +230,15 @@ class SourceUnitDeriver:
         async def extract_and_persist(
             batch: SourceDerivationBatch,
         ) -> MemoryExtractionResult:
-            result = await request.extract_batch(batch)
+            try:
+                result = await request.extract_batch(batch)
+            except Exception as exc:
+                if not isinstance(batch, DiffGuidedExtractionBatch):
+                    raise
+                result = MemoryExtractionResult(
+                    error_type="diff_guided_extraction_error",
+                    metadata={"safe_error_code": type(exc).__name__},
+                )
             await self._store.record_source_derivation_batch_result(
                 derivation_id=derivation.id,
                 batch_id=batch.id,
@@ -259,6 +273,29 @@ class SourceUnitDeriver:
             "reused_derivation_batch_count": len(completed_results),
             "executed_derivation_batch_count": len(pending_batches),
         }
+        if (
+            request.context.work_strategy == "auto"
+            and len(batches) == 1
+            and isinstance(batches[0], DiffGuidedExtractionBatch)
+            and extraction.error_type
+        ):
+            fallback = await self.derive(
+                replace(
+                    request,
+                    context=replace(
+                        request.context,
+                        work_strategy="structural",
+                    ),
+                )
+            )
+            fallback.extraction.metadata = {
+                **fallback.extraction.metadata,
+                "diff_guided_fallback": True,
+                "failed_diff_derivation_count": 1,
+            }
+            if not fallback.extraction.error_type:
+                await self._store.supersede_source_derivation(derivation.id)
+            return fallback
         structural_batches = tuple(batch for batch in batches if isinstance(batch, StructuralExtractionBatch))
         if structural_batches:
             units = tuple(batch.context.unit for batch in structural_batches)
@@ -311,7 +348,11 @@ def plan_source_derivation_work(
     if changed_observation_ids != {observation.id}:
         return projection_batches
 
-    if context.update_mode != "diff_guided" or not context.changed_hunks:
+    if (
+        context.work_strategy == "structural"
+        or context.update_mode != "diff_guided"
+        or not context.changed_hunks
+    ):
         policy = UnitizationPolicy()
         units = unitize_markdown(
             context.document_content,
@@ -444,6 +485,7 @@ def source_unit_derivation_context_to_payload(
         "user_id": context.user_id,
         "source_activity_epoch": context.source_activity_epoch,
         "current_changed_ranges": [[start, end] for start, end in context.current_changed_ranges],
+        "work_strategy": context.work_strategy,
     }
 
 
@@ -557,6 +599,11 @@ def source_unit_derivation_context_from_payload(
             (int(value[0]), int(value[1]))
             for value in payload.get("current_changed_ranges", [])
             if isinstance(value, list) and len(value) == 2
+        ),
+        work_strategy=(
+            "structural"
+            if payload.get("work_strategy") == "structural"
+            else "auto"
         ),
     )
 
@@ -786,6 +833,8 @@ def _derivation_context_identity_payload(
     document = context_payload.get("document")
     if not isinstance(document, Mapping):
         raise ValueError("Source derivation context has no Document snapshot")
+    # work_strategy is an operational fallback choice. Batch input hashes
+    # distinguish its manifest without changing the lifecycle context identity.
     return {
         "doc_id": document.get("doc_id"),
         "source": document.get("source"),
