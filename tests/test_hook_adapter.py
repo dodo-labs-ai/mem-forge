@@ -899,9 +899,9 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
-def test_packaged_plugin_version_0_1_35_is_consistent():
+def test_packaged_plugin_version_0_1_36_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.35"
+    version = "0.1.36"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
@@ -1106,6 +1106,106 @@ MEMFORGE_WORKSPACE_ID = "user_workspace"
     )
 
 
+def test_mcp_tool_call_waits_for_pending_roots_before_selecting_workspace(monkeypatch, tmp_path):
+    proxy = _load_plugin_mcp_proxy()
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / ".git").mkdir()
+    local_config = repository / ".memforge" / "config.toml"
+    local_config.parent.mkdir()
+    local_config.write_text('[memforge]\nworkspace_id = "repository_workspace"\n', encoding="utf-8")
+    captured_urls: list[str] = []
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __init__(self, payload: dict) -> None:
+            self.payload = json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return self.payload
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured_urls.append(request.full_url)
+            if request.full_url.endswith("/sources/searchable"):
+                return FakeResponse({"data": []})
+            return FakeResponse({"results": []})
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example.hana.ondemand.com")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "process_workspace")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    initialize = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"roots": {"listChanged": True}},
+                "clientInfo": {"name": "test"},
+            },
+        }
+    )
+    assert initialize["result"]["serverInfo"]["name"] == "memforge"
+    roots_request = proxy._handle_rpc_message(
+        {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    )
+    assert roots_request["method"] == "roots/list"
+
+    deferred = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "list_sources", "arguments": {}},
+        }
+    )
+
+    assert deferred is None
+    assert captured_urls == []
+
+    resumed = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": roots_request["id"],
+            "result": {"roots": [{"uri": repository.as_uri(), "name": repository.name}]},
+        }
+    )
+    search_response = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {
+                    "query": "workspace routing",
+                    "repository_context": {"working_directory": str(repository)},
+                },
+            },
+        }
+    )
+
+    assert isinstance(resumed, list)
+    assert [response["id"] for response in resumed] == [2]
+    assert "result" in resumed[0]
+    assert "result" in search_response
+    base = "https://cloud.example.hana.ondemand.com/api/workspaces/repository_workspace/api"
+    assert captured_urls == [
+        f"{base}/sources/searchable",
+        f"{base}/memories/search",
+    ]
+
+
 def test_invalid_hook_target_fails_before_urlopen(monkeypatch):
     from memforge import hook_adapter
 
@@ -1168,6 +1268,63 @@ def test_mcp_proxy_starts_without_memforge_executable():
     assert response["result"]["serverInfo"]["name"] == "memforge"
     assert response["result"]["serverInfo"]["version"] == manifest["version"]
     assert response["result"]["capabilities"]["tools"]["listChanged"] is False
+
+
+def test_packaged_mcp_emits_deferred_tool_response_after_roots_response(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    proxy = root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_mcp.py"
+    messages = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"roots": {"listChanged": True}},
+                "clientInfo": {"name": "test"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "unknown_tool", "arguments": {}},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "memforge-roots-list-1",
+            "result": {"roots": [{"uri": tmp_path.as_uri(), "name": "test"}]},
+        },
+    ]
+    frames = b"".join(
+        b"Content-Length: "
+        + str(len(payload)).encode()
+        + b"\r\n\r\n"
+        + payload
+        for message in messages
+        if (payload := json.dumps(message).encode())
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(proxy)],
+        input=frames,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == b""
+    responses = _mcp_content_length_messages(result.stdout)
+    assert [(response.get("method"), response.get("id")) for response in responses] == [
+        (None, 1),
+        ("roots/list", "memforge-roots-list-1"),
+        (None, 2),
+    ]
+    tool_payload = json.loads(responses[-1]["result"]["content"][0]["text"])
+    assert tool_payload == {"error": "Unknown tool: unknown_tool"}
 
 
 @pytest.mark.parametrize("client", ["codex", "claude-code"])

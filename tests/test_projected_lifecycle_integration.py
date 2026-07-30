@@ -3296,6 +3296,43 @@ async def test_source_rebaseline_preserves_failed_vector_cleanup_for_retry(db: D
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_vector_retry_respects_durable_backoff_and_completion_is_idempotent(
+    db: Database,
+) -> None:
+    projection = _projection(run_id="projection-vector-backoff", body="A7 is removed.")
+    await db.record_source_projection(projection)
+    await _seed_incumbent_support(db, projection=projection)
+    await db.rebaseline_source_lifecycle("src-1")
+    [task] = await db.list_lifecycle_vector_tasks(source_id="src-1")
+
+    retry_at = "2026-07-30T10:01:00+00:00"
+    await db.fail_lifecycle_vector_task(
+        task.id,
+        "temporary vector failure",
+        next_attempt_at=retry_at,
+    )
+
+    assert (
+        await db.list_ready_lifecycle_vector_tasks(
+            source_id="src-1",
+            max_attempts=5,
+            now="2026-07-30T10:00:59+00:00",
+        )
+        == []
+    )
+    [ready] = await db.list_ready_lifecycle_vector_tasks(
+        source_id="src-1",
+        max_attempts=5,
+        now=retry_at,
+    )
+    assert ready.id == task.id
+
+    await db.complete_lifecycle_vector_task(task.id)
+    await db.complete_lifecycle_vector_task(task.id)
+    assert await db.list_lifecycle_vector_tasks(source_id="src-1") == []
+
+
+@pytest.mark.asyncio
 async def test_memory_store_rebaseline_drains_only_its_source_vector_tasks() -> None:
     class _Relational:
         async def rebaseline_source_lifecycle(

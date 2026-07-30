@@ -1122,6 +1122,7 @@ CREATE TABLE IF NOT EXISTS lifecycle_vector_outbox (
     status            TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
     attempts          INTEGER NOT NULL DEFAULT 0,
     error             TEXT,
+    next_attempt_at   TEXT,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL,
     UNIQUE (lifecycle_plan_id, memory_id, operation)
@@ -1163,6 +1164,7 @@ CREATE TABLE IF NOT EXISTS source_deletion_vector_outbox (
     status      TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
     attempts    INTEGER NOT NULL DEFAULT 0,
     error       TEXT,
+    next_attempt_at TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -3171,6 +3173,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             )""",
             """CREATE INDEX IF NOT EXISTS idx_source_derivation_batches_status
                ON source_derivation_batches(derivation_id, status, updated_at)""",
+        ],
+    ),
+    (
+        72,
+        "Back off durable vector outbox retries",
+        [
+            "ALTER TABLE lifecycle_vector_outbox ADD COLUMN next_attempt_at TEXT",
+            "ALTER TABLE source_deletion_vector_outbox ADD COLUMN next_attempt_at TEXT",
         ],
     ),
 ]
@@ -8368,12 +8378,84 @@ class Database:
             for row in rows
         ]
 
+    async def list_ready_lifecycle_vector_tasks(
+        self,
+        *,
+        source_id: str | None = None,
+        lifecycle_plan_id: str | None = None,
+        limit: int = 100,
+        max_attempts: int,
+        now: str | None = None,
+    ) -> list[LifecycleVectorTask]:
+        if limit < 1 or max_attempts < 1:
+            raise ValueError("lifecycle vector readiness requires positive bounds")
+        ready_at = now or _now_iso()
+        conditions = """WHERE (
+            lvo.status = 'pending'
+            OR (
+                lvo.status = 'failed' AND lvo.attempts < ?
+                AND (lvo.next_attempt_at IS NULL OR lvo.next_attempt_at <= ?)
+            )
+        )"""
+        params: list[object] = [max_attempts, ready_at]
+        if source_id is not None:
+            conditions += " AND lp.source_id = ?"
+            params.append(source_id)
+        if lifecycle_plan_id is not None:
+            conditions += " AND lvo.lifecycle_plan_id = ?"
+            params.append(lifecycle_plan_id)
+        selects = [
+            f"""SELECT lvo.id, lvo.lifecycle_plan_id, lvo.memory_id,
+                       lvo.operation, lvo.status, lvo.attempts, lvo.error,
+                       lvo.created_at, lvo.updated_at
+                  FROM lifecycle_vector_outbox lvo
+                  JOIN lifecycle_plans lp ON lp.id = lvo.lifecycle_plan_id
+                  {conditions}"""
+        ]
+        if lifecycle_plan_id is None:
+            deletion_conditions = """WHERE (
+                status = 'pending'
+                OR (
+                    status = 'failed' AND attempts < ?
+                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                )
+            )"""
+            params.extend((max_attempts, ready_at))
+            if source_id is not None:
+                deletion_conditions += " AND source_id = ?"
+                params.append(source_id)
+            selects.append(
+                f"""SELECT id, 'source-delete:' || source_id AS lifecycle_plan_id,
+                           memory_id, 'delete' AS operation, status, attempts,
+                           error, created_at, updated_at
+                      FROM source_deletion_vector_outbox
+                      {deletion_conditions}"""
+            )
+        params.append(limit)
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM (" + " UNION ALL ".join(selects) + ") "
+            "ORDER BY CASE status WHEN 'failed' THEN updated_at ELSE created_at END, id LIMIT ?",
+            tuple(params),
+        )
+        return [
+            LifecycleVectorTask(
+                id=row["id"],
+                lifecycle_plan_id=row["lifecycle_plan_id"],
+                memory_id=row["memory_id"],
+                operation=LifecycleVectorOperation(row["operation"]),
+                status=LifecycleVectorTaskStatus(row["status"]),
+                attempts=int(row["attempts"]),
+                error=row["error"],
+            )
+            for row in rows
+        ]
+
     async def complete_lifecycle_vector_task(self, task_id: str) -> None:
         async with self._write_lock:
             cursor = await self.db.execute(
                 """UPDATE lifecycle_vector_outbox
                    SET status = 'completed', attempts = attempts + 1,
-                       updated_at = ?
+                       next_attempt_at = NULL, updated_at = ?
                    WHERE id = ? AND status IN ('pending', 'failed')""",
                 (_now_iso(), task_id),
             )
@@ -8381,33 +8463,53 @@ class Database:
                 cursor = await self.db.execute(
                     """UPDATE source_deletion_vector_outbox
                        SET status = 'completed', attempts = attempts + 1,
-                           updated_at = ?
+                           next_attempt_at = NULL, updated_at = ?
                        WHERE id = ? AND status IN ('pending', 'failed')""",
                     (_now_iso(), task_id),
                 )
             if cursor.rowcount != 1:
-                raise ValueError("lifecycle vector task is not pending")
+                rows = await self.db.execute_fetchall(
+                    """SELECT status FROM lifecycle_vector_outbox WHERE id = ?
+                       UNION ALL
+                       SELECT status FROM source_deletion_vector_outbox WHERE id = ?""",
+                    (task_id, task_id),
+                )
+                if not rows or rows[0]["status"] != "completed":
+                    raise ValueError("lifecycle vector task is not pending")
             await self.db.commit()
 
-    async def fail_lifecycle_vector_task(self, task_id: str, error: str) -> None:
+    async def fail_lifecycle_vector_task(
+        self,
+        task_id: str,
+        error: str,
+        *,
+        next_attempt_at: str | None = None,
+    ) -> None:
         async with self._write_lock:
             cursor = await self.db.execute(
                 """UPDATE lifecycle_vector_outbox
                    SET status = 'failed', attempts = attempts + 1,
-                       error = COALESCE(error, ?), updated_at = ?
+                       error = COALESCE(error, ?), next_attempt_at = ?, updated_at = ?
                    WHERE id = ? AND status IN ('pending', 'failed')""",
-                (error[:4000], _now_iso(), task_id),
+                (error[:4000], next_attempt_at, _now_iso(), task_id),
             )
             if cursor.rowcount != 1:
                 cursor = await self.db.execute(
                     """UPDATE source_deletion_vector_outbox
                        SET status = 'failed', attempts = attempts + 1,
-                           error = COALESCE(error, ?), updated_at = ?
+                           error = COALESCE(error, ?), next_attempt_at = ?, updated_at = ?
                        WHERE id = ? AND status IN ('pending', 'failed')""",
-                    (error[:4000], _now_iso(), task_id),
+                    (error[:4000], next_attempt_at, _now_iso(), task_id),
                 )
             if cursor.rowcount != 1:
-                raise ValueError("lifecycle vector task is not pending")
+                rows = await self.db.execute_fetchall(
+                    """SELECT status FROM lifecycle_vector_outbox WHERE id = ?
+                       UNION ALL
+                       SELECT status FROM source_deletion_vector_outbox WHERE id = ?""",
+                    (task_id, task_id),
+                )
+                if not rows or rows[0]["status"] != "completed":
+                    raise ValueError("lifecycle vector task is not pending")
             await self.db.commit()
 
     async def has_ready_relation_discovery_work(self, *, max_attempts: int) -> bool:

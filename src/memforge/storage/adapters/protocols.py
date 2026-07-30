@@ -621,8 +621,23 @@ class RelationalStore(Protocol):
         lifecycle_plan_id: str | None = None,
         limit: int = 100,
     ) -> list[LifecycleVectorTask]: ...
+    async def list_ready_lifecycle_vector_tasks(
+        self,
+        *,
+        source_id: str | None = None,
+        lifecycle_plan_id: str | None = None,
+        limit: int = 100,
+        max_attempts: int,
+        now: str | None = None,
+    ) -> list[LifecycleVectorTask]: ...
     async def complete_lifecycle_vector_task(self, task_id: str) -> None: ...
-    async def fail_lifecycle_vector_task(self, task_id: str, error: str) -> None: ...
+    async def fail_lifecycle_vector_task(
+        self,
+        task_id: str,
+        error: str,
+        *,
+        next_attempt_at: str | None = None,
+    ) -> None: ...
     async def has_ready_relation_discovery_work(self, *, max_attempts: int) -> bool: ...
     async def lease_relation_discovery_work(
         self,
