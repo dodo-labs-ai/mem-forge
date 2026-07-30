@@ -70,6 +70,8 @@ from memforge.storage.adapters.protocols import (
     EntityLinkResult,
     EntityResolutionScope,
     EntityUpsert,
+    RecentMemoryItem,
+    RecentMemoryPage,
 )
 
 logger = logging.getLogger(__name__)
@@ -233,6 +235,34 @@ def _enabled_source_visibility_condition(
                 FROM memory_sources ms_enabled
                 WHERE ms_enabled.memory_id = m.id
                   AND (ms_enabled.source_id IS NULL OR ms_enabled.source_id NOT IN ({placeholders}))
+            )
+        )""",
+        list(disabled_source_ids),
+    )
+
+
+def _current_source_visibility_condition(
+    disabled_source_ids: list[str],
+) -> tuple[str, list[str]]:
+    disabled_clause = ""
+    if disabled_source_ids:
+        placeholders = ", ".join("?" for _ in disabled_source_ids)
+        disabled_clause = f" AND ms_enabled.source_id NOT IN ({placeholders})"
+    return (
+        f"""(
+            NOT EXISTS (
+                SELECT 1
+                FROM memory_sources ms_any
+                WHERE ms_any.memory_id = m.id
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM memory_sources ms_enabled
+                JOIN sources s_enabled
+                  ON s_enabled.id = ms_enabled.source_id
+                 AND s_enabled.status = 'active'
+                WHERE ms_enabled.memory_id = m.id
+                  {disabled_clause}
             )
         )""",
         list(disabled_source_ids),
@@ -1332,6 +1362,7 @@ class SqliteRelationalStore:
         *,
         limit: int,
         offset: int,
+        memory_types: Sequence[str] = (),
     ) -> tuple[list[str], int]:
         source_filter = source_filter or MemorySourceFilter()
         has_source_filter = not source_filter.is_empty()
@@ -1351,6 +1382,10 @@ class SqliteRelationalStore:
             clauses=clauses,
             params=params,
         )
+        if memory_types:
+            placeholders = ", ".join("?" for _ in memory_types)
+            clauses.append(f"m.memory_type IN ({placeholders})")
+            params.extend(memory_types)
         if has_source_row_join and disabled_source_ids:
             placeholders = ", ".join("?" for _ in disabled_source_ids)
             clauses.append(f"(ms.source_id IS NULL OR ms.source_id NOT IN ({placeholders}))")
@@ -1378,6 +1413,101 @@ class SqliteRelationalStore:
             async for row in cursor:
                 ids.append(row[0])
         return ids, total
+
+    async def list_recent_memory_ids(
+        self,
+        source_filter: MemorySourceFilter,
+        time_range: MemoryTimeRange,
+        scope: AccessScope,
+        *,
+        memory_types: Sequence[str],
+        listing_watermark: datetime,
+        after: RecentMemoryItem | None,
+        limit: int,
+    ) -> RecentMemoryPage:
+        if time_range.after is None or time_range.before is None:
+            raise ValueError("recent-memory listing requires a closed half-open window")
+
+        predicate_sql, predicate_params = visible_sql(scope, "m")
+        joins: list[str] = []
+        clauses = [predicate_sql]
+        params: list[Any] = list(predicate_params)
+        order_sql, has_source_row_join = _append_source_time_predicates(
+            source_filter=source_filter,
+            time_range=time_range,
+            joins=joins,
+            clauses=clauses,
+            params=params,
+        )
+        if has_source_row_join:
+            joins.append("JOIN sources s ON s.id = ms.source_id AND s.status = 'active'")
+        if memory_types:
+            placeholders = ", ".join("?" for _ in memory_types)
+            clauses.append(f"m.memory_type IN ({placeholders})")
+            params.extend(memory_types)
+
+        disabled_source_ids = await self._db.list_disabled_source_ids_for_user(scope.user_id)
+        if has_source_row_join:
+            if disabled_source_ids:
+                placeholders = ", ".join("?" for _ in disabled_source_ids)
+                clauses.append(f"ms.source_id NOT IN ({placeholders})")
+                params.extend(disabled_source_ids)
+        else:
+            source_visibility_sql, source_visibility_params = _current_source_visibility_condition(
+                disabled_source_ids
+            )
+            clauses.append(source_visibility_sql)
+            params.extend(source_visibility_params)
+
+        if time_range.date_type == "source_updated_at":
+            clauses.append("ms.source_updated_at <= ?")
+            params.append(listing_watermark.isoformat())
+            sort_expression = "MAX(ms.source_updated_at)"
+        else:
+            clauses.append("m.updated_at <= ?")
+            params.append(listing_watermark.isoformat())
+            sort_expression = "m.updated_at"
+
+        join_sql = " ".join(joins)
+        where_sql = " AND ".join(clauses)
+        group_sql = "GROUP BY m.id" if joins else ""
+        count_sql = (
+            f"SELECT COUNT(*) FROM (SELECT m.id FROM memories m {join_sql} "
+            f"WHERE {where_sql} {group_sql}) q"
+        )
+        async with self._db.db.execute(count_sql, params) as cursor:
+            row = await cursor.fetchone()
+            total = int(row[0]) if row else 0
+
+        page_params = list(params)
+        having_sql = ""
+        if after is not None:
+            if joins:
+                having_sql = (
+                    f"HAVING ({sort_expression} < ? OR "
+                    f"({sort_expression} = ? AND m.id < ?))"
+                )
+                page_params.extend((after.sort_at.isoformat(), after.sort_at.isoformat(), after.memory_id))
+            else:
+                where_sql += " AND (m.updated_at < ? OR (m.updated_at = ? AND m.id < ?))"
+                page_params.extend((after.sort_at.isoformat(), after.sort_at.isoformat(), after.memory_id))
+
+        page_sql = (
+            f"SELECT m.id, {sort_expression} AS sort_at FROM memories m {join_sql} "
+            f"WHERE {where_sql} {group_sql} {having_sql} "
+            f"ORDER BY {order_sql} LIMIT ?"
+        )
+        rows: list[RecentMemoryItem] = []
+        async with self._db.db.execute(page_sql, [*page_params, limit + 1]) as cursor:
+            async for row in cursor:
+                sort_at = datetime.fromisoformat(str(row["sort_at"]).replace("Z", "+00:00"))
+                rows.append(RecentMemoryItem(memory_id=str(row["id"]), sort_at=sort_at))
+        has_more = len(rows) > limit
+        return RecentMemoryPage(
+            items=tuple(rows[:limit]),
+            total_count=total,
+            has_more=has_more,
+        )
 
     async def graph_search(
         self,

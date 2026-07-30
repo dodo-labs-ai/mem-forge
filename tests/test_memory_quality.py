@@ -1361,6 +1361,75 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
 
 
 @pytest.mark.asyncio
+async def test_admin_recent_memory_endpoint_uses_dedicated_listing_interface(
+    db: Database,
+    tmp_path: Path,
+):
+    from memforge.retrieval.filters import MemoryTimeRange
+    from memforge.server.admin_api import create_admin_app
+    from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
+
+    calls = []
+
+    class FakeSearchEngine:
+        async def list_recent_memories(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "results": [],
+                "result_kind": "current_memories",
+                "is_changelog": False,
+                "next_cursor": None,
+            }
+
+    class FakeRuntimeProvider:
+        async def build_search_engine(self, _db, _config, *, audit_logger=None):
+            return FakeSearchEngine()
+
+    app = create_admin_app(
+        db=db,
+        config=_config(tmp_path),
+        runtime_provider=FakeRuntimeProvider(),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/memories/recent",
+            json={
+                "time_range": {
+                    "date_type": "source_updated_at",
+                    "start_at": "2026-07-21T00:00:00+08:00",
+                    "end_at": "2026-07-28T00:00:00+08:00",
+                },
+                "memory_types": ["decision"],
+                "page_size": 25,
+                "include_private": True,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["result_kind"] == "current_memories"
+    assert calls == [
+        {
+            "source_filter": None,
+            "time_range": MemoryTimeRange(
+                after=datetime(2026, 7, 20, 16, tzinfo=timezone.utc),
+                before=datetime(2026, 7, 27, 16, tzinfo=timezone.utc),
+                date_type="source_updated_at",
+            ),
+            "memory_types": ["decision"],
+            "page_size": 25,
+            "cursor": None,
+            "request_scope": AccessScope(
+                user_id=LOCAL_DEV_USER_ID,
+                include_private=True,
+                allowed_statuses=("active",),
+                active_project=None,
+                scope_mode="workspace",
+            ),
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_get_memory_sources_orders_extracted_before_corroborated(db: Database):
     memory = await _insert_memory(
         db,
