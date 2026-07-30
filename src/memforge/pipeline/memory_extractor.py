@@ -16,6 +16,7 @@ from memforge.llm.structured import (
 from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.document_units import ExtractionContext
 from memforge.pipeline.document_update import DEFAULT_MAX_DIFF_CHARS
+from memforge.pipeline.extraction_contract import DURABLE_MEMORY_QUALITY_RULES
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_SUMMARY_CHARS,
@@ -41,22 +42,6 @@ GLOSSARY_APPENDIX_CHAR_CAP = 2_000
 UNIT_MARKDOWN_CHAR_CAP = 80_000
 PROJECTION_CONTEXT_CHAR_CAP = 20_000
 
-_DURABLE_MEMORY_QUALITY_RULES = """Top rules (apply these first; reject candidates that fail any of them):
-
-0. PREFER EMPTY. Returning {{"memories": []}} is the default. The bar for emitting a Memory is high: it must teach a future developer something they would otherwise miss six months from now, after the implementation has been refactored. Routine work, mechanical detail, transient output, and meta-discussion produce zero Memories.
-
-1. CODE-RECOVERABLE FACTS ARE NOT MEMORIES. Reject any candidate a developer could verify by reading the current code, schema, types, configuration, or by running `grep` / `git log -p` in under a minute. Specifically, do not emit Memories that merely restate function or method names, class names, type signatures, parameter lists, ID or constant values, file paths, schema columns, migration numbers, generated query text, or "X passes Y to Z" wiring. Keep a candidate only when it states a reusable constraint, reason, rule, invariant, conclusion, or procedure that survives a future refactor.
-
-2. ONE CLAIM, ONE MEMORY. Pick the single most general accurate phrasing for each underlying claim; do not emit reworded duplicates.
-
-3. FOLD REJECTED ALTERNATIVES INTO THE CHOSEN DECISION. Emit one "picked A over B because <reason>" decision rather than separate Memories for rejected alternatives.
-
-4. FUTURE USEFULNESS CHECK. Skip claims that will be obvious after the next refactor, self-resolve within days, or preserve only one generated or observed instance rather than reusable knowledge.
-
-5. NO META-MEMORIES. Do not emit Memories about the act of working: commit structure, diff splitting, tools used, validation output, work-in-progress state, or whether a project rule was followed. Memory is about the project's durable domain knowledge, not the editing process.
-
-"""
-
 # ---------------------------------------------------------------------------
 # Memory extraction prompt (Call 2)
 # ---------------------------------------------------------------------------
@@ -78,7 +63,7 @@ Extract durable atomic knowledge units justified by the document. Returning an e
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "extraction_context": exact quote from the document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix (e.g. "**Alice** (10:05): the actual message content")
 
-""" + _DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
+""" + DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
 - Each memory must be SELF-CONTAINED (understandable without the source document).
 - Extraction does not decide novelty against historical Memory rows. Emit each
   durable claim once with exact current evidence; lifecycle reconciliation owns
@@ -93,7 +78,6 @@ Extract durable atomic knowledge units justified by the document. Returning an e
 - Do not extract document metadata as memories: author names, last modified dates, document status, revision-history rows, reviewer lists, and link list rows belong to provenance/source metadata.
 - Do not infer relationships from reference/link-only evidence. If a source only provides a link or label, skip it or preserve the weaker relationship exactly as stated.
 - Preserve conditional language. If the source says "if", "provided", "as long as", "would", or "should", keep that condition in the memory. Do not turn open questions into decisions.
-- Preserve the source language of the durable claim in memory.content. If the source evidence is primarily Chinese, write the memory in Chinese. Do not translate memories to English unless the source itself is English or mixed-language phrasing is needed for exact technical identifiers.
 - Do NOT extract: formatting details, boilerplate, table-of-contents entries.
 - Do NOT extract: passwords, credentials, tokens, API keys, or any secret/authentication information.
 
@@ -124,7 +108,7 @@ For changed durable knowledge, return JSON objects with:
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "extraction_context": exact quote from the updated document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix from the updated document.
 
-""" + _DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
+""" + DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
 - Focus ONLY on durable memory changes caused by <changed_hunks>.
 - Use <updated_document> only to understand context and copy exact quotes; do not extract unaffected facts elsewhere in it.
 - Extract the current durable claims changed by <changed_hunks>; lifecycle
@@ -135,7 +119,6 @@ For changed durable knowledge, return JSON objects with:
 - Treat normalized source headers and platform/provenance fields as operational metadata: workflow status, assignee/owner routing, sprint/milestone, rank/order, labels/tags, timestamps, participants, reactions, edit time, author/reviewer rows, revision history, link-list rows, and formatting.
 - Return an empty "memories" array for operational metadata-only changes unless the changed text explicitly states durable team knowledge, such as a decision, constraint, convention, procedure, product behavior, architectural fact, or long-lived ownership/responsibility rule.
 - Preserve conditional language. Do not turn open questions, suggestions, or unresolved discussion into decisions.
-- Preserve the source language of the durable claim in memory.content. If the source evidence is primarily Chinese, write the memory in Chinese. Do not translate memories to English unless the source itself is English or mixed-language phrasing is needed for exact technical identifiers.
 - Do NOT extract table-of-contents entries, boilerplate, passwords, credentials, tokens, or API keys.
 
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memory changes."""
@@ -173,7 +156,7 @@ Each memory must be a JSON object with:
 - "evidence_quote": exact quote copied from <unit_markdown>
 - "evidence_anchor": "unit"
 
-""" + _DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
+""" + DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
 - Extract only durable team knowledge grounded in <unit_markdown>.
 - Extraction emits each current durable claim once with exact evidence.
   Reconciliation owns historical identity and support decisions.
@@ -181,7 +164,6 @@ Each memory must be a JSON object with:
 - For agent_session sources, extract only durable project decisions, conventions, procedures, and architectural rules that are NOT visible by reading the current code. Skip receipt/session metadata, validation commands/results, runtime notes, service start/stop state, local paths, working-tree state, and facts about the agent session itself.
 - Do not extract passwords, credentials, tokens, API keys, or secrets.
 - Preserve conditional language.
-- Preserve the source language of the durable claim in memory.content. If the source evidence is primarily Chinese, write the memory in Chinese. Do not translate memories to English unless the source itself is English or mixed-language phrasing is needed for exact technical identifiers.
 
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memories."""
 
@@ -200,7 +182,7 @@ The following observations are CONTEXT only. Use them to resolve references and 
 {context_observations}
 </context_observations>
 
-""" + _DURABLE_MEMORY_QUALITY_RULES + """Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
+""" + DURABLE_MEMORY_QUALITY_RULES + """Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
 
 For a PRIMARY `binary_artifact` observation with separately supplied image
 evidence, inspect the image itself. A claim grounded in that image must set
@@ -222,7 +204,7 @@ must not replace inspection of the Artifact. Return an empty
 Extraction emits each current durable claim once with exact evidence from a
 PRIMARY observation. Reconciliation owns historical identity and support.
 
-Prefer an empty memories array over weak or transient claims. Do not emit records that only say an item was created, updated, uploaded, attached, assigned, labeled, ranked, moved, reprioritized, or passed through a routine workflow status. Do not emit revision history, source metadata, routing fields, questions, or secrets. An attachment-upload event is provenance, not authority about the attachment's contents; only separately supplied attachment-content evidence may support a claim. Preserve durable resolution rationale and settled outcomes, conditions, and source language.
+Prefer an empty memories array over weak or transient claims. Do not emit records that only say an item was created, updated, uploaded, attached, assigned, labeled, ranked, moved, reprioritized, or passed through a routine workflow status. Do not emit revision history, source metadata, routing fields, questions, or secrets. An attachment-upload event is provenance, not authority about the attachment's contents; only separately supplied attachment-content evidence may support a claim. Preserve durable resolution rationale, settled outcomes, and conditions.
 
 Return ONLY a JSON object with a "memories" array."""
 

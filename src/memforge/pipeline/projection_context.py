@@ -5,14 +5,14 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
+from memforge.pipeline.extraction_contract import (
+    PROJECTION_EXTRACTION_CONTRACT_VERSION,
+)
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_INFERENCE_BYTES,
     MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
 )
 from memforge.source_projection import SourceProjection
-
-
-PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v2"
 
 
 @dataclass(frozen=True, slots=True)

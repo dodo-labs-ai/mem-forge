@@ -89,7 +89,10 @@ from memforge.models import (
     content_hash,
 )
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
-from memforge.pipeline.projection_context import ProjectionExtractionBatch
+from memforge.pipeline.projection_context import (
+    ProjectionExtractionBatch,
+    plan_projection_extraction_batches,
+)
 from memforge.pipeline.source_projection_adapters import (
     project_source_item,
     project_source_unit_tombstone,
@@ -1698,6 +1701,85 @@ async def test_source_derivation_separates_exact_payload_hash_from_stable_identi
         first_attempt.target_unit_revision_id
     )
     assert next_epoch_attempt.context.source_activity_epoch == 2
+
+
+@pytest.mark.asyncio
+async def test_projection_extraction_contract_change_invalidates_staged_derivation(
+    db: Database,
+) -> None:
+    projection = _projection(
+        run_id="projection-language-contract",
+        body="决定：A7 保持启用。",
+    )
+    document = await db.get_document("confluence-123")
+    assert document is not None
+    context = SourceUnitDerivationContext(
+        document=document,
+        doc_type="confluence",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="决定：A7 保持启用。",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=None,
+        user_id=None,
+        source_activity_epoch=None,
+    )
+
+    current_batches = plan_projection_extraction_batches(projection)
+    assert current_batches
+    previous_batches = tuple(
+        replace(batch, id=f"{batch.id}-v2")
+        for batch in current_batches
+    )
+    previous = source_derivation_manifest(
+        projection,
+        previous_batches,
+        context=context,
+        extraction_contract_version="projection-extraction-v2",
+    )
+    previous_attempt = await db.stage_source_derivation(previous)
+    for batch in previous_batches:
+        previous_attempt = await db.record_source_derivation_batch_result(
+            derivation_id=previous.id,
+            batch_id=batch.id,
+            result=MemoryExtractionResult(memories=[]),
+        )
+    assert previous_attempt.status == "completed"
+
+    executed_batch_ids: list[str] = []
+
+    async def extract_batch(
+        batch: ProjectionExtractionBatch,
+    ) -> MemoryExtractionResult:
+        executed_batch_ids.append(batch.id)
+        return MemoryExtractionResult(memories=[])
+
+    result = await SourceUnitDeriver(db).derive(
+        SourceUnitDerivationRequest(
+            projection=projection,
+            context=context,
+            extract_batch=extract_batch,
+            max_concurrent=1,
+        )
+    )
+
+    current = source_derivation_manifest(
+        projection,
+        current_batches,
+        context=context,
+    )
+
+    assert (
+        current.extraction_contract_version
+        != previous.extraction_contract_version
+    )
+    assert current.id != previous.id
+    assert result.derivation.id == current.id
+    assert result.reused_batch_count == 0
+    assert result.executed_batch_count == len(current_batches)
+    assert executed_batch_ids == [batch.id for batch in current_batches]
 
 
 def test_source_derivation_diagnostics_reject_content_and_bound_field_count() -> None:
