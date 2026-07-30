@@ -7792,6 +7792,58 @@ async def test_source_sync_worker_interleaves_relation_work_during_source_backlo
 
 
 @pytest.mark.asyncio
+async def test_source_sync_worker_drains_vector_outbox_without_a_source_run(
+    db: Database,
+    monkeypatch,
+) -> None:
+    import memforge.runtime as runtime
+
+    class Delivery:
+        pending = True
+        attempted_tasks = 3
+        delivered_tasks = 3
+        failed_tasks = 0
+
+    class MemoryStore:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def attempt_lifecycle_vector_delivery(self):
+            self.calls += 1
+            return Delivery()
+
+    class RuntimeProvider:
+        def __init__(self) -> None:
+            self.memory_store = MemoryStore()
+            self.runtime_builds = 0
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            self.runtime_builds += 1
+            return self
+
+    provider = RuntimeProvider()
+
+    async def pending_vector_task(**kwargs):
+        assert kwargs["limit"] == 1
+        return [object()]
+
+    monkeypatch.setattr(db, "list_ready_lifecycle_vector_tasks", pending_vector_task)
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=provider,
+        worker_id="worker-vector-outbox",
+    )
+
+    processed = await worker.process_lifecycle_vector_delivery_once()
+
+    assert processed
+    assert provider.runtime_builds == 1
+    assert provider.memory_store.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_sync_service_passes_force_full_sync_to_source_task(db: Database, monkeypatch):
     source_id = "src-force-service"
     await db.upsert_source(
