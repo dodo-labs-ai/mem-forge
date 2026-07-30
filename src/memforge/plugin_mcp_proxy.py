@@ -1026,6 +1026,7 @@ def _compact_memory_source(source: dict[str, Any]) -> dict[str, Any]:
         "source_type",
         "support_kind",
         "doc_title",
+        "excerpt",
         "source_url",
         "content_url",
         "pdf_url",
