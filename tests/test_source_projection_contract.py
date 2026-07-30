@@ -144,6 +144,29 @@ def test_range_overlap_is_generic() -> None:
     assert resolve_anchor_impact(_anchor(start=0, end=10), delta) is ImpactResult.DISJOINT
 
 
+def test_range_impact_is_unknown_without_same_revision_range_mapping() -> None:
+    whole_observation_delta = RevisionDelta(
+        source_unit_id="unit-1",
+        previous_unit_revision_id="unitrev-1",
+        current_unit_revision_id="unitrev-2",
+        axes=frozenset({DeltaAxis.SEMANTIC}),
+        coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+        changed_anchors=(_anchor(),),
+    )
+    next_revision_range_delta = RevisionDelta(
+        source_unit_id="unit-1",
+        previous_unit_revision_id="unitrev-1",
+        current_unit_revision_id="unitrev-2",
+        axes=frozenset({DeltaAxis.SEMANTIC}),
+        coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+        changed_anchors=(_anchor(revision_id="obsrev-3", start=20, end=30),),
+    )
+
+    anchor = _anchor(revision_id="obsrev-2", start=0, end=10)
+    assert resolve_anchor_impact(anchor, whole_observation_delta) is ImpactResult.UNKNOWN
+    assert resolve_anchor_impact(anchor, next_revision_range_delta) is ImpactResult.UNKNOWN
+
+
 def test_location_only_delta_does_not_affect_semantic_evidence() -> None:
     delta = RevisionDelta(
         source_unit_id="unit-page-1",

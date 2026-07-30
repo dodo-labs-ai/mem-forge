@@ -80,7 +80,9 @@ from memforge.source_artifacts import (
     source_artifact_revision_from_metadata,
 )
 from memforge.source_derivation import (
+    DiffGuidedExtractionBatch,
     SourceDerivationAttempt,
+    StructuralExtractionBatch,
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
     SourceUnitDeriver,
@@ -247,6 +249,7 @@ class ExtractionWorkPool:
             if self._active_by_source[waiting_source] < fair_share:
                 return False
         return True
+
 
 _PROCESS_EXTRACTION_POOL_LOCK = threading.Lock()
 _PROCESS_EXTRACTION_POOL: ExtractionWorkPool | None = None
@@ -746,11 +749,7 @@ class GeneSyncOrchestrator:
         scope_transition = None
         if not non_mutating_run:
             scope_transition = await self.db.get_open_projection_scope_transition(source_id)
-        if (
-            force_full_sync
-            or execution_mode is not SourceSyncMode.NORMAL
-            or scope_transition is not None
-        ):
+        if force_full_sync or execution_mode is not SourceSyncMode.NORMAL or scope_transition is not None:
             # Reuse is an ordinary incremental optimization only. Recovery
             # modes and scope transitions require the full per-document path.
             reusable_projection_doc_ids = frozenset()
@@ -769,9 +768,7 @@ class GeneSyncOrchestrator:
                 )
                 docs_updated += recovered["updated"]
                 memories_extracted += recovered["memories_extracted"]
-                memories_corroborated += recovered[
-                    "memories_corroborated"
-                ]
+                memories_corroborated += recovered["memories_corroborated"]
 
             # ----------------------------------------------------------
             # Step 0: Authenticate
@@ -864,11 +861,7 @@ class GeneSyncOrchestrator:
                 authoritative_snapshot=authoritative_snapshot,
                 discovery_complete=bool(getattr(gene, "discovery_complete", False)),
             )
-            run_coverage = (
-                ProjectionCoverage.PARTIAL_PROJECTION
-                if non_mutating_run
-                else discovery_coverage
-            )
+            run_coverage = ProjectionCoverage.PARTIAL_PROJECTION if non_mutating_run else discovery_coverage
 
             if projection_repair:
                 requested_doc_ids = set(reprocess_doc_ids or ())
@@ -897,16 +890,10 @@ class GeneSyncOrchestrator:
                     "reusable Source Projection membership is outside provider discovery: "
                     f"{sorted(unexpected_reuse_ids)[0]}"
                 )
-            reusable_projection_doc_ids = (
-                reusable_projection_doc_ids & discovered_doc_ids
-            )
+            reusable_projection_doc_ids = reusable_projection_doc_ids & discovered_doc_ids
             total_item_count = len(items)
             if reusable_projection_doc_ids:
-                items = [
-                    item
-                    for item in items
-                    if item.item_id not in reusable_projection_doc_ids
-                ]
+                items = [item for item in items if item.item_id not in reusable_projection_doc_ids]
                 reused_projection_count = total_item_count - len(items)
                 docs_processed += reused_projection_count
                 logger.info(
@@ -1175,11 +1162,7 @@ class GeneSyncOrchestrator:
                     source_type=configured_source_type,
                     source_name=source_name,
                     run_id=run_id,
-                    lifecycle_cycle_id=(
-                        scope_transition.id
-                        if scope_transition is not None
-                        else durable_cycle_id
-                    ),
+                    lifecycle_cycle_id=(scope_transition.id if scope_transition is not None else durable_cycle_id),
                     indexed_doc_ids=indexed_doc_ids,
                     crawled_doc_ids=crawled_doc_ids,
                     source_filter_summary=_source_filter_summary(gene, last_sync_time),
@@ -1278,9 +1261,7 @@ class GeneSyncOrchestrator:
 
         if self.memory_store is not None:
             try:
-                await self.memory_store.attempt_lifecycle_vector_delivery(
-                    source_id=source_id
-                )
+                await self.memory_store.attempt_lifecycle_vector_delivery(source_id=source_id)
             except Exception:
                 # Relational lifecycle state and its durable outbox are
                 # authoritative. Delivery is run-level and independent of
@@ -1436,8 +1417,7 @@ class GeneSyncOrchestrator:
             await self.db.supersede_source_derivation(attempt.id)
         if superseded_attempts:
             logger.info(
-                "Superseded %d stale or older Source derivation context(s) "
-                "before recovery for source %s",
+                "Superseded %d stale or older Source derivation context(s) before recovery for source %s",
                 len(superseded_attempts),
                 source_id,
             )
@@ -1501,12 +1481,8 @@ class GeneSyncOrchestrator:
                 continue
             stats["processed"] += 1
             stats["updated"] += 1
-            stats["memories_extracted"] += int(
-                lifecycle_stats.get("added", 0)
-            )
-            stats["memories_corroborated"] += int(
-                lifecycle_stats.get("updated", 0)
-            )
+            stats["memories_extracted"] += int(lifecycle_stats.get("added", 0))
+            stats["memories_corroborated"] += int(lifecycle_stats.get("updated", 0))
         return stats
 
     async def _resume_source_derivation_attempt(
@@ -1522,14 +1498,8 @@ class GeneSyncOrchestrator:
         if context.source_activity_epoch != source_activity_epoch:
             await self.db.supersede_source_derivation(attempt.id)
             return None
-        current_revision = await self.db.get_current_source_unit_revision(
-            attempt.source_unit_id
-        )
-        current_revision_id = (
-            current_revision.id
-            if current_revision is not None
-            else None
-        )
+        current_revision = await self.db.get_current_source_unit_revision(attempt.source_unit_id)
+        current_revision_id = current_revision.id if current_revision is not None else None
         if current_revision_id not in {
             attempt.base_unit_revision_id,
             attempt.target_unit_revision_id,
@@ -1550,19 +1520,19 @@ class GeneSyncOrchestrator:
         if await self.db.get_lifecycle_plan_payload(plan_id) is not None:
             await self.db.supersede_source_derivation(attempt.id)
             logger.info(
-                "Superseded Source derivation %s because lifecycle plan %s "
-                "already applied for Source Unit %s",
+                "Superseded Source derivation %s because lifecycle plan %s already applied for Source Unit %s",
                 attempt.id,
                 plan_id,
                 attempt.source_unit_id,
             )
             return None
-        extraction = await self._extract_projection_batches(
+        extraction = await self._extract_source_derivation_work(
             projection=projection,
             source_type=projection.source_type,
             doc_type=context.doc_type,
             source_id=source_id,
             derivation_context=context,
+            current_changed_ranges=context.current_changed_ranges,
         )
         if extraction.error_type:
             return None
@@ -1571,9 +1541,7 @@ class GeneSyncOrchestrator:
             extraction.artifact_summaries,
         )
         source_updated_at = (
-            datetime.fromisoformat(context.source_updated_at)
-            if context.source_updated_at is not None
-            else None
+            datetime.fromisoformat(context.source_updated_at) if context.source_updated_at is not None else None
         )
         return await self.memory_engine.apply_projected_lifecycle(
             projection=projection,
@@ -1585,16 +1553,11 @@ class GeneSyncOrchestrator:
             document_content=context.document_content,
             update_mode=context.update_mode,
             changed_hunks=context.changed_hunks,
-            update_plan_stats=(
-                dict(context.update_plan_stats)
-                if context.update_plan_stats is not None
-                else None
-            ),
+            update_plan_stats=(dict(context.update_plan_stats) if context.update_plan_stats is not None else None),
+            current_changed_ranges=context.current_changed_ranges,
             source_updated_at=source_updated_at,
             user_id=context.user_id,
-            protected_source_observation_ids=(
-                extraction.protected_source_observation_ids
-            ),
+            protected_source_observation_ids=(extraction.protected_source_observation_ids),
             document=context.document,
             derivation_id=attempt.id,
             expected_source_activity_epoch=source_activity_epoch,
@@ -1851,8 +1814,7 @@ class GeneSyncOrchestrator:
             )
             if (
                 scope_identity_probe is not None
-                and scope_identity_probe.source_units[0].provider_key
-                == historical_source_unit.provider_key
+                and scope_identity_probe.source_units[0].provider_key == historical_source_unit.provider_key
             ):
                 # Re-entry during an explicit selector transition keeps the
                 # provider's stable identity. This includes ref A -> B -> A;
@@ -2068,10 +2030,7 @@ class GeneSyncOrchestrator:
                 existing_doc = lineage_predecessor_docs[0]
                 existing_hash = existing_doc.content_hash
         content_unchanged = existing_hash == new_hash
-        skip_semantic_work = (
-            not projection_requires_extraction
-            and not force_reprocess
-        )
+        skip_semantic_work = not projection_requires_extraction and not force_reprocess
         previous_markdown = (
             self._read_previous_normalized_content(existing_doc)
             if existing_hash is not None and existing_hash != new_hash
@@ -2269,27 +2228,17 @@ class GeneSyncOrchestrator:
                 raw_memories=[],
                 doc_type=f"{source_type}_empty",
                 project_key=project_key,
-                repo_identifier=normalized.source_semantics.get(
-                    "repo_identifier"
-                ),
+                repo_identifier=normalized.source_semantics.get("repo_identifier"),
                 document_content="",
-                update_mode=(
-                    update_plan.mode if update_plan else "full_document"
-                ),
-                changed_hunks=(
-                    update_plan.changed_hunks if update_plan else None
-                ),
-                update_plan_stats=self._document_update_plan_stats(
-                    update_plan
-                ),
+                update_mode=(update_plan.mode if update_plan else "full_document"),
+                changed_hunks=(update_plan.changed_hunks if update_plan else None),
+                update_plan_stats=self._document_update_plan_stats(update_plan),
                 source_updated_at=_source_updated_at_for_item(
                     item,
                     normalized.source_semantics,
                 ),
                 user_id=(
-                    str(
-                        normalized.source_semantics.get("uploader_user_id")
-                    ).strip()
+                    str(normalized.source_semantics.get("uploader_user_id")).strip()
                     if normalized.source_semantics.get("uploader_user_id")
                     else None
                 ),
@@ -2338,37 +2287,23 @@ class GeneSyncOrchestrator:
             item,
             normalized.source_semantics,
         )
-        uploader_user_id = normalized.source_semantics.get(
-            "uploader_user_id"
-        )
+        uploader_user_id = normalized.source_semantics.get("uploader_user_id")
         actor_user_id = (
-            str(uploader_user_id).strip()
-            if isinstance(uploader_user_id, str)
-            and uploader_user_id.strip()
-            else None
+            str(uploader_user_id).strip() if isinstance(uploader_user_id, str) and uploader_user_id.strip() else None
         )
         derivation_context = SourceUnitDerivationContext(
             document=doc_record,
             doc_type=source_type,
             project_key=project_key,
-            repo_identifier=(
-                str(repo_identifier)
-                if repo_identifier is not None
-                else None
-            ),
+            repo_identifier=(str(repo_identifier) if repo_identifier is not None else None),
             document_content=markdown_body,
-            update_mode=(
-                update_plan.mode if update_plan else "full_document"
-            ),
-            changed_hunks=(
-                update_plan.changed_hunks if update_plan else None
-            ),
-            update_plan_stats=self._document_update_plan_stats(
-                update_plan
-            ),
+            update_mode=(update_plan.mode if update_plan else "full_document"),
+            changed_hunks=(update_plan.changed_hunks if update_plan else None),
+            update_plan_stats=self._document_update_plan_stats(update_plan),
             source_updated_at=source_updated_at.isoformat(),
             user_id=actor_user_id,
             source_activity_epoch=expected_source_activity_epoch,
+            current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
         )
         # Extraction owns the only document-content model call. Historical
         # cross-document/cross-source discovery remains post-commit Relation
@@ -2412,11 +2347,7 @@ class GeneSyncOrchestrator:
             raw_memory_count=len(raw_memories),
             existing_memory_count=0,
             entity_mention_count=len(
-                {
-                    entity_ref
-                    for raw_memory in raw_memories
-                    for entity_ref in raw_memory.entity_refs
-                }
+                {entity_ref for raw_memory in raw_memories for entity_ref in raw_memory.entity_refs}
             ),
             content_chars=len(markdown_body),
         )
@@ -2436,11 +2367,10 @@ class GeneSyncOrchestrator:
             update_mode=update_plan.mode if update_plan else "full_document",
             changed_hunks=update_plan.changed_hunks if update_plan else None,
             update_plan_stats=self._document_update_plan_stats(update_plan),
+            current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
             source_updated_at=source_updated_at,
             user_id=actor_user_id,
-            protected_source_observation_ids=(
-                extraction_result.protected_source_observation_ids
-            ),
+            protected_source_observation_ids=(extraction_result.protected_source_observation_ids),
             document=doc_record,
             derivation_id=extraction_result.derivation_id,
             expected_source_activity_epoch=expected_source_activity_epoch,
@@ -2457,54 +2387,22 @@ class GeneSyncOrchestrator:
             memories_extracted=stats["memories_extracted"],
             memories_corroborated=stats["memories_corroborated"],
             entity_mention_count=len(
-                {
-                    entity_ref
-                    for raw_memory in raw_memories
-                    for entity_ref in raw_memory.entity_refs
-                }
+                {entity_ref for raw_memory in raw_memories for entity_ref in raw_memory.entity_refs}
             ),
-            entity_resolution_unique_mentions=memory_stats.get(
-                "entity_resolution_unique_mentions", 0
-            ),
-            entity_resolution_exact_hits=memory_stats.get(
-                "entity_resolution_exact_hits", 0
-            ),
-            entity_resolution_alias_hits=memory_stats.get(
-                "entity_resolution_alias_hits", 0
-            ),
-            entity_resolution_embedded_mentions=memory_stats.get(
-                "entity_resolution_embedded_mentions", 0
-            ),
-            entity_resolution_ambiguous_mentions=memory_stats.get(
-                "entity_resolution_ambiguous_mentions", 0
-            ),
-            entity_resolution_embedding_batches=memory_stats.get(
-                "entity_resolution_embedding_batches", 0
-            ),
-            entity_resolution_llm_calls=memory_stats.get(
-                "entity_resolution_llm_calls", 0
-            ),
-            entity_resolution_candidate_count=memory_stats.get(
-                "entity_resolution_candidate_count", 0
-            ),
-            entity_resolution_new_entities=memory_stats.get(
-                "entity_resolution_new_entities", 0
-            ),
-            entity_resolution_elapsed_ms=memory_stats.get(
-                "entity_resolution_elapsed_ms", 0
-            ),
-            identity_resolution_pair_count=memory_stats.get(
-                "identity_resolution_pair_count", 0
-            ),
-            identity_resolution_llm_calls=memory_stats.get(
-                "identity_resolution_llm_calls", 0
-            ),
-            identity_resolution_prompt_chars=memory_stats.get(
-                "identity_resolution_prompt_chars", 0
-            ),
-            identity_resolution_elapsed_ms=memory_stats.get(
-                "identity_resolution_elapsed_ms", 0
-            ),
+            entity_resolution_unique_mentions=memory_stats.get("entity_resolution_unique_mentions", 0),
+            entity_resolution_exact_hits=memory_stats.get("entity_resolution_exact_hits", 0),
+            entity_resolution_alias_hits=memory_stats.get("entity_resolution_alias_hits", 0),
+            entity_resolution_embedded_mentions=memory_stats.get("entity_resolution_embedded_mentions", 0),
+            entity_resolution_ambiguous_mentions=memory_stats.get("entity_resolution_ambiguous_mentions", 0),
+            entity_resolution_embedding_batches=memory_stats.get("entity_resolution_embedding_batches", 0),
+            entity_resolution_llm_calls=memory_stats.get("entity_resolution_llm_calls", 0),
+            entity_resolution_candidate_count=memory_stats.get("entity_resolution_candidate_count", 0),
+            entity_resolution_new_entities=memory_stats.get("entity_resolution_new_entities", 0),
+            entity_resolution_elapsed_ms=memory_stats.get("entity_resolution_elapsed_ms", 0),
+            identity_resolution_pair_count=memory_stats.get("identity_resolution_pair_count", 0),
+            identity_resolution_llm_calls=memory_stats.get("identity_resolution_llm_calls", 0),
+            identity_resolution_prompt_chars=memory_stats.get("identity_resolution_prompt_chars", 0),
+            identity_resolution_elapsed_ms=memory_stats.get("identity_resolution_elapsed_ms", 0),
         )
 
         # ------------------------------------------------------------------
@@ -2517,11 +2415,7 @@ class GeneSyncOrchestrator:
             previous_version=previous_version,
             current_version=item.version,
             content_diff=None,
-            ai_change_summary=(
-                f"New document: {item.title}"
-                if change_type == "created"
-                else f"Updated: {item.title}"
-            ),
+            ai_change_summary=(f"New document: {item.title}" if change_type == "created" else f"Updated: {item.title}"),
             detected_at=now,
             title=item.title,
             source=source_id,
@@ -2574,14 +2468,10 @@ class GeneSyncOrchestrator:
     ) -> MemoryExtractionResult:
         """Run full extraction or diff-guided extraction for a document."""
         changed_observation_ids = {
-            anchor.observation_id
-            for delta in projection.deltas
-            for anchor in delta.changed_anchors
+            anchor.observation_id for delta in projection.deltas for anchor in delta.changed_anchors
         }
         changed_observation_ids.update(
-            observation_id
-            for delta in projection.deltas
-            for observation_id in delta.added_observation_ids
+            observation_id for delta in projection.deltas for observation_id in delta.added_observation_ids
         )
         if not changed_observation_ids:
             result = MemoryExtractionResult(
@@ -2603,18 +2493,23 @@ class GeneSyncOrchestrator:
             "extract_projection_batch_memories",
         ):
             if derivation_context is None:
-                raise ValueError(
-                    "projection batch extraction requires a durable derivation context"
-                )
-            result = await self._extract_projection_batches(
+                raise ValueError("Source derivation work requires a durable derivation context")
+            result = await self._extract_source_derivation_work(
                 projection=projection,
                 source_type=source_type,
                 doc_type=doc_type,
                 source_id=source_id,
                 derivation_context=derivation_context,
+                current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
+            )
+            work_kinds = result.metadata.get("derivation_work_kinds", [])
+            extraction_mode = (
+                "diff_guided"
+                if work_kinds == ["diff_guided"]
+                else ("full_document" if work_kinds == ["structural_unit"] else "projection_batches")
             )
             await self._record_memory_extraction_result(
-                mode="projection_batches",
+                mode=extraction_mode,
                 plan=update_plan,
                 doc_id=doc_id,
                 source_id=source_id,
@@ -2641,7 +2536,7 @@ class GeneSyncOrchestrator:
                     result = self._enforce_diff_guided_evidence_boundary(
                         result=result,
                         updated_document=markdown_body,
-                        plan=update_plan,
+                        current_changed_ranges=(update_plan.current_changed_ranges),
                         source_id=source_id,
                         doc_id=doc_id,
                     )
@@ -2740,7 +2635,7 @@ class GeneSyncOrchestrator:
         *,
         result: MemoryExtractionResult,
         updated_document: str,
-        plan: DocumentUpdatePlan,
+        current_changed_ranges: tuple[tuple[int, int], ...],
         source_id: str,
         doc_id: str,
     ) -> MemoryExtractionResult:
@@ -2753,7 +2648,7 @@ class GeneSyncOrchestrator:
             if not quote_overlaps_current_changes(
                 updated_document,
                 quote,
-                plan.current_changed_ranges,
+                current_changed_ranges,
             ):
                 rejected += 1
                 continue
@@ -2774,7 +2669,7 @@ class GeneSyncOrchestrator:
             },
         )
 
-    async def _extract_projection_batches(
+    async def _extract_source_derivation_work(
         self,
         *,
         projection: SourceProjection,
@@ -2782,10 +2677,44 @@ class GeneSyncOrchestrator:
         doc_type: str,
         source_id: str,
         derivation_context: SourceUnitDerivationContext,
+        current_changed_ranges: tuple[tuple[int, int], ...],
     ) -> MemoryExtractionResult:
-        """Execute all transient Observation batches as one extraction outcome."""
+        """Execute durable extraction work for one Source Unit revision."""
 
         async def extract_one(batch):
+            if isinstance(batch, DiffGuidedExtractionBatch):
+                async with self._heavy_work_slot(source_id):
+                    result = await self.memory_extractor.extract_memory_changes(
+                        changed_hunks=batch.changed_hunks,
+                        updated_document=batch.updated_document,
+                        source_type=source_type,
+                        doc_type=doc_type,
+                    )
+                if not result.error_type:
+                    result = self._enforce_diff_guided_evidence_boundary(
+                        result=result,
+                        updated_document=batch.updated_document,
+                        current_changed_ranges=current_changed_ranges,
+                        source_id=source_id,
+                        doc_id=derivation_context.document.doc_id,
+                    )
+                return result
+
+            if isinstance(batch, StructuralExtractionBatch):
+                async with self._heavy_work_slot(source_id) as admission:
+                    result = await self.memory_extractor.extract_unit_memories(
+                        batch.context,
+                        doc_type=doc_type,
+                    )
+                    result.metadata = {
+                        **(result.metadata or {}),
+                        "extraction_queue_wait_ms": admission.queue_wait_ms,
+                        "input_binary_bytes": 0,
+                        "multimodal_calls": 0,
+                        "max_active_multimodal": admission.active_multimodal,
+                    }
+                    return result
+
             primary_ids = set(batch.primary_observation_ids)
             async with self._heavy_work_slot(
                 source_id,
@@ -2845,9 +2774,7 @@ class GeneSyncOrchestrator:
                 metadata=revision.metadata,
             )
             if artifact is None:
-                raise RuntimeError(
-                    "projected Source Artifact metadata is invalid"
-                )
+                raise RuntimeError("projected Source Artifact metadata is invalid")
             if not artifact.media_type.startswith("image/"):
                 continue
             if not artifact.inference_eligible:
@@ -2856,10 +2783,7 @@ class GeneSyncOrchestrator:
             if total_bytes > MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH:
                 raise RuntimeError("projected image batch exceeds the inference byte budget")
             body = self.doc_store.read_artifact(artifact.uri)
-            if (
-                len(body) != artifact.size_bytes
-                or hashlib.sha256(body).hexdigest() != artifact.sha256
-            ):
+            if len(body) != artifact.size_bytes or hashlib.sha256(body).hexdigest() != artifact.sha256:
                 raise RuntimeError("projected image Artifact failed integrity validation")
             images.append(
                 StructuredLlmImage(

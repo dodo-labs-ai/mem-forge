@@ -70,9 +70,7 @@ def build_projected_claim_evidence(
             revision.metadata,
         )
     }
-    ordered_observation_ids = [
-        item.id for item in projection.observations if item.id in inference_eligible_ids
-    ]
+    ordered_observation_ids = [item.id for item in projection.observations if item.id in inference_eligible_ids]
     current_evidence_ids = {
         anchor.observation_id
         for delta in projection.deltas
@@ -88,8 +86,7 @@ def build_projected_claim_evidence(
     artifact_observation_ids = {
         observation_id
         for observation_id, observation in observations_by_id.items()
-        if observation.observation_type == "binary_artifact"
-        and observation_id in inference_eligible_ids
+        if observation.observation_type == "binary_artifact" and observation_id in inference_eligible_ids
     }
 
     units_by_id: dict[str, EvidenceUnit] = {}
@@ -104,17 +101,12 @@ def build_projected_claim_evidence(
             observation_hint=raw.source_observation_id,
             revalidated_noop=raw.evidence_anchor == "revalidated_noop",
             empty_quote_observation_ids=(
-                artifact_observation_ids
-                if raw.evidence_anchor == "source_artifact"
-                else set()
+                artifact_observation_ids if raw.evidence_anchor == "source_artifact" else set()
             ),
         )
 
         primary_revision = revisions_by_observation[primary_id]
-        artifact_evidence = (
-            raw.evidence_anchor == "source_artifact"
-            and primary_id in artifact_observation_ids
-        )
+        artifact_evidence = raw.evidence_anchor == "source_artifact" and primary_id in artifact_observation_ids
         evidence_content = "" if artifact_evidence else quote
         evidence_unit_id = _stable_id(
             "eu-projected",
@@ -140,11 +132,7 @@ def build_projected_claim_evidence(
             evidence_provenance=(
                 EvidenceContentProvenance.SOURCE_ARTIFACT
                 if artifact_evidence
-                else (
-                    EvidenceContentProvenance.SOURCE_EXCERPT
-                    if quote
-                    else EvidenceContentProvenance.NO_EXCERPT
-                )
+                else (EvidenceContentProvenance.SOURCE_EXCERPT if quote else EvidenceContentProvenance.NO_EXCERPT)
             ),
             source_metadata={
                 "projection_run_id": projection.run_id,
@@ -167,10 +155,9 @@ def build_projected_claim_evidence(
         claim_references = [
             EvidenceReference(
                 role=EvidenceRole.PRIMARY,
-                anchor=SourceAnchor(
-                    kind=AnchorKind.WHOLE_OBSERVATION,
-                    observation_id=primary_id,
-                    observation_revision_id=primary_revision.id,
+                anchor=_primary_evidence_anchor(
+                    revision=primary_revision,
+                    quote=quote,
                 ),
                 evidence_unit_id=unit.id,
             )
@@ -223,6 +210,29 @@ def build_projected_claim_evidence(
     )
 
 
+def _primary_evidence_anchor(
+    *,
+    revision: SourceObservationRevision,
+    quote: str,
+) -> SourceAnchor:
+    """Use an exact unique quote range; otherwise retain conservative authority."""
+
+    start = revision.content.find(quote) if quote else -1
+    if start >= 0 and revision.content.find(quote, start + 1) < 0:
+        return SourceAnchor(
+            kind=AnchorKind.REVISION_RANGE,
+            observation_id=revision.observation_id,
+            observation_revision_id=revision.id,
+            range_start=start,
+            range_end=start + len(quote),
+        )
+    return SourceAnchor(
+        kind=AnchorKind.WHOLE_OBSERVATION,
+        observation_id=revision.observation_id,
+        observation_revision_id=revision.id,
+    )
+
+
 def _primary_observation_id(
     *,
     candidate_ids: set[str],
@@ -242,17 +252,12 @@ def _primary_observation_id(
             return exact_quote_matches[0]
         if len(candidate_ids) == 1:
             return next(iter(candidate_ids))
-        raise ValueError(
-            "extracted Memory cannot be localized to exactly one changed Source Observation"
-        )
+        raise ValueError("extracted Memory cannot be localized to exactly one changed Source Observation")
 
     if observation_hint in candidate_ids or revalidated_noop:
         if observation_hint not in revisions_by_observation:
             raise ValueError("explicit source observation is unavailable in the current revision")
-        if (
-            not quote
-            and observation_hint in empty_quote_observation_ids
-        ):
+        if not quote and observation_hint in empty_quote_observation_ids:
             return observation_hint
         if not quote or quote not in revisions_by_observation[observation_hint].content:
             raise ValueError("explicit source observation does not contain the evidence quote")
