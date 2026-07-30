@@ -5,10 +5,12 @@ import pytest
 from memforge.llm.structured import MemoryCandidate, MemoryExtractionResponse
 from memforge.pipeline.document_units import ExtractionContext, ExtractionUnit
 from memforge.pipeline.memory_extractor import (
+    MEMORY_CHANGE_EXTRACTION_PROMPT,
     MEMORY_EXTRACTION_PROMPT,
     PROJECTION_BATCH_EXTRACTION_PROMPT,
     UNIT_MEMORY_EXTRACTION_PROMPT,
     MemoryExtractor,
+    _DURABLE_MEMORY_QUALITY_RULES,
 )
 
 
@@ -100,3 +102,24 @@ def test_full_scope_extraction_prompts_delegate_history_to_lifecycle():
     ):
         assert "reconciliation" in prompt.lower()
         assert "existing_memories" not in prompt
+
+
+def test_all_extraction_prompts_share_the_durable_memory_quality_contract():
+    required_rules = (
+        "PREFER EMPTY",
+        "CODE-RECOVERABLE FACTS ARE NOT MEMORIES",
+        "ONE CLAIM, ONE MEMORY",
+        "FOLD REJECTED ALTERNATIVES INTO THE CHOSEN DECISION",
+        "FUTURE USEFULNESS CHECK",
+        "NO META-MEMORIES",
+    )
+
+    for prompt in (
+        MEMORY_EXTRACTION_PROMPT,
+        MEMORY_CHANGE_EXTRACTION_PROMPT,
+        UNIT_MEMORY_EXTRACTION_PROMPT,
+        PROJECTION_BATCH_EXTRACTION_PROMPT,
+    ):
+        assert _DURABLE_MEMORY_QUALITY_RULES in prompt
+        for rule in required_rules:
+            assert rule in prompt
