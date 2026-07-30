@@ -899,9 +899,9 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
-def test_packaged_plugin_version_0_1_36_is_consistent():
+def test_packaged_plugin_version_0_1_37_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.36"
+    version = "0.1.37"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
@@ -2249,6 +2249,174 @@ def test_mcp_proxy_source_selection_descriptions_guide_scoped_and_global_search(
     assert "skip for broad or cross-source requests" in list_sources_description
     assert "Returns source_id, name, type, status, counts, and last_synced_at" in list_sources_description
     assert len(list_sources_description) <= 260
+
+
+def test_mcp_proxy_exposes_recent_current_memory_listing_without_a_query():
+    proxy = _load_plugin_mcp_proxy()
+    tools = {tool["name"]: tool for tool in proxy.TOOLS}
+
+    tool = tools["list_recent_memories"]
+    schema = tool["inputSchema"]
+
+    assert "current Memories" in tool["description"]
+    assert "not a source changelog" in tool["description"]
+    assert "Do not supply or invent a query" in tool["description"]
+    assert "query" not in schema["properties"]
+    assert schema["required"] == ["time_range"]
+    assert schema["properties"]["time_range"]["required"] == ["start_at", "end_at"]
+    assert schema["properties"]["time_range"]["properties"]["date_type"]["enum"] == [
+        "source_updated_at",
+        "memory_updated_at",
+    ]
+    assert schema["properties"]["memory_types"]["items"]["enum"] == [
+        "fact",
+        "decision",
+        "convention",
+        "procedure",
+    ]
+    assert schema["properties"]["cursor"]["description"].startswith("Opaque continuation cursor")
+
+
+def test_mcp_proxy_forwards_recent_memory_listing_and_preserves_pagination_contract(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    captured = {}
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return json.dumps(
+                {
+                    "results": [
+                        {
+                            "memory_id": "mem-1",
+                            "memory_type": "decision",
+                            "summary": "Use stable recent-memory cursors.",
+                            "matched_at": "2026-07-25T00:00:00+00:00",
+                            "relevance_score": 42.0,
+                            "status": "active",
+                            "retrieval_evidence": {"large": "internal"},
+                        }
+                    ],
+                    "result_kind": "current_memories",
+                    "is_changelog": False,
+                    "time_field": "source_updated_at",
+                    "resolved_window": {
+                        "start_at": "2026-07-20T16:00:00+00:00",
+                        "end_at": "2026-07-27T16:00:00+00:00",
+                    },
+                    "listing_watermark": "2026-07-31T04:00:00+00:00",
+                    "cursor_kind": "keyset",
+                    "consistency": "request_bound_watermark_not_mvcc_snapshot",
+                    "total_candidates": 2,
+                    "candidate_count_kind": "exact",
+                    "count_scope": "current_page_read",
+                    "limit": 1,
+                    "has_more": True,
+                    "next_cursor": "opaque-next-page",
+                }
+            ).encode()
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = request.data
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge.example.hana.ondemand.com")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._call_tool(
+        "list_recent_memories",
+        {
+            "source_ids": ["src-jira"],
+            "time_range": {
+                "date_type": "source_updated_at",
+                "start_at": "2026-07-21T00:00:00+08:00",
+                "end_at": "2026-07-28T00:00:00+08:00",
+            },
+            "memory_types": ["decision"],
+            "page_size": 1,
+        },
+    )
+
+    assert captured["url"].endswith("/api/workspaces/mount_tai/api/memories/recent")
+    assert json.loads(captured["body"].decode()) == {
+        "source_ids": ["src-jira"],
+        "time_range": {
+            "date_type": "source_updated_at",
+            "start_at": "2026-07-21T00:00:00+08:00",
+            "end_at": "2026-07-28T00:00:00+08:00",
+        },
+        "memory_types": ["decision"],
+        "page_size": 1,
+        "include_private": True,
+    }
+    assert result == {
+        "results": [
+            {
+                "memory_id": "mem-1",
+                "memory_type": "decision",
+                "summary": "Use stable recent-memory cursors.",
+                "matched_at": "2026-07-25T00:00:00+00:00",
+                "status": "active",
+            }
+        ],
+        "result_kind": "current_memories",
+        "is_changelog": False,
+        "time_field": "source_updated_at",
+        "resolved_window": {
+            "start_at": "2026-07-20T16:00:00+00:00",
+            "end_at": "2026-07-27T16:00:00+00:00",
+        },
+        "listing_watermark": "2026-07-31T04:00:00+00:00",
+        "cursor_kind": "keyset",
+        "consistency": "request_bound_watermark_not_mvcc_snapshot",
+        "total_candidates": 2,
+        "candidate_count_kind": "exact",
+        "count_scope": "current_page_read",
+        "limit": 1,
+        "has_more": True,
+        "next_cursor": "opaque-next-page",
+    }
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (
+            {
+                "query": "updates",
+                "time_range": {
+                    "start_at": "2026-07-21T00:00:00+08:00",
+                    "end_at": "2026-07-28T00:00:00+08:00",
+                },
+            },
+            "Unsupported list_recent_memories parameter(s): query",
+        ),
+        (
+            {
+                "time_range": {
+                    "start_at": "2026-07-21T00:00:00",
+                    "end_at": "2026-07-28T00:00:00+08:00",
+                },
+            },
+            "time_range.start_at must include an explicit UTC offset",
+        ),
+    ],
+)
+def test_mcp_proxy_rejects_recent_memory_filler_query_or_ambiguous_timezone(arguments, message):
+    proxy = _load_plugin_mcp_proxy()
+
+    assert proxy._call_tool("list_recent_memories", arguments) == {"error": message}
 
 
 def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):

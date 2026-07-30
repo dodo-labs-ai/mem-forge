@@ -2,7 +2,7 @@
 
 This plugin connects Claude Code lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.36`.
+The packaged runtime and plugin version is `0.1.37`.
 
 With no routing variables, the plugin targets local OSS at
 `http://127.0.0.1:8765/api`. Otherwise put the target in the top-level `env`
@@ -50,7 +50,7 @@ registers the MCP server; duplicating it in config can pin the agent to a stale
 plugin cache path after upgrades.
 
 The bundled MCP proxy does not need a local MemForge CLI or local-DB MCP
-process. It forwards search, memory detail, recent-change, and session document
+process. It forwards search, current recent-Memory listing, memory detail, and session document
 calls through the configured immutable target. MCP and lifecycle hooks read the
 same top-level agent routing values. `get_resource(mode="file")` is handled
 locally so returned `local_path` values point to the agent machine.
@@ -85,6 +85,15 @@ Use MemForge to search for "<topic>". If source evidence matters, call
 get_memory on the relevant result before citing source details.
 ```
 
+List current Memories observed from active sources during a resolved time
+window without inventing a topic query:
+
+```text
+Use MemForge list_recent_memories for 2026-07-21T00:00:00+08:00 through
+2026-07-28T00:00:00+08:00. This is a current-Memory view, not a source
+changelog. Follow next_cursor with the same filters until has_more is false.
+```
+
 Fetch backing evidence:
 
 ```text
@@ -110,8 +119,8 @@ The hook worker does not call `/api/sources/{source_id}/sync`.
 It stores retry state in `~/.memforge-agent/queue.sqlite` unless
 `MEMFORGE_AGENT_QUEUE_DB` points somewhere else.
 
-The bundled MCP proxy exposes tools such as `search`, `get_memory`, and
-`get_resource`.
+The bundled MCP proxy exposes tools such as `search`, `list_recent_memories`,
+`get_memory`, and `get_resource`.
 `get_resource` fetches `content_url` / `pdf_url` artifacts through
 `MEMFORGE_API_URL`; in `file` mode it writes the artifact to
 `~/.memforge-agent/artifacts`.

@@ -91,7 +91,6 @@ from memforge.models import (
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
-    plan_projection_extraction_batches,
 )
 from memforge.pipeline.source_projection_adapters import (
     project_source_item,
@@ -103,6 +102,7 @@ from memforge.source_derivation import (
     SourceUnitDerivationRequest,
     SourceUnitDerivationContext,
     SourceUnitDeriver,
+    plan_source_derivation_work,
     safe_derivation_error,
     source_derivation_manifest,
 )
@@ -218,11 +218,7 @@ def _projection_with_artifact(
                 sha256=hashlib.sha256(payload).hexdigest(),
                 uri=f"artifact://diagram-{provider_revision}.png",
                 inference_eligible=inference_eligible,
-                inference_ineligible_reason=(
-                    None
-                    if inference_eligible
-                    else "invalid_image_structure"
-                ),
+                inference_ineligible_reason=(None if inference_eligible else "invalid_image_structure"),
             ),
         ),
         prior_unit_revision=prior,
@@ -291,12 +287,7 @@ def _candidate_response(
     *decisions: CandidateRelationDecision | None,
 ) -> CandidateRelationResponse:
     return CandidateRelationResponse.model_validate(
-        {
-            f"slot_{index:02d}": (
-                decisions[index] if index < len(decisions) else None
-            )
-            for index in range(24)
-        }
+        {f"slot_{index:02d}": (decisions[index] if index < len(decisions) else None) for index in range(24)}
     )
 
 
@@ -304,12 +295,7 @@ def _audit_response(
     *decisions: IncumbentSupportAuditDecision | None,
 ) -> IncumbentSupportAuditResponse:
     return IncumbentSupportAuditResponse.model_validate(
-        {
-            f"slot_{index:02d}": (
-                decisions[index] if index < len(decisions) else None
-            )
-            for index in range(30)
-        }
+        {f"slot_{index:02d}": (decisions[index] if index < len(decisions) else None) for index in range(30)}
     )
 
 
@@ -429,18 +415,13 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
         source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
     )
     [incumbent] = await db.list_memories()
-    previous_support = await db.get_active_memory_support_reference_ids(
-        incumbent.id
-    )
+    previous_support = await db.get_active_memory_support_reference_ids(incumbent.id)
 
     second = _projection(
         run_id="projection-conflict-review-2",
         body="Service uses PostgreSQL 16.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     reviewing_engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
@@ -471,20 +452,16 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
     assert stats["pending_review"] == 1
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
-    assert await db.get_active_memory_support_reference_ids(
-        incumbent.id
-    ) == previous_support
+    assert await db.get_active_memory_support_reference_ids(incumbent.id) == previous_support
     assert [memory.id for memory in await db.list_memories()] == [incumbent.id]
     [review] = await db.list_lifecycle_reviews(
         "src-1",
         status=LifecycleReviewStatus.PENDING,
     )
     assert review.incumbent_memory_id == incumbent.id
-    assert second.source_unit_revisions[0].id == (
-        await db.get_current_source_unit_revision(
-            second.source_units[0].id
-        )
-    ).id
+    assert (
+        second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id
+    )
 
 
 @pytest.mark.asyncio
@@ -498,14 +475,10 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
         inference_eligible=True,
     )
     artifact_observation_id = next(
-        observation.id
-        for observation in first.observations
-        if observation.observation_type == "binary_artifact"
+        observation.id for observation in first.observations if observation.observation_type == "binary_artifact"
     )
     page_observation_id = next(
-        observation.id
-        for observation in first.observations
-        if observation.observation_type == "page_body"
+        observation.id for observation in first.observations if observation.observation_type == "page_body"
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -518,16 +491,12 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
         doc_id="confluence-123",
         raw_memories=[
             RawMemory(
-                content=(
-                    "The architecture diagram establishes that A7 remains enabled."
-                ),
+                content=("The architecture diagram establishes that A7 remains enabled."),
                 memory_type="decision",
                 evidence_quote="# Page",
                 evidence_anchor="projection_batch",
                 source_observation_id=page_observation_id,
-                required_source_observation_ids=(
-                    artifact_observation_id,
-                ),
+                required_source_observation_ids=(artifact_observation_id,),
             )
         ],
         doc_type="design-doc",
@@ -540,14 +509,10 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
         source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
     )
     [incumbent] = await db.list_memories()
-    previous_support = (
-        await db.get_active_memory_support_reference_ids(incumbent.id)
-    )
-    observation_ids = (
-        await db.get_active_memory_support_observation_ids_many(
-            (incumbent.id,),
-            source_id="src-1",
-        )
+    previous_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    observation_ids = await db.get_active_memory_support_observation_ids_many(
+        (incumbent.id,),
+        source_id="src-1",
     )
     assert artifact_observation_id in observation_ids[incumbent.id]
     assert page_observation_id in observation_ids[incumbent.id]
@@ -558,10 +523,7 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
         provider_revision="2",
         inference_eligible=False,
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     protected_engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
@@ -585,17 +547,13 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
     )
 
     current = await db.get_memory(incumbent.id)
-    current_support = (
-        await db.get_active_memory_support_reference_ids(incumbent.id)
-    )
+    current_support = await db.get_active_memory_support_reference_ids(incumbent.id)
     assert current is not None and current.status == "active"
     assert stats["pending_review"] == 1
     assert current_support == previous_support
-    assert second.source_unit_revisions[0].id == (
-        await db.get_current_source_unit_revision(
-            second.source_units[0].id
-        )
-    ).id
+    assert (
+        second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id
+    )
 
 
 @pytest.mark.asyncio
@@ -609,14 +567,10 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
         inference_eligible=True,
     )
     artifact_observation_id = next(
-        observation.id
-        for observation in first.observations
-        if observation.observation_type == "binary_artifact"
+        observation.id for observation in first.observations if observation.observation_type == "binary_artifact"
     )
     page_observation_id = next(
-        observation.id
-        for observation in first.observations
-        if observation.observation_type == "page_body"
+        observation.id for observation in first.observations if observation.observation_type == "page_body"
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -646,17 +600,12 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
         source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
     )
     [incumbent] = await db.list_memories()
-    previous_support = await db.get_active_memory_support_reference_ids(
-        incumbent.id
-    )
+    previous_support = await db.get_active_memory_support_reference_ids(incumbent.id)
     second = _projection(
         run_id="projection-artifact-removed",
         body="# Page",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     reviewing_engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
@@ -680,17 +629,13 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
     )
 
     current = await db.get_memory(incumbent.id)
-    current_support = await db.get_active_memory_support_reference_ids(
-        incumbent.id
-    )
+    current_support = await db.get_active_memory_support_reference_ids(incumbent.id)
     assert current is not None and current.status == "active"
     assert stats["pending_review"] == 1
     assert current_support == previous_support
-    assert second.source_unit_revisions[0].id == (
-        await db.get_current_source_unit_revision(
-            second.source_units[0].id
-        )
-    ).id
+    assert (
+        second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id
+    )
 
 
 class _RecordingAddClient:
@@ -716,6 +661,7 @@ class _RecordingAddClient:
                 reason="The unchanged incumbent remains supported.",
             )
         )
+
 
 class _PersistentlyIncompleteAuditClient:
     def __init__(self, incumbent_id: str) -> None:
@@ -817,12 +763,7 @@ def _candidate_ledger_response(
     *decisions: CandidateLedgerDecision | None,
 ) -> CandidateLedgerResponse:
     return CandidateLedgerResponse(
-        **{
-            f"slot_{index:02d}": (
-                decisions[index] if index < len(decisions) else None
-            )
-            for index in range(24)
-        }
+        **{f"slot_{index:02d}": (decisions[index] if index < len(decisions) else None) for index in range(24)}
     )
 
 
@@ -1069,9 +1010,7 @@ async def test_incomplete_candidate_ledger_is_audited_as_fallback_and_keeps_memo
         body="The trigger remained OPEN. The trigger was not processed.",
     )
     observation_id = projection.observations[0].id
-    client = _CandidateLedgerClient(
-        _candidate_ledger_response(CandidateLedgerDecision(action="KEEP"))
-    )
+    client = _CandidateLedgerClient(_candidate_ledger_response(CandidateLedgerDecision(action="KEEP")))
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
@@ -1133,9 +1072,7 @@ class _SemanticEquivalentClient:
 
     async def audit_incumbent_support(self, prompt: str, **kwargs):
         del prompt, kwargs
-        return _audit_response(
-            IncumbentSupportAuditDecision(action="NOOP", reason="still supported")
-        )
+        return _audit_response(IncumbentSupportAuditDecision(action="NOOP", reason="still supported"))
 
     async def classify_memory_relations(self, prompt: str, **kwargs):
         del kwargs
@@ -1284,6 +1221,68 @@ async def _seed_incumbent_support(
     return incumbent
 
 
+def test_exact_unique_quote_materializes_revision_range_primary_anchor() -> None:
+    projection = _projection(
+        run_id="projection-exact-range",
+        body="Intro.\n\nA7 is removed.\n\nClosing note.",
+    )
+    quote = "A7 is removed."
+    evidence = build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=(
+            RawMemory(
+                content="A7 is removed.",
+                memory_type="decision",
+                evidence_quote=quote,
+            ),
+        ),
+        doc_id="confluence-123",
+        source_type="confluence",
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        access_context_hash="workspace-eng",
+        extractor_run_id=projection.run_id,
+    )
+
+    [primary] = [reference for reference in evidence.references if reference.role is EvidenceRole.PRIMARY]
+    revision = projection.observation_revisions[0]
+    expected_start = revision.content.index(quote)
+    assert primary.anchor.kind is AnchorKind.REVISION_RANGE
+    assert primary.anchor.observation_revision_id == revision.id
+    assert primary.anchor.range_start == expected_start
+    assert primary.anchor.range_end == expected_start + len(quote)
+
+
+def test_repeated_quote_keeps_conservative_whole_observation_anchor() -> None:
+    projection = _projection(
+        run_id="projection-ambiguous-range",
+        body="Repeated fact.\n\nRepeated fact.",
+    )
+    evidence = build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=(
+            RawMemory(
+                content="Repeated fact.",
+                memory_type="fact",
+                evidence_quote="Repeated fact.",
+            ),
+        ),
+        doc_id="confluence-123",
+        source_type="confluence",
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        access_context_hash="workspace-eng",
+        extractor_run_id=projection.run_id,
+    )
+
+    [primary] = [reference for reference in evidence.references if reference.role is EvidenceRole.PRIMARY]
+    assert primary.anchor.kind is AnchorKind.WHOLE_OBSERVATION
+
+
 @pytest.mark.asyncio
 async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> None:
     first = _projection(run_id="projection-noop-1", body="A7 is removed.")
@@ -1383,10 +1382,7 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
         run_id="projection-derivation-atomic-2",
         body="A7 remains removed.",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            revision.observation_id: revision
-            for revision in first.observation_revisions
-        },
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     original_document = await db.get_document("confluence-123")
     assert original_document is not None
@@ -1433,9 +1429,7 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
         source_support_reference_ids={},
         all_active_support_reference_ids={},
         support_set_hashes={},
-        observation_revision_ids=tuple(
-            revision.id for revision in second.observation_revisions
-        ),
+        observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
         new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
@@ -1457,9 +1451,7 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
             plan,
             document=staged_document,
             derivation_id=attempt.id,
-            derivation_context_identity_hash=(
-                attempt.context_identity_hash
-            ),
+            derivation_context_identity_hash=(attempt.context_identity_hash),
         )
 
     with pytest.raises(
@@ -1483,9 +1475,7 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
             plan,
             document=replace(staged_document, title="Unstaged title"),
             derivation_id=attempt.id,
-            derivation_context_identity_hash=(
-                attempt.context_identity_hash
-            ),
+            derivation_context_identity_hash=(attempt.context_identity_hash),
         )
 
     with pytest.raises(
@@ -1503,18 +1493,12 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
         plan,
         document=staged_document,
         derivation_id=attempt.id,
-        derivation_context_identity_hash=(
-            attempt.context_identity_hash
-        ),
+        derivation_context_identity_hash=(attempt.context_identity_hash),
     )
 
     committed_document = await db.get_document("confluence-123")
-    [committed_attempt] = await db.list_source_derivation_attempts(
-        source_id="src-1"
-    )
-    current_unit = await db.get_current_source_unit_revision(
-        second.source_units[0].id
-    )
+    [committed_attempt] = await db.list_source_derivation_attempts(source_id="src-1")
+    current_unit = await db.get_current_source_unit_revision(second.source_units[0].id)
     assert committed_document is not None
     assert committed_document.title == "Atomically updated page"
     assert current_unit is not None
@@ -1532,22 +1516,16 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
     )
     document = await db.get_document("confluence-123")
     assert document is not None
-    observation_ids = tuple(
-        observation.id for observation in projection.observations
-    )
+    observation_ids = tuple(observation.id for observation in projection.observations)
     batches = (
         ProjectionExtractionBatch(
             id="batch-first",
             source_unit_id=projection.source_units[0].id,
             primary_image_bytes=0,
             primary_observation_ids=(observation_ids[0],),
-            primary_content_by_observation_id=(
-                (observation_ids[0], "first"),
-            ),
+            primary_content_by_observation_id=((observation_ids[0], "first"),),
             context_observation_ids=(),
-            context_observation_ids_by_primary=(
-                (observation_ids[0], ()),
-            ),
+            context_observation_ids_by_primary=((observation_ids[0], ()),),
             primary_markdown="first",
             context_markdown="",
         ),
@@ -1556,13 +1534,9 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
             source_unit_id=projection.source_units[0].id,
             primary_image_bytes=0,
             primary_observation_ids=(observation_ids[-1],),
-            primary_content_by_observation_id=(
-                (observation_ids[-1], "second"),
-            ),
+            primary_content_by_observation_id=((observation_ids[-1], "second"),),
             context_observation_ids=(),
-            context_observation_ids_by_primary=(
-                (observation_ids[-1], ()),
-            ),
+            context_observation_ids_by_primary=((observation_ids[-1], ()),),
             primary_markdown="second",
             context_markdown="",
         ),
@@ -1576,7 +1550,7 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
     with pytest.raises(RuntimeError, match="worker interrupted"):
         await SourceUnitDeriver(
             db,
-            plan_batches=lambda _projection: batches,
+            plan_work=lambda _projection, _context: batches,
         ).derive(
             SourceUnitDerivationRequest(
                 projection=projection,
@@ -1598,12 +1572,8 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
             )
         )
 
-    [attempt] = await db.list_source_derivation_attempts(
-        source_id="src-1"
-    )
-    assert {
-        batch.batch_id: batch.status for batch in attempt.batches
-    } == {
+    [attempt] = await db.list_source_derivation_attempts(source_id="src-1")
+    assert {batch.batch_id: batch.status for batch in attempt.batches} == {
         "batch-first": "completed",
         "batch-second": "pending",
     }
@@ -1663,21 +1633,18 @@ async def test_source_derivation_separates_exact_payload_hash_from_stable_identi
     )
 
     assert first_manifest.id == second_manifest.id
-    assert (
-        first_manifest.projection_identity_hash
-        == second_manifest.projection_identity_hash
-    )
+    assert first_manifest.projection_identity_hash == second_manifest.projection_identity_hash
+    assert first_manifest.projection_payload_hash != second_manifest.projection_payload_hash
     assert (
         first_manifest.projection_payload_hash
-        != second_manifest.projection_payload_hash
+        == hashlib.sha256(
+            json.dumps(
+                first_manifest.projection_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
     )
-    assert first_manifest.projection_payload_hash == hashlib.sha256(
-        json.dumps(
-            first_manifest.projection_payload,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
 
     first_attempt = await db.stage_source_derivation(first_manifest)
     retry_attempt = await db.stage_source_derivation(second_manifest)
@@ -1686,20 +1653,13 @@ async def test_source_derivation_separates_exact_payload_hash_from_stable_identi
         (),
         context=replace(context, source_activity_epoch=2),
     )
-    next_epoch_attempt = await db.stage_source_derivation(
-        next_epoch_manifest
-    )
+    next_epoch_attempt = await db.stage_source_derivation(next_epoch_manifest)
 
     assert retry_attempt.id == first_attempt.id
-    assert (
-        retry_attempt.projection_payload_hash
-        == first_manifest.projection_payload_hash
-    )
+    assert retry_attempt.projection_payload_hash == first_manifest.projection_payload_hash
     assert retry_attempt.projection.run_id == first.run_id
     assert next_epoch_attempt.id != first_attempt.id
-    assert next_epoch_attempt.target_unit_revision_id == (
-        first_attempt.target_unit_revision_id
-    )
+    assert next_epoch_attempt.target_unit_revision_id == (first_attempt.target_unit_revision_id)
     assert next_epoch_attempt.context.source_activity_epoch == 2
 
 
@@ -1727,12 +1687,9 @@ async def test_projection_extraction_contract_change_invalidates_staged_derivati
         source_activity_epoch=None,
     )
 
-    current_batches = plan_projection_extraction_batches(projection)
+    current_batches = plan_source_derivation_work(projection, context)
     assert current_batches
-    previous_batches = tuple(
-        replace(batch, id=f"{batch.id}-v2")
-        for batch in current_batches
-    )
+    previous_batches = tuple(replace(batch, id=f"{batch.id}-v2") for batch in current_batches)
     previous = source_derivation_manifest(
         projection,
         previous_batches,
@@ -1771,10 +1728,7 @@ async def test_projection_extraction_contract_change_invalidates_staged_derivati
         context=context,
     )
 
-    assert (
-        current.extraction_contract_version
-        != previous.extraction_contract_version
-    )
+    assert current.extraction_contract_version != previous.extraction_contract_version
     assert current.id != previous.id
     assert result.derivation.id == current.id
     assert result.reused_batch_count == 0
@@ -1891,21 +1845,15 @@ async def test_noop_without_current_evidence_rolls_back_stale_support(db: Databa
             plan,
             document=staged_document,
             derivation_id=attempt.id,
-            derivation_context_identity_hash=(
-                attempt.context_identity_hash
-            ),
+            derivation_context_identity_hash=(attempt.context_identity_hash),
         )
 
     current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
     assert current_unit is not None
     assert current_unit.id == first.source_unit_revisions[0].id
     assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
-    assert (await db.get_document("confluence-123")).title == (
-        original_document.title
-    )
-    [rolled_back_attempt] = await db.list_source_derivation_attempts(
-        source_id="src-1"
-    )
+    assert (await db.get_document("confluence-123")).title == (original_document.title)
+    [rolled_back_attempt] = await db.list_source_derivation_attempts(source_id="src-1")
     assert rolled_back_attempt.status == "completed"
 
 
@@ -2062,9 +2010,7 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
     assert current_unit is not None
     assert current_unit.id == second.source_unit_revisions[0].id
     assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
-    support_state = (await db.get_active_memory_support_states((incumbent.id,)))[
-        incumbent.id
-    ]
+    support_state = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
     assert support_state.reference_ids == old_support
     assert support_state.current_reference_ids == ()
     review = await db.get_lifecycle_review(str(plan.mutations[0].payload["review_id"]))
@@ -5335,9 +5281,7 @@ async def test_rebaseline_reset_preserves_an_overlapping_source_projection(
     assert result.retired_memory_ids == ()
     assert persisted is not None and persisted.status == "active"
     remaining_sources = await db.get_memory_sources(memory.id)
-    assert [(source.source_id, source.doc_id) for source in remaining_sources] == [
-        ("src-overlap", "confluence-123")
-    ]
+    assert [(source.source_id, source.doc_id) for source in remaining_sources] == [("src-overlap", "confluence-123")]
     metadata = await db.db.execute_fetchall(
         """SELECT source_id FROM memory_search_metadata_trigram
              WHERE memory_id = ? AND doc_id = ?""",
@@ -5905,13 +5849,11 @@ async def test_tombstone_retains_document_when_unmapped_provenance_remains(
     await db.record_source_projection(initial)
     memory = await _seed_incumbent_support(db, projection=initial)
     await db.db.execute(
-        "UPDATE memory_sources SET support_kind = 'corroborated' "
-        "WHERE memory_id = ? AND doc_id = ?",
+        "UPDATE memory_sources SET support_kind = 'corroborated' WHERE memory_id = ? AND doc_id = ?",
         (memory.id, "confluence-123"),
     )
     await db.db.execute(
-        "UPDATE memory_support_assertions SET active = 0, removed_at = ? "
-        "WHERE memory_id = ?",
+        "UPDATE memory_support_assertions SET active = 0, removed_at = ? WHERE memory_id = ?",
         (datetime.now(timezone.utc).isoformat(), memory.id),
     )
     await db.db.commit()
@@ -5920,10 +5862,7 @@ async def test_tombstone_retains_document_when_unmapped_provenance_remains(
         run_id="projection-unmapped-delete",
         source_unit=initial.source_units[0],
         prior_unit_revision=initial.source_unit_revisions[0],
-        prior_observation_revisions={
-            revision.observation_id: revision
-            for revision in initial.observation_revisions
-        },
+        prior_observation_revisions={revision.observation_id: revision for revision in initial.observation_revisions},
         reason="not_returned_by_authoritative_snapshot",
     )
     adapters = build_sqlite_adapters(db, object())
@@ -5946,9 +5885,7 @@ async def test_tombstone_retains_document_when_unmapped_provenance_remains(
         "can_delete_document": False,
     }
     assert await db.get_document("confluence-123") is not None
-    assert [source.doc_id for source in await db.get_memory_sources(memory.id)] == [
-        "confluence-123"
-    ]
+    assert [source.doc_id for source in await db.get_memory_sources(memory.id)] == ["confluence-123"]
 
     retry = await engine.apply_projected_tombstone(
         projection=tombstone,

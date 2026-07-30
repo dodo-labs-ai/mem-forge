@@ -10,12 +10,15 @@ Architecture reference: docs/architecture.md Section 10.
 from __future__ import annotations
 
 import asyncio
+import base64
+from dataclasses import asdict, dataclass, replace
+import hashlib
+import json
 import logging
 import math
 import re
 import time
 import unicodedata
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -35,6 +38,7 @@ from memforge.storage.adapters.protocols import (
     EntityLinkCandidate,
     KeywordCandidate,
     KeywordSearch,
+    RecentMemoryItem,
     RelationalStore,
     VectorStore,
 )
@@ -535,6 +539,103 @@ class SearchEngine:
     # Public API
     # ==================================================================
 
+    async def list_recent_memories(
+        self,
+        *,
+        source_filter: MemorySourceFilter | None,
+        time_range: MemoryTimeRange,
+        memory_types: list[str] | None = None,
+        page_size: int = 50,
+        cursor: str | None = None,
+        request_scope: AccessScope | None = None,
+    ) -> dict[str, Any]:
+        """List current Memories by exact predicates and a request-bound keyset.
+
+        The cursor preserves a fixed UTC upper watermark and the last ordered
+        key. It is not a database MVCC snapshot: concurrent or late-arriving
+        source changes are intentionally observed by a new listing.
+        """
+        if time_range.after is None or time_range.before is None:
+            raise ValueError("recent-memory listing requires start_at and end_at")
+        if time_range.after >= time_range.before:
+            raise ValueError("recent-memory listing requires start_at before end_at")
+        if page_size < 1 or page_size > 50:
+            raise ValueError("page_size must be from 1 to 50")
+
+        scope = request_scope or _default_access_scope(False)
+        if scope.allowed_statuses != ("active",):
+            scope = replace(scope, allowed_statuses=("active",))
+        normalized_filter = source_filter or MemorySourceFilter()
+        normalized_types = tuple(dict.fromkeys(memory_types or ()))
+        fingerprint = _recent_listing_fingerprint(
+            source_filter=normalized_filter,
+            time_range=time_range,
+            memory_types=normalized_types,
+            scope=scope,
+        )
+
+        if cursor is None:
+            listing_watermark = datetime.now(timezone.utc)
+            after = None
+        else:
+            listing_watermark, after = _decode_recent_listing_cursor(cursor, fingerprint=fingerprint)
+
+        page = await self._relational.list_recent_memory_ids(
+            normalized_filter,
+            time_range,
+            scope,
+            memory_types=normalized_types,
+            listing_watermark=listing_watermark,
+            after=after,
+            limit=page_size,
+        )
+        ids = [item.memory_id for item in page.items]
+        ranked = [
+            _RankedCandidate(
+                memory_id=item.memory_id,
+                final_score=float(page_size - index),
+                updated_at=item.sort_at,
+            )
+            for index, item in enumerate(page.items)
+        ]
+        enriched_results = await self._enrich_results(ids, ranked)
+        matched_at_by_memory_id = {
+            item.memory_id: item.sort_at.astimezone(timezone.utc).isoformat()
+            for item in page.items
+        }
+        results: list[dict[str, Any]] = []
+        for result in enriched_results:
+            payload = asdict(result)
+            payload.pop("relevance_score", None)
+            payload["matched_at"] = matched_at_by_memory_id[result.memory_id]
+            results.append(payload)
+        next_cursor = None
+        if page.has_more and page.items:
+            next_cursor = _encode_recent_listing_cursor(
+                fingerprint=fingerprint,
+                listing_watermark=listing_watermark,
+                after=page.items[-1],
+            )
+        return {
+            "results": results,
+            "result_kind": "current_memories",
+            "is_changelog": False,
+            "time_field": time_range.date_type,
+            "resolved_window": {
+                "start_at": time_range.after.astimezone(timezone.utc).isoformat(),
+                "end_at": time_range.before.astimezone(timezone.utc).isoformat(),
+            },
+            "listing_watermark": listing_watermark.isoformat(),
+            "cursor_kind": "keyset",
+            "consistency": "request_bound_watermark_not_mvcc_snapshot",
+            "total_candidates": page.total_count,
+            "candidate_count_kind": "exact",
+            "count_scope": "current_page_read",
+            "limit": page_size,
+            "has_more": page.has_more,
+            "next_cursor": next_cursor,
+        }
+
     async def search(
         self,
         query: str,
@@ -580,6 +681,7 @@ class SearchEngine:
                 scope,
                 limit=top_k,
                 offset=offset,
+                memory_types=tuple(memory_types or ()),
             )
             ranked = [
                 _RankedCandidate(memory_id=memory_id, rrf_score=float(top_k - index), final_score=float(top_k - index))
@@ -1287,6 +1389,82 @@ class SearchEngine:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+def _recent_listing_fingerprint(
+    *,
+    source_filter: MemorySourceFilter,
+    time_range: MemoryTimeRange,
+    memory_types: tuple[str, ...],
+    scope: AccessScope,
+) -> str:
+    payload = {
+        "source_ids": sorted(source_filter.source_ids),
+        "clients": sorted(source_filter.clients),
+        "repo_identifiers": sorted(source_filter.repo_identifiers),
+        "start_at": time_range.after.astimezone(timezone.utc).isoformat() if time_range.after else None,
+        "end_at": time_range.before.astimezone(timezone.utc).isoformat() if time_range.before else None,
+        "date_type": time_range.date_type,
+        "memory_types": sorted(memory_types),
+        "scope": {
+            "user_id": scope.user_id,
+            "include_private": scope.include_private,
+            "allowed_statuses": list(scope.allowed_statuses),
+            "active_project": scope.active_project,
+            "scope_mode": scope.scope_mode,
+            "active_repo_identifier": scope.active_repo_identifier,
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _encode_recent_listing_cursor(
+    *,
+    fingerprint: str,
+    listing_watermark: datetime,
+    after: RecentMemoryItem,
+) -> str:
+    payload = {
+        "v": 1,
+        "f": fingerprint,
+        "s": listing_watermark.astimezone(timezone.utc).isoformat(),
+        "a": after.sort_at.astimezone(timezone.utc).isoformat(),
+        "i": after.memory_id,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode("ascii")
+
+
+def _decode_recent_listing_cursor(
+    cursor: str,
+    *,
+    fingerprint: str,
+) -> tuple[datetime, RecentMemoryItem]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+        if not isinstance(payload, dict):
+            raise ValueError
+        if payload.get("v") != 1 or payload.get("f") != fingerprint:
+            raise ValueError
+        listing_watermark = datetime.fromisoformat(str(payload["s"]).replace("Z", "+00:00"))
+        sort_at = datetime.fromisoformat(str(payload["a"]).replace("Z", "+00:00"))
+        memory_id = str(payload["i"]).strip()
+        if (
+            listing_watermark.tzinfo is None
+            or listing_watermark.utcoffset() is None
+            or sort_at.tzinfo is None
+            or sort_at.utcoffset() is None
+            or not memory_id
+        ):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("cursor is invalid or does not match the recent-memory request") from exc
+    return listing_watermark.astimezone(timezone.utc), RecentMemoryItem(
+        memory_id=memory_id,
+        sort_at=sort_at.astimezone(timezone.utc),
+    )
+
 
 def _metadata_keyword_evidence(hit: KeywordCandidate) -> dict[str, Any]:
     return {
