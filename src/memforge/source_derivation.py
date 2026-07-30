@@ -8,12 +8,18 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from memforge.models import DocumentRecord, MemoryExtractionResult, RawMemory
 from memforge.pipeline.bounded_work import collect_bounded
 from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
+)
+from memforge.pipeline.document_units import (
+    ExtractionContext,
+    ExtractionContextPacker,
+    UnitizationPolicy,
+    unitize_markdown,
 )
 from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
@@ -39,9 +45,7 @@ SOURCE_DERIVATION_BATCH_PENDING = "pending"
 SOURCE_DERIVATION_BATCH_COMPLETED = "completed"
 SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE = "retryable_failure"
 
-_SAFE_DERIVATION_DIAGNOSTIC_RE = re.compile(
-    r"^[A-Za-z0-9_.\[\]$-]+$"
-)
+_SAFE_DERIVATION_DIAGNOSTIC_RE = re.compile(r"^[A-Za-z0-9_.\[\]$-]+$")
 _MAX_SAFE_DERIVATION_ERROR_FIELDS = 32
 
 
@@ -116,6 +120,33 @@ class SourceUnitDerivationContext:
     source_updated_at: str | None
     user_id: str | None
     source_activity_epoch: int | None
+    current_changed_ranges: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DiffGuidedExtractionBatch:
+    """One changed-range work item for a single textual Source Observation."""
+
+    id: str
+    source_unit_id: str
+    primary_observation_ids: tuple[str, ...]
+    changed_hunks: str
+    updated_document: str
+    kind: Literal["diff_guided"] = "diff_guided"
+
+
+@dataclass(frozen=True, slots=True)
+class StructuralExtractionBatch:
+    """One deterministic Markdown unit in full-document extraction."""
+
+    id: str
+    source_unit_id: str
+    primary_observation_ids: tuple[str, ...]
+    context: ExtractionContext
+    kind: Literal["structural_unit"] = "structural_unit"
+
+
+SourceDerivationBatch = ProjectionExtractionBatch | DiffGuidedExtractionBatch | StructuralExtractionBatch
 
 
 class SourceDerivationStore(Protocol):
@@ -144,7 +175,7 @@ class SourceUnitDerivationRequest:
     projection: SourceProjection
     context: SourceUnitDerivationContext
     extract_batch: Callable[
-        [ProjectionExtractionBatch],
+        [SourceDerivationBatch],
         Awaitable[MemoryExtractionResult],
     ]
     max_concurrent: int
@@ -165,37 +196,33 @@ class SourceUnitDeriver:
         self,
         store: SourceDerivationStore,
         *,
-        plan_batches: Callable[
-            [SourceProjection],
-            tuple[ProjectionExtractionBatch, ...],
-        ] = plan_projection_extraction_batches,
+        plan_work: Callable[
+            [SourceProjection, SourceUnitDerivationContext],
+            tuple[SourceDerivationBatch, ...],
+        ]
+        | None = None,
     ) -> None:
         self._store = store
-        self._plan_batches = plan_batches
+        self._plan_work = plan_work or plan_source_derivation_work
 
     async def derive(
         self,
         request: SourceUnitDerivationRequest,
     ) -> SourceUnitDerivationResult:
-        batches = self._plan_batches(request.projection)
+        batches = self._plan_work(request.projection, request.context)
         manifest = source_derivation_manifest(
             request.projection,
             batches,
             context=request.context,
         )
         derivation = await self._store.stage_source_derivation(manifest)
-        completed_results = (
-            await self._store.get_completed_source_derivation_batch_results(
-                derivation_id=derivation.id,
-            )
+        completed_results = await self._store.get_completed_source_derivation_batch_results(
+            derivation_id=derivation.id,
         )
-        pending_batches = tuple(
-            batch
-            for batch in batches
-            if batch.id not in completed_results
-        )
+        pending_batches = tuple(batch for batch in batches if batch.id not in completed_results)
+
         async def extract_and_persist(
-            batch: ProjectionExtractionBatch,
+            batch: SourceDerivationBatch,
         ) -> MemoryExtractionResult:
             result = await request.extract_batch(batch)
             await self._store.record_source_derivation_batch_result(
@@ -220,9 +247,7 @@ class SourceUnitDeriver:
             )
         }
         ordered_results = tuple(
-            completed_results.get(batch.id)
-            or new_results_by_batch_id[batch.id]
-            for batch in batches
+            completed_results.get(batch.id) or new_results_by_batch_id[batch.id] for batch in batches
         )
         extraction = _assemble_derivation_results(
             projection=request.projection,
@@ -230,9 +255,26 @@ class SourceUnitDeriver:
         )
         extraction.metadata = {
             **extraction.metadata,
+            "derivation_work_kinds": sorted({_derivation_batch_kind(batch) for batch in batches}),
             "reused_derivation_batch_count": len(completed_results),
             "executed_derivation_batch_count": len(pending_batches),
         }
+        structural_batches = tuple(batch for batch in batches if isinstance(batch, StructuralExtractionBatch))
+        if structural_batches:
+            units = tuple(batch.context.unit for batch in structural_batches)
+            extraction.metadata.update(
+                {
+                    "unitized": True,
+                    "unit_count": len(units),
+                    "failed_unit_count": extraction.metadata.get(
+                        "failed_batch_count",
+                        0,
+                    ),
+                    "segmentation_version": units[0].segmentation_version,
+                    "partition_strategy": "recursive_fit_first",
+                    "max_unit_input_tokens": (UnitizationPolicy().max_unit_input_tokens),
+                }
+            )
         return SourceUnitDerivationResult(
             derivation=derivation,
             extraction=extraction,
@@ -241,9 +283,90 @@ class SourceUnitDeriver:
         )
 
 
+def plan_source_derivation_work(
+    projection: SourceProjection,
+    context: SourceUnitDerivationContext,
+) -> tuple[SourceDerivationBatch, ...]:
+    """Plan provider-neutral extraction work for one immutable Source Unit."""
+
+    projection_batches = plan_projection_extraction_batches(projection)
+    if len(projection.observations) != 1 or len(projection.observation_revisions) != 1:
+        return projection_batches
+
+    observation = projection.observations[0]
+    revision = projection.observation_revisions[0]
+    if (
+        revision.observation_id != observation.id
+        or observation.observation_type == "binary_artifact"
+        or not observation_is_inference_eligible(
+            observation.observation_type,
+            revision.metadata,
+        )
+    ):
+        return projection_batches
+
+    changed_observation_ids = {
+        anchor.observation_id for delta in projection.deltas for anchor in delta.changed_anchors
+    } | {observation_id for delta in projection.deltas for observation_id in delta.added_observation_ids}
+    if changed_observation_ids != {observation.id}:
+        return projection_batches
+
+    if context.update_mode != "diff_guided" or not context.changed_hunks:
+        policy = UnitizationPolicy()
+        units = unitize_markdown(
+            context.document_content,
+            doc_id=context.document.doc_id,
+            policy=policy,
+        )
+        packer = ExtractionContextPacker(units)
+        target_revision_id = projection.source_unit_revisions[0].id
+        return tuple(
+            StructuralExtractionBatch(
+                id=(
+                    "ubatch-"
+                    + hashlib.sha256(
+                        (
+                            f"{SOURCE_DERIVATION_CONTRACT_VERSION}\x1f"
+                            f"{target_revision_id}\x1fstructural_unit\x1f"
+                            f"{unit.unit_id}\x1f{unit.content_fingerprint}"
+                        ).encode("utf-8")
+                    ).hexdigest()[:16]
+                ),
+                source_unit_id=projection.source_units[0].id,
+                primary_observation_ids=(observation.id,),
+                context=packer.pack(
+                    document_title=context.document.title,
+                    document_url=context.document.source_url,
+                    source_type=projection.source_type,
+                    unit=unit,
+                    entities=[],
+                ),
+            )
+            for unit in units
+        )
+
+    target_revision_id = projection.source_unit_revisions[0].id
+    digest = hashlib.sha256(
+        (
+            f"{SOURCE_DERIVATION_CONTRACT_VERSION}\x1f"
+            f"{target_revision_id}\x1fdiff_guided\x1f"
+            f"{hashlib.sha256(context.changed_hunks.encode('utf-8')).hexdigest()}"
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return (
+        DiffGuidedExtractionBatch(
+            id=f"dbatch-{digest}",
+            source_unit_id=projection.source_units[0].id,
+            primary_observation_ids=(observation.id,),
+            changed_hunks=context.changed_hunks,
+            updated_document=context.document_content,
+        ),
+    )
+
+
 def source_derivation_manifest(
     projection: SourceProjection,
-    batches: tuple[ProjectionExtractionBatch, ...],
+    batches: tuple[SourceDerivationBatch, ...],
     *,
     context: SourceUnitDerivationContext,
     extraction_contract_version: str = SOURCE_DERIVATION_CONTRACT_VERSION,
@@ -260,16 +383,10 @@ def source_derivation_manifest(
         raise ValueError("Source derivation target does not match projected Source Unit revision")
     projection_payload = source_projection_to_payload(projection)
     projection_payload_json = _canonical_json(projection_payload)
-    projection_payload_hash = hashlib.sha256(
-        projection_payload_json.encode("utf-8")
-    ).hexdigest()
-    projection_identity_hash = source_derivation_projection_identity_hash(
-        projection
-    )
+    projection_payload_hash = hashlib.sha256(projection_payload_json.encode("utf-8")).hexdigest()
+    projection_identity_hash = source_derivation_projection_identity_hash(projection)
     context_payload = source_unit_derivation_context_to_payload(context)
-    context_payload_hash = hashlib.sha256(
-        _canonical_json(context_payload).encode("utf-8")
-    ).hexdigest()
+    context_payload_hash = hashlib.sha256(_canonical_json(context_payload).encode("utf-8")).hexdigest()
     context_identity_hash = source_derivation_context_identity_hash(context)
     manifest_batches = tuple(
         SourceDerivationBatchManifest(
@@ -291,13 +408,9 @@ def source_derivation_manifest(
         "projection_identity_hash": projection_identity_hash,
         "context_identity_hash": context_identity_hash,
         "extraction_contract_version": extraction_contract_version,
-        "batch_input_hashes": [
-            item.input_payload_hash for item in manifest_batches
-        ],
+        "batch_input_hashes": [item.input_payload_hash for item in manifest_batches],
     }
-    derivation_id = "sdrv-" + hashlib.sha256(
-        _canonical_json(identity_payload).encode("utf-8")
-    ).hexdigest()[:32]
+    derivation_id = "sdrv-" + hashlib.sha256(_canonical_json(identity_payload).encode("utf-8")).hexdigest()[:32]
     return SourceDerivationManifest(
         id=derivation_id,
         source_id=projection.source_id,
@@ -326,14 +439,11 @@ def source_unit_derivation_context_to_payload(
         "document_content": context.document_content,
         "update_mode": context.update_mode,
         "changed_hunks": context.changed_hunks,
-        "update_plan_stats": (
-            dict(context.update_plan_stats)
-            if context.update_plan_stats is not None
-            else None
-        ),
+        "update_plan_stats": (dict(context.update_plan_stats) if context.update_plan_stats is not None else None),
         "source_updated_at": context.source_updated_at,
         "user_id": context.user_id,
         "source_activity_epoch": context.source_activity_epoch,
+        "current_changed_ranges": [[start, end] for start, end in context.current_changed_ranges],
     }
 
 
@@ -343,9 +453,7 @@ def source_derivation_projection_identity_hash(
     """Hash stable source truth while excluding operational observation fields."""
 
     payload = source_projection_to_payload(projection)
-    return hashlib.sha256(
-        _canonical_json(_projection_identity_payload(payload)).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(_canonical_json(_projection_identity_payload(payload)).encode("utf-8")).hexdigest()
 
 
 def source_derivation_context_identity_hash(
@@ -354,11 +462,7 @@ def source_derivation_context_identity_hash(
     """Hash the stable Document and lifecycle inputs authorized for reuse."""
 
     payload = source_unit_derivation_context_to_payload(context)
-    return hashlib.sha256(
-        _canonical_json(_derivation_context_identity_payload(payload)).encode(
-            "utf-8"
-        )
-    ).hexdigest()
+    return hashlib.sha256(_canonical_json(_derivation_context_identity_payload(payload)).encode("utf-8")).hexdigest()
 
 
 def source_derivation_document_identity_hash(
@@ -369,9 +473,7 @@ def source_derivation_document_identity_hash(
     stable_payload = _document_record_payload(document)
     for field in ("last_synced", "created_at", "updated_at"):
         stable_payload.pop(field, None)
-    return hashlib.sha256(
-        _canonical_json(stable_payload).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(_canonical_json(stable_payload).encode("utf-8")).hexdigest()
 
 
 def _document_record_payload(
@@ -395,16 +497,8 @@ def _document_record_payload(
         "pdf_content_uri": document.pdf_content_uri,
         "last_synced": document.last_synced.isoformat(),
         "client": document.client,
-        "created_at": (
-            document.created_at.isoformat()
-            if document.created_at is not None
-            else None
-        ),
-        "updated_at": (
-            document.updated_at.isoformat()
-            if document.updated_at is not None
-            else None
-        ),
+        "created_at": (document.created_at.isoformat() if document.created_at is not None else None),
+        "updated_at": (document.updated_at.isoformat() if document.updated_at is not None else None),
     }
 
 
@@ -414,43 +508,25 @@ def source_unit_derivation_context_from_payload(
     raw_document = payload.get("document")
     if not isinstance(raw_document, Mapping):
         raise ValueError("Source derivation context has no Document snapshot")
-    last_modified = datetime.fromisoformat(
-        str(raw_document["last_modified"])
-    )
+    last_modified = datetime.fromisoformat(str(raw_document["last_modified"]))
     return SourceUnitDerivationContext(
         document=DocumentRecord(
             doc_id=str(raw_document["doc_id"]),
             source=str(raw_document["source"]),
             source_url=str(raw_document.get("source_url") or ""),
             title=str(raw_document.get("title") or ""),
-            space_or_project=str(
-                raw_document.get("space_or_project") or ""
-            ),
+            space_or_project=str(raw_document.get("space_or_project") or ""),
             author=_optional_string(raw_document.get("author")),
             last_modified=last_modified,
             labels=_string_list(raw_document.get("labels")),
             version=str(raw_document.get("version") or ""),
             content_hash=str(raw_document["content_hash"]),
-            token_count=(
-                int(raw_document["token_count"])
-                if raw_document.get("token_count") is not None
-                else None
-            ),
-            raw_content_uri=_optional_string(
-                raw_document.get("raw_content_uri")
-            ),
-            raw_content_type=_optional_string(
-                raw_document.get("raw_content_type")
-            ),
-            normalized_content_uri=_optional_string(
-                raw_document.get("normalized_content_uri")
-            ),
-            pdf_content_uri=_optional_string(
-                raw_document.get("pdf_content_uri")
-            ),
-            last_synced=datetime.fromisoformat(
-                str(raw_document["last_synced"])
-            ),
+            token_count=(int(raw_document["token_count"]) if raw_document.get("token_count") is not None else None),
+            raw_content_uri=_optional_string(raw_document.get("raw_content_uri")),
+            raw_content_type=_optional_string(raw_document.get("raw_content_type")),
+            normalized_content_uri=_optional_string(raw_document.get("normalized_content_uri")),
+            pdf_content_uri=_optional_string(raw_document.get("pdf_content_uri")),
+            last_synced=datetime.fromisoformat(str(raw_document["last_synced"])),
             client=_optional_string(raw_document.get("client")),
             created_at=(
                 datetime.fromisoformat(str(raw_document["created_at"]))
@@ -465,25 +541,22 @@ def source_unit_derivation_context_from_payload(
         ),
         doc_type=str(payload["doc_type"]),
         project_key=_optional_string(payload.get("project_key")),
-        repo_identifier=_optional_string(
-            payload.get("repo_identifier")
-        ),
+        repo_identifier=_optional_string(payload.get("repo_identifier")),
         document_content=str(payload.get("document_content") or ""),
         update_mode=str(payload.get("update_mode") or "full_document"),
         changed_hunks=_optional_string(payload.get("changed_hunks")),
         update_plan_stats=(
-            dict(payload["update_plan_stats"])
-            if isinstance(payload.get("update_plan_stats"), Mapping)
-            else None
+            dict(payload["update_plan_stats"]) if isinstance(payload.get("update_plan_stats"), Mapping) else None
         ),
-        source_updated_at=_optional_string(
-            payload.get("source_updated_at")
-        ),
+        source_updated_at=_optional_string(payload.get("source_updated_at")),
         user_id=_optional_string(payload.get("user_id")),
         source_activity_epoch=(
-            int(payload["source_activity_epoch"])
-            if payload.get("source_activity_epoch") is not None
-            else None
+            int(payload["source_activity_epoch"]) if payload.get("source_activity_epoch") is not None else None
+        ),
+        current_changed_ranges=tuple(
+            (int(value[0]), int(value[1]))
+            for value in payload.get("current_changed_ranges", [])
+            if isinstance(value, list) and len(value) == 2
         ),
     )
 
@@ -528,17 +601,11 @@ def memory_extraction_result_from_output_payload(
                 entity_refs=_string_list(value.get("entity_refs")),
                 valid_from=_optional_string(value.get("valid_from")),
                 valid_until=_optional_string(value.get("valid_until")),
-                extraction_context=_optional_string(
-                    value.get("extraction_context")
-                ),
+                extraction_context=_optional_string(value.get("extraction_context")),
                 evidence_quote=_optional_string(value.get("evidence_quote")),
                 evidence_anchor=_optional_string(value.get("evidence_anchor")),
-                source_observation_id=_optional_string(
-                    value.get("source_observation_id")
-                ),
-                required_source_observation_ids=_string_list(
-                    value.get("required_source_observation_ids")
-                ),
+                source_observation_id=_optional_string(value.get("source_observation_id")),
+                required_source_observation_ids=_string_list(value.get("required_source_observation_ids")),
                 support_validation=(
                     dict(value.get("support_validation") or {})
                     if isinstance(value.get("support_validation"), Mapping)
@@ -552,9 +619,7 @@ def memory_extraction_result_from_output_payload(
             raise ValueError("Source derivation Artifact summary payload is invalid")
         summaries.append(
             SourceArtifactSummary(
-                source_observation_id=str(
-                    value.get("source_observation_id") or ""
-                ),
+                source_observation_id=str(value.get("source_observation_id") or ""),
                 summary=str(value.get("summary") or ""),
             )
         )
@@ -602,11 +667,7 @@ def _safe_derivation_diagnostic(
     if not isinstance(value, str):
         return fallback
     normalized = value.strip()
-    if (
-        not normalized
-        or len(normalized) > 255
-        or _SAFE_DERIVATION_DIAGNOSTIC_RE.fullmatch(normalized) is None
-    ):
+    if not normalized or len(normalized) > 255 or _SAFE_DERIVATION_DIAGNOSTIC_RE.fullmatch(normalized) is None:
         return fallback
     return normalized
 
@@ -615,23 +676,52 @@ def _batch_input_payload_hash(
     *,
     target_revision_id: str,
     extraction_contract_version: str,
-    batch: ProjectionExtractionBatch,
+    batch: SourceDerivationBatch,
 ) -> str:
+    if isinstance(batch, DiffGuidedExtractionBatch):
+        payload = {
+            "target_unit_revision_id": target_revision_id,
+            "extraction_contract_version": extraction_contract_version,
+            "batch_id": batch.id,
+            "work_kind": batch.kind,
+            "primary_observation_ids": list(batch.primary_observation_ids),
+            "changed_hunks_sha256": hashlib.sha256(batch.changed_hunks.encode("utf-8")).hexdigest(),
+            "updated_document_sha256": hashlib.sha256(batch.updated_document.encode("utf-8")).hexdigest(),
+        }
+        return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    if isinstance(batch, StructuralExtractionBatch):
+        unit = batch.context.unit
+        payload = {
+            "target_unit_revision_id": target_revision_id,
+            "extraction_contract_version": extraction_contract_version,
+            "batch_id": batch.id,
+            "work_kind": batch.kind,
+            "primary_observation_ids": list(batch.primary_observation_ids),
+            "unit_id": unit.unit_id,
+            "unit_content_sha256": hashlib.sha256(unit.unit_markdown.encode("utf-8")).hexdigest(),
+            "heading_path": list(unit.heading_path),
+            "segmentation_version": unit.segmentation_version,
+        }
+        return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
     payload = {
         "target_unit_revision_id": target_revision_id,
         "extraction_contract_version": extraction_contract_version,
         "batch_id": batch.id,
         "primary_observation_ids": list(batch.primary_observation_ids),
-        "primary_content_sha256": hashlib.sha256(
-            batch.primary_markdown.encode("utf-8")
-        ).hexdigest(),
+        "primary_content_sha256": hashlib.sha256(batch.primary_markdown.encode("utf-8")).hexdigest(),
         "context_observation_ids": list(batch.context_observation_ids),
-        "context_content_sha256": hashlib.sha256(
-            batch.context_markdown.encode("utf-8")
-        ).hexdigest(),
+        "context_content_sha256": hashlib.sha256(batch.context_markdown.encode("utf-8")).hexdigest(),
         "primary_image_bytes": batch.primary_image_bytes,
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _derivation_batch_kind(batch: SourceDerivationBatch) -> str:
+    if isinstance(batch, DiffGuidedExtractionBatch):
+        return batch.kind
+    if isinstance(batch, StructuralExtractionBatch):
+        return batch.kind
+    return "projection_batch"
 
 
 def _raw_memory_payload(memory: RawMemory) -> dict[str, object]:
@@ -646,9 +736,7 @@ def _raw_memory_payload(memory: RawMemory) -> dict[str, object]:
         "evidence_quote": memory.evidence_quote,
         "evidence_anchor": memory.evidence_anchor,
         "source_observation_id": memory.source_observation_id,
-        "required_source_observation_ids": list(
-            memory.required_source_observation_ids
-        ),
+        "required_source_observation_ids": list(memory.required_source_observation_ids),
         "support_validation": dict(memory.support_validation),
     }
 
@@ -706,26 +794,19 @@ def _derivation_context_identity_payload(
         "project_key": context_payload.get("project_key"),
         "repo_identifier": context_payload.get("repo_identifier"),
         "document_content_sha256": hashlib.sha256(
-            str(context_payload.get("document_content") or "").encode(
-                "utf-8"
-            )
+            str(context_payload.get("document_content") or "").encode("utf-8")
         ).hexdigest(),
         "update_mode": context_payload.get("update_mode"),
         "changed_hunks_sha256": (
-            hashlib.sha256(
-                str(context_payload["changed_hunks"]).encode("utf-8")
-            ).hexdigest()
+            hashlib.sha256(str(context_payload["changed_hunks"]).encode("utf-8")).hexdigest()
             if context_payload.get("changed_hunks") is not None
             else None
         ),
-        "update_plan_stats": context_payload.get(
-            "update_plan_stats"
-        ),
+        "update_plan_stats": context_payload.get("update_plan_stats"),
         "source_updated_at": context_payload.get("source_updated_at"),
         "user_id": context_payload.get("user_id"),
-        "source_activity_epoch": context_payload.get(
-            "source_activity_epoch"
-        ),
+        "source_activity_epoch": context_payload.get("source_activity_epoch"),
+        "current_changed_ranges": context_payload.get("current_changed_ranges"),
     }
 
 
@@ -735,10 +816,7 @@ def _assemble_derivation_results(
     results: tuple[MemoryExtractionResult, ...],
 ) -> MemoryExtractionResult:
     metrics = _aggregate_extraction_metrics(results)
-    revisions_by_observation_id = {
-        revision.observation_id: revision
-        for revision in projection.observation_revisions
-    }
+    revisions_by_observation_id = {revision.observation_id: revision for revision in projection.observation_revisions}
     protected_observation_ids = tuple(
         observation.id
         for observation in projection.observations
@@ -757,9 +835,7 @@ def _assemble_derivation_results(
         revision.observation_id
         for revision in projection.observation_revisions
         if isinstance(revision.metadata.get("source_artifact"), Mapping)
-        and str(
-            revision.metadata["source_artifact"].get("media_type") or ""
-        ).startswith("image/")
+        and str(revision.metadata["source_artifact"].get("media_type") or "").startswith("image/")
     }
     for result in results:
         if result.error_type:
@@ -768,10 +844,7 @@ def _assemble_derivation_results(
         memories.extend(result.memories)
         for summary in result.artifact_summaries:
             observation_id = summary.source_observation_id
-            if (
-                observation_id not in projected_image_ids
-                or observation_id in summaries_by_observation_id
-            ):
+            if observation_id not in projected_image_ids or observation_id in summaries_by_observation_id:
                 invalid_summary_count += 1
                 continue
             summaries_by_observation_id[observation_id] = summary
@@ -779,16 +852,14 @@ def _assemble_derivation_results(
         first = failures[0]
         return MemoryExtractionResult(
             protected_source_observation_ids=protected_observation_ids,
-            error_type="projection_batch_failure",
+            error_type="source_derivation_work_failure",
             error=first.error or first.error_type,
             metadata={
                 **metrics,
                 "batch_count": len(results),
                 "failed_batch_count": len(failures),
                 "extracted_count_before_failure": len(memories),
-                "discarded_invalid_artifact_summary_count": (
-                    invalid_summary_count
-                ),
+                "discarded_invalid_artifact_summary_count": (invalid_summary_count),
             },
         )
     return MemoryExtractionResult(
@@ -818,13 +889,7 @@ def _aggregate_extraction_metrics(
         "discarded_orphan_artifact_summary_count",
         "discarded_invalid_artifact_summary_count",
     )
-    aggregated = {
-        key: sum(
-            int((result.metadata or {}).get(key, 0) or 0)
-            for result in results
-        )
-        for key in keys
-    }
+    aggregated = {key: sum(int((result.metadata or {}).get(key, 0) or 0) for result in results) for key in keys}
     aggregated["max_active_multimodal"] = max(
         (
             int(

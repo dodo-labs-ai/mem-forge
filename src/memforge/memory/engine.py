@@ -145,8 +145,7 @@ class MemoryEngine:
         """
         unit_support = await self.db.get_source_unit_support_reference_ids(source_unit_id)
         incumbents_by_id = {
-            memory.id: memory
-            for memory in await self.db.list_active_memories(tuple(sorted(unit_support)))
+            memory.id: memory for memory in await self.db.list_active_memories(tuple(sorted(unit_support)))
         }
         for memory in await self.db.get_memories_by_source_doc(
             doc_id,
@@ -243,19 +242,14 @@ class MemoryEngine:
 
         if not incumbent_ids or not protected_source_observation_ids:
             return frozenset()
-        observation_ids_by_memory_id = (
-            await self.db.get_active_memory_support_observation_ids_many(
-                tuple(sorted(incumbent_ids)),
-                source_id=source_id,
-            )
+        observation_ids_by_memory_id = await self.db.get_active_memory_support_observation_ids_many(
+            tuple(sorted(incumbent_ids)),
+            source_id=source_id,
         )
         return frozenset(
             memory_id
-            for memory_id, observation_ids
-            in observation_ids_by_memory_id.items()
-            if protected_source_observation_ids.intersection(
-                observation_ids
-            )
+            for memory_id, observation_ids in observation_ids_by_memory_id.items()
+            if protected_source_observation_ids.intersection(observation_ids)
         )
 
     async def _rebind_noop_evidence_to_current_revision(
@@ -295,20 +289,13 @@ class MemoryEngine:
             )
             scoped_reference_ids = frozenset(unit_support.get(operation.memory_id, ()))
             support = tuple(item for item in source_support if item.reference_id in scoped_reference_ids)
-            missing_dependencies = [
-                item
-                for item in support
-                if item.anchor.observation_id not in current_revisions
-            ]
+            missing_dependencies = [item for item in support if item.anchor.observation_id not in current_revisions]
             if missing_dependencies and projection.coverage.proves_absence:
                 rebound.append(
                     ReconcileOperation(
                         action=ReconcileAction.DELETE,
                         memory_id=operation.memory_id,
-                        reason=(
-                            "current Source Projection removed an exact "
-                            "supporting Observation"
-                        ),
+                        reason=("current Source Projection removed an exact supporting Observation"),
                         flag_for_review=True,
                     )
                 )
@@ -359,8 +346,7 @@ class MemoryEngine:
                                     "previous_primary_quote": selected.excerpt,
                                     "primary": current_primary.content,
                                     "required": [
-                                        current_revisions[item.anchor.observation_id].content
-                                        for item in stale_required
+                                        current_revisions[item.anchor.observation_id].content for item in stale_required
                                     ],
                                 },
                                 ensure_ascii=False,
@@ -375,10 +361,7 @@ class MemoryEngine:
                         ReconcileOperation(
                             action=ReconcileAction.DELETE,
                             memory_id=operation.memory_id,
-                            reason=(
-                                "revised evidence support could not be "
-                                "structurally validated"
-                            ),
+                            reason=("revised evidence support could not be structurally validated"),
                             flag_for_review=True,
                         )
                     )
@@ -408,10 +391,7 @@ class MemoryEngine:
                             ReconcileOperation(
                                 action=ReconcileAction.DELETE,
                                 memory_id=operation.memory_id,
-                                reason=(
-                                    "revised PRIMARY evidence could not be "
-                                    "exactly re-anchored"
-                                ),
+                                reason=("revised PRIMARY evidence could not be exactly re-anchored"),
                                 flag_for_review=True,
                             )
                         )
@@ -456,6 +436,7 @@ class MemoryEngine:
         document: DocumentRecord | None = None,
         derivation_id: str | None = None,
         expected_source_activity_epoch: int | None = None,
+        current_changed_ranges: tuple[tuple[int, int], ...] = (),
     ) -> dict[str, int]:
         """Reconcile a complete Source Unit ledger and atomically apply one plan."""
 
@@ -517,18 +498,10 @@ class MemoryEngine:
                 "candidate_ledger_dropped_redundant_count": (candidate_ledger.dropped_redundant_count),
                 "candidate_ledger_dropped_low_value_count": (candidate_ledger.dropped_low_value_count),
                 "candidate_ledger_llm_calls": candidate_ledger.structured_llm_calls,
-                "candidate_ledger_llm_elapsed_ms": (
-                    candidate_ledger.structured_llm_elapsed_ms
-                ),
-                "candidate_ledger_validation_retries": (
-                    candidate_ledger.validation_retries
-                ),
-                "candidate_ledger_fallback_batch_count": (
-                    candidate_ledger.fallback_batch_count
-                ),
-                "candidate_ledger_fallback_candidate_count": (
-                    candidate_ledger.fallback_candidate_count
-                ),
+                "candidate_ledger_llm_elapsed_ms": (candidate_ledger.structured_llm_elapsed_ms),
+                "candidate_ledger_validation_retries": (candidate_ledger.validation_retries),
+                "candidate_ledger_fallback_batch_count": (candidate_ledger.fallback_batch_count),
+                "candidate_ledger_fallback_candidate_count": (candidate_ledger.fallback_candidate_count),
                 "candidate_ledger_prompt_chars": candidate_ledger.prompt_chars,
             }
         )
@@ -538,16 +511,10 @@ class MemoryEngine:
             doc_id=doc_id,
             source_unit_id=scope.source_unit_id,
         )
-        derivation_protected_ids = (
-            await self._derivation_protected_incumbents(
-                source_id=projection.source_id,
-                incumbent_ids=frozenset(
-                    memory.id for memory in incumbents
-                ),
-                protected_source_observation_ids=frozenset(
-                    protected_source_observation_ids
-                ),
-            )
+        derivation_protected_ids = await self._derivation_protected_incumbents(
+            source_id=projection.source_id,
+            incumbent_ids=frozenset(memory.id for memory in incumbents),
+            protected_source_observation_ids=frozenset(protected_source_observation_ids),
         )
         incumbent_impacts: dict[str, ImpactResult] = {}
         needs_incumbent_impacts = projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION or (
@@ -575,9 +542,7 @@ class MemoryEngine:
                         if memory.id in derivation_protected_ids
                         else "source observation is explicitly empty"
                     ),
-                    flag_for_review=(
-                        memory.id in derivation_protected_ids
-                    ),
+                    flag_for_review=(memory.id in derivation_protected_ids),
                 )
                 for memory in sorted(incumbents, key=lambda item: item.id)
             )
@@ -592,16 +557,10 @@ class MemoryEngine:
             model_incumbents = [
                 memory
                 for memory in incumbents
-                if memory.id
-                not in (
-                    deterministic_disjoint_ids
-                    | derivation_protected_ids
-                )
+                if memory.id not in (deterministic_disjoint_ids | derivation_protected_ids)
             ]
             model_incumbent_count = len(model_incumbents)
-            deterministic_disjoint_keep_count = len(
-                deterministic_disjoint_ids
-            )
+            deterministic_disjoint_keep_count = len(deterministic_disjoint_ids)
             if model_incumbents and not self.structured_llm_client:
                 raise RuntimeError("complete lifecycle reconciliation requires an LLM client")
             result = await reconcile_memories(
@@ -631,9 +590,7 @@ class MemoryEngine:
                 ReconcileOperation(
                     action=ReconcileAction.NOOP,
                     memory_id=memory_id,
-                    reason=(
-                        "Revision Delta proves the incumbent evidence is disjoint"
-                    ),
+                    reason=("Revision Delta proves the incumbent evidence is disjoint"),
                 )
                 for memory_id in sorted(deterministic_disjoint_ids)
             )
@@ -641,9 +598,7 @@ class MemoryEngine:
                 ReconcileOperation(
                     action=ReconcileAction.DELETE,
                     memory_id=memory_id,
-                    reason=(
-                        "current Source Artifact revision is not inference eligible"
-                    ),
+                    reason=("current Source Artifact revision is not inference eligible"),
                     flag_for_review=True,
                 )
                 for memory_id in sorted(derivation_protected_ids)
@@ -705,17 +660,9 @@ class MemoryEngine:
             protected_memory_ids=derivation_protected_ids,
         )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
-        incumbent_support_states = await self.db.get_active_memory_support_states(
-            tuple(incumbents_by_id)
-        )
-        all_support = {
-            memory_id: state.reference_ids
-            for memory_id, state in incumbent_support_states.items()
-        }
-        support_hashes = {
-            memory_id: state.support_set_hash
-            for memory_id, state in incumbent_support_states.items()
-        }
+        incumbent_support_states = await self.db.get_active_memory_support_states(tuple(incumbents_by_id))
+        all_support = {memory_id: state.reference_ids for memory_id, state in incumbent_support_states.items()}
+        support_hashes = {memory_id: state.support_set_hash for memory_id, state in incumbent_support_states.items()}
         visibility, owner_user_id = await memory_visibility_for_source_id(
             self.db,
             source_id=projection.source_id,
@@ -733,15 +680,9 @@ class MemoryEngine:
         preclassified_relations: dict[str, tuple[PreclassifiedRelationDecision, ...]] = {}
         identity_claim_hashes: list[str] = []
         identity_requests: list[IdentityResolutionRequest] = []
-        operation_memories = tuple(
-            operation.memory for operation in operations if operation.memory is not None
-        )
+        operation_memories = tuple(operation.memory for operation in operations if operation.memory is not None)
         entity_resolution = await self.entity_resolver.resolve_many(
-            tuple(
-                entity_ref
-                for raw_memory in operation_memories
-                for entity_ref in raw_memory.entity_refs
-            ),
+            tuple(entity_ref for raw_memory in operation_memories for entity_ref in raw_memory.entity_refs),
             scope=EntityResolutionScope(access_context_hash=access_context_hash),
             doc_context=document_content[:2000],
         )
@@ -811,9 +752,7 @@ class MemoryEngine:
                 )
             )
         )
-        classified_candidate_support = await self.db.get_active_memory_support_states(
-            classified_candidate_ids
-        )
+        classified_candidate_support = await self.db.get_active_memory_support_states(classified_candidate_ids)
         attached_target_ids: list[str] = []
         for claim_hash, resolution in zip(
             identity_claim_hashes,
@@ -827,9 +766,7 @@ class MemoryEngine:
                     candidate_memory_id=decision.candidate_memory_id,
                     expected_candidate_content_hash=decision.candidate_content_hash,
                     expected_candidate_support_set_hash=(
-                        classified_candidate_support[
-                            decision.candidate_memory_id
-                        ].current_support_set_hash
+                        classified_candidate_support[decision.candidate_memory_id].current_support_set_hash
                     ),
                     expected_candidate_access_context_hash=lifecycle_access_context_hash(
                         visibility=decision.candidate_visibility,
@@ -851,8 +788,7 @@ class MemoryEngine:
             corroboration_proofs[claim_hash] = dict(equivalence_proof)
             attached_target_ids.append(target.id)
         attached_support_states = {
-            memory_id: classified_candidate_support[memory_id]
-            for memory_id in attached_target_ids
+            memory_id: classified_candidate_support[memory_id] for memory_id in attached_target_ids
         }
         for memory_id, state in attached_support_states.items():
             all_support[memory_id] = state.reference_ids
@@ -918,15 +854,10 @@ class MemoryEngine:
                         update_mode=update_mode,
                         changed_hunks=changed_hunks,
                         update_plan_stats=update_plan_stats,
-                        source_updated_at=(
-                            source_updated_at.isoformat()
-                            if source_updated_at is not None
-                            else None
-                        ),
+                        source_updated_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
                         user_id=user_id,
-                        source_activity_epoch=(
-                            expected_source_activity_epoch
-                        ),
+                        source_activity_epoch=(expected_source_activity_epoch),
+                        current_changed_ranges=current_changed_ranges,
                     )
                 )
                 if derivation_id is not None and document is not None
@@ -1005,9 +936,7 @@ class MemoryEngine:
                 doc_id=doc_id,
                 status="committed",
                 reason=(
-                    "candidate_admission_with_fallback"
-                    if result.fallback_batch_count
-                    else "complete_candidate_ledger"
+                    "candidate_admission_with_fallback" if result.fallback_batch_count else "complete_candidate_ledger"
                 ),
                 payload=_candidate_ledger_audit_payload(result),
             )
@@ -1107,12 +1036,8 @@ class MemoryEngine:
         )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
         support_states = await self.db.get_active_memory_support_states(tuple(incumbents_by_id))
-        all_support = {
-            memory_id: state.reference_ids for memory_id, state in support_states.items()
-        }
-        support_hashes = {
-            memory_id: state.support_set_hash for memory_id, state in support_states.items()
-        }
+        all_support = {memory_id: state.reference_ids for memory_id, state in support_states.items()}
+        support_hashes = {memory_id: state.support_set_hash for memory_id, state in support_states.items()}
         visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
         plan = build_lifecycle_plan(
             plan_id=plan_id,
@@ -1148,9 +1073,7 @@ class MemoryEngine:
         await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
         return await self._projected_tombstone_result(
             doc_id=doc_id,
-            mutation_types=tuple(
-                mutation.mutation_type.value for mutation in plan.mutations
-            ),
+            mutation_types=tuple(mutation.mutation_type.value for mutation in plan.mutations),
         )
 
     async def _projected_tombstone_result(
@@ -1169,9 +1092,7 @@ class MemoryEngine:
         return {
             "retired": mutation_types.count("retire_memory"),
             "pending_review": pending_review,
-            "can_delete_document": (
-                pending_review == 0 and not remaining_document_support
-            ),
+            "can_delete_document": (pending_review == 0 and not remaining_document_support),
         }
 
     def _candidate_can_persist(
@@ -1229,6 +1150,7 @@ class MemoryEngine:
             status="active",
             extraction_context=raw.extraction_context,
         )
+
 
 def _observation_semantic_class(
     projection: SourceProjection,
