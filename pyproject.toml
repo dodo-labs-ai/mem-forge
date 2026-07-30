@@ -71,6 +71,9 @@ packages = ["src/memforge"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 faulthandler_timeout = 120
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+]
 
 [tool.ruff]
 line-length = 120

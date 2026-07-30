@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -49,6 +51,7 @@ class SyncScheduler:
         self.db = db
         self.sync_service = sync_service
         self.scheduler = AsyncIOScheduler()
+        self._running_jobs: set[asyncio.Task[Any]] = set()
 
     async def start(self) -> None:
         self.scheduler.start()
@@ -66,9 +69,10 @@ class SyncScheduler:
             return
 
         self.scheduler.add_job(
-            self.sync_service.run_all_active_sources,
+            self._run_tracked,
             trigger=build_schedule_trigger(schedule),
             id=SYNC_JOB_ID,
+            args=(self.sync_service.run_all_active_sources,),
             replace_existing=True,
             coalesce=True,
             max_instances=1,
@@ -84,9 +88,10 @@ class SyncScheduler:
         if self.scheduler.get_job(EXPIRY_JOB_ID):
             return
         self.scheduler.add_job(
-            self._retire_expired_memories,
+            self._run_tracked,
             trigger=CronTrigger(hour=0, minute=0, timezone="UTC"),
             id=EXPIRY_JOB_ID,
+            args=(self._retire_expired_memories,),
             replace_existing=True,
             coalesce=True,
             max_instances=1,
@@ -96,9 +101,10 @@ class SyncScheduler:
         if self.scheduler.get_job(INDEX_HEALTH_JOB_ID):
             return
         self.scheduler.add_job(
-            self._check_index_health,
+            self._run_tracked,
             trigger=CronTrigger(hour=0, minute=30, timezone="UTC"),
             id=INDEX_HEALTH_JOB_ID,
+            args=(self._check_index_health,),
             replace_existing=True,
             coalesce=True,
             max_instances=1,
@@ -108,13 +114,23 @@ class SyncScheduler:
         if self.scheduler.get_job(SOURCE_SCHEDULE_SCAN_JOB_ID):
             return
         self.scheduler.add_job(
-            self._sync_due_sources,
+            self._run_tracked,
             trigger=CronTrigger(minute="*", timezone="UTC"),
             id=SOURCE_SCHEDULE_SCAN_JOB_ID,
+            args=(self._sync_due_sources,),
             replace_existing=True,
             coalesce=True,
             max_instances=1,
         )
+
+    async def _run_tracked(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        task = asyncio.current_task()
+        assert task is not None
+        self._running_jobs.add(task)
+        try:
+            return await operation()
+        finally:
+            self._running_jobs.discard(task)
 
     async def _retire_expired_memories(self) -> None:
         retired_count = await self.sync_service.retire_expired_memories()
@@ -153,4 +169,14 @@ class SyncScheduler:
 
     async def shutdown(self) -> None:
         if self.scheduler.running:
+            self.scheduler.pause()
+            # A job may already have been submitted to AsyncIOExecutor but not
+            # entered _run_tracked yet. Give submitted coroutines one turn to
+            # register before waiting for the stable active set.
+            await asyncio.sleep(0)
+            while self._running_jobs:
+                await asyncio.gather(*tuple(self._running_jobs), return_exceptions=True)
             self.scheduler.shutdown(wait=False)
+            # AsyncIOScheduler.shutdown() posts its state transition onto the
+            # event loop rather than awaiting it.
+            await asyncio.sleep(0)
