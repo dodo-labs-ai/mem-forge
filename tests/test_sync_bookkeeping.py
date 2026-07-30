@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 from PIL import Image
+from apscheduler.triggers.date import DateTrigger
 
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
@@ -85,7 +86,7 @@ from memforge.storage.database import Database
 from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.source_sync_manifest import SourceSyncManifestStore
-from memforge.scheduler import SyncScheduler
+from memforge.scheduler import SOURCE_SCHEDULE_SCAN_JOB_ID, SyncScheduler
 
 
 @pytest.fixture
@@ -6194,6 +6195,51 @@ async def test_scheduler_excludes_sources_without_sync_execution(
     await SyncScheduler(db, SyncService(db, AppConfig()))._sync_due_sources()
 
     assert server_scan_calls == [("default", {"src-agent-session-schedule-policy"})]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_shutdown_waits_for_running_job() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingDatabase:
+        async def get_schedule_config(self) -> dict:
+            return {"enabled": False}
+
+        async def enqueue_due_local_agent_jobs(self, *, limit: int) -> list:
+            assert limit == 50
+            started.set()
+            await release.wait()
+            return []
+
+        async def list_sources(self) -> list:
+            return []
+
+        async def enqueue_due_source_sync_runs(self, **kwargs) -> list:
+            return []
+
+    database = BlockingDatabase()
+    service = SyncService(database, AppConfig())  # type: ignore[arg-type]
+    scheduler = SyncScheduler(database, service)  # type: ignore[arg-type]
+    await scheduler.start()
+    scheduler.scheduler.reschedule_job(
+        SOURCE_SCHEDULE_SCAN_JOB_ID,
+        trigger=DateTrigger(run_date=datetime.now(timezone.utc)),
+    )
+
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        shutdown = asyncio.create_task(scheduler.shutdown())
+        await asyncio.sleep(0)
+
+        assert not shutdown.done()
+
+        release.set()
+        await asyncio.wait_for(shutdown, timeout=1)
+    finally:
+        release.set()
+        if scheduler.scheduler.running:
+            await scheduler.shutdown()
 
 
 @pytest.mark.asyncio
