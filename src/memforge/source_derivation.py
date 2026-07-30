@@ -12,8 +12,10 @@ from typing import Any, Protocol
 
 from memforge.models import DocumentRecord, MemoryExtractionResult, RawMemory
 from memforge.pipeline.bounded_work import collect_bounded
-from memforge.pipeline.projection_context import (
+from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
+)
+from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
     observation_is_inference_eligible,
     plan_projection_extraction_batches,

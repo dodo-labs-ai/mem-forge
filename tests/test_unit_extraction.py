@@ -4,13 +4,13 @@ import pytest
 
 from memforge.llm.structured import MemoryCandidate, MemoryExtractionResponse
 from memforge.pipeline.document_units import ExtractionContext, ExtractionUnit
+from memforge.pipeline.extraction_contract import DURABLE_MEMORY_QUALITY_RULES
 from memforge.pipeline.memory_extractor import (
     MEMORY_CHANGE_EXTRACTION_PROMPT,
     MEMORY_EXTRACTION_PROMPT,
     PROJECTION_BATCH_EXTRACTION_PROMPT,
     UNIT_MEMORY_EXTRACTION_PROMPT,
     MemoryExtractor,
-    _DURABLE_MEMORY_QUALITY_RULES,
 )
 
 
@@ -120,6 +120,26 @@ def test_all_extraction_prompts_share_the_durable_memory_quality_contract():
         UNIT_MEMORY_EXTRACTION_PROMPT,
         PROJECTION_BATCH_EXTRACTION_PROMPT,
     ):
-        assert _DURABLE_MEMORY_QUALITY_RULES in prompt
+        assert DURABLE_MEMORY_QUALITY_RULES in prompt
         for rule in required_rules:
             assert rule in prompt
+
+
+def test_all_extraction_prompts_share_the_owned_evidence_language_contract():
+    required_rules = (
+        "For each candidate, preserve the language of its owned source evidence.",
+        "When that evidence is primarily Chinese, write memory.content in Chinese.",
+        "unless the evidence itself is English or mixed-language phrasing is necessary",
+        "Read-only context may resolve meaning but must not change the candidate's language.",
+    )
+
+    for rule in required_rules:
+        assert rule in DURABLE_MEMORY_QUALITY_RULES
+
+    for prompt in (
+        MEMORY_EXTRACTION_PROMPT,
+        MEMORY_CHANGE_EXTRACTION_PROMPT,
+        UNIT_MEMORY_EXTRACTION_PROMPT,
+        PROJECTION_BATCH_EXTRACTION_PROMPT,
+    ):
+        assert DURABLE_MEMORY_QUALITY_RULES in prompt
