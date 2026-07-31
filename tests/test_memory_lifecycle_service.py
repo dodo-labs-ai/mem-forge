@@ -461,14 +461,19 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     assert stored_new.status == "active"
     assert await db.get_active_memory_support_reference_ids(result.replacement_memory_id)
     assert stored_new.content == "Invoke Claude Code with `claude`, not `claude-code`."
-    assert stored_new.extraction_context == "User corrected the command while reviewing Claude Code CLI usage."
+    assert stored_new.extraction_context == (
+        "Invoke Claude Code with `claude`, not `claude-code`."
+    )
     assert claim is not None
     assert claim["memory_id"] == result.replacement_memory_id
     assert claim["claim_text"] == "Invoke Claude Code with `claude`, not `claude-code`."
     assert concept is not None
     assert "Invoke Claude Code with `claude`, not `claude-code`." in concept["markdown_body"]
     assert "Use claude-code to invoke Claude Code CLI" not in concept["markdown_body"]
-    assert [(source.doc_id, source.source_type) for source in new_sources] == [("concept-claude-cli", "agent_session")]
+    assert [(source.doc_id, source.source_type) for source in new_sources] == [
+        ("concept-claude-cli", "agent_session")
+    ]
+    assert new_sources[0].excerpt == stored_new.extraction_context
 
     await db.delete_source_cascade("src-agent-sessions-codex")
 
