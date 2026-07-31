@@ -3087,11 +3087,13 @@ class DiffBoundaryViolatingMemoryExtractor(RecordingMemoryExtractor):
                 RawMemory(
                     content="The payrollTaskExecutor thread group has five threads.",
                     memory_type="fact",
+                    evidence_quote="| payrollTaskExecutor | 5 | 5 |",
                     extraction_context="| payrollTaskExecutor | 5 | 5 |",
                 ),
                 RawMemory(
                     content="The document now uses the repository-owned thread-list asset.",
                     memory_type="fact",
+                    evidence_quote="![](assets/list-of-threads.png)",
                     extraction_context="![](assets/list-of-threads.png)",
                 ),
             ]
@@ -3121,6 +3123,39 @@ class FailingDiffThenStructuralExtractor(ProjectionBatchRecordingExtractor):
         return MemoryExtractionResult(
             error_type="structured_llm_error",
             metadata={"safe_error_code": "invalid_response"},
+        )
+
+
+class WholeDocumentDiffThenStructuralExtractor(ProjectionBatchRecordingExtractor):
+    async def extract_memory_changes(self, **kwargs):
+        self.change_calls.append(kwargs)
+        whole_document = kwargs["updated_document"]
+        return MemoryExtractionResult(
+            memories=[
+                RawMemory(
+                    content="The service uses PostgreSQL 15.",
+                    memory_type="fact",
+                    evidence_quote=whole_document,
+                    extraction_context=whole_document,
+                )
+            ]
+        )
+
+    async def extract_unit_memories(self, context, **kwargs):
+        self.unit_calls.append({"context": context, **kwargs})
+        quote = "The service uses PostgreSQL 15."
+        if quote not in context.unit.unit_markdown:
+            return MemoryExtractionResult(memories=[])
+        return MemoryExtractionResult(
+            memories=[
+                RawMemory(
+                    content="The service uses PostgreSQL 15.",
+                    memory_type="fact",
+                    evidence_quote=quote,
+                    extraction_context=quote,
+                    evidence_anchor="unit",
+                )
+            ]
         )
 
 
@@ -9873,6 +9908,58 @@ async def test_diff_guided_extraction_rejects_candidates_outside_current_change(
     assert len(extraction_rows) == 1
     assert extraction_rows[0].payload["extracted_count"] == 1
     assert extraction_rows[0].payload["rejected_outside_changed_range_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_whole_document_diff_evidence_falls_back_without_inlining_document(
+    db: Database,
+) -> None:
+    source_id = "src-whole-document-diff-evidence"
+    stable_body = "\n".join(f"Stable context line {index}." for index in range(300))
+    old_markdown = f"# Design\n\n{stable_body}\n\nThe service uses PostgreSQL 14."
+    new_markdown = f"# Design\n\n{stable_body}\n\nThe service uses PostgreSQL 15."
+    doc_store = StubDocumentStore()
+    normalized_content_uri = doc_store.store_normalized(
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design",
+        markdown=old_markdown,
+    )
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design",
+        markdown=old_markdown,
+        version="1",
+        normalized_content_uri=normalized_content_uri,
+    )
+    extractor = WholeDocumentDiffThenStructuralExtractor()
+    memory_engine = RecordingMemoryEngine()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        memory_extractor=extractor,
+        memory_engine=memory_engine,
+        memory_store=_audited_memory_store(db),
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UpdatingDocumentGene(new_markdown),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert len(extractor.change_calls) == 1
+    assert len(extractor.unit_calls) >= 1
+    assert len(memory_engine.projected_lifecycle_calls) == 1
+    raw_memories = memory_engine.projected_lifecycle_calls[0]["raw_memories"]
+    assert [memory.extraction_context for memory in raw_memories] == [
+        "The service uses PostgreSQL 15."
+    ]
+    assert all(memory.extraction_context != new_markdown for memory in raw_memories)
 
 
 @pytest.mark.asyncio

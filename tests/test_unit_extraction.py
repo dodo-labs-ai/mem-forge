@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from memforge.llm.structured import MemoryCandidate, MemoryExtractionResponse
@@ -57,7 +59,7 @@ def _context() -> ExtractionContext:
 
 
 @pytest.mark.asyncio
-async def test_extract_unit_memories_trusts_unit_anchor_as_boundary_contract():
+async def test_extract_unit_memories_requires_anchor_and_exact_unit_quote():
     client = RecordingStructuredMemoryClient(
         MemoryExtractionResponse(
             memories=[
@@ -66,8 +68,12 @@ async def test_extract_unit_memories_trusts_unit_anchor_as_boundary_contract():
                     memory_type="fact",
                     confidence=0.9,
                     entity_refs=["UnifiedContextApi"],
-                    extraction_context="Tracking uses UnifiedContextApi for explicit API calls.",
-                    evidence_quote="Tracking uses UnifiedContextApi for explicit API calls.",
+                    extraction_context=(
+                        "Tracking uses [UnifiedContextApi](../uca) for explicit API calls."
+                    ),
+                    evidence_quote=(
+                        "Tracking uses [UnifiedContextApi](../uca) for explicit API calls."
+                    ),
                     evidence_anchor="unit",
                 ),
                 MemoryCandidate(
@@ -79,6 +85,12 @@ async def test_extract_unit_memories_trusts_unit_anchor_as_boundary_contract():
                     evidence_quote="Tracking uses UnifiedContextApi for explicit API calls.",
                     evidence_anchor="glossary",
                 ),
+                MemoryCandidate(
+                    content="An invented unit claim.",
+                    memory_type="fact",
+                    evidence_quote="This quote is absent from the owned unit.",
+                    evidence_anchor="unit",
+                ),
             ]
         )
     )
@@ -88,10 +100,46 @@ async def test_extract_unit_memories_trusts_unit_anchor_as_boundary_contract():
 
     assert [memory.content for memory in result.memories] == ["Tracking uses UnifiedContextApi for explicit API calls."]
     assert result.memories[0].evidence_anchor == "unit"
-    assert result.memories[0].extraction_context == "Tracking uses UnifiedContextApi for explicit API calls."
+    assert result.memories[0].extraction_context == (
+        "Tracking uses [UnifiedContextApi](../uca) for explicit API calls."
+    )
     assert result.metadata["structured_llm_calls"] == 1
     assert result.metadata["prompt_chars"] == len(client.calls[0]["prompt"])
     assert "glossary_appendix" in client.calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_extract_unit_memories_preserves_long_claim_local_quote_without_truncation():
+    quote = "The review gate preserves incumbent support until approval. " * 8
+    context = _context()
+    context = replace(
+        context,
+        unit=replace(
+            context.unit,
+            unit_markdown=f"## Review contract\n\nBefore.\n\n{quote}\n\nAfter.",
+        ),
+    )
+    client = RecordingStructuredMemoryClient(
+        MemoryExtractionResponse(
+            memories=[
+                MemoryCandidate(
+                    content="Review creation does not remove incumbent support.",
+                    memory_type="decision",
+                    extraction_context=context.unit.unit_markdown,
+                    evidence_quote=quote,
+                    evidence_anchor="unit",
+                )
+            ]
+        )
+    )
+
+    result = await MemoryExtractor(
+        structured_llm_client=client
+    ).extract_unit_memories(context, doc_type="reference")
+
+    assert len(quote) > 200
+    assert result.memories[0].evidence_quote == quote
+    assert result.memories[0].extraction_context == quote
 
 
 def test_full_scope_extraction_prompts_delegate_history_to_lifecycle():

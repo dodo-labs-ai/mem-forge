@@ -395,6 +395,39 @@ async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context
 
 
 @pytest.mark.asyncio
+async def test_projection_batch_preserves_one_long_canonical_excerpt() -> None:
+    quote = "Decision rationale requires approval before removing incumbent support. " * 7
+    projection = _teams_projection((quote, "Acknowledged."))
+    batch = plan_projection_extraction_batches(
+        projection,
+        max_primary_observations=1,
+    )[0]
+
+    class Client:
+        async def extract_projection_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return MemoryExtractionResponse(
+                memories=[
+                    MemoryCandidate(
+                        content="Incumbent support remains until approval.",
+                        memory_type="decision",
+                        evidence_quote=quote,
+                        extraction_context=batch.primary_markdown,
+                        source_observation_id=batch.primary_observation_ids[0],
+                    )
+                ]
+            )
+
+    result = await MemoryExtractor(
+        structured_llm_client=Client()
+    ).extract_projection_batch_memories(batch, source_type="teams")
+
+    assert len(quote) > 200
+    assert result.memories[0].evidence_quote == quote
+    assert result.memories[0].extraction_context == quote
+
+
+@pytest.mark.asyncio
 async def test_projection_batch_extractor_accepts_only_explicit_visual_evidence() -> None:
     projection = _jira_projection(1)
     batch = plan_projection_extraction_batches(projection)[0]

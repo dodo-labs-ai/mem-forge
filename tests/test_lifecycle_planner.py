@@ -32,7 +32,8 @@ def _replacement() -> RawMemory:
         content="A7 is retained and marked as reduced retro chain.",
         memory_type="decision",
         confidence=0.9,
-        extraction_context="A7 is retained",
+        evidence_quote="A7 is retained",
+        extraction_context="the entire untrusted source document",
     )
 
 
@@ -99,6 +100,9 @@ def test_gated_replacement_stages_review_without_mutating_incumbent() -> None:
         "remove_support",
         "supersede_memory",
     ]
+    create_payload = staged["proposed_mutations"][0]["payload"]["memory"]
+    assert create_payload["extraction_context"] == "A7 is retained"
+    assert create_payload["document_source"]["excerpt"] == "A7 is retained"
 
 
 def test_pending_review_builds_fresh_atomic_approval_plan() -> None:

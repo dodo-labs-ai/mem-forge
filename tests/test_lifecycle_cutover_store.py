@@ -1615,6 +1615,66 @@ async def test_backfill_maps_exact_document_lineage_and_enables_gate(db: Databas
 
 
 @pytest.mark.asyncio
+async def test_backfill_single_observation_without_exact_excerpt_does_not_copy_revision(
+    db: Database,
+) -> None:
+    now = "2026-07-15T00:00:00+00:00"
+    await db.db.execute(
+        """INSERT INTO documents (
+               doc_id, source, source_url, title, space_or_project, last_modified, version,
+               content_hash, last_synced
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "legacy-doc",
+            "src-1",
+            "https://example.test/page-1",
+            "Page 1",
+            "ENG",
+            now,
+            "1",
+            "hash",
+            now,
+        ),
+    )
+    await db.add_memory_source(
+        "mem-legacy",
+        "legacy-doc",
+        "confluence",
+        "legacy excerpt absent from the current revision",
+        source_updated_at=None,
+    )
+    projection = _projection()
+    projection = replace(
+        projection,
+        source_units=(
+            replace(
+                projection.source_units[0],
+                locator={
+                    "document_id": "legacy-doc",
+                    "url": "https://example.test/page-1",
+                },
+            ),
+        ),
+    )
+    await db.record_source_projection(
+        replace(projection, run_id="projection-run-limited-backfill")
+    )
+
+    result = await run_source_lifecycle_backfill(db, "src-1")
+
+    assert result.mapped_memories == 1
+    [support] = await db.get_active_memory_support_evidence(
+        "mem-legacy",
+        source_id="src-1",
+    )
+    unit = await db.get_evidence_unit(support.evidence_unit_id)
+    assert unit is not None
+    assert unit.content == ""
+    assert unit.excerpt is None
+    assert unit.evidence_provenance is EvidenceContentProvenance.LEGACY_LIMITED
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("current_revision_id", "expected_mapped", "expected_findings"),
     (("obsrev-supported", 1, 0), ("obsrev-newer", 0, 1)),
