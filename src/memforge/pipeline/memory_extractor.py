@@ -14,6 +14,10 @@ from memforge.llm.structured import (
     StructuredLlmImage,
 )
 from memforge.models import MemoryExtractionResult, RawMemory
+from memforge.pipeline.claim_evidence import (
+    ClaimEvidenceWorkKind,
+    localize_claim_evidence,
+)
 from memforge.pipeline.document_units import ExtractionContext
 from memforge.pipeline.document_update import DEFAULT_MAX_DIFF_CHARS
 from memforge.pipeline.extraction_contract import DURABLE_MEMORY_QUALITY_RULES
@@ -33,7 +37,7 @@ __all__ = ["MemoryExtractor"]
 # LLM sees the same limits the code enforces.
 # ---------------------------------------------------------------------------
 
-EXTRACTION_QUOTE_MAX_CHARS = 200
+EXTRACTION_QUOTE_MAX_CHARS = 4_000
 DOC_CONTENT_CHAR_CAP = 100_000
 CHANGED_HUNK_CHAR_CAP = DEFAULT_MAX_DIFF_CHARS
 UPDATED_DOC_CHAR_CAP = 100_000
@@ -61,7 +65,7 @@ Extract durable atomic knowledge units justified by the document. Returning an e
 - "entity_refs": list of key entity mentions copied from the owned evidence
 - "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
-- "extraction_context": exact quote from the document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix (e.g. "**Alice** (10:05): the actual message content")
+- "evidence_quote": exact quote copied from the document (guidance maximum {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix (e.g. "**Alice** (10:05): the actual message content")
 
 """ + DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
 - Each memory must be SELF-CONTAINED (understandable without the source document).
@@ -106,7 +110,7 @@ For changed durable knowledge, return JSON objects with:
 - "entity_refs": list of key entity mentions copied from the changed evidence
 - "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
-- "extraction_context": exact quote from the updated document this was extracted from (max {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix from the updated document.
+- "evidence_quote": exact quote copied from the updated document that supports this change (guidance maximum {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix from the updated document.
 
 """ + DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
 - Focus ONLY on durable memory changes caused by <changed_hunks>.
@@ -152,8 +156,7 @@ Each memory must be a JSON object with:
 - "entity_refs": list of key entity mentions copied from <unit_markdown>
 - "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
-- "extraction_context": exact quote from <unit_markdown> (max {quote_max} chars)
-- "evidence_quote": exact quote copied from <unit_markdown>
+- "evidence_quote": exact quote copied from <unit_markdown> (guidance maximum {quote_max} chars)
 - "evidence_anchor": "unit"
 
 """ + DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
@@ -182,12 +185,12 @@ The following observations are CONTEXT only. Use them to resolve references and 
 {context_observations}
 </context_observations>
 
-""" + DURABLE_MEMORY_QUALITY_RULES + """Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include an exact `evidence_quote` copied from PRIMARY observations and `extraction_context` containing that quote. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
+""" + DURABLE_MEMORY_QUALITY_RULES + """Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include one exact `evidence_quote` copied from PRIMARY observations. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
 
 For a PRIMARY `binary_artifact` observation with separately supplied image
 evidence, inspect the image itself. A claim grounded in that image must set
 `source_observation_id` to that exact Artifact Observation, and must leave
-`evidence_quote` and `extraction_context` empty because binary evidence has no
+`evidence_quote` empty because binary evidence has no
 text quote. Do not infer image contents from the filename, upload event, parent
 text, or metadata. Do not emit a claim for an Artifact image that was not
 supplied in this request.
@@ -260,10 +263,14 @@ class MemoryExtractor:
             quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
 
-        return await self._extract_with_schema(
+        result = await self._extract_with_schema(
             prompt,
             label="memory extraction",
             invoke=self.structured_llm_client.extract_memories,
+        )
+        return self._localize_text_result(
+            result,
+            authority_text=content[:DOC_CONTENT_CHAR_CAP],
         )
 
     async def extract_memory_changes(
@@ -290,10 +297,37 @@ class MemoryExtractor:
             quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
 
-        return await self._extract_with_schema(
+        result = await self._extract_with_schema(
             prompt,
             label="memory change extraction",
             invoke=self.structured_llm_client.extract_memories,
+        )
+        return self._localize_text_result(
+            result,
+            authority_text=updated_document[:UPDATED_DOC_CHAR_CAP],
+        )
+
+    @staticmethod
+    def _localize_text_result(
+        result: MemoryExtractionResult,
+        *,
+        authority_text: str,
+    ) -> MemoryExtractionResult:
+        if result.error_type:
+            return result
+        localized_memories = []
+        for memory in result.memories:
+            localized = localize_claim_evidence(
+                memory,
+                authority_text=authority_text,
+                work_kind=ClaimEvidenceWorkKind.OBSERVATION,
+            )
+            if localized.accepted:
+                localized_memories.append(localized.memory)
+        return MemoryExtractionResult(
+            memories=localized_memories,
+            artifact_summaries=result.artifact_summaries,
+            metadata=result.metadata,
         )
 
     async def extract_unit_memories(
@@ -333,11 +367,16 @@ class MemoryExtractor:
         for memory in result.memories:
             if memory.evidence_anchor != "unit":
                 continue
-            evidence_quote = memory.evidence_quote or memory.extraction_context or ""
-            memory.evidence_quote = evidence_quote
-            memory.evidence_anchor = "unit"
-            memory.extraction_context = evidence_quote[:EXTRACTION_QUOTE_MAX_CHARS]
-            kept.append(memory)
+            localized = localize_claim_evidence(
+                memory,
+                authority_text=context.unit.unit_markdown,
+                work_kind=ClaimEvidenceWorkKind.STRUCTURAL_UNIT,
+                allow_short_whole_authority=True,
+            )
+            if not localized.accepted:
+                continue
+            localized.memory.evidence_anchor = "unit"
+            kept.append(localized.memory)
         return MemoryExtractionResult(memories=kept, metadata=result.metadata)
 
     async def extract_projection_batch_memories(
@@ -379,10 +418,10 @@ class MemoryExtractor:
             if image.source_observation_id in batch.primary_observation_ids
         }
         for memory in result.memories:
-            quote = (memory.evidence_quote or memory.extraction_context or "").strip()
+            quote = memory.evidence_quote or ""
             explicit_observation_id = memory.source_observation_id
             if explicit_observation_id in visual_observation_ids:
-                if quote:
+                if quote.strip():
                     continue
                 memory.evidence_quote = None
                 memory.evidence_anchor = "source_artifact"
@@ -397,7 +436,7 @@ class MemoryExtractor:
                 memory.required_source_observation_ids = list(required_ids)
                 kept.append(memory)
                 continue
-            if not quote or quote not in batch.primary_markdown:
+            if not quote.strip() or quote not in batch.primary_markdown:
                 continue
             if explicit_observation_id is not None:
                 if quote not in primary_content.get(explicit_observation_id, ""):
@@ -412,19 +451,28 @@ class MemoryExtractor:
                 if len(matching_observations) != 1:
                     continue
                 source_observation_id = matching_observations[0]
-            memory.evidence_quote = quote
-            memory.evidence_anchor = "projection_batch"
-            memory.extraction_context = quote[:EXTRACTION_QUOTE_MAX_CHARS]
-            memory.source_observation_id = source_observation_id
-            required_ids = tuple(dict.fromkeys(memory.required_source_observation_ids))
+            localized = localize_claim_evidence(
+                memory,
+                authority_text=primary_content[source_observation_id],
+                work_kind=ClaimEvidenceWorkKind.OBSERVATION,
+                allow_short_whole_authority=True,
+            )
+            if not localized.accepted:
+                continue
+            localized_memory = localized.memory
+            localized_memory.evidence_anchor = "projection_batch"
+            localized_memory.source_observation_id = source_observation_id
+            required_ids = tuple(
+                dict.fromkeys(localized_memory.required_source_observation_ids)
+            )
             allowed_context_ids = context_by_primary.get(source_observation_id, ())
             if (
                 source_observation_id in required_ids
                 or any(item not in allowed_context_ids for item in required_ids)
             ):
                 continue
-            memory.required_source_observation_ids = list(required_ids)
-            kept.append(memory)
+            localized_memory.required_source_observation_ids = list(required_ids)
+            kept.append(localized_memory)
         return MemoryExtractionResult(
             memories=kept,
             artifact_summaries=result.artifact_summaries,

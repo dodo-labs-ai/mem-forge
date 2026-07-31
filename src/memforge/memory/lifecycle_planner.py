@@ -582,6 +582,7 @@ def _memory_payload(
     entity_ids: tuple[int, ...],
 ) -> dict[str, object]:
     content = raw.content.strip()
+    canonical_excerpt = raw.evidence_quote
     valid_from = parse_memory_validity_date(raw.valid_from)
     valid_until = parse_memory_validity_date(raw.valid_until)
     return {
@@ -593,7 +594,7 @@ def _memory_payload(
         "owner_user_id": defaults.owner_user_id,
         "project_key": defaults.project_key,
         "repo_identifier": defaults.repo_identifier,
-        "extraction_context": raw.extraction_context,
+        "extraction_context": canonical_excerpt,
         "valid_from": valid_from.isoformat() if valid_from is not None else None,
         "valid_until": valid_until.isoformat() if valid_until is not None else None,
         "entity_refs": list(raw.entity_refs),
@@ -601,7 +602,7 @@ def _memory_payload(
         "document_source": {
             "doc_id": defaults.doc_id,
             "source_type": defaults.source_type,
-            "excerpt": raw.extraction_context,
+            "excerpt": canonical_excerpt,
             "source_updated_at": defaults.source_updated_at,
         },
     }

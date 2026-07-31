@@ -770,6 +770,7 @@ def _project_native(
                     semantic_comment,
                     {"issue_key": issue_key},
                     str(comment.get("updated") or comment.get("created") or "") or None,
+                    {"claim_evidence_scope": "atomic"},
                 )
             )
             relations.append((SourceRelationType.PRECEDES, previous_key, comment_id, None, {}))
@@ -954,6 +955,7 @@ def _project_native(
                     semantic_message,
                     {"conversation_id": conversation_id},
                     str(message.get("lastModifiedDateTime") or message.get("time") or "") or None,
+                    {"claim_evidence_scope": "atomic"},
                 )
             )
             reply_to = message.get("reply_to_id") or message.get("replyToId")

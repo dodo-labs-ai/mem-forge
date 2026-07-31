@@ -124,6 +124,7 @@ def test_large_observation_is_not_copied_into_each_claim_evidence_unit() -> None
             content="Retries are limited to three attempts.",
             memory_type="fact",
             evidence_quote=first_quote,
+            extraction_context=body,
             source_observation_id=observation_id,
         ),
         RawMemory(
@@ -156,6 +157,78 @@ def test_large_observation_is_not_copied_into_each_claim_evidence_unit() -> None
         for reference in staged.references
         if reference.role.value == "primary"
     } == {projection.observation_revisions[0].id}
+    canonical_first = staged.canonical_memories_by_claim_hash[
+        content_hash(raw_memories[0].content)
+    ]
+    assert canonical_first.evidence_quote == first_quote
+    assert canonical_first.extraction_context == first_quote
+
+
+def test_whole_large_observation_becomes_revision_authority_without_inline_content() -> None:
+    body = "# Large document\n\n" + ("owned context " * 10_000)
+    projection = _github_projection(body)
+    observation_id = projection.observations[0].id
+    raw = RawMemory(
+        content="The document defines durable owned context.",
+        memory_type="fact",
+        evidence_quote=body,
+        extraction_context=body,
+        source_observation_id=observation_id,
+    )
+
+    staged = build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=(raw,),
+        doc_id="github-repo-docs-large",
+        source_type="github_repo",
+        project_key=None,
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier="acme/repo",
+        access_context_hash="workspace-repo",
+        extractor_run_id="sync-large-whole",
+    )
+
+    assert staged.units[0].content == ""
+    assert staged.units[0].excerpt is None
+    assert staged.units[0].evidence_provenance.value == "no_excerpt"
+    canonical = staged.canonical_memories_by_claim_hash[content_hash(raw.content)]
+    assert canonical.evidence_quote is None
+    assert canonical.extraction_context is None
+    [primary] = [
+        item for item in staged.references if item.role.value == "primary"
+    ]
+    assert primary.anchor.kind.value == "whole_observation"
+
+
+def test_whole_small_document_observation_is_not_used_as_a_claim_excerpt() -> None:
+    body = "# Design\n\nThe service keeps one canonical evidence excerpt."
+    projection = _github_projection(body)
+    raw = RawMemory(
+        content="The service keeps one canonical evidence excerpt.",
+        memory_type="decision",
+        evidence_quote=body,
+        source_observation_id=projection.observations[0].id,
+    )
+
+    staged = build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=(raw,),
+        doc_id="github-repo-docs-large",
+        source_type="github_repo",
+        project_key=None,
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier="acme/repo",
+        access_context_hash="workspace-repo",
+        extractor_run_id="sync-small-whole",
+    )
+
+    assert staged.units[0].content == ""
+    assert staged.units[0].excerpt is None
+    canonical = staged.canonical_memories_by_claim_hash[content_hash(raw.content)]
+    assert canonical.evidence_quote is None
+    assert canonical.extraction_context is None
 
 
 def test_unlocalized_claim_does_not_claim_or_copy_a_source_excerpt() -> None:
@@ -191,7 +264,7 @@ async def test_short_jira_comment_is_primary_with_adjacent_context_only(db: Data
     raw = RawMemory(
         content="A7 is retained.",
         memory_type="decision",
-        extraction_context="Correction: retain A7",
+        evidence_quote="Correction: retain A7",
     )
 
     staged = build_projected_claim_evidence(
@@ -218,6 +291,45 @@ async def test_short_jira_comment_is_primary_with_adjacent_context_only(db: Data
     }
     assert await db.db.execute_fetchall("SELECT id FROM evidence_units") == []
     assert await db.db.execute_fetchall("SELECT id FROM evidence_references") == []
+
+
+def test_short_atomic_jira_comment_may_use_its_whole_observation_as_excerpt() -> None:
+    projection = _jira_projection()
+    comment = next(
+        item
+        for item in projection.observations
+        if item.observation_type == "comment" and item.provider_key == "502"
+    )
+    revision = next(
+        item
+        for item in projection.observation_revisions
+        if item.observation_id == comment.id
+    )
+    raw = RawMemory(
+        content="The Jira correction retains A7.",
+        memory_type="decision",
+        evidence_quote=revision.content,
+        source_observation_id=comment.id,
+    )
+
+    staged = build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=(raw,),
+        doc_id="jira-PAY-12",
+        source_type="jira",
+        project_key="PAY",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        access_context_hash="workspace-pay",
+        extractor_run_id="sync-atomic-comment",
+    )
+
+    assert staged.units[0].content == revision.content
+    assert staged.units[0].excerpt == revision.content
+    canonical = staged.canonical_memories_by_claim_hash[content_hash(raw.content)]
+    assert canonical.evidence_quote == revision.content
+    assert canonical.extraction_context == revision.content
 
 
 def test_visual_claim_is_bound_to_exact_artifact_revision_without_fabricated_quote() -> None:

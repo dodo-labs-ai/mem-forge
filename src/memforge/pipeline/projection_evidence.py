@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from memforge.memory.evidence import (
     EvidenceContentProvenance,
@@ -14,6 +14,10 @@ from memforge.memory.evidence import (
     evidence_reference_id_for,
 )
 from memforge.models import RawMemory, content_hash
+from memforge.pipeline.claim_evidence import (
+    ClaimEvidenceWorkKind,
+    localize_claim_evidence,
+)
 from memforge.pipeline.projection_context import (
     context_observation_ids_for,
     observation_is_inference_eligible,
@@ -31,6 +35,7 @@ class ProjectedClaimEvidence:
     units: tuple[EvidenceUnit, ...]
     references: tuple[EvidenceReference, ...]
     reference_ids_by_claim_hash: Mapping[str, tuple[str, ...]]
+    canonical_memories_by_claim_hash: Mapping[str, RawMemory]
 
 
 def build_projected_claim_evidence(
@@ -92,8 +97,9 @@ def build_projected_claim_evidence(
     units_by_id: dict[str, EvidenceUnit] = {}
     references_by_id: dict[str, EvidenceReference] = {}
     reference_ids_by_claim_hash: dict[str, tuple[str, ...]] = {}
+    canonical_memories_by_claim_hash: dict[str, RawMemory] = {}
     for raw in raw_memories:
-        quote = (raw.evidence_quote or raw.extraction_context or "").strip()
+        quote = raw.evidence_quote or ""
         primary_id = _primary_observation_id(
             candidate_ids=candidate_ids,
             revisions_by_observation=revisions_by_observation,
@@ -107,6 +113,27 @@ def build_projected_claim_evidence(
 
         primary_revision = revisions_by_observation[primary_id]
         artifact_evidence = raw.evidence_anchor == "source_artifact" and primary_id in artifact_observation_ids
+        canonical_memory = replace(
+            raw,
+            evidence_quote=None,
+            extraction_context=None,
+        )
+        if quote and not artifact_evidence:
+            localized = localize_claim_evidence(
+                raw,
+                authority_text=primary_revision.content,
+                work_kind=ClaimEvidenceWorkKind.OBSERVATION,
+                allow_short_whole_authority=(
+                    primary_revision.metadata.get("claim_evidence_scope")
+                    == "atomic"
+                ),
+            )
+            if not localized.accepted:
+                raise ValueError(
+                    "evidence quote is not canonical for the selected Source Observation"
+                )
+            canonical_memory = localized.memory
+            quote = canonical_memory.evidence_quote or ""
         evidence_content = "" if artifact_evidence else quote
         evidence_unit_id = _stable_id(
             "eu-projected",
@@ -202,11 +229,14 @@ def build_projected_claim_evidence(
         for item in persisted:
             assert item.id is not None
             references_by_id.setdefault(item.id, item)
-        reference_ids_by_claim_hash[content_hash(raw.content.strip())] = support_ids
+        claim_hash = content_hash(raw.content.strip())
+        reference_ids_by_claim_hash[claim_hash] = support_ids
+        canonical_memories_by_claim_hash[claim_hash] = canonical_memory
     return ProjectedClaimEvidence(
         units=tuple(units_by_id.values()),
         references=tuple(references_by_id.values()),
         reference_ids_by_claim_hash=reference_ids_by_claim_hash,
+        canonical_memories_by_claim_hash=canonical_memories_by_claim_hash,
     )
 
 

@@ -867,6 +867,12 @@ async def _persist_backfill_lineage(
     activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
     evidence_unit_id = _stable_id("eu-backfill", source_id, memory_id, revision.id)
     access_hash = _access_context_hash(provenance)
+    legacy_excerpt = provenance.excerpt or ""
+    exact_excerpt = (
+        legacy_excerpt
+        if legacy_excerpt and legacy_excerpt in revision.content
+        else None
+    )
     unit = EvidenceUnit(
         id=evidence_unit_id,
         source_id=source_id,
@@ -879,9 +885,13 @@ async def _persist_backfill_lineage(
         visibility=provenance.visibility,
         owner_user_id=provenance.owner_user_id,
         repo_identifier=provenance.repo_identifier,
-        content=revision.content,
-        excerpt=provenance.excerpt,
-        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        content=exact_excerpt or "",
+        excerpt=exact_excerpt,
+        evidence_provenance=(
+            EvidenceContentProvenance.SOURCE_EXCERPT
+            if exact_excerpt
+            else EvidenceContentProvenance.LEGACY_LIMITED
+        ),
         source_metadata={
             "backfill": True,
             "source_unit_id": source_unit_id,

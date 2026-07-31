@@ -44,13 +44,16 @@ from memforge.models import (
     content_hash as compute_content_hash,
 )
 from memforge.pipeline.bounded_work import collect_bounded
+from memforge.pipeline.claim_evidence import (
+    ClaimEvidenceWorkKind,
+    localize_claim_evidence,
+)
 from memforge.pipeline.sync_memory import ProcessMemoryReclaimer, SyncMemoryObserver
 
 from memforge.pipeline.document_units import ExtractionContextPacker, UnitizationPolicy, unitize_markdown
 from memforge.pipeline.document_update import (
     DocumentUpdatePlan,
     plan_document_update,
-    quote_overlaps_current_changes,
 )
 from memforge.pipeline.source_projection_adapters import (
     DEFAULT_SOURCE_PROJECTION_ADAPTER,
@@ -2644,16 +2647,17 @@ class GeneSyncOrchestrator:
         kept = []
         rejected = 0
         for memory in result.memories:
-            quote = (memory.evidence_quote or memory.extraction_context or "").strip()
-            if not quote_overlaps_current_changes(
-                updated_document,
-                quote,
-                current_changed_ranges,
-            ):
+            localized = localize_claim_evidence(
+                memory,
+                authority_text=updated_document,
+                work_kind=ClaimEvidenceWorkKind.CHANGED_RANGE,
+                current_changed_ranges=current_changed_ranges,
+            )
+            if not localized.accepted:
                 rejected += 1
                 continue
-            memory.evidence_quote = quote
-            kept.append(memory)
+            localized.memory.evidence_anchor = "changed_range"
+            kept.append(localized.memory)
         if rejected:
             logger.warning(
                 "Rejected %d diff-guided memory candidate(s) outside changed ranges for %s/%s",
@@ -2667,6 +2671,16 @@ class GeneSyncOrchestrator:
                 **result.metadata,
                 "rejected_outside_changed_range_count": rejected,
             },
+            error_type=(
+                "diff_guided_evidence_invalid"
+                if result.memories and not kept
+                else None
+            ),
+            error=(
+                "No diff-guided candidate had canonical Evidence in the changed range."
+                if result.memories and not kept
+                else None
+            ),
         )
 
     async def _extract_source_derivation_work(
