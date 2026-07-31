@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
@@ -806,6 +807,17 @@ class MemoryEngine:
             access_context_hash=access_context_hash,
             extractor_run_id=projection.run_id,
             observed_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
+        )
+        operations = tuple(
+            replace(
+                operation,
+                memory=projected_evidence.canonical_memories_by_claim_hash[
+                    content_hash(operation.memory.content.strip())
+                ],
+            )
+            if operation.memory is not None
+            else operation
+            for operation in operations
         )
         plan_id = lifecycle_plan_id(scope)
         plan = build_lifecycle_plan(

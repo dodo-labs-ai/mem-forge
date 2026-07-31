@@ -972,6 +972,16 @@ class AgentKnowledgeBundleService:
             extractor_run_id=projection.run_id,
             observed_at=observed_at.isoformat(),
         )
+        canonical_memories = evidence.canonical_memories_by_claim_hash
+        incumbent_candidates = {
+            memory_id: canonical_memories.get(
+                content_hash(candidate.content.strip()),
+                candidate,
+            )
+            for memory_id, candidate in incumbent_candidates.items()
+        }
+        if raw_memory is not None:
+            raw_memory = canonical_memories[content_hash(raw_memory.content.strip())]
         operations = [
             ReconcileOperation(
                 action=ReconcileAction.NOOP,

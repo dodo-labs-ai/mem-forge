@@ -43,7 +43,7 @@ async def test_memory_extractor_uses_structured_schema_client():
                     memory_type="fact",
                     confidence=0.9,
                     entity_refs=["Service A"],
-                    extraction_context="Service A uses PostgreSQL 16",
+                        evidence_quote="Service A uses PostgreSQL 16",
                 )
             ]
         )
