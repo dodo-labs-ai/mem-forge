@@ -308,39 +308,11 @@ class CandidateLedgerDecision(StructuredResponseModel):
 
 
 class CandidateLedgerResponse(StructuredResponseModel):
-    """Fixed-slot response for one bounded candidate-ledger batch."""
+    """Ordered decisions for one bounded candidate-ledger batch."""
 
     model_config = ConfigDict(extra="forbid")
 
-    slot_00: CandidateLedgerDecision | None
-    slot_01: CandidateLedgerDecision | None
-    slot_02: CandidateLedgerDecision | None
-    slot_03: CandidateLedgerDecision | None
-    slot_04: CandidateLedgerDecision | None
-    slot_05: CandidateLedgerDecision | None
-    slot_06: CandidateLedgerDecision | None
-    slot_07: CandidateLedgerDecision | None
-    slot_08: CandidateLedgerDecision | None
-    slot_09: CandidateLedgerDecision | None
-    slot_10: CandidateLedgerDecision | None
-    slot_11: CandidateLedgerDecision | None
-    slot_12: CandidateLedgerDecision | None
-    slot_13: CandidateLedgerDecision | None
-    slot_14: CandidateLedgerDecision | None
-    slot_15: CandidateLedgerDecision | None
-    slot_16: CandidateLedgerDecision | None
-    slot_17: CandidateLedgerDecision | None
-    slot_18: CandidateLedgerDecision | None
-    slot_19: CandidateLedgerDecision | None
-    slot_20: CandidateLedgerDecision | None
-    slot_21: CandidateLedgerDecision | None
-    slot_22: CandidateLedgerDecision | None
-    slot_23: CandidateLedgerDecision | None
-
-    def ordered_slots(self) -> tuple[CandidateLedgerDecision | None, ...]:
-        """Return all protocol slots in their deterministic request order."""
-
-        return tuple(getattr(self, f"slot_{index:02d}") for index in range(24))
+    decisions: list[CandidateLedgerDecision]
 
 
 class CandidateRelationDecision(StructuredResponseModel):
@@ -505,47 +477,11 @@ class EntityBatchValidationDecision(StructuredResponseModel):
 
 
 class EntityBatchValidationResponse(StructuredResponseModel):
-    """Fixed-slot response for one bounded entity ambiguity adjudication call."""
+    """Ordered decisions for one bounded entity ambiguity adjudication call."""
 
     model_config = ConfigDict(extra="forbid")
 
-    slot_00: EntityBatchValidationDecision | None
-    slot_01: EntityBatchValidationDecision | None
-    slot_02: EntityBatchValidationDecision | None
-    slot_03: EntityBatchValidationDecision | None
-    slot_04: EntityBatchValidationDecision | None
-    slot_05: EntityBatchValidationDecision | None
-    slot_06: EntityBatchValidationDecision | None
-    slot_07: EntityBatchValidationDecision | None
-    slot_08: EntityBatchValidationDecision | None
-    slot_09: EntityBatchValidationDecision | None
-    slot_10: EntityBatchValidationDecision | None
-    slot_11: EntityBatchValidationDecision | None
-    slot_12: EntityBatchValidationDecision | None
-    slot_13: EntityBatchValidationDecision | None
-    slot_14: EntityBatchValidationDecision | None
-    slot_15: EntityBatchValidationDecision | None
-    slot_16: EntityBatchValidationDecision | None
-    slot_17: EntityBatchValidationDecision | None
-    slot_18: EntityBatchValidationDecision | None
-    slot_19: EntityBatchValidationDecision | None
-    slot_20: EntityBatchValidationDecision | None
-    slot_21: EntityBatchValidationDecision | None
-    slot_22: EntityBatchValidationDecision | None
-    slot_23: EntityBatchValidationDecision | None
-    slot_24: EntityBatchValidationDecision | None
-    slot_25: EntityBatchValidationDecision | None
-    slot_26: EntityBatchValidationDecision | None
-    slot_27: EntityBatchValidationDecision | None
-    slot_28: EntityBatchValidationDecision | None
-    slot_29: EntityBatchValidationDecision | None
-    slot_30: EntityBatchValidationDecision | None
-    slot_31: EntityBatchValidationDecision | None
-
-    def ordered_slots(self) -> tuple[EntityBatchValidationDecision | None, ...]:
-        """Return judgments in their datastore-bound request order."""
-
-        return tuple(getattr(self, f"slot_{index:02d}") for index in range(32))
+    decisions: list[EntityBatchValidationDecision]
 
 
 class QueryEntityDetectionResponse(StructuredResponseModel):

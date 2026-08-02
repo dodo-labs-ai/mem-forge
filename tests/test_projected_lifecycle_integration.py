@@ -818,11 +818,9 @@ class _CandidateLedgerClient:
 
 
 def _candidate_ledger_response(
-    *decisions: CandidateLedgerDecision | None,
+    *decisions: CandidateLedgerDecision,
 ) -> CandidateLedgerResponse:
-    return CandidateLedgerResponse(
-        **{f"slot_{index:02d}": (decisions[index] if index < len(decisions) else None) for index in range(24)}
-    )
+    return CandidateLedgerResponse(decisions=list(decisions))
 
 
 class _FailingOutboxDrainer(_OutboxDrainer):

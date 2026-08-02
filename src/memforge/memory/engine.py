@@ -696,6 +696,9 @@ class MemoryEngine:
                 "entity_resolution_ambiguous_mentions": entity_resolution.metrics.ambiguous_mentions,
                 "entity_resolution_embedding_batches": entity_resolution.metrics.embedding_batches,
                 "entity_resolution_llm_calls": entity_resolution.metrics.structured_llm_calls,
+                "entity_resolution_validation_retries": (
+                    entity_resolution.metrics.validation_retries
+                ),
                 "entity_resolution_candidate_count": entity_resolution.metrics.candidate_count,
                 "entity_resolution_new_entities": entity_resolution.metrics.new_entities,
                 "entity_resolution_elapsed_ms": entity_resolution.metrics.elapsed_ms,
