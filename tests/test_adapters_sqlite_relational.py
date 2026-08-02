@@ -199,7 +199,7 @@ async def test_sqlite_active_support_evidence_chunks_and_preserves_empty_memory_
 
 
 @pytest.mark.asyncio
-async def test_sqlite_active_support_bundle_observations_are_bounded(
+async def test_sqlite_active_support_observations_are_bounded(
     db: Database,
     monkeypatch,
 ) -> None:
@@ -210,7 +210,7 @@ async def test_sqlite_active_support_bundle_observations_are_bounded(
         nonlocal calls
         if (
             "FROM memory_support_assertions msa" in sql
-            and "JOIN evidence_references bundle_er" in sql
+            and "JOIN evidence_references supported_er" in sql
         ):
             calls += 1
         return await original(sql, parameters)

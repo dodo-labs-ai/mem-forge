@@ -109,7 +109,7 @@ def test_artifact_revision_summary_is_revision_pinned_and_legacy_optional() -> N
     )
 
 
-def test_artifact_revision_requires_materialized_inference_eligibility() -> None:
+def test_artifact_revision_parses_legacy_inference_metadata_conservatively() -> None:
     revision = source_artifact_revision_from_metadata(
         observation_id="obs-image",
         observation_revision_id="obsrev-image",
@@ -129,7 +129,9 @@ def test_artifact_revision_requires_materialized_inference_eligibility() -> None
         },
     )
 
-    assert revision is None
+    assert revision is not None
+    assert revision.inference_eligible is True
+    assert revision.inference_ineligible_reason is None
 
     unexplained_ineligible = source_artifact_revision_from_metadata(
         observation_id="obs-image",
@@ -152,6 +154,30 @@ def test_artifact_revision_requires_materialized_inference_eligibility() -> None
     )
 
     assert unexplained_ineligible is None
+
+    byte_limited = source_artifact_revision_from_metadata(
+        observation_id="obs-image",
+        observation_revision_id="obsrev-image",
+        source_id="src-1",
+        source_unit_id="unit-1",
+        metadata={
+            "source_artifact": {
+                "artifact_id": "artifact-1",
+                "parent_observation_id": "obs-parent",
+                "provider_revision": "1",
+                "filename": "diagram.png",
+                "media_type": "image/png",
+                "size_bytes": source_artifacts.MAX_SOURCE_ARTIFACT_INFERENCE_BYTES + 1,
+                "sha256": "a" * 64,
+                "uri": "artifact://diagram.png",
+                "inference_eligible": False,
+            }
+        },
+    )
+
+    assert byte_limited is not None
+    assert byte_limited.inference_eligible is False
+    assert byte_limited.inference_ineligible_reason == "inference_byte_limit"
 
 
 @pytest.mark.asyncio
