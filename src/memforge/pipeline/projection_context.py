@@ -11,6 +11,7 @@ from memforge.pipeline.extraction_contract import (
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_INFERENCE_BYTES,
     MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
+    source_artifact_inference_eligibility,
 )
 from memforge.source_projection import SourceProjection
 
@@ -233,8 +234,8 @@ def observation_is_inference_eligible(
     if not isinstance(raw, dict):
         return False
     size_bytes = _observation_binary_size(metadata)
-    inference_eligible = raw.get("inference_eligible")
-    if not isinstance(inference_eligible, bool):
+    inference_eligible = source_artifact_inference_eligibility(metadata)
+    if inference_eligible is None:
         return False
     return inference_eligible and size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
 

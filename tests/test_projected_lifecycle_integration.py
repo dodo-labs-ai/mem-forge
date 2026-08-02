@@ -557,6 +557,64 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
 
 
 @pytest.mark.asyncio
+async def test_context_artifact_does_not_become_active_support_dependency(
+    db: Database,
+) -> None:
+    projection = _projection_with_artifact(
+        run_id="projection-context-artifact",
+        payload=b"valid-context-image",
+        provider_revision="1",
+        inference_eligible=True,
+    )
+    artifact_observation_id = next(
+        observation.id
+        for observation in projection.observations
+        if observation.observation_type == "binary_artifact"
+    )
+    page_observation_id = next(
+        observation.id
+        for observation in projection.observations
+        if observation.observation_type == "page_body"
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+    await engine.apply_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content="A7 remains enabled.",
+                memory_type="decision",
+                evidence_quote="# Page",
+                evidence_anchor="projection_batch",
+                source_observation_id=page_observation_id,
+            )
+        ],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="# Page",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    [incumbent] = await db.list_memories()
+
+    observation_ids = await db.get_active_memory_support_observation_ids_many(
+        (incumbent.id,),
+        source_id="src-1",
+    )
+
+    assert observation_ids[incumbent.id] == (page_observation_id,)
+    assert artifact_observation_id not in observation_ids[incumbent.id]
+
+
+@pytest.mark.asyncio
 async def test_removed_artifact_dependency_commits_projection_with_pending_review(
     db: Database,
 ) -> None:

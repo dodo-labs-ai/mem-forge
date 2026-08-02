@@ -7226,7 +7226,7 @@ class Database:
         *,
         source_id: str,
     ) -> Mapping[str, tuple[str, ...]]:
-        """Return every Observation in actively supported Evidence bundles."""
+        """Return Observations named by active support-granting references."""
 
         ids = tuple(
             dict.fromkeys(
@@ -7243,22 +7243,15 @@ class Database:
             placeholders = ", ".join("?" for _ in chunk)
             rows = await self.db.execute_fetchall(
                 f"""SELECT DISTINCT msa.memory_id,
-                           bundle_er.observation_id
+                           supported_er.observation_id
                     FROM memory_support_assertions msa
                     JOIN evidence_references supported_er
                       ON supported_er.id = msa.evidence_reference_id
-                    JOIN evidence_units eu
-                      ON eu.id = supported_er.evidence_unit_id
-                     AND eu.source_id = msa.source_id
-                     AND eu.access_context_hash =
-                         msa.access_context_hash
-                    JOIN evidence_references bundle_er
-                      ON bundle_er.evidence_unit_id = eu.id
                     WHERE msa.memory_id IN ({placeholders})
                       AND msa.active = 1
                       AND msa.source_id = ?
                     ORDER BY msa.memory_id,
-                             bundle_er.observation_id""",
+                             supported_er.observation_id""",
                 (*chunk, source_id),
             )
             for row in rows:
