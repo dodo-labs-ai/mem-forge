@@ -17,8 +17,11 @@ from pydantic import ValidationError
 from memforge.llm.structured import (
     ArtifactSelectionSummary,
     AgentSessionAuthorityResponse,
+    CandidateLedgerDecision,
     CandidateLedgerResponse,
     CandidateRelationResponse,
+    EntityBatchValidationDecision,
+    EntityBatchValidationResponse,
     EntityValidationResponse,
     IncumbentSupportAuditResponse,
     LiteLlmStructuredClient,
@@ -958,14 +961,11 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
             )
         if schema is CandidateLedgerResponse:
             return CompletionResponse(
-                json.dumps(
-                    {
-                        f"slot_{index:02d}": (
-                            {"action": "KEEP"} if index == 0 else None
-                        )
-                        for index in range(24)
-                    }
-                )
+                '{"decisions":[{"action":"KEEP"}]}'
+            )
+        if schema is EntityBatchValidationResponse:
+            return CompletionResponse(
+                '{"decisions":[{"matched_id":7,"confidence":0.95}]}'
             )
         if schema is MemoryRelationResponse:
             return CompletionResponse(
@@ -991,9 +991,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         )
     )
 
-    assert (
-        await client.select_memory_candidates("prompt")
-    ).ordered_slots()[0].action == "KEEP"
+    assert (await client.select_memory_candidates("prompt")).decisions[0].action == "KEEP"
     assert (
         await client.reconcile_candidate_relations("prompt")
     ).ordered_slots()[0].action == "ADD"
@@ -1003,6 +1001,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     assert (await client.classify_memory_relations("prompt")).decisions[0].direction == "challenger_to_candidate"
     assert (await client.validate_memory_support("prompt")).supported is True
     assert (await client.validate_entity_match("prompt")).matched_id == 7
+    assert (await client.validate_entity_batch("prompt")).decisions[0].matched_id == 7
     assert (await client.rerank_memories("prompt")).ranking == [2, 0, 1]
 
     assert [call["response_format"] for call in calls] == [
@@ -1012,6 +1011,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         MemoryRelationResponse,
         MemorySupportValidationResponse,
         EntityValidationResponse,
+        EntityBatchValidationResponse,
         RerankResponse,
     ]
 
@@ -1049,10 +1049,36 @@ def test_composed_reconciliation_schemas_reject_cross_phase_decisions() -> None:
 
 
 def test_candidate_ledger_schema_rejects_model_owned_candidate_index() -> None:
-    payload = {f"slot_{index:02d}": ({"index": 0, "action": "KEEP"} if index == 0 else None) for index in range(24)}
+    payload = {"decisions": [{"index": 0, "action": "KEEP"}]}
 
     with pytest.raises(ValidationError):
         CandidateLedgerResponse.model_validate(payload)
+
+
+def test_transient_batch_schemas_use_ordered_decision_arrays() -> None:
+    ledger = CandidateLedgerResponse(
+        decisions=[CandidateLedgerDecision(action="KEEP")]
+    )
+    entities = EntityBatchValidationResponse(
+        decisions=[
+            EntityBatchValidationDecision(matched_id=7, confidence=0.99)
+        ]
+    )
+
+    assert ledger.decisions[0].action == "KEEP"
+    assert entities.decisions[0].matched_id == 7
+    assert set(CandidateLedgerResponse.model_json_schema()["properties"]) == {
+        "decisions"
+    }
+    assert set(EntityBatchValidationResponse.model_json_schema()["properties"]) == {
+        "decisions"
+    }
+    with pytest.raises(ValidationError):
+        CandidateLedgerResponse.model_validate({"slot_00": {"action": "KEEP"}})
+    with pytest.raises(ValidationError):
+        EntityBatchValidationResponse.model_validate(
+            {"slot_00": {"matched_id": 7, "confidence": 0.99}}
+        )
 
 
 @pytest.mark.asyncio

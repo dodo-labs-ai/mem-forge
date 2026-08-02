@@ -26,10 +26,9 @@ __all__ = [
 _CANDIDATE_LEDGER_PROMPT = """Select the non-redundant durable Memory candidates in one bounded
 admission batch extracted from a Source Unit revision.
 
-Return exactly one judgment in every named field in <decision_slots>:
-- when a field maps to a candidate index, return that candidate's judgment in the field;
-- when a field maps to null, return null;
-- do not return the candidate index inside the judgment. The datastore owns candidate identity.
+Return a decisions array with exactly one judgment per candidate, in the same
+order as <candidates>. Do not repeat the candidate index inside the judgment;
+the caller owns candidate identity and binds each decision by array position.
 
 For each mapped candidate:
 - KEEP when the candidate has any material truth condition not fully captured by another visible kept
@@ -48,11 +47,7 @@ record a different outcome, or preserve a distinct durable fact. Do not rewrite 
 {candidates_json}
 </candidates>
 
-<decision_slots>
-{decision_slots_json}
-</decision_slots>
-
-Return only the fixed-slot JSON object required by the response schema."""
+Return only the ordered decisions object required by the response schema."""
 
 _VALIDATION_ATTEMPTS = 2
 _DEFAULT_MAX_CONTEXT_CHARS = 100_000
@@ -72,7 +67,7 @@ class CandidateLedgerDrop:
 
 @dataclass(frozen=True)
 class _IndexedLedgerDecision:
-    """Datastore-bound judgment after a response slot receives its index."""
+    """Judgment bound to its caller-owned candidate index by array position."""
 
     index: int
     action: Literal["KEEP", "DROP_REDUNDANT", "DROP_LOW_VALUE"]
@@ -213,17 +208,12 @@ async def select_unique_memory_candidates(
                 }
                 for index in expected_indices
             ]
-            slot_map = {
-                f"slot_{slot_index:02d}": (expected_indices[slot_index] if slot_index < len(expected_indices) else None)
-                for slot_index in range(_CANDIDATE_LEDGER_DECISION_BATCH_SIZE)
-            }
             candidate_prompt = _CANDIDATE_LEDGER_PROMPT.format(
                 candidates_json=json.dumps(
                     payload,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
-                decision_slots_json=json.dumps(slot_map, separators=(",", ":")),
             )
             if len(candidate_prompt) <= max_context_chars:
                 prompt = candidate_prompt
@@ -275,7 +265,7 @@ async def select_unique_memory_candidates(
             structured_llm_elapsed_ms += max(0, round((perf_counter() - call_started) * 1000))
             try:
                 batch_decisions = _validate_ledger_batch(
-                    response.ordered_slots(),
+                    response.decisions,
                     expected_indices=plan.expected_indices,
                 )
                 break
@@ -285,8 +275,8 @@ async def select_unique_memory_candidates(
                 validation_retries += 1
                 prompt = (
                     f"{prompt}\n\n<validation_feedback>\n"
-                    f"The previous response was rejected: {exc}. Return exactly one valid "
-                    "judgment in every mapped slot and null in every unused slot.\n"
+                    f"The previous response was rejected: {exc}. Return exactly "
+                    f"{len(plan.expected_indices)} valid decisions in candidate order.\n"
                     "</validation_feedback>"
                 )
         if batch_decisions is None:
@@ -450,22 +440,18 @@ def _validate_complete_ledger(
 
 
 def _validate_ledger_batch(
-    slots: Sequence[CandidateLedgerDecision | None],
+    decisions: Sequence[CandidateLedgerDecision],
     *,
     expected_indices: tuple[int, ...],
 ) -> dict[int, _IndexedLedgerDecision]:
-    if len(slots) != _CANDIDATE_LEDGER_DECISION_BATCH_SIZE:
-        raise ValueError("candidate ledger response does not contain the fixed protocol slots")
+    if len(decisions) != len(expected_indices):
+        raise ValueError(
+            "candidate ledger decision count mismatch: "
+            f"expected {len(expected_indices)}, got {len(decisions)}"
+        )
     by_index: dict[int, _IndexedLedgerDecision] = {}
     visible_indices = set(expected_indices)
-    for slot_index, judgment in enumerate(slots):
-        if slot_index >= len(expected_indices):
-            if judgment is not None:
-                raise ValueError(f"unused decision slot {slot_index} must be null")
-            continue
-        index = expected_indices[slot_index]
-        if judgment is None:
-            raise ValueError(f"decision slot {slot_index} for candidate index {index} must not be null")
+    for index, judgment in zip(expected_indices, decisions, strict=True):
         if judgment.action == "DROP_REDUNDANT" and (
             judgment.canonical_index is None or judgment.canonical_index >= index
         ):

@@ -66,7 +66,18 @@ def _source_artifact_inference_fields(
 ) -> tuple[bool, str | None] | None:
     """Parse current and legacy inference metadata at one compatibility seam."""
 
-    inference_eligible = raw.get("inference_eligible")
+    if "inference_eligible" not in raw:
+        # The legacy writer predates both eligibility fields. A reason without
+        # its eligibility decision is not a historical shape we can prove.
+        if "inference_ineligible_reason" in raw:
+            return None
+        eligible = size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
+        return (
+            eligible,
+            None if eligible else "inference_byte_limit",
+        )
+
+    inference_eligible = raw["inference_eligible"]
     raw_ineligible_reason = raw.get("inference_ineligible_reason")
     inference_ineligible_reason = (
         str(raw_ineligible_reason)
@@ -79,14 +90,6 @@ def _source_artifact_inference_fields(
     ):
         return None
 
-    if inference_eligible is None:
-        # Artifact revisions written before the eligibility field was added
-        # used the inference byte budget as their complete admission contract.
-        eligible = size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
-        return (
-            eligible,
-            None if eligible else "inference_byte_limit",
-        )
     if not isinstance(inference_eligible, bool):
         return None
     if inference_eligible:
