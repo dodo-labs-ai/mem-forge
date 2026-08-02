@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, get_args
 from weakref import WeakKeyDictionary
 
 import litellm
+import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from memforge.llm.providers import litellm_optional_kwargs
@@ -33,6 +34,7 @@ type StructuredLlmTerminalCategory = Literal[
     "provider_error",
     "invalid_response",
 ]
+type NativeSchemaTransport = Literal["auto", "anthropic_output_config"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,6 +515,11 @@ class StructuredLlmConfig:
     # Every client in the worker event loop shares this logical-call admission.
     # Callers that do not opt in remain conservatively serial.
     max_concurrent: int = 1
+    # ``auto`` follows LiteLLM's provider capability registry and uses its
+    # response_format integration. Gateways whose registry entry lags an
+    # Anthropic deployment may explicitly select the current Anthropic wire
+    # contract without teaching this provider-neutral client a gateway name.
+    native_schema_transport: NativeSchemaTransport = "auto"
 
 
 @dataclass(frozen=True)
@@ -1048,6 +1055,26 @@ def _supports_native_response_schema(model_name: str) -> bool:
         )
         return False
 
+
+def _native_schema_request_kwargs(
+    response_format: type[BaseModel] | None,
+    transport: NativeSchemaTransport,
+) -> dict[str, object]:
+    """Build one provider wire contract while retaining local Pydantic authority."""
+
+    if response_format is None:
+        return {}
+    if transport == "anthropic_output_config":
+        return {
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": anthropic.transform_schema(response_format),
+                }
+            }
+        }
+    return {"response_format": response_format}
+
 def _strip_json_fences(text: str) -> str:
     """Drop a leading ```/```json fence and trailing ``` if the model adds them."""
     stripped = text.strip()
@@ -1465,7 +1492,11 @@ class LiteLlmStructuredClient:
         state: _StructuredCallState,
         images: tuple[StructuredLlmImage, ...],
     ):
-        if not _supports_native_response_schema(model_name):
+        native_schema_transport = self.config.native_schema_transport
+        if (
+            native_schema_transport == "auto"
+            and not _supports_native_response_schema(model_name)
+        ):
             state.final_mode = "json_text"
             logger.debug(
                 "Structured LLM model %s does not advertise native response_schema support; "
@@ -1481,6 +1512,7 @@ class LiteLlmStructuredClient:
                     model_name=model_name,
                     max_tokens=max_tokens,
                     native_schema=False,
+                    native_schema_transport=native_schema_transport,
                     deadline=deadline,
                     state=state,
                     images=images,
@@ -1500,6 +1532,7 @@ class LiteLlmStructuredClient:
                 model_name=model_name,
                 max_tokens=max_tokens,
                 native_schema=True,
+                native_schema_transport=native_schema_transport,
                 deadline=deadline,
                 state=state,
                 images=images,
@@ -1529,6 +1562,7 @@ class LiteLlmStructuredClient:
                 model_name=model_name,
                 max_tokens=max_tokens,
                 native_schema=False,
+                native_schema_transport=native_schema_transport,
                 deadline=deadline,
                 state=state,
                 images=images,
@@ -1547,6 +1581,7 @@ class LiteLlmStructuredClient:
         model_name: str,
         max_tokens: int,
         native_schema: bool,
+        native_schema_transport: NativeSchemaTransport,
         deadline: float,
         state: _StructuredCallState,
         images: tuple[StructuredLlmImage, ...],
@@ -1572,6 +1607,7 @@ class LiteLlmStructuredClient:
             max_tokens=max_tokens,
             provider_kwargs=provider_kwargs,
             response_format=response_format if native_schema else None,
+            native_schema_transport=native_schema_transport,
             deadline=deadline,
             state=state,
         )
@@ -1590,10 +1626,15 @@ class LiteLlmStructuredClient:
         max_tokens: int,
         provider_kwargs: dict[str, Any],
         response_format: type[BaseModel] | None,
+        native_schema_transport: NativeSchemaTransport,
         deadline: float,
         state: _StructuredCallState,
     ):
         loop = asyncio.get_running_loop()
+        schema_kwargs = _native_schema_request_kwargs(
+            response_format,
+            native_schema_transport,
+        )
         while True:
             remaining_s = max(0.001, deadline - loop.time())
             state.attempt_count += 1
@@ -1613,7 +1654,7 @@ class LiteLlmStructuredClient:
                         api_key=self.config.api_key,
                     ),
                     **provider_kwargs,
-                    **({"response_format": response_format} if response_format else {}),
+                    **schema_kwargs,
                 )
             except Exception as exc:
                 state.record_failed_attempt()

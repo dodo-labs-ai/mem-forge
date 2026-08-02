@@ -799,6 +799,107 @@ async def test_litellm_structured_client_respects_schema_capability_for_sap_anth
 
 
 @pytest.mark.asyncio
+async def test_litellm_structured_client_uses_anthropic_output_config_when_explicitly_selected(
+    monkeypatch,
+):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(
+            '{"decisions":[{"action":"KEEP","canonical_index":null,"reason":"unique"}]}'
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    # The explicit transport is authoritative when a gateway's LiteLLM registry
+    # entry lags the provider capability.
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="sap/anthropic--claude-4.6-sonnet",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+            native_schema_transport="anthropic_output_config",
+        )
+    )
+
+    response = await client.select_memory_candidates("classify the candidate")
+
+    assert response.decisions == [
+        CandidateLedgerDecision(
+            action="KEEP",
+            canonical_index=None,
+            reason="unique",
+        )
+    ]
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["messages"] == [{"role": "user", "content": "{{?memforge_prompt}}"}]
+    assert call["placeholder_values"] == {"memforge_prompt": "classify the candidate"}
+    assert "response_format" not in call
+    output_format = call["output_config"]["format"]
+    assert output_format["type"] == "json_schema"
+    schema = output_format["schema"]
+    assert schema["properties"]["decisions"]["type"] == "array"
+    decision = schema["$defs"]["CandidateLedgerDecision"]
+    assert decision["additionalProperties"] is False
+    assert decision["required"] == ["action"]
+    canonical_index = decision["properties"]["canonical_index"]["anyOf"]
+    assert [variant["type"] for variant in canonical_index] == ["integer", "null"]
+    assert "minimum: 0" in canonical_index[0]["description"]
+    serialized = json.dumps(schema, sort_keys=True)
+    for unsupported in ('"default"', '"minimum"', '"maximum"', '"maxLength"'):
+        assert unsupported not in serialized
+
+
+@pytest.mark.asyncio
+async def test_anthropic_output_config_transforms_entity_batch_schema(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(
+            '{"decisions":[{"matched_id":null,"confidence":0,"reason":"new entity"}]}'
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="sap/anthropic--claude-4.6-sonnet",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+            native_schema_transport="anthropic_output_config",
+        )
+    )
+
+    response = await client.validate_entity_batch("classify the entity")
+
+    assert response.decisions == [
+        EntityBatchValidationDecision(
+            matched_id=None,
+            confidence=0,
+            reason="new entity",
+        )
+    ]
+    call = calls[0]
+    assert "response_format" not in call
+    schema = call["output_config"]["format"]["schema"]
+    assert schema["properties"]["decisions"]["type"] == "array"
+    decision = schema["$defs"]["EntityBatchValidationDecision"]
+    assert decision["additionalProperties"] is False
+    assert [
+        variant["type"]
+        for variant in decision["properties"]["matched_id"]["anyOf"]
+    ] == ["integer", "null"]
+    serialized = json.dumps(schema, sort_keys=True)
+    for unsupported in ('"default"', '"minimum"', '"maximum"', '"maxLength"'):
+        assert unsupported not in serialized
+
+
+@pytest.mark.asyncio
 async def test_litellm_structured_client_repairs_invalid_json_backslash_escapes(monkeypatch):
     async def fake_acompletion(**kwargs):
         return CompletionResponse(
