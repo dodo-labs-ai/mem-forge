@@ -760,7 +760,9 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
 
 
 @pytest.mark.asyncio
-async def test_litellm_structured_client_uses_response_schema_for_sap_anthropic_alias(monkeypatch):
+async def test_litellm_structured_client_respects_schema_capability_for_sap_anthropic_alias(
+    monkeypatch,
+):
     calls = []
 
     async def fake_acompletion(**kwargs):
@@ -787,8 +789,10 @@ async def test_litellm_structured_client_uses_response_schema_for_sap_anthropic_
     assert len(calls) == 1
     assert calls[0]["model"] == "sap/anthropic--claude-4.6-sonnet"
     assert calls[0]["messages"] == [{"role": "user", "content": "{{?memforge_prompt}}"}]
-    assert calls[0]["placeholder_values"] == {"memforge_prompt": prompt}
-    assert calls[0]["response_format"] is MemoryExtractionResponse
+    assert calls[0]["placeholder_values"]["memforge_prompt"].startswith(
+        f"{prompt}\n\nReturn ONLY a single JSON object"
+    )
+    assert "response_format" not in calls[0]
 
 
 @pytest.mark.asyncio

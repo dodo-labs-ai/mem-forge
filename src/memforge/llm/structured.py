@@ -1102,8 +1102,6 @@ def _json_text_prompt(prompt: str, response_format: type[BaseModel]) -> str:
 
 
 def _supports_native_response_schema(model_name: str) -> bool:
-    if _is_sap_anthropic_model(model_name):
-        return True
     try:
         return bool(litellm.supports_response_schema(model=model_name))
     except Exception:
@@ -1113,12 +1111,6 @@ def _supports_native_response_schema(model_name: str) -> bool:
             exc_info=True,
         )
         return False
-
-
-def _is_sap_anthropic_model(model_name: str) -> bool:
-    """Return true for SAP GenAI Hub Anthropic aliases that accept response_format."""
-    return model_name.lower().startswith("sap/anthropic--")
-
 
 def _strip_json_fences(text: str) -> str:
     """Drop a leading ```/```json fence and trailing ``` if the model adds them."""
