@@ -597,6 +597,73 @@ async def test_fetch_describes_jira_image_attachment_with_comment_parent():
 
 
 @pytest.mark.asyncio
+async def test_jira_secure_attachment_stream_uses_id_based_locator():
+    image = b"\xff\xd8\xffknown-jira-image"
+
+    class AttachmentClient(RecordingAsyncClient):
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls.append((method, url, kwargs))
+            return JsonResponse(
+                _search_page(
+                    [
+                        _jira_issue(
+                            "PAY-123",
+                            issue_id="100123",
+                            field_overrides={
+                                "attachment": [
+                                    {
+                                        "id": "7001",
+                                        "filename": "200%_zoom.jpg",
+                                        "mimeType": "image/jpeg",
+                                        "size": len(image),
+                                        "created": "2026-05-21T09:01:00Z",
+                                        "content": (
+                                            "https://jira.example.test"
+                                            "/secure/attachment/7001/200%25_zoom.jpg"
+                                        ),
+                                    }
+                                ]
+                            },
+                        )
+                    ]
+                )
+            )
+
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
+        source_id="src-jira",
+    )
+    discovery_client = AttachmentClient(base_url="https://jira.example.test")
+    gene._client = discovery_client
+    gene._base_url = "https://jira.example.test"
+
+    items = [item async for item in gene.discover()]
+    raw = await gene.fetch(items[0])
+    artifact = raw.artifacts[0]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/secure/attachment/7001/attachment-7001"
+        return httpx.Response(
+            200,
+            content=image,
+            headers={"content-type": "image/jpeg", "content-length": str(len(image))},
+        )
+
+    gene._client = httpx.AsyncClient(
+        base_url="https://jira.example.test",
+        transport=httpx.MockTransport(handler),
+    )
+    gene._request_limiter = None
+    gene._auth_mode = "pat"
+    try:
+        assert artifact.locator["request_path"] == "/secure/attachment/7001/attachment-7001"
+        async with gene.open_source_artifact(artifact) as download:
+            assert b"".join([chunk async for chunk in download.chunks]) == image
+    finally:
+        await gene._client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_open_source_artifact_streams_jira_attachment():
     image = b"\x89PNG\r\n\x1a\nknown-jira-image"
 
