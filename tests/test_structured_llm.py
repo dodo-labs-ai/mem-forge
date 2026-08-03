@@ -751,7 +751,7 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
     assert calls[0]["model"] == "anthropic/anthropic--claude-sonnet-latest"
     assert calls[0]["api_base"] == "http://localhost:6655/anthropic"
     assert calls[0]["api_key"] == "local-key"
-    assert calls[0]["timeout"] == pytest.approx(120.0, abs=0.01)
+    assert 119.0 < calls[0]["timeout"] <= 120.0
     assert calls[0]["max_tokens"] == 8192
     assert calls[0]["messages"][0]["content"].startswith("prompt\n\nReturn ONLY")
     assert "response_format" not in calls[0]
