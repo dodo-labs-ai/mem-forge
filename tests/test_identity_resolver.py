@@ -471,6 +471,32 @@ class _CompleteStructuredClient:
 
 
 @pytest.mark.asyncio
+async def test_structured_classifier_default_batch_keeps_exact_coverage_ledgers_small() -> None:
+    challenger = _memory("mem-batch-challenger", "Current claim")
+    pairs = tuple(
+        MemoryPair(
+            challenger,
+            _memory(f"mem-batch-candidate-{index}", f"Candidate claim {index}"),
+        )
+        for index in range(33)
+    )
+    client = _CompleteStructuredClient()
+
+    result = await StructuredMemoryPairClassifier(
+        client=client,
+        model="test-model",
+    ).classify(pairs)
+
+    assert len(result.decisions) == 33
+    assert result.llm_calls == 2
+    assert [
+        len(group["candidates"])
+        for payload in client.payloads
+        for group in payload
+    ] == [32, 1]
+
+
+@pytest.mark.asyncio
 async def test_identity_resolver_preserves_pair_attribution_across_classifier_batches() -> None:
     first_challenger = _memory("mem-new-a", "Production deployment requires approval.")
     first_candidate = _memory("mem-refines", "Production deployment requires Security approval.")

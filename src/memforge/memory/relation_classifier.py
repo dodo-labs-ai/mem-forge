@@ -92,7 +92,7 @@ class MemoryPairClassifier(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class MemoryPairClassificationPolicy:
-    max_pairs_per_call: int = 64
+    max_pairs_per_call: int = 32
     max_prompt_chars: int = 120_000
     max_output_tokens: int = 32_768
     max_memory_content_chars: int = 4_000
