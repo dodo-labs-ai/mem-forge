@@ -708,7 +708,10 @@ class JiraGene(Gene):
             content_url = str(descriptor.get("content") or "").strip()
             if not attachment_id or not filename or not content_url:
                 raise SourceArtifactContractError("Jira attachment identity is incomplete")
-            request_path = self._attachment_request_path(content_url)
+            request_path = self._attachment_request_path(
+                content_url,
+                attachment_id=attachment_id,
+            )
             parent_type, parent_key = self._jira_attachment_parent(
                 filename=filename,
                 issue_id=issue_id,
@@ -761,7 +764,7 @@ class JiraGene(Gene):
                 content_encoding=response.headers.get("content-encoding"),
             )
 
-    def _attachment_request_path(self, content_url: str) -> str:
+    def _attachment_request_path(self, content_url: str, *, attachment_id: str) -> str:
         parsed = urlsplit(content_url)
         if parsed.query or parsed.fragment:
             raise SourceArtifactContractError("Jira attachment URL cannot contain query or fragment")
@@ -769,10 +772,28 @@ class JiraGene(Gene):
             base = urlsplit(self._base_url)
             if parsed.scheme != base.scheme or parsed.netloc != base.netloc:
                 raise SourceArtifactContractError("Jira attachment URL is outside the configured origin")
-            return parsed.path
-        if not content_url.startswith("/"):
-            raise SourceArtifactContractError("Jira attachment URL must be absolute or root-relative")
-        return content_url
+            request_path = parsed.path
+        else:
+            if not content_url.startswith("/"):
+                raise SourceArtifactContractError(
+                    "Jira attachment URL must be absolute or root-relative"
+                )
+            request_path = content_url
+
+        secure_prefix = "/secure/attachment/"
+        prefix, marker, secure_path = request_path.partition(secure_prefix)
+        if not marker:
+            return request_path
+        route_attachment_id, separator, display_name = secure_path.partition("/")
+        if route_attachment_id != attachment_id:
+            raise SourceArtifactContractError(
+                "Jira attachment URL identity does not match its descriptor"
+            )
+        if not separator or not display_name or "/" in display_name:
+            raise SourceArtifactContractError(
+                "Jira secure attachment URL is incomplete"
+            )
+        return f"{prefix}{marker}{attachment_id}/attachment-{attachment_id}"
 
     @staticmethod
     def _jira_attachment_parent(

@@ -392,10 +392,57 @@ async def test_identity_resolver_fails_closed_for_incomplete_structured_pair_led
         "expected_count=2, actual_count=1, missing_count=1, "
         "duplicate_count=0, unexpected_count=0"
     )
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2
+    assert "coverage_correction" in client.calls[1][0]
     assert batch.metrics.pair_count == 2
-    assert batch.metrics.llm_calls == 1
+    assert batch.metrics.llm_calls == 2
     assert batch.metrics.prompt_chars > 0
+
+
+@pytest.mark.asyncio
+async def test_structured_classifier_keeps_first_duplicate_without_retry() -> None:
+    class DuplicateClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def classify_memory_relations(
+            self,
+            prompt: str,
+            **_kwargs,
+        ):
+            self.calls.append(prompt)
+            indices = [0, 0, 1]
+            return SimpleNamespace(
+                decisions=[
+                    SimpleNamespace(
+                        pair_index=index,
+                        classification=(
+                            "equivalent"
+                            if position == 0
+                            else "unrelated"
+                        ),
+                        direction="symmetric",
+                        reason=f"fixture-{position}",
+                    )
+                    for position, index in enumerate(indices)
+                ]
+            )
+
+    challenger = _memory("mem-new-retry", "Production deployment requires approval.")
+    pairs = (
+        MemoryPair(challenger, _memory("mem-first-retry", "Approval is mandatory.")),
+        MemoryPair(challenger, _memory("mem-second-retry", "Security approval is mandatory.")),
+    )
+    client = DuplicateClient()
+    classifier = StructuredMemoryPairClassifier(client=client, model="test-model")
+
+    result = await classifier.classify(pairs)
+
+    assert tuple(decision.pair for decision in result.decisions) == pairs
+    assert result.decisions[0].relation_type is MemoryRelationType.EQUIVALENT
+    assert result.decisions[0].reason == "fixture-0"
+    assert result.llm_calls == 1
+    assert len(client.calls) == 1
 
 
 class _CompleteStructuredClient:

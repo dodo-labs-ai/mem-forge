@@ -663,6 +663,7 @@ class RelationalStore(Protocol):
         limit: int,
         lease_seconds: int,
         max_attempts: int,
+        source_id: str | None = None,
     ) -> list[RelationDiscoveryWork]: ...
     async def complete_relation_discovery_work(
         self,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import re
+import json
 
 import pytest
 
@@ -29,11 +29,9 @@ def _candidate(
 
 
 def _ledger_response(
-    *decisions: CandidateLedgerDecision | None,
+    *decisions: CandidateLedgerDecision,
 ) -> CandidateLedgerResponse:
-    return CandidateLedgerResponse(
-        **{f"slot_{index:02d}": (decisions[index] if index < len(decisions) else None) for index in range(24)}
-    )
+    return CandidateLedgerResponse(decisions=list(decisions))
 
 
 class _LedgerClient:
@@ -81,8 +79,12 @@ class _ConcurrentLedgerClient:
             self.two_admitted.set()
         try:
             await self.release.wait()
-            mapped = re.findall(r'"slot_\d{2}":(\d+|null)', prompt)
-            return _ledger_response(*(CandidateLedgerDecision(action="KEEP") for value in mapped if value != "null"))
+            candidates = json.loads(
+                prompt.split("<candidates>\n", 1)[1].split("\n</candidates>", 1)[0]
+            )
+            return _ledger_response(
+                *(CandidateLedgerDecision(action="KEEP") for _ in candidates)
+            )
         finally:
             self.active -= 1
 
@@ -139,6 +141,35 @@ async def test_candidate_ledger_retries_once_when_decision_coverage_is_incomplet
     assert result.validation_retries == 1
     assert result.prompt_chars == sum(len(prompt) for prompt in client.prompts)
     assert result.structured_llm_elapsed_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_retries_once_when_decision_coverage_is_excessive():
+    first = _candidate("The trigger remained OPEN.", observation_id="obs-1")
+    second = _candidate("The trigger was not processed.", observation_id="obs-2")
+    client = _LedgerClient(
+        _ledger_response(
+            CandidateLedgerDecision(action="KEEP"),
+            CandidateLedgerDecision(action="KEEP"),
+            CandidateLedgerDecision(action="KEEP"),
+        ),
+        _ledger_response(
+            CandidateLedgerDecision(action="KEEP"),
+            CandidateLedgerDecision(action="KEEP"),
+        ),
+    )
+
+    result = await select_unique_memory_candidates(
+        [first, second],
+        structured_llm_client=client,
+        llm_model=None,
+    )
+
+    assert result.candidates == (first, second)
+    assert len(client.prompts) == 2
+    assert "expected 2, got 3" in client.prompts[1]
+    assert result.structured_llm_calls == 2
+    assert result.validation_retries == 1
 
 
 @pytest.mark.asyncio
@@ -234,8 +265,8 @@ async def test_candidate_ledger_bounds_calls_independently_from_source_unit_card
     assert result.candidates == tuple(candidates)
     assert result.structured_llm_calls == 9
     assert len(client.prompts) == 9
-    assert '"slot_00":0' in client.prompts[0]
-    assert '"slot_00":192' in client.prompts[-1]
+    assert '"index":0' in client.prompts[0]
+    assert '"index":192' in client.prompts[-1]
     assert '"index":204' not in client.prompts[0]
     assert '"index":204' in client.prompts[-1]
 
@@ -309,10 +340,9 @@ async def test_candidate_ledger_composes_bounded_decision_batches():
     assert result.candidates == tuple(candidates)
     assert result.structured_llm_calls == 3
     assert len(client.prompts) == 3
-    assert '"slot_00":0' in client.prompts[0]
-    assert '"slot_00":24' in client.prompts[1]
-    assert '"slot_00":48' in client.prompts[2]
-    assert '"slot_07":null' in client.prompts[2]
+    assert '"index":0' in client.prompts[0]
+    assert '"index":24' in client.prompts[1]
+    assert '"index":48' in client.prompts[2]
     assert '"index":54' not in client.prompts[0]
     assert '"index":54' in client.prompts[2]
 
@@ -343,7 +373,7 @@ async def test_candidate_ledger_keeps_failed_admission_batch_and_continues():
     assert result.fallback_batch_count == 1
     assert result.fallback_candidate_count == 24
     assert len(client.prompts) == 3
-    assert '"slot_00":48' in client.prompts[-1]
+    assert '"index":48' in client.prompts[-1]
 
 
 @pytest.mark.asyncio

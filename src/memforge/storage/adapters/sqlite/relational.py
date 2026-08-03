@@ -1149,12 +1149,14 @@ class SqliteRelationalStore:
         limit: int,
         lease_seconds: int,
         max_attempts: int,
+        source_id: str | None = None,
     ) -> list[RelationDiscoveryWork]:
         return await self._db.lease_relation_discovery_work(
             worker_id=worker_id,
             limit=limit,
             lease_seconds=lease_seconds,
             max_attempts=max_attempts,
+            source_id=source_id,
         )
 
     async def has_ready_relation_discovery_work(self, *, max_attempts: int) -> bool:

@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, get_args
 from weakref import WeakKeyDictionary
 
 import litellm
+import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from memforge.llm.providers import litellm_optional_kwargs
@@ -33,6 +34,7 @@ type StructuredLlmTerminalCategory = Literal[
     "provider_error",
     "invalid_response",
 ]
+type NativeSchemaTransport = Literal["auto", "anthropic_output_config"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,39 +310,11 @@ class CandidateLedgerDecision(StructuredResponseModel):
 
 
 class CandidateLedgerResponse(StructuredResponseModel):
-    """Fixed-slot response for one bounded candidate-ledger batch."""
+    """Ordered decisions for one bounded candidate-ledger batch."""
 
     model_config = ConfigDict(extra="forbid")
 
-    slot_00: CandidateLedgerDecision | None
-    slot_01: CandidateLedgerDecision | None
-    slot_02: CandidateLedgerDecision | None
-    slot_03: CandidateLedgerDecision | None
-    slot_04: CandidateLedgerDecision | None
-    slot_05: CandidateLedgerDecision | None
-    slot_06: CandidateLedgerDecision | None
-    slot_07: CandidateLedgerDecision | None
-    slot_08: CandidateLedgerDecision | None
-    slot_09: CandidateLedgerDecision | None
-    slot_10: CandidateLedgerDecision | None
-    slot_11: CandidateLedgerDecision | None
-    slot_12: CandidateLedgerDecision | None
-    slot_13: CandidateLedgerDecision | None
-    slot_14: CandidateLedgerDecision | None
-    slot_15: CandidateLedgerDecision | None
-    slot_16: CandidateLedgerDecision | None
-    slot_17: CandidateLedgerDecision | None
-    slot_18: CandidateLedgerDecision | None
-    slot_19: CandidateLedgerDecision | None
-    slot_20: CandidateLedgerDecision | None
-    slot_21: CandidateLedgerDecision | None
-    slot_22: CandidateLedgerDecision | None
-    slot_23: CandidateLedgerDecision | None
-
-    def ordered_slots(self) -> tuple[CandidateLedgerDecision | None, ...]:
-        """Return all protocol slots in their deterministic request order."""
-
-        return tuple(getattr(self, f"slot_{index:02d}") for index in range(24))
+    decisions: list[CandidateLedgerDecision]
 
 
 class CandidateRelationDecision(StructuredResponseModel):
@@ -356,39 +330,11 @@ class CandidateRelationDecision(StructuredResponseModel):
 
 
 class CandidateRelationResponse(StructuredResponseModel):
-    """Fixed-slot candidate side of a composed reconciliation ledger."""
+    """Ordered candidate side of a composed reconciliation ledger."""
 
     model_config = ConfigDict(extra="forbid")
 
-    slot_00: CandidateRelationDecision | None
-    slot_01: CandidateRelationDecision | None
-    slot_02: CandidateRelationDecision | None
-    slot_03: CandidateRelationDecision | None
-    slot_04: CandidateRelationDecision | None
-    slot_05: CandidateRelationDecision | None
-    slot_06: CandidateRelationDecision | None
-    slot_07: CandidateRelationDecision | None
-    slot_08: CandidateRelationDecision | None
-    slot_09: CandidateRelationDecision | None
-    slot_10: CandidateRelationDecision | None
-    slot_11: CandidateRelationDecision | None
-    slot_12: CandidateRelationDecision | None
-    slot_13: CandidateRelationDecision | None
-    slot_14: CandidateRelationDecision | None
-    slot_15: CandidateRelationDecision | None
-    slot_16: CandidateRelationDecision | None
-    slot_17: CandidateRelationDecision | None
-    slot_18: CandidateRelationDecision | None
-    slot_19: CandidateRelationDecision | None
-    slot_20: CandidateRelationDecision | None
-    slot_21: CandidateRelationDecision | None
-    slot_22: CandidateRelationDecision | None
-    slot_23: CandidateRelationDecision | None
-
-    def ordered_slots(self) -> tuple[CandidateRelationDecision | None, ...]:
-        """Return candidate judgments in datastore-bound request order."""
-
-        return tuple(getattr(self, f"slot_{index:02d}") for index in range(24))
+    decisions: list[CandidateRelationDecision]
 
 
 class IncumbentSupportAuditDecision(StructuredResponseModel):
@@ -402,45 +348,11 @@ class IncumbentSupportAuditDecision(StructuredResponseModel):
 
 
 class IncumbentSupportAuditResponse(StructuredResponseModel):
-    """Fixed-slot incumbent side of a composed reconciliation ledger."""
+    """Ordered incumbent side of a composed reconciliation ledger."""
 
     model_config = ConfigDict(extra="forbid")
 
-    slot_00: IncumbentSupportAuditDecision | None
-    slot_01: IncumbentSupportAuditDecision | None
-    slot_02: IncumbentSupportAuditDecision | None
-    slot_03: IncumbentSupportAuditDecision | None
-    slot_04: IncumbentSupportAuditDecision | None
-    slot_05: IncumbentSupportAuditDecision | None
-    slot_06: IncumbentSupportAuditDecision | None
-    slot_07: IncumbentSupportAuditDecision | None
-    slot_08: IncumbentSupportAuditDecision | None
-    slot_09: IncumbentSupportAuditDecision | None
-    slot_10: IncumbentSupportAuditDecision | None
-    slot_11: IncumbentSupportAuditDecision | None
-    slot_12: IncumbentSupportAuditDecision | None
-    slot_13: IncumbentSupportAuditDecision | None
-    slot_14: IncumbentSupportAuditDecision | None
-    slot_15: IncumbentSupportAuditDecision | None
-    slot_16: IncumbentSupportAuditDecision | None
-    slot_17: IncumbentSupportAuditDecision | None
-    slot_18: IncumbentSupportAuditDecision | None
-    slot_19: IncumbentSupportAuditDecision | None
-    slot_20: IncumbentSupportAuditDecision | None
-    slot_21: IncumbentSupportAuditDecision | None
-    slot_22: IncumbentSupportAuditDecision | None
-    slot_23: IncumbentSupportAuditDecision | None
-    slot_24: IncumbentSupportAuditDecision | None
-    slot_25: IncumbentSupportAuditDecision | None
-    slot_26: IncumbentSupportAuditDecision | None
-    slot_27: IncumbentSupportAuditDecision | None
-    slot_28: IncumbentSupportAuditDecision | None
-    slot_29: IncumbentSupportAuditDecision | None
-
-    def ordered_slots(self) -> tuple[IncumbentSupportAuditDecision | None, ...]:
-        """Return incumbent judgments in datastore-bound request order."""
-
-        return tuple(getattr(self, f"slot_{index:02d}") for index in range(30))
+    decisions: list[IncumbentSupportAuditDecision]
 
 
 class MemoryRelationDecision(StructuredResponseModel):
@@ -505,47 +417,11 @@ class EntityBatchValidationDecision(StructuredResponseModel):
 
 
 class EntityBatchValidationResponse(StructuredResponseModel):
-    """Fixed-slot response for one bounded entity ambiguity adjudication call."""
+    """Ordered decisions for one bounded entity ambiguity adjudication call."""
 
     model_config = ConfigDict(extra="forbid")
 
-    slot_00: EntityBatchValidationDecision | None
-    slot_01: EntityBatchValidationDecision | None
-    slot_02: EntityBatchValidationDecision | None
-    slot_03: EntityBatchValidationDecision | None
-    slot_04: EntityBatchValidationDecision | None
-    slot_05: EntityBatchValidationDecision | None
-    slot_06: EntityBatchValidationDecision | None
-    slot_07: EntityBatchValidationDecision | None
-    slot_08: EntityBatchValidationDecision | None
-    slot_09: EntityBatchValidationDecision | None
-    slot_10: EntityBatchValidationDecision | None
-    slot_11: EntityBatchValidationDecision | None
-    slot_12: EntityBatchValidationDecision | None
-    slot_13: EntityBatchValidationDecision | None
-    slot_14: EntityBatchValidationDecision | None
-    slot_15: EntityBatchValidationDecision | None
-    slot_16: EntityBatchValidationDecision | None
-    slot_17: EntityBatchValidationDecision | None
-    slot_18: EntityBatchValidationDecision | None
-    slot_19: EntityBatchValidationDecision | None
-    slot_20: EntityBatchValidationDecision | None
-    slot_21: EntityBatchValidationDecision | None
-    slot_22: EntityBatchValidationDecision | None
-    slot_23: EntityBatchValidationDecision | None
-    slot_24: EntityBatchValidationDecision | None
-    slot_25: EntityBatchValidationDecision | None
-    slot_26: EntityBatchValidationDecision | None
-    slot_27: EntityBatchValidationDecision | None
-    slot_28: EntityBatchValidationDecision | None
-    slot_29: EntityBatchValidationDecision | None
-    slot_30: EntityBatchValidationDecision | None
-    slot_31: EntityBatchValidationDecision | None
-
-    def ordered_slots(self) -> tuple[EntityBatchValidationDecision | None, ...]:
-        """Return judgments in their datastore-bound request order."""
-
-        return tuple(getattr(self, f"slot_{index:02d}") for index in range(32))
+    decisions: list[EntityBatchValidationDecision]
 
 
 class QueryEntityDetectionResponse(StructuredResponseModel):
@@ -577,6 +453,11 @@ class StructuredLlmConfig:
     # Every client in the worker event loop shares this logical-call admission.
     # Callers that do not opt in remain conservatively serial.
     max_concurrent: int = 1
+    # ``auto`` follows LiteLLM's provider capability registry and uses its
+    # response_format integration. Gateways whose registry entry lags an
+    # Anthropic deployment may explicitly select the current Anthropic wire
+    # contract without teaching this provider-neutral client a gateway name.
+    native_schema_transport: NativeSchemaTransport = "auto"
 
 
 @dataclass(frozen=True)
@@ -1102,8 +983,6 @@ def _json_text_prompt(prompt: str, response_format: type[BaseModel]) -> str:
 
 
 def _supports_native_response_schema(model_name: str) -> bool:
-    if _is_sap_anthropic_model(model_name):
-        return True
     try:
         return bool(litellm.supports_response_schema(model=model_name))
     except Exception:
@@ -1115,10 +994,24 @@ def _supports_native_response_schema(model_name: str) -> bool:
         return False
 
 
-def _is_sap_anthropic_model(model_name: str) -> bool:
-    """Return true for SAP GenAI Hub Anthropic aliases that accept response_format."""
-    return model_name.lower().startswith("sap/anthropic--")
+def _native_schema_request_kwargs(
+    response_format: type[BaseModel] | None,
+    transport: NativeSchemaTransport,
+) -> dict[str, object]:
+    """Build one provider wire contract while retaining local Pydantic authority."""
 
+    if response_format is None:
+        return {}
+    if transport == "anthropic_output_config":
+        return {
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": anthropic.transform_schema(response_format),
+                }
+            }
+        }
+    return {"response_format": response_format}
 
 def _strip_json_fences(text: str) -> str:
     """Drop a leading ```/```json fence and trailing ``` if the model adds them."""
@@ -1537,7 +1430,11 @@ class LiteLlmStructuredClient:
         state: _StructuredCallState,
         images: tuple[StructuredLlmImage, ...],
     ):
-        if not _supports_native_response_schema(model_name):
+        native_schema_transport = self.config.native_schema_transport
+        if (
+            native_schema_transport == "auto"
+            and not _supports_native_response_schema(model_name)
+        ):
             state.final_mode = "json_text"
             logger.debug(
                 "Structured LLM model %s does not advertise native response_schema support; "
@@ -1553,6 +1450,7 @@ class LiteLlmStructuredClient:
                     model_name=model_name,
                     max_tokens=max_tokens,
                     native_schema=False,
+                    native_schema_transport=native_schema_transport,
                     deadline=deadline,
                     state=state,
                     images=images,
@@ -1572,6 +1470,7 @@ class LiteLlmStructuredClient:
                 model_name=model_name,
                 max_tokens=max_tokens,
                 native_schema=True,
+                native_schema_transport=native_schema_transport,
                 deadline=deadline,
                 state=state,
                 images=images,
@@ -1601,6 +1500,7 @@ class LiteLlmStructuredClient:
                 model_name=model_name,
                 max_tokens=max_tokens,
                 native_schema=False,
+                native_schema_transport=native_schema_transport,
                 deadline=deadline,
                 state=state,
                 images=images,
@@ -1619,6 +1519,7 @@ class LiteLlmStructuredClient:
         model_name: str,
         max_tokens: int,
         native_schema: bool,
+        native_schema_transport: NativeSchemaTransport,
         deadline: float,
         state: _StructuredCallState,
         images: tuple[StructuredLlmImage, ...],
@@ -1644,6 +1545,7 @@ class LiteLlmStructuredClient:
             max_tokens=max_tokens,
             provider_kwargs=provider_kwargs,
             response_format=response_format if native_schema else None,
+            native_schema_transport=native_schema_transport,
             deadline=deadline,
             state=state,
         )
@@ -1662,10 +1564,15 @@ class LiteLlmStructuredClient:
         max_tokens: int,
         provider_kwargs: dict[str, Any],
         response_format: type[BaseModel] | None,
+        native_schema_transport: NativeSchemaTransport,
         deadline: float,
         state: _StructuredCallState,
     ):
         loop = asyncio.get_running_loop()
+        schema_kwargs = _native_schema_request_kwargs(
+            response_format,
+            native_schema_transport,
+        )
         while True:
             remaining_s = max(0.001, deadline - loop.time())
             state.attempt_count += 1
@@ -1685,7 +1592,7 @@ class LiteLlmStructuredClient:
                         api_key=self.config.api_key,
                     ),
                     **provider_kwargs,
-                    **({"response_format": response_format} if response_format else {}),
+                    **schema_kwargs,
                 )
             except Exception as exc:
                 state.record_failed_attempt()

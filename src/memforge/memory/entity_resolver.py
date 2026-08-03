@@ -24,7 +24,8 @@ from memforge.storage.adapters.protocols import (
 
 logger = logging.getLogger(__name__)
 
-_ENTITY_ADJUDICATION_SLOT_COUNT = 32
+_ENTITY_ADJUDICATION_BATCH_LIMIT = 32
+_ENTITY_ADJUDICATION_VALIDATION_ATTEMPTS = 2
 
 __all__ = [
     "EntityResolutionBatch",
@@ -45,6 +46,7 @@ class EntityResolutionMetrics:
     ambiguous_mentions: int
     embedding_batches: int
     structured_llm_calls: int
+    validation_retries: int
     candidate_count: int
     new_entities: int
     elapsed_ms: int
@@ -79,10 +81,10 @@ class EntityResolutionPolicy:
         ):
             if value < 1:
                 raise ValueError(f"{name} must be positive")
-        if self.adjudication_batch_size > _ENTITY_ADJUDICATION_SLOT_COUNT:
+        if self.adjudication_batch_size > _ENTITY_ADJUDICATION_BATCH_LIMIT:
             raise ValueError(
-                "adjudication_batch_size cannot exceed fixed response slot capacity "
-                f"({_ENTITY_ADJUDICATION_SLOT_COUNT})"
+                "adjudication_batch_size cannot exceed the bounded adjudication limit "
+                f"({_ENTITY_ADJUDICATION_BATCH_LIMIT})"
             )
 
 
@@ -105,11 +107,11 @@ def validate_alias(alias_name: str, canonical_name: str) -> bool:
 
 _ENTITY_BATCH_PROMPT = """Resolve each entity mention against only its supplied candidates.
 
-Each case is assigned to a datastore-owned response slot. Return the judgment
-for each active case in its matching slot. Every unused slot must be null.
-Do not repeat or rewrite the mention.
+Return a decisions array with exactly one judgment per case, in the same order
+as the cases below. Do not repeat or rewrite the mention; the caller binds each
+decision by array position.
 
-Response slots, mentions, and candidate IDs:
+Mentions and candidate IDs:
 {cases_json}
 
 Document context:
@@ -247,6 +249,7 @@ class EntityResolver:
                         ambiguous[canonical] = candidates
 
         structured_llm_calls = 0
+        validation_retries = 0
         learned_aliases: list[EntityAlias] = []
         if ambiguous and self.structured_llm_client is not None:
             cases = tuple(
@@ -262,41 +265,50 @@ class EntityResolver:
 
             async def adjudicate_batch(
                 case_batch: tuple[dict[str, object], ...],
-            ) -> tuple[tuple[str, object], ...]:
+            ) -> tuple[tuple[tuple[str, object], ...], int, int]:
                 prompt = self._render_adjudication_prompt(case_batch, context=context_text)
-                response = await self.structured_llm_client.validate_entity_batch(
-                    prompt,
-                    max_tokens=max(512, min(4096, len(case_batch) * 256)),
-                    model=self.llm_model,
-                )
-                ordered_slots = response.ordered_slots()
-                active_slots = ordered_slots[: len(case_batch)]
-                unused_slots = ordered_slots[len(case_batch) :]
-                missing_active = sum(decision is None for decision in active_slots)
-                non_null_unused = sum(decision is not None for decision in unused_slots)
-                if missing_active or non_null_unused:
-                    raise RuntimeError(
-                        "entity adjudication slot coverage invalid: "
-                        f"active_count={len(case_batch)}, "
-                        f"missing_active_count={missing_active}, "
-                        f"non_null_unused_count={non_null_unused}"
+                for attempt in range(_ENTITY_ADJUDICATION_VALIDATION_ATTEMPTS):
+                    response = await self.structured_llm_client.validate_entity_batch(
+                        prompt,
+                        max_tokens=max(512, min(4096, len(case_batch) * 256)),
+                        model=self.llm_model,
                     )
-                return tuple(
-                    (
-                        str(case["mention"]),
-                        decision,
+                    if len(response.decisions) == len(case_batch):
+                        return (
+                            tuple(
+                                (str(case["mention"]), decision)
+                                for case, decision in zip(
+                                    case_batch,
+                                    response.decisions,
+                                    strict=True,
+                                )
+                            ),
+                            attempt + 1,
+                            attempt,
+                        )
+                    error = (
+                        "entity adjudication coverage invalid: "
+                        f"expected_count={len(case_batch)}, "
+                        f"actual_count={len(response.decisions)}"
                     )
-                    for case, decision in zip(case_batch, active_slots, strict=True)
-                    if decision is not None
-                )
+                    if attempt + 1 >= _ENTITY_ADJUDICATION_VALIDATION_ATTEMPTS:
+                        raise RuntimeError(error)
+                    prompt = (
+                        f"{prompt}\n\n<validation_feedback>\n"
+                        f"The previous response was rejected: {error}. Return exactly "
+                        f"{len(case_batch)} decisions in case order.\n"
+                        "</validation_feedback>"
+                    )
+                raise AssertionError("entity adjudication attempts exhausted")
 
             batch_decisions = await collect_bounded(
                 case_batches,
                 adjudicate_batch,
                 max_concurrent=structured_llm_max_concurrent(self.structured_llm_client),
             )
-            structured_llm_calls += len(case_batches)
-            for adjudicated in batch_decisions:
+            structured_llm_calls += sum(result[1] for result in batch_decisions)
+            validation_retries += sum(result[2] for result in batch_decisions)
+            for adjudicated, _, _ in batch_decisions:
                 decisions.update(adjudicated)
             for mention, candidates in ambiguous.items():
                 decision = decisions.get(mention)
@@ -341,6 +353,7 @@ class EntityResolver:
             ambiguous_mentions=len(ambiguous),
             embedding_batches=embedding_batches,
             structured_llm_calls=structured_llm_calls,
+            validation_retries=validation_retries,
             candidate_count=candidate_count,
             new_entities=len(new_names),
         )
@@ -378,9 +391,8 @@ class EntityResolver:
         *,
         context: str,
     ) -> str:
-        slotted_cases = tuple({"slot": f"slot_{index:02d}", **case} for index, case in enumerate(cases))
         return _ENTITY_BATCH_PROMPT.format(
-            cases_json=json.dumps(slotted_cases, ensure_ascii=False, sort_keys=True),
+            cases_json=json.dumps(tuple(cases), ensure_ascii=False, sort_keys=True),
             context=context,
         )
 
@@ -395,6 +407,7 @@ class EntityResolver:
         ambiguous_mentions: int = 0,
         embedding_batches: int = 0,
         structured_llm_calls: int = 0,
+        validation_retries: int = 0,
         candidate_count: int = 0,
         new_entities: int = 0,
     ) -> EntityResolutionBatch:
@@ -406,13 +419,15 @@ class EntityResolver:
             ambiguous_mentions=ambiguous_mentions,
             embedding_batches=embedding_batches,
             structured_llm_calls=structured_llm_calls,
+            validation_retries=validation_retries,
             candidate_count=candidate_count,
             new_entities=new_entities,
             elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
         )
         logger.info(
             "entity_resolution_batch unique=%d exact=%d alias=%d embedded=%d "
-            "ambiguous=%d candidates=%d embedding_batches=%d llm_calls=%d new=%d elapsed_ms=%d",
+            "ambiguous=%d candidates=%d embedding_batches=%d llm_calls=%d "
+            "validation_retries=%d new=%d elapsed_ms=%d",
             metrics.unique_mentions,
             metrics.exact_hits,
             metrics.alias_hits,
@@ -421,6 +436,7 @@ class EntityResolver:
             metrics.candidate_count,
             metrics.embedding_batches,
             metrics.structured_llm_calls,
+            metrics.validation_retries,
             metrics.new_entities,
             metrics.elapsed_ms,
         )
