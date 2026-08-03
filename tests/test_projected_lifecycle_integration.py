@@ -4438,6 +4438,14 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
     )
 
     assert await db.get_evidence_relations(evidence_unit.id) == authoritative_relations
+    async with db.db.execute(
+        "SELECT status, error FROM relation_discovery_work WHERE id = ?",
+        (completion.request.id,),
+    ) as cursor:
+        completed_work = await cursor.fetchone()
+    assert completed_work is not None
+    assert completed_work["status"] == "completed"
+    assert completed_work["error"] is None
 
 
 class _DeterministicRefinementClassifier:

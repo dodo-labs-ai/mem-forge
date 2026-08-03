@@ -8701,7 +8701,7 @@ class Database:
                     """UPDATE relation_discovery_work
                           SET status = 'completed', lease_owner = NULL,
                               lease_token = NULL, lease_until = NULL,
-                              next_attempt_at = NULL,
+                              next_attempt_at = NULL, error = NULL,
                               updated_at = ?, completed_at = ?
                         WHERE id = ? AND status = 'running'
                           AND lease_owner = ? AND lease_token = ?""",
