@@ -113,6 +113,7 @@ class RelationDiscovery:
         *,
         worker_id: str,
         budget: RelationDiscoveryBudget | None = None,
+        source_id: str | None = None,
     ) -> RelationDiscoverySliceResult:
         policy = budget or DEFAULT_RELATION_DISCOVERY_BUDGET
         started = time.perf_counter()
@@ -129,6 +130,7 @@ class RelationDiscovery:
                 limit=1,
                 lease_seconds=policy.lease_seconds,
                 max_attempts=policy.max_attempts,
+                source_id=source_id,
             )
             if not leased:
                 break
