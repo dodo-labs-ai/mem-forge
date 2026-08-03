@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib.util
 import json
@@ -899,9 +900,17 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
-def test_packaged_plugin_version_0_1_37_is_consistent():
+def test_mcp_tools_all_accept_repository_context():
+    from memforge import plugin_mcp_proxy
+
+    assert plugin_mcp_proxy.TOOLS
+    for tool in plugin_mcp_proxy.TOOLS:
+        assert "repository_context" in tool["inputSchema"]["properties"], tool["name"]
+
+
+def test_packaged_plugin_version_0_1_38_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.37"
+    version = "0.1.38"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
@@ -1110,7 +1119,7 @@ def test_mcp_tool_call_waits_for_pending_roots_before_selecting_workspace(monkey
     proxy = _load_plugin_mcp_proxy()
     repository = tmp_path / "repository"
     repository.mkdir()
-    (repository / ".git").mkdir()
+    _init_git_repo_with_origin(repository, "https://github.com/example/repository.git")
     local_config = repository / ".memforge" / "config.toml"
     local_config.parent.mkdir()
     local_config.write_text('[memforge]\nworkspace_id = "repository_workspace"\n', encoding="utf-8")
@@ -1204,6 +1213,313 @@ def test_mcp_tool_call_waits_for_pending_roots_before_selecting_workspace(monkey
         f"{base}/sources/searchable",
         f"{base}/memories/search",
     ]
+
+
+def test_mcp_tool_calls_use_explicit_repository_context_for_workspace_without_roots(
+    monkeypatch, tmp_path
+):
+    proxy = _load_plugin_mcp_proxy()
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _init_git_repo_with_origin(repository, "https://github.com/example/repository.git")
+    local_config = repository / ".memforge" / "config.toml"
+    local_config.parent.mkdir()
+    local_config.write_text('[memforge]\nworkspace_id = "repository_workspace"\n', encoding="utf-8")
+    captured_requests: list[tuple[str, bytes | None]] = []
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __init__(self, payload: dict) -> None:
+            self.payload = json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return self.payload
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured_requests.append((request.full_url, request.data))
+            if request.full_url.endswith("/sources/searchable"):
+                return FakeResponse({"data": []})
+            return FakeResponse({"results": []})
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example.hana.ondemand.com")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "process_workspace")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    initialize = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "test"},
+            },
+        }
+    )
+    assert initialize["result"]["serverInfo"]["name"] == "memforge"
+
+    repository_context = {"working_directory": str(repository)}
+    list_sources_response = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "list_sources",
+                "arguments": {"repository_context": repository_context},
+            },
+        }
+    )
+    search_response = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {
+                    "query": "workspace routing",
+                    "repository_context": repository_context,
+                },
+            },
+        }
+    )
+
+    assert "result" in list_sources_response
+    assert "result" in search_response
+    base = "https://cloud.example.hana.ondemand.com/api/workspaces/repository_workspace/api"
+    assert [url for url, _body in captured_requests] == [
+        f"{base}/sources/searchable",
+        f"{base}/memories/search",
+    ]
+    search_body = json.loads(captured_requests[1][1].decode())
+    assert search_body["active_repo_identifier"] == "github.com/example/repository"
+    assert "repository_context" not in search_body
+
+
+def test_explicit_repository_context_bypasses_pending_roots(monkeypatch, tmp_path):
+    proxy = _load_plugin_mcp_proxy()
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _init_git_repo_with_origin(repository, "https://github.com/example/repository.git")
+    local_config = repository / ".memforge" / "config.toml"
+    local_config.parent.mkdir()
+    local_config.write_text('[memforge]\nworkspace_id = "repository_workspace"\n', encoding="utf-8")
+    captured_urls: list[str] = []
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"data":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured_urls.append(request.full_url)
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example.hana.ondemand.com")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "process_workspace")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"roots": {"listChanged": True}},
+                "clientInfo": {"name": "test"},
+            },
+        }
+    )
+    roots_request = proxy._handle_rpc_message(
+        {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    )
+    assert roots_request["method"] == "roots/list"
+
+    response = proxy._handle_rpc_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "list_sources",
+                "arguments": {
+                    "repository_context": {"working_directory": str(repository)}
+                },
+            },
+        }
+    )
+
+    assert "result" in response
+    assert captured_urls == [
+        "https://cloud.example.hana.ondemand.com/api/workspaces/"
+        "repository_workspace/api/sources/searchable"
+    ]
+
+
+def test_explicit_repository_context_beats_roots_and_uses_normal_fallback_without_override(
+    monkeypatch, tmp_path
+):
+    proxy = _load_plugin_mcp_proxy()
+    root_repository = tmp_path / "root-repository"
+    explicit_repository = tmp_path / "explicit-repository"
+    fallback_repository = tmp_path / "fallback-repository"
+    for repository, remote in (
+        (root_repository, "https://github.com/example/root.git"),
+        (explicit_repository, "https://github.com/example/explicit.git"),
+        (fallback_repository, "https://github.com/example/fallback.git"),
+    ):
+        repository.mkdir()
+        _init_git_repo_with_origin(repository, remote)
+    for repository, workspace_id in (
+        (root_repository, "root_workspace"),
+        (explicit_repository, "explicit_workspace"),
+    ):
+        local_config = repository / ".memforge" / "config.toml"
+        local_config.parent.mkdir()
+        local_config.write_text(
+            f'[memforge]\nworkspace_id = "{workspace_id}"\n', encoding="utf-8"
+        )
+    captured_urls: list[str] = []
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"data":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            captured_urls.append(request.full_url)
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example.hana.ondemand.com")
+    monkeypatch.setenv("MEMFORGE_API_TOKEN", "token-123")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "process_workspace")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    _provide_mcp_roots(proxy, root_repository)
+
+    proxy._call_tool(
+        "list_sources",
+        {"repository_context": {"working_directory": str(explicit_repository)}},
+    )
+    proxy._call_tool(
+        "list_sources",
+        {"repository_context": {"working_directory": str(fallback_repository)}},
+    )
+
+    base = "https://cloud.example.hana.ondemand.com/api/workspaces"
+    assert captured_urls == [
+        f"{base}/explicit_workspace/api/sources/searchable",
+        f"{base}/process_workspace/api/sources/searchable",
+    ]
+
+
+@pytest.mark.parametrize(
+    "repository_context",
+    [
+        "not-an-object",
+        {},
+        {"working_directory": "relative/path"},
+        {"working_directory": "/not/a/git/repository"},
+        {"working_directory": "/tmp", "unexpected": True},
+    ],
+)
+def test_invalid_explicit_repository_context_fails_closed(
+    monkeypatch, repository_context
+):
+    proxy = _load_plugin_mcp_proxy()
+
+    class FakeOpener:
+        def open(self, *_args, **_kwargs):
+            raise AssertionError("invalid explicit context must fail before HTTP")
+
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "process_workspace")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+
+    result = proxy._call_tool(
+        "list_sources",
+        {"repository_context": repository_context},
+    )
+
+    assert "error" in result
+    assert "repository_context" in result["error"]
+
+
+def test_concurrent_repository_contexts_keep_workspace_and_attribution_request_local(
+    monkeypatch, tmp_path
+):
+    proxy = _load_plugin_mcp_proxy()
+    repositories: list[tuple[Path, str, str]] = []
+    for name, workspace_id in (("alpha", "alpha_workspace"), ("beta", "beta_workspace")):
+        repository = tmp_path / name
+        repository.mkdir()
+        _init_git_repo_with_origin(repository, f"https://github.com/example/{name}.git")
+        local_config = repository / ".memforge" / "config.toml"
+        local_config.parent.mkdir()
+        local_config.write_text(
+            f'[memforge]\nworkspace_id = "{workspace_id}"\n', encoding="utf-8"
+        )
+        repositories.append((repository, name, workspace_id))
+    captured: dict[str, tuple[str, str | None]] = {}
+
+    def fake_http_json(method, path, body, *, target=None):
+        captured[body["query"]] = (
+            target.resource_url(path),
+            body.get("active_repo_identifier"),
+        )
+        return {"results": []}
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example.hana.ondemand.com")
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "process_workspace")
+    monkeypatch.setattr(proxy, "_http_json", fake_http_json)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                proxy._call_tool,
+                "search",
+                {
+                    "query": name,
+                    "repository_context": {"working_directory": str(repository)},
+                },
+            )
+            for repository, name, _workspace_id in repositories
+        ]
+        assert [future.result() for future in futures] == [{"results": []}, {"results": []}]
+
+    for _repository, name, workspace_id in repositories:
+        url, repo_identifier = captured[name]
+        assert url == (
+            "https://cloud.example.hana.ondemand.com/api/workspaces/"
+            f"{workspace_id}/api/memories/search"
+        )
+        assert repo_identifier == f"github.com/example/{name}"
 
 
 def test_invalid_hook_target_fails_before_urlopen(monkeypatch):
@@ -3499,7 +3815,7 @@ def test_mcp_proxy_preserves_claim_local_evidence_on_get_memory(monkeypatch):
     monkeypatch.setattr(
         proxy,
         "_http_json",
-        lambda *_args: {
+        lambda *_args, **_kwargs: {
             "id": "mem-1",
             "memory_type": "fact",
             "content": "A visual claim",
