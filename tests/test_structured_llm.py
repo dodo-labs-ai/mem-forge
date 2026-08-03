@@ -19,10 +19,12 @@ from memforge.llm.structured import (
     AgentSessionAuthorityResponse,
     CandidateLedgerDecision,
     CandidateLedgerResponse,
+    CandidateRelationDecision,
     CandidateRelationResponse,
     EntityBatchValidationDecision,
     EntityBatchValidationResponse,
     EntityValidationResponse,
+    IncumbentSupportAuditDecision,
     IncumbentSupportAuditResponse,
     LiteLlmStructuredClient,
     MemoryCandidate,
@@ -1036,29 +1038,11 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         schema = kwargs["response_format"]
         if schema is CandidateRelationResponse:
             return CompletionResponse(
-                json.dumps(
-                    {
-                        f"slot_{index:02d}": (
-                            {"action": "ADD", "reason": "new"}
-                            if index == 0
-                            else None
-                        )
-                        for index in range(24)
-                    }
-                )
+                '{"decisions":[{"action":"ADD","reason":"new"}]}'
             )
         if schema is IncumbentSupportAuditResponse:
             return CompletionResponse(
-                json.dumps(
-                    {
-                        f"slot_{index:02d}": (
-                            {"action": "NOOP", "reason": "supported"}
-                            if index == 0
-                            else None
-                        )
-                        for index in range(30)
-                    }
-                )
+                '{"decisions":[{"action":"NOOP","reason":"supported"}]}'
             )
         if schema is CandidateLedgerResponse:
             return CompletionResponse(
@@ -1095,10 +1079,10 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     assert (await client.select_memory_candidates("prompt")).decisions[0].action == "KEEP"
     assert (
         await client.reconcile_candidate_relations("prompt")
-    ).ordered_slots()[0].action == "ADD"
+    ).decisions[0].action == "ADD"
     assert (
         await client.audit_incumbent_support("prompt")
-    ).ordered_slots()[0].action == "NOOP"
+    ).decisions[0].action == "NOOP"
     assert (await client.classify_memory_relations("prompt")).decisions[0].direction == "challenger_to_candidate"
     assert (await client.validate_memory_support("prompt")).supported is True
     assert (await client.validate_entity_match("prompt")).matched_id == 7
@@ -1119,31 +1103,25 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
 
 def test_composed_reconciliation_schemas_reject_cross_phase_decisions() -> None:
     candidate_payload = {
-        f"slot_{index:02d}": (
+        "decisions": [
             {
                 "action": "NOOP",
                 "memory_id": "mem-1",
                 "reason": "model-owned datastore identity",
             }
-            if index == 0
-            else None
-        )
-        for index in range(24)
+        ]
     }
     with pytest.raises(ValidationError):
         CandidateRelationResponse.model_validate(candidate_payload)
 
     audit_payload = {
-        f"slot_{index:02d}": (
+        "decisions": [
             {
                 "action": "ADD",
                 "index": 0,
                 "reason": "candidate row in incumbent audit",
             }
-            if index == 0
-            else None
-        )
-        for index in range(30)
+        ]
     }
     with pytest.raises(ValidationError):
         IncumbentSupportAuditResponse.model_validate(audit_payload)
@@ -1165,15 +1143,31 @@ def test_transient_batch_schemas_use_ordered_decision_arrays() -> None:
             EntityBatchValidationDecision(matched_id=7, confidence=0.99)
         ]
     )
+    candidate_relations = CandidateRelationResponse(
+        decisions=[CandidateRelationDecision(action="ADD")]
+    )
+    incumbent_audits = IncumbentSupportAuditResponse(
+        decisions=[IncumbentSupportAuditDecision(action="NOOP")]
+    )
 
     assert ledger.decisions[0].action == "KEEP"
     assert entities.decisions[0].matched_id == 7
+    assert candidate_relations.decisions[0].action == "ADD"
+    assert incumbent_audits.decisions[0].action == "NOOP"
     assert set(CandidateLedgerResponse.model_json_schema()["properties"]) == {
         "decisions"
     }
     assert set(EntityBatchValidationResponse.model_json_schema()["properties"]) == {
         "decisions"
     }
+    assert set(CandidateRelationResponse.model_json_schema()["properties"]) == {
+        "decisions"
+    }
+    assert set(IncumbentSupportAuditResponse.model_json_schema()["properties"]) == {
+        "decisions"
+    }
+    assert json.dumps(CandidateRelationResponse.model_json_schema()).count('"anyOf"') <= 16
+    assert json.dumps(IncumbentSupportAuditResponse.model_json_schema()).count('"anyOf"') <= 16
     with pytest.raises(ValidationError):
         CandidateLedgerResponse.model_validate({"slot_00": {"action": "KEEP"}})
     with pytest.raises(ValidationError):

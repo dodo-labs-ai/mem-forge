@@ -35,29 +35,15 @@ def _memory(mem_id: str, content: str, *, corroboration_count: int = 1) -> Memor
 
 
 def _candidate_response(
-    *decisions: CandidateRelationDecision | None,
+    *decisions: CandidateRelationDecision,
 ) -> CandidateRelationResponse:
-    return CandidateRelationResponse.model_validate(
-        {
-            f"slot_{index:02d}": (
-                decisions[index] if index < len(decisions) else None
-            )
-            for index in range(24)
-        }
-    )
+    return CandidateRelationResponse(decisions=list(decisions))
 
 
 def _audit_response(
-    *decisions: IncumbentSupportAuditDecision | None,
+    *decisions: IncumbentSupportAuditDecision,
 ) -> IncumbentSupportAuditResponse:
-    return IncumbentSupportAuditResponse.model_validate(
-        {
-            f"slot_{index:02d}": (
-                decisions[index] if index < len(decisions) else None
-            )
-            for index in range(30)
-        }
-    )
+    return IncumbentSupportAuditResponse(decisions=list(decisions))
 
 
 def test_parse_decisions_preserves_flag_for_review() -> None:
@@ -335,7 +321,7 @@ async def test_incomplete_candidate_relation_cell_invalidates_composed_ledger() 
 
     assert result.operations == []
     assert result.failure is not None
-    assert "candidate relation slot 0 must not be null" in result.failure.error
+    assert "candidate relation response count 0 does not match expected count 1" in result.failure.error
 
 
 @pytest.mark.asyncio
@@ -345,6 +331,7 @@ async def test_any_incomplete_batch_invalidates_the_entire_ledger() -> None:
     class MissingDecisionClient:
         def __init__(self) -> None:
             self.offset = 0
+            self.short_batch_calls = 0
 
         async def audit_incumbent_support(self, prompt: str, **kwargs):
             del kwargs
@@ -364,21 +351,24 @@ async def test_any_incomplete_batch_invalidates_the_entire_ledger() -> None:
                 for _ in batch
             ]
             if len(batch) == 1:
+                self.short_batch_calls += 1
                 decisions = []
             return _audit_response(*decisions)
 
+    client = MissingDecisionClient()
     result = await reconcile_memories(
         new_extractions=[],
         existing_memories=incumbents,
         doc_type="design",
-        structured_llm_client=MissingDecisionClient(),
+        structured_llm_client=client,
         updated_document="# Current design",
         include_metadata=True,
     )
 
     assert result.operations == []
     assert result.failure is not None
-    assert "incumbent audit slot 0 must not be null" in result.failure.error
+    assert client.short_batch_calls == 2
+    assert "incumbent audit response count 0 does not match expected count 1" in result.failure.error
 
 
 @pytest.mark.asyncio
@@ -554,25 +544,31 @@ async def test_missing_new_extraction_decision_invalidates_batch() -> None:
     incumbent = _memory("mem-existing", "Stable claim")
 
     class MissingCandidateClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
         async def reconcile_candidate_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
+            self.calls += 1
             return _candidate_response()
 
         async def audit_incumbent_support(self, prompt: str, **kwargs):
             del prompt, kwargs
             return _audit_response(IncumbentSupportAuditDecision(action="NOOP", reason="Still supported"))
 
+    client = MissingCandidateClient()
     result = await reconcile_memories(
         new_extractions=[RawMemory(content="New claim", memory_type="fact")],
         existing_memories=[incumbent],
         doc_type="ticket",
-        structured_llm_client=MissingCandidateClient(),
+        structured_llm_client=client,
         include_metadata=True,
     )
 
     assert result.operations == []
     assert result.failure is not None
-    assert "candidate relation slot 0 must not be null" in result.failure.error
+    assert client.calls == 2
+    assert "candidate relation response count 0 does not match expected count 1" in result.failure.error
 
 
 @pytest.mark.asyncio
