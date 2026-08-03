@@ -284,19 +284,15 @@ def _jira_projection(
 
 
 def _candidate_response(
-    *decisions: CandidateRelationDecision | None,
+    *decisions: CandidateRelationDecision,
 ) -> CandidateRelationResponse:
-    return CandidateRelationResponse.model_validate(
-        {f"slot_{index:02d}": (decisions[index] if index < len(decisions) else None) for index in range(24)}
-    )
+    return CandidateRelationResponse(decisions=list(decisions))
 
 
 def _audit_response(
-    *decisions: IncumbentSupportAuditDecision | None,
+    *decisions: IncumbentSupportAuditDecision,
 ) -> IncumbentSupportAuditResponse:
-    return IncumbentSupportAuditResponse.model_validate(
-        {f"slot_{index:02d}": (decisions[index] if index < len(decisions) else None) for index in range(30)}
-    )
+    return IncumbentSupportAuditResponse(decisions=list(decisions))
 
 
 class _ReplacementClient:
@@ -2825,7 +2821,7 @@ async def test_persistent_incomplete_incumbent_audit_fails_closed_without_mutati
 
     with pytest.raises(
         RuntimeError,
-        match="incumbent audit slot 0 must not be null",
+        match="incumbent audit response count 0 does not match expected count 1",
     ):
         await engine.apply_projected_lifecycle(
             projection=second,
