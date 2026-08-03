@@ -112,7 +112,10 @@ def build_projected_claim_evidence(
         )
 
         primary_revision = revisions_by_observation[primary_id]
-        artifact_evidence = raw.evidence_anchor == "source_artifact" and primary_id in artifact_observation_ids
+        artifact_evidence = (
+            raw.evidence_anchor in {"source_artifact", "revalidated_noop"}
+            and primary_id in artifact_observation_ids
+        )
         canonical_memory = replace(
             raw,
             evidence_quote=None,
@@ -287,7 +290,13 @@ def _primary_observation_id(
     if observation_hint in candidate_ids or revalidated_noop:
         if observation_hint not in revisions_by_observation:
             raise ValueError("explicit source observation is unavailable in the current revision")
-        if not quote and observation_hint in empty_quote_observation_ids:
+        # A revalidated NOOP hint is copied from active PRIMARY Support, not
+        # supplied by extraction. Its unchanged whole-Observation authority
+        # therefore remains valid without inventing a claim-local excerpt.
+        if not quote and (
+            revalidated_noop
+            or observation_hint in empty_quote_observation_ids
+        ):
             return observation_hint
         if not quote or quote not in revisions_by_observation[observation_hint].content:
             raise ValueError("explicit source observation does not contain the evidence quote")

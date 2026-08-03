@@ -182,6 +182,7 @@ def _projection_with_artifact(
     payload: bytes,
     provider_revision: str,
     inference_eligible: bool,
+    body: str = "# Page",
     prior=None,
     prior_observations=None,
 ) -> SourceProjection:
@@ -193,7 +194,6 @@ def _projection_with_artifact(
         version=provider_revision,
         extra={"page_id": "123", "space_key": "ENG"},
     )
-    body = "# Page"
     return project_source_item(
         source_id="src-1",
         source_type="confluence",
@@ -2894,6 +2894,10 @@ async def test_explicit_empty_revision_deterministically_removes_incumbent_suppo
 async def _seed_jira_required_incumbent(
     db: Database,
     first: SourceProjection,
+    *,
+    primary_excerpt: str | None = "Decision: retain A7",
+    primary_provenance: EvidenceContentProvenance | None = None,
+    source_type: str = "jira",
 ) -> Memory:
     incumbent = Memory(
         id="mem-jira-required",
@@ -2906,7 +2910,7 @@ async def _seed_jira_required_incumbent(
     await db.add_memory_source(
         incumbent.id,
         "confluence-123",
-        "jira",
+        source_type,
         "Decision: retain A7",
         source_updated_at=None,
     )
@@ -2918,7 +2922,7 @@ async def _seed_jira_required_incumbent(
         source_id="src-1",
         doc_id="confluence-123",
         doc_revision_id=first.source_unit_revisions[0].id,
-        source_type="jira",
+        source_type=source_type,
         source_anchor=primary.id,
         source_lineage_id=first.source_units[0].id,
         project_key="ENG",
@@ -2926,8 +2930,15 @@ async def _seed_jira_required_incumbent(
         owner_user_id=None,
         repo_identifier=None,
         content=revisions[primary.id].content,
-        excerpt="Decision: retain A7",
-        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        excerpt=primary_excerpt,
+        evidence_provenance=(
+            primary_provenance
+            or (
+                EvidenceContentProvenance.SOURCE_EXCERPT
+                if primary_excerpt
+                else EvidenceContentProvenance.NO_EXCERPT
+            )
+        ),
         access_context_hash="workspace-eng",
     )
     await db.upsert_evidence_unit(unit)
@@ -3243,6 +3254,76 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
     plan_payload = json.loads(str(plan_row["payload_json"]))
     attach = next(mutation for mutation in plan_payload["mutations"] if mutation["mutation_type"] == "attach_support")
     assert attach["payload"]["support_validation"]["supported"] is True
+
+
+@pytest.mark.asyncio
+async def test_noop_revalidates_revised_required_with_artifact_primary(
+    db: Database,
+) -> None:
+    first = _projection_with_artifact(
+        run_id="projection-artifact-primary-1",
+        payload=b"stable-diagram",
+        provider_revision="1",
+        inference_eligible=True,
+        body="# Page\nA7 applies only to regular payroll.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_jira_required_incumbent(
+        db,
+        first,
+        primary_excerpt=None,
+        primary_provenance=EvidenceContentProvenance.SOURCE_ARTIFACT,
+        source_type="confluence",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    second = _projection_with_artifact(
+        run_id="projection-artifact-primary-2",
+        payload=b"stable-diagram",
+        provider_revision="1",
+        inference_eligible=True,
+        body="# Page\nA7 remains limited to regular payroll runs.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_SupportValidatingNoopClient(
+            incumbent.id,
+            supported=True,
+        ),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="# Page\nA7 remains limited to regular payroll runs.",
+        update_mode="diff_guided",
+        changed_hunks="wording clarified; scope remains regular payroll",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["noop"] == 1
+    evidence = await db.get_active_memory_support_evidence(
+        incumbent.id,
+        source_id="src-1",
+    )
+    [primary] = [item for item in evidence if item.role is EvidenceRole.PRIMARY]
+    assert primary.excerpt is None
+    assert primary.anchor.kind is AnchorKind.WHOLE_OBSERVATION
+    unit = await db.get_evidence_unit(primary.evidence_unit_id)
+    assert unit is not None
+    assert unit.evidence_provenance is EvidenceContentProvenance.SOURCE_ARTIFACT
 
 
 @pytest.mark.asyncio
