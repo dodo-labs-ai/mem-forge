@@ -4,6 +4,8 @@
 
 - Code should look like "first-place design", not "bug-fix archaeology." Comments, docstrings, and prompts should read as if the current approach was always the intended design. A new developer reading the code shouldn't see refactoring history.
 - Prefer clean, robust ownership boundaries over fallback workarounds. Do not add DB-only fallback paths for lifecycle operations that also require search/vector cleanup; route those operations through the owning service instead.
+- Do not introduce batching, reduce a batch size, or split a schema merely to bypass a provider limit or failing path. First identify whether the limit exposes a better schema, transport, ownership, or execution-boundary design; present the alternatives and tradeoffs to the user and obtain explicit confirmation before choosing batching as the remediation.
+- When batching is explicitly approved or is already part of the workload contract, keep it a transport/computation detail: it must not create additional business or lifecycle states, weaken complete coverage, or change atomic and fail-closed correctness semantics.
 
 ## Project
 
