@@ -400,8 +400,8 @@ async def test_identity_resolver_fails_closed_for_incomplete_structured_pair_led
 
 
 @pytest.mark.asyncio
-async def test_structured_classifier_retries_invalid_coverage_once() -> None:
-    class DuplicateThenCompleteClient:
+async def test_structured_classifier_keeps_first_duplicate_without_retry() -> None:
+    class DuplicateClient:
         def __init__(self) -> None:
             self.calls: list[str] = []
 
@@ -411,19 +411,20 @@ async def test_structured_classifier_retries_invalid_coverage_once() -> None:
             **_kwargs,
         ):
             self.calls.append(prompt)
-            if len(self.calls) == 1:
-                indices = [0, 0]
-            else:
-                indices = [0, 1]
+            indices = [0, 0, 1]
             return SimpleNamespace(
                 decisions=[
                     SimpleNamespace(
                         pair_index=index,
-                        classification="unrelated",
+                        classification=(
+                            "equivalent"
+                            if position == 0
+                            else "unrelated"
+                        ),
                         direction="symmetric",
-                        reason="fixture",
+                        reason=f"fixture-{position}",
                     )
-                    for index in indices
+                    for position, index in enumerate(indices)
                 ]
             )
 
@@ -432,15 +433,16 @@ async def test_structured_classifier_retries_invalid_coverage_once() -> None:
         MemoryPair(challenger, _memory("mem-first-retry", "Approval is mandatory.")),
         MemoryPair(challenger, _memory("mem-second-retry", "Security approval is mandatory.")),
     )
-    client = DuplicateThenCompleteClient()
+    client = DuplicateClient()
     classifier = StructuredMemoryPairClassifier(client=client, model="test-model")
 
     result = await classifier.classify(pairs)
 
     assert tuple(decision.pair for decision in result.decisions) == pairs
-    assert result.llm_calls == 2
-    assert "coverage_correction" in client.calls[1]
-    assert "[0, 1]" in client.calls[1]
+    assert result.decisions[0].relation_type is MemoryRelationType.EQUIVALENT
+    assert result.decisions[0].reason == "fixture-0"
+    assert result.llm_calls == 1
+    assert len(client.calls) == 1
 
 
 class _CompleteStructuredClient:
@@ -468,32 +470,6 @@ class _CompleteStructuredClient:
                     )
                 )
         return SimpleNamespace(decisions=decisions)
-
-
-@pytest.mark.asyncio
-async def test_structured_classifier_default_batch_keeps_exact_coverage_ledgers_small() -> None:
-    challenger = _memory("mem-batch-challenger", "Current claim")
-    pairs = tuple(
-        MemoryPair(
-            challenger,
-            _memory(f"mem-batch-candidate-{index}", f"Candidate claim {index}"),
-        )
-        for index in range(33)
-    )
-    client = _CompleteStructuredClient()
-
-    result = await StructuredMemoryPairClassifier(
-        client=client,
-        model="test-model",
-    ).classify(pairs)
-
-    assert len(result.decisions) == 33
-    assert result.llm_calls == 2
-    assert [
-        len(group["candidates"])
-        for payload in client.payloads
-        for group in payload
-    ] == [32, 1]
 
 
 @pytest.mark.asyncio

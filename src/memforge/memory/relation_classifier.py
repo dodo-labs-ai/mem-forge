@@ -92,7 +92,7 @@ class MemoryPairClassifier(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class MemoryPairClassificationPolicy:
-    max_pairs_per_call: int = 32
+    max_pairs_per_call: int = 64
     max_prompt_chars: int = 120_000
     max_output_tokens: int = 32_768
     max_memory_content_chars: int = 4_000
@@ -242,7 +242,10 @@ class StructuredMemoryPairClassifier:
                     )
                     raw_decisions = tuple(response.decisions)
                     try:
-                        self._validate_coverage(raw_decisions, expected_indices=batch_indices)
+                        by_index = self._first_decisions_by_index(
+                            raw_decisions,
+                            expected_indices=batch_indices,
+                        )
                     except MemoryPairClassificationError as error:
                         if attempt == 1:
                             raise
@@ -255,7 +258,6 @@ class StructuredMemoryPairClassifier:
                         coverage_retry_prompt_chars += len(request_prompt)
                         continue
                     break
-                by_index = {int(decision.pair_index): decision for decision in raw_decisions}
                 return tuple(
                     (
                         pair_index,
@@ -339,19 +341,25 @@ class StructuredMemoryPairClassifier:
         return tuple(batches)
 
     @staticmethod
-    def _validate_coverage(
+    def _first_decisions_by_index(
         decisions: tuple[Any, ...],
         *,
         expected_indices: tuple[int, ...],
-    ) -> None:
+    ) -> dict[int, Any]:
         expected_index_set = set(expected_indices)
-        actual_indices = [int(decision.pair_index) for decision in decisions]
+        actual_indices: list[int] = []
+        first_by_index: dict[int, Any] = {}
+        for decision in decisions:
+            index = int(decision.pair_index)
+            actual_indices.append(index)
+            if index in expected_index_set and index not in first_by_index:
+                first_by_index[index] = decision
         counts = Counter(actual_indices)
         duplicate_indices = {index for index, count in counts.items() if count > 1}
         actual_index_set = set(actual_indices)
-        missing_indices = expected_index_set - actual_index_set
+        missing_indices = expected_index_set - first_by_index.keys()
         unexpected_indices = actual_index_set - expected_index_set
-        if len(decisions) != len(expected_indices) or duplicate_indices or missing_indices or unexpected_indices:
+        if missing_indices or unexpected_indices:
             raise MemoryPairClassificationError(
                 "memory relation decision coverage invalid: "
                 f"expected_count={len(expected_indices)}, "
@@ -360,3 +368,4 @@ class StructuredMemoryPairClassifier:
                 f"duplicate_count={len(duplicate_indices)}, "
                 f"unexpected_count={len(unexpected_indices)}"
             )
+        return first_by_index
