@@ -8550,26 +8550,32 @@ class Database:
         limit: int,
         lease_seconds: int,
         max_attempts: int,
+        source_id: str | None = None,
     ) -> list[RelationDiscoveryWork]:
         if not worker_id or limit < 1 or lease_seconds < 1 or max_attempts < 1:
             raise ValueError("relation discovery lease requires positive bounds and worker id")
+        if source_id is not None and not source_id:
+            raise ValueError("relation discovery source scope must be non-empty")
         now = _now_iso()
         lease_until = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
+        source_clause = " AND source_id = ?" if source_id is not None else ""
+        source_params = (source_id,) if source_id is not None else ()
         leased: list[RelationDiscoveryWork] = []
         async with self._write_lock:
             try:
                 await self.db.execute("BEGIN IMMEDIATE")
                 rows = await self.db.execute_fetchall(
-                    """SELECT * FROM relation_discovery_work
+                    f"""SELECT * FROM relation_discovery_work
                        WHERE attempts < ?
                          AND (
                            status = 'pending'
                            OR (status = 'failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
                            OR (status = 'running' AND lease_until < ?)
                          )
+                         {source_clause}
                        ORDER BY created_at, id
                        LIMIT ?""",
-                    (max_attempts, now, now, limit),
+                    (max_attempts, now, now, *source_params, limit),
                 )
                 for row in rows:
                     lease_token = uuid.uuid4().hex
