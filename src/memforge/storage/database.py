@@ -7226,7 +7226,7 @@ class Database:
         *,
         source_id: str,
     ) -> Mapping[str, tuple[str, ...]]:
-        """Return every Observation in actively supported Evidence bundles."""
+        """Return Observations named by active support-granting references."""
 
         ids = tuple(
             dict.fromkeys(
@@ -7243,22 +7243,15 @@ class Database:
             placeholders = ", ".join("?" for _ in chunk)
             rows = await self.db.execute_fetchall(
                 f"""SELECT DISTINCT msa.memory_id,
-                           bundle_er.observation_id
+                           supported_er.observation_id
                     FROM memory_support_assertions msa
                     JOIN evidence_references supported_er
                       ON supported_er.id = msa.evidence_reference_id
-                    JOIN evidence_units eu
-                      ON eu.id = supported_er.evidence_unit_id
-                     AND eu.source_id = msa.source_id
-                     AND eu.access_context_hash =
-                         msa.access_context_hash
-                    JOIN evidence_references bundle_er
-                      ON bundle_er.evidence_unit_id = eu.id
                     WHERE msa.memory_id IN ({placeholders})
                       AND msa.active = 1
                       AND msa.source_id = ?
                     ORDER BY msa.memory_id,
-                             bundle_er.observation_id""",
+                             supported_er.observation_id""",
                 (*chunk, source_id),
             )
             for row in rows:
@@ -8557,26 +8550,32 @@ class Database:
         limit: int,
         lease_seconds: int,
         max_attempts: int,
+        source_id: str | None = None,
     ) -> list[RelationDiscoveryWork]:
         if not worker_id or limit < 1 or lease_seconds < 1 or max_attempts < 1:
             raise ValueError("relation discovery lease requires positive bounds and worker id")
+        if source_id is not None and not source_id:
+            raise ValueError("relation discovery source scope must be non-empty")
         now = _now_iso()
         lease_until = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
+        source_clause = " AND source_id = ?" if source_id is not None else ""
+        source_params = (source_id,) if source_id is not None else ()
         leased: list[RelationDiscoveryWork] = []
         async with self._write_lock:
             try:
                 await self.db.execute("BEGIN IMMEDIATE")
                 rows = await self.db.execute_fetchall(
-                    """SELECT * FROM relation_discovery_work
+                    f"""SELECT * FROM relation_discovery_work
                        WHERE attempts < ?
                          AND (
                            status = 'pending'
                            OR (status = 'failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
                            OR (status = 'running' AND lease_until < ?)
                          )
+                         {source_clause}
                        ORDER BY created_at, id
                        LIMIT ?""",
-                    (max_attempts, now, now, limit),
+                    (max_attempts, now, now, *source_params, limit),
                 )
                 for row in rows:
                     lease_token = uuid.uuid4().hex
@@ -8702,7 +8701,7 @@ class Database:
                     """UPDATE relation_discovery_work
                           SET status = 'completed', lease_owner = NULL,
                               lease_token = NULL, lease_until = NULL,
-                              next_attempt_at = NULL,
+                              next_attempt_at = NULL, error = NULL,
                               updated_at = ?, completed_at = ?
                         WHERE id = ? AND status = 'running'
                           AND lease_owner = ? AND lease_token = ?""",

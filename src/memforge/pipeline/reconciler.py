@@ -90,12 +90,12 @@ For each new extraction listed for this phase, decide ONE action:
   or the newly extracted candidate is worded differently.
 
 When the ledger contract requests an incumbent audit, audit EVERY existing memory
-slot in the batch against the updated document and return exactly one explicit
-decision in its corresponding response slot:
+in the batch against the updated document and return exactly one explicit
+decision at the same array position:
 - NOOP when it remains supported or is disjoint from the changed evidence.
 - DELETE when this source unit no longer supports it and there is no replacement.
-Never omit an active slot. Missing or populated unused slots invalidate the
-whole batch.
+Never omit a decision. A response count that differs from the request count
+invalidates the whole batch.
 
 When update_mode is diff_guided, use changed_hunks as the authority for what
 changed. Use the full updated document only to validate support and understand
@@ -121,9 +121,9 @@ the updated document excerpt may be incomplete.
 </existing_memories>
 
 Rules:
-1. Fill exactly the named response slots required by the ledger contract.
+1. Return decisions in the exact request order required by the ledger contract.
 2. Never echo a candidate index or datastore memory ID. Identity is bound by the
-   named response slot; matching an incumbent uses only its bounded incumbent_slot.
+   decision's array position; matching an incumbent uses only its bounded incumbent_slot.
 3. For UPDATE, SUPERSEDE, and NOOP candidate relations, specify the affected
    incumbent_slot.
 4. For UPDATE, provide the merged current text as "updated_content".
@@ -140,7 +140,7 @@ Rules:
    equivalent source rewrite. That is NOOP. UPDATE requires at least one durable
    factual detail in updated_content that the incumbent did not already carry.
 
-Return ONLY the fixed-slot JSON object required by the response schema."""
+Return ONLY the ordered decisions JSON object required by the response schema."""
 
 
 RECONCILIATION_INCUMBENT_BATCH_SIZE = 30
@@ -149,8 +149,7 @@ RECONCILIATION_BATCH_VALIDATION_ATTEMPTS = 2
 
 _CANDIDATE_RELATION_CONTRACT = """This is one cell of a complete candidate-by-incumbent
 relation matrix:
-- Return exactly one judgment in every active named candidate response slot.
-- Return null in every unused candidate response slot.
+- Return exactly one judgment for every listed candidate, in list order.
 - Compare each candidate only with the listed incumbents.
 - Use ADD when the candidate does not match an incumbent in this cell; the deterministic
   reducer will authorize a global ADD only after every incumbent cell is complete.
@@ -159,8 +158,7 @@ relation matrix:
 
 _INCUMBENT_AUDIT_CONTRACT = """This is the independent incumbent-support audit:
 - There are no new extractions in this phase.
-- Return exactly one NOOP or DELETE judgment in every active named incumbent response slot.
-- Return null in every unused incumbent response slot.
+- Return exactly one NOOP or DELETE judgment for every listed incumbent, in list order.
 - Decide only whether the updated Source Unit still supports the incumbent.
 - Do not emit ADD, UPDATE, or SUPERSEDE."""
 
@@ -221,8 +219,8 @@ async def reconcile_memories(
             for offset in range(0, len(existing_memories), RECONCILIATION_INCUMBENT_BATCH_SIZE)
         ]
         # Every input size uses the same two phase-specific protocols. Candidate
-        # and incumbent identity is bound by fixed response slots rather than
-        # echoed by the model in an open list.
+        # and incumbent identity is bound by ordered response position rather
+        # than echoed by the model.
         for incumbent_batch in incumbent_batches:
             for candidate_batch in candidate_batches:
                 batch_decisions, calls, elapsed = await _run_reconciliation_batch(
@@ -314,7 +312,7 @@ def _render_reconciliation_prompt(
     new_json = json.dumps(
         [
             {
-                "slot": f"slot_{slot_index:02d}",
+                "request_position": slot_index,
                 "content": raw.content,
                 "memory_type": raw.memory_type,
                 "confidence": raw.confidence,
@@ -327,7 +325,7 @@ def _render_reconciliation_prompt(
     existing_json = json.dumps(
         [
             {
-                "response_slot": f"slot_{slot_index:02d}",
+                "request_position": slot_index,
                 "incumbent_slot": slot_index,
                 "content": memory.content,
                 "memory_type": memory.memory_type,
@@ -350,62 +348,62 @@ def _render_reconciliation_prompt(
     )
 
 
-def _bind_candidate_relation_slots(
-    slots,
+def _bind_candidate_relation_decisions(
+    judgments,
     *,
     expected_indices: tuple[int, ...],
     incumbents: list[Memory],
 ) -> list[dict]:
     """Bind model judgments to candidate and incumbent identities owned by the request."""
 
-    if len(slots) != RECONCILIATION_CANDIDATE_BATCH_SIZE:
-        raise ValueError("candidate relation response does not contain the fixed protocol slots")
+    if len(judgments) != len(expected_indices):
+        raise ValueError(
+            "candidate relation response count "
+            f"{len(judgments)} does not match expected count {len(expected_indices)}"
+        )
     decisions: list[dict] = []
-    for slot_index, judgment in enumerate(slots):
-        if slot_index >= len(expected_indices):
-            if judgment is not None:
-                raise ValueError(f"unused candidate relation slot {slot_index} must be null")
-            continue
-        if judgment is None:
-            raise ValueError(f"candidate relation slot {slot_index} must not be null")
+    for position, judgment in enumerate(judgments):
         data = judgment.model_dump()
         incumbent_slot = data.pop("incumbent_slot")
         action = str(data.get("action", "")).upper()
         if action == "ADD":
             if incumbent_slot is not None:
-                raise ValueError(f"ADD candidate relation slot {slot_index} must not select an incumbent")
+                raise ValueError(
+                    f"ADD candidate relation position {position} must not select an incumbent"
+                )
         else:
             if not isinstance(incumbent_slot, int) or incumbent_slot >= len(incumbents):
-                raise ValueError(f"candidate relation slot {slot_index} selected an inactive incumbent slot")
+                raise ValueError(
+                    f"candidate relation position {position} selected an inactive incumbent slot"
+                )
             data["memory_id"] = incumbents[incumbent_slot].id
         if action == "UPDATE" and not data.get("updated_content"):
-            raise ValueError(f"UPDATE candidate relation slot {slot_index} requires updated_content")
-        data["index"] = expected_indices[slot_index]
+            raise ValueError(
+                f"UPDATE candidate relation position {position} requires updated_content"
+            )
+        data["index"] = expected_indices[position]
         decisions.append(data)
     return decisions
 
 
-def _bind_incumbent_audit_slots(
-    slots,
+def _bind_incumbent_audit_decisions(
+    judgments,
     *,
     incumbents: list[Memory],
 ) -> list[dict]:
     """Bind incumbent support judgments to datastore identities by request order."""
 
-    if len(slots) != RECONCILIATION_INCUMBENT_BATCH_SIZE:
-        raise ValueError("incumbent audit response does not contain the fixed protocol slots")
+    if len(judgments) != len(incumbents):
+        raise ValueError(
+            "incumbent audit response count "
+            f"{len(judgments)} does not match expected count {len(incumbents)}"
+        )
     decisions: list[dict] = []
-    for slot_index, judgment in enumerate(slots):
-        if slot_index >= len(incumbents):
-            if judgment is not None:
-                raise ValueError(f"unused incumbent audit slot {slot_index} must be null")
-            continue
-        if judgment is None:
-            raise ValueError(f"incumbent audit slot {slot_index} must not be null")
+    for position, judgment in enumerate(judgments):
         decisions.append(
             {
                 **judgment.model_dump(),
-                "memory_id": incumbents[slot_index].id,
+                "memory_id": incumbents[position].id,
             }
         )
     return decisions
@@ -439,14 +437,14 @@ async def _run_reconciliation_batch(
             elapsed_seconds += perf_counter() - llm_started
         try:
             if decision_phase == "candidate_relation":
-                batch_decisions = _bind_candidate_relation_slots(
-                    response.ordered_slots(),
+                batch_decisions = _bind_candidate_relation_decisions(
+                    response.decisions,
                     expected_indices=expected_indices,
                     incumbents=incumbents,
                 )
             elif decision_phase == "incumbent_audit":
-                batch_decisions = _bind_incumbent_audit_slots(
-                    response.ordered_slots(),
+                batch_decisions = _bind_incumbent_audit_decisions(
+                    response.decisions,
                     incumbents=incumbents,
                 )
             else:

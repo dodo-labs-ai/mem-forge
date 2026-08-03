@@ -13,6 +13,7 @@ from memforge.source_artifacts import (
     SourceArtifactContractError,
     SourceArtifactDownload,
     SourceArtifactSummary,
+    source_artifact_inference_eligibility,
     source_artifact_revision_from_metadata,
     materialize_source_artifacts,
 )
@@ -62,6 +63,122 @@ def _opener(payloads: dict[str, bytes], *, transport_length_delta: int = 0):
     return open_artifact
 
 
+def _artifact_metadata(
+    *,
+    size_bytes: object = 4,
+    **inference_fields: object,
+) -> dict[str, object]:
+    return {
+        "source_artifact": {
+            "artifact_id": "artifact-1",
+            "parent_observation_id": "obs-parent",
+            "provider_revision": "1",
+            "filename": "diagram.png",
+            "media_type": "image/png",
+            "size_bytes": size_bytes,
+            "sha256": "a" * 64,
+            "uri": "artifact://diagram.png",
+            **inference_fields,
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("size_bytes", "inference_fields", "expected"),
+    (
+        (4, {}, (True, None)),
+        (source_artifacts.MAX_SOURCE_ARTIFACT_INFERENCE_BYTES, {}, (True, None)),
+        (
+            source_artifacts.MAX_SOURCE_ARTIFACT_INFERENCE_BYTES + 1,
+            {},
+            (False, "inference_byte_limit"),
+        ),
+        (4, {"inference_eligible": True}, (True, None)),
+        (
+            4,
+            {
+                "inference_eligible": False,
+                "inference_ineligible_reason": "invalid_image_structure",
+            },
+            (False, "invalid_image_structure"),
+        ),
+        (
+            4,
+            {
+                "inference_eligible": False,
+                "inference_ineligible_reason": "inference_byte_limit",
+            },
+            None,
+        ),
+        (
+            source_artifacts.MAX_SOURCE_ARTIFACT_INFERENCE_BYTES + 1,
+            {
+                "inference_eligible": False,
+                "inference_ineligible_reason": "invalid_image_structure",
+            },
+            None,
+        ),
+        (4, {"inference_eligible": False}, None),
+        (
+            source_artifacts.MAX_SOURCE_ARTIFACT_INFERENCE_BYTES + 1,
+            {"inference_eligible": False},
+            (False, "inference_byte_limit"),
+        ),
+        (
+            4,
+            {
+                "inference_eligible": True,
+                "inference_ineligible_reason": "invalid_image_structure",
+            },
+            None,
+        ),
+        (4, {"inference_eligible": None}, None),
+        (4, {"inference_ineligible_reason": None}, None),
+        (
+            4,
+            {"inference_ineligible_reason": "invalid_image_structure"},
+            None,
+        ),
+        (
+            4,
+            {
+                "inference_eligible": False,
+                "inference_ineligible_reason": "unknown_reason",
+            },
+            None,
+        ),
+        (-1, {}, None),
+        ("not-a-size", {}, None),
+    ),
+)
+def test_artifact_inference_metadata_has_one_legacy_current_decision_table(
+    size_bytes: object,
+    inference_fields: dict[str, object],
+    expected: tuple[bool, str | None] | None,
+) -> None:
+    metadata = _artifact_metadata(
+        size_bytes=size_bytes,
+        **inference_fields,
+    )
+
+    revision = source_artifact_revision_from_metadata(
+        observation_id="obs-image",
+        observation_revision_id="obsrev-image",
+        source_id="src-1",
+        source_unit_id="unit-1",
+        metadata=metadata,
+    )
+
+    assert source_artifact_inference_eligibility(metadata) == (
+        expected[0] if expected is not None else None
+    )
+    assert (
+        (revision.inference_eligible, revision.inference_ineligible_reason)
+        if revision is not None
+        else None
+    ) == expected
+
+
 def test_artifact_revision_summary_is_revision_pinned_and_legacy_optional() -> None:
     metadata = {
         "source_artifact": {
@@ -109,7 +226,7 @@ def test_artifact_revision_summary_is_revision_pinned_and_legacy_optional() -> N
     )
 
 
-def test_artifact_revision_requires_materialized_inference_eligibility() -> None:
+def test_artifact_revision_parses_legacy_inference_metadata_conservatively() -> None:
     revision = source_artifact_revision_from_metadata(
         observation_id="obs-image",
         observation_revision_id="obsrev-image",
@@ -129,7 +246,9 @@ def test_artifact_revision_requires_materialized_inference_eligibility() -> None
         },
     )
 
-    assert revision is None
+    assert revision is not None
+    assert revision.inference_eligible is True
+    assert revision.inference_ineligible_reason is None
 
     unexplained_ineligible = source_artifact_revision_from_metadata(
         observation_id="obs-image",
@@ -152,6 +271,30 @@ def test_artifact_revision_requires_materialized_inference_eligibility() -> None
     )
 
     assert unexplained_ineligible is None
+
+    byte_limited = source_artifact_revision_from_metadata(
+        observation_id="obs-image",
+        observation_revision_id="obsrev-image",
+        source_id="src-1",
+        source_unit_id="unit-1",
+        metadata={
+            "source_artifact": {
+                "artifact_id": "artifact-1",
+                "parent_observation_id": "obs-parent",
+                "provider_revision": "1",
+                "filename": "diagram.png",
+                "media_type": "image/png",
+                "size_bytes": source_artifacts.MAX_SOURCE_ARTIFACT_INFERENCE_BYTES + 1,
+                "sha256": "a" * 64,
+                "uri": "artifact://diagram.png",
+                "inference_eligible": False,
+            }
+        },
+    )
+
+    assert byte_limited is not None
+    assert byte_limited.inference_eligible is False
+    assert byte_limited.inference_ineligible_reason == "inference_byte_limit"
 
 
 @pytest.mark.asyncio

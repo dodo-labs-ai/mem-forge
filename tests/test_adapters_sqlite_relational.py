@@ -97,6 +97,62 @@ async def test_sqlite_relation_work_round_trips_preclassified_identity_decisions
     assert work.request.preclassified_decisions == request.preclassified_decisions
 
 
+@pytest.mark.asyncio
+async def test_sqlite_relation_work_lease_can_be_scoped_to_source(db: Database) -> None:
+    challenger = _memory("mem-source-scoped-lease")
+    await db.insert_memory(challenger)
+    for index, source_id in enumerate(("src-older", "src-target")):
+        await db.upsert_source(
+            id=source_id,
+            type="confluence",
+            name=source_id,
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id=LOCAL_DEV_USER_ID,
+        )
+        await db.db.execute(
+            """INSERT INTO lifecycle_plans (
+                   id, reconciliation_scope_id, source_id, source_unit_id,
+                   target_unit_revision_id, status, payload_json, payload_hash, created_at
+               ) VALUES (?, ?, ?, ?, ?, 'applied', '{}', ?, ?)""",
+            (
+                f"plan-source-{index}",
+                f"scope-source-{index}",
+                source_id,
+                f"unit-source-{index}",
+                f"unitrev-source-{index}",
+                f"plan-source-hash-{index}",
+                f"2026-07-22T0{index}:00:00+00:00",
+            ),
+        )
+        await db._enqueue_relation_discovery_work_unlocked(  # noqa: SLF001
+            f"plan-source-{index}",
+            RelationDiscoveryRequest(
+                id=f"relation-work-source-{index}",
+                memory_id=challenger.id,
+                expected_content_hash=challenger.content_hash,
+                source_id=source_id,
+                source_unit_id=f"unit-source-{index}",
+                source_unit_revision_id=f"unitrev-source-{index}",
+                doc_id=f"doc-source-{index}",
+                actor_user_id=None,
+            ),
+            now=f"2026-07-22T0{index}:00:00+00:00",
+        )
+    await db.db.commit()
+
+    [leased] = await db.lease_relation_discovery_work(
+        worker_id="source-scoped-worker",
+        limit=1,
+        lease_seconds=60,
+        max_attempts=6,
+        source_id="src-target",
+    )
+
+    assert leased.request.id == "relation-work-source-1"
+    assert leased.request.source_id == "src-target"
+
+
 def _scope(statuses=("active",)) -> AccessScope:
     return AccessScope(
         user_id=LOCAL_DEV_USER_ID,
@@ -199,7 +255,7 @@ async def test_sqlite_active_support_evidence_chunks_and_preserves_empty_memory_
 
 
 @pytest.mark.asyncio
-async def test_sqlite_active_support_bundle_observations_are_bounded(
+async def test_sqlite_active_support_observations_are_bounded(
     db: Database,
     monkeypatch,
 ) -> None:
@@ -210,7 +266,7 @@ async def test_sqlite_active_support_bundle_observations_are_bounded(
         nonlocal calls
         if (
             "FROM memory_support_assertions msa" in sql
-            and "JOIN evidence_references bundle_er" in sql
+            and "JOIN evidence_references supported_er" in sql
         ):
             calls += 1
         return await original(sql, parameters)

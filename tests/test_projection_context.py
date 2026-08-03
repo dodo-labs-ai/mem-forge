@@ -291,6 +291,40 @@ def test_multimodal_batches_bound_bytes_and_exclude_ineligible_originals() -> No
     )
 
 
+def test_multimodal_batches_admit_legacy_artifact_without_eligibility_metadata() -> None:
+    projection = _confluence_projection_with_images(1, artifact_size=7)
+    binary_id = next(
+        observation.id
+        for observation in projection.observations
+        if observation.observation_type == "binary_artifact"
+    )
+    revisions = []
+    for revision in projection.observation_revisions:
+        if revision.observation_id != binary_id:
+            revisions.append(revision)
+            continue
+        metadata = dict(revision.metadata)
+        artifact = dict(metadata["source_artifact"])
+        artifact.pop("inference_eligible")
+        artifact.pop("inference_ineligible_reason")
+        metadata["source_artifact"] = artifact
+        revisions.append(replace(revision, metadata=metadata))
+    legacy_projection = replace(
+        projection,
+        observation_revisions=tuple(revisions),
+    )
+
+    batches = plan_projection_extraction_batches(
+        legacy_projection,
+        max_primary_binary_bytes=10,
+    )
+
+    assert any(
+        binary_id in batch.primary_observation_ids
+        for batch in batches
+    )
+
+
 def test_pdf_artifact_does_not_claim_multimodal_image_input_bytes() -> None:
     projection = _confluence_projection_with_images(
         1,

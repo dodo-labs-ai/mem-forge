@@ -127,6 +127,7 @@ class _Store:
         self.completed = None
         self.reviews = ()
         self.disabled_lookup_user_id = None
+        self.lease_kwargs = None
         self.work = RelationDiscoveryWork(
             request=RelationDiscoveryRequest(
                 id="work-1",
@@ -145,7 +146,8 @@ class _Store:
             lease_token="token-1",
         )
 
-    async def lease_relation_discovery_work(self, **_kwargs):
+    async def lease_relation_discovery_work(self, **kwargs):
+        self.lease_kwargs = kwargs
         if self.leased:
             return []
         self.leased = True
@@ -274,6 +276,24 @@ async def test_relation_discovery_finishes_one_selected_ledger_before_slice_budg
         "candidate-1",
         "candidate-2",
     }
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_can_scope_leases_to_one_source() -> None:
+    challenger = _memory("challenger", "Current claim")
+    store = _Store(challenger, ())
+
+    await RelationDiscovery(
+        store=store,  # type: ignore[arg-type]
+        candidate_retriever=_Candidates(()),  # type: ignore[arg-type]
+        pair_classifier=_Classifier(),
+    ).process_slice(
+        worker_id="controlled-recovery",
+        source_id="src-challenger",
+    )
+
+    assert store.lease_kwargs is not None
+    assert store.lease_kwargs["source_id"] == "src-challenger"
 
 
 @pytest.mark.asyncio

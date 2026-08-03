@@ -142,6 +142,22 @@ Return exactly one decision for every pair_index and no other pair_index.
 """
 
 
+def _coverage_retry_prompt(
+    prompt: str,
+    *,
+    expected_indices: tuple[int, ...],
+    failure: str,
+) -> str:
+    return (
+        f"{prompt}\n\n"
+        "<coverage_correction>\n"
+        f"The previous response was invalid: {failure}\n"
+        "Regenerate the complete decisions array. Return each of these pair_index values "
+        f"exactly once and no others: {json.dumps(expected_indices)}.\n"
+        "</coverage_correction>"
+    )
+
+
 def _prompt_memory(memory: Memory, *, max_content_chars: int) -> dict[str, str]:
     content = memory.content
     if len(content) > max_content_chars:
@@ -207,21 +223,41 @@ class StructuredMemoryPairClassifier:
         attempted_pairs = sum(len(indexed_pairs) for indexed_pairs, _ in batches)
         llm_calls = len(batches)
         prompt_chars = sum(len(prompt) for _, prompt in batches)
+        coverage_retry_calls = 0
+        coverage_retry_prompt_chars = 0
         try:
 
             async def classify_batch(
                 batch: tuple[tuple[tuple[int, MemoryPair], ...], str],
             ) -> tuple[tuple[int, MemoryPairDecision], ...]:
+                nonlocal coverage_retry_calls, coverage_retry_prompt_chars
                 indexed_pairs, prompt = batch
-                response = await self._client.classify_memory_relations(
-                    prompt,
-                    max_tokens=self._policy.max_output_tokens,
-                    model=self._model,
-                )
-                raw_decisions = tuple(response.decisions)
                 batch_indices = tuple(index for index, _ in indexed_pairs)
-                self._validate_coverage(raw_decisions, expected_indices=batch_indices)
-                by_index = {int(decision.pair_index): decision for decision in raw_decisions}
+                request_prompt = prompt
+                for attempt in range(2):
+                    response = await self._client.classify_memory_relations(
+                        request_prompt,
+                        max_tokens=self._policy.max_output_tokens,
+                        model=self._model,
+                    )
+                    raw_decisions = tuple(response.decisions)
+                    try:
+                        by_index = self._first_decisions_by_index(
+                            raw_decisions,
+                            expected_indices=batch_indices,
+                        )
+                    except MemoryPairClassificationError as error:
+                        if attempt == 1:
+                            raise
+                        request_prompt = _coverage_retry_prompt(
+                            prompt,
+                            expected_indices=batch_indices,
+                            failure=str(error),
+                        )
+                        coverage_retry_calls += 1
+                        coverage_retry_prompt_chars += len(request_prompt)
+                        continue
+                    break
                 return tuple(
                     (
                         pair_index,
@@ -248,8 +284,8 @@ class StructuredMemoryPairClassifier:
                     decisions_by_index[pair_index] = decision
             return MemoryPairClassification(
                 decisions=tuple(decisions_by_index[index] for index in range(len(pairs))),
-                llm_calls=llm_calls,
-                prompt_chars=prompt_chars,
+                llm_calls=llm_calls + coverage_retry_calls,
+                prompt_chars=prompt_chars + coverage_retry_prompt_chars,
             )
         except MemoryPairClassificationError as error:
             if not (attempted_pairs or llm_calls or prompt_chars):
@@ -257,15 +293,15 @@ class StructuredMemoryPairClassifier:
             raise MemoryPairClassificationError(
                 str(error),
                 pair_count=attempted_pairs,
-                llm_calls=llm_calls,
-                prompt_chars=prompt_chars,
+                llm_calls=llm_calls + coverage_retry_calls,
+                prompt_chars=prompt_chars + coverage_retry_prompt_chars,
             ) from error
         except Exception as error:
             raise MemoryPairClassificationError(
                 f"memory relation classification failed: {error}",
                 pair_count=attempted_pairs,
-                llm_calls=llm_calls,
-                prompt_chars=prompt_chars,
+                llm_calls=llm_calls + coverage_retry_calls,
+                prompt_chars=prompt_chars + coverage_retry_prompt_chars,
             ) from error
 
     def plan(
@@ -305,19 +341,25 @@ class StructuredMemoryPairClassifier:
         return tuple(batches)
 
     @staticmethod
-    def _validate_coverage(
+    def _first_decisions_by_index(
         decisions: tuple[Any, ...],
         *,
         expected_indices: tuple[int, ...],
-    ) -> None:
+    ) -> dict[int, Any]:
         expected_index_set = set(expected_indices)
-        actual_indices = [int(decision.pair_index) for decision in decisions]
+        actual_indices: list[int] = []
+        first_by_index: dict[int, Any] = {}
+        for decision in decisions:
+            index = int(decision.pair_index)
+            actual_indices.append(index)
+            if index in expected_index_set and index not in first_by_index:
+                first_by_index[index] = decision
         counts = Counter(actual_indices)
         duplicate_indices = {index for index, count in counts.items() if count > 1}
         actual_index_set = set(actual_indices)
-        missing_indices = expected_index_set - actual_index_set
+        missing_indices = expected_index_set - first_by_index.keys()
         unexpected_indices = actual_index_set - expected_index_set
-        if len(decisions) != len(expected_indices) or duplicate_indices or missing_indices or unexpected_indices:
+        if missing_indices or unexpected_indices:
             raise MemoryPairClassificationError(
                 "memory relation decision coverage invalid: "
                 f"expected_count={len(expected_indices)}, "
@@ -326,3 +368,4 @@ class StructuredMemoryPairClassifier:
                 f"duplicate_count={len(duplicate_indices)}, "
                 f"unexpected_count={len(unexpected_indices)}"
             )
+        return first_by_index

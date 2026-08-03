@@ -59,6 +59,83 @@ def normalize_source_artifact_media_type(value: object) -> str:
     return str(value or "").split(";", 1)[0].strip().lower()
 
 
+def _source_artifact_inference_fields(
+    raw: Mapping[str, object],
+    *,
+    size_bytes: int,
+) -> tuple[bool, str | None] | None:
+    """Normalize supported inference metadata shapes at one compatibility seam."""
+
+    if "inference_eligible" not in raw:
+        # The fieldless compatibility shape derives eligibility from size. A
+        # reason without its eligibility decision is ambiguous and rejected.
+        if "inference_ineligible_reason" in raw:
+            return None
+        eligible = size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
+        return (
+            eligible,
+            None if eligible else "inference_byte_limit",
+        )
+
+    inference_eligible = raw["inference_eligible"]
+    raw_ineligible_reason = raw.get("inference_ineligible_reason")
+    inference_ineligible_reason = (
+        str(raw_ineligible_reason)
+        if raw_ineligible_reason is not None
+        else None
+    )
+    if inference_ineligible_reason not in (
+        None,
+        *SOURCE_ARTIFACT_INELIGIBILITY_REASONS,
+    ):
+        return None
+
+    if not isinstance(inference_eligible, bool):
+        return None
+    if inference_eligible:
+        return (
+            (True, None)
+            if inference_ineligible_reason is None
+            else None
+        )
+    if inference_ineligible_reason is not None:
+        size_exceeds_inference_limit = (
+            size_bytes > MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
+        )
+        reason_is_inference_byte_limit = (
+            inference_ineligible_reason == "inference_byte_limit"
+        )
+        if size_exceeds_inference_limit != reason_is_inference_byte_limit:
+            return None
+        return False, inference_ineligible_reason
+    # The boolean-only compatibility shape admits False only when the recorded
+    # size independently proves the byte-limit reason.
+    if size_bytes > MAX_SOURCE_ARTIFACT_INFERENCE_BYTES:
+        return False, "inference_byte_limit"
+    return None
+
+
+def source_artifact_inference_eligibility(
+    metadata: Mapping[str, object],
+) -> bool | None:
+    """Return parsed Artifact eligibility, or ``None`` for invalid metadata."""
+
+    raw = metadata.get("source_artifact")
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        size_bytes = int(raw["size_bytes"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if size_bytes < 0:
+        return None
+    fields = _source_artifact_inference_fields(
+        raw,
+        size_bytes=size_bytes,
+    )
+    return fields[0] if fields is not None else None
+
+
 def parse_source_artifact_content_length(value: object) -> int | None:
     """Parse an optional non-negative HTTP Content-Length."""
 
@@ -291,24 +368,13 @@ def source_artifact_revision_from_metadata(
         return None
     try:
         size_bytes = int(raw["size_bytes"])
-        inference_eligible = raw.get("inference_eligible")
-        if not isinstance(inference_eligible, bool):
-            return None
-        raw_ineligible_reason = raw.get("inference_ineligible_reason")
-        inference_ineligible_reason = (
-            str(raw_ineligible_reason)
-            if raw_ineligible_reason is not None
-            else None
+        inference_fields = _source_artifact_inference_fields(
+            raw,
+            size_bytes=size_bytes,
         )
-        if inference_ineligible_reason not in (
-            None,
-            *SOURCE_ARTIFACT_INELIGIBILITY_REASONS,
-        ):
+        if inference_fields is None:
             return None
-        if inference_eligible and inference_ineligible_reason is not None:
-            return None
-        if not inference_eligible and inference_ineligible_reason is None:
-            return None
+        inference_eligible, inference_ineligible_reason = inference_fields
         summary_value = raw.get("summary")
         summary = None
         if summary_value is not None:

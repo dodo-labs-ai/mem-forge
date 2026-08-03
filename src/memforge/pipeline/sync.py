@@ -2399,6 +2399,10 @@ class GeneSyncOrchestrator:
             entity_resolution_ambiguous_mentions=memory_stats.get("entity_resolution_ambiguous_mentions", 0),
             entity_resolution_embedding_batches=memory_stats.get("entity_resolution_embedding_batches", 0),
             entity_resolution_llm_calls=memory_stats.get("entity_resolution_llm_calls", 0),
+            entity_resolution_validation_retries=memory_stats.get(
+                "entity_resolution_validation_retries",
+                0,
+            ),
             entity_resolution_candidate_count=memory_stats.get("entity_resolution_candidate_count", 0),
             entity_resolution_new_entities=memory_stats.get("entity_resolution_new_entities", 0),
             entity_resolution_elapsed_ms=memory_stats.get("entity_resolution_elapsed_ms", 0),
