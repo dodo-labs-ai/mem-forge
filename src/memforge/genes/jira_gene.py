@@ -780,11 +780,20 @@ class JiraGene(Gene):
                 )
             request_path = content_url
 
-        expected_prefix = f"/secure/attachment/{attachment_id}/"
-        prefix, marker, _display_name = request_path.partition(expected_prefix)
+        secure_prefix = "/secure/attachment/"
+        prefix, marker, secure_path = request_path.partition(secure_prefix)
         if not marker:
             return request_path
-        return f"{prefix}{marker}attachment-{attachment_id}"
+        route_attachment_id, separator, display_name = secure_path.partition("/")
+        if route_attachment_id != attachment_id:
+            raise SourceArtifactContractError(
+                "Jira attachment URL identity does not match its descriptor"
+            )
+        if not separator or not display_name or "/" in display_name:
+            raise SourceArtifactContractError(
+                "Jira secure attachment URL is incomplete"
+            )
+        return f"{prefix}{marker}{attachment_id}/attachment-{attachment_id}"
 
     @staticmethod
     def _jira_attachment_parent(
