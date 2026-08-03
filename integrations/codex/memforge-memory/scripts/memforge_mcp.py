@@ -65,12 +65,13 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.37"
+SERVER_VERSION = "0.1.38"
 SERVER_INSTRUCTIONS = (
-    "Repository context is optional. For search and create_memory, when the coding host exposes "
-    "an exact current working directory, pass it as repository_context.working_directory. Never "
-    "guess or use a plugin/install directory. Omit it when unavailable; the operation must "
-    "continue. MemForge resolves the Git remote locally and never sends the local path to the service."
+    "Repository context is optional. When the coding host exposes an exact current working "
+    "directory, pass it as repository_context.working_directory on every MemForge tool call. "
+    "Never guess or use a plugin/install directory. Omit it when unavailable; the operation "
+    "must continue. MemForge resolves workspace routing and the Git remote locally and never "
+    "sends the local path to the service."
 )
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
@@ -81,7 +82,6 @@ CURRENT_REPO_ONLY_DISABLED_ERROR = (
 SEARCH_ALLOWED_KEYS = frozenset(
     {
         "query",
-        "repository_context",
         "source_filter",
         "time_range",
         "top_k",
@@ -119,8 +119,8 @@ _DEFERRED_TOOL_CALLS: list[tuple[Any, str, dict[str, Any]]] = []
 REPOSITORY_CONTEXT_SCHEMA = {
     "type": "object",
     "description": (
-        "Optional agent-host context used locally to derive repository attribution. "
-        "The local path is never forwarded to MemForge."
+        "Optional agent-host context used locally to select a repository workspace and derive "
+        "repository attribution. The local path is never forwarded to MemForge."
     ),
     "properties": {
         "working_directory": {
@@ -578,6 +578,9 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
+for _tool in TOOLS:
+    _tool["inputSchema"]["properties"]["repository_context"] = REPOSITORY_CONTEXT_SCHEMA
+
 
 class NoRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
@@ -599,6 +602,14 @@ class ResourceTarget:
         self.relative_url = relative_url
         self.request_url = request_url
         self.identity_key = identity_key
+
+
+class ToolCallContext:
+    __slots__ = ("target", "repo_identifier")
+
+    def __init__(self, target: Any, repo_identifier: str | None) -> None:
+        self.target = target
+        self.repo_identifier = repo_identifier
 
 
 def main() -> int:
@@ -646,7 +657,9 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | list[dict[s
             params = message.get("params") if isinstance(message.get("params"), dict) else {}
             name = str(params.get("name") or "")
             arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-            if _PENDING_ROOTS_REQUEST_ID is not None:
+            if _PENDING_ROOTS_REQUEST_ID is not None and not _has_explicit_repository_context(
+                arguments
+            ):
                 if len(_DEFERRED_TOOL_CALLS) >= MAX_DEFERRED_TOOL_CALLS:
                     return _rpc_error(
                         request_id,
@@ -674,31 +687,45 @@ def _tool_call_response(request_id: Any, name: str, arguments: dict[str, Any]) -
 
 
 def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        call_context = _tool_call_context(args.get("repository_context"))
+    except ValueError as exc:
+        return {"error": str(exc)}
+    args = {key: value for key, value in args.items() if key != "repository_context"}
     if name == "search":
         try:
-            body = _search_args_with_context(args)
+            body = _search_args_with_context(args, repo_identifier=call_context.repo_identifier)
         except ValueError as exc:
             return {"error": str(exc)}
-        return _compact_search_response(_http_json("POST", "/memories/search", body))
+        return _compact_search_response(
+            _http_json("POST", "/memories/search", body, target=call_context.target)
+        )
     if name == "list_recent_memories":
         try:
             body = _recent_memory_args(args)
         except ValueError as exc:
             return {"error": str(exc)}
-        return _compact_recent_memories_response(_http_json("POST", "/memories/recent", body))
+        return _compact_recent_memories_response(
+            _http_json("POST", "/memories/recent", body, target=call_context.target)
+        )
     if name == "list_sources":
         if args:
             return {"error": "list_sources does not accept parameters"}
-        return _http_json("GET", "/sources/searchable", None)
+        return _http_json("GET", "/sources/searchable", None, target=call_context.target)
     if name == "get_memory":
         memory_id = str(args.get("memory_id") or "").strip()
         if not memory_id:
             return {"error": "memory_id is required"}
         return _compact_memory_response(
-            _http_json("GET", f"/memories/{quote(memory_id, safe='')}?include_private=true", None)
+            _http_json(
+                "GET",
+                f"/memories/{quote(memory_id, safe='')}?include_private=true",
+                None,
+                target=call_context.target,
+            )
         )
     if name == "get_resource":
-        return _handle_get_resource(args)
+        return _handle_get_resource(args, target=call_context.target)
     if name == "create_memory":
         try:
             memory_type = str(args.get("memory_type") or "fact").strip()
@@ -715,15 +742,14 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 if not isinstance(confidence, (int, float)):
                     raise ValueError("confidence must be a number")
                 body["confidence"] = float(confidence)
-            repo_identifier = _repository_identifier_for_tool_context(args.get("repository_context"))
-            if repo_identifier:
-                body["repo_identifier"] = repo_identifier
+            if call_context.repo_identifier:
+                body["repo_identifier"] = call_context.repo_identifier
             idempotency_key = str(args.get("idempotency_key") or "").strip()
             if idempotency_key:
                 body["idempotency_key"] = idempotency_key
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("POST", "/memories/create", body)
+        return _http_json("POST", "/memories/create", body, target=call_context.target)
     if name == "retire_memory":
         try:
             memory_id = _required_string_arg(args, "memory_id")
@@ -733,7 +759,12 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("POST", f"/memories/{quote(memory_id, safe='')}/retire", body)
+        return _http_json(
+            "POST",
+            f"/memories/{quote(memory_id, safe='')}/retire",
+            body,
+            target=call_context.target,
+        )
     if name == "replace_memory":
         try:
             memory_id = _required_string_arg(args, "memory_id")
@@ -749,7 +780,12 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("POST", f"/memories/{quote(memory_id, safe='')}/replace", body)
+        return _http_json(
+            "POST",
+            f"/memories/{quote(memory_id, safe='')}/replace",
+            body,
+            target=call_context.target,
+        )
     if name == "list_memory_reviews":
         allowed = {"status", "limit", "offset"}
         unknown = sorted(set(args) - allowed)
@@ -763,13 +799,23 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("GET", "/memory-reviews?" + urlencode(query), None)
+        return _http_json(
+            "GET",
+            "/memory-reviews?" + urlencode(query),
+            None,
+            target=call_context.target,
+        )
     if name == "get_memory_review":
         try:
             review_id = _required_string_arg(args, "review_id")
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("GET", f"/memory-reviews/{quote(review_id, safe='')}", None)
+        return _http_json(
+            "GET",
+            f"/memory-reviews/{quote(review_id, safe='')}",
+            None,
+            target=call_context.target,
+        )
     if name == "resolve_memory_review":
         try:
             review_id = _required_string_arg(args, "review_id")
@@ -787,7 +833,12 @@ def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 body["reviewer"] = reviewer
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("POST", f"/memory-reviews/{quote(review_id, safe='')}/{decision}", body)
+        return _http_json(
+            "POST",
+            f"/memory-reviews/{quote(review_id, safe='')}/{decision}",
+            body,
+            target=call_context.target,
+        )
     return {"error": f"Unknown tool: {name}"}
 
 
@@ -830,14 +881,15 @@ def _required_bounded_int_arg(args: dict[str, Any], name: str, *, minimum: int, 
     return value
 
 
-def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
+def _search_args_with_context(
+    args: dict[str, Any], *, repo_identifier: str | None = None
+) -> dict[str, Any]:
     unknown = sorted(set(args) - SEARCH_ALLOWED_KEYS)
     if unknown:
         raise ValueError(
             "Unsupported search parameter(s): " + ", ".join(unknown) + ". Omit unknown filters instead of guessing."
         )
     body = dict(args)
-    repository_context = body.pop("repository_context", None)
     query = str(body.get("query") or "").strip()
     has_deterministic_filter = False
     if "top_k" in body:
@@ -858,7 +910,6 @@ def _search_args_with_context(args: dict[str, Any]) -> dict[str, Any]:
             body["entities"] = normalized_entities
     body["include_private"] = True
     body["include_superseded"] = False
-    repo_identifier = _repository_identifier_for_tool_context(repository_context)
     if repo_identifier:
         body["active_repo_identifier"] = repo_identifier
     source_filter = body.get("source_filter")
@@ -1004,18 +1055,49 @@ def _active_repo_identifier() -> str | None:
     return resolve_repository_context(root_paths=_CLIENT_ROOT_PATHS).repo_identifier
 
 
-def _repository_identifier_for_tool_context(value: Any) -> str | None:
+def _tool_call_context(value: Any) -> ToolCallContext:
     if value is None:
-        return _active_repo_identifier()
-    if not isinstance(value, dict) or set(value) - {"working_directory"}:
-        return None
+        return ToolCallContext(
+            target=configured_target(_CLIENT_ROOT_PATHS),
+            repo_identifier=_active_repo_identifier(),
+        )
+    if not isinstance(value, dict):
+        raise ValueError("repository_context must be an object with working_directory")
+    unknown = sorted(set(value) - {"working_directory"})
+    if unknown:
+        raise ValueError(
+            "Unsupported repository_context parameter(s): " + ", ".join(unknown)
+        )
     working_directory = value.get("working_directory")
     if not isinstance(working_directory, str) or not working_directory.strip():
-        return None
-    return resolve_repository_context(
+        raise ValueError(
+            "repository_context.working_directory must be an absolute path or file:// URI"
+        )
+    repository_path = _root_path({"uri": working_directory})
+    if repository_path is None or not Path(repository_path).is_absolute():
+        raise ValueError(
+            "repository_context.working_directory must be an absolute path or file:// URI"
+        )
+    repository_context = resolve_repository_context(
         working_directory=working_directory,
-        root_paths=_CLIENT_ROOT_PATHS,
-    ).repo_identifier
+    )
+    if repository_context.state != "exact" or not repository_context.repo_identifier:
+        raise ValueError(
+            "repository_context.working_directory must resolve to a Git repository with an "
+            "origin remote; refusing to fall back to another workspace"
+        )
+    return ToolCallContext(
+        target=configured_target((repository_path,)),
+        repo_identifier=repository_context.repo_identifier,
+    )
+
+
+def _repository_identifier_for_tool_context(value: Any) -> str | None:
+    return _tool_call_context(value).repo_identifier
+
+
+def _has_explicit_repository_context(arguments: dict[str, Any]) -> bool:
+    return arguments.get("repository_context") is not None
 
 
 def _mcp_client() -> str:
@@ -1256,8 +1338,8 @@ def _compact_memory_source(source: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
-def _resource_url(path: str) -> str:
-    return _configured_target().resource_url(path)
+def _resource_url(path: str, *, target: Any | None = None) -> str:
+    return (target or _configured_target()).resource_url(path)
 
 
 def _configured_target():
@@ -1274,10 +1356,17 @@ def _api_headers(*, json_body: bool = False) -> dict[str, str]:
     return headers
 
 
-def _http_json(method: str, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
+def _http_json(
+    method: str,
+    path: str,
+    body: dict[str, Any] | None,
+    *,
+    target: Any | None = None,
+) -> dict[str, Any]:
+    target = target or _configured_target()
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = Request(
-        _resource_url(path),
+        _resource_url(path, target=target),
         data=data,
         headers=_api_headers(json_body=body is not None),
         method=method,
@@ -1294,12 +1383,13 @@ def _http_json(method: str, path: str, body: dict[str, Any] | None) -> dict[str,
     except (OSError, URLError, json.JSONDecodeError) as exc:
         return {
             "error": "MemForge API unavailable",
-            "api_url": _configured_target().workspace_api_base,
+            "api_url": target.workspace_api_base,
             "detail": str(exc),
         }
 
 
-def _handle_get_resource(args: dict[str, Any]) -> dict[str, Any]:
+def _handle_get_resource(args: dict[str, Any], *, target: Any | None = None) -> dict[str, Any]:
+    target = target or _configured_target()
     mode = str(args.get("mode") or "text").strip().lower()
     if mode not in {"text", "file", "base64"}:
         return {"error": f"unsupported mode: {mode}", "supported_modes": ["text", "file", "base64"]}
@@ -1311,8 +1401,8 @@ def _handle_get_resource(args: dict[str, Any]) -> dict[str, Any]:
     if isinstance(max_chars, dict):
         return max_chars
 
-    target = _parse_resource_url(str(args.get("url") or "").strip(), _configured_target().origin)
-    if target is None:
+    resource_target = _parse_resource_url(str(args.get("url") or "").strip(), target)
+    if resource_target is None:
         return {
             "error": "unsupported resource URL",
             "hint": (
@@ -1324,18 +1414,27 @@ def _handle_get_resource(args: dict[str, Any]) -> dict[str, Any]:
 
     try:
         if mode == "file":
-            return _fetch_resource_file(target)
-        return _fetch_resource_inline(target, mode=mode, max_bytes=max_bytes, max_chars=max_chars)
+            return _fetch_resource_file(resource_target)
+        return _fetch_resource_inline(
+            resource_target,
+            mode=mode,
+            max_bytes=max_bytes,
+            max_chars=max_chars,
+        )
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:1000]
         return {
             "error": "resource fetch failed",
             "status_code": exc.code,
-            "url": target.relative_url,
+            "url": resource_target.relative_url,
             "detail": detail,
         }
     except (OSError, URLError) as exc:
-        return {"error": "resource fetch failed", "url": target.relative_url, "detail": str(exc)}
+        return {
+            "error": "resource fetch failed",
+            "url": resource_target.relative_url,
+            "detail": str(exc),
+        }
 
 
 def _fetch_resource_inline(
@@ -1466,9 +1565,9 @@ def _verify_resource_integrity(
         raise OSError("resource SHA-256 does not match X-Content-SHA256")
 
 
-def _parse_resource_url(url: str, origin: str) -> ResourceTarget | None:
+def _parse_resource_url(url: str, target: Any) -> ResourceTarget | None:
     parsed = urlparse(url)
-    base = urlparse(origin)
+    base = urlparse(target.origin)
     if parsed.query or parsed.fragment:
         return None
 
@@ -1488,17 +1587,32 @@ def _parse_resource_url(url: str, origin: str) -> ResourceTarget | None:
     if any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
         return None
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "content":
-        return ResourceTarget(parts[2], "content", path, _resource_url(path[len("/api") :]))
+        return ResourceTarget(
+            parts[2],
+            "content",
+            path,
+            _resource_url(path[len("/api") :], target=target),
+        )
     if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "pdf":
-        return ResourceTarget(parts[2], "pdf", path, _resource_url(path[len("/api") :]))
+        return ResourceTarget(
+            parts[2],
+            "pdf",
+            path,
+            _resource_url(path[len("/api") :], target=target),
+        )
     if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
-        return ResourceTarget(parts[2], parts[4], path, _resource_url(path[len("/api") :]))
+        return ResourceTarget(
+            parts[2],
+            parts[4],
+            path,
+            _resource_url(path[len("/api") :], target=target),
+        )
     if len(parts) == 3 and parts[:2] == ["api", "source-artifacts"]:
         return ResourceTarget(
             parts[2],
             "source_artifact",
             path,
-            _resource_url(path[len("/api") :]),
+            _resource_url(path[len("/api") :], target=target),
             identity_key="observation_revision_id",
         )
     return None
