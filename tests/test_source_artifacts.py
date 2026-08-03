@@ -102,6 +102,22 @@ def _artifact_metadata(
             },
             (False, "invalid_image_structure"),
         ),
+        (
+            4,
+            {
+                "inference_eligible": False,
+                "inference_ineligible_reason": "inference_byte_limit",
+            },
+            None,
+        ),
+        (
+            source_artifacts.MAX_SOURCE_ARTIFACT_INFERENCE_BYTES + 1,
+            {
+                "inference_eligible": False,
+                "inference_ineligible_reason": "invalid_image_structure",
+            },
+            None,
+        ),
         (4, {"inference_eligible": False}, None),
         (
             source_artifacts.MAX_SOURCE_ARTIFACT_INFERENCE_BYTES + 1,

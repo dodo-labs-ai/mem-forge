@@ -9,7 +9,7 @@ import pytest
 
 from memforge.genes.jira_gene import JiraGene
 from memforge.models import ContentItem
-from memforge.source_artifacts import RawSourceArtifact
+from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 
 
 def _search_page(issues: list[dict], *, total: int | None = None, start_at: int = 0) -> dict:
@@ -661,6 +661,53 @@ async def test_jira_secure_attachment_stream_uses_id_based_locator():
             assert b"".join([chunk async for chunk in download.chunks]) == image
     finally:
         await gene._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_jira_secure_attachment_rejects_descriptor_url_identity_mismatch():
+    class AttachmentClient(RecordingAsyncClient):
+        async def request(self, method: str, url: str, **kwargs):
+            self.calls.append((method, url, kwargs))
+            return JsonResponse(
+                _search_page(
+                    [
+                        _jira_issue(
+                            "PAY-123",
+                            issue_id="100123",
+                            field_overrides={
+                                "attachment": [
+                                    {
+                                        "id": "7001",
+                                        "filename": "screenshot.jpg",
+                                        "mimeType": "image/jpeg",
+                                        "size": 4,
+                                        "created": "2026-05-21T09:01:00Z",
+                                        "content": (
+                                            "https://jira.example.test"
+                                            "/secure/attachment/9999/screenshot.jpg"
+                                        ),
+                                    }
+                                ]
+                            },
+                        )
+                    ]
+                )
+            )
+
+    gene = JiraGene(
+        config={"base_url": "https://jira.example.test", "projects": ["PAY"]},
+        source_id="src-jira",
+    )
+    gene._client = AttachmentClient(base_url="https://jira.example.test")
+    gene._base_url = "https://jira.example.test"
+
+    items = [item async for item in gene.discover()]
+
+    with pytest.raises(
+        SourceArtifactContractError,
+        match="Jira attachment URL identity does not match its descriptor",
+    ):
+        await gene.fetch(items[0])
 
 
 @pytest.mark.asyncio

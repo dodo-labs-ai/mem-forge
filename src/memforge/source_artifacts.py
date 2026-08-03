@@ -64,11 +64,11 @@ def _source_artifact_inference_fields(
     *,
     size_bytes: int,
 ) -> tuple[bool, str | None] | None:
-    """Parse current and legacy inference metadata at one compatibility seam."""
+    """Normalize supported inference metadata shapes at one compatibility seam."""
 
     if "inference_eligible" not in raw:
-        # The legacy writer predates both eligibility fields. A reason without
-        # its eligibility decision is not a historical shape we can prove.
+        # The fieldless compatibility shape derives eligibility from size. A
+        # reason without its eligibility decision is ambiguous and rejected.
         if "inference_ineligible_reason" in raw:
             return None
         eligible = size_bytes <= MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
@@ -99,9 +99,17 @@ def _source_artifact_inference_fields(
             else None
         )
     if inference_ineligible_reason is not None:
+        size_exceeds_inference_limit = (
+            size_bytes > MAX_SOURCE_ARTIFACT_INFERENCE_BYTES
+        )
+        reason_is_inference_byte_limit = (
+            inference_ineligible_reason == "inference_byte_limit"
+        )
+        if size_exceeds_inference_limit != reason_is_inference_byte_limit:
+            return None
         return False, inference_ineligible_reason
-    # The first eligibility writer persisted a boolean before deterministic
-    # reasons existed. It wrote False only for the byte-limit condition.
+    # The boolean-only compatibility shape admits False only when the recorded
+    # size independently proves the byte-limit reason.
     if size_bytes > MAX_SOURCE_ARTIFACT_INFERENCE_BYTES:
         return False, "inference_byte_limit"
     return None
