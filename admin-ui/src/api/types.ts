@@ -593,13 +593,33 @@ export interface TeamsAuthStatus {
 
 export type MemoryReviewStatus = "pending" | "approved" | "rejected" | "stale";
 export type MemoryReviewKind = "supersede";
+export type MemoryReviewActionKey = "use_latest_state" | "keep_current_state";
+
+export interface MemoryReviewActionPresentation {
+  key: MemoryReviewActionKey;
+  label: string;
+  consequence: string;
+  requires_note: boolean;
+}
+
+export interface MemoryReviewPresentation {
+  summary: string;
+  why_human: string;
+  current_label: string;
+  proposed_label: string;
+  actions: MemoryReviewActionPresentation[];
+  technical_reason: string | null;
+}
 
 export interface MemoryReviewSummary {
   id: string;
   kind: MemoryReviewKind | string;
   status: MemoryReviewStatus | string;
+  review_origin: "memory" | "lifecycle";
+  source_id: string | null;
+  source_name: string | null;
   incumbent_memory_id: string;
-  challenger_memory_id: string;
+  challenger_memory_id: string | null;
   reason: string | null;
   review_note: string | null;
   reviewer: string | null;
@@ -608,6 +628,7 @@ export interface MemoryReviewSummary {
   created_at: string | null;
   resolved_at: string | null;
   is_stale: boolean;
+  presentation: MemoryReviewPresentation;
   incumbent?: MemoryReviewMemorySummary | null;
   challenger?: MemoryReviewMemorySummary | null;
 }

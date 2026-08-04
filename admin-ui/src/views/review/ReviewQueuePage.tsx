@@ -1,34 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { CheckCircle2, RefreshCw, ShieldCheck, Sparkles } from "lucide-react";
+import { ArrowRight, CheckCircle2, RefreshCw, ShieldCheck } from "lucide-react";
 import { resourceClient } from "@/api/client";
-import type {
-  MemoryReviewListResponse,
-  MemoryReviewMemorySummary,
-} from "@/api/types";
+import type { MemoryReviewListResponse } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
-import { DataSurface } from "@/components/admin/DataSurface";
 import { EmptyState } from "@/components/admin/EmptyState";
 import { PageHeader } from "@/components/admin/PageHeader";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { Card, CardContent } from "@/components/ui/card";
 import { timeAgo } from "@/utils/date";
 
 const REVIEW_QUEUE_LIMIT = 100;
-
-const AGENT_SESSION_SOURCE_TYPE = "agent_session";
-
-function MissingSnapshotLabel() {
-  return <span className="italic text-muted-foreground">Unavailable</span>;
-}
 
 function useReviewQueue() {
   return useQuery<MemoryReviewListResponse>({
@@ -42,8 +25,9 @@ function useReviewQueue() {
   });
 }
 
-function isAgentSessionMemory(memory: MemoryReviewMemorySummary | null | undefined): boolean {
-  return memory?.origin_source_type === AGENT_SESSION_SOURCE_TYPE;
+function preview(value: string | null | undefined): string {
+  if (!value) return "Not available in this proposal";
+  return value.length > 180 ? `${value.slice(0, 177)}…` : value;
 }
 
 export function ReviewQueuePage() {
@@ -56,126 +40,83 @@ export function ReviewQueuePage() {
     <div className="space-y-4">
       <PageHeader
         title="Review queue"
-        description="Pending memory updates that need a human decision before they go live."
+        description="Decide which memory state MemForge should use. Technical details stay available when you need them."
         actions={
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => {
-              queueQuery.refetch();
-            }}
-          >
+          <Button type="button" variant="outline" onClick={() => queueQuery.refetch()}>
             <RefreshCw className="size-4" />
-            Refresh
+            Refresh list
           </Button>
         }
       />
 
-      <DataSurface>
-        <div className="flex flex-col gap-3 border-b p-4 xl:flex-row xl:items-center xl:justify-between">
-          <div>
-            <h2 className="text-base font-semibold">Pending decisions</h2>
-            <p className="mt-1 text-sm text-muted-foreground">
-              {total.toLocaleString()} reviews waiting. Open one to compare and decide.
-            </p>
+      <div className="flex items-center justify-between rounded-lg border bg-muted/20 px-4 py-3">
+        <div>
+          <div className="text-sm font-medium">Decisions waiting</div>
+          <div className="text-xs text-muted-foreground">
+            {total.toLocaleString()} {total === 1 ? "review needs" : "reviews need"} your input
           </div>
         </div>
-        <AsyncBoundary
-          isLoading={queueQuery.isLoading}
-          isError={queueQuery.isError}
-          error={queueQuery.error}
-          onRetry={() => queueQuery.refetch()}
-          isEmpty={reviews.length === 0}
-          empty={
-            <EmptyState
-              icon={CheckCircle2}
-              title="All clear"
-              description="No memory reviews are pending. New ones appear here when sync flags a risky update."
-            />
-          }
-        >
-          <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow className="hover:bg-transparent">
-                  <TableHead className="w-8" />
-                  <TableHead>Proposed update</TableHead>
-                  <TableHead>Current memory</TableHead>
-                  <TableHead className="w-40">Reason</TableHead>
-                  <TableHead className="w-32">Age</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {reviews.map((review) => {
-                  const challenger = review.challenger;
-                  const incumbent = review.incumbent;
-                  return (
-                    <TableRow
-                      key={review.id}
-                      className="cursor-pointer"
-                      onClick={() => navigate(`/review/${review.id}`)}
-                    >
-                      <TableCell>
-                        <ShieldCheck className="size-4 text-amber-500" />
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex max-w-xl items-start gap-2">
-                          <div className="min-w-0 flex-1 truncate text-sm font-medium">
-                            {challenger?.content ?? <MissingSnapshotLabel />}
-                          </div>
-                          {isAgentSessionMemory(challenger) && (
-                            <Badge
-                              variant="outline"
-                              className="shrink-0 gap-1 text-[10px]"
-                              title="Generated agent-session summary"
-                            >
-                              <Sparkles className="size-3" />
-                              agent-session
-                            </Badge>
-                          )}
+        <ShieldCheck className="size-5 text-amber-500" />
+      </div>
+
+      <AsyncBoundary
+        isLoading={queueQuery.isLoading}
+        isError={queueQuery.isError}
+        error={queueQuery.error}
+        onRetry={() => queueQuery.refetch()}
+        isEmpty={reviews.length === 0}
+        empty={
+          <EmptyState
+            icon={CheckCircle2}
+            title="All clear"
+            description="No current memory decisions need your attention."
+          />
+        }
+      >
+        <div className="space-y-3">
+          {reviews.map((review) => (
+            <Card key={review.id} className="transition-colors hover:border-foreground/20">
+              <CardContent className="p-5">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      <Badge variant="secondary">
+                        {review.source_name ?? (review.review_origin === "lifecycle" ? "Source sync" : "Memory update")}
+                      </Badge>
+                      <span>{timeAgo(review.created_at)}</span>
+                    </div>
+                    <h2 className="mt-3 text-base font-semibold">{review.presentation.summary}</h2>
+                    <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+                      {review.presentation.why_human}
+                    </p>
+                    <div className="mt-4 grid gap-3 md:grid-cols-2">
+                      <div className="rounded-md border bg-muted/20 p-3">
+                        <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                          {review.presentation.current_label}
                         </div>
-                        {challenger && (
-                          <div className="mt-1 text-xs text-muted-foreground">
-                            confidence {challenger.confidence.toFixed(2)} ·{" "}
-                            {challenger.corroboration_count} source
-                            {challenger.corroboration_count === 1 ? "" : "s"}
-                          </div>
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        <div className="max-w-xl truncate text-sm text-muted-foreground">
-                          {incumbent?.content ?? <MissingSnapshotLabel />}
+                        <p className="mt-1 text-sm leading-relaxed">
+                          {preview(review.incumbent?.content)}
+                        </p>
+                      </div>
+                      <div className="rounded-md border bg-muted/20 p-3">
+                        <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                          {review.presentation.proposed_label}
                         </div>
-                        {incumbent && (
-                          <div className="mt-1 text-xs text-muted-foreground">
-                            confidence {incumbent.confidence.toFixed(2)} ·{" "}
-                            {incumbent.corroboration_count} source
-                            {incumbent.corroboration_count === 1 ? "" : "s"}
-                          </div>
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        {review.is_stale ? (
-                          <Badge variant="secondary" className="text-[11px]">
-                            Stale
-                          </Badge>
-                        ) : (
-                          <span className="text-sm text-muted-foreground">
-                            {review.reason ?? "—"}
-                          </span>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-muted-foreground">
-                        {timeAgo(review.created_at)}
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-              </TableBody>
-            </Table>
-          </div>
-        </AsyncBoundary>
-      </DataSurface>
+                        <p className="mt-1 text-sm leading-relaxed">
+                          {preview(review.challenger?.content)}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                  <Button className="shrink-0" onClick={() => navigate(`/review/${review.id}`)}>
+                    Review decision <ArrowRight className="size-4" />
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      </AsyncBoundary>
     </div>
   );
 }

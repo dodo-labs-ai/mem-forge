@@ -1093,8 +1093,16 @@ class SqliteRelationalStore:
         self,
         review_id: str,
         status: LifecycleReviewStatus,
+        *,
+        reviewer: str | None = None,
+        review_note: str | None = None,
     ) -> LifecycleReview:
-        return await self._db.resolve_lifecycle_review(review_id, status)
+        return await self._db.resolve_lifecycle_review(
+            review_id,
+            status,
+            reviewer=reviewer,
+            review_note=review_note,
+        )
 
     async def list_lifecycle_vector_tasks(
         self,

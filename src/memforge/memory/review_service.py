@@ -335,40 +335,6 @@ class ReviewService:
             challenger=await self.db.get_memory(challenger.id),
         )
 
-    async def refresh(self, review_id: str) -> ResolvedReview:
-        """Re-pin a review's expected timestamps to the current memories.
-
-        Useful when the incumbent or challenger drifted after a sync and the
-        reviewer wants to retake the decision against the updated state.
-        """
-        review = await self.db.get_memory_review(review_id)
-        if review is None:
-            raise ReviewNotFound(review_id)
-        incumbent, challenger = await self._load_pair(review)
-        self._guard_supersede(review, incumbent, challenger)
-
-        if challenger.status not in ("pending_review",) or incumbent.status != "active":
-            # The lifecycle has already moved past where the review can apply.
-            raise ReviewError(
-                f"Cannot refresh review {review.id}: incumbent status is "
-                f"{incumbent.status!r}, challenger status is {challenger.status!r}"
-            )
-
-        await self.db.refresh_memory_review_expectations(
-            review_id,
-            expected_incumbent_updated_at=(
-                incumbent.updated_at.isoformat() if incumbent.updated_at else None
-            ),
-            expected_challenger_updated_at=(
-                challenger.updated_at.isoformat() if challenger.updated_at else None
-            ),
-        )
-        return ResolvedReview(
-            review=await self.db.get_memory_review(review_id),  # type: ignore[arg-type]
-            incumbent=incumbent,
-            challenger=challenger,
-        )
-
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

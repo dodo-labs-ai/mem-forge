@@ -630,6 +630,9 @@ class RelationalStore(Protocol):
         self,
         review_id: str,
         status: LifecycleReviewStatus,
+        *,
+        reviewer: str | None = None,
+        review_note: str | None = None,
     ) -> LifecycleReview: ...
     async def list_lifecycle_vector_tasks(
         self,

@@ -68,6 +68,11 @@ from memforge.memory.review_service import (
     ReviewService,
     ReviewStaleConflict,
 )
+from memforge.memory.review_presentation import (
+    ReviewPresentation,
+    present_lifecycle_review,
+    present_memory_review,
+)
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     ConfigField,
@@ -1433,12 +1438,31 @@ class MemoryReviewMemorySummary(BaseModel):
     origin_client: str | None = None
 
 
+class ReviewActionPresentationResponse(BaseModel):
+    key: Literal["use_latest_state", "keep_current_state"]
+    label: str
+    consequence: str
+    requires_note: bool
+
+
+class ReviewPresentationResponse(BaseModel):
+    summary: str
+    why_human: str
+    current_label: str
+    proposed_label: str
+    actions: list[ReviewActionPresentationResponse]
+    technical_reason: str | None = None
+
+
 class MemoryReviewResponse(BaseModel):
     id: str
     kind: str
     status: str
+    review_origin: Literal["memory", "lifecycle"] = "memory"
+    source_id: str | None = None
+    source_name: str | None = None
     incumbent_memory_id: str
-    challenger_memory_id: str
+    challenger_memory_id: str | None
     reason: str | None = None
     review_note: str | None = None
     reviewer: str | None = None
@@ -1448,6 +1472,7 @@ class MemoryReviewResponse(BaseModel):
     created_at: str | None = None
     resolved_at: str | None = None
     is_stale: bool = False
+    presentation: ReviewPresentationResponse
 
 
 class MemoryReviewListItemResponse(MemoryReviewResponse):
@@ -2384,7 +2409,14 @@ def _review_to_response(
         created_at=_dt_iso(review.created_at),
         resolved_at=_dt_iso(review.resolved_at),
         is_stale=_is_review_stale(review, incumbent, challenger),
+        presentation=_presentation_response(
+            present_memory_review(kind=review.kind, reason=review.reason)
+        ),
     )
+
+
+def _presentation_response(value: ReviewPresentation) -> ReviewPresentationResponse:
+    return ReviewPresentationResponse.model_validate(value.to_dict())
 
 
 async def _build_memory_summary(
@@ -2435,6 +2467,99 @@ def _build_memory_review_list_summary(
         origin_source_type=origin_source_type,
         origin_client=origin_client,
     )
+
+
+def _lifecycle_candidate_payload(staged_evidence: Mapping[str, object]) -> tuple[str | None, Mapping[str, object] | None]:
+    candidate_id = staged_evidence.get("replacement_memory_id")
+    if not isinstance(candidate_id, str) or not candidate_id:
+        candidate_id = None
+    candidate = staged_evidence.get("candidate")
+    candidate_payload = candidate if isinstance(candidate, Mapping) else None
+    proposed = staged_evidence.get("proposed_mutations")
+    if isinstance(proposed, list):
+        for raw in proposed:
+            if not isinstance(raw, Mapping):
+                continue
+            mutation_type = raw.get("mutation_type")
+            if mutation_type not in {"create_memory", "reactivate_memory"}:
+                continue
+            raw_id = raw.get("memory_id")
+            if isinstance(raw_id, str) and raw_id:
+                candidate_id = raw_id
+            payload = raw.get("payload")
+            if isinstance(payload, Mapping):
+                memory_payload = payload.get("memory")
+                if isinstance(memory_payload, Mapping):
+                    candidate_payload = memory_payload
+            break
+    return candidate_id, candidate_payload
+
+
+async def _lifecycle_review_response(
+    db: Database,
+    review: Any,
+    source: Mapping[str, object],
+    *,
+    detail: bool,
+    config: AppConfig | None = None,
+    artifact_store: DocumentArtifactStore | None = None,
+) -> MemoryReviewListItemResponse | MemoryReviewDetailResponse:
+    incumbent = await db.get_memory(review.incumbent_memory_id)
+    incumbent_summary = None
+    if incumbent is not None:
+        incumbent_summary = (
+            await _build_memory_summary(db, incumbent, config, artifact_store)
+            if detail
+            else _build_memory_review_list_summary(incumbent)
+        )
+
+    candidate_id, candidate_payload = _lifecycle_candidate_payload(review.staged_evidence)
+    candidate_memory = await db.get_memory(candidate_id) if candidate_id else None
+    challenger_summary = None
+    if candidate_memory is not None:
+        challenger_summary = (
+            await _build_memory_summary(db, candidate_memory, config, artifact_store)
+            if detail
+            else _build_memory_review_list_summary(candidate_memory)
+        )
+    elif candidate_payload is not None and isinstance(candidate_payload.get("content"), str):
+        challenger_summary = MemoryReviewMemorySummary(
+            id=candidate_id or f"candidate:{review.id}",
+            memory_type=str(candidate_payload.get("memory_type") or "fact"),
+            content=str(candidate_payload["content"]),
+            confidence=float(candidate_payload.get("confidence") or 0.0),
+            corroboration_count=0,
+            status="proposed",
+            origin_source_type=str(source.get("type") or "") or None,
+        )
+
+    common = {
+        "id": review.id,
+        "kind": "lifecycle",
+        "status": review.status.value,
+        "review_origin": "lifecycle",
+        "source_id": str(source.get("id") or "") or None,
+        "source_name": str(source.get("name") or "") or None,
+        "incumbent_memory_id": review.incumbent_memory_id,
+        "challenger_memory_id": candidate_id,
+        "reason": review.reason,
+        "review_note": getattr(review, "review_note", None),
+        "reviewer": getattr(review, "reviewer", None),
+        "created_at": review.created_at,
+        "resolved_at": review.resolved_at,
+        "is_stale": review.status.value == "stale",
+        "presentation": _presentation_response(
+            present_lifecycle_review(
+                staged_evidence=review.staged_evidence,
+                reason=review.reason,
+            )
+        ),
+        "incumbent": incumbent_summary,
+        "challenger": challenger_summary,
+    }
+    if detail:
+        return MemoryReviewDetailResponse(**common, related_challengers=[])
+    return MemoryReviewListItemResponse(**common)
 
 
 async def _build_memory_store(
@@ -4178,6 +4303,12 @@ def create_admin_app(
                     "status": review.status.value,
                     "staged_evidence": dict(review.staged_evidence),
                     "reason": review.reason,
+                    "review_note": review.review_note,
+                    "reviewer": review.reviewer,
+                    "presentation": present_lifecycle_review(
+                        staged_evidence=review.staged_evidence,
+                        reason=review.reason,
+                    ).to_dict(),
                     "created_at": review.created_at,
                     "resolved_at": review.resolved_at,
                 }
@@ -4806,17 +4937,18 @@ def create_admin_app(
             "remaining_findings": result.finding_count,
         }
 
-    @source_router.post("/{source_id}/memory-lifecycle/reviews/{review_id}/approve")
-    async def approve_source_lifecycle_review(
+    async def _decide_lifecycle_review(
         source_id: str,
         review_id: str,
         request: Request,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
-    ):
-        """Atomically apply one reviewed proposal after gate and stale-guard checks."""
-
+        db: Database,
+        *,
+        action: Literal["use_latest_state", "keep_current_state"],
+        note: str | None,
+        reviewer: str | None,
+        config: AppConfig | None = None,
+        runtime_provider: RuntimeProvider | None = None,
+    ) -> dict[str, object]:
         from memforge.memory.lifecycle_plan import LifecycleGateState, LifecycleReviewStatus
         from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
 
@@ -4827,12 +4959,21 @@ def create_admin_app(
         review = await db.get_lifecycle_review(review_id)
         if review is None:
             raise HTTPException(status_code=404, detail="Lifecycle review not found")
-        if review.status is LifecycleReviewStatus.APPROVED:
+        target_status = (
+            LifecycleReviewStatus.APPROVED
+            if action == "use_latest_state"
+            else LifecycleReviewStatus.REJECTED
+        )
+        if review.status is target_status:
             return {
                 "source_id": source_id,
                 "review_id": review_id,
                 "status": review.status.value,
-                "lifecycle_plan_id": f"lifecycle-review-approval-{review.id}",
+                **(
+                    {"lifecycle_plan_id": f"lifecycle-review-approval-{review.id}"}
+                    if target_status is LifecycleReviewStatus.APPROVED
+                    else {}
+                ),
             }
         if review.status is not LifecycleReviewStatus.PENDING:
             raise HTTPException(
@@ -4844,11 +4985,35 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail="Lifecycle review plan is unavailable")
         if payload["scope"].get("source_id") != source_id:
             raise HTTPException(status_code=404, detail="Lifecycle review not found")
+        if action == "keep_current_state":
+            if not note or not note.strip():
+                raise HTTPException(status_code=400, detail="A note is required to keep the current state")
+            try:
+                rejected = await db.resolve_lifecycle_review(
+                    review_id,
+                    LifecycleReviewStatus.REJECTED,
+                    reviewer=reviewer,
+                    review_note=note.strip(),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {
+                "source_id": source_id,
+                "review_id": review_id,
+                "status": rejected.status.value,
+            }
         gate = await db.get_lifecycle_gate(source_id)
         if gate.state is not LifecycleGateState.ENABLED:
             raise HTTPException(status_code=409, detail="Source lifecycle gate is not enabled")
+        if config is None or runtime_provider is None:
+            raise RuntimeError("Lifecycle approval requires the configured runtime")
         try:
-            plan = build_lifecycle_review_approval_plan(review, payload)
+            plan = build_lifecycle_review_approval_plan(
+                review,
+                payload,
+                reviewer=reviewer,
+                review_note=note.strip() if note else None,
+            )
             await db.apply_lifecycle_plan(plan)
         except ValueError as exc:
             if "stale guard" in str(exc) or "already" in str(exc):
@@ -4874,52 +5039,49 @@ def create_admin_app(
             "lifecycle_plan_id": plan.id,
         }
 
+    @source_router.post("/{source_id}/memory-lifecycle/reviews/{review_id}/approve")
+    async def approve_source_lifecycle_review(
+        source_id: str,
+        review_id: str,
+        request: Request,
+        req: MemoryReviewDecisionRequest = MemoryReviewDecisionRequest(),
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+    ):
+        """Use the latest state after gate and stale-guard checks."""
+
+        return await _decide_lifecycle_review(
+            source_id,
+            review_id,
+            request,
+            db,
+            action="use_latest_state",
+            note=req.note,
+            reviewer=req.reviewer,
+            config=config,
+            runtime_provider=runtime_provider,
+        )
+
     @source_router.post("/{source_id}/memory-lifecycle/reviews/{review_id}/reject")
     async def reject_source_lifecycle_review(
         source_id: str,
         review_id: str,
         request: Request,
+        req: MemoryReviewDecisionRequest,
         db: Database = Depends(get_db),
     ):
-        """Reject a pending proposal without mutating the incumbent Memory."""
+        """Keep the current state and discard the staged proposal."""
 
-        from memforge.memory.lifecycle_plan import LifecycleReviewStatus
-
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_management(request, source)
-        review = await db.get_lifecycle_review(review_id)
-        if review is None:
-            raise HTTPException(status_code=404, detail="Lifecycle review not found")
-        if review.status is LifecycleReviewStatus.REJECTED:
-            return {
-                "source_id": source_id,
-                "review_id": review_id,
-                "status": review.status.value,
-            }
-        if review.status is not LifecycleReviewStatus.PENDING:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Lifecycle review is already {review.status.value}",
-            )
-        payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
-        if payload is None or not isinstance(payload.get("scope"), dict):
-            raise HTTPException(status_code=409, detail="Lifecycle review plan is unavailable")
-        if payload["scope"].get("source_id") != source_id:
-            raise HTTPException(status_code=404, detail="Lifecycle review not found")
-        try:
-            rejected = await db.resolve_lifecycle_review(
-                review_id,
-                LifecycleReviewStatus.REJECTED,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {
-            "source_id": source_id,
-            "review_id": review_id,
-            "status": rejected.status.value,
-        }
+        return await _decide_lifecycle_review(
+            source_id,
+            review_id,
+            request,
+            db,
+            action="keep_current_state",
+            note=req.note,
+            reviewer=req.reviewer,
+        )
 
     @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
     async def list_source_projects(
@@ -6721,13 +6883,15 @@ def create_admin_app(
         offset: int = 0,
         db: Database = Depends(get_db),
     ):
-        """List memory reviews. Defaults to open items that still need attention."""
+        """List all user-facing Reviews through one decision contract."""
+        from memforge.memory.lifecycle_plan import LifecycleReviewStatus
+
         normalized_status = status if status and status != "all" else None
         reviews = await db.list_memory_reviews(
             status=normalized_status,
             kind=kind,
-            limit=limit,
-            offset=offset,
+            limit=limit + offset,
+            offset=0,
         )
 
         review_memories: dict[str, Memory] = {}
@@ -6744,6 +6908,8 @@ def create_admin_app(
             incumbent = review_memories.get(review.incumbent_memory_id)
             challenger = review_memories.get(review.challenger_memory_id)
             base = _review_to_response(review, incumbent=incumbent, challenger=challenger)
+            if normalized_status == "open" and base.is_stale:
+                continue
             incumbent_origin = origins.get(incumbent.id, (None, None)) if incumbent else (None, None)
             challenger_origin = origins.get(challenger.id, (None, None)) if challenger else (None, None)
             incumbent_summary = (
@@ -6772,8 +6938,38 @@ def create_admin_app(
                 )
             )
 
+        lifecycle_status = None
+        if normalized_status == "open":
+            lifecycle_status = LifecycleReviewStatus.PENDING
+        elif normalized_status:
+            try:
+                lifecycle_status = LifecycleReviewStatus(normalized_status)
+            except ValueError:
+                lifecycle_status = None
+        lifecycle_count = 0
+        if kind in {None, "lifecycle"}:
+            for source in await db.list_sources():
+                lifecycle_reviews = await db.list_lifecycle_reviews(
+                    str(source["id"]),
+                    status=lifecycle_status,
+                )
+                lifecycle_count += len(lifecycle_reviews)
+                for review in lifecycle_reviews:
+                    responses.append(
+                        await _lifecycle_review_response(
+                            db,
+                            review,
+                            source,
+                            detail=False,
+                        )
+                    )
+
+        responses.sort(key=lambda item: item.created_at or "", reverse=True)
         total = await db.count_memory_reviews(status=normalized_status, kind=kind)
-        return MemoryReviewListResponse(data=responses, total=total)
+        return MemoryReviewListResponse(
+            data=responses[offset : offset + limit],
+            total=total + lifecycle_count,
+        )
 
     @review_router.get("/{review_id}", response_model=MemoryReviewDetailResponse)
     async def get_memory_review(
@@ -6784,7 +6980,26 @@ def create_admin_app(
     ):
         review = await db.get_memory_review(review_id)
         if review is None:
-            raise HTTPException(status_code=404, detail="Review not found")
+            lifecycle_review = await db.get_lifecycle_review(review_id)
+            if lifecycle_review is None:
+                raise HTTPException(status_code=404, detail="Review not found")
+            payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
+            source_id = (
+                str(payload.get("scope", {}).get("source_id") or "")
+                if isinstance(payload, Mapping) and isinstance(payload.get("scope"), Mapping)
+                else ""
+            )
+            source = await db.get_source(source_id) if source_id else None
+            if source is None:
+                raise HTTPException(status_code=409, detail="Lifecycle review source is unavailable")
+            return await _lifecycle_review_response(
+                db,
+                lifecycle_review,
+                source,
+                detail=True,
+                config=config,
+                artifact_store=artifact_store,
+            )
 
         incumbent = await db.get_memory(review.incumbent_memory_id)
         challenger = await db.get_memory(review.challenger_memory_id)
@@ -6807,12 +7022,41 @@ def create_admin_app(
     @review_router.post("/{review_id}/approve", response_model=MemoryReviewDetailResponse)
     async def approve_memory_review(
         review_id: str,
+        request: Request,
         req: MemoryReviewDecisionRequest = MemoryReviewDecisionRequest(),
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
+        lifecycle_review = await db.get_lifecycle_review(review_id)
+        if lifecycle_review is not None:
+            payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
+            scope = payload.get("scope") if isinstance(payload, Mapping) else None
+            source_id = str(scope.get("source_id") or "") if isinstance(scope, Mapping) else ""
+            await _decide_lifecycle_review(
+                source_id,
+                review_id,
+                request,
+                db,
+                action="use_latest_state",
+                note=req.note,
+                reviewer=req.reviewer,
+                config=config,
+                runtime_provider=runtime_provider,
+            )
+            updated = await db.get_lifecycle_review(review_id)
+            source = await db.get_source(source_id)
+            assert updated is not None and source is not None
+            return await _lifecycle_review_response(
+                db,
+                updated,
+                source,
+                detail=True,
+                config=config,
+                artifact_store=artifact_store,
+            )
+
         service = await _build_review_service(db, config, runtime_provider)
         try:
             result = await service.approve(
@@ -6856,6 +7100,7 @@ def create_admin_app(
     @review_router.post("/{review_id}/reject", response_model=MemoryReviewDetailResponse)
     async def reject_memory_review(
         review_id: str,
+        request: Request,
         req: MemoryReviewDecisionRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
@@ -6863,7 +7108,33 @@ def create_admin_app(
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         if not req.note or not req.note.strip():
-            raise HTTPException(status_code=400, detail="A note is required to reject a review")
+            raise HTTPException(status_code=400, detail="A note is required to keep the current state")
+
+        lifecycle_review = await db.get_lifecycle_review(review_id)
+        if lifecycle_review is not None:
+            payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
+            scope = payload.get("scope") if isinstance(payload, Mapping) else None
+            source_id = str(scope.get("source_id") or "") if isinstance(scope, Mapping) else ""
+            await _decide_lifecycle_review(
+                source_id,
+                review_id,
+                request,
+                db,
+                action="keep_current_state",
+                note=req.note,
+                reviewer=req.reviewer,
+            )
+            updated = await db.get_lifecycle_review(review_id)
+            source = await db.get_source(source_id)
+            assert updated is not None and source is not None
+            return await _lifecycle_review_response(
+                db,
+                updated,
+                source,
+                detail=True,
+                config=config,
+                artifact_store=artifact_store,
+            )
 
         service = await _build_review_service(db, config, runtime_provider)
         try:
@@ -6890,36 +7161,6 @@ def create_admin_app(
 
         review = result.review or await db.get_memory_review(review_id)
         assert review is not None
-        base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
-        incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent, config, artifact_store) if result.incumbent else None
-        )
-        challenger_summary = (
-            await _build_memory_summary(db, result.challenger, config, artifact_store) if result.challenger else None
-        )
-        return MemoryReviewDetailResponse(
-            **base.model_dump(),
-            incumbent=incumbent_summary,
-            challenger=challenger_summary,
-        )
-
-    @review_router.post("/{review_id}/refresh", response_model=MemoryReviewDetailResponse)
-    async def refresh_memory_review(
-        review_id: str,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        artifact_store: DocumentArtifactStore = Depends(get_document_store),
-        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
-    ):
-        service = await _build_review_service(db, config, runtime_provider)
-        try:
-            result = await service.refresh(review_id)
-        except ReviewNotFound:
-            raise HTTPException(status_code=404, detail="Review not found")
-        except ReviewError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-        review = result.review
         base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
         incumbent_summary = (
             await _build_memory_summary(db, result.incumbent, config, artifact_store) if result.incumbent else None

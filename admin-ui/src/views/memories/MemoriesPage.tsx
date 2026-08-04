@@ -317,7 +317,7 @@ export function MemoriesPage() {
   const reviewByMemoryId = (() => {
     const map = new Map<string, string>();
     for (const review of reviewsQuery.data?.data ?? []) {
-      map.set(review.challenger_memory_id, review.id);
+      if (review.challenger_memory_id) map.set(review.challenger_memory_id, review.id);
       map.set(review.incumbent_memory_id, review.id);
     }
     return map;
