@@ -908,9 +908,9 @@ def test_mcp_tools_all_accept_repository_context():
         assert "repository_context" in tool["inputSchema"]["properties"], tool["name"]
 
 
-def test_packaged_plugin_version_0_1_39_is_consistent():
+def test_packaged_plugin_version_0_1_40_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.39"
+    version = "0.1.40"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
