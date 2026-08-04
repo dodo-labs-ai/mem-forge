@@ -771,9 +771,13 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
             assert source_id == "src-neutral"
             return list(self.jobs.values())
 
-        async def list_lifecycle_reviews(self, source_id: str, **kwargs) -> list:
+        async def list_lifecycle_reviews(self, source_id: str | None = None, **kwargs) -> list:
             assert source_id == "src-neutral"
             return []
+
+        async def count_lifecycle_reviews(self, source_id: str | None = None, **kwargs) -> int:
+            assert source_id == "src-neutral"
+            return 0
 
         async def list_lifecycle_vector_tasks(self, **kwargs) -> list:
             assert kwargs.get("source_id") == "src-neutral"

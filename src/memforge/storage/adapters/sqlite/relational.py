@@ -1083,11 +1083,28 @@ class SqliteRelationalStore:
 
     async def list_lifecycle_reviews(
         self,
-        source_id: str,
+        source_id: str | None = None,
         *,
         status: LifecycleReviewStatus | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
     ) -> list[LifecycleReview]:
-        return await self._db.list_lifecycle_reviews(source_id, status=status)
+        return await self._db.list_lifecycle_reviews(
+            source_id,
+            status=status,
+            limit=limit,
+            offset=offset,
+            newest_first=newest_first,
+        )
+
+    async def count_lifecycle_reviews(
+        self,
+        source_id: str | None = None,
+        *,
+        status: LifecycleReviewStatus | None = None,
+    ) -> int:
+        return await self._db.count_lifecycle_reviews(source_id, status=status)
 
     async def resolve_lifecycle_review(
         self,

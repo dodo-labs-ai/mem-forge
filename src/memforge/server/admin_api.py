@@ -6886,12 +6886,24 @@ def create_admin_app(
         """List all user-facing Reviews through one decision contract."""
         from memforge.memory.lifecycle_plan import LifecycleReviewStatus
 
+        if limit < 1 or limit > 500:
+            raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+        if offset < 0:
+            raise HTTPException(status_code=400, detail="offset must not be negative")
+
         normalized_status = status if status and status != "all" else None
-        reviews = await db.list_memory_reviews(
-            status=normalized_status,
-            kind=kind,
-            limit=limit + offset,
-            offset=0,
+        page_window = limit + offset
+        include_legacy = kind != "lifecycle"
+        include_lifecycle = kind in {None, "lifecycle"}
+        reviews = (
+            await db.list_memory_reviews(
+                status=normalized_status,
+                kind=kind,
+                limit=page_window,
+                offset=0,
+            )
+            if include_legacy
+            else []
         )
 
         review_memories: dict[str, Memory] = {}
@@ -6947,25 +6959,44 @@ def create_admin_app(
             except ValueError:
                 lifecycle_status = None
         lifecycle_count = 0
-        if kind in {None, "lifecycle"}:
-            for source in await db.list_sources():
-                lifecycle_reviews = await db.list_lifecycle_reviews(
-                    str(source["id"]),
-                    status=lifecycle_status,
-                )
-                lifecycle_count += len(lifecycle_reviews)
-                for review in lifecycle_reviews:
-                    responses.append(
-                        await _lifecycle_review_response(
-                            db,
-                            review,
-                            source,
-                            detail=False,
-                        )
+        if include_lifecycle:
+            lifecycle_reviews = await db.list_lifecycle_reviews(
+                status=lifecycle_status,
+                limit=page_window,
+                offset=0,
+                newest_first=True,
+            )
+            lifecycle_count = await db.count_lifecycle_reviews(status=lifecycle_status)
+            sources_by_id = {
+                str(source["id"]): source
+                for source in await db.list_sources()
+            }
+            for review in lifecycle_reviews:
+                source = sources_by_id.get(review.source_id or "")
+                if source is None:
+                    source = {
+                        "id": review.source_id,
+                        "name": None,
+                        "type": None,
+                    }
+                responses.append(
+                    await _lifecycle_review_response(
+                        db,
+                        review,
+                        source,
+                        detail=False,
                     )
+                )
 
-        responses.sort(key=lambda item: item.created_at or "", reverse=True)
-        total = await db.count_memory_reviews(status=normalized_status, kind=kind)
+        responses.sort(
+            key=lambda item: (item.created_at or "", item.id),
+            reverse=True,
+        )
+        total = (
+            await db.count_memory_reviews(status=normalized_status, kind=kind)
+            if include_legacy
+            else 0
+        )
         return MemoryReviewListResponse(
             data=responses[offset : offset + limit],
             total=total + lifecycle_count,

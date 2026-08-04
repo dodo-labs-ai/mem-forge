@@ -3,5 +3,6 @@ export const STATS_REFETCH_MS = 30_000;
 export const SYNC_POLL_MS = 2_000;
 export const LIST_PAGE_SIZE = 50;
 export const ENTITY_PAGE_SIZE = 100;
+export const REVIEW_QUEUE_PAGE_SIZE = 25;
 export const SUCCESS_BANNER_DISMISS_MS = 10_000;
 export const SYNC_BANNER_VISIBLE_MS = 30_000;

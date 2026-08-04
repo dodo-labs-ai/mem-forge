@@ -8331,28 +8331,78 @@ class Database:
         return json.loads(row["payload_json"]) if row is not None else None
 
     async def get_lifecycle_review(self, review_id: str) -> LifecycleReview | None:
-        async with self.db.execute("SELECT * FROM lifecycle_reviews WHERE id = ?", (review_id,)) as cursor:
+        async with self.db.execute(
+            "SELECT lr.*, lp.source_id AS source_id FROM lifecycle_reviews lr "
+            "JOIN lifecycle_plans lp ON lp.id = lr.lifecycle_plan_id WHERE lr.id = ?",
+            (review_id,),
+        ) as cursor:
             row = await cursor.fetchone()
         return self._row_to_lifecycle_review(row) if row is not None else None
 
     async def list_lifecycle_reviews(
         self,
-        source_id: str,
+        source_id: str | None = None,
         *,
         status: LifecycleReviewStatus | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
     ) -> list[LifecycleReview]:
-        params: list[object] = [source_id]
-        status_clause = ""
+        if offset < 0:
+            raise ValueError("lifecycle review offset must not be negative")
+        if limit is not None and limit < 1:
+            raise ValueError("lifecycle review limit must be positive")
+        if limit is None and offset:
+            raise ValueError("lifecycle review offset requires a limit")
+
+        conditions: list[str] = []
+        params: list[object] = []
+        if source_id is not None:
+            conditions.append("lp.source_id = ?")
+            params.append(source_id)
         if status is not None:
-            status_clause = " AND lr.status = ?"
+            conditions.append("lr.status = ?")
             params.append(status.value)
+        direction = "DESC" if newest_first else "ASC"
+        query = (
+            "SELECT lr.*, lp.source_id AS source_id FROM lifecycle_reviews lr "
+            "JOIN lifecycle_plans lp ON lp.id = lr.lifecycle_plan_id"
+        )
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += f" ORDER BY lr.created_at {direction}, lr.id {direction}"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend((limit, offset))
         rows = await self.db.execute_fetchall(
-            "SELECT lr.* FROM lifecycle_reviews lr "
-            "JOIN lifecycle_plans lp ON lp.id = lr.lifecycle_plan_id "
-            "WHERE lp.source_id = ?" + status_clause + " ORDER BY lr.created_at, lr.id",
+            query,
             tuple(params),
         )
         return [self._row_to_lifecycle_review(row) for row in rows]
+
+    async def count_lifecycle_reviews(
+        self,
+        source_id: str | None = None,
+        *,
+        status: LifecycleReviewStatus | None = None,
+    ) -> int:
+        conditions: list[str] = []
+        params: list[object] = []
+        if source_id is not None:
+            conditions.append("lp.source_id = ?")
+            params.append(source_id)
+        if status is not None:
+            conditions.append("lr.status = ?")
+            params.append(status.value)
+        query = (
+            "SELECT COUNT(*) FROM lifecycle_reviews lr "
+            "JOIN lifecycle_plans lp ON lp.id = lr.lifecycle_plan_id"
+        )
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        async with self.db.execute(query, tuple(params)) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
 
     async def resolve_lifecycle_review(
         self,
@@ -9071,6 +9121,7 @@ class Database:
             reviewer=row["reviewer"],
             created_at=row["created_at"],
             resolved_at=row["resolved_at"],
+            source_id=row["source_id"] if "source_id" in row.keys() else None,
         )
 
     def _row_to_lifecycle_backfill_job(self, row) -> LifecycleBackfillJob:
@@ -17621,7 +17672,7 @@ class Database:
         if kind:
             query += " AND kind = ?"
             params.append(kind)
-        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        query += " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
         results: list[MemoryReview] = []
