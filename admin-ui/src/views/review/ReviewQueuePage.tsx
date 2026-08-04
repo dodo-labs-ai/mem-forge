@@ -12,6 +12,10 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { REVIEW_QUEUE_PAGE_SIZE } from "@/lib/constants";
 import { timeAgo } from "@/utils/date";
+import {
+  buildReviewChangeCue,
+  type ReviewCueExcerpt,
+} from "@/views/review/reviewQueueCue";
 
 function useReviewQueue(page: number) {
   return useQuery<MemoryReviewListResponse>({
@@ -29,9 +33,21 @@ function useReviewQueue(page: number) {
   });
 }
 
-function preview(value: string | null | undefined): string {
-  if (!value) return "Not available in this proposal";
-  return value.length > 120 ? `${value.slice(0, 117)}…` : value;
+function CueExcerpt({ value, emptyText }: { value: ReviewCueExcerpt | null; emptyText: string }) {
+  if (!value) return <span>{emptyText}</span>;
+  return (
+    <span>
+      {value.before}
+      {value.before && value.changed ? " " : null}
+      {value.changed ? (
+        <mark className="bg-amber-100/80 px-0.5 text-foreground dark:bg-amber-900/40">
+          {value.changed}
+        </mark>
+      ) : null}
+      {value.changed && value.after ? " " : null}
+      {value.after}
+    </span>
+  );
 }
 
 function pageFromSearchParams(searchParams: URLSearchParams): number {
@@ -93,8 +109,12 @@ export function ReviewQueuePage() {
           }
         >
           <ul className="divide-y divide-border">
-            {reviews.map((review) => (
-              <li key={review.id}>
+            {reviews.map((review) => {
+              const cue = buildReviewChangeCue(
+                review.incumbent?.content,
+                review.challenger?.content,
+              );
+              return <li key={review.id}>
                 <button
                   type="button"
                   onClick={() => navigate(`/review/${review.id}`)}
@@ -106,6 +126,7 @@ export function ReviewQueuePage() {
                         {review.source_name ??
                           (review.review_origin === "lifecycle" ? "Source sync" : "Memory update")}
                       </Badge>
+                      <Badge variant="outline">{review.presentation.decision_label}</Badge>
                       <span>{timeAgo(review.created_at)}</span>
                     </div>
                     <h2 className="mt-1.5 text-sm font-semibold">
@@ -116,23 +137,26 @@ export function ReviewQueuePage() {
                         <span className="mr-2 text-[11px] font-medium uppercase tracking-wide">
                           {review.presentation.current_label}
                         </span>
-                        {preview(review.incumbent?.content)}
+                        <CueExcerpt value={cue.current} emptyText="Current memory unavailable" />
                       </p>
                       <p className="min-w-0 truncate text-sm text-muted-foreground">
                         <span className="mr-2 text-[11px] font-medium uppercase tracking-wide">
                           {review.presentation.proposed_label}
                         </span>
-                        {preview(review.challenger?.content)}
+                        <CueExcerpt
+                          value={cue.proposed}
+                          emptyText={review.presentation.proposed_empty_text}
+                        />
                       </p>
                     </div>
                   </div>
-                  <span className="mt-1 flex shrink-0 items-center gap-1 text-sm font-medium">
-                    Review
-                    <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+                  <span className="mt-1 flex shrink-0 items-center text-muted-foreground">
+                    <span className="sr-only">Open review</span>
+                    <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
                   </span>
                 </button>
               </li>
-            ))}
+            })}
           </ul>
         </AsyncBoundary>
 
