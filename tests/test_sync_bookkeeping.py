@@ -6685,6 +6685,66 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
 
 
 @pytest.mark.asyncio
+async def test_source_sync_worker_does_not_treat_direct_cloud_jira_as_authoritative_snapshot(
+    db: Database,
+):
+    import memforge.runtime as runtime
+
+    source_id = "src-cloud-jira-incremental"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Cloud Jira",
+        config_json=json.dumps(
+            {
+                "sync_mode": "cloud",
+                "query_mode": "advanced",
+                "jql": "project = SFPAY",
+            }
+        ),
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
+    class CapturingRuntimeProvider:
+        def __init__(self) -> None:
+            self.authoritative_snapshot: bool | None = None
+            self.source: dict | None = None
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            self.authoritative_snapshot = kwargs["authoritative_snapshot"]
+            self.source = kwargs["source"]
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    provider = CapturingRuntimeProvider()
+    await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="manual",
+        force_full_sync=False,
+    )
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=provider,
+        worker_id="worker-cloud-jira",
+    )
+
+    await worker.run_once()
+
+    assert provider.authoritative_snapshot is False
+    assert provider.source is not None
+    assert "local_agent_package_manifest" not in provider.source["config"]
+
+
+@pytest.mark.asyncio
 async def test_source_projection_reuse_requires_prior_manifest_and_current_lineage(
     db: Database,
 ) -> None:

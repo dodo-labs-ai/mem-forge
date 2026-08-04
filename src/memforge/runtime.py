@@ -1083,7 +1083,10 @@ class SourceSyncWorker:
                         for source_input in inputs
                         if source_input.input_generation <= run.input_generation_watermark
                     ]
-            authoritative_collection = local_agent_collection_is_authoritative(source["type"])
+            authoritative_collection = (
+                run.input_snapshot_id is not None
+                and local_agent_collection_is_authoritative(source["type"])
+            )
             reusable_projection_doc_ids = frozenset()
             if run.input_snapshot_id is not None and not run.force_full_sync:
                 reusable_projection_doc_ids = (
