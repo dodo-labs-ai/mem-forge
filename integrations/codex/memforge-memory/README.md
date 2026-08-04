@@ -2,7 +2,7 @@
 
 This plugin connects Codex lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.38`.
+The packaged runtime and plugin version is `0.1.39`.
 
 With no routing variables, the plugin targets local OSS at
 `http://127.0.0.1:8765/api`. Otherwise set the target in `~/.codex/config.toml`.
@@ -54,13 +54,15 @@ Codex MCP stdio -> plugin-local proxy -> HTTP(S) MemForge API
 get_resource(mode=file) -> ~/.memforge-agent/artifacts -> local_path
 ```
 
-Codex may pass its exact current working directory through the optional MCP
-`repository_context` argument on every MemForge tool. The local proxy uses it
-to select the repository workspace and derive a normalized Git remote, then
-discards the path before calling OSS or Cloud. When context is absent, the
-proxy uses compatible MCP Roots or the configured global workspace. An
-explicit malformed or non-repository context fails before HTTP instead of
-silently reading another workspace.
+The proxy negotiates Codex's request-scoped `codex/sandbox-state-meta`
+capability. Codex then attaches the current task environment's `sandboxCwd` to
+each MCP tool call, allowing the proxy to select the repository workspace and
+derive a normalized Git remote without relying on a process-global directory.
+An explicit `repository_context.working_directory` remains available for other
+hosts and takes precedence when supplied. Compatible MCP Roots and the global
+workspace are fallbacks. Local paths are discarded before OSS or Cloud calls;
+malformed negotiated or explicit context fails before HTTP instead of silently
+reading another workspace.
 
 Install from GitHub (no checkout required):
 
