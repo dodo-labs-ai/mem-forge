@@ -594,6 +594,7 @@ export interface TeamsAuthStatus {
 export type MemoryReviewStatus = "pending" | "approved" | "rejected" | "stale";
 export type MemoryReviewKind = "supersede";
 export type MemoryReviewActionKey = "use_latest_state" | "keep_current_state";
+export type MemoryReviewDecisionLabel = "Updated" | "Support removed" | "Conflict";
 
 export interface MemoryReviewActionPresentation {
   key: MemoryReviewActionKey;
@@ -603,10 +604,12 @@ export interface MemoryReviewActionPresentation {
 }
 
 export interface MemoryReviewPresentation {
+  decision_label: MemoryReviewDecisionLabel;
   summary: string;
   why_human: string;
   current_label: string;
   proposed_label: string;
+  proposed_empty_text: string;
   actions: MemoryReviewActionPresentation[];
   technical_reason: string | null;
 }
