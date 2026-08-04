@@ -145,8 +145,11 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
     assert [(source.doc_id, source.source_type) for source in sources] == [
         (f"user-memory-{result.memory_id}", "user_memory")
     ]
-    assert sources[0].excerpt == "Use Status and FollowUpStepStatus when polling PayrollProcessingTriggerViews."
-    assert sources[0].excerpt != stored.extraction_context
+    assert sources[0].excerpt == (
+        "During the xall-004 smoke test, PayrollProcessingTriggerViews polling only "
+        "matched after using Status and FollowUpStepStatus."
+    )
+    assert sources[0].excerpt == stored.extraction_context
     document = await db.get_document(f"user-memory-{result.memory_id}")
     assert document is not None
     assert document.source == "user_memory"
@@ -240,8 +243,8 @@ async def test_replace_document_memory_creates_correction_provenance_without_car
     assert [(source.doc_id, source.source_type) for source in new_sources] == [
         (f"correction-{result.replacement_memory_id}", "user_correction")
     ]
-    assert new_sources[0].excerpt == "Mount Tai defects use queue B"
-    assert new_sources[0].excerpt != "User corrected this after reviewing the Mount Tai defect triage board."
+    assert new_sources[0].excerpt == "User corrected this after reviewing the Mount Tai defect triage board."
+    assert new_sources[0].excerpt == stored_new.extraction_context
 
 
 @pytest.mark.asyncio
@@ -528,7 +531,18 @@ async def test_create_memory_route_audits_request_principal_and_client(db: Datab
 
     assert response.status_code == 200, response.text
     assert detail_response.status_code == 200, detail_response.text
-    assert detail_response.json()["id"] == payload["memory_id"]
+    detail = detail_response.json()
+    assert detail["id"] == payload["memory_id"]
+    assert detail["content"] == "Use canonical payroll trigger status fields."
+    [source] = detail["sources"]
+    assert source["doc_id"] == f"user-memory-{payload['memory_id']}"
+    assert source["source_type"] == "user_memory"
+    assert source["support_kind"] == "extracted"
+    assert source["doc_title"] == f"User memory {payload['memory_id']}"
+    assert source["source_url"] == f"memforge://user-memory/user-memory-{payload['memory_id']}"
+    assert source["content_url"] is None
+    assert source["pdf_url"] is None
+    assert source["excerpt"] == "User confirmed this after validating the payroll smoke flow."
     stored = await db.get_memory(payload["memory_id"])
     assert payload["status"] == "inserted"
     assert stored is not None

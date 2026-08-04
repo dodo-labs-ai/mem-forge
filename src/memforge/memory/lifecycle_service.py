@@ -114,7 +114,7 @@ class MemoryLifecycleService:
             doc_id,
             "user_memory",
             source_updated_at=now,
-            excerpt=content,
+            excerpt=provenance,
         )
         memory_id = memory.id
         if status != "inserted":
@@ -228,7 +228,7 @@ class MemoryLifecycleService:
                     replacement_kind=replacement_kind,
                     replacement_reason=reason,
                     source_updated_at=now,
-                    excerpt=replacement_content,
+                    excerpt=provenance,
                     carry_revision_sources=False,
                 )
             except ValueError as exc:
