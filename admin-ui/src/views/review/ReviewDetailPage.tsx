@@ -225,7 +225,7 @@ export function ReviewDetailPage() {
         <StateCard
           label={review.presentation.proposed_label}
           memory={review.challenger}
-          emptyCopy="The proposal removes source support rather than introducing replacement text."
+          emptyCopy={review.presentation.proposed_empty_text}
         />
       </div>
 
