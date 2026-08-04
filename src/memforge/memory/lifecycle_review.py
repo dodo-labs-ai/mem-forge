@@ -26,6 +26,9 @@ from memforge.memory.relation_discovery_contract import (
 def build_lifecycle_review_approval_plan(
     review: LifecycleReview,
     original_plan_payload: Mapping[str, object],
+    *,
+    reviewer: str | None = None,
+    review_note: str | None = None,
 ) -> LifecyclePlan:
     """Turn a pending proposal into a fresh atomic plan with original stale guards.
 
@@ -72,7 +75,12 @@ def build_lifecycle_review_approval_plan(
         mutation_type=LifecycleMutationType.RESOLVE_REVIEW,
         memory_id=incumbent_id,
         source_id=source_id,
-        payload={"review_id": review.id, "status": LifecycleReviewStatus.APPROVED.value},
+        payload={
+            "review_id": review.id,
+            "status": LifecycleReviewStatus.APPROVED.value,
+            "reviewer": reviewer,
+            "review_note": review_note,
+        },
     )
     scope = ReconciliationScope(
         id=f"{_text(scope_payload.get('id'), 'scope.id')}:review:{review.id}",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from typing import Any
 
@@ -11,11 +12,11 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.lifecycle_plan import LifecycleReviewStatus
 from memforge.memory.review_service import (
     ReviewAlreadyResolved,
     ReviewError,
     ReviewService,
-    ReviewStaleConflict,
 )
 from memforge.memory.store import MemoryStore
 from memforge.models import (
@@ -202,6 +203,9 @@ async def _seed_supersede_review(
     )
     await db.insert_memory(challenger)
 
+    # Re-fetch first so the optimistic guards use the exact persisted values.
+    incumbent = await db.get_memory(incumbent.id)  # type: ignore[assignment]
+    challenger = await db.get_memory(challenger.id)  # type: ignore[assignment]
     review = MemoryReview(
         id=generate_review_id(),
         kind=ReviewKind.SUPERSEDE.value,
@@ -215,20 +219,77 @@ async def _seed_supersede_review(
         created_at=datetime.now(timezone.utc),
     )
     await db.insert_memory_review(review)
-
-    # Re-fetch to pick up the on-disk timestamps so guards see the actual values.
-    incumbent = await db.get_memory(incumbent.id)  # type: ignore[assignment]
-    challenger = await db.get_memory(challenger.id)  # type: ignore[assignment]
-    review = await db.get_memory_review(review.id)  # type: ignore[assignment]
-    # Re-pin expectations to the freshly stored timestamps so the fixture is
-    # not pre-stale before the test even starts.
-    await db.refresh_memory_review_expectations(
-        review.id,
-        expected_incumbent_updated_at=incumbent.updated_at.isoformat(),
-        expected_challenger_updated_at=challenger.updated_at.isoformat(),
-    )
     review = await db.get_memory_review(review.id)  # type: ignore[assignment]
     return incumbent, challenger, review
+
+
+async def _seed_lifecycle_review(db: Database, *, review_id: str = "review-lifecycle") -> str:
+    incumbent = _memory("mem-lifecycle-current", "The service stays with Team Vita.")
+    await db.insert_memory(incumbent)
+    await db.upsert_source(
+        id="src-lifecycle",
+        type="jira",
+        name="Mount Tai Backlog",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "scope": {
+            "id": "scope-lifecycle",
+            "source_id": "src-lifecycle",
+            "source_unit_id": "unit-jira-1",
+            "base_unit_revision_id": "unitrev-1",
+            "target_unit_revision_id": "unitrev-2",
+        },
+        "stale_guard": {
+            "observation_revision_ids": [],
+            "support_set_hashes": {incumbent.id: "support-hash"},
+            "memory_versions": {incumbent.id: incumbent.updated_at.isoformat()},
+        },
+    }
+    await db.db.execute(
+        """INSERT INTO lifecycle_plans (
+               id, reconciliation_scope_id, source_id, source_unit_id,
+               target_unit_revision_id, status, payload_json, payload_hash, created_at
+           ) VALUES (?, ?, ?, ?, ?, 'applied', ?, ?, ?)""",
+        (
+            "plan-lifecycle-review",
+            "scope-lifecycle",
+            "src-lifecycle",
+            "unit-jira-1",
+            "unitrev-2",
+            json.dumps(payload),
+            "payload-hash",
+            now,
+        ),
+    )
+    staged = {
+        "proposed_disposition": "supersede",
+        "replacement_memory_id": "mem-lifecycle-proposed",
+        "candidate": {
+            "content": "The service moves to Team Pfizer.",
+            "memory_type": "fact",
+            "confidence": 0.91,
+        },
+        "proposed_mutations": [],
+    }
+    await db.db.execute(
+        """INSERT INTO lifecycle_reviews (
+               id, lifecycle_plan_id, incumbent_memory_id, status,
+               staged_evidence_json, reason, created_at
+           ) VALUES (?, 'plan-lifecycle-review', ?, 'pending', ?, ?, ?)""",
+        (
+            review_id,
+            incumbent.id,
+            json.dumps(staged),
+            "candidate_supersede_vs_audit_keep",
+            now,
+        ),
+    )
+    await db.db.commit()
+    return review_id
 
 
 async def _attach_related_challenger(
@@ -348,7 +409,7 @@ class TestReviewCrud:
         assert [r.id for r in approved] == [review.id]
 
     @pytest.mark.asyncio
-    async def test_open_reviews_include_pending_and_stale_but_not_resolved(self, db, chroma):
+    async def test_open_reviews_include_only_actionable_pending_reviews(self, db, chroma):
         _, _, pending_review = await _seed_supersede_review(db, chroma, suffix="pend")
         _, _, stale_review = await _seed_supersede_review(db, chroma, suffix="stale")
         _, _, approved_review = await _seed_supersede_review(db, chroma, suffix="appr")
@@ -368,8 +429,8 @@ class TestReviewCrud:
         open_reviews = await db.list_memory_reviews(status="open")
         open_count = await db.count_memory_reviews(status="open")
 
-        assert {r.id for r in open_reviews} == {pending_review.id, stale_review.id}
-        assert open_count == 2
+        assert [r.id for r in open_reviews] == [pending_review.id]
+        assert open_count == 1
 
     @pytest.mark.asyncio
     async def test_review_list_includes_pending_challenger_snapshot(self, db, chroma, tmp_path):
@@ -552,6 +613,61 @@ class TestReviewCrud:
 # ---------------------------------------------------------------------------
 
 
+class TestUnifiedLifecycleReviewApi:
+    @pytest.mark.asyncio
+    async def test_queue_and_detail_present_lifecycle_review_as_two_user_decisions(
+        self, db, tmp_path
+    ):
+        review_id = await _seed_lifecycle_review(db)
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            queue = client.get("/api/memory-reviews", params={"status": "open"})
+            detail = client.get(f"/api/memory-reviews/{review_id}")
+
+        assert queue.status_code == 200
+        row = next(item for item in queue.json()["data"] if item["id"] == review_id)
+        assert row["review_origin"] == "lifecycle"
+        assert row["source_name"] == "Mount Tai Backlog"
+        assert row["presentation"]["summary"] == (
+            "A source update proposes a newer state for this memory."
+        )
+        assert [action["key"] for action in row["presentation"]["actions"]] == [
+            "use_latest_state",
+            "keep_current_state",
+        ]
+        assert detail.status_code == 200
+        assert detail.json()["incumbent"]["content"] == "The service stays with Team Vita."
+        assert detail.json()["challenger"]["content"] == "The service moves to Team Pfizer."
+
+    @pytest.mark.asyncio
+    async def test_keep_current_state_requires_and_records_a_note(self, db, tmp_path):
+        review_id = await _seed_lifecycle_review(db)
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            missing = client.post(f"/api/memory-reviews/{review_id}/reject", json={})
+            kept = client.post(
+                f"/api/memory-reviews/{review_id}/reject",
+                json={"note": "The current ownership remains valid.", "reviewer": "alice"},
+            )
+
+        assert missing.status_code == 400
+        assert kept.status_code == 200
+        assert kept.json()["status"] == "rejected"
+        stored = await db.get_lifecycle_review(review_id)
+        assert stored is not None
+        assert stored.review_note == "The current ownership remains valid."
+        assert stored.reviewer == "alice"
+        open_rows = await db.list_lifecycle_reviews(
+            "src-lifecycle",
+            status=LifecycleReviewStatus.PENDING,
+        )
+        assert open_rows == []
+
+
 class TestApprove:
     @pytest.mark.asyncio
     async def test_approve_promotes_challenger_and_supersedes_incumbent(self, db, chroma, review_service):
@@ -715,7 +831,7 @@ class TestApprove:
         assert (await db.get_memory(challenger.id)).updated_at == snapshot_challenger.updated_at
 
     @pytest.mark.asyncio
-    async def test_stale_incumbent_blocks_approval_and_marks_review_stale(self, db, chroma, review_service):
+    async def test_memory_drift_expires_review_before_it_can_be_decided(self, db, chroma, review_service):
         incumbent, _, review = await _seed_supersede_review(db, chroma)
 
         await db.update_memory_content(
@@ -724,11 +840,13 @@ class TestApprove:
             new_confidence=None,
         )
 
-        with pytest.raises(ReviewStaleConflict):
+        with pytest.raises(ReviewAlreadyResolved, match="already stale"):
             await review_service.approve(review.id, reviewer="alice", note=None)
 
         stored = await db.get_memory_review(review.id)
         assert stored.status == "stale"
+        assert stored.resolved_at is not None
+        assert await db.list_memory_reviews(status="open") == []
 
 
 # ---------------------------------------------------------------------------
@@ -899,48 +1017,3 @@ class TestCrossSourceReviewResolution:
         assert (await db.get_memory(incumbent.id)).status == "active"
         assert (await db.get_memory(challenger.id)).status == "active"
         assert set(chroma.records) == {incumbent.id, challenger.id}
-
-
-# ---------------------------------------------------------------------------
-# Refresh
-# ---------------------------------------------------------------------------
-
-
-class TestRefresh:
-    @pytest.mark.asyncio
-    async def test_refresh_repins_expectations_after_drift(self, db, chroma, review_service):
-        incumbent, _, review = await _seed_supersede_review(db, chroma)
-
-        await db.update_memory_content(
-            incumbent.id,
-            new_content="PostgreSQL is now version 15",
-            new_confidence=None,
-        )
-
-        result = await review_service.refresh(review.id)
-
-        refreshed_incumbent = await db.get_memory(incumbent.id)
-        assert result.review.status == "pending"
-        assert result.review.expected_incumbent_updated_at == refreshed_incumbent.updated_at.isoformat()
-
-    @pytest.mark.asyncio
-    async def test_refresh_clears_stale_attempt_metadata(self, db, chroma, review_service):
-        incumbent, _, review = await _seed_supersede_review(db, chroma)
-
-        await db.update_memory_content(
-            incumbent.id,
-            new_content="PostgreSQL is now version 15",
-            new_confidence=None,
-        )
-        with pytest.raises(ReviewStaleConflict):
-            await review_service.approve(review.id, reviewer="alice", note=None)
-
-        stale = await db.get_memory_review(review.id)
-        assert stale.status == "stale"
-
-        result = await review_service.refresh(review.id)
-
-        assert result.review.status == "pending"
-        assert result.review.reviewer is None
-        assert result.review.review_note is None
-        assert result.review.resolved_at is None

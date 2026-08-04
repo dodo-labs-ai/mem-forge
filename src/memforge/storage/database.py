@@ -1110,6 +1110,8 @@ CREATE TABLE IF NOT EXISTS lifecycle_reviews (
     status              TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'stale')),
     staged_evidence_json TEXT NOT NULL DEFAULT '{}',
     reason              TEXT,
+    review_note         TEXT,
+    reviewer            TEXT,
     created_at          TEXT NOT NULL,
     resolved_at         TEXT
 );
@@ -3181,6 +3183,34 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         [
             "ALTER TABLE lifecycle_vector_outbox ADD COLUMN next_attempt_at TEXT",
             "ALTER TABLE source_deletion_vector_outbox ADD COLUMN next_attempt_at TEXT",
+        ],
+    ),
+    (
+        73,
+        "Record lifecycle Review decisions",
+        [
+            "ALTER TABLE lifecycle_reviews ADD COLUMN review_note TEXT",
+            "ALTER TABLE lifecycle_reviews ADD COLUMN reviewer TEXT",
+            """UPDATE memory_reviews
+               SET status = 'stale', resolved_at = COALESCE(resolved_at, datetime('now'))
+               WHERE status = 'pending' AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM memories incumbent
+                       WHERE incumbent.id = memory_reviews.incumbent_memory_id
+                         AND (
+                             memory_reviews.expected_incumbent_updated_at IS NULL
+                             OR memory_reviews.expected_incumbent_updated_at = incumbent.updated_at
+                         )
+                   )
+                   OR NOT EXISTS (
+                       SELECT 1 FROM memories challenger
+                       WHERE challenger.id = memory_reviews.challenger_memory_id
+                         AND (
+                             memory_reviews.expected_challenger_updated_at IS NULL
+                             OR memory_reviews.expected_challenger_updated_at = challenger.updated_at
+                         )
+                   )
+               )""",
         ],
     ),
 ]
@@ -8149,8 +8179,8 @@ class Database:
             await self.db.execute(
                 """INSERT INTO lifecycle_reviews (
                     id, lifecycle_plan_id, incumbent_memory_id, status,
-                    staged_evidence_json, reason, created_at, resolved_at
-                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, NULL)""",
+                    staged_evidence_json, reason, review_note, reviewer, created_at, resolved_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, NULL, NULL, ?, NULL)""",
                 (
                     review_id,
                     plan_id,
@@ -8169,9 +8199,16 @@ class Database:
             if status != LifecycleReviewStatus.APPROVED.value:
                 raise ValueError("atomic lifecycle review resolution only supports approval")
             cursor = await self.db.execute(
-                "UPDATE lifecycle_reviews SET status = 'approved', resolved_at = ? "
+                "UPDATE lifecycle_reviews SET status = 'approved', resolved_at = ?, "
+                "reviewer = ?, review_note = ? "
                 "WHERE id = ? AND incumbent_memory_id = ? AND status = 'pending'",
-                (now, review_id, mutation.memory_id),
+                (
+                    now,
+                    mutation.payload.get("reviewer"),
+                    mutation.payload.get("review_note"),
+                    review_id,
+                    mutation.memory_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValueError("lifecycle review approval stale guard failed")
@@ -8321,13 +8358,17 @@ class Database:
         self,
         review_id: str,
         status: LifecycleReviewStatus,
+        *,
+        reviewer: str | None = None,
+        review_note: str | None = None,
     ) -> LifecycleReview:
         if status not in {LifecycleReviewStatus.REJECTED, LifecycleReviewStatus.STALE}:
             raise ValueError("direct lifecycle review resolution must be rejected or stale")
         async with self._write_lock:
             cursor = await self.db.execute(
-                "UPDATE lifecycle_reviews SET status = ?, resolved_at = ? WHERE id = ? AND status = 'pending'",
-                (status.value, _now_iso(), review_id),
+                "UPDATE lifecycle_reviews SET status = ?, resolved_at = ?, reviewer = ?, review_note = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (status.value, _now_iso(), reviewer, review_note, review_id),
             )
             if cursor.rowcount != 1:
                 raise ValueError("lifecycle review is not pending")
@@ -9026,6 +9067,8 @@ class Database:
             status=LifecycleReviewStatus(row["status"]),
             staged_evidence=json.loads(row["staged_evidence_json"] or "{}"),
             reason=row["reason"],
+            review_note=row["review_note"],
+            reviewer=row["reviewer"],
             created_at=row["created_at"],
             resolved_at=row["resolved_at"],
         )
@@ -10673,6 +10716,7 @@ class Database:
                     memory_id,
                 ),
             )
+            await self._stale_pending_reviews_unlocked((memory_id,), now=now)
             await self._rebuild_memory_fts_unlocked(
                 memory_id,
                 search_visible_statuses=set(allowed_search_statuses()),
@@ -17384,7 +17428,7 @@ class Database:
                  ON ms.memory_id = mr.challenger_memory_id
                WHERE mr.incumbent_memory_id = ?
                  AND mr.kind = ?
-                 AND mr.status IN ('pending', 'stale')
+                 AND mr.status = 'pending'
                  AND ms.doc_id = ?
                ORDER BY mr.created_at DESC LIMIT 1""",
             (incumbent_memory_id, kind, doc_id),
@@ -17570,7 +17614,7 @@ class Database:
         params: list = []
         if status:
             if status == "open":
-                query += " AND status IN ('pending', 'stale')"
+                query += " AND status = 'pending'"
             else:
                 query += " AND status = ?"
                 params.append(status)
@@ -17595,7 +17639,7 @@ class Database:
         params: list = []
         if status:
             if status == "open":
-                query += " AND status IN ('pending', 'stale')"
+                query += " AND status = 'pending'"
             else:
                 query += " AND status = ?"
                 params.append(status)
@@ -17621,33 +17665,6 @@ class Database:
                     status = ?, reviewer = ?, review_note = ?, resolved_at = ?
                    WHERE id = ?""",
                 (status, reviewer, review_note, now, review_id),
-            )
-            await self.db.commit()
-
-    async def refresh_memory_review_expectations(
-        self,
-        review_id: str,
-        *,
-        expected_incumbent_updated_at: str | None,
-        expected_challenger_updated_at: str | None,
-    ) -> None:
-        """Re-pin the review's optimistic-concurrency expectations to current state.
-
-        Returns the review to ``pending`` and clears any reviewer/note/resolved
-        timestamp left from the previous stale-marking attempt: the next
-        decision starts fresh against the refreshed expectations.
-        """
-        async with self._write_lock:
-            await self.db.execute(
-                """UPDATE memory_reviews SET
-                    expected_incumbent_updated_at = ?,
-                    expected_challenger_updated_at = ?,
-                    status = 'pending',
-                    reviewer = NULL,
-                    review_note = NULL,
-                    resolved_at = NULL
-                   WHERE id = ?""",
-                (expected_incumbent_updated_at, expected_challenger_updated_at, review_id),
             )
             await self.db.commit()
 

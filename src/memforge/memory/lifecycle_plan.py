@@ -283,6 +283,8 @@ class LifecycleReview:
     status: LifecycleReviewStatus
     staged_evidence: Mapping[str, object]
     reason: str | None = None
+    review_note: str | None = None
+    reviewer: str | None = None
     created_at: str | None = None
     resolved_at: str | None = None
 
