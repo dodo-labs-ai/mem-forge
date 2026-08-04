@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.39"
+SERVER_VERSION = "0.1.40"
 SERVER_INSTRUCTIONS = (
     "Repository context is optional. When the coding host exposes an exact current working "
     "directory, pass it as repository_context.working_directory on every MemForge tool call. "
