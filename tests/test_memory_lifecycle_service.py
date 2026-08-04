@@ -28,6 +28,7 @@ from memforge.models import (
     content_hash,
 )
 from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.retrieval.search import SearchEngine
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -500,7 +501,11 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_create_memory_route_audits_request_principal_and_client(db: Database, tmp_path, monkeypatch):
+async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_search(
+    db: Database,
+    tmp_path,
+    monkeypatch,
+):
     from memforge.server.admin_api import create_admin_app
 
     async def fake_embed(self, _text: str) -> list[float]:
@@ -508,10 +513,34 @@ async def test_create_memory_route_audits_request_principal_and_client(db: Datab
 
     monkeypatch.setattr("memforge.memory.store.MemoryStore._embed", fake_embed)
 
+    class RoundTripRuntimeProvider:
+        def build_adapters(self, database, memory_collection, *, audit_logger=None):
+            return build_sqlite_adapters(
+                database,
+                memory_collection,
+                audit_logger=audit_logger,
+            )
+
+        async def build_search_engine(self, database, config, *, audit_logger=None):
+            adapters = build_sqlite_adapters(
+                database,
+                RecordingCollection(),
+                audit_logger=audit_logger,
+            )
+            return SearchEngine(
+                relational=adapters.relational,
+                keyword=adapters.keyword,
+                vector=adapters.vector,
+                embed_cfg={},
+                config=config.retrieval,
+                embedding_provider=lambda _text: None,
+            )
+
     app = create_admin_app(
         db=db,
         config=_api_config(tmp_path),
         principal_resolver=lambda _request: "andrew.sun01@sap.com",
+        runtime_provider=RoundTripRuntimeProvider(),
     )
 
     with TestClient(app) as client:
@@ -525,12 +554,30 @@ async def test_create_memory_route_audits_request_principal_and_client(db: Datab
             },
         )
         payload = response.json()
+        search_response = client.post(
+            "/api/memories/search",
+            json={
+                "query": "canonical payroll trigger status fields",
+                "include_private": True,
+                "top_k": 10,
+            },
+        )
         detail_response = client.get(
             f"/api/memories/{payload['memory_id']}?include_private=true"
         )
 
     assert response.status_code == 200, response.text
+    assert search_response.status_code == 200, search_response.text
     assert detail_response.status_code == 200, detail_response.text
+    search_payload = search_response.json()
+    [search_result] = [
+        result
+        for result in search_payload["results"]
+        if result["memory_id"] == payload["memory_id"]
+    ]
+    assert search_result["summary"] == "Use canonical payroll trigger status fields."
+    assert "User confirmed this after validating the payroll smoke flow." not in str(search_result)
+    assert "sources" not in search_result
     detail = detail_response.json()
     assert detail["id"] == payload["memory_id"]
     assert detail["content"] == "Use canonical payroll trigger status fields."
