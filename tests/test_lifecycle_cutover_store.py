@@ -1676,10 +1676,15 @@ async def test_backfill_single_observation_without_exact_excerpt_does_not_copy_r
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("current_revision_id", "expected_mapped", "expected_findings"),
-    (("obsrev-supported", 1, 0), ("obsrev-newer", 0, 1)),
+    ("support_revision_ids", "current_revision_id", "expected_mapped", "expected_findings"),
+    (
+        (("obsrev-supported",), "obsrev-supported", 1, 0),
+        (("obsrev-supported",), "obsrev-newer", 0, 1),
+        (("obsrev-old", "obsrev-supported"), "obsrev-supported", 1, 0),
+    ),
 )
 async def test_backfill_trusts_existing_active_support_only_at_current_revision(
+    support_revision_ids: tuple[str, ...],
     current_revision_id: str,
     expected_mapped: int,
     expected_findings: int,
@@ -1693,18 +1698,21 @@ async def test_backfill_trusts_existing_active_support_only_at_current_revision(
         available_provenance={"documents": [{"doc_id": "legacy-doc"}]},
         mapping_attempt={"strategy": "legacy"},
     )
-    support = ActiveSupportEvidence(
-        memory_id="mem-supported",
-        source_id="src-1",
-        reference_id="ref-supported",
-        evidence_unit_id="unit-evidence-supported",
-        role=EvidenceRole.PRIMARY,
-        anchor=SourceAnchor(
-            kind=AnchorKind.WHOLE_OBSERVATION,
-            observation_id="obs-supported",
-            observation_revision_id="obsrev-supported",
-        ),
-        excerpt="Exact supported claim",
+    supports = tuple(
+        ActiveSupportEvidence(
+            memory_id="mem-supported",
+            source_id="src-1",
+            reference_id=f"ref-{revision_id}",
+            evidence_unit_id=f"unit-evidence-{revision_id}",
+            role=EvidenceRole.PRIMARY,
+            anchor=SourceAnchor(
+                kind=AnchorKind.WHOLE_OBSERVATION,
+                observation_id="obs-supported",
+                observation_revision_id=revision_id,
+            ),
+            excerpt="Exact supported claim",
+        )
+        for revision_id in support_revision_ids
     )
 
     class SupportedDb:
@@ -1733,10 +1741,10 @@ async def test_backfill_trusts_existing_active_support_only_at_current_revision(
 
         async def get_active_memory_support_evidence(self, memory_id: str, *, source_id: str):
             assert (memory_id, source_id) == ("mem-supported", "src-1")
-            return (support,)
+            return supports
 
         async def get_evidence_unit(self, evidence_unit_id: str):
-            assert evidence_unit_id == support.evidence_unit_id
+            assert evidence_unit_id in {support.evidence_unit_id for support in supports}
             return replace(
                 _unit(),
                 id=evidence_unit_id,

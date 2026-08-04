@@ -105,6 +105,68 @@ def test_gated_replacement_stages_review_without_mutating_incumbent() -> None:
     assert create_payload["document_source"]["excerpt"] == "A7 is retained"
 
 
+def test_gated_noop_evidence_rebind_stages_review_without_mutating_incumbent() -> None:
+    old = _memory()
+    candidate = RawMemory(
+        content=old.content,
+        memory_type=old.memory_type,
+        confidence=0.9,
+        evidence_quote="A7 is removed.",
+        support_validation={"validated_quote": "A7 is removed."},
+    )
+
+    plan = build_lifecycle_plan(
+        plan_id="plan-noop-rebind",
+        scope=_scope(),
+        gate_state=LifecycleGateState.GATED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=old.id,
+                memory=candidate,
+                reason="claim unchanged; evidence moved to current revision",
+            ),
+        ),
+        incumbents={old.id: old},
+        source_support_reference_ids={old.id: ("eref-old",)},
+        all_active_support_reference_ids={old.id: ("eref-old",)},
+        support_set_hashes={old.id: "support-hash"},
+        observation_revision_ids=("obsrev-2",),
+        new_evidence_reference_ids=("eref-new",),
+        defaults=_defaults(),
+    )
+
+    assert [item.mutation_type for item in plan.mutations] == [
+        LifecycleMutationType.CREATE_REVIEW,
+    ]
+    assert plan.coverage_proof.incumbent_decisions[0].disposition.value == "review"
+    proposed = plan.mutations[0].payload["staged_evidence"]["proposed_mutations"]
+    assert [item["mutation_type"] for item in proposed] == [
+        "remove_support",
+        "attach_support",
+    ]
+    assert proposed[0]["evidence_reference_ids"] == ["eref-old"]
+    assert proposed[1]["evidence_reference_ids"] == ["eref-new"]
+
+    mutation = plan.mutations[0]
+    review = LifecycleReview(
+        id=str(mutation.payload["review_id"]),
+        lifecycle_plan_id=plan.id,
+        incumbent_memory_id=mutation.memory_id,
+        status=LifecycleReviewStatus.PENDING,
+        staged_evidence=mutation.payload["staged_evidence"],
+        reason=str(mutation.payload["reason"]),
+    )
+    approval = build_lifecycle_review_approval_plan(review, lifecycle_plan_to_payload(plan))
+
+    assert [item.mutation_type for item in approval.mutations] == [
+        LifecycleMutationType.RESOLVE_REVIEW,
+        LifecycleMutationType.REMOVE_SUPPORT,
+        LifecycleMutationType.ATTACH_SUPPORT,
+    ]
+    assert approval.coverage_proof.incumbent_decisions[0].disposition.value == "keep"
+
+
 def test_pending_review_builds_fresh_atomic_approval_plan() -> None:
     original = _build(gate=LifecycleGateState.GATED)
     mutation = original.mutations[0]

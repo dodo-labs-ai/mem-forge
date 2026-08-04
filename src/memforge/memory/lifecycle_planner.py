@@ -250,11 +250,11 @@ def build_lifecycle_plan(
         external_support = set(all_support).difference(current_source_support)
 
         if operation.action is ReconcileAction.NOOP:
-            decisions.append(IncumbentDecision(memory_id, IncumbentDisposition.KEEP, operation.reason or "kept"))
             evidence_reference_ids = references_for(operation.memory) if operation.memory is not None else ()
+            proposed_mutations: list[LifecycleMutation] = []
             if evidence_reference_ids:
                 if current_source_support and set(evidence_reference_ids) != set(current_source_support):
-                    mutations.append(
+                    proposed_mutations.append(
                         LifecycleMutation(
                             LifecycleMutationType.REMOVE_SUPPORT,
                             memory_id=memory_id,
@@ -262,7 +262,7 @@ def build_lifecycle_plan(
                             evidence_reference_ids=current_source_support,
                         )
                     )
-                mutations.append(
+                proposed_mutations.append(
                     LifecycleMutation(
                         LifecycleMutationType.ATTACH_SUPPORT,
                         memory_id=memory_id,
@@ -275,6 +275,25 @@ def build_lifecycle_plan(
                         },
                     )
                 )
+            if gate_state is LifecycleGateState.GATED and any(
+                item.mutation_type is LifecycleMutationType.REMOVE_SUPPORT
+                for item in proposed_mutations
+            ):
+                decisions.append(
+                    IncumbentDecision(memory_id, IncumbentDisposition.REVIEW, operation.reason or "gate")
+                )
+                mutations.append(
+                    _review_mutation(
+                        scope,
+                        operation,
+                        memory_id,
+                        proposed_mutations=tuple(proposed_mutations),
+                        disposition=IncumbentDisposition.KEEP,
+                    )
+                )
+                continue
+            decisions.append(IncumbentDecision(memory_id, IncumbentDisposition.KEEP, operation.reason or "kept"))
+            mutations.extend(proposed_mutations)
             continue
 
         if operation.action is ReconcileAction.DELETE:

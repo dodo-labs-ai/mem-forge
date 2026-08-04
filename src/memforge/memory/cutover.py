@@ -682,32 +682,33 @@ async def run_source_lifecycle_backfill(
             memory_id,
             source_id=source_id,
         )
-        primary_support = next(
-            (item for item in active_support if item.role is EvidenceRole.PRIMARY),
-            None,
-        )
-        support_unit = (
-            await db.get_evidence_unit(primary_support.evidence_unit_id)
-            if primary_support is not None
-            else None
-        )
-        current_support_revision = None
-        if support_unit is not None and support_unit.source_lineage_id:
+        current_primary_support = None
+        current_primary_unit = None
+        for primary_support in active_support:
+            if primary_support.role is not EvidenceRole.PRIMARY:
+                continue
+            support_unit = await db.get_evidence_unit(primary_support.evidence_unit_id)
+            if (
+                support_unit is None
+                or support_unit.source_id != source_id
+                or not support_unit.source_lineage_id
+            ):
+                continue
             current_revisions = await db.get_current_source_observation_revisions(
                 support_unit.source_lineage_id
             )
             current_support_revision = current_revisions.get(
                 primary_support.anchor.observation_id
             )
-        if (
-            primary_support is not None
-            and support_unit is not None
-            and support_unit.source_id == source_id
-            and support_unit.source_lineage_id
-            and current_support_revision is not None
-            and current_support_revision.id
-            == primary_support.anchor.observation_revision_id
-        ):
+            if (
+                current_support_revision is not None
+                and current_support_revision.id
+                == primary_support.anchor.observation_revision_id
+            ):
+                current_primary_support = primary_support
+                current_primary_unit = support_unit
+                break
+        if current_primary_support is not None and current_primary_unit is not None:
             mapped += 1
             if (
                 existing_finding is not None
@@ -716,8 +717,8 @@ async def run_source_lifecycle_backfill(
                 activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
                 await db.resolve_lifecycle_cutover_finding(
                     finding_id,
-                    observation_id=primary_support.anchor.observation_id,
-                    source_unit_id=support_unit.source_lineage_id,
+                    observation_id=current_primary_support.anchor.observation_id,
+                    source_unit_id=current_primary_unit.source_lineage_id or "",
                     source_activity=activity,
                 )
             continue
