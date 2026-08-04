@@ -21,7 +21,11 @@ assert.doesNotMatch(detail, />\s*Reject\s*</);
 assert.doesNotMatch(detail, /SplitDiffBlock|diffWords/);
 
 assert.match(queue, /review\.presentation\.summary/);
-assert.match(queue, /review\.presentation\.why_human/);
-assert.match(queue, /Review decision/);
+assert.match(queue, /REVIEW_QUEUE_PAGE_SIZE/);
+assert.match(queue, /offset: page \* REVIEW_QUEUE_PAGE_SIZE/);
+assert.match(queue, /<Pagination/);
+assert.match(queue, /searchParams\.get\("page"\)/);
+assert.doesNotMatch(queue, /review\.presentation\.why_human/);
+assert.doesNotMatch(queue, /CardContent/);
 
 console.log("review decision UX contract verified");

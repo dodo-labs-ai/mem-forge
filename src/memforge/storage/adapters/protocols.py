@@ -622,10 +622,19 @@ class RelationalStore(Protocol):
     async def get_lifecycle_review(self, review_id: str) -> LifecycleReview | None: ...
     async def list_lifecycle_reviews(
         self,
-        source_id: str,
+        source_id: str | None = None,
         *,
         status: LifecycleReviewStatus | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+        newest_first: bool = False,
     ) -> list[LifecycleReview]: ...
+    async def count_lifecycle_reviews(
+        self,
+        source_id: str | None = None,
+        *,
+        status: LifecycleReviewStatus | None = None,
+    ) -> int: ...
     async def resolve_lifecycle_review(
         self,
         review_id: str,

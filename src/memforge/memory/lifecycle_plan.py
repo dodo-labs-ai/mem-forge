@@ -287,6 +287,7 @@ class LifecycleReview:
     reviewer: str | None = None
     created_at: str | None = None
     resolved_at: str | None = None
+    source_id: str | None = None
 
 
 class IncumbentDisposition(str, Enum):

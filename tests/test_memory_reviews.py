@@ -642,6 +642,80 @@ class TestUnifiedLifecycleReviewApi:
         assert detail.json()["challenger"]["content"] == "The service moves to Team Pfizer."
 
     @pytest.mark.asyncio
+    async def test_queue_pages_one_stable_order_across_memory_and_lifecycle_reviews(
+        self,
+        db,
+        chroma,
+        tmp_path,
+    ):
+        _, _, newest = await _seed_supersede_review(db, chroma, suffix="page-new")
+        _, _, older = await _seed_supersede_review(db, chroma, suffix="page-old")
+        lifecycle_new = await _seed_lifecycle_review(db, review_id="review-lifecycle-page-new")
+        await db.db.execute(
+            """INSERT INTO lifecycle_reviews (
+                   id, lifecycle_plan_id, incumbent_memory_id, status,
+                   staged_evidence_json, reason, created_at
+               )
+               SELECT ?, lifecycle_plan_id, incumbent_memory_id, status,
+                      staged_evidence_json, reason, ?
+               FROM lifecycle_reviews WHERE id = ?""",
+            (
+                "review-lifecycle-page-old",
+                "2026-01-01T00:00:00+00:00",
+                lifecycle_new,
+            ),
+        )
+        await db.db.execute(
+            "UPDATE lifecycle_reviews SET created_at = ? WHERE id = ?",
+            ("2026-01-03T00:00:00+00:00", lifecycle_new),
+        )
+        await db.db.execute(
+            "UPDATE memory_reviews SET created_at = ? WHERE id = ?",
+            ("2026-01-04T00:00:00+00:00", newest.id),
+        )
+        await db.db.execute(
+            "UPDATE memory_reviews SET created_at = ? WHERE id = ?",
+            ("2026-01-02T00:00:00+00:00", older.id),
+        )
+        await db.db.commit()
+
+        lifecycle_page = await db.list_lifecycle_reviews(
+            status=LifecycleReviewStatus.PENDING,
+            limit=1,
+            offset=1,
+            newest_first=True,
+        )
+        assert [review.id for review in lifecycle_page] == ["review-lifecycle-page-old"]
+        assert lifecycle_page[0].source_id == "src-lifecycle"
+        assert await db.count_lifecycle_reviews(status=LifecycleReviewStatus.PENDING) == 2
+
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            first_page = client.get(
+                "/api/memory-reviews",
+                params={"status": "open", "limit": 2, "offset": 0},
+            )
+            second_page = client.get(
+                "/api/memory-reviews",
+                params={"status": "open", "limit": 2, "offset": 2},
+            )
+
+        assert first_page.status_code == 200
+        assert second_page.status_code == 200
+        assert first_page.json()["total"] == 4
+        assert second_page.json()["total"] == 4
+        assert [row["id"] for row in first_page.json()["data"]] == [
+            newest.id,
+            lifecycle_new,
+        ]
+        assert [row["id"] for row in second_page.json()["data"]] == [
+            older.id,
+            "review-lifecycle-page-old",
+        ]
+
+    @pytest.mark.asyncio
     async def test_keep_current_state_requires_and_records_a_note(self, db, tmp_path):
         review_id = await _seed_lifecycle_review(db)
         from memforge.server.admin_api import create_admin_app
