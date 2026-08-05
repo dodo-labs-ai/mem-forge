@@ -65,13 +65,15 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.40"
+SERVER_VERSION = "0.1.41"
+CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
-    "Repository context is optional. When the coding host exposes an exact current working "
-    "directory, pass it as repository_context.working_directory on every MemForge tool call. "
-    "Never guess or use a plugin/install directory. Omit it when unavailable; the operation "
-    "must continue. MemForge resolves workspace routing and the Git remote locally and never "
-    "sends the local path to the service."
+    "Repository context is optional. MemForge uses negotiated request-scoped host context when "
+    "available. Otherwise, when the coding host exposes an exact current working directory, pass "
+    "it as repository_context.working_directory. Never guess or use a plugin/install directory. "
+    "Omit it when unavailable; the operation must continue. Explicit repository_context takes "
+    "precedence. MemForge resolves workspace routing and the Git remote locally and never sends "
+    "the local path to the service."
 )
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
@@ -114,7 +116,7 @@ MAX_DEFERRED_TOOL_CALLS = 32
 _CLIENT_SUPPORTS_ROOTS = False
 _PENDING_ROOTS_REQUEST_ID: str | None = None
 _CLIENT_ROOT_PATHS: list[str] = []
-_DEFERRED_TOOL_CALLS: list[tuple[Any, str, dict[str, Any]]] = []
+_DEFERRED_TOOL_CALLS: list[tuple[Any, str, dict[str, Any], Any]] = []
 
 REPOSITORY_CONTEXT_SCHEMA = {
     "type": "object",
@@ -639,7 +641,10 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | list[dict[s
             _record_client_capabilities(message)
             result = {
                 "protocolVersion": "2025-03-26",
-                "capabilities": {"tools": {"listChanged": False}},
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                    "experimental": {CODEX_SANDBOX_STATE_META_CAPABILITY: {}},
+                },
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": SERVER_INSTRUCTIONS,
             }
@@ -661,8 +666,9 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | list[dict[s
             params = message.get("params") if isinstance(message.get("params"), dict) else {}
             name = str(params.get("name") or "")
             arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-            if _PENDING_ROOTS_REQUEST_ID is not None and not _has_explicit_repository_context(
-                arguments
+            request_meta = params.get("_meta")
+            if _PENDING_ROOTS_REQUEST_ID is not None and not _has_request_repository_context(
+                arguments, request_meta
             ):
                 if len(_DEFERRED_TOOL_CALLS) >= MAX_DEFERRED_TOOL_CALLS:
                     return _rpc_error(
@@ -670,9 +676,9 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | list[dict[s
                         -32001,
                         "Workspace context is still resolving; retry the tool call.",
                     )
-                _DEFERRED_TOOL_CALLS.append((request_id, name, arguments))
+                _DEFERRED_TOOL_CALLS.append((request_id, name, arguments, request_meta))
                 return None
-            return _tool_call_response(request_id, name, arguments)
+            return _tool_call_response(request_id, name, arguments, request_meta)
         if request_id is None:
             return None
         return _rpc_error(request_id, -32601, f"Method not found: {method}")
@@ -682,17 +688,25 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | list[dict[s
         return _rpc_error(request_id, -32603, f"Internal error: {exc}")
 
 
-def _tool_call_response(request_id: Any, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def _tool_call_response(
+    request_id: Any,
+    name: str,
+    arguments: dict[str, Any],
+    request_meta: Any = None,
+) -> dict[str, Any]:
     try:
-        payload = _call_tool(name, arguments)
+        payload = _call_tool(name, arguments, request_meta=request_meta)
         return _rpc_result(request_id, _tool_result(payload))
     except Exception as exc:  # pragma: no cover - defensive MCP boundary
         return _rpc_error(request_id, -32603, f"Internal error: {exc}")
 
 
-def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> dict[str, Any]:
     try:
-        call_context = _tool_call_context(args.get("repository_context"))
+        call_context = _tool_call_context(
+            args.get("repository_context"),
+            request_meta=request_meta,
+        )
     except ValueError as exc:
         return {"error": str(exc)}
     args = {key: value for key, value in args.items() if key != "repository_context"}
@@ -1059,36 +1073,54 @@ def _active_repo_identifier() -> str | None:
     return resolve_repository_context(root_paths=_CLIENT_ROOT_PATHS).repo_identifier
 
 
-def _tool_call_context(value: Any) -> ToolCallContext:
-    if value is None:
+def _tool_call_context(value: Any, *, request_meta: Any = None) -> ToolCallContext:
+    if value is not None:
+        return _tool_call_context_from_working_directory(
+            value,
+            field_name="repository_context.working_directory",
+            require_object=True,
+        )
+
+    sandbox_cwd = _codex_sandbox_cwd(request_meta)
+    if sandbox_cwd is None:
         return ToolCallContext(
             target=configured_target(_CLIENT_ROOT_PATHS),
             repo_identifier=_active_repo_identifier(),
         )
-    if not isinstance(value, dict):
+
+    return _tool_call_context_from_working_directory(
+        sandbox_cwd,
+        field_name=f"{CODEX_SANDBOX_STATE_META_CAPABILITY}.sandboxCwd",
+    )
+
+
+def _tool_call_context_from_working_directory(
+    value: Any,
+    *,
+    field_name: str,
+    require_object: bool = False,
+) -> ToolCallContext:
+    if require_object and not isinstance(value, dict):
         raise ValueError("repository_context must be an object with working_directory")
-    unknown = sorted(set(value) - {"working_directory"})
+    context = value if isinstance(value, dict) else {"working_directory": value}
+    unknown = sorted(set(context) - {"working_directory"})
     if unknown:
         raise ValueError(
             "Unsupported repository_context parameter(s): " + ", ".join(unknown)
         )
-    working_directory = value.get("working_directory")
+    working_directory = context.get("working_directory")
     if not isinstance(working_directory, str) or not working_directory.strip():
-        raise ValueError(
-            "repository_context.working_directory must be an absolute path or file:// URI"
-        )
+        raise ValueError(f"{field_name} must be an absolute path or file:// URI")
     repository_path = _root_path({"uri": working_directory})
     if repository_path is None or not Path(repository_path).is_absolute():
-        raise ValueError(
-            "repository_context.working_directory must be an absolute path or file:// URI"
-        )
+        raise ValueError(f"{field_name} must be an absolute path or file:// URI")
     repository_context = resolve_repository_context(
         working_directory=working_directory,
     )
     if repository_context.state != "exact" or not repository_context.repo_identifier:
         raise ValueError(
-            "repository_context.working_directory must resolve to a Git repository with an "
-            "origin remote; refusing to fall back to another workspace"
+            f"{field_name} must resolve to a Git repository with an origin remote; refusing to "
+            "fall back to another workspace"
         )
     return ToolCallContext(
         target=configured_target((repository_path,)),
@@ -1100,8 +1132,28 @@ def _repository_identifier_for_tool_context(value: Any) -> str | None:
     return _tool_call_context(value).repo_identifier
 
 
-def _has_explicit_repository_context(arguments: dict[str, Any]) -> bool:
-    return arguments.get("repository_context") is not None
+def _codex_sandbox_cwd(request_meta: Any) -> str | None:
+    if not isinstance(request_meta, dict) or CODEX_SANDBOX_STATE_META_CAPABILITY not in request_meta:
+        return None
+    sandbox_state = request_meta.get(CODEX_SANDBOX_STATE_META_CAPABILITY)
+    if not isinstance(sandbox_state, dict):
+        raise ValueError(
+            f"{CODEX_SANDBOX_STATE_META_CAPABILITY}.sandboxCwd must be an absolute path or "
+            "file:// URI"
+        )
+    sandbox_cwd = sandbox_state.get("sandboxCwd")
+    if not isinstance(sandbox_cwd, str) or not sandbox_cwd.strip():
+        raise ValueError(
+            f"{CODEX_SANDBOX_STATE_META_CAPABILITY}.sandboxCwd must be an absolute path or "
+            "file:// URI"
+        )
+    return sandbox_cwd
+
+
+def _has_request_repository_context(arguments: dict[str, Any], request_meta: Any) -> bool:
+    return arguments.get("repository_context") is not None or (
+        isinstance(request_meta, dict) and CODEX_SANDBOX_STATE_META_CAPABILITY in request_meta
+    )
 
 
 def _mcp_client() -> str:
@@ -1142,8 +1194,8 @@ def _handle_rpc_response(message: dict[str, Any]) -> list[dict[str, Any]] | None
     deferred = tuple(_DEFERRED_TOOL_CALLS)
     _DEFERRED_TOOL_CALLS.clear()
     return [
-        _tool_call_response(request_id, name, arguments)
-        for request_id, name, arguments in deferred
+        _tool_call_response(request_id, name, arguments, request_meta)
+        for request_id, name, arguments, request_meta in deferred
     ] or None
 
 
