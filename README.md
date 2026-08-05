@@ -122,6 +122,11 @@ docker compose up --build
 Open `http://localhost:5174`. The compose stack starts the MemForge API, serves
 the admin UI, and keeps local data in the `memforge-data` Docker volume. Copy
 `.env.example` to `.env` when you want to set model keys or local overrides.
+The OSS public beta has no built-in request authentication, so Docker publishes
+both the UI and API on host loopback only. Browser, CLI, local-agent daemon, and
+host-side Codex or Claude clients can connect from the same machine; other LAN
+devices cannot. A client in another container has its own `localhost` and needs
+an explicitly configured host/container route rather than a wider host binding.
 If Docker Hub is slow or blocked in your network, set
 `MEMFORGE_DOCKERHUB_PREFIX` in `.env` to a mirror prefix such as
 `docker.m.daocloud.io/library/`, then rerun the same command.

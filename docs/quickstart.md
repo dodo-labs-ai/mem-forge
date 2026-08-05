@@ -39,6 +39,13 @@ proxies `/api/*` requests to the `api` container.
 
 The API is also available directly at `http://localhost:8765`.
 
+This OSS public-beta profile is single-user and authentication-free. Compose
+publishes both ports strictly on host loopback, so the browser, CLI, local-agent
+daemon, and host-side agent plugins work while other LAN devices cannot connect.
+Do not use this profile as a shared or remote service. A client running in
+another container has a different `localhost`; give it an explicitly supported
+host/container route instead of widening the published host binding.
+
 If either port is already in use, set `MEMFORGE_API_HOST_PORT` or
 `MEMFORGE_ADMIN_UI_HOST_PORT` in `.env` and restart with the same
 `docker compose up --build` command.
