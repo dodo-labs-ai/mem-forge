@@ -53,7 +53,9 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "${MEMFORGE_ADMIN_UI_HOST_PORT:-5174}:8080"
+      # The UI proxies the authentication-free API, so keep both surfaces on
+      # this machine by default.
+      - "${MEMFORGE_ADMIN_UI_BIND_ADDR:-127.0.0.1}:${MEMFORGE_ADMIN_UI_HOST_PORT:-5174}:8080"
 
 volumes:
   memforge-data:
