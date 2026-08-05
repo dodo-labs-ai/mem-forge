@@ -23,6 +23,10 @@ def test_lifecycle_review_exposes_exactly_two_user_decisions() -> None:
     ]
     assert presentation.actions[0].requires_note is False
     assert presentation.actions[1].requires_note is True
+    assert presentation.decision_label == "Updated"
+    assert presentation.summary == "Use the proposed source state or keep the current memory?"
+    assert presentation.current_label == "Current memory"
+    assert presentation.proposed_label == "Proposed memory"
     assert presentation.technical_reason == "audit_keep_vs_candidate_supersede"
 
 
@@ -32,7 +36,10 @@ def test_support_removal_explains_that_other_support_can_keep_memory_active() ->
         reason="source_no_longer_supports_claim",
     )
 
-    assert presentation.summary == "The latest source state no longer supports this memory."
+    assert presentation.decision_label == "Support removed"
+    assert presentation.summary == "Apply this source-support removal?"
+    assert presentation.proposed_label == "Source change"
+    assert "No replacement memory" in presentation.proposed_empty_text
     assert "only if no other support remains" in presentation.actions[0].consequence
 
 
@@ -45,3 +52,14 @@ def test_legacy_internal_reason_is_only_technical_detail() -> None:
     assert "deterministic_relation_conflict" not in presentation.summary
     assert "deterministic_relation_conflict" not in presentation.why_human
     assert presentation.technical_reason == "deterministic_relation_conflict:v7:v8"
+
+
+def test_cross_source_conflict_is_presented_as_a_source_backed_choice() -> None:
+    presentation = present_memory_review(
+        kind="cross_source_conflict",
+        reason="conflicting_source_authority",
+    )
+
+    assert presentation.decision_label == "Conflict"
+    assert presentation.summary == "Choose which source-backed memory should remain current."
+    assert presentation.proposed_label == "Conflicting memory"

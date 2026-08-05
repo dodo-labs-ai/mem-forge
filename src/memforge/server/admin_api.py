@@ -1446,10 +1446,12 @@ class ReviewActionPresentationResponse(BaseModel):
 
 
 class ReviewPresentationResponse(BaseModel):
+    decision_label: Literal["Updated", "Support removed", "Conflict"]
     summary: str
     why_human: str
     current_label: str
     proposed_label: str
+    proposed_empty_text: str
     actions: list[ReviewActionPresentationResponse]
     technical_reason: str | None = None
 

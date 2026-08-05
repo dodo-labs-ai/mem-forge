@@ -630,8 +630,9 @@ class TestUnifiedLifecycleReviewApi:
         row = next(item for item in queue.json()["data"] if item["id"] == review_id)
         assert row["review_origin"] == "lifecycle"
         assert row["source_name"] == "Mount Tai Backlog"
+        assert row["presentation"]["decision_label"] == "Updated"
         assert row["presentation"]["summary"] == (
-            "A source update proposes a newer state for this memory."
+            "Use the proposed source state or keep the current memory?"
         )
         assert [action["key"] for action in row["presentation"]["actions"]] == [
             "use_latest_state",

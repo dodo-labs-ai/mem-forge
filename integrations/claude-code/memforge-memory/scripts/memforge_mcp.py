@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.39"
+SERVER_VERSION = "0.1.41"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Repository context is optional. MemForge uses negotiated request-scoped host context when "
@@ -348,9 +348,9 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_memory",
         "description": (
-            "Fetch full memory detail by ID when complete provenance, supporting sources, "
-            "entity links, lifecycle metadata, or a search result follow_up hint indicates "
-            "that summary-only context may be insufficient."
+            "Fetch full memory detail by ID when a search result is insufficient. Returns "
+            "canonical content together with claim-local provenance in sources[].excerpt, "
+            "supporting source and artifact locators, entity links, and lifecycle metadata."
         ),
         "inputSchema": {
             "type": "object",
@@ -401,7 +401,9 @@ TOOLS: list[dict[str, Any]] = [
             "Users need not name this tool. First search for similar memories to avoid duplicates, "
             "show a readable preview with the new durable claim, provenance/evidence, scope, and type, then get "
             "explicit confirmation via request_user_input if available, else a concise text question. "
-            "Generate durable memory content from the confirmed preview without unapproved semantic changes. "
+            "Distill durable memory content as one self-contained claim or bounded procedure "
+            "from the confirmed preview without unapproved semantic changes; do not copy the "
+            "raw conversation into content. "
             "Keep provenance, confirmation details, test/deploy notes, and why-the-tool-was-called "
             "out of content; put source details in provenance. Never create memory silently."
         ),
@@ -411,8 +413,9 @@ TOOLS: list[dict[str, Any]] = [
                 "content": {
                     "type": "string",
                     "description": (
-                        "Canonical durable memory content generated from the user-confirmed readable "
-                        "preview. Preserve its meaning without unapproved semantic changes. Do not "
+                        "One self-contained canonical durable claim or bounded procedure, distilled from "
+                        "the user-confirmed readable preview. Preserve its meaning, scope, preconditions, "
+                        "and required ordering without unapproved semantic changes. Do not "
                         "put confirmation details, provenance, test/deploy notes, or why-the-tool-was-called "
                         "into content; those belong in provenance or stay out of the memory."
                     ),
@@ -420,9 +423,10 @@ TOOLS: list[dict[str, Any]] = [
                 "provenance": {
                     "type": "string",
                     "description": (
-                        "Required evidence or source context for the provenance card. Use this "
-                        "for details that explain where the memory came from but should not be "
-                        "used as RAG memory content."
+                        "Required claim-local evidence or source context. It is stored separately from "
+                        "canonical content and returned as get_memory.sources[].excerpt. Use it for "
+                        "details that explain where the memory came from or how it was verified, but "
+                        "exclude secrets and raw oversized logs."
                     ),
                 },
                 "memory_type": {

@@ -3927,6 +3927,19 @@ class AuthoritativeEmptyRequiredPdfGene(PdfBackfillGene):
         raise AssertionError("authoritative empty evidence must not request a PDF")
 
 
+class IncrementalAuthoritativeEmptyRequiredPdfGene(AuthoritativeEmptyRequiredPdfGene):
+    def __init__(self, item_count: int, release: asyncio.Event) -> None:
+        super().__init__(item_count=item_count, release=release)
+        self.discover_since: list[datetime | None] = []
+
+    async def discover(self, since=None):
+        self.discover_since.append(since)
+        if since is not None:
+            return
+        async for item in super().discover(since=since):
+            yield item
+
+
 class UnexpectedPdfExportGene(PdfBackfillGene):
     async def fetch_pdf(self, item):
         raise AssertionError("unchanged document with a stored PDF must not export again")
@@ -11221,6 +11234,48 @@ async def test_authoritative_empty_confluence_page_does_not_require_pdf(db: Data
     assert document is not None
     assert document.content_hash == content_hash("")
     assert document.pdf_content_uri is None
+
+
+@pytest.mark.asyncio
+async def test_authoritative_empty_confluence_page_without_pdf_keeps_incremental_sync(db: Database):
+    source_id = "src-authoritative-empty-confluence-incremental"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Architecture",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    gene = IncrementalAuthoritativeEmptyRequiredPdfGene(item_count=1, release=release)
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=NoopMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    initial = await orchestrator.sync_gene(
+        gene=gene,
+        source_name="Architecture",
+        source_id=source_id,
+    )
+    incremental = await orchestrator.sync_gene(
+        gene=gene,
+        source_name="Architecture",
+        source_id=source_id,
+    )
+
+    assert initial.last_sync_status == "success"
+    assert initial.docs_processed == 1
+    assert incremental.last_sync_status == "success"
+    assert incremental.docs_processed == 0
+    assert gene.discover_since[0] is None
+    assert gene.discover_since[1] is not None
 
 
 @pytest.mark.asyncio
