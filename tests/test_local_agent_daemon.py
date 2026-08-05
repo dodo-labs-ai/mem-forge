@@ -916,6 +916,22 @@ def test_adapter_daemon_status_uses_environment_target_provenance(monkeypatch, t
     assert payload["recommendations"] == ["Set MEMFORGE_API_TOKEN before starting the daemon."]
 
 
+def test_adapter_daemon_status_does_not_recommend_token_for_local_oss(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
+    monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
+    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
+    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
+    monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
+
+    result = CliRunner().invoke(cli, ["adapter", "daemon", "status"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["target"]["edition"] == "oss"
+    assert "recommendations" not in payload
+
+
 def test_adapter_daemon_status_allows_cloud_target_without_global_workspace(monkeypatch, tmp_path):
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_STATE", str(tmp_path / "state.json"))
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
