@@ -1671,7 +1671,7 @@ def _local_agent_target_summary(ctx) -> dict[str, Any]:
 def _local_agent_status_recommendations(target: dict[str, Any]) -> list[str]:
     recommendations: list[str] = []
     token_env = str(target.get("token_env") or "MEMFORGE_API_TOKEN")
-    if not target.get("api_token_configured"):
+    if target.get("edition") == "cloud" and not target.get("api_token_configured"):
         recommendations.append(f"Set {token_env} before starting the daemon.")
     return recommendations
 
