@@ -2,7 +2,7 @@
 
 This plugin connects Claude Code lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.40`.
+The packaged runtime and plugin version is `0.1.41`.
 
 With no routing variables, the plugin targets local OSS at
 `http://127.0.0.1:8765/api`. Otherwise put the target in the top-level `env`
@@ -63,10 +63,11 @@ get_resource(mode=file) -> ~/.memforge-agent/artifacts -> local_path
 Claude Code may pass its exact current working directory through the optional
 MCP `repository_context` argument on every MemForge tool. The local proxy uses
 it to select the repository workspace and derive a normalized Git remote, then
-discards the path before calling OSS or Cloud. When context is absent, the
-proxy uses compatible MCP Roots or the configured global workspace. An
-explicit malformed or non-repository context fails before HTTP instead of
-silently reading another workspace.
+discards the path before calling OSS or Cloud. Negotiated request-scoped host
+context, when supported by a client, sits behind an explicit argument and ahead
+of compatible MCP Roots or the configured global workspace. Malformed
+negotiated or explicit context fails before HTTP instead of silently reading
+another workspace.
 
 Install from GitHub (run inside an active Claude Code session):
 
