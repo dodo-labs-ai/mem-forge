@@ -809,7 +809,7 @@ class GeneSyncOrchestrator:
                 missing_pdf_count = await self._count_missing_pdf_uris(source_id)
                 if missing_pdf_count:
                     logger.info(
-                        "Found %d documents missing PDF provenance for %s; forcing full sync",
+                        "Found %d documents missing required PDF provenance for %s; forcing full sync",
                         missing_pdf_count,
                         source_id,
                     )
@@ -3378,6 +3378,7 @@ class GeneSyncOrchestrator:
         return doc_ids
 
     async def _count_missing_pdf_uris(self, source_id: str) -> int:
+        """Count non-empty Confluence documents that still require PDF provenance."""
         async with self.db.db.execute(
             """SELECT COUNT(*)
                FROM documents d
@@ -3386,8 +3387,9 @@ class GeneSyncOrchestrator:
                  AND s.type = 'confluence'
                  AND d.normalized_content_uri IS NOT NULL
                  AND d.normalized_content_uri <> ''
+                 AND (d.content_hash IS NULL OR d.content_hash <> ?)
                  AND (d.pdf_content_uri IS NULL OR d.pdf_content_uri = '')""",
-            (source_id,),
+            (source_id, compute_content_hash("")),
         ) as cursor:
             row = await cursor.fetchone()
             return int(row[0] if row else 0)
