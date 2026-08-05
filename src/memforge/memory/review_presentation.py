@@ -12,6 +12,7 @@ from typing import Literal, Mapping
 
 
 ReviewActionKey = Literal["use_latest_state", "keep_current_state"]
+ReviewDecisionLabel = Literal["Updated", "Support removed", "Conflict"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,10 +25,12 @@ class ReviewActionPresentation:
 
 @dataclass(frozen=True, slots=True)
 class ReviewPresentation:
+    decision_label: ReviewDecisionLabel
     summary: str
     why_human: str
     current_label: str
     proposed_label: str
+    proposed_empty_text: str
     actions: tuple[ReviewActionPresentation, ReviewActionPresentation]
     technical_reason: str | None = None
 
@@ -39,17 +42,25 @@ def present_memory_review(*, kind: str, reason: str | None) -> ReviewPresentatio
     """Present a workbench Review without exposing its internal action names."""
 
     if kind == "cross_source_conflict":
-        summary = "Two current memories describe incompatible states."
+        decision_label = "Conflict"
+        summary = "Choose which source-backed memory should remain current."
         why_human = (
             "Both memories have valid source evidence, but MemForge has no authority "
             "to choose which state should remain active."
         )
+        proposed_label = "Conflicting memory"
     else:
-        summary = "A newer candidate may replace the memory currently in use."
+        decision_label = "Updated"
+        summary = "Use the proposed memory or keep the current one?"
         why_human = "The update would change active memory state, so MemForge needs your decision before applying it."
+        proposed_label = "Proposed memory"
     return _presentation(
+        decision_label=decision_label,
         summary=summary,
         why_human=why_human,
+        current_label="Current memory",
+        proposed_label=proposed_label,
+        proposed_empty_text="The proposed memory snapshot is unavailable.",
         use_latest_consequence=("Use the proposed state going forward and keep the previous state in audit history."),
         technical_reason=reason,
     )
@@ -66,20 +77,33 @@ def present_lifecycle_review(
     candidate = staged_evidence.get("candidate")
     has_candidate = isinstance(candidate, Mapping) and bool(candidate.get("content"))
     if disposition == "supersede" or has_candidate:
-        summary = "A source update proposes a newer state for this memory."
+        decision_label = "Updated"
+        summary = "Use the proposed source state or keep the current memory?"
         use_latest = "Use the proposed state going forward and keep the previous state in audit history."
+        proposed_label = "Proposed memory"
+        proposed_empty_text = "The proposed memory snapshot is unavailable."
     elif disposition == "remove_support":
-        summary = "The latest source state no longer supports this memory."
+        decision_label = "Support removed"
+        summary = "Apply this source-support removal?"
         use_latest = "Apply the source update. The current memory will retire only if no other support remains."
+        proposed_label = "Source change"
+        proposed_empty_text = "No replacement memory; this proposal removes source support."
     else:
-        summary = "A source update proposes changing the current memory state."
+        decision_label = "Updated"
+        summary = "Apply the proposed source change or keep the current memory?"
         use_latest = "Apply the complete lifecycle proposal shown here."
+        proposed_label = "Proposed memory"
+        proposed_empty_text = "The proposal does not include a replacement memory."
     return _presentation(
+        decision_label=decision_label,
         summary=summary,
         why_human=(
             "Lifecycle checks produced one complete proposal, but applying it would "
             "change active memory state and requires your decision."
         ),
+        current_label="Current memory",
+        proposed_label=proposed_label,
+        proposed_empty_text=proposed_empty_text,
         use_latest_consequence=use_latest,
         technical_reason=reason,
     )
@@ -87,16 +111,22 @@ def present_lifecycle_review(
 
 def _presentation(
     *,
+    decision_label: ReviewDecisionLabel,
     summary: str,
     why_human: str,
+    current_label: str,
+    proposed_label: str,
+    proposed_empty_text: str,
     use_latest_consequence: str,
     technical_reason: str | None,
 ) -> ReviewPresentation:
     return ReviewPresentation(
+        decision_label=decision_label,
         summary=summary,
         why_human=why_human,
-        current_label="Current state",
-        proposed_label="Proposed state",
+        current_label=current_label,
+        proposed_label=proposed_label,
+        proposed_empty_text=proposed_empty_text,
         actions=(
             ReviewActionPresentation(
                 key="use_latest_state",

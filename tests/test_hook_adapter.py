@@ -908,9 +908,9 @@ def test_mcp_tools_all_accept_repository_context():
         assert "repository_context" in tool["inputSchema"]["properties"], tool["name"]
 
 
-def test_packaged_plugin_version_0_1_39_is_consistent():
+def test_packaged_plugin_version_0_1_41_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.39"
+    version = "0.1.41"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
@@ -2823,6 +2823,10 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "request_user_input" in tools["create_memory"]["description"]
     assert "durable memory content" in tools["create_memory"]["description"]
     assert "provenance" in tools["create_memory"]["description"]
+    assert "one self-contained" in create_schema["properties"]["content"]["description"].lower()
+    assert "get_memory.sources[].excerpt" in create_schema["properties"]["provenance"]["description"]
+    assert "canonical content" in tools["get_memory"]["description"]
+    assert "sources[].excerpt" in tools["get_memory"]["description"]
     assert "Do not put confirmation details" in create_schema["properties"]["content"]["description"]
 
     retire_schema = tools["retire_memory"]["inputSchema"]
