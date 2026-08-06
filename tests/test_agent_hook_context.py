@@ -54,7 +54,7 @@ def test_hook_context_skips_trivial_prompt(tmp_path):
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
             response = client.post(
-                "/api/hooks/context",
+                "/api/v1/hooks/context",
                 json={
                     "client": "codex",
                     "hook": "UserPromptSubmit",
@@ -105,7 +105,7 @@ def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path, mon
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
             response = client.post(
-                "/api/hooks/context",
+                "/api/v1/hooks/context",
                 json={
                     "client": "claude-code",
                     "hook": "UserPromptSubmit",
@@ -127,8 +127,15 @@ def test_hook_context_injects_relevant_memories_for_project_prompt(tmp_path, mon
         asyncio.run(database.close())
 
 
-def test_hook_context_recent_changes_use_access_predicate(tmp_path):
+def test_hook_context_recent_changes_use_access_predicate(tmp_path, monkeypatch):
+    from memforge.retrieval import search as search_module
     from memforge.server.admin_api import create_admin_app
+
+    monkeypatch.setattr(
+        search_module,
+        "embed_texts",
+        lambda texts, **_kwargs: [[0.0] * 8 for _ in texts],
+    )
 
     cfg = _config(tmp_path)
     database = Database(str(tmp_path / "hooks.db"))
@@ -155,7 +162,7 @@ def test_hook_context_recent_changes_use_access_predicate(tmp_path):
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
             response = client.post(
-                "/api/hooks/context",
+                "/api/v1/hooks/context",
                 json={
                     "client": "codex",
                     "hook": "SessionStart",
@@ -204,7 +211,7 @@ def test_hook_context_reports_source_warnings_even_for_trivial_prompt(tmp_path):
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
             response = client.post(
-                "/api/hooks/context",
+                "/api/v1/hooks/context",
                 json={
                     "client": "codex",
                     "hook": "UserPromptSubmit",

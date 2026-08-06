@@ -91,7 +91,7 @@ async def test_get_memory_by_id_returns_404_for_other_users_private(seeded_app):
         # Resolved principal is LOCAL_DEV_USER_ID. U2's private row must not
         # leak through the by-id reader; the handler must build a workspace
         # default scope and apply the predicate.
-        response = client.get("/api/memories/m-u2-private")
+        response = client.get("/api/v1/memories/m-u2-private")
 
     assert response.status_code == 404, response.text
 
@@ -100,8 +100,8 @@ async def test_get_memory_by_id_returns_404_for_other_users_private(seeded_app):
 async def test_get_memory_by_id_includes_only_owners_private_by_default(seeded_app):
     app, _database = seeded_app
     with TestClient(app) as client:
-        own = client.get("/api/memories/m-u1-private")
-        other = client.get("/api/memories/m-u2-private")
+        own = client.get("/api/v1/memories/m-u1-private")
+        other = client.get("/api/v1/memories/m-u2-private")
 
     assert own.status_code == 200, own.text
     assert own.json()["id"] == "m-u1-private"
@@ -113,7 +113,7 @@ async def test_list_memories_excludes_other_users_private(seeded_app):
     app, _database = seeded_app
     with TestClient(app) as client:
         # Simple-filter list (no ``search`` param).
-        simple = client.get("/api/memories", params={"limit": 50})
+        simple = client.get("/api/v1/memories", params={"limit": 50})
         assert simple.status_code == 200, simple.text
         simple_ids = {row["id"] for row in simple.json()["data"]}
         assert "m-u2-private" not in simple_ids
@@ -124,7 +124,7 @@ async def test_list_memories_excludes_other_users_private(seeded_app):
 
         # Search-mode list path.
         searched = client.get(
-            "/api/memories",
+            "/api/v1/memories",
             params={"search": "meeting", "limit": 50},
         )
         assert searched.status_code == 200, searched.text
@@ -138,7 +138,7 @@ async def test_list_memories_personalized_includes_only_owners_private(seeded_ap
     app, _database = seeded_app
     with TestClient(app) as client:
         response = client.get(
-            "/api/memories",
+            "/api/v1/memories",
             params={"include_private": "true", "limit": 50},
         )
 

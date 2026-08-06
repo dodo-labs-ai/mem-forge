@@ -2,48 +2,30 @@
 
 This plugin connects Claude Code lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.41`.
+The packaged runtime and plugin version is `0.1.42`.
 
 With no routing variables, the plugin targets local OSS at
-`http://127.0.0.1:8765/api`. Otherwise put the target in the top-level `env`
+`http://127.0.0.1:8765/api/v1`. Otherwise put the target in the top-level `env`
 object in `~/.claude/settings.json`. Lifecycle hooks do not
 inherit MCP-server-only environment, so do not put these routing values only in
 an MCP server entry. `MEMFORGE_API_URL` must be an HTTP(S) origin without
-`/api`. Origins whose hostname is `hana.ondemand.com` or one of its subdomains
-are Cloud targets and require `MEMFORGE_WORKSPACE_ID`; every other origin is OSS
-and forbids a workspace.
+an API path. OSS and Cloud share the same `/api/v1` contract.
 
 ```json
 {
   "env": {
-    "MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-    "MEMFORGE_WORKSPACE_ID": "mount_tai"
+    "MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com"
   }
 }
 ```
 
-For remote OSS, use its origin and omit `MEMFORGE_WORKSPACE_ID`. Set
-`MEMFORGE_API_TOKEN` separately in the process or
+Set `MEMFORGE_API_TOKEN` separately in the process or
 top-level agent environment when bearer authentication is required; the token
-is an identity credential, not a workspace selector. Invalid or partial targets
-fail locally before any MCP or hook network request.
-
-The top-level environment setting is the global default. To select a different
-Cloud workspace for one Git repository, create the uncommitted
-`<repository>/.memforge/config.toml`:
-
-```toml
-[memforge]
-workspace_id = "repository_workspace"
-```
-
-The repository file is ignored by Git and only selects the workspace; API
-origins and credentials retain their process-then-user precedence. For workspace
-selection, a valid repository override has highest priority, followed by a
-process `MEMFORGE_WORKSPACE_ID` such as the top-level `env` default. Missing or
-invalid repository configuration leaves that process default unchanged. The
-bundled MCP uses the host repository root and the hooks use the hook workspace,
-so both resolve the same override.
+is an identity credential, not a workspace selector. Call `list_workspaces`
+when discovery is useful and pass optional `workspace_id` to any other tool.
+It may be omitted when the account has a default or exactly one accessible
+workspace. Repository context remains provenance attribution; it never selects
+a workspace.
 
 Do not add a manual MCP server block for MemForge. The plugin's `.mcp.json`
 registers the MCP server; duplicating it in config can pin the agent to a stale
@@ -62,10 +44,10 @@ get_resource(mode=file) -> ~/.memforge-agent/artifacts -> local_path
 
 Claude Code may pass its exact current working directory through the optional
 MCP `repository_context` argument on every MemForge tool. The local proxy uses
-it to select the repository workspace and derive a normalized Git remote, then
+it to derive a normalized Git remote, then
 discards the path before calling OSS or Cloud. Negotiated request-scoped host
 context, when supported by a client, sits behind an explicit argument and ahead
-of compatible MCP Roots or the configured global workspace. Malformed
+of compatible MCP Roots. Malformed
 negotiated or explicit context fails before HTTP instead of silently reading
 another workspace.
 

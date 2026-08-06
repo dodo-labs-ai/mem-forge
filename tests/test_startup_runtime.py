@@ -280,7 +280,7 @@ def test_admin_app_lifespan_owns_database_and_sync_service(tmp_path):
     with TestClient(app) as client:
         assert app.state.db._db is not None
         assert app.state.sync_service is not None
-        assert client.get("/api/health").status_code == 200
+        assert client.get("/api/v1/health").status_code == 200
 
     assert app.state.db._db is None
 
@@ -304,7 +304,7 @@ async def test_health_reports_recent_audit_failures_as_warning(db, tmp_path):
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.get("/api/health")
+        response = client.get("/api/v1/health")
 
     payload = response.json()
     assert response.status_code == 200
@@ -335,7 +335,7 @@ async def test_health_ignores_old_audit_failures(db, tmp_path):
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.get("/api/health")
+        response = client.get("/api/v1/health")
 
     payload = response.json()
     assert response.status_code == 200
@@ -373,7 +373,7 @@ def test_gene_config_schema_hides_runtime_transport_fields_from_ui(tmp_path):
     app = create_admin_app(config=_config(tmp_path))
 
     with TestClient(app) as client:
-        response = client.get("/api/genes/confluence/config-schema")
+        response = client.get("/api/v1/genes/confluence/config-schema")
 
     assert response.status_code == 200
     fields = {field["key"]: field for field in response.json()["fields"]}
@@ -388,7 +388,7 @@ def test_gene_metadata_declares_available_execution_kinds(tmp_path):
     app = create_admin_app(config=_config(tmp_path))
 
     with TestClient(app) as client:
-        response = client.get("/api/genes")
+        response = client.get("/api/v1/genes")
 
     assert response.status_code == 200
     genes = {gene["name"]: gene for gene in response.json()}
@@ -421,7 +421,7 @@ def test_admin_source_create_encrypts_and_redacts_pat(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "confluence",
                 "access_policy": "private",
@@ -436,7 +436,7 @@ def test_admin_source_create_encrypts_and_redacts_pat(tmp_path, monkeypatch):
         )
         assert response.status_code == 200
         source_id = response.json()["id"]
-        sources_response = client.get("/api/sources")
+        sources_response = client.get("/api/v1/sources")
 
     with sqlite3.connect(cfg.storage.db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -466,7 +466,7 @@ def test_admin_source_create_and_update_persist_sync_schedule(tmp_path, monkeypa
 
     with TestClient(app) as client:
         create_response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "confluence",
                 "name": "Scheduled Wiki",
@@ -482,27 +482,27 @@ def test_admin_source_create_and_update_persist_sync_schedule(tmp_path, monkeypa
         )
         assert create_response.status_code == 200, create_response.text
         source_id = create_response.json()["id"]
-        created_sources = client.get("/api/sources").json()["data"]
+        created_sources = client.get("/api/v1/sources").json()["data"]
         created = next(source for source in created_sources if source["id"] == source_id)
         next_run_at = created["sync_schedule"]["next_run_at"]
 
         update_response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "name": "Scheduled Wiki Renamed",
                 "sync_schedule": {"enabled": True, "interval_minutes": 60},
             },
         )
         assert update_response.status_code == 200, update_response.text
-        updated_sources = client.get("/api/sources").json()["data"]
+        updated_sources = client.get("/api/v1/sources").json()["data"]
         updated = next(source for source in updated_sources if source["id"] == source_id)
 
         disable_response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={"sync_schedule": None},
         )
         assert disable_response.status_code == 200, disable_response.text
-        disabled_sources = client.get("/api/sources").json()["data"]
+        disabled_sources = client.get("/api/v1/sources").json()["data"]
         disabled = next(source for source in disabled_sources if source["id"] == source_id)
 
     assert created["sync_schedule"]["enabled"] is True
@@ -525,7 +525,7 @@ def test_admin_source_update_preserves_encrypted_pat_when_blank(tmp_path, monkey
 
     with TestClient(app) as client:
         create_response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
@@ -551,7 +551,7 @@ def test_admin_source_update_preserves_encrypted_pat_when_blank(tmp_path, monkey
             )
 
         update_response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "name": "Engineering Wiki",
                 "config": {
@@ -561,7 +561,7 @@ def test_admin_source_update_preserves_encrypted_pat_when_blank(tmp_path, monkey
                 },
             },
         )
-        sources_response = client.get("/api/sources")
+        sources_response = client.get("/api/v1/sources")
 
     assert update_response.status_code == 200
     with sqlite3.connect(cfg.storage.db_path) as conn:
@@ -589,7 +589,7 @@ def test_admin_source_update_persists_status(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         create_response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
@@ -605,10 +605,10 @@ def test_admin_source_update_persists_status(tmp_path, monkeypatch):
         source_id = create_response.json()["id"]
 
         update_response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={"status": "paused"},
         )
-        sources_response = client.get("/api/sources")
+        sources_response = client.get("/api/v1/sources")
 
     assert update_response.status_code == 200
     source_payload = next(s for s in sources_response.json()["data"] if s["id"] == source_id)
@@ -624,7 +624,7 @@ def test_admin_source_update_rejects_unknown_status(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         create_response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
@@ -640,7 +640,7 @@ def test_admin_source_update_rejects_unknown_status(tmp_path, monkeypatch):
         source_id = create_response.json()["id"]
 
         update_response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={"status": "disabled"},
         )
 
@@ -657,7 +657,7 @@ def test_admin_source_sync_rejects_paused_source(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         create_response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
@@ -671,9 +671,9 @@ def test_admin_source_sync_rejects_paused_source(tmp_path, monkeypatch):
         )
         assert create_response.status_code == 200
         source_id = create_response.json()["id"]
-        assert client.put(f"/api/sources/{source_id}", json={"status": "paused"}).status_code == 200
+        assert client.put(f"/api/v1/sources/{source_id}", json={"status": "paused"}).status_code == 200
 
-        sync_response = client.post(f"/api/sources/{source_id}/sync")
+        sync_response = client.post(f"/api/v1/sources/{source_id}/sync")
 
     assert sync_response.status_code == 400
     assert sync_response.json()["detail"] == "Source is paused"
@@ -698,7 +698,7 @@ async def test_agent_session_document_intake_is_retired_before_source_status(db,
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
         response = client.post(
-            "/api/agent-sessions/documents",
+            "/api/v1/agent-sessions/documents",
             json={
                 "client": "codex",
                 "session_id": "session-1",
@@ -740,7 +740,7 @@ async def test_agent_session_window_intake_rejects_paused_source_before_llm(
     app.state.agent_session_window_client = FailingWindowClient()
     with TestClient(app) as client:
         response = client.post(
-            "/api/agent-sessions/windows",
+            "/api/v1/agent-sessions/windows",
             json={
                 "client": "claude-code",
                 "session_id": "session-1",
@@ -853,7 +853,7 @@ def test_admin_source_save_rejects_missing_tls_ca_bundle(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
@@ -880,7 +880,7 @@ def test_admin_source_save_rejects_insecure_atlassian_base_url(tmp_path, monkeyp
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "jira",
                 "access_policy": "private",
@@ -906,7 +906,7 @@ def test_admin_source_save_rejects_pat_without_base_url(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
@@ -951,7 +951,7 @@ def test_admin_source_create_rejects_missing_atlassian_pat(
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": source_type,
                 "name": name,
@@ -975,7 +975,7 @@ def test_admin_source_create_accepts_confluence_page_url_without_spaces(tmp_path
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "confluence",
                 "name": "Payroll Architecture",
@@ -1012,7 +1012,7 @@ def test_admin_source_create_requires_spaces_for_confluence_space_scope(tmp_path
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "confluence",
                 "name": "Engineering Wiki",
@@ -1037,7 +1037,7 @@ def test_admin_source_create_allows_jira_browser_session_without_source_cookie(t
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",
@@ -1050,7 +1050,7 @@ def test_admin_source_create_allows_jira_browser_session_without_source_cookie(t
                 "project_binding": _project_binding(),
             },
         )
-        sources_response = client.get("/api/sources")
+        sources_response = client.get("/api/v1/sources")
 
     assert response.status_code == 200, response.text
     assert sources_response.status_code == 200, sources_response.text
@@ -1070,7 +1070,7 @@ def test_admin_source_create_rejects_missing_required_source_scope(tmp_path, mon
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",
@@ -1094,7 +1094,7 @@ def test_admin_source_create_ignores_forged_jira_cookie_configured_flag(tmp_path
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",
@@ -1109,7 +1109,7 @@ def test_admin_source_create_ignores_forged_jira_cookie_configured_flag(tmp_path
             },
         )
         source_id = response.json().get("id")
-        sources = client.get("/api/sources").json()["data"]
+        sources = client.get("/api/v1/sources").json()["data"]
 
     assert response.status_code == 200, response.text
     source = next(source for source in sources if source["id"] == source_id)
@@ -1124,7 +1124,7 @@ def test_admin_source_create_rejects_forged_jira_pat_configured_flag(tmp_path, m
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",
@@ -1189,7 +1189,7 @@ async def test_admin_sources_exposes_failed_and_partial_sync_status(db, tmp_path
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.get("/api/sources")
+        response = client.get("/api/v1/sources")
 
     assert response.status_code == 200
     sources = {source["id"]: source for source in response.json()["data"]}
@@ -1295,7 +1295,7 @@ async def test_admin_sources_exposes_running_stored_counts_separately(db, tmp_pa
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
         app.state.sync_service = FakeSyncService()
-        response = client.get("/api/sources")
+        response = client.get("/api/v1/sources")
 
     assert response.status_code == 200
     source = next(source for source in response.json()["data"] if source["id"] == source_id)
@@ -1399,9 +1399,9 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, t
     )
 
     with TestClient(app) as client:
-        sources_response = client.get("/api/sources")
+        sources_response = client.get("/api/v1/sources")
         memories_response = client.get(
-            "/api/memories",
+            "/api/v1/memories",
             params={
                 "source": source_id,
                 "include_private": "true",
@@ -1461,15 +1461,15 @@ async def test_unknown_source_type_still_redacts_and_encrypts_secret_fields(db, 
 
     app = create_admin_app(db=db, config=cfg)
     with TestClient(app) as client:
-        sources_response = client.get("/api/sources")
+        sources_response = client.get("/api/v1/sources")
         update_response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "name": "Removed Gene",
                 "config": {"base_url": "https://wiki.example.test", "pat": "new-plain"},
             },
         )
-        sources_after_update = client.get("/api/sources")
+        sources_after_update = client.get("/api/v1/sources")
 
     assert sources_response.status_code == 200
     source_payload = next(s for s in sources_response.json()["data"] if s["id"] == source_id)
@@ -1546,7 +1546,7 @@ async def test_pat_source_noop_update_preserves_sync_cursor(db, tmp_path, monkey
     app = create_admin_app(db=db, config=cfg)
     with TestClient(app) as client:
         response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "name": "Engineering Wiki",
                 "config": {
@@ -1619,7 +1619,7 @@ async def test_pat_replacement_preserves_jira_sync_cursor_when_scope_is_unchange
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
         response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "name": "Delivery Board",
                 "config": {**scope_config, "auth_mode": "pat", "request_interval_ms": 1000, "pat": "old-jira-pat"},
@@ -1689,7 +1689,7 @@ async def test_jira_pat_replacement_resets_sync_cursor_when_secret_changes(db, t
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
         response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "name": "Delivery Board",
                 "config": {**scope_config, "pat": "new-jira-pat"},
@@ -1758,7 +1758,7 @@ async def test_jira_auth_mode_change_resets_sync_cursor(db, tmp_path, monkeypatc
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
         response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "name": "Delivery Board",
                 "config": {
@@ -1817,7 +1817,7 @@ async def test_source_provider_namespace_update_is_rejected(db, tmp_path, monkey
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
         response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "name": "Delivery Board",
                 "config": {
@@ -1873,7 +1873,7 @@ async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path)
     app = create_admin_app(db=db, config=cfg)
     with TestClient(app) as client:
         response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "name": "Engineering Notes",
                 "config": source_config,
@@ -2152,10 +2152,10 @@ async def test_gene_discovery_preview_runs_configured_gene_without_saving_source
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
         response = client.post(
-            "/api/genes/preview_gene/preview-discovery",
+            "/api/v1/genes/preview_gene/preview-discovery",
             json={"config": {"base_url": "https://docs.example.test"}, "limit": 2},
         )
-        sources_response = client.get("/api/sources")
+        sources_response = client.get("/api/v1/sources")
 
     assert response.status_code == 200
     payload = response.json()
@@ -2239,7 +2239,7 @@ async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path
 
     with TestClient(app) as client:
         created = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "name": "Stored Secret Source",
                 "type": "secret_preview_gene",
@@ -2253,7 +2253,7 @@ async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path
         assert created.status_code == 200
         source_id = created.json()["id"]
         response = client.post(
-            "/api/genes/secret_preview_gene/preview-discovery",
+            "/api/v1/genes/secret_preview_gene/preview-discovery",
             json={
                 "source_id": source_id,
                 "config": {"base_url": "https://docs.example.test"},
@@ -2261,14 +2261,14 @@ async def test_gene_discovery_preview_reuses_existing_source_secret(db, tmp_path
             },
         )
         missing_explicit_secret = client.post(
-            "/api/genes/secret_preview_gene/preview-discovery",
+            "/api/v1/genes/secret_preview_gene/preview-discovery",
             json={
                 "config": {"base_url": "https://docs.example.test"},
                 "limit": 2,
             },
         )
         mismatched_source_type = client.post(
-            "/api/genes/confluence/preview-discovery",
+            "/api/v1/genes/confluence/preview-discovery",
             json={
                 "source_id": source_id,
                 "config": {"base_url": "https://docs.example.test"},
@@ -2289,7 +2289,7 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
         missing_page = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "name": "Payroll Docs",
                 "type": "github_pages",
@@ -2302,7 +2302,7 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
             },
         )
         valid = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "name": "Payroll Docs",
                 "type": "github_pages",
@@ -2317,7 +2317,7 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
             },
         )
         valid_subdomain_isolation = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "name": "Enterprise Pages Docs",
                 "type": "github_pages",
@@ -2333,9 +2333,9 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
                 "project_binding": _project_binding(),
             },
         )
-        sources = client.get("/api/sources")
+        sources = client.get("/api/v1/sources")
         wrong_site_path = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "name": "Other Docs",
                 "type": "github_pages",
@@ -2349,7 +2349,7 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
             },
         )
         missing_pat = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "name": "PAT Docs",
                 "type": "github_pages",
@@ -2431,7 +2431,7 @@ async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path,
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
         response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "name": "Delivery Board",
                 "config": {
@@ -2440,7 +2440,7 @@ async def test_source_config_update_resets_incremental_sync_cursor(db, tmp_path,
                 },
             },
         )
-        sources_response = client.get("/api/sources")
+        sources_response = client.get("/api/v1/sources")
 
     assert response.status_code == 200
     assert await db.get_sync_state(source_id) is None
@@ -2518,7 +2518,7 @@ async def test_source_scope_update_cancels_active_sync_before_reset(db, tmp_path
     with TestClient(app) as client:
         app.state.sync_service = fake_sync_service
         response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "name": "SFPAY Arch",
                 "config": {
@@ -2575,7 +2575,7 @@ async def test_source_scope_update_terminates_durable_pending_run(db, tmp_path, 
 
     with TestClient(app) as client:
         response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={
                 "config": {
                     **old_config,
@@ -2632,7 +2632,7 @@ async def test_jira_advanced_jql_update_terminates_pending_run(db, tmp_path, mon
 
     with TestClient(app) as client:
         response = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={"config": {**old_config, "jql": "key = PAY-2"}},
         )
 
@@ -2695,7 +2695,7 @@ async def test_repeated_source_scope_update_creates_a_new_transition_cycle(
 
     with TestClient(app) as client:
         first = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={"name": "Repeated rescope", "config": config("root-b")},
         )
     assert first.status_code == 200
@@ -2703,7 +2703,7 @@ async def test_repeated_source_scope_update_creates_a_new_transition_cycle(
 
     with TestClient(app) as client:
         reverse = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={"name": "Repeated rescope", "config": config("root-a")},
         )
     assert reverse.status_code == 200
@@ -2711,7 +2711,7 @@ async def test_repeated_source_scope_update_creates_a_new_transition_cycle(
 
     with TestClient(app) as client:
         repeated = client.put(
-            f"/api/sources/{source_id}",
+            f"/api/v1/sources/{source_id}",
             json={"name": "Repeated rescope", "config": config("root-b")},
         )
     assert repeated.status_code == 200
@@ -2752,7 +2752,7 @@ async def test_manual_sync_returns_conflict_during_lifecycle_maintenance(
     app = create_admin_app(db=db, config=_config(tmp_path))
 
     with TestClient(app) as client:
-        response = client.post(f"/api/sources/{source_id}/sync")
+        response = client.post(f"/api/v1/sources/{source_id}/sync")
 
     assert response.status_code == 409
     assert response.json()["detail"] == (
@@ -2793,7 +2793,7 @@ async def test_server_sync_routes_translate_atomic_activity_race_to_409(
         transport=transport,
         base_url="http://testserver",
     ) as client:
-        response = await client.post(f"/api/sources/{source_id}/{route}")
+        response = await client.post(f"/api/v1/sources/{source_id}/{route}")
 
     assert response.status_code == 409
     assert response.json()["detail"] == "source activity started during enqueue"
@@ -2835,7 +2835,7 @@ async def test_local_process_route_translates_atomic_activity_race_to_409(
     )
     with TestClient(app) as client:
         manifest = client.post(
-            f"/api/sources/{source_id}/adapter/manifest",
+            f"/api/v1/sources/{source_id}/adapter/manifest",
             json={
                 "items": [],
                 "coverage": "complete_snapshot",
@@ -2845,7 +2845,7 @@ async def test_local_process_route_translates_atomic_activity_race_to_409(
             },
         )
         response = client.post(
-            f"/api/sources/{source_id}/process",
+            f"/api/v1/sources/{source_id}/process",
             json={
                 "local_agent_job_id": "atomic-race-job",
                 "local_agent_attempt_count": 1,
@@ -2932,8 +2932,8 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
         app.state.sync_service = fake_sync_service
-        response = client.post(f"/api/sources/{source_id}/force-resync")
-        sources_response = client.get("/api/sources")
+        response = client.post(f"/api/v1/sources/{source_id}/force-resync")
+        sources_response = client.get("/api/v1/sources")
 
     assert response.status_code == 202
     assert response.json() == {
@@ -3021,7 +3021,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
     with TestClient(app) as client:
         app.state.sync_service = fake_sync_service
         manifest = client.post(
-            f"/api/sources/{source_id}/adapter/manifest",
+            f"/api/v1/sources/{source_id}/adapter/manifest",
             json={
                 "items": [],
                 "coverage": "complete_snapshot",
@@ -3031,7 +3031,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
             },
         )
         response = client.post(
-            f"/api/sources/{source_id}/process",
+            f"/api/v1/sources/{source_id}/process",
             json={
                 "force_full_sync": True,
                 "local_agent_job_id": "test-job",
@@ -3080,7 +3080,7 @@ async def test_local_agent_process_endpoint_rejects_server_owned_source(db, tmp_
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.post(f"/api/sources/{source_id}/process")
+        response = client.post(f"/api/v1/sources/{source_id}/process")
 
     assert response.status_code == 400
     assert response.json()["detail"] == "source_is_not_local_agent_backed"
@@ -3099,13 +3099,13 @@ async def test_admin_source_sync_status_uses_durable_worker_run(db, tmp_path):
         access_policy="workspace",
         owner_user_id="dev",
     )
-    await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    await db.enqueue_source_sync_run(source_id=source_id, workspace_id="local", trigger="manual")
 
     config = _config(tmp_path)
     config.sync.worker_enabled = False
     app = create_admin_app(db=db, config=config)
     with TestClient(app) as client:
-        response = client.get("/api/sources")
+        response = client.get("/api/v1/sources")
 
     assert response.status_code == 200, response.text
     source = next(row for row in response.json()["data"] if row["id"] == source_id)
@@ -3126,7 +3126,7 @@ async def test_admin_source_sync_status_exposes_durable_progress_after_refresh(d
         access_policy="workspace",
         owner_user_id="dev",
     )
-    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, workspace_id="local", trigger="manual")
     leased = await db.lease_next_source_sync_run(
         worker_id="worker-a",
         now=datetime.now(timezone.utc),
@@ -3149,7 +3149,7 @@ async def test_admin_source_sync_status_exposes_durable_progress_after_refresh(d
     config.sync.worker_enabled = False
     app = create_admin_app(db=db, config=config)
     with TestClient(app) as client:
-        response = client.get("/api/sources")
+        response = client.get("/api/v1/sources")
 
     assert response.status_code == 200, response.text
     source = next(row for row in response.json()["data"] if row["id"] == source_id)
@@ -3177,7 +3177,7 @@ async def test_admin_source_sync_status_marks_expired_worker_lease_recovering(db
         access_policy="workspace",
         owner_user_id="dev",
     )
-    await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    await db.enqueue_source_sync_run(source_id=source_id, workspace_id="local", trigger="manual")
     leased = await db.lease_next_source_sync_run(
         worker_id="worker-old",
         now=datetime(2026, 1, 1, tzinfo=timezone.utc),
@@ -3189,7 +3189,7 @@ async def test_admin_source_sync_status_marks_expired_worker_lease_recovering(db
     config.sync.worker_enabled = False
     app = create_admin_app(db=db, config=config)
     with TestClient(app) as client:
-        response = client.get("/api/sources")
+        response = client.get("/api/v1/sources")
 
     source = next(row for row in response.json()["data"] if row["id"] == source_id)
     assert source["sync"]["status"] == "recovering"
@@ -3289,7 +3289,7 @@ async def test_llm_config_probe_fetches_model_ids(db, tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/llm-config/probe",
+            "/api/v1/llm-config/probe",
             json={
                 "kind": "embedding",
                 "base_url": "https://proxy.example.test/v1",
@@ -3329,7 +3329,7 @@ async def test_llm_config_probe_treats_missing_models_as_manual_fallback(db, tmp
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/llm-config/probe",
+            "/api/v1/llm-config/probe",
             json={"kind": "enrichment", "base_url": "https://proxy.example.test", "api_key": "proxy-key"},
         )
 
@@ -3366,7 +3366,7 @@ async def test_llm_config_probe_falls_through_from_html_models_to_v1_models(db, 
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/llm-config/probe",
+            "/api/v1/llm-config/probe",
             json={"kind": "enrichment", "base_url": "https://proxy.example.test", "api_key": "proxy-key"},
         )
 
@@ -3400,7 +3400,7 @@ async def test_llm_config_probe_suggests_host_docker_internal(db, tmp_path, monk
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/llm-config/probe",
+            "/api/v1/llm-config/probe",
             json={"kind": "embedding", "base_url": "http://localhost:6655/openai/v1", "api_key": None},
         )
 
@@ -3433,7 +3433,7 @@ async def test_llm_config_probe_auth_error_without_key_is_actionable(db, tmp_pat
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/llm-config/probe",
+            "/api/v1/llm-config/probe",
             json={"kind": "enrichment", "base_url": "https://api.example.test/v1", "api_key": None},
         )
 
@@ -3461,8 +3461,8 @@ async def test_llm_config_put_can_preserve_and_clear_keys(db, tmp_path):
     app = create_admin_app(db=db, config=_config(tmp_path))
 
     with TestClient(app) as client:
-        preserve_response = client.put("/api/llm-config", json={"embedding_api_key": None})
-        clear_response = client.put("/api/llm-config", json={"enrichment_api_key": ""})
+        preserve_response = client.put("/api/v1/llm-config", json={"embedding_api_key": None})
+        clear_response = client.put("/api/v1/llm-config", json={"enrichment_api_key": ""})
 
     stored = await db.get_llm_config()
     assert preserve_response.status_code == 200
@@ -3491,7 +3491,7 @@ async def test_llm_config_put_can_be_disabled_for_deployment_managed_config(db, 
 
     with TestClient(app) as client:
         response = client.put(
-            "/api/llm-config",
+            "/api/v1/llm-config",
             json={"enrichment_model": "replacement-model"},
         )
 

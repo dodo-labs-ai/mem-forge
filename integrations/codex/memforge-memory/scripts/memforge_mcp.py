@@ -19,7 +19,7 @@ import sys
 import tempfile
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlencode, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 try:
@@ -65,15 +65,16 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.41"
+SERVER_VERSION = "0.1.42"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Repository context is optional. MemForge uses negotiated request-scoped host context when "
     "available. Otherwise, when the coding host exposes an exact current working directory, pass "
     "it as repository_context.working_directory. Never guess or use a plugin/install directory. "
     "Omit it when unavailable; the operation must continue. Explicit repository_context takes "
-    "precedence. MemForge resolves workspace routing and the Git remote locally and never sends "
-    "the local path to the service."
+    "precedence. MemForge derives repository attribution locally and never sends the local path "
+    "to the service. Workspace selection is request-scoped through the optional workspace_id "
+    "tool parameter."
 )
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
@@ -121,8 +122,9 @@ _DEFERRED_TOOL_CALLS: list[tuple[Any, str, dict[str, Any], Any]] = []
 REPOSITORY_CONTEXT_SCHEMA = {
     "type": "object",
     "description": (
-        "Optional agent-host context used locally to select a repository workspace and derive "
-        "repository attribution. The local path is never forwarded to MemForge."
+        "Optional agent-host context used locally to identify the active repository and derive "
+        "repository attribution. It never selects a MemForge workspace, and the local path is "
+        "never forwarded to MemForge."
     ),
     "properties": {
         "working_directory": {
@@ -139,8 +141,30 @@ REPOSITORY_CONTEXT_SCHEMA = {
     "additionalProperties": False,
 }
 
+WORKSPACE_ID_SCHEMA = {
+    "type": "string",
+    "minLength": 1,
+    "description": (
+        "Optional workspace selected for this call. Omit it to use the server-side default or "
+        "the caller's only accessible workspace."
+    ),
+}
+
 
 TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "list_workspaces",
+        "description": (
+            "List workspaces accessible to the current principal and identify the optional "
+            "server-side default. Discovery is optional; other tools resolve omitted workspace_id "
+            "without requiring this tool to be called first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
     {
         "name": "search",
         "description": (
@@ -378,9 +402,9 @@ TOOLS: list[dict[str, Any]] = [
                     "description": (
                         "A MemForge artifact URL from get_memory.sources[] or "
                         "get_memory.evidence_artifacts[].url, such as "
-                        "/api/documents/{doc_id}/content, /api/documents/{doc_id}/pdf, "
-                        "/api/documents/{doc_id}/artifacts/{kind}, or "
-                        "/api/source-artifacts/{observation_revision_id}."
+                        "/api/v1/documents/{doc_id}/content, /api/v1/documents/{doc_id}/pdf, "
+                        "/api/v1/documents/{doc_id}/artifacts/{kind}, or "
+                        "/api/v1/source-artifacts/{observation_revision_id}."
                     ),
                 },
                 "mode": {
@@ -585,7 +609,10 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 for _tool in TOOLS:
+    if _tool["name"] == "list_workspaces":
+        continue
     _tool["inputSchema"]["properties"]["repository_context"] = REPOSITORY_CONTEXT_SCHEMA
+    _tool["inputSchema"]["properties"]["workspace_id"] = WORKSPACE_ID_SCHEMA
 
 
 class NoRedirectHandler(HTTPRedirectHandler):
@@ -702,6 +729,16 @@ def _tool_call_response(
 
 
 def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> dict[str, Any]:
+    if name == "list_workspaces":
+        if args:
+            return {"error": "list_workspaces does not accept parameters"}
+        return _http_json(
+            "GET",
+            "/workspaces",
+            None,
+            target=configured_target(),
+            workspace_id=None,
+        )
     try:
         call_context = _tool_call_context(
             args.get("repository_context"),
@@ -709,14 +746,28 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
         )
     except ValueError as exc:
         return {"error": str(exc)}
-    args = {key: value for key, value in args.items() if key != "repository_context"}
+    try:
+        workspace_id = _optional_string_arg(args, "workspace_id")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    args = {
+        key: value
+        for key, value in args.items()
+        if key not in {"repository_context", "workspace_id"}
+    }
     if name == "search":
         try:
             body = _search_args_with_context(args, repo_identifier=call_context.repo_identifier)
         except ValueError as exc:
             return {"error": str(exc)}
         return _compact_search_response(
-            _http_json("POST", "/memories/search", body, target=call_context.target)
+            _http_json(
+                "POST",
+                "/memories/search",
+                body,
+                target=call_context.target,
+                workspace_id=workspace_id,
+            )
         )
     if name == "list_recent_memories":
         try:
@@ -724,12 +775,24 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
         except ValueError as exc:
             return {"error": str(exc)}
         return _compact_recent_memories_response(
-            _http_json("POST", "/memories/recent", body, target=call_context.target)
+            _http_json(
+                "POST",
+                "/memories/recent",
+                body,
+                target=call_context.target,
+                workspace_id=workspace_id,
+            )
         )
     if name == "list_sources":
         if args:
             return {"error": "list_sources does not accept parameters"}
-        return _http_json("GET", "/sources/searchable", None, target=call_context.target)
+        return _http_json(
+            "GET",
+            "/sources/searchable",
+            None,
+            target=call_context.target,
+            workspace_id=workspace_id,
+        )
     if name == "get_memory":
         memory_id = str(args.get("memory_id") or "").strip()
         if not memory_id:
@@ -740,10 +803,15 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
                 f"/memories/{quote(memory_id, safe='')}?include_private=true",
                 None,
                 target=call_context.target,
+                workspace_id=workspace_id,
             )
         )
     if name == "get_resource":
-        return _handle_get_resource(args, target=call_context.target)
+        return _handle_get_resource(
+            args,
+            target=call_context.target,
+            workspace_id=workspace_id,
+        )
     if name == "create_memory":
         try:
             memory_type = str(args.get("memory_type") or "fact").strip()
@@ -767,7 +835,13 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
                 body["idempotency_key"] = idempotency_key
         except ValueError as exc:
             return {"error": str(exc)}
-        return _http_json("POST", "/memories/create", body, target=call_context.target)
+        return _http_json(
+            "POST",
+            "/memories/create",
+            body,
+            target=call_context.target,
+            workspace_id=workspace_id,
+        )
     if name == "retire_memory":
         try:
             memory_id = _required_string_arg(args, "memory_id")
@@ -782,6 +856,7 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             f"/memories/{quote(memory_id, safe='')}/retire",
             body,
             target=call_context.target,
+            workspace_id=workspace_id,
         )
     if name == "replace_memory":
         try:
@@ -803,6 +878,7 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             f"/memories/{quote(memory_id, safe='')}/replace",
             body,
             target=call_context.target,
+            workspace_id=workspace_id,
         )
     if name == "list_memory_reviews":
         allowed = {"status", "limit", "offset"}
@@ -822,6 +898,7 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             "/memory-reviews?" + urlencode(query),
             None,
             target=call_context.target,
+            workspace_id=workspace_id,
         )
     if name == "get_memory_review":
         try:
@@ -833,6 +910,7 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             f"/memory-reviews/{quote(review_id, safe='')}",
             None,
             target=call_context.target,
+            workspace_id=workspace_id,
         )
     if name == "resolve_memory_review":
         try:
@@ -856,6 +934,7 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             f"/memory-reviews/{quote(review_id, safe='')}/{decision}",
             body,
             target=call_context.target,
+            workspace_id=workspace_id,
         )
     return {"error": f"Unknown tool: {name}"}
 
@@ -1084,7 +1163,7 @@ def _tool_call_context(value: Any, *, request_meta: Any = None) -> ToolCallConte
     sandbox_cwd = _codex_sandbox_cwd(request_meta)
     if sandbox_cwd is None:
         return ToolCallContext(
-            target=configured_target(_CLIENT_ROOT_PATHS),
+            target=configured_target(),
             repo_identifier=_active_repo_identifier(),
         )
 
@@ -1119,11 +1198,10 @@ def _tool_call_context_from_working_directory(
     )
     if repository_context.state != "exact" or not repository_context.repo_identifier:
         raise ValueError(
-            f"{field_name} must resolve to a Git repository with an origin remote; refusing to "
-            "fall back to another workspace"
+            f"{field_name} must resolve to a Git repository with an origin remote"
         )
     return ToolCallContext(
-        target=configured_target((repository_path,)),
+        target=configured_target(),
         repo_identifier=repository_context.repo_identifier,
     )
 
@@ -1394,12 +1472,20 @@ def _compact_memory_source(source: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
-def _resource_url(path: str, *, target: Any | None = None) -> str:
-    return (target or _configured_target()).resource_url(path)
+def _resource_url(
+    path: str,
+    *,
+    target: Any | None = None,
+    workspace_id: str | None = None,
+) -> str:
+    return (target or _configured_target()).resource_url(
+        path,
+        workspace_id=workspace_id,
+    )
 
 
 def _configured_target():
-    return configured_target(_CLIENT_ROOT_PATHS)
+    return configured_target()
 
 
 def _api_headers(*, json_body: bool = False) -> dict[str, str]:
@@ -1418,11 +1504,12 @@ def _http_json(
     body: dict[str, Any] | None,
     *,
     target: Any | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     target = target or _configured_target()
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = Request(
-        _resource_url(path, target=target),
+        _resource_url(path, target=target, workspace_id=workspace_id),
         data=data,
         headers=_api_headers(json_body=body is not None),
         method=method,
@@ -1439,12 +1526,17 @@ def _http_json(
     except (OSError, URLError, json.JSONDecodeError) as exc:
         return {
             "error": "MemForge API unavailable",
-            "api_url": target.workspace_api_base,
+            "api_url": target.api_base,
             "detail": str(exc),
         }
 
 
-def _handle_get_resource(args: dict[str, Any], *, target: Any | None = None) -> dict[str, Any]:
+def _handle_get_resource(
+    args: dict[str, Any],
+    *,
+    target: Any | None = None,
+    workspace_id: str | None = None,
+) -> dict[str, Any]:
     target = target or _configured_target()
     mode = str(args.get("mode") or "text").strip().lower()
     if mode not in {"text", "file", "base64"}:
@@ -1457,13 +1549,17 @@ def _handle_get_resource(args: dict[str, Any], *, target: Any | None = None) -> 
     if isinstance(max_chars, dict):
         return max_chars
 
-    resource_target = _parse_resource_url(str(args.get("url") or "").strip(), target)
+    resource_target = _parse_resource_url(
+        str(args.get("url") or "").strip(),
+        target,
+        workspace_id=workspace_id,
+    )
     if resource_target is None:
         return {
             "error": "unsupported resource URL",
             "hint": (
-                "Use a relative MemForge /api/documents/{doc_id}/content, /pdf, "
-                "/artifacts/{kind}, or /api/source-artifacts/{observation_revision_id} "
+                "Use a relative MemForge /api/v1/documents/{doc_id}/content, /pdf, "
+                "/artifacts/{kind}, or /api/v1/source-artifacts/{observation_revision_id} "
                 "URL, or an absolute URL under MEMFORGE_API_URL."
             ),
         }
@@ -1621,11 +1717,26 @@ def _verify_resource_integrity(
         raise OSError("resource SHA-256 does not match X-Content-SHA256")
 
 
-def _parse_resource_url(url: str, target: Any) -> ResourceTarget | None:
+def _parse_resource_url(
+    url: str,
+    target: Any,
+    *,
+    workspace_id: str | None = None,
+) -> ResourceTarget | None:
     parsed = urlparse(url)
     base = urlparse(target.origin)
-    if parsed.query or parsed.fragment:
+    if parsed.fragment:
         return None
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    if any(key != "workspace_id" for key, _value in query):
+        return None
+    locator_workspace_ids = [value.strip() for key, value in query if key == "workspace_id"]
+    if len(locator_workspace_ids) > 1 or any(not value for value in locator_workspace_ids):
+        return None
+    locator_workspace_id = locator_workspace_ids[0] if locator_workspace_ids else None
+    if workspace_id and locator_workspace_id and workspace_id != locator_workspace_id:
+        return None
+    effective_workspace_id = workspace_id or locator_workspace_id
 
     if parsed.scheme or parsed.netloc:
         if parsed.scheme not in {"http", "https"}:
@@ -1642,33 +1753,52 @@ def _parse_resource_url(url: str, target: Any) -> ResourceTarget | None:
     parts = [unquote(part) for part in path.strip("/").split("/") if part]
     if any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
         return None
-    if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "content":
+    relative_url = path
+    if locator_workspace_id:
+        relative_url += "?" + urlencode({"workspace_id": locator_workspace_id})
+    if len(parts) == 5 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "content":
         return ResourceTarget(
-            parts[2],
+            parts[3],
             "content",
-            path,
-            _resource_url(path[len("/api") :], target=target),
+            relative_url,
+            _resource_url(
+                path[len("/api/v1") :],
+                target=target,
+                workspace_id=effective_workspace_id,
+            ),
         )
-    if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "pdf":
+    if len(parts) == 5 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "pdf":
         return ResourceTarget(
-            parts[2],
+            parts[3],
             "pdf",
-            path,
-            _resource_url(path[len("/api") :], target=target),
+            relative_url,
+            _resource_url(
+                path[len("/api/v1") :],
+                target=target,
+                workspace_id=effective_workspace_id,
+            ),
         )
-    if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
+    if len(parts) == 6 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "artifacts":
         return ResourceTarget(
-            parts[2],
-            parts[4],
-            path,
-            _resource_url(path[len("/api") :], target=target),
+            parts[3],
+            parts[5],
+            relative_url,
+            _resource_url(
+                path[len("/api/v1") :],
+                target=target,
+                workspace_id=effective_workspace_id,
+            ),
         )
-    if len(parts) == 3 and parts[:2] == ["api", "source-artifacts"]:
+    if len(parts) == 4 and parts[:3] == ["api", "v1", "source-artifacts"]:
         return ResourceTarget(
-            parts[2],
+            parts[3],
             "source_artifact",
-            path,
-            _resource_url(path[len("/api") :], target=target),
+            relative_url,
+            _resource_url(
+                path[len("/api/v1") :],
+                target=target,
+                workspace_id=effective_workspace_id,
+            ),
             identity_key="observation_revision_id",
         )
     return None

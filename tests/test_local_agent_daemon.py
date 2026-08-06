@@ -189,7 +189,7 @@ def test_local_adapter_capability_commands_include_teams():
 
 def test_oss_local_markdown_job_uses_the_unscoped_api_client(monkeypatch):
     client = ToolClient(
-        target=build_target(origin="http://127.0.0.1:8765", workspace_id=None),
+        target=build_target(origin="http://127.0.0.1:8765"),
         api_token=None,
     )
     observed: dict[str, object] = {}
@@ -260,8 +260,8 @@ def test_cloud_local_agent_job_requires_and_applies_workspace_scope():
     assert source_id == "src-local"
     assert error is None
     assert scoped is not client
-    assert scoped.target.workspace_id == "workspace-a"
-    assert scoped.target.workspace_api_base.endswith("/api/workspaces/workspace-a/api")
+    assert scoped.workspace_id == "workspace-a"
+    assert scoped.target.api_base.endswith("/api/v1")
 
 
 def test_teams_browse_job_reauths_when_no_local_session(monkeypatch):
@@ -324,7 +324,6 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
     class FakeClient:
         target = build_target(
             origin="https://memforge.example.hana.ondemand.com",
-            workspace_id="workspace-client",
         )
 
         def for_workspace(self, workspace_id: str):
@@ -908,7 +907,6 @@ def test_adapter_daemon_status_uses_environment_target_provenance(monkeypatch, t
     assert payload["target"] == {
         "edition": "cloud",
         "api_url": "https://environment.hana.ondemand.com",
-        "workspace_id": "ws-environment",
         "active_target": "",
         "token_env": "MEMFORGE_API_TOKEN",
         "api_token_configured": False,
@@ -951,7 +949,7 @@ def test_adapter_daemon_status_allows_cloud_target_without_global_workspace(monk
     assert result.exit_code == 0, result.output
     target = json.loads(result.output)["target"]
     assert target["edition"] == "cloud"
-    assert target["workspace_id"] is None
+    assert "workspace_id" not in target
     assert target["api_token_configured"] is True
 
 

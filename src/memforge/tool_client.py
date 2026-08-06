@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from memforge.api_target import MemForgeTarget, build_target
+from memforge.api_target import MemForgeTarget
 from memforge.sync_progress import normalize_sync_progress_snapshot
 
 
@@ -51,22 +51,25 @@ class ToolClient:
         *,
         target: MemForgeTarget,
         api_token: str | None,
+        workspace_id: str | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self.target = target
         self.api_token = api_token
+        self.workspace_id = workspace_id.strip() if workspace_id else None
         self.timeout_seconds = timeout_seconds
 
     def for_workspace(self, workspace_id: str) -> ToolClient:
         """Return a client scoped to one workspace from a server-level client."""
         return ToolClient(
-            target=build_target(origin=self.target.origin, workspace_id=workspace_id),
+            target=self.target,
             api_token=self.api_token,
+            workspace_id=workspace_id,
             timeout_seconds=self.timeout_seconds,
         )
 
     def _resource_url(self, path: str) -> str:
-        return self.target.resource_url(path)
+        return self.target.resource_url(path, workspace_id=self.workspace_id)
 
     def _host_url(self, path: str) -> str:
         if not path.startswith("/api/"):
@@ -740,8 +743,8 @@ class ToolClient:
             return {
                 "error": "unsupported resource URL",
                 "hint": (
-                    "Use a relative MemForge /api/documents/{doc_id}/content, /pdf, "
-                    "/artifacts/{kind}, or /api/source-artifacts/{observation_revision_id} "
+                    "Use a relative MemForge /api/v1/documents/{doc_id}/content, /pdf, "
+                    "/artifacts/{kind}, or /api/v1/source-artifacts/{observation_revision_id} "
                     "URL, or an absolute URL under MEMFORGE_API_URL."
                 ),
             }
@@ -915,18 +918,18 @@ def _parse_resource_url(
     parts = [unquote(part) for part in path.strip("/").split("/") if part]
     if any(part in {".", ".."} or "/" in part or "\\" in part for part in parts):
         return None
-    if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "content":
-        return ResourceTarget(parts[2], "content", path, request_url_for_path(path[len("/api") :]))
-    if len(parts) == 4 and parts[:2] == ["api", "documents"] and parts[3] == "pdf":
-        return ResourceTarget(parts[2], "pdf", path, request_url_for_path(path[len("/api") :]))
-    if len(parts) == 5 and parts[:2] == ["api", "documents"] and parts[3] == "artifacts":
-        return ResourceTarget(parts[2], parts[4], path, request_url_for_path(path[len("/api") :]))
-    if len(parts) == 3 and parts[:2] == ["api", "source-artifacts"]:
+    if len(parts) == 5 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "content":
+        return ResourceTarget(parts[3], "content", path, request_url_for_path(path[len("/api/v1") :]))
+    if len(parts) == 5 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "pdf":
+        return ResourceTarget(parts[3], "pdf", path, request_url_for_path(path[len("/api/v1") :]))
+    if len(parts) == 6 and parts[:3] == ["api", "v1", "documents"] and parts[4] == "artifacts":
+        return ResourceTarget(parts[3], parts[5], path, request_url_for_path(path[len("/api/v1") :]))
+    if len(parts) == 4 and parts[:3] == ["api", "v1", "source-artifacts"]:
         return ResourceTarget(
-            parts[2],
+            parts[3],
             "source_artifact",
             path,
-            request_url_for_path(path[len("/api") :]),
+            request_url_for_path(path[len("/api/v1") :]),
             identity_key="observation_revision_id",
         )
     return None

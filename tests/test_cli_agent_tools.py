@@ -39,12 +39,13 @@ class FakeToolClient:
         *,
         target: MemForgeTarget,
         api_token: str | None = None,
+        workspace_id: str | None = None,
         timeout_seconds: float = 60.0,
     ):
         self.target = target
         self.api_url = target.origin
         self.api_token = api_token
-        self.workspace_id = target.workspace_id or ""
+        self.workspace_id = workspace_id or ""
         self.timeout_seconds = timeout_seconds
 
     @classmethod
@@ -206,8 +207,9 @@ class FakeToolClient:
 
     def for_workspace(self, workspace_id: str):
         return type(self)(
-            target=build_target(origin=self.api_url, workspace_id=workspace_id),
+            target=build_target(origin=self.api_url),
             api_token=self.api_token,
+            workspace_id=workspace_id,
             timeout_seconds=self.timeout_seconds,
         )
 
@@ -216,9 +218,9 @@ def _cloud_test_client() -> FakeToolClient:
     return FakeToolClient(
         target=build_target(
             origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-            workspace_id="ws-from-cloud",
         ),
         api_token="tok",
+        workspace_id="ws-from-cloud",
     )
 
 
@@ -355,7 +357,7 @@ def test_get_resource_cli_supports_file_mode(monkeypatch, tmp_path: Path):
 
     result = CliRunner().invoke(
         cli,
-        ["get-resource", "/api/documents/doc-456/pdf", "--mode", "file", "--max-bytes", "1024"],
+        ["get-resource", "/api/v1/documents/doc-456/pdf", "--mode", "file", "--max-bytes", "1024"],
     )
 
     assert result.exit_code == 0, result.output
@@ -367,7 +369,7 @@ def test_get_resource_cli_supports_file_mode(monkeypatch, tmp_path: Path):
             {
                 "api_url": "http://127.0.0.1:8765",
                 "api_token": None,
-                "url": "/api/documents/doc-456/pdf",
+                "url": "/api/v1/documents/doc-456/pdf",
                 "mode": "file",
                 "max_chars": 120000,
                 "max_bytes": 1024,
@@ -551,8 +553,6 @@ def test_target_profile_sets_default_api_url(monkeypatch, tmp_path: Path):
             "sap.prod",
             "--api-url",
             "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-            "--workspace-id",
-            "mount_tai",
             "--token-env",
             "SAP_TOKEN",
         ],
@@ -565,7 +565,7 @@ def test_target_profile_sets_default_api_url(monkeypatch, tmp_path: Path):
         ("health", {"api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "api_token": "secret-token"})
     ]
     assert "edition = " not in cli_config.read_text(encoding="utf-8")
-    assert 'workspace_id = "mount_tai"' in cli_config.read_text(encoding="utf-8")
+    assert "workspace_id" not in cli_config.read_text(encoding="utf-8")
 
 
 def test_target_profile_does_not_mix_global_token(monkeypatch, tmp_path: Path):
@@ -582,8 +582,6 @@ def test_target_profile_does_not_mix_global_token(monkeypatch, tmp_path: Path):
             "sap",
             "--api-url",
             "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-            "--workspace-id",
-            "mount_tai",
             "--token-env",
             "SAP_TOKEN",
         ],
@@ -615,8 +613,6 @@ def test_env_api_url_does_not_use_active_target_token(monkeypatch, tmp_path: Pat
             "sap",
             "--api-url",
             "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-            "--workspace-id",
-            "mount_tai",
             "--token-env",
             "SAP_TOKEN",
         ],
@@ -635,7 +631,7 @@ def test_env_api_url_does_not_use_active_target_token(monkeypatch, tmp_path: Pat
     assert FakeToolClient.calls == [("health", {"api_url": "https://override.example.test", "api_token": None})]
 
 
-def test_target_add_rejects_invalid_tagged_union_before_writing(monkeypatch, tmp_path: Path):
+def test_target_add_accepts_cloud_origin_without_client_workspace_state(monkeypatch, tmp_path: Path):
     cli_config = tmp_path / "cli.toml"
     monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(cli_config))
 
@@ -644,9 +640,8 @@ def test_target_add_rejects_invalid_tagged_union_before_writing(monkeypatch, tmp
         ["target", "add", "invalid", "--api-url", "https://memforge-dev.cfapps.eu12.hana.ondemand.com"],
     )
 
-    assert result.exit_code != 0
-    assert "cloud_workspace_required" in result.output
-    assert not cli_config.exists()
+    assert result.exit_code == 0, result.output
+    assert "workspace_id" not in cli_config.read_text(encoding="utf-8")
 
 
 class _StubClient:

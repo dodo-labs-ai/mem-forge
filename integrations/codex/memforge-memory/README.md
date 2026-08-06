@@ -2,42 +2,25 @@
 
 This plugin connects Codex lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.41`.
+The packaged runtime and plugin version is `0.1.42`.
 
 With no routing variables, the plugin targets local OSS at
-`http://127.0.0.1:8765/api`. Otherwise set the target in `~/.codex/config.toml`.
-`MEMFORGE_API_URL` must be an HTTP(S) origin without `/api`. Origins whose
-hostname is `hana.ondemand.com` or one of its subdomains are Cloud targets and
-require `MEMFORGE_WORKSPACE_ID`; every other origin is OSS and forbids a
-workspace. Set `MEMFORGE_API_TOKEN` separately when bearer authentication is
+`http://127.0.0.1:8765/api/v1`. Otherwise set the origin in
+`~/.codex/config.toml`. `MEMFORGE_API_URL` must be an HTTP(S) origin without an
+API path. Set `MEMFORGE_API_TOKEN` separately when bearer authentication is
 required.
 
 ```toml
 [memforge]
 MEMFORGE_API_URL = "https://memforge-dev.cfapps.eu12.hana.ondemand.com"
 MEMFORGE_API_TOKEN = "..."
-MEMFORGE_WORKSPACE_ID = "mount_tai"
 ```
 
-For remote OSS, use its origin and omit `MEMFORGE_WORKSPACE_ID`. Invalid or
-partial targets fail locally before any MCP or hook network request.
-
-The user-level setting is the global default. To select a different Cloud
-workspace for one Git repository, create the uncommitted
-`<repository>/.memforge/config.toml`:
-
-```toml
-[memforge]
-workspace_id = "repository_workspace"
-```
-
-The repository file is ignored by Git and only selects the workspace; API
-origins and credentials retain their process-then-user precedence. For workspace
-selection, a valid repository override has highest priority, followed by a
-process `MEMFORGE_WORKSPACE_ID` and then the user-level default. Missing or
-invalid repository configuration leaves the process or user default unchanged.
-The bundled MCP uses the host repository root and the hooks use the hook
-workspace, so both resolve the same override.
+The same `/api/v1` surface is used for OSS and Cloud. Call `list_workspaces` to
+discover accessible workspaces when useful, then pass optional `workspace_id`
+to any other tool. It may be omitted when the account has a default or exactly
+one accessible workspace. Repository context remains provenance attribution;
+it never selects a workspace.
 
 Do not add a manual `[mcp_servers.memforge]` block. The plugin's `.mcp.json`
 registers the MCP server; duplicating it in `config.toml` can pin Codex to a
@@ -56,11 +39,11 @@ get_resource(mode=file) -> ~/.memforge-agent/artifacts -> local_path
 
 The proxy negotiates Codex's request-scoped `codex/sandbox-state-meta`
 capability. Codex then attaches the current task environment's `sandboxCwd` to
-each MCP tool call, allowing the proxy to select the repository workspace and
-derive a normalized Git remote without relying on a process-global directory.
+each MCP tool call, allowing the proxy to derive a normalized Git remote
+without relying on a process-global directory.
 An explicit `repository_context.working_directory` remains available for other
-hosts and takes precedence when supplied. Compatible MCP Roots and the global
-workspace are fallbacks. Local paths are discarded before OSS or Cloud calls;
+hosts and takes precedence when supplied. Compatible MCP Roots are attribution
+fallbacks. Local paths are discarded before OSS or Cloud calls;
 malformed negotiated or explicit context fails before HTTP instead of silently
 reading another workspace.
 

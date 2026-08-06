@@ -545,7 +545,7 @@ async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_searc
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/memories/create",
+            "/api/v1/memories/create",
             json={
                 "content": "Use canonical payroll trigger status fields.",
                 "provenance": "User confirmed this after validating the payroll smoke flow.",
@@ -555,7 +555,7 @@ async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_searc
         )
         payload = response.json()
         search_response = client.post(
-            "/api/memories/search",
+            "/api/v1/memories/search",
             json={
                 "query": "canonical payroll trigger status fields",
                 "include_private": True,
@@ -563,7 +563,7 @@ async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_searc
             },
         )
         detail_response = client.get(
-            f"/api/memories/{payload['memory_id']}?include_private=true"
+            f"/api/v1/memories/{payload['memory_id']}?include_private=true"
         )
 
     assert response.status_code == 200, response.text
@@ -626,7 +626,7 @@ async def test_create_memory_route_requires_provenance(db: Database, tmp_path, m
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/memories/create",
+            "/api/v1/memories/create",
             json={
                 "content": "Keep create_memory content durable and reusable.",
                 "reason": "Legacy clients used to send this field.",
@@ -656,7 +656,7 @@ async def test_create_memory_route_rejects_legacy_reason_field(db: Database, tmp
     provenance = "User explicitly asked to keep this convention after reviewing MCP memory behavior."
     with TestClient(app) as client:
         response = client.post(
-            "/api/memories/create",
+            "/api/v1/memories/create",
             json={
                 "content": "Keep create_memory content durable and reusable.",
                 "provenance": provenance,
@@ -680,7 +680,7 @@ async def test_retire_memory_route_returns_conflict_for_stale_content_hash(db: D
 
     with TestClient(app) as client:
         response = client.post(
-            f"/api/memories/{memory.id}/retire",
+            f"/api/v1/memories/{memory.id}/retire",
             json={
                 "reason": "User says this is stale",
                 "expected_content_hash": "wrong",
@@ -705,7 +705,7 @@ async def test_retire_memory_route_audits_request_principal(db: Database, tmp_pa
 
     with TestClient(app) as client:
         response = client.post(
-            f"/api/memories/{memory.id}/retire",
+            f"/api/v1/memories/{memory.id}/retire",
             json={
                 "reason": "User says this is stale",
                 "expected_content_hash": memory.content_hash,
@@ -741,7 +741,7 @@ async def test_replace_memory_route_audits_request_principal(db: Database, tmp_p
 
     with TestClient(app) as client:
         response = client.post(
-            f"/api/memories/{memory.id}/replace",
+            f"/api/v1/memories/{memory.id}/replace",
             json={
                 "replacement_content": "Route replacement corrected fact",
                 "provenance": "User supplied the corrected route in chat.",

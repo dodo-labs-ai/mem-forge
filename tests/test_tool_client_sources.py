@@ -24,10 +24,7 @@ class _RecordingClient(ToolClient):
 
     def __init__(self, response: dict[str, Any]) -> None:
         super().__init__(
-            target=build_target(
-                origin="https://self.example.test",
-                workspace_id=None,
-            ),
+            target=build_target(origin="https://self.example.test"),
             api_token="tok",
         )
         self._response = response
@@ -51,7 +48,7 @@ def test_create_source_posts_type_name_and_config():
     assert client.calls == [
         (
             "POST",
-            "/api/sources",
+            "/api/v1/sources",
             {
                 "type": "local_markdown",
                 "name": "Notes",
@@ -67,7 +64,7 @@ def test_list_sources_gets_sources_collection():
     result = client.list_sources()
 
     assert result["data"][0]["id"] == "src-1"
-    assert client.calls == [("GET", "/api/sources", None)]
+    assert client.calls == [("GET", "/api/v1/sources", None)]
 
 
 def test_get_source_schedule_uses_source_schedule_endpoint():
@@ -76,7 +73,7 @@ def test_get_source_schedule_uses_source_schedule_endpoint():
     result = client.get_source_schedule("src-1")
 
     assert result["enabled"] is True
-    assert client.calls == [("GET", "/api/sources/src-1/schedule", None)]
+    assert client.calls == [("GET", "/api/v1/sources/src-1/schedule", None)]
 
 
 def test_update_source_schedule_puts_source_schedule_payload():
@@ -92,7 +89,7 @@ def test_update_source_schedule_puts_source_schedule_payload():
     assert client.calls == [
         (
             "PUT",
-            "/api/sources/src-1/schedule",
+            "/api/v1/sources/src-1/schedule",
             {"enabled": True, "interval_minutes": 60},
         )
     ]
@@ -119,7 +116,7 @@ def test_push_github_repo_document_posts_adapter_payload():
     assert client.calls == [
         (
             "POST",
-            "/api/sources/src-github/adapter/packages",
+            "/api/v1/sources/src-github/adapter/packages",
             {
                 "repo_url": "https://github.tools.sap/org/repo",
                 "repo_ref": "main",
@@ -153,7 +150,7 @@ def test_prepare_local_source_snapshot_posts_complete_fenced_manifest():
     assert client.calls == [
         (
             "POST",
-            "/api/sources/src-github/adapter/manifest",
+            "/api/v1/sources/src-github/adapter/manifest",
             {
                 "items": [{"doc_id": "doc-1", "revision": "blob-1", "change_kind": "upsert"}],
                 "coverage": "complete_snapshot",
@@ -188,7 +185,7 @@ def test_push_jira_package_posts_raw_payload_without_markdown_body():
     assert client.calls == [
         (
             "POST",
-            "/api/sources/src-jira/adapter/packages",
+            "/api/v1/sources/src-jira/adapter/packages",
             {
                 "base_url": "https://jira.example.test",
                 "issue_key": "PAY-1",
@@ -232,7 +229,7 @@ def test_push_teams_window_package_posts_raw_payload_without_markdown_body():
     assert client.calls == [
         (
             "POST",
-            "/api/sources/src-teams/adapter/packages",
+            "/api/v1/sources/src-teams/adapter/packages",
             {
                 "conversation_id": "19:channel@example.test",
                 "window_id": "teams-thread:src-teams:conv:root",
@@ -262,7 +259,7 @@ def test_start_source_sync_posts_source_sync_payload():
     assert client.calls == [
         (
             "POST",
-            "/api/sources/src-jira/sync",
+            "/api/v1/sources/src-jira/sync",
             {"force_full_sync": False},
         )
     ]
@@ -283,7 +280,7 @@ def test_start_source_processing_posts_snapshot_identity():
     assert client.calls == [
         (
             "POST",
-            "/api/sources/src-local/process",
+            "/api/v1/sources/src-local/process",
             {
                 "force_full_sync": True,
                 "sync_snapshot_id": "laj-sync-3",
@@ -296,11 +293,9 @@ def test_start_source_processing_posts_snapshot_identity():
 
 def test_start_source_processing_resolves_the_workspace_resource_url(monkeypatch):
     client = ToolClient(
-        target=build_target(
-            origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-            workspace_id="mount_tai",
-        ),
+        target=build_target(origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com"),
         api_token="tok",
+        workspace_id="mount_tai",
     )
     calls: list[tuple[str, str, dict[str, Any] | None]] = []
 
@@ -316,7 +311,7 @@ def test_start_source_processing_resolves_the_workspace_resource_url(monkeypatch
     assert calls == [
         (
             "POST",
-            "https://memforge-dev.cfapps.eu12.hana.ondemand.com/api/workspaces/mount_tai/api/sources/src-local/process",
+            "https://memforge-dev.cfapps.eu12.hana.ondemand.com/api/v1/sources/src-local/process?workspace_id=mount_tai",
             {"force_full_sync": False},
         )
     ]
@@ -331,7 +326,7 @@ def test_get_source_projection_inventory_uses_source_resource_url():
     assert client.calls == [
         (
             "GET",
-            "/api/sources/src%20teams/projection-inventory?limit=200",
+            "/api/v1/sources/src%20teams/projection-inventory?limit=200",
             None,
         )
     ]
@@ -419,16 +414,14 @@ def test_local_agent_job_heartbeat_sends_user_progress():
 
 def test_tool_client_uses_target_for_workspace_resource_calls():
     client = ToolClient(
-        target=build_target(
-            origin="https://memforge.example.hana.ondemand.com",
-            workspace_id="ws-a",
-        ),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
         api_token="tok",
+        workspace_id="ws-a",
     )
 
     assert (
         client._resource_url("/sources/src-github/adapter/packages")
-        == "https://memforge.example.hana.ondemand.com/api/workspaces/ws-a/api/sources/src-github/adapter/packages"
+        == "https://memforge.example.hana.ondemand.com/api/v1/sources/src-github/adapter/packages?workspace_id=ws-a"
     )
 
 
@@ -440,18 +433,16 @@ def test_tool_client_can_scope_server_level_client_to_job_workspace():
 
     scoped = server_client.for_workspace("mount_tai")
 
-    assert scoped.target.workspace_id == "mount_tai"
-    assert scoped.target.workspace_api_base == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api"
+    assert scoped.target.api_base == "https://memforge.example.hana.ondemand.com/api/v1"
+    assert scoped.workspace_id == "mount_tai"
     assert scoped.api_token == "token"
 
 
 def test_control_plane_daemon_jobs_use_host_origin_not_workspace_resource():
     client = ToolClient(
-        target=build_target(
-            origin="https://memforge.example.hana.ondemand.com",
-            workspace_id="ws-a",
-        ),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
         api_token="tok",
+        workspace_id="ws-a",
     )
 
     assert (
@@ -471,11 +462,9 @@ def test_control_plane_lease_unavailable_reports_attempted_host_url(monkeypatch)
 
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: UnavailableOpener())
     client = ToolClient(
-        target=build_target(
-            origin="https://memforge.example.hana.ondemand.com",
-            workspace_id="ws-a",
-        ),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
         api_token="tok",
+        workspace_id="ws-a",
     )
 
     result = client.lease_local_agent_jobs()
@@ -508,17 +497,15 @@ def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
 
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
     client = ToolClient(
-        target=build_target(
-            origin="https://memforge.example.hana.ondemand.com",
-            workspace_id="mount_tai",
-        ),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
         api_token="tok",
+        workspace_id="mount_tai",
     )
 
     result = client.search(query="artifact cache")
 
     assert result == {"results": []}
-    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/memories/search"
+    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/v1/memories/search?workspace_id=mount_tai"
     assert captured["authorization"] == "Bearer tok"
     assert json.loads(captured["body"].decode())["query"] == "artifact cache"
 
@@ -541,7 +528,7 @@ def test_tool_client_forwards_structured_memory_search_facets():
     assert client.calls == [
         (
             "POST",
-            "/api/memories/search",
+            "/api/v1/memories/search",
             {
                 "query": "scheduler fixes last week",
                 "top_k": 10,
@@ -566,7 +553,7 @@ def test_tool_client_get_memory_uses_personalized_detail_route():
 
     assert result["id"] == "mem-private"
     assert client.calls == [
-        ("GET", "/api/memories/mem-private?include_private=true", None),
+        ("GET", "/api/v1/memories/mem-private?include_private=true", None),
     ]
 
 
@@ -585,7 +572,7 @@ def test_tool_client_create_memory_posts_user_memory_payload():
     assert client.calls == [
         (
             "POST",
-            "/api/memories/create",
+            "/api/v1/memories/create",
             {
                 "content": "Use readable confirmation previews before memory mutations.",
                 "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
@@ -610,7 +597,7 @@ def test_tool_client_retire_memory_posts_lifecycle_guard():
     assert client.calls == [
         (
             "POST",
-            "/api/memories/mem-1/retire",
+            "/api/v1/memories/mem-1/retire",
             {"reason": "User says this is stale", "expected_content_hash": "hash-1"},
         )
     ]
@@ -632,7 +619,7 @@ def test_tool_client_replace_memory_posts_lifecycle_guard():
     assert client.calls == [
         (
             "POST",
-            "/api/memories/mem-1/replace",
+            "/api/v1/memories/mem-1/replace",
             {
                 "replacement_content": "Corrected memory",
                 "provenance": "User supplied the corrected value in chat.",
@@ -652,9 +639,9 @@ def test_tool_client_memory_review_methods_use_review_endpoints():
     client.resolve_memory_review("rev-1", decision="reject", note="Not durable", reviewer="alice")
 
     assert client.calls == [
-        ("GET", "/api/memory-reviews?status=open&limit=5&offset=2", None),
-        ("GET", "/api/memory-reviews/rev-1", None),
-        ("POST", "/api/memory-reviews/rev-1/reject", {"note": "Not durable", "reviewer": "alice"}),
+        ("GET", "/api/v1/memory-reviews?status=open&limit=5&offset=2", None),
+        ("GET", "/api/v1/memory-reviews/rev-1", None),
+        ("POST", "/api/v1/memory-reviews/rev-1/reject", {"note": "Not durable", "reviewer": "alice"}),
     ]
 
 
@@ -681,19 +668,17 @@ def test_tool_client_fetches_resource_through_hosted_workspace(monkeypatch):
 
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
     client = ToolClient(
-        target=build_target(
-            origin="https://memforge.example.hana.ondemand.com",
-            workspace_id="mount_tai",
-        ),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
         api_token="tok",
+        workspace_id="mount_tai",
     )
 
-    result = client.get_resource(url="/api/documents/doc-1/content")
+    result = client.get_resource(url="/api/v1/documents/doc-1/content")
 
     assert result["text"] == "# Source"
     assert (
         captured["url"]
-        == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/documents/doc-1/content"
+        == "https://memforge.example.hana.ondemand.com/api/v1/documents/doc-1/content?workspace_id=mount_tai"
     )
     assert captured["authorization"] == "Bearer tok"
 
@@ -727,15 +712,13 @@ def test_tool_client_fetches_source_artifact_through_hosted_workspace(monkeypatc
 
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
     client = ToolClient(
-        target=build_target(
-            origin="https://memforge.example.hana.ondemand.com",
-            workspace_id="mount_tai",
-        ),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
         api_token="tok",
+        workspace_id="mount_tai",
     )
 
     result = client.get_resource(
-        url="/api/source-artifacts/obsrev-1",
+        url="/api/v1/source-artifacts/obsrev-1",
         mode="base64",
     )
 
@@ -746,7 +729,7 @@ def test_tool_client_fetches_source_artifact_through_hosted_workspace(monkeypatc
     assert (
         captured["url"]
         == "https://memforge.example.hana.ondemand.com"
-        "/api/workspaces/mount_tai/api/source-artifacts/obsrev-1"
+        "/api/v1/source-artifacts/obsrev-1?workspace_id=mount_tai"
     )
     assert captured["authorization"] == "Bearer tok"
 
@@ -800,15 +783,13 @@ def test_tool_client_file_mode_verifies_resource_integrity(
     monkeypatch.setenv("MEMFORGE_ARTIFACT_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
     client = ToolClient(
-        target=build_target(
-            origin="https://memforge.example.hana.ondemand.com",
-            workspace_id="mount_tai",
-        ),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
         api_token="tok",
+        workspace_id="mount_tai",
     )
 
     result = client.get_resource(
-        url="/api/source-artifacts/obsrev-1",
+        url="/api/v1/source-artifacts/obsrev-1",
         mode="file",
     )
 

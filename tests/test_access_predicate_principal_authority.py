@@ -110,7 +110,7 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
             rejected = client.post(
-                "/api/memories/search",
+                "/api/v1/memories/search",
                 json={
                     "query": "meeting notes",
                     "top_k": 10,
@@ -122,7 +122,7 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
                 },
             )
             response = client.post(
-                "/api/memories/search",
+                "/api/v1/memories/search",
                 json={
                     "query": "meeting notes",
                     "top_k": 10,

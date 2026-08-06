@@ -22,9 +22,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path.startswith("/api/auth/jira-session"):
+        if self.path.startswith("/api/v1/auth/jira-session"):
             self._send(200, {"provider": "jira", "origin": "https://jira.example.test", "status": "active"})
-        elif self.path == "/api/auth/jira-origins":
+        elif self.path == "/api/v1/auth/jira-origins":
             self._send(200, {"origins": [{"origin": "https://jira.example.test", "status": "active"}]})
         else:
             self._send(404, {"error": "nope"})
@@ -32,15 +32,15 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
-        if self.path == "/api/auth/jira-session":
+        if self.path == "/api/v1/auth/jira-session":
             self._send(200, {"provider": "jira", "origin": body["base_url"], "status": "active"})
-        elif self.path == "/api/auth/jira-session/expire":
+        elif self.path == "/api/v1/auth/jira-session/expire":
             self._send(200, {"ok": True})
         else:
             self._send(404, {"error": "nope"})
 
     def do_DELETE(self):
-        if self.path.startswith("/api/auth/jira-session"):
+        if self.path.startswith("/api/v1/auth/jira-session"):
             self._send(200, {"ok": True, "forgotten": True})
         else:
             self._send(404, {"error": "nope"})
@@ -57,7 +57,7 @@ def server():
 
 def test_tool_client_jira_session_round_trip(server):
     client = ToolClient(
-        target=build_target(origin=server, workspace_id=None),
+        target=build_target(origin=server),
         api_token=None,
     )
     assert client.get_jira_session("https://jira.example.test")["status"] == "active"

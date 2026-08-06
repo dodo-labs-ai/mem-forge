@@ -2,13 +2,15 @@ import axios from "axios";
 import type { QueryClient } from "@tanstack/react-query";
 
 const STANDALONE_TARGET: WorkspaceApiTarget = Object.freeze({
-  resourceBaseUrl: "/api",
-  localAgentBaseUrl: "/api/cloud/local-agent",
+  resourceBaseUrl: "/api/v1",
+  localAgentBaseUrl: "/api/v1/cloud/local-agent",
+  workspaceId: "local",
 });
 
 export interface WorkspaceApiTarget {
   resourceBaseUrl: string;
   localAgentBaseUrl: string;
+  workspaceId: string | null;
 }
 
 export interface WorkspaceApiController {
@@ -37,6 +39,7 @@ function normalizeTarget(target: WorkspaceApiTarget): Readonly<WorkspaceApiTarge
   return Object.freeze({
     resourceBaseUrl: normalizeBaseUrl(target.resourceBaseUrl),
     localAgentBaseUrl: normalizeBaseUrl(target.localAgentBaseUrl),
+    workspaceId: target.workspaceId?.trim() || null,
   });
 }
 
@@ -47,7 +50,8 @@ function sameTarget(
   if (left === null || right === null) return left === right;
   return (
     left.resourceBaseUrl === right.resourceBaseUrl &&
-    left.localAgentBaseUrl === right.localAgentBaseUrl
+    left.localAgentBaseUrl === right.localAgentBaseUrl &&
+    left.workspaceId === right.workspaceId
   );
 }
 
@@ -63,6 +67,9 @@ export function createWorkspaceApiController(
       currentTarget = nextTarget;
       resourceClient.defaults.baseURL =
         nextTarget?.resourceBaseUrl ?? STANDALONE_TARGET.resourceBaseUrl;
+      resourceClient.defaults.params = nextTarget?.workspaceId
+        ? { workspace_id: nextTarget.workspaceId }
+        : {};
       queryClient.clear();
     },
   });

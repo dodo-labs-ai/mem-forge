@@ -54,7 +54,7 @@ def test_create_list_update_round_trip(tmp_path):
     try:
         with TestClient(app) as client:
             create = client.post(
-                "/api/projects",
+                "/api/v1/projects",
                 json={"name": "Payroll", "kind": "normal"},
             )
             assert create.status_code == 201, create.text
@@ -63,12 +63,12 @@ def test_create_list_update_round_trip(tmp_path):
             assert created["kind"] == "normal"
             assert created["name"] == "Payroll"
 
-            listed = client.get("/api/projects").json()
+            listed = client.get("/api/v1/projects").json()
             keys = {p["key"] for p in listed}
             assert {SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY, "PAYROLL"} <= keys
 
             patch = client.patch(
-                f"/api/projects/{created['id']}",
+                f"/api/v1/projects/{created['id']}",
                 json={"name": "Pay", "kind": "shared"},
             )
             assert patch.status_code == 200, patch.text
@@ -84,7 +84,7 @@ def test_create_with_explicit_key(tmp_path):
     try:
         with TestClient(app) as client:
             create = client.post(
-                "/api/projects",
+                "/api/v1/projects",
                 json={"name": "Risk Engine", "key": "RISK"},
             )
             assert create.status_code == 201, create.text
@@ -98,7 +98,7 @@ def test_project_created_at_is_timezone_qualified(tmp_path):
     try:
         with TestClient(app) as client:
             create = client.post(
-                "/api/projects",
+                "/api/v1/projects",
                 json={"name": "Risk Engine", "key": "RISK"},
             )
             assert create.status_code == 201, create.text
@@ -112,9 +112,9 @@ def test_duplicate_key_returns_conflict(tmp_path):
     app, database = _make_app(tmp_path)
     try:
         with TestClient(app) as client:
-            first = client.post("/api/projects", json={"name": "Pay"})
+            first = client.post("/api/v1/projects", json={"name": "Pay"})
             assert first.status_code == 201
-            second = client.post("/api/projects", json={"name": "Pay"})
+            second = client.post("/api/v1/projects", json={"name": "Pay"})
             assert second.status_code == 409
             assert "already exists" in second.json()["detail"]
     finally:
@@ -125,10 +125,10 @@ def test_delete_reserved_keys_refused(tmp_path):
     app, database = _make_app(tmp_path)
     try:
         with TestClient(app) as client:
-            listed = client.get("/api/projects").json()
+            listed = client.get("/api/v1/projects").json()
             by_key = {p["key"]: p for p in listed}
             for reserved in (SHARED_PROJECT_KEY, UNSORTED_PROJECT_KEY):
-                resp = client.delete(f"/api/projects/{by_key[reserved]['id']}")
+                resp = client.delete(f"/api/v1/projects/{by_key[reserved]['id']}")
                 assert resp.status_code == 400
                 assert "reserved" in resp.json()["detail"]
     finally:
@@ -156,13 +156,13 @@ def test_delete_real_project_rebuckets_to_unsorted(tmp_path):
 
         with TestClient(app) as client:
             create = client.post(
-                "/api/projects",
+                "/api/v1/projects",
                 json={"name": "Pay", "key": "PAY"},
             )
             assert create.status_code == 201, create.text
             project_id = create.json()["id"]
 
-            delete = client.delete(f"/api/projects/{project_id}")
+            delete = client.delete(f"/api/v1/projects/{project_id}")
             assert delete.status_code == 200, delete.text
             body = delete.json()
             assert body["id"] == project_id
@@ -170,8 +170,8 @@ def test_delete_real_project_rebuckets_to_unsorted(tmp_path):
             assert body["rebucketed_memory_ids"] == ["m-pay"]
 
             # The project row is gone.
-            assert client.get("/api/projects").status_code == 200
-            keys = {p["key"] for p in client.get("/api/projects").json()}
+            assert client.get("/api/v1/projects").status_code == 200
+            keys = {p["key"] for p in client.get("/api/v1/projects").json()}
             assert "PAY" not in keys
 
         async def _verify_rebucket():
@@ -188,7 +188,7 @@ def test_delete_unknown_project_returns_404(tmp_path):
     app, database = _make_app(tmp_path)
     try:
         with TestClient(app) as client:
-            resp = client.delete("/api/projects/proj-does-not-exist")
+            resp = client.delete("/api/v1/projects/proj-does-not-exist")
             assert resp.status_code == 404
     finally:
         asyncio.run(database.close())
@@ -234,7 +234,7 @@ def test_create_source_round_trips_project_binding(tmp_path):
                 "default": UNSORTED_PROJECT_KEY,
             }
             resp = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 json=_local_markdown_source_payload(project_binding=binding),
             )
             assert resp.status_code == 200, resp.text
@@ -259,7 +259,7 @@ def test_create_source_without_project_binding_lands_in_unmapped(tmp_path):
     try:
         with TestClient(app) as client:
             resp = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 json=_local_markdown_source_payload(),
             )
             assert resp.status_code == 200, resp.text
@@ -282,14 +282,14 @@ def test_update_source_replaces_and_preserves_project_binding(tmp_path):
         with TestClient(app) as client:
             initial = {"mode": "fixed", "project_key": "PAY"}
             create = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 json=_local_markdown_source_payload(project_binding=initial),
             )
             source_id = create.json()["id"]
 
             replacement = {"mode": "fixed", "project_key": "RISK"}
             put = client.put(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 json={"project_binding": replacement},
             )
             assert put.status_code == 200, put.text
@@ -303,7 +303,7 @@ def test_update_source_replaces_and_preserves_project_binding(tmp_path):
         with TestClient(app) as client:
             # A PUT that does not mention the binding must not clear it.
             put_noop = client.put(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 json={"name": "renamed"},
             )
             assert put_noop.status_code == 200, put_noop.text
@@ -319,13 +319,13 @@ def test_update_source_can_clear_project_binding_to_unmapped(tmp_path):
     try:
         with TestClient(app) as client:
             create = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 json=_local_markdown_source_payload(project_binding={"mode": "fixed", "project_key": "PAY"}),
             )
             source_id = create.json()["id"]
 
             resp = client.put(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 json={"project_binding": None},
             )
             assert resp.status_code == 200, resp.text
@@ -423,7 +423,7 @@ def test_delete_orders_vector_before_relational_commit(tmp_path):
         # uncaught error becomes a 500 instead of bubbling to pytest.
         with TestClient(app, raise_server_exceptions=False) as client:
             create = client.post(
-                "/api/projects",
+                "/api/v1/projects",
                 json={"name": "Pay", "key": "PAY"},
             )
             project_id = create.json()["id"]
@@ -437,13 +437,13 @@ def test_delete_orders_vector_before_relational_commit(tmp_path):
 
             MemoryStore.rebucket_project_memories = _explode  # type: ignore[assignment]
             try:
-                resp = client.delete(f"/api/projects/{project_id}")
+                resp = client.delete(f"/api/v1/projects/{project_id}")
                 assert resp.status_code >= 500
             finally:
                 MemoryStore.rebucket_project_memories = original  # type: ignore[assignment]
 
             # The project row still exists; the memory still points to PAY.
-            keys = {p["key"] for p in client.get("/api/projects").json()}
+            keys = {p["key"] for p in client.get("/api/v1/projects").json()}
             assert "PAY" in keys
 
         async def _verify_unmoved():
@@ -524,7 +524,7 @@ def test_resolved_projects_endpoint_groups_memories_by_resolved_key(tmp_path):
 
     try:
         with TestClient(app) as client:
-            resp = client.get("/api/sources/src-doc/projects/resolved")
+            resp = client.get("/api/v1/sources/src-doc/projects/resolved")
             assert resp.status_code == 200, resp.text
             body = resp.json()
             assert body["source_id"] == "src-doc"

@@ -128,20 +128,20 @@ def test_entity_admin_routes_use_adapter_methods_without_sqlite_db(tmp_path: Pat
     app = create_admin_app(db=database, config=_config(tmp_path))
 
     with TestClient(app) as client:
-        list_response = client.get("/api/entities")
-        detail_response = client.get("/api/entities/1")
-        aliases_response = client.get("/api/entities/1/aliases")
-        add_alias_response = client.post("/api/entities/1/aliases", json={"alias": "Payroll Org"})
-        remove_alias_response = client.delete("/api/entities/1/aliases/Payroll%20Zone")
+        list_response = client.get("/api/v1/entities")
+        detail_response = client.get("/api/v1/entities/1")
+        aliases_response = client.get("/api/v1/entities/1/aliases")
+        add_alias_response = client.post("/api/v1/entities/1/aliases", json={"alias": "Payroll Org"})
+        remove_alias_response = client.delete("/api/v1/entities/1/aliases/Payroll%20Zone")
         merge_response = client.post(
-            "/api/entities/merge",
+            "/api/v1/entities/merge",
             json={"source_id": 2, "target_id": 1},
         )
         self_merge_response = client.post(
-            "/api/entities/merge",
+            "/api/v1/entities/merge",
             json={"source_id": 1, "target_id": 1},
         )
-        memory_detail_response = client.get("/api/memories/mem-1")
+        memory_detail_response = client.get("/api/v1/memories/mem-1")
 
     assert list_response.status_code == 200, list_response.text
     assert list_response.json()["total"] == 1

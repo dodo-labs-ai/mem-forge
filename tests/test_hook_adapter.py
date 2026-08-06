@@ -900,17 +900,20 @@ def test_codex_and_claude_plugins_include_hooks_and_adapter_wrappers():
     assert "SubagentStop" in claude_hooks["hooks"]
 
 
-def test_mcp_tools_all_accept_repository_context():
+def test_mcp_data_tools_accept_repository_context_but_workspace_directory_does_not():
     from memforge import plugin_mcp_proxy
 
     assert plugin_mcp_proxy.TOOLS
     for tool in plugin_mcp_proxy.TOOLS:
+        if tool["name"] == "list_workspaces":
+            assert tool["inputSchema"]["properties"] == {}
+            continue
         assert "repository_context" in tool["inputSchema"]["properties"], tool["name"]
 
 
-def test_packaged_plugin_version_0_1_41_is_consistent():
+def test_packaged_plugin_version_0_1_42_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.41"
+    version = "0.1.42"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
@@ -1077,10 +1080,10 @@ def test_mcp_and_hook_share_cloud_resource_url(monkeypatch):
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
 
     assert plugin_mcp_proxy._resource_url("/sources") == (
-        "https://cloud.example.hana.ondemand.com/api/workspaces/mount_tai/api/sources"
+        "https://cloud.example.hana.ondemand.com/api/v1/sources"
     )
     assert hook_adapter._resource_url("/hooks/receipts") == (
-        "https://cloud.example.hana.ondemand.com/api/workspaces/mount_tai/api/hooks/receipts"
+        "https://cloud.example.hana.ondemand.com/api/v1/hooks/receipts"
     )
 
 
@@ -1108,10 +1111,10 @@ MEMFORGE_WORKSPACE_ID = "user_workspace"
     _provide_mcp_roots(plugin_mcp_proxy, repository)
 
     assert plugin_mcp_proxy._resource_url("/sources") == (
-        "https://cloud.example.hana.ondemand.com/api/workspaces/repository_workspace/api/sources"
+        "https://cloud.example.hana.ondemand.com/api/v1/sources"
     )
     assert hook_adapter._resource_url("/hooks/receipts", repository_paths=(str(repository),)) == (
-        "https://cloud.example.hana.ondemand.com/api/workspaces/repository_workspace/api/hooks/receipts"
+        "https://cloud.example.hana.ondemand.com/api/v1/hooks/receipts"
     )
 
 
@@ -1208,7 +1211,7 @@ def test_mcp_tool_call_waits_for_pending_roots_before_selecting_workspace(monkey
     assert [response["id"] for response in resumed] == [2]
     assert "result" in resumed[0]
     assert "result" in search_response
-    base = "https://cloud.example.hana.ondemand.com/api/workspaces/repository_workspace/api"
+    base = "https://cloud.example.hana.ondemand.com/api/v1"
     assert captured_urls == [
         f"{base}/sources/searchable",
         f"{base}/memories/search",
@@ -1297,7 +1300,7 @@ def test_mcp_tool_calls_use_explicit_repository_context_for_workspace_without_ro
 
     assert "result" in list_sources_response
     assert "result" in search_response
-    base = "https://cloud.example.hana.ondemand.com/api/workspaces/repository_workspace/api"
+    base = "https://cloud.example.hana.ondemand.com/api/v1"
     assert [url for url, _body in captured_requests] == [
         f"{base}/sources/searchable",
         f"{base}/memories/search",
@@ -1321,7 +1324,7 @@ def test_codex_sandbox_cwd_routes_each_tool_call_to_repository_workspace(
     )
     captured: list[tuple[str, str | None]] = []
 
-    def fake_http_json(method, path, body, *, target=None):
+    def fake_http_json(method, path, body, *, target=None, workspace_id=None):
         captured.append((target.resource_url(path), (body or {}).get("active_repo_identifier")))
         return {"results": []}
 
@@ -1361,8 +1364,7 @@ def test_codex_sandbox_cwd_routes_each_tool_call_to_repository_workspace(
     assert "result" in response
     assert captured == [
         (
-            "https://cloud.example.hana.ondemand.com/api/workspaces/"
-            "repository_workspace/api/memories/search",
+            "https://cloud.example.hana.ondemand.com/api/v1/memories/search",
             "github.com/example/repository",
         )
     ]
@@ -1388,7 +1390,7 @@ def test_explicit_repository_context_beats_codex_sandbox_cwd(monkeypatch, tmp_pa
         )
     captured_urls: list[str] = []
 
-    def fake_http_json(method, path, body, *, target=None):
+    def fake_http_json(method, path, body, *, target=None, workspace_id=None):
         captured_urls.append(target.resource_url(path))
         return {"data": []}
 
@@ -1419,8 +1421,7 @@ def test_explicit_repository_context_beats_codex_sandbox_cwd(monkeypatch, tmp_pa
 
     assert "result" in response
     assert captured_urls == [
-        "https://cloud.example.hana.ondemand.com/api/workspaces/"
-        "explicit_workspace/api/sources/searchable"
+        "https://cloud.example.hana.ondemand.com/api/v1/sources/searchable"
     ]
 
 
@@ -1441,7 +1442,7 @@ def test_codex_sandbox_cwd_beats_settled_roots(monkeypatch, tmp_path):
         )
     captured_urls: list[str] = []
 
-    def fake_http_json(method, path, body, *, target=None):
+    def fake_http_json(method, path, body, *, target=None, workspace_id=None):
         captured_urls.append(target.resource_url(path))
         return {"data": []}
 
@@ -1460,8 +1461,7 @@ def test_codex_sandbox_cwd_beats_settled_roots(monkeypatch, tmp_path):
 
     assert result == {"data": []}
     assert captured_urls == [
-        "https://cloud.example.hana.ondemand.com/api/workspaces/"
-        "sandbox_workspace/api/sources/searchable"
+        "https://cloud.example.hana.ondemand.com/api/v1/sources/searchable"
     ]
 
 
@@ -1477,7 +1477,7 @@ def test_codex_sandbox_cwd_bypasses_pending_roots(monkeypatch, tmp_path):
     )
     captured_urls: list[str] = []
 
-    def fake_http_json(method, path, body, *, target=None):
+    def fake_http_json(method, path, body, *, target=None, workspace_id=None):
         captured_urls.append(target.resource_url(path))
         return {"data": []}
 
@@ -1520,8 +1520,7 @@ def test_codex_sandbox_cwd_bypasses_pending_roots(monkeypatch, tmp_path):
 
     assert "result" in response
     assert captured_urls == [
-        "https://cloud.example.hana.ondemand.com/api/workspaces/"
-        "repository_workspace/api/sources/searchable"
+        "https://cloud.example.hana.ondemand.com/api/v1/sources/searchable"
     ]
 
 
@@ -1626,8 +1625,7 @@ def test_explicit_repository_context_bypasses_pending_roots(monkeypatch, tmp_pat
 
     assert "result" in response
     assert captured_urls == [
-        "https://cloud.example.hana.ondemand.com/api/workspaces/"
-        "repository_workspace/api/sources/searchable"
+        "https://cloud.example.hana.ondemand.com/api/v1/sources/searchable"
     ]
 
 
@@ -1688,10 +1686,9 @@ def test_explicit_repository_context_beats_roots_and_uses_normal_fallback_withou
         {"repository_context": {"working_directory": str(fallback_repository)}},
     )
 
-    base = "https://cloud.example.hana.ondemand.com/api/workspaces"
     assert captured_urls == [
-        f"{base}/explicit_workspace/api/sources/searchable",
-        f"{base}/process_workspace/api/sources/searchable",
+        "https://cloud.example.hana.ondemand.com/api/v1/sources/searchable",
+        "https://cloud.example.hana.ondemand.com/api/v1/sources/searchable",
     ]
 
 
@@ -1743,7 +1740,7 @@ def test_concurrent_repository_contexts_keep_workspace_and_attribution_request_l
         repositories.append((repository, name, workspace_id))
     captured: dict[str, tuple[str, str | None]] = {}
 
-    def fake_http_json(method, path, body, *, target=None):
+    def fake_http_json(method, path, body, *, target=None, workspace_id=None):
         captured[body["query"]] = (
             target.resource_url(path),
             body.get("active_repo_identifier"),
@@ -1768,12 +1765,9 @@ def test_concurrent_repository_contexts_keep_workspace_and_attribution_request_l
         ]
         assert [future.result() for future in futures] == [{"results": []}, {"results": []}]
 
-    for _repository, name, workspace_id in repositories:
+    for _repository, name, _workspace_id in repositories:
         url, repo_identifier = captured[name]
-        assert url == (
-            "https://cloud.example.hana.ondemand.com/api/workspaces/"
-            f"{workspace_id}/api/memories/search"
-        )
+        assert url == "https://cloud.example.hana.ondemand.com/api/v1/memories/search"
         assert repo_identifier == f"github.com/example/{name}"
 
 
@@ -1794,7 +1788,7 @@ def test_concurrent_codex_sandbox_cwds_keep_workspace_and_attribution_request_lo
         repositories.append((repository, name, workspace_id))
     captured: dict[str, tuple[str, str | None]] = {}
 
-    def fake_http_json(method, path, body, *, target=None):
+    def fake_http_json(method, path, body, *, target=None, workspace_id=None):
         captured[body["query"]] = (
             target.resource_url(path),
             body.get("active_repo_identifier"),
@@ -1819,27 +1813,39 @@ def test_concurrent_codex_sandbox_cwds_keep_workspace_and_attribution_request_lo
         ]
         assert [future.result() for future in futures] == [{"results": []}, {"results": []}]
 
-    for _repository, name, workspace_id in repositories:
+    for _repository, name, _workspace_id in repositories:
         url, repo_identifier = captured[name]
-        assert url == (
-            "https://cloud.example.hana.ondemand.com/api/workspaces/"
-            f"{workspace_id}/api/memories/search"
-        )
+        assert url == "https://cloud.example.hana.ondemand.com/api/v1/memories/search"
         assert repo_identifier == f"github.com/example/{name}"
 
 
-def test_invalid_hook_target_fails_before_urlopen(monkeypatch):
+def test_cloud_hook_uses_server_workspace_resolution_when_selector_is_omitted(monkeypatch):
     from memforge import hook_adapter
+
+    captured: list[str] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(request, **_kwargs):
+        captured.append(request.full_url)
+        return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example.hana.ondemand.com")
     monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
-    monkeypatch.setattr(
-        hook_adapter.urllib.request,
-        "urlopen",
-        lambda *_args, **_kwargs: pytest.fail("network"),
-    )
+    monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
 
-    assert hook_adapter.main(["submit-session"]) == 1
+    assert hook_adapter.main(["submit-session"]) == 0
+    assert captured == [
+        "https://cloud.example.hana.ondemand.com/api/v1/hooks/receipts"
+    ]
 
 
 def test_plugin_config_parity_normalizer_rejects_mixed_target_import_block():
@@ -2162,7 +2168,7 @@ def test_mcp_proxy_forwards_search_to_service_with_token(monkeypatch):
     result = proxy._call_tool("search", {"query": "artifact cache"})
 
     assert result == {"results": []}
-    assert captured["url"] == "https://self.example/api/memories/search"
+    assert captured["url"] == "https://self.example/api/v1/memories/search"
     assert captured["authorization"] == "Bearer token-123"
     assert captured["content_type"] == "application/json"
     assert json.loads(captured["body"].decode()) == {
@@ -2347,7 +2353,7 @@ def test_mcp_proxy_forwards_list_sources_to_searchable_sources(monkeypatch):
 
     assert result["data"][0]["source_id"] == "src-mounttai"
     assert (
-        captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/sources/searchable"
+        captured["url"] == "https://memforge.example.hana.ondemand.com/api/v1/sources/searchable"
     )
     assert captured["authorization"] == "Bearer token-123"
 
@@ -2769,6 +2775,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
         "top_k",
         "offset",
         "entities",
+        "workspace_id",
     }
     repository_context = properties["repository_context"]
     assert repository_context["additionalProperties"] is False
@@ -2809,7 +2816,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "search -> get_memory -> get_resource" in tools["get_resource"]["description"]
     get_resource_url = tools["get_resource"]["inputSchema"]["properties"]["url"]["description"]
     assert "get_memory.evidence_artifacts[].url" in get_resource_url
-    assert "/api/source-artifacts/{observation_revision_id}" in get_resource_url
+    assert "/api/v1/source-artifacts/{observation_revision_id}" in get_resource_url
 
     create_schema = tools["create_memory"]["inputSchema"]
     assert create_schema["required"] == ["content", "provenance"]
@@ -2977,7 +2984,7 @@ def test_mcp_proxy_forwards_recent_memory_listing_and_preserves_pagination_contr
         },
     )
 
-    assert captured["url"].endswith("/api/workspaces/mount_tai/api/memories/recent")
+    assert captured["url"].endswith("/api/v1/memories/recent")
     assert json.loads(captured["body"].decode()) == {
         "source_ids": ["src-jira"],
         "time_range": {
@@ -3080,7 +3087,7 @@ def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
     result = proxy._call_tool("search", {"query": "artifact cache"})
 
     assert result == {"results": []}
-    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/memories/search"
+    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/v1/memories/search"
     assert captured["authorization"] == "Bearer token-123"
     assert json.loads(captured["body"].decode()) == {
         "query": "artifact cache",
@@ -3130,7 +3137,7 @@ def test_mcp_proxy_forwards_retire_memory_to_lifecycle_endpoint(monkeypatch):
     assert captured["method"] == "POST"
     assert (
         captured["url"]
-        == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/memories/mem-123/retire"
+        == "https://memforge.example.hana.ondemand.com/api/v1/memories/mem-123/retire"
     )
     assert json.loads(captured["body"].decode()) == {
         "reason": "User confirmed this memory is obsolete.",
@@ -3179,7 +3186,7 @@ def test_mcp_proxy_forwards_create_memory_with_plugin_client_context(monkeypatch
 
     assert result == {"status": "inserted", "memory_id": "mem-new"}
     assert captured["method"] == "POST"
-    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/memories/create"
+    assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/v1/memories/create"
     assert json.loads(captured["body"].decode()) == {
         "content": "Use readable confirmation previews before memory mutations.",
         "provenance": "User asked to remember this after reviewing the MemForge MCP UX.",
@@ -3502,7 +3509,7 @@ def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
 
     assert result["replacement_memory_id"] == "mem-new"
     assert captured["method"] == "POST"
-    assert captured["url"] == "https://self.example/api/memories/mem-old/replace"
+    assert captured["url"] == "https://self.example/api/v1/memories/mem-old/replace"
     assert json.loads(captured["body"].decode()) == {
         "replacement_content": "Use the new deployment route.",
         "provenance": "User corrected this while reviewing the deployment guide.",
@@ -3576,11 +3583,11 @@ def test_mcp_proxy_forwards_memory_review_tools(monkeypatch):
     ) == {"ok": True}
 
     assert calls[0]["method"] == "GET"
-    assert calls[0]["url"] == "https://self.example/api/memory-reviews?status=open&limit=5&offset=0"
+    assert calls[0]["url"] == "https://self.example/api/v1/memory-reviews?status=open&limit=5&offset=0"
     assert calls[1]["method"] == "GET"
-    assert calls[1]["url"] == "https://self.example/api/memory-reviews/rev-1"
+    assert calls[1]["url"] == "https://self.example/api/v1/memory-reviews/rev-1"
     assert calls[2]["method"] == "POST"
-    assert calls[2]["url"] == "https://self.example/api/memory-reviews/rev-1/reject"
+    assert calls[2]["url"] == "https://self.example/api/v1/memory-reviews/rev-1/reject"
     assert json.loads(calls[2]["body"].decode()) == {"note": "Not durable enough."}
 
 
@@ -3857,7 +3864,7 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
                             "support_kind": "extracted",
                             "doc_title": "SFPAY-179397: Create Blocker Hint",
                             "source_url": "https://jira.example/browse/SFPAY-179397",
-                            "content_url": "/api/documents/jira-SFPAY-179397/content",
+                            "content_url": "/api/v1/documents/jira-SFPAY-179397/content",
                             "pdf_url": None,
                             "source_updated_at": "2026-07-02T03:50:32+00:00",
                             "excerpt": "large excerpt",
@@ -3892,7 +3899,7 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
                 "support_kind": "extracted",
                 "doc_title": "SFPAY-179397: Create Blocker Hint",
                 "source_url": "https://jira.example/browse/SFPAY-179397",
-                "content_url": "/api/documents/jira-SFPAY-179397/content",
+                "content_url": "/api/v1/documents/jira-SFPAY-179397/content",
                 "pdf_url": None,
                 "source_updated_at": "2026-07-02T03:50:32+00:00",
                 "excerpt": "large excerpt",
@@ -4096,14 +4103,14 @@ def test_mcp_proxy_fetches_resource_through_hosted_workspace(monkeypatch):
 
     result = proxy._call_tool(
         "get_resource",
-        {"url": "/api/documents/doc-1/content", "mode": "text"},
+        {"url": "/api/v1/documents/doc-1/content", "mode": "text"},
     )
 
     assert result["text"] == "# Source"
-    assert result["url"] == "/api/documents/doc-1/content"
+    assert result["url"] == "/api/v1/documents/doc-1/content"
     assert (
         captured["url"]
-        == "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/documents/doc-1/content"
+        == "https://memforge.example.hana.ondemand.com/api/v1/documents/doc-1/content"
     )
     assert captured["authorization"] == "Bearer token-123"
 
@@ -4123,7 +4130,7 @@ def test_mcp_proxy_preserves_claim_local_evidence_on_get_memory(monkeypatch):
         "size_bytes": 3,
         "sha256": "abc",
         "summary": "Architecture diagram showing the request flow.",
-        "url": "/api/source-artifacts/obsrev-1",
+        "url": "/api/v1/source-artifacts/obsrev-1",
     }
     monkeypatch.setattr(
         proxy,
@@ -4139,7 +4146,7 @@ def test_mcp_proxy_preserves_claim_local_evidence_on_get_memory(monkeypatch):
                     "support_kind": "extracted",
                     "doc_title": "Architecture",
                     "excerpt": "The request flow is gateway then worker.",
-                    "content_url": "/api/documents/doc-1/content",
+                    "content_url": "/api/v1/documents/doc-1/content",
                 }
             ],
             "evidence_artifacts": [artifact],
@@ -4155,7 +4162,7 @@ def test_mcp_proxy_preserves_claim_local_evidence_on_get_memory(monkeypatch):
             "support_kind": "extracted",
             "doc_title": "Architecture",
             "excerpt": "The request flow is gateway then worker.",
-            "content_url": "/api/documents/doc-1/content",
+            "content_url": "/api/v1/documents/doc-1/content",
         }
     ]
     assert result["evidence_artifacts"] == [
@@ -4165,7 +4172,7 @@ def test_mcp_proxy_preserves_claim_local_evidence_on_get_memory(monkeypatch):
             "filename": "diagram.png",
             "content_type": "image/png",
             "size_bytes": 3,
-            "url": "/api/source-artifacts/obsrev-1",
+            "url": "/api/v1/source-artifacts/obsrev-1",
         }
     ]
 
@@ -4193,7 +4200,7 @@ def test_mcp_proxy_returns_source_artifact_as_native_image_content(monkeypatch):
 
     class FakeOpener:
         def open(self, request, timeout):
-            assert request.full_url == "http://memforge.test/api/source-artifacts/obsrev-1"
+            assert request.full_url == "http://memforge.test/api/v1/source-artifacts/obsrev-1"
             return FakeResponse()
 
     monkeypatch.setenv("MEMFORGE_API_URL", "http://memforge.test")
@@ -4207,7 +4214,7 @@ def test_mcp_proxy_returns_source_artifact_as_native_image_content(monkeypatch):
             "params": {
                 "name": "get_resource",
                 "arguments": {
-                    "url": "/api/source-artifacts/obsrev-1",
+                    "url": "/api/v1/source-artifacts/obsrev-1",
                     "mode": "base64",
                 },
             },
@@ -4220,7 +4227,7 @@ def test_mcp_proxy_returns_source_artifact_as_native_image_content(monkeypatch):
         "mimeType": "image/png",
     }
     metadata = json.loads(response["result"]["content"][0]["text"])
-    assert metadata["url"] == "/api/source-artifacts/obsrev-1"
+    assert metadata["url"] == "/api/v1/source-artifacts/obsrev-1"
     assert metadata["sha256"] == "0f4636c78f65d3639ece5a064b5ae753e3408614a14fb18ab4d7540d2c248543"
     assert "data_base64" not in metadata
 
@@ -4266,13 +4273,13 @@ def test_mcp_proxy_downloads_resource_to_local_cache(monkeypatch, tmp_path):
 
     result = proxy._handle_get_resource(
         {
-            "url": "/api/documents/doc-123/pdf",
+            "url": "/api/v1/documents/doc-123/pdf",
             "mode": "file",
         }
     )
 
     local_path = Path(result["local_path"])
-    assert captured["url"] == "http://memforge.test/api/documents/doc-123/pdf"
+    assert captured["url"] == "http://memforge.test/api/v1/documents/doc-123/pdf"
     assert result["mode"] == "file"
     assert result["content_type"] == "application/pdf"
     assert result["size_bytes"] == len(body)
@@ -4317,7 +4324,7 @@ def test_mcp_proxy_file_mode_rejects_truncated_resource(monkeypatch, tmp_path):
 
     result = proxy._handle_get_resource(
         {
-            "url": "/api/source-artifacts/obsrev-1",
+            "url": "/api/v1/source-artifacts/obsrev-1",
             "mode": "file",
         }
     )
@@ -4339,7 +4346,7 @@ def test_mcp_proxy_rejects_foreign_and_ambiguous_resource_urls(monkeypatch):
     )
     encoded_slash = proxy._handle_get_resource(
         {
-            "url": "/api/documents/doc%2F123/pdf",
+            "url": "/api/v1/documents/doc%2F123/pdf",
             "mode": "file",
         }
     )
@@ -4464,8 +4471,8 @@ def test_post_json_targets_zero_configuration_local_oss(monkeypatch):
     hook_adapter._post_json("/hooks/context", {}, timeout=1)
 
     assert urls == [
-        "http://127.0.0.1:8765/api/hooks/context",
-        "http://127.0.0.1:8765/api/hooks/context",
+        "http://127.0.0.1:8765/api/v1/hooks/context",
+        "http://127.0.0.1:8765/api/v1/hooks/context",
     ]
 
 
@@ -4496,8 +4503,8 @@ def test_post_json_targets_hosted_workspace_when_configured(monkeypatch):
     hook_adapter._post_json("/agent-sessions/windows", {}, timeout=1)
 
     assert urls == [
-        "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/hooks/context",
-        "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/agent-sessions/windows",
+        "https://memforge.example.hana.ondemand.com/api/v1/hooks/context",
+        "https://memforge.example.hana.ondemand.com/api/v1/agent-sessions/windows",
     ]
 
 
@@ -4616,7 +4623,7 @@ MEMFORGE_WORKSPACE_ID = "mount_tai"
     hook_adapter._post_json("/hooks/receipts", {}, timeout=1)
 
     assert observed == {
-        "url": "https://memforge.example.hana.ondemand.com/api/workspaces/mount_tai/api/hooks/receipts",
+        "url": "https://memforge.example.hana.ondemand.com/api/v1/hooks/receipts",
         "authorization": "Bearer config-token",
     }
 

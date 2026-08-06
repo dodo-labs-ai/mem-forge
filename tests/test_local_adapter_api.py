@@ -25,7 +25,14 @@ from memforge.source_artifacts import SourceArtifactContractError
 
 
 class _EmptySourceInputDatabase:
-    async def list_source_sync_inputs(self, *, source_id: str, input_snapshot_id: str | None):
+    async def list_source_sync_inputs(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        input_snapshot_id: str | None,
+    ):
+        assert workspace_id == "local"
         return []
 
 
@@ -59,6 +66,7 @@ async def test_github_package_artifact_io_does_not_block_event_loop(tmp_path: Pa
         task = asyncio.create_task(
             submit_github_repo_document(
                 db=_EmptySourceInputDatabase(),
+                workspace_id="local",
                 config=_config(tmp_path),
                 source={
                     "id": "src-github",
@@ -113,7 +121,7 @@ def _connect_database(tmp_path: Path) -> Database:
 
 
 def _project_source_inputs(database: Database, source: dict) -> dict:
-    inputs = asyncio.run(database.list_source_sync_inputs(source_id=source["id"]))
+    inputs = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source["id"]))
     return source_with_sync_inputs(source, inputs)
 
 
@@ -121,7 +129,7 @@ def _create_local_markdown_source(
     client: TestClient, *, name: str = "Engineering notes", vault_id: str = "engineering"
 ) -> dict:
     response = client.post(
-        "/api/sources",
+        "/api/v1/sources",
         json={
             "type": "local_markdown",
             "name": name,
@@ -142,7 +150,7 @@ def _create_unmapped_local_markdown_source(
     client: TestClient, *, name: str = "Engineering notes", vault_id: str = "engineering"
 ) -> dict:
     response = client.post(
-        "/api/sources",
+        "/api/v1/sources",
         json={
             "type": "local_markdown",
             "name": name,
@@ -168,7 +176,7 @@ def _create_github_repo_source(
     include_extensions: list[str] | None = None,
 ) -> dict:
     response = client.post(
-        "/api/sources",
+        "/api/v1/sources",
         json={
             "type": "github_repo",
             "name": name,
@@ -196,7 +204,7 @@ def _create_jira_source(
     sync_mode: str = "local_agent",
 ) -> dict:
     response = client.post(
-        "/api/sources",
+        "/api/v1/sources",
         json={
             "type": "jira",
             "name": name,
@@ -218,7 +226,7 @@ def _create_jira_source(
 
 def _create_teams_source(client: TestClient, *, name: str = "Teams Channel") -> dict:
     response = client.post(
-        "/api/sources",
+        "/api/v1/sources",
         json={
             "type": "teams",
             "name": name,
@@ -267,7 +275,7 @@ def test_create_local_markdown_source_generates_internal_vault_id(tmp_path):
         app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
         with LeaseAwareTestClient(app) as client:
             response = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 json={
                     "type": "local_markdown",
                     "name": "Engineering notes",
@@ -300,7 +308,7 @@ def test_update_local_markdown_source_preserves_internal_vault_id(tmp_path):
         with LeaseAwareTestClient(app) as client:
             created = _create_local_markdown_source(client, vault_id="engineering")
             response = client.put(
-                f"/api/sources/{created['id']}",
+                f"/api/v1/sources/{created['id']}",
                 json={
                     "name": "Engineering docs",
                     "config": {
@@ -377,7 +385,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
             initial_documents_dir = Path(initial_row["config"]["local_agent_documents_dir"])
             assert initial_documents_dir.exists()
             manifest_response = client.post(
-                f"/api/sources/{source_id}/adapter/manifest",
+                f"/api/v1/sources/{source_id}/adapter/manifest",
                 json={
                     "items": [
                         {
@@ -394,11 +402,11 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
                 },
             )
             premature_process = client.post(
-                f"/api/sources/{source_id}/process",
+                f"/api/v1/sources/{source_id}/process",
                 json={"sync_snapshot_id": "test-local-agent-job:attempt:1"},
             )
             revision_mismatch = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "base_url": "https://jira.example.test",
                     "issue_key": "PAY-1",
@@ -410,7 +418,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
                 },
             )
             undeclared = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "base_url": "https://jira.example.test",
                     "issue_key": "PAY-2",
@@ -422,7 +430,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
                 },
             )
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "base_url": "https://jira.example.test",
                     "issue_key": "PAY-1",
@@ -435,7 +443,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
                 },
             )
             repeated_response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "base_url": "https://jira.example.test",
                     "issue_key": "PAY-1",
@@ -448,7 +456,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
                 },
             )
             process_response = client.post(
-                f"/api/sources/{source_id}/process",
+                f"/api/v1/sources/{source_id}/process",
                 json={
                     "force_full_sync": False,
                     "sync_snapshot_id": "test-local-agent-job:attempt:1",
@@ -479,7 +487,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
         package_path = documents_dir / f"{payload['doc_id']}.json"
         assert payload["package_path"] is None
         assert not package_path.exists()
-        inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        inputs = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id))
         assert len(inputs) == 1
         assert inputs[0].raw_uri == payload["package_uri"]
         assert inputs[0].metadata["doc_id"] == payload["doc_id"]
@@ -487,6 +495,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
         assert inputs[0].metadata["manifest_entry"]["provider_revision"] == "2026-07-10T08:00:00+00:00"
         snapshot_inputs = asyncio.run(
             database.list_source_sync_inputs(
+                workspace_id="local",
                 source_id=source_id,
                 input_snapshot_id="test-local-agent-job:attempt:1",
             )
@@ -494,6 +503,7 @@ def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
         assert [item.input_id for item in snapshot_inputs] == [inputs[0].input_id]
         repeated_snapshot_inputs = asyncio.run(
             database.list_source_sync_inputs(
+                workspace_id="local",
                 source_id=source_id,
                 input_snapshot_id="test-local-agent-job:attempt:1",
             )
@@ -534,7 +544,7 @@ def test_jira_adapter_rejects_comment_without_stable_provider_id(tmp_path):
         with LeaseAwareTestClient(app) as client:
             source_id = _create_jira_source(client)["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "base_url": "https://jira.example.test",
                     "issue_key": "PAY-1",
@@ -561,7 +571,7 @@ def test_jira_local_agent_mode_rejects_pat_auth(tmp_path):
         app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
         with LeaseAwareTestClient(app) as client:
             response = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 json={
                     "type": "jira",
                     "name": "Payroll Jira",
@@ -597,7 +607,7 @@ def test_update_jira_local_agent_source_preserves_sync_mode_when_omitted(tmp_pat
             assert before is not None
             initial_documents_dir = before["config"]["local_agent_documents_dir"]
             response = client.put(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 json={
                     "config": {
                         "base_url": "https://jira.example.test",
@@ -681,7 +691,7 @@ def test_jira_adapter_document_push_requires_local_agent_mode(tmp_path):
             created = _create_jira_source(client, sync_mode="cloud")
             source_id = created["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "base_url": "https://jira.example.test",
                     "issue_key": "PAY-1",
@@ -707,7 +717,7 @@ def test_local_adapter_document_push_writes_package(tmp_path):
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "decisions/cutoff.md",
@@ -737,7 +747,7 @@ def test_local_adapter_document_push_writes_package(tmp_path):
 
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
-        inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        inputs = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id))
         assert len(inputs) == 1
         assert inputs[0].raw_uri == body["package_uri"]
         assert inputs[0].metadata["doc_id"] == body["doc_id"]
@@ -779,7 +789,7 @@ def test_duplicate_local_package_attests_the_retained_artifact_not_the_new_uploa
         with LeaseAwareTestClient(app) as client:
             source_id = _create_local_markdown_source(client)["id"]
             first = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "decisions/retained.md",
@@ -792,7 +802,7 @@ def test_duplicate_local_package_attests_the_retained_artifact_not_the_new_uploa
             retained_uri = first.json()["package_uri"]
             retained_sha = hashlib.sha256(Path(retained_uri).read_bytes()).hexdigest()
             [legacy_input] = asyncio.run(
-                database.list_source_sync_inputs(source_id=source_id)
+                database.list_source_sync_inputs(workspace_id="local", source_id=source_id)
             )
             legacy_metadata = dict(legacy_input.metadata)
             legacy_metadata.pop("package_sha256")
@@ -808,7 +818,7 @@ def test_duplicate_local_package_attests_the_retained_artifact_not_the_new_uploa
             asyncio.run(database.db.commit())
 
             duplicate = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "decisions/retained.md",
@@ -821,7 +831,7 @@ def test_duplicate_local_package_attests_the_retained_artifact_not_the_new_uploa
         assert duplicate.status_code == 200, duplicate.text
         assert duplicate.json()["package_uri"] == retained_uri
         assert duplicate.json()["package_sha256"] == retained_sha
-        [attested] = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        [attested] = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id))
         assert attested.input_id == legacy_input.input_id
         assert attested.raw_uri == retained_uri
         assert attested.metadata["package_sha256"] == retained_sha
@@ -853,7 +863,7 @@ def test_duplicate_local_package_does_not_attest_an_invalid_retained_artifact(
         with LeaseAwareTestClient(app) as client:
             source_id = _create_local_markdown_source(client)["id"]
             first = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "decisions/corrupt.md",
@@ -865,7 +875,7 @@ def test_duplicate_local_package_does_not_attest_an_invalid_retained_artifact(
             assert first.status_code == 200, first.text
             retained_uri = first.json()["package_uri"]
             [legacy_input] = asyncio.run(
-                database.list_source_sync_inputs(source_id=source_id)
+                database.list_source_sync_inputs(workspace_id="local", source_id=source_id)
             )
             legacy_metadata = dict(legacy_input.metadata)
             legacy_metadata.pop("package_sha256")
@@ -885,7 +895,7 @@ def test_duplicate_local_package_does_not_attest_an_invalid_retained_artifact(
                 Path(retained_uri).unlink()
 
             duplicate = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "decisions/corrupt.md",
@@ -899,7 +909,7 @@ def test_duplicate_local_package_does_not_attest_an_invalid_retained_artifact(
         assert duplicate.json()["detail"] == (
             "source_lifecycle_local_replay_artifact_invalid"
         )
-        [unchanged] = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        [unchanged] = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id))
         assert "package_sha256" not in unchanged.metadata
         assert "package_sha256" not in unchanged.metadata["manifest_entry"]
         if retained_failure == "corrupt":
@@ -930,7 +940,7 @@ def test_normal_local_source_fetch_rejects_tampered_canonical_package(tmp_path):
         with LeaseAwareTestClient(app) as client:
             source_id = _create_local_markdown_source(client)["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "tampered.md",
@@ -993,7 +1003,7 @@ def test_local_file_package_attests_explicit_empty_content(tmp_path, source_type
                     "process_now": False,
                 }
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json=payload,
             )
         assert response.status_code == 200, response.text
@@ -1033,7 +1043,7 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
             created = _create_github_repo_source(client)
             source_id = created["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1071,7 +1081,7 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
 
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
-        inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        inputs = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id))
         assert len(inputs) == 1
         assert inputs[0].raw_uri == body["package_uri"]
         assert inputs[0].metadata["doc_id"] == body["doc_id"]
@@ -1114,7 +1124,7 @@ def test_github_repo_local_push_materializes_binary_artifact_input(tmp_path):
                 include_extensions=["png"],
             )["id"]
             artifact_response = client.post(
-                f"/api/sources/{source_id}/adapter/artifacts",
+                f"/api/v1/sources/{source_id}/adapter/artifacts",
                 params={
                     "source_unit_key": "Payroll Processing/architecture.png",
                     "provider_key": "Payroll Processing/architecture.png",
@@ -1132,7 +1142,7 @@ def test_github_repo_local_push_materializes_binary_artifact_input(tmp_path):
             assert artifact_response.status_code == 200, artifact_response.text
             artifact_input_hash = artifact_response.json()["input_sha256"]
             package_response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1195,7 +1205,7 @@ def test_github_repo_local_push_rejects_artifact_from_prior_source_activity_epoc
                 include_extensions=["png"],
             )["id"]
             artifact_response = client.post(
-                f"/api/sources/{source_id}/adapter/artifacts",
+                f"/api/v1/sources/{source_id}/adapter/artifacts",
                 params={
                     "source_unit_key": "Payroll Processing/architecture.png",
                     "provider_key": "Payroll Processing/architecture.png",
@@ -1221,7 +1231,7 @@ def test_github_repo_local_push_rejects_artifact_from_prior_source_activity_epoc
 
             asyncio.run(_advance_source_epoch())
             package_response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1259,7 +1269,7 @@ def test_local_markdown_rejects_implicit_binary_artifact_intake(tmp_path):
         with LeaseAwareTestClient(app) as client:
             source_id = _create_local_markdown_source(client)["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/artifacts",
+                f"/api/v1/sources/{source_id}/adapter/artifacts",
                 params={
                     "source_unit_key": "notes/readme.md",
                     "provider_key": "diagram.png",
@@ -1304,7 +1314,7 @@ def test_teams_local_push_materializes_hosted_image_artifact_input(tmp_path):
                 window_type="time_block",
             )
             artifact_response = client.post(
-                f"/api/sources/{source_id}/adapter/artifacts",
+                f"/api/v1/sources/{source_id}/adapter/artifacts",
                 params={
                     "source_unit_key": window_id,
                     "provider_key": "message-1/hostedContents/hosted-1",
@@ -1322,7 +1332,7 @@ def test_teams_local_push_materializes_hosted_image_artifact_input(tmp_path):
             assert artifact_response.status_code == 200, artifact_response.text
             artifact_input_hash = artifact_response.json()["input_sha256"]
             package_response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "conversation_id": "19:chat@example.test",
                     "window_id": window_id,
@@ -1395,7 +1405,7 @@ def test_jira_local_push_materializes_comment_image_artifact_input(tmp_path):
         with LeaseAwareTestClient(app) as client:
             source_id = _create_jira_source(client)["id"]
             artifact_response = client.post(
-                f"/api/sources/{source_id}/adapter/artifacts",
+                f"/api/v1/sources/{source_id}/adapter/artifacts",
                 params={
                     "source_unit_key": "PAY-1",
                     "provider_key": "attachment-1",
@@ -1440,7 +1450,7 @@ def test_jira_local_push_materializes_comment_image_artifact_input(tmp_path):
                 "changelog": {"startAt": 0, "histories": [], "total": 0},
             }
             package_response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "base_url": "https://jira.example.test",
                     "issue_key": "PAY-1",
@@ -1499,7 +1509,7 @@ def test_github_repo_manifest_reuses_unchanged_input_without_another_package(tmp
                 relative_path=relative_path,
             )
             initial_manifest = client.post(
-                f"/api/sources/{source_id}/adapter/manifest",
+                f"/api/v1/sources/{source_id}/adapter/manifest",
                 json={
                     "items": [
                         {"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}
@@ -1511,7 +1521,7 @@ def test_github_repo_manifest_reuses_unchanged_input_without_another_package(tmp
                 },
             )
             first = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1521,7 +1531,7 @@ def test_github_repo_manifest_reuses_unchanged_input_without_another_package(tmp
                 },
             )
             planned = client.post(
-                f"/api/sources/{source_id}/adapter/manifest",
+                f"/api/v1/sources/{source_id}/adapter/manifest",
                 json={
                     "items": [{"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}],
                     "coverage": "complete_snapshot",
@@ -1545,12 +1555,14 @@ def test_github_repo_manifest_reuses_unchanged_input_without_another_package(tmp
         }
         [first_input] = asyncio.run(
             database.list_source_sync_inputs(
+                workspace_id="local",
                 source_id=source_id,
                 input_snapshot_id="test-local-agent-job:attempt:1",
             )
         )
         [reused_input] = asyncio.run(
             database.list_source_sync_inputs(
+                workspace_id="local",
                 source_id=source_id,
                 input_snapshot_id="test-local-agent-job-2:attempt:1",
             )
@@ -1581,7 +1593,7 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
                 relative_path=relative_path,
             )
             first = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1591,7 +1603,7 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
                 },
             )
             changed = client.post(
-                f"/api/sources/{source_id}/adapter/manifest",
+                f"/api/v1/sources/{source_id}/adapter/manifest",
                 json={
                     "items": [{"doc_id": doc_id, "revision": "blob-sha-2", "change_kind": "upsert"}],
                     "coverage": "complete_snapshot",
@@ -1601,7 +1613,7 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
                 },
             )
             changed_manifest_retry = client.post(
-                f"/api/sources/{source_id}/adapter/manifest",
+                f"/api/v1/sources/{source_id}/adapter/manifest",
                 json={
                     "items": [{"doc_id": doc_id, "revision": "blob-sha-3", "change_kind": "upsert"}],
                     "coverage": "complete_snapshot",
@@ -1611,7 +1623,7 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
                 },
             )
             removed = client.post(
-                f"/api/sources/{source_id}/adapter/manifest",
+                f"/api/v1/sources/{source_id}/adapter/manifest",
                 json={
                     "items": [],
                     "coverage": "complete_snapshot",
@@ -1621,7 +1633,7 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
                 },
             )
             incomplete = client.post(
-                f"/api/sources/{source_id}/adapter/manifest",
+                f"/api/v1/sources/{source_id}/adapter/manifest",
                 json={
                     "items": [{"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}],
                     "coverage": "partial",
@@ -1631,7 +1643,7 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
                 },
             )
             bounded = client.post(
-                f"/api/sources/{source_id}/adapter/manifest",
+                f"/api/v1/sources/{source_id}/adapter/manifest",
                 json={
                     "items": [{"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}],
                     "coverage": "bounded_delta",
@@ -1652,6 +1664,7 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
         assert removed.json()["required_doc_ids"] == []
         assert asyncio.run(
             database.list_source_sync_inputs(
+                workspace_id="local",
                 source_id=source_id,
                 input_snapshot_id="removed-job:attempt:1",
             )
@@ -1674,7 +1687,7 @@ def test_github_repo_adapter_document_push_requires_local_push_mode(tmp_path):
         with LeaseAwareTestClient(app) as client:
             source_id = _create_github_repo_source(client, connection_mode="cloud_pull")["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1702,7 +1715,7 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
                 exclude_paths=["Payroll Processing/archived"],
             )["id"]
             wrong_ref = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "feature",
@@ -1712,7 +1725,7 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
                 },
             )
             wrong_path = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1722,7 +1735,7 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
                 },
             )
             wrong_extension = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1732,7 +1745,7 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
                 },
             )
             excluded_path = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1763,7 +1776,7 @@ def test_github_repo_adapter_document_push_enforces_max_files(tmp_path):
         with LeaseAwareTestClient(app) as client:
             source_id = _create_github_repo_source(client, max_files=1)["id"]
             first = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1773,7 +1786,7 @@ def test_github_repo_adapter_document_push_enforces_max_files(tmp_path):
                 },
             )
             second = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1815,7 +1828,7 @@ def test_github_repo_adapter_document_push_max_files_counts_current_scope_only(t
                 encoding="utf-8",
             )
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
                     "repo_ref": "main",
@@ -1862,7 +1875,7 @@ def test_local_adapter_document_push_requires_execution_owner(tmp_path):
         )
         with LeaseAwareTestClient(app) as client:
             response = client.post(
-                "/api/sources/src-owned-local/adapter/packages",
+                "/api/v1/sources/src-owned-local/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "decisions/cutoff.md",
@@ -1896,7 +1909,7 @@ def test_local_adapter_revalidates_lease_before_committing_snapshot_membership(t
         with LeaseAwareTestClient(app) as client:
             source_id = _create_local_markdown_source(client)["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "lease-check.md",
@@ -1922,7 +1935,7 @@ def test_local_adapter_document_push_allows_unmapped_source(tmp_path):
             created = _create_unmapped_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "notes/unmapped.md",
@@ -1957,8 +1970,8 @@ def test_local_adapter_push_is_idempotent_on_doc_id(tmp_path):
                 "markdown_body": "# Index\n\nTop level.",
                 "process_now": False,
             }
-            first = client.post(f"/api/sources/{source_id}/adapter/packages", json=payload).json()
-            second = client.post(f"/api/sources/{source_id}/adapter/packages", json=payload).json()
+            first = client.post(f"/api/v1/sources/{source_id}/adapter/packages", json=payload).json()
+            second = client.post(f"/api/v1/sources/{source_id}/adapter/packages", json=payload).json()
         assert first["doc_id"] == second["doc_id"]
         assert first["package_path"] == second["package_path"]
     finally:
@@ -1980,7 +1993,7 @@ def test_local_adapter_push_attributes_input_to_app_workspace(tmp_path):
         with LeaseAwareTestClient(app) as client:
             source_id = _create_local_markdown_source(client)["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "notes/index.md",
@@ -2019,7 +2032,7 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
                 window_type="thread",
             )
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "conversation_id": "19:channel@example.test",
                     "window_id": window_id,
@@ -2076,7 +2089,7 @@ def test_teams_adapter_push_writes_window_package(tmp_path):
         row = asyncio.run(database.get_source(source_id))
         assert row is not None
         assert "local_agent_documents_dir" not in row["config"]
-        inputs = asyncio.run(database.list_source_sync_inputs(source_id=source_id))
+        inputs = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id))
         assert len(inputs) == 1
         assert inputs[0].raw_uri == body["package_uri"]
         assert inputs[0].metadata["doc_id"] == body["doc_id"]
@@ -2125,7 +2138,7 @@ def test_teams_adapter_rejects_ambiguous_message_evidence(
         with LeaseAwareTestClient(app) as client:
             source_id = _create_teams_source(client)["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "conversation_id": "19:channel@example.test",
                     "window_id": "window-a",
@@ -2157,7 +2170,7 @@ def test_teams_adapter_rejects_window_locator_bound_to_another_conversation(tmp_
                 window_type="time_block",
             )
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "conversation_id": "19:conversation-b@example.test",
                     "window_id": window_id,
@@ -2195,7 +2208,7 @@ def test_local_adapter_push_rejects_vault_mismatch(tmp_path):
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "wrong-vault",
                     "relative_path": "notes/x.md",
@@ -2220,7 +2233,7 @@ def test_local_adapter_push_rejects_path_traversal(tmp_path):
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "../escape.md",
@@ -2252,7 +2265,7 @@ def test_teams_gene_discovers_local_agent_window_packages(tmp_path):
                 window_type="time_block",
             )
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "conversation_id": "19:channel@example.test",
                     "window_id": window_id,
@@ -2321,9 +2334,9 @@ def test_local_adapter_push_rejects_paused_source(tmp_path):
         with LeaseAwareTestClient(app) as client:
             created = _create_local_markdown_source(client)
             source_id = created["id"]
-            assert client.put(f"/api/sources/{source_id}", json={"status": "paused"}).status_code == 200
+            assert client.put(f"/api/v1/sources/{source_id}", json={"status": "paused"}).status_code == 200
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "notes.md",
@@ -2362,7 +2375,7 @@ def test_local_adapter_push_rejects_lifecycle_maintenance_before_artifact_write(
                 )
             )
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "notes.md",
@@ -2401,7 +2414,7 @@ def test_local_adapter_push_cleans_artifact_when_lease_expires_after_write(
         with LeaseAwareTestClient(app) as client:
             source_id = _create_local_markdown_source(client)["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "notes.md",
@@ -2414,7 +2427,7 @@ def test_local_adapter_push_cleans_artifact_when_lease_expires_after_write(
         assert response.json()["detail"] == "local_agent_lease_not_current"
         assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == []
         assert asyncio.run(database.list_source_artifact_cleanup_tasks()) == []
-        assert asyncio.run(database.list_source_sync_inputs(source_id=source_id)) == []
+        assert asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id)) == []
     finally:
         asyncio.run(database.close())
 
@@ -2456,7 +2469,7 @@ def test_local_adapter_push_epoch_cas_rejects_maintenance_after_lease_check(
         with LeaseAwareTestClient(app) as client:
             source_id = _create_local_markdown_source(client)["id"]
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "notes.md",
@@ -2467,7 +2480,7 @@ def test_local_adapter_push_epoch_cas_rejects_maintenance_after_lease_check(
 
         assert response.status_code == 409, response.text
         assert "source activity epoch changed" in response.json()["detail"]
-        assert asyncio.run(database.list_source_sync_inputs(source_id=source_id)) == []
+        assert asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id)) == []
         assert list(Path(cfg.storage.docs_path).rglob("*package*.json")) == []
         assert asyncio.run(database.list_source_artifact_cleanup_tasks()) == []
     finally:
@@ -2497,7 +2510,7 @@ def test_local_adapter_push_requires_local_adapter_source(tmp_path):
         app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
         with LeaseAwareTestClient(app) as client:
             response = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "x",
                     "relative_path": "x.md",
@@ -2524,7 +2537,7 @@ def test_local_markdown_gene_discovers_pushed_packages(tmp_path):
             created = _create_local_markdown_source(client)
             source_id = created["id"]
             client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
                     "vault_id": "engineering",
                     "relative_path": "release.md",
@@ -2590,7 +2603,7 @@ def test_local_markdown_gene_converts_by_content_type(tmp_path):
             ]
             for rel, ctype, body in docs:
                 resp = client.post(
-                    f"/api/sources/{source_id}/adapter/packages",
+                    f"/api/v1/sources/{source_id}/adapter/packages",
                     json={
                         "vault_id": "engineering",
                         "relative_path": rel,

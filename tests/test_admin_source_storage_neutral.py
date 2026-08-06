@@ -160,6 +160,7 @@ async def _setup_completed_teams_local_replay(
         )
         await database.create_source_sync_input(
             source_id="src-teams",
+            workspace_id="local",
             raw_uri=retired_uri,
             raw_sha256="sha-retired-window",
             raw_content_type="application/json",
@@ -210,6 +211,7 @@ async def _setup_completed_teams_local_replay(
         )
         await database.create_source_sync_input(
             source_id="src-teams",
+            workspace_id="local",
             raw_uri=current_uri,
             raw_sha256=local_agent_semantic_input_sha256(
                 _teams_doc_id(),
@@ -265,6 +267,7 @@ async def _setup_completed_teams_local_replay(
         )
         await database.create_source_sync_input(
             source_id="src-teams",
+            workspace_id="local",
             raw_uri=newer_uri,
             raw_sha256=local_agent_semantic_input_sha256(_teams_doc_id(), newer_hash),
             raw_content_type="application/json",
@@ -284,6 +287,7 @@ async def _setup_completed_teams_local_replay(
     assert source is not None
     run = await database.enqueue_source_sync_run(
         source_id="src-teams",
+        workspace_id="local",
         trigger="local_agent",
         force_full_sync=force_full_sync,
         input_snapshot_id=snapshot_id,
@@ -401,7 +405,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
             workspace_id: str = "default",
         ):
             assert source_id == "src-neutral"
-            assert workspace_id == "default"
+            assert workspace_id == "local"
             return None
 
         async def list_lifecycle_backfill_jobs(
@@ -442,7 +446,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
     app = create_admin_app(db=FakeSourceReader(), config=_config(tmp_path))
 
     with TestClient(app) as client:
-        response = client.get("/api/sources")
+        response = client.get("/api/v1/sources")
 
     assert response.status_code == 200
     source = response.json()["data"][0]
@@ -575,7 +579,7 @@ def test_source_list_projects_a_retried_sync_as_a_fresh_attempt(tmp_path):
     )
 
     with TestClient(app) as client:
-        response = client.get("/api/sources")
+        response = client.get("/api/v1/sources")
 
     assert response.status_code == 200
     sync = response.json()["data"][0]["sync"]
@@ -645,7 +649,7 @@ def test_source_projects_route_uses_storage_neutral_admin_reader(tmp_path):
     app = create_admin_app(db=FakeSourceReader(), config=_config(tmp_path))
 
     with TestClient(app) as client:
-        response = client.get("/api/sources/src-neutral/projects")
+        response = client.get("/api/v1/sources/src-neutral/projects")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -714,9 +718,9 @@ def test_source_schedule_routes_use_storage_neutral_store(tmp_path):
     )
 
     with TestClient(app) as client:
-        get_response = client.get("/api/sources/src-neutral/schedule")
+        get_response = client.get("/api/v1/sources/src-neutral/schedule")
         put_response = client.put(
-            "/api/sources/src-neutral/schedule",
+            "/api/v1/sources/src-neutral/schedule",
             json={"enabled": True, "interval_minutes": 60},
         )
 
@@ -824,7 +828,7 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
             workspace_id: str = "default",
         ):
             assert source_id == "src-neutral"
-            assert workspace_id == "default"
+            assert workspace_id == "local"
             return None
 
         async def enable_lifecycle_gate(
@@ -890,8 +894,8 @@ def test_source_memory_lifecycle_routes_expose_durable_operator_axes(tmp_path, m
     )
 
     with TestClient(app) as client:
-        queued = client.post("/api/sources/src-neutral/memory-lifecycle/backfill")
-        status = client.get("/api/sources/src-neutral/memory-lifecycle")
+        queued = client.post("/api/v1/sources/src-neutral/memory-lifecycle/backfill")
+        status = client.get("/api/v1/sources/src-neutral/memory-lifecycle")
 
     assert queued.status_code == 202, queued.text
     assert status.status_code == 200, status.text
@@ -947,15 +951,15 @@ def test_source_rebaseline_endpoint_is_confirmation_bound_and_completes_replay(t
     try:
         with TestClient(app) as client:
             mismatch = client.post(
-                "/api/sources/src-replayable/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-replayable/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-other"},
             )
             agent = client.post(
-                "/api/sources/src-agent/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-agent/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-agent"},
             )
             accepted = client.post(
-                "/api/sources/src-replayable/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-replayable/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-replayable"},
             )
 
@@ -1059,10 +1063,10 @@ def test_source_rebaseline_keeps_gate_closed_when_vector_delivery_is_pending(
     try:
         with TestClient(app) as client:
             accepted = client.post(
-                "/api/sources/src-confluence/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-confluence/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-confluence"},
             )
-            status = client.get("/api/sources/src-confluence/memory-lifecycle")
+            status = client.get("/api/v1/sources/src-confluence/memory-lifecycle")
 
         assert accepted.status_code == 202, accepted.text
         assert status.status_code == 200, status.text
@@ -1149,10 +1153,10 @@ def test_source_rebaseline_drains_vector_batches_before_enabling_gate(
     try:
         with TestClient(app) as client:
             accepted = client.post(
-                "/api/sources/src-confluence/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-confluence/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-confluence"},
             )
-            status = client.get("/api/sources/src-confluence/memory-lifecycle")
+            status = client.get("/api/v1/sources/src-confluence/memory-lifecycle")
 
         assert accepted.status_code == 202, accepted.text
         assert status.status_code == 200, status.text
@@ -1226,7 +1230,7 @@ def test_server_source_rebaseline_preflight_failure_never_resets_lifecycle(
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-confluence/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-confluence/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-confluence"},
             )
 
@@ -1326,7 +1330,7 @@ def test_source_rebaseline_uses_post_fence_source_snapshot(tmp_path, monkeypatch
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-confluence/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-confluence/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-confluence"},
             )
 
@@ -1354,6 +1358,7 @@ def test_source_rebaseline_cancels_active_durable_sync_before_maintenance(tmp_pa
         )
         run = await database.enqueue_source_sync_run(
             source_id="src-confluence",
+            workspace_id="local",
             trigger="manual",
             force_full_sync=True,
         )
@@ -1368,7 +1373,7 @@ def test_source_rebaseline_cancels_active_durable_sync_before_maintenance(tmp_pa
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-confluence/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-confluence/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-confluence"},
             )
 
@@ -1414,7 +1419,7 @@ def test_source_rebaseline_unexpected_preflight_error_fails_job_and_releases_fen
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -1487,7 +1492,7 @@ def test_local_agent_lifecycle_backfill_repairs_from_durable_current_corpus(
     )
     try:
         with TestClient(app) as client:
-            response = client.post("/api/sources/src-teams/memory-lifecycle/backfill")
+            response = client.post("/api/v1/sources/src-teams/memory-lifecycle/backfill")
 
         assert response.status_code == 202, response.text
         assert len(provider.calls) == 1
@@ -1535,7 +1540,7 @@ def test_local_agent_source_rebaseline_fails_before_reset_without_terminal_repla
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -1577,7 +1582,7 @@ def test_local_agent_source_rebaseline_fails_before_reset_when_snapshot_inputs_a
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -1624,7 +1629,7 @@ def test_teams_source_rebaseline_replays_current_corpus_across_attempt_bound_inp
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -1681,7 +1686,7 @@ def test_force_full_teams_rebaseline_uses_attempt_snapshot_when_old_index_is_a_s
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -1729,7 +1734,7 @@ def test_incremental_teams_rebaseline_does_not_infer_old_index_deletion(tmp_path
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -1772,7 +1777,7 @@ def test_incremental_local_agent_source_rebaseline_replays_exact_current_corpus(
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -1829,7 +1834,7 @@ def test_local_rebaseline_accepts_attested_terminal_full_sync_after_lifecycle_ga
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -1872,7 +1877,7 @@ def test_local_rebaseline_rejects_failed_incremental_input_boundary(tmp_path):
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -1915,7 +1920,7 @@ def test_teams_rebaseline_selects_indexed_version_after_semantic_reversion(tmp_p
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -1963,6 +1968,7 @@ def test_incremental_local_rebaseline_ignores_input_uploaded_after_success(tmp_p
         )
         await database.create_source_sync_input(
             source_id="src-teams",
+            workspace_id="local",
             raw_uri=unconsumed_uri,
             raw_sha256="sha-unconsumed-window-a",
             raw_content_type="application/json",
@@ -1989,7 +1995,7 @@ def test_incremental_local_rebaseline_ignores_input_uploaded_after_success(tmp_p
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -2038,7 +2044,7 @@ def test_local_rebaseline_rejects_unreadable_or_mismatched_artifact_before_reset
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -2086,7 +2092,7 @@ def test_local_rebaseline_rejects_legacy_input_without_package_attestation(tmp_p
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -2129,7 +2135,7 @@ def test_local_rebaseline_rejects_source_config_changed_after_success(tmp_path):
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -2173,7 +2179,7 @@ def test_teams_rebaseline_rejects_unattested_empty_attempt(tmp_path):
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-teams/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-teams"},
             )
 
@@ -2233,6 +2239,7 @@ def test_document_collection_rebaseline_accepts_completed_empty_snapshot(tmp_pat
         assert source is not None
         run = await database.enqueue_source_sync_run(
             source_id="src-markdown",
+            workspace_id="local",
             trigger="local_agent",
             force_full_sync=True,
             input_snapshot_id="job-markdown:attempt:1",
@@ -2268,7 +2275,7 @@ def test_document_collection_rebaseline_accepts_completed_empty_snapshot(tmp_pat
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-markdown/memory-lifecycle/rebaseline",
+                "/api/v1/sources/src-markdown/memory-lifecycle/rebaseline",
                 json={"confirm_source_id": "src-markdown"},
             )
 
@@ -2375,7 +2382,7 @@ def test_source_lifecycle_finding_repair_returns_exact_lineage_and_gate_state(
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources/src-neutral/memory-lifecycle/findings/finding-1/repair",
+            "/api/v1/sources/src-neutral/memory-lifecycle/findings/finding-1/repair",
             json={
                 "observation_id": "observation-2",
                 "evidence_quote": "exact source quote",
@@ -2409,6 +2416,7 @@ def test_source_lifecycle_finding_repair_conflicts_with_active_source_sync(tmp_p
         )
         await database.enqueue_source_sync_run(
             source_id="src-teams",
+            workspace_id="local",
             trigger="manual",
         )
 
@@ -2421,7 +2429,7 @@ def test_source_lifecycle_finding_repair_conflicts_with_active_source_sync(tmp_p
     try:
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-teams/memory-lifecycle/findings/finding-1/repair",
+                "/api/v1/sources/src-teams/memory-lifecycle/findings/finding-1/repair",
                 json={"observation_id": "observation-1"},
             )
 

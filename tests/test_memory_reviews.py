@@ -383,8 +383,8 @@ class TestReviewCrud:
 
         app = create_admin_app(db=db, config=_config(tmp_path))
         with TestClient(app) as client:
-            list_response = client.get("/api/memory-reviews", params={"status": "open"})
-            detail_response = client.get(f"/api/memory-reviews/{review.id}")
+            list_response = client.get("/api/v1/memory-reviews", params={"status": "open"})
+            detail_response = client.get(f"/api/v1/memory-reviews/{review.id}")
 
         assert list_response.status_code == 200
         row = next(item for item in list_response.json()["data"] if item["id"] == review.id)
@@ -440,7 +440,7 @@ class TestReviewCrud:
 
         app = create_admin_app(db=db, config=_config(tmp_path))
         with TestClient(app) as client:
-            response = client.get("/api/memory-reviews", params={"status": "open", "limit": 10})
+            response = client.get("/api/v1/memory-reviews", params={"status": "open", "limit": 10})
 
         assert response.status_code == 200
         rows = response.json()["data"]
@@ -526,13 +526,13 @@ class TestReviewCrud:
 
         app = create_admin_app(db=db, config=_config(tmp_path))
         with TestClient(app) as client:
-            response = client.get(f"/api/memory-reviews/{review.id}")
+            response = client.get(f"/api/v1/memory-reviews/{review.id}")
 
         assert response.status_code == 200
         payload = response.json()
         incumbent_source = payload["incumbent"]["sources"][0]
         challenger_source = payload["challenger"]["sources"][0]
-        assert incumbent_source["content_url"] == "/api/documents/doc-review-incumbent/content"
+        assert incumbent_source["content_url"] == "/api/v1/documents/doc-review-incumbent/content"
         assert challenger_source["content_url"] is None
         assert "file_uri" not in incumbent_source
         assert "pdf_uri" not in incumbent_source
@@ -598,12 +598,12 @@ class TestReviewCrud:
             document_store=MemoryBackedDocumentStore(),
         )
         with TestClient(app) as client:
-            detail = client.get(f"/api/memory-reviews/{review.id}")
-            content = client.get("/api/documents/doc-review-object-incumbent/content")
+            detail = client.get(f"/api/v1/memory-reviews/{review.id}")
+            content = client.get("/api/v1/documents/doc-review-object-incumbent/content")
 
         assert detail.status_code == 200
         incumbent_source = detail.json()["incumbent"]["sources"][0]
-        assert incumbent_source["content_url"] == ("/api/documents/doc-review-object-incumbent/content")
+        assert incumbent_source["content_url"] == ("/api/v1/documents/doc-review-object-incumbent/content")
         assert content.status_code == 200
         assert content.text == "# Incumbent object evidence"
 
@@ -623,8 +623,8 @@ class TestUnifiedLifecycleReviewApi:
 
         app = create_admin_app(db=db, config=_config(tmp_path))
         with TestClient(app) as client:
-            queue = client.get("/api/memory-reviews", params={"status": "open"})
-            detail = client.get(f"/api/memory-reviews/{review_id}")
+            queue = client.get("/api/v1/memory-reviews", params={"status": "open"})
+            detail = client.get(f"/api/v1/memory-reviews/{review_id}")
 
         assert queue.status_code == 200
         row = next(item for item in queue.json()["data"] if item["id"] == review_id)
@@ -695,11 +695,11 @@ class TestUnifiedLifecycleReviewApi:
         app = create_admin_app(db=db, config=_config(tmp_path))
         with TestClient(app) as client:
             first_page = client.get(
-                "/api/memory-reviews",
+                "/api/v1/memory-reviews",
                 params={"status": "open", "limit": 2, "offset": 0},
             )
             second_page = client.get(
-                "/api/memory-reviews",
+                "/api/v1/memory-reviews",
                 params={"status": "open", "limit": 2, "offset": 2},
             )
 
@@ -723,9 +723,9 @@ class TestUnifiedLifecycleReviewApi:
 
         app = create_admin_app(db=db, config=_config(tmp_path))
         with TestClient(app) as client:
-            missing = client.post(f"/api/memory-reviews/{review_id}/reject", json={})
+            missing = client.post(f"/api/v1/memory-reviews/{review_id}/reject", json={})
             kept = client.post(
-                f"/api/memory-reviews/{review_id}/reject",
+                f"/api/v1/memory-reviews/{review_id}/reject",
                 json={"note": "The current ownership remains valid.", "reviewer": "alice"},
             )
 

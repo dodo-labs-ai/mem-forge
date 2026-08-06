@@ -30,7 +30,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from memforge.api_target import Edition, MemForgeTarget, TargetConfigurationError, build_host_target, build_target
+from memforge.api_target import Edition, MemForgeTarget, build_target
 from memforge.auth import browser_session
 from memforge.config import AppConfig, load_config
 from memforge.github_repo_utils import (
@@ -166,8 +166,6 @@ def _write_cli_config(data: dict[str, Any]) -> None:
             continue
         lines.append(f"[targets.{_toml_key(str(name))}]")
         lines.append(f"api_url = {_toml_string(str(target.get('api_url') or ''))}")
-        if target.get("workspace_id"):
-            lines.append(f"workspace_id = {_toml_string(str(target['workspace_id']))}")
         if target.get("token_env"):
             lines.append(f"token_env = {_toml_string(str(target['token_env']))}")
         lines.append("")
@@ -185,15 +183,11 @@ def _toml_key(value: str) -> str:
 
 def _resolve_api_target(
     _config: AppConfig,
-    *,
-    allow_cloud_without_workspace: bool = False,
 ) -> _ResolvedCliTarget:
-    target_env_names = ("MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID")
+    target_env_names = ("MEMFORGE_API_URL",)
     if any(os.getenv(name, "").strip() for name in target_env_names):
         target = _build_cli_target(
             api_url=os.getenv("MEMFORGE_API_URL"),
-            workspace_id=os.getenv("MEMFORGE_WORKSPACE_ID"),
-            allow_cloud_without_workspace=allow_cloud_without_workspace,
         )
         return _ResolvedCliTarget(
             target=target,
@@ -209,8 +203,6 @@ def _resolve_api_target(
     if isinstance(profile, dict):
         target = _build_cli_target(
             api_url=profile.get("api_url"),
-            workspace_id=profile.get("workspace_id"),
-            allow_cloud_without_workspace=allow_cloud_without_workspace,
         )
         token_env = str(profile.get("token_env") or "")
         return _ResolvedCliTarget(
@@ -221,7 +213,7 @@ def _resolve_api_target(
         )
 
     return _ResolvedCliTarget(
-        target=build_target(origin=None, workspace_id=None),
+        target=build_target(origin=None),
         api_token=os.getenv("MEMFORGE_API_TOKEN"),
         active_target="",
         token_env="",
@@ -231,18 +223,8 @@ def _resolve_api_target(
 def _build_cli_target(
     *,
     api_url: object,
-    workspace_id: object,
-    allow_cloud_without_workspace: bool = False,
 ) -> MemForgeTarget:
-    try:
-        return build_target(
-            origin=str(api_url) if api_url is not None else None,
-            workspace_id=str(workspace_id) if workspace_id is not None else None,
-        )
-    except TargetConfigurationError as exc:
-        if allow_cloud_without_workspace and exc.code == "cloud_workspace_required":
-            return build_host_target(origin=str(api_url) if api_url is not None else None)
-        raise click.ClickException(exc.code) from exc
+    return build_target(origin=str(api_url) if api_url is not None else None)
 
 
 def _tool_client(ctx) -> ToolClient:
@@ -251,10 +233,7 @@ def _tool_client(ctx) -> ToolClient:
 
 
 def _local_agent_tool_client(ctx) -> ToolClient:
-    resolved = _resolve_api_target(
-        ctx.obj["config"],
-        allow_cloud_without_workspace=True,
-    )
+    resolved = _resolve_api_target(ctx.obj["config"])
     return ToolClient(target=resolved.target, api_token=resolved.api_token)
 
 
@@ -943,22 +922,20 @@ def target_list(ctx):
 @target.command("add")
 @click.argument("name")
 @click.option("--api-url", required=True, help="MemForge API URL for this target.")
-@click.option("--workspace-id", default=None, help="Required workspace ID for Cloud targets.")
 @click.option(
     "--token-env", default="MEMFORGE_API_TOKEN", show_default=True, help="Environment variable for the token."
 )
 @click.pass_context
-def target_add(ctx, name: str, api_url: str, workspace_id: str | None, token_env: str):
+def target_add(ctx, name: str, api_url: str, token_env: str):
     """Add or update an API target and make it active."""
     name = name.strip()
     if not name:
         raise click.ClickException("Target name is required.")
-    resolved = _build_cli_target(api_url=api_url, workspace_id=workspace_id)
+    resolved = _build_cli_target(api_url=api_url)
     data = _read_cli_config()
     targets = data.setdefault("targets", {})
     targets[name] = {
         "api_url": resolved.origin,
-        "workspace_id": resolved.workspace_id,
         "token_env": token_env.strip(),
     }
     data["active"] = name
@@ -970,7 +947,6 @@ def target_add(ctx, name: str, api_url: str, workspace_id: str | None, token_env
             "active": name,
             "edition": resolved.edition.value,
             "api_url": resolved.origin,
-            "workspace_id": resolved.workspace_id,
         },
     )
 
@@ -1657,11 +1633,10 @@ def _local_agent_clean_target_summary(target: dict[str, Any]) -> dict[str, Any]:
 
 def _local_agent_target_summary(ctx) -> dict[str, Any]:
     config: AppConfig = ctx.obj["config"]
-    resolved = _resolve_api_target(config, allow_cloud_without_workspace=True)
+    resolved = _resolve_api_target(config)
     return {
         "edition": resolved.target.edition.value,
         "api_url": resolved.target.origin,
-        "workspace_id": resolved.target.workspace_id,
         "active_target": resolved.active_target,
         "token_env": resolved.token_env,
         "api_token_configured": bool(resolved.api_token),

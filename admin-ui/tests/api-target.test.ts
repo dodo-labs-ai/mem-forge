@@ -15,28 +15,33 @@ const queryClient = {
 };
 
 const workspaceApi = createWorkspaceApiController(queryClient);
-assert.equal(resourceClient.defaults.baseURL, "/api");
+assert.equal(resourceClient.defaults.baseURL, "/api/v1");
 assert.equal(workspaceApi.current(), null);
 
 workspaceApi.setTarget({
-  resourceBaseUrl: "/api/workspaces/mount_tai/api/",
+  resourceBaseUrl: "/api/v1/",
   localAgentBaseUrl: "/api/cloud/workspaces/mount_tai/local-agent/",
+  workspaceId: "mount_tai",
 });
-assert.equal(resourceClient.defaults.baseURL, "/api/workspaces/mount_tai/api");
+assert.equal(resourceClient.defaults.baseURL, "/api/v1");
+assert.deepEqual(resourceClient.defaults.params, { workspace_id: "mount_tai" });
 assert.deepEqual(workspaceApi.current(), {
-  resourceBaseUrl: "/api/workspaces/mount_tai/api",
+  resourceBaseUrl: "/api/v1",
   localAgentBaseUrl: "/api/cloud/workspaces/mount_tai/local-agent",
+  workspaceId: "mount_tai",
 });
 assert.equal(clearCount, 1);
 
 workspaceApi.setTarget({
-  resourceBaseUrl: "/api/workspaces/mount_tai/api",
+  resourceBaseUrl: "/api/v1",
   localAgentBaseUrl: "/api/cloud/workspaces/mount_tai/local-agent",
+  workspaceId: "mount_tai",
 });
 assert.equal(clearCount, 1, "a semantically identical target must preserve the query cache");
 
 workspaceApi.setTarget(null);
-assert.equal(resourceClient.defaults.baseURL, "/api");
+assert.equal(resourceClient.defaults.baseURL, "/api/v1");
+assert.deepEqual(resourceClient.defaults.params, {});
 assert.equal(workspaceApi.current(), null);
 assert.equal(clearCount, 2);
 

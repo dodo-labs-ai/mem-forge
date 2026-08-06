@@ -473,12 +473,12 @@ async def test_admin_memory_detail_exposes_service_artifact_urls_only(db: Databa
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.get(f"/api/memories/{memory.id}")
+        response = client.get(f"/api/v1/memories/{memory.id}")
 
     assert response.status_code == 200
     source = response.json()["sources"][0]
     assert source["content_url"] is None
-    assert source["pdf_url"] == "/api/documents/doc-pdf-uri/pdf"
+    assert source["pdf_url"] == "/api/v1/documents/doc-pdf-uri/pdf"
     assert "file_uri" not in source
     assert "pdf_uri" not in source
 
@@ -509,26 +509,26 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        detail = client.get(f"/api/memories/{memory.id}")
-        manifest = client.get("/api/documents/doc-artifact-url/artifacts")
-        markdown_artifact = client.get("/api/documents/doc-artifact-url/artifacts/normalized_markdown")
-        pdf_artifact = client.get("/api/documents/doc-artifact-url/artifacts/pdf")
-        pdf_head = client.head("/api/documents/doc-artifact-url/artifacts/pdf")
-        missing_artifact = client.get("/api/documents/doc-artifact-url/artifacts/raw_source")
-        missing_document = client.get("/api/documents/missing-doc/artifacts")
-        content = client.get("/api/documents/doc-artifact-url/content")
-        pdf = client.get("/api/documents/doc-artifact-url/pdf")
+        detail = client.get(f"/api/v1/memories/{memory.id}")
+        manifest = client.get("/api/v1/documents/doc-artifact-url/artifacts")
+        markdown_artifact = client.get("/api/v1/documents/doc-artifact-url/artifacts/normalized_markdown")
+        pdf_artifact = client.get("/api/v1/documents/doc-artifact-url/artifacts/pdf")
+        pdf_head = client.head("/api/v1/documents/doc-artifact-url/artifacts/pdf")
+        missing_artifact = client.get("/api/v1/documents/doc-artifact-url/artifacts/raw_source")
+        missing_document = client.get("/api/v1/documents/missing-doc/artifacts")
+        content = client.get("/api/v1/documents/doc-artifact-url/content")
+        pdf = client.get("/api/v1/documents/doc-artifact-url/pdf")
 
     assert detail.status_code == 200
     source = detail.json()["sources"][0]
-    assert source["content_url"] == "/api/documents/doc-artifact-url/content"
-    assert source["pdf_url"] == "/api/documents/doc-artifact-url/pdf"
+    assert source["content_url"] == "/api/v1/documents/doc-artifact-url/content"
+    assert source["pdf_url"] == "/api/v1/documents/doc-artifact-url/pdf"
     assert "file_uri" not in source
     assert "pdf_uri" not in source
     assert manifest.status_code == 200
     artifacts = manifest.json()["artifacts"]
-    assert artifacts["normalized_markdown"]["url"] == ("/api/documents/doc-artifact-url/artifacts/normalized_markdown")
-    assert artifacts["pdf"]["url"] == "/api/documents/doc-artifact-url/artifacts/pdf"
+    assert artifacts["normalized_markdown"]["url"] == ("/api/v1/documents/doc-artifact-url/artifacts/normalized_markdown")
+    assert artifacts["pdf"]["url"] == "/api/v1/documents/doc-artifact-url/artifacts/pdf"
     assert markdown_artifact.status_code == 200
     assert markdown_artifact.text == "# Source\n\nDurable memory evidence."
     assert pdf_artifact.status_code == 200
@@ -713,9 +713,9 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
 
     app = create_admin_app(db=db, config=config, document_store=document_store)
     with TestClient(app) as client:
-        detail = client.get(f"/api/memories/{memory.id}")
-        resource = client.get("/api/source-artifacts/obsrev-image")
-        resource_head = client.head("/api/source-artifacts/obsrev-image")
+        detail = client.get(f"/api/v1/memories/{memory.id}")
+        resource = client.get("/api/v1/source-artifacts/obsrev-image")
+        resource_head = client.head("/api/v1/source-artifacts/obsrev-image")
 
     assert detail.status_code == 200
     [artifact] = detail.json()["evidence_artifacts"]
@@ -727,7 +727,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     assert artifact["summary"] == (
         "Service case review screen showing the investigation areas."
     )
-    assert artifact["url"] == "/api/source-artifacts/obsrev-image"
+    assert artifact["url"] == "/api/v1/source-artifacts/obsrev-image"
 
     await db.db.execute(
         "UPDATE source_observations SET current_revision_id = ? WHERE id = ?",
@@ -735,7 +735,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     )
     await db.db.commit()
     with TestClient(app) as client:
-        stale_support_detail = client.get(f"/api/memories/{memory.id}")
+        stale_support_detail = client.get(f"/api/v1/memories/{memory.id}")
     assert stale_support_detail.status_code == 200
     assert stale_support_detail.json()["evidence_artifacts"] == []
     assert resource.status_code == 200
@@ -759,7 +759,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     )
     await db.db.commit()
     with TestClient(app) as client:
-        stale_revision = client.get("/api/source-artifacts/obsrev-image")
+        stale_revision = client.get("/api/v1/source-artifacts/obsrev-image")
     assert stale_revision.status_code == 404
 
     await db.db.execute(
@@ -772,7 +772,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     )
     await db.db.commit()
     with TestClient(app) as client:
-        unauthorized_replay = client.get("/api/source-artifacts/obsrev-image")
+        unauthorized_replay = client.get("/api/v1/source-artifacts/obsrev-image")
     assert unauthorized_replay.status_code == 404
 
 
@@ -844,8 +844,8 @@ async def test_admin_document_content_uses_exact_document_identity_for_same_titl
 
     app = create_admin_app(db=db, config=config, document_store=document_store)
     with TestClient(app) as client:
-        first = client.get("/api/documents/doc-user-guide-a/content")
-        second = client.get("/api/documents/doc-user-guide-b/content")
+        first = client.get("/api/v1/documents/doc-user-guide-a/content")
+        second = client.get("/api/v1/documents/doc-user-guide-b/content")
 
     assert first.status_code == 200
     assert first.text == "# First guide"
@@ -871,14 +871,14 @@ async def test_admin_document_content_alias_falls_back_to_raw_source(db: Databas
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        manifest = client.get("/api/documents/doc-raw-artifact-url/artifacts")
-        raw_artifact = client.get("/api/documents/doc-raw-artifact-url/artifacts/raw_source")
-        content = client.get("/api/documents/doc-raw-artifact-url/content")
+        manifest = client.get("/api/v1/documents/doc-raw-artifact-url/artifacts")
+        raw_artifact = client.get("/api/v1/documents/doc-raw-artifact-url/artifacts/raw_source")
+        content = client.get("/api/v1/documents/doc-raw-artifact-url/content")
 
     assert manifest.status_code == 200
     artifacts = manifest.json()["artifacts"]
     assert "normalized_markdown" not in artifacts
-    assert artifacts["raw_source"]["url"] == "/api/documents/doc-raw-artifact-url/artifacts/raw_source"
+    assert artifacts["raw_source"]["url"] == "/api/v1/documents/doc-raw-artifact-url/artifacts/raw_source"
     assert raw_artifact.status_code == 200
     assert raw_artifact.text == "<h1>Raw source</h1>"
     assert content.status_code == 200
@@ -947,13 +947,13 @@ async def test_admin_document_artifacts_can_use_non_filesystem_store(db: Databas
         document_store=MemoryBackedDocumentStore(),
     )
     with TestClient(app) as client:
-        detail = client.get(f"/api/memories/{memory.id}")
-        manifest = client.get("/api/documents/doc-object-artifact-url/artifacts")
-        content = client.get("/api/documents/doc-object-artifact-url/content")
+        detail = client.get(f"/api/v1/memories/{memory.id}")
+        manifest = client.get("/api/v1/documents/doc-object-artifact-url/artifacts")
+        content = client.get("/api/v1/documents/doc-object-artifact-url/content")
 
     assert detail.status_code == 200
     source = detail.json()["sources"][0]
-    assert source["content_url"] == "/api/documents/doc-object-artifact-url/content"
+    assert source["content_url"] == "/api/v1/documents/doc-object-artifact-url/content"
     assert manifest.status_code == 200
     assert manifest.json()["artifacts"]["normalized_markdown"]["size_bytes"] == 55
     assert content.status_code == 200
@@ -978,9 +978,9 @@ async def test_admin_document_artifacts_reject_local_paths_outside_docs_root(
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        manifest = client.get("/api/documents/doc-outside-artifact-root/artifacts")
-        content = client.get("/api/documents/doc-outside-artifact-root/content")
-        artifact = client.get("/api/documents/doc-outside-artifact-root/artifacts/normalized_markdown")
+        manifest = client.get("/api/v1/documents/doc-outside-artifact-root/artifacts")
+        content = client.get("/api/v1/documents/doc-outside-artifact-root/content")
+        artifact = client.get("/api/v1/documents/doc-outside-artifact-root/artifacts/normalized_markdown")
 
     assert manifest.status_code == 200
     assert manifest.json()["artifacts"] == {}
@@ -1046,7 +1046,7 @@ async def test_delete_source_uses_injected_document_store(
     store = RecordingDocumentStore()
     app = create_admin_app(db=db, config=_config(tmp_path), document_store=store)
     with TestClient(app) as client:
-        response = client.delete("/api/sources/src-confluence")
+        response = client.delete("/api/v1/sources/src-confluence")
 
     assert response.status_code == 200, response.text
     assert store.deleted == ["mem://doc.md"]
@@ -1061,7 +1061,7 @@ async def test_delete_source_is_idempotent_when_source_is_already_absent(
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.delete("/api/sources/src-already-deleted")
+        response = client.delete("/api/v1/sources/src-already-deleted")
 
     assert response.status_code == 200, response.text
     assert response.json() == {
@@ -1127,7 +1127,7 @@ async def test_delete_source_succeeds_and_retains_cleanup_task_when_artifact_del
         document_store=UnavailableDocumentStore(),
     )
     with TestClient(app) as client:
-        response = client.delete("/api/sources/src-cleanup-failure")
+        response = client.delete("/api/v1/sources/src-cleanup-failure")
 
     tasks = await db.list_source_artifact_cleanup_tasks(limit=10)
     assert response.status_code == 200, response.text
@@ -1163,7 +1163,7 @@ async def test_delete_source_restores_previous_status_when_delete_transaction_fa
     app = create_admin_app(db=db, config=_config(tmp_path))
 
     with TestClient(app, raise_server_exceptions=False) as client:
-        response = client.delete("/api/sources/src-delete-rollback")
+        response = client.delete("/api/v1/sources/src-delete-rollback")
 
     source = await db.get_source("src-delete-rollback")
     assert response.status_code == 500
@@ -1278,7 +1278,7 @@ async def test_admin_memory_list_search_accepts_hyphenated_jira_id(db: Database,
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.get("/api/memories", params={"search": "PAY-176425"})
+        response = client.get("/api/v1/memories", params={"search": "PAY-176425"})
 
     assert response.status_code == 200
     payload = response.json()
@@ -1326,7 +1326,7 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
     )
     with TestClient(app) as client:
         response = client.post(
-            "/api/memories/search",
+            "/api/v1/memories/search",
             json={"query": "proxy search", "top_k": 3},
         )
 
@@ -1392,7 +1392,7 @@ async def test_admin_recent_memory_endpoint_uses_dedicated_listing_interface(
     )
     with TestClient(app) as client:
         response = client.post(
-            "/api/memories/recent",
+            "/api/v1/memories/recent",
             json={
                 "time_range": {
                     "date_type": "source_updated_at",
@@ -1549,7 +1549,7 @@ async def test_admin_memory_search_validates_source_ids_without_hydrating_admin_
     )
     with TestClient(app) as client:
         response = client.post(
-            "/api/memories/search",
+            "/api/v1/memories/search",
             json={
                 "query": "payroll defect",
                 "source_filter": {"source_ids": ["src-mounttai"]},
@@ -1562,7 +1562,7 @@ async def test_admin_memory_search_validates_source_ids_without_hydrating_admin_
     await db.set_source_subscription("src-mounttai", LOCAL_DEV_USER_ID, enabled=False)
     with TestClient(app) as client:
         response = client.post(
-            "/api/memories/search",
+            "/api/v1/memories/search",
             json={
                 "query": "payroll defect",
                 "source_filter": {"source_ids": ["src-mounttai", "src-missing"]},
@@ -1595,7 +1595,7 @@ async def test_admin_recent_changes_endpoint_returns_memory_updates(db: Database
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.get("/api/recent-changes", params={"include_memories": "true"})
+        response = client.get("/api/v1/recent-changes", params={"include_memories": "true"})
 
     assert response.status_code == 200
     payload = response.json()
@@ -1617,7 +1617,7 @@ async def test_admin_memory_list_search_accepts_fts_operator_text(db: Database, 
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.get("/api/memories", params={"search": "AND"})
+        response = client.get("/api/v1/memories", params={"search": "AND"})
 
     assert response.status_code == 200
 
@@ -1643,7 +1643,7 @@ async def test_admin_memory_delete_cleans_search_indexes(
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.delete(f"/api/memories/{memory.id}")
+        response = client.delete(f"/api/v1/memories/{memory.id}")
 
     stored = await db.get_memory(memory.id)
     assert response.status_code == 200
@@ -1673,7 +1673,7 @@ async def test_admin_pending_review_status_cleans_search_indexes(
 
     app = create_admin_app(db=db, config=_config(tmp_path))
     with TestClient(app) as client:
-        response = client.put(f"/api/memories/{memory.id}", json={"status": "pending_review"})
+        response = client.put(f"/api/v1/memories/{memory.id}", json={"status": "pending_review"})
 
     stored = await db.get_memory(memory.id)
     assert response.status_code == 200

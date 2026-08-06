@@ -27,7 +27,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -2847,7 +2847,7 @@ def create_admin_app(
     document_store: DocumentArtifactStore | None = None,
     local_agent_lease_validator: Callable[[Request, str, str, int, str], Awaitable[bool]] | None = None,
     local_agent_job_enqueuer: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
-    workspace_id: str = "default",
+    workspace_id: str = "local",
 ) -> FastAPI:
     """Create and configure the MemForge Admin API FastAPI application.
 
@@ -2954,6 +2954,42 @@ def create_admin_app(
     app.state.local_agent_lease_validator = local_agent_lease_validator
     app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
 
+    @app.middleware("http")
+    async def resolve_workspace_context(request: Request, call_next):
+        """Resolve the singleton workspace for every v1 data-plane request."""
+        if request.url.path.startswith("/api/v1/") and request.url.path != "/api/v1/workspaces":
+            current_workspace_id = str(request.app.state.workspace_id)
+            requested_values = request.query_params.getlist("workspace_id")
+            if len(requested_values) > 1:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "code": "invalid_workspace_selector",
+                        "detail": "workspace_id may be supplied at most once.",
+                    },
+                )
+            requested_workspace_id = requested_values[0].strip() if requested_values else None
+            if requested_values and not requested_workspace_id:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "code": "invalid_workspace_selector",
+                        "detail": "workspace_id must not be empty.",
+                    },
+                )
+            if requested_workspace_id and requested_workspace_id != current_workspace_id:
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "code": "workspace_not_found_or_inaccessible",
+                        "detail": "Workspace not found or inaccessible.",
+                    },
+                )
+            response = await call_next(request)
+            response.headers["MemForge-Workspace"] = current_workspace_id
+            return response
+        return await call_next(request)
+
     # -- CORS --
     cors_origins = config.server.cors_origins.split(",") if config.server.cors_origins != "*" else ["*"]
     app.add_middleware(
@@ -2993,7 +3029,7 @@ def create_admin_app(
             raise HTTPException(status_code=401, detail="Invalid token")
 
     # -- Auth endpoints --
-    auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
+    auth_router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
     class LoginRequest(BaseModel):
         username: str
@@ -3102,20 +3138,20 @@ def create_admin_app(
 
     # -- Register routers --
     health_router = APIRouter(tags=["health"])
-    document_router = APIRouter(prefix="/api/documents", tags=["documents"])
-    source_artifact_router = APIRouter(prefix="/api/source-artifacts", tags=["source-artifacts"])
-    memory_router = APIRouter(prefix="/api/memories", tags=["memories"])
-    review_router = APIRouter(prefix="/api/memory-reviews", tags=["memory-reviews"])
-    entity_router = APIRouter(prefix="/api/entities", tags=["entities"])
-    gene_router = APIRouter(prefix="/api/genes", tags=["genes"])
-    source_router = APIRouter(prefix="/api/sources", tags=["sources"])
-    source_list_router = APIRouter(prefix="/api/source-list", tags=["sources"])
-    agent_session_router = APIRouter(prefix="/api/agent-sessions", tags=["agent-sessions"])
-    hook_router = APIRouter(prefix="/api/hooks", tags=["hooks"])
-    recent_change_router = APIRouter(prefix="/api/recent-changes", tags=["recent-changes"])
-    schedule_router = APIRouter(prefix="/api/schedule", tags=["schedule"])
-    llm_router = APIRouter(prefix="/api/llm-config", tags=["llm-config"])
-    projects_router = APIRouter(prefix="/api/projects", tags=["projects"])
+    document_router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
+    source_artifact_router = APIRouter(prefix="/api/v1/source-artifacts", tags=["source-artifacts"])
+    memory_router = APIRouter(prefix="/api/v1/memories", tags=["memories"])
+    review_router = APIRouter(prefix="/api/v1/memory-reviews", tags=["memory-reviews"])
+    entity_router = APIRouter(prefix="/api/v1/entities", tags=["entities"])
+    gene_router = APIRouter(prefix="/api/v1/genes", tags=["genes"])
+    source_router = APIRouter(prefix="/api/v1/sources", tags=["sources"])
+    source_list_router = APIRouter(prefix="/api/v1/source-list", tags=["sources"])
+    agent_session_router = APIRouter(prefix="/api/v1/agent-sessions", tags=["agent-sessions"])
+    hook_router = APIRouter(prefix="/api/v1/hooks", tags=["hooks"])
+    recent_change_router = APIRouter(prefix="/api/v1/recent-changes", tags=["recent-changes"])
+    schedule_router = APIRouter(prefix="/api/v1/schedule", tags=["schedule"])
+    llm_router = APIRouter(prefix="/api/v1/llm-config", tags=["llm-config"])
+    projects_router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
     local_agent_router = APIRouter(
         prefix="/api/cloud/local-agent",
         tags=["local-agent"],
@@ -3139,7 +3175,25 @@ def create_admin_app(
     # 1. Health & Stats
     # ===================================================================
 
-    @health_router.get("/api/health", response_model=HealthResponse)
+    @health_router.get("/api/v1/workspaces")
+    async def list_workspaces(request: Request) -> dict[str, object]:
+        """Return the single workspace exposed by a self-hosted runtime."""
+        current_workspace_id = str(request.app.state.workspace_id)
+        return {
+            "workspaces": [
+                {
+                    "workspace_id": current_workspace_id,
+                    "name": "Local workspace",
+                    "role": "owner",
+                    "status": "active",
+                    "selectable": True,
+                    "is_default": True,
+                }
+            ],
+            "default_workspace_id": current_workspace_id,
+        }
+
+    @health_router.get("/api/v1/health", response_model=HealthResponse)
     async def health(request: Request, db: Database = Depends(get_db)):
         """System health check through the active runtime provider."""
         runtime_provider = request.app.state.runtime_provider
@@ -3155,7 +3209,7 @@ def create_admin_app(
             genes={name: _runtime_component_to_response(component) for name, component in report.genes.items()},
         )
 
-    @health_router.get("/api/stats", response_model=StatsResponse)
+    @health_router.get("/api/v1/stats", response_model=StatsResponse)
     async def stats(db: Database = Depends(get_db)):
         """Overall system statistics: memory counts, entity counts, source counts."""
         # Memory counts by type
@@ -6236,6 +6290,7 @@ def create_admin_app(
             if source_type == GITHUB_REPO_SOURCE_TYPE:
                 result = await submit_github_repo_document(
                     db=db,
+                    workspace_id=workspace_id,
                     config=config,
                     source=source,
                     repo_url=req.repo_url or "",
@@ -7434,7 +7489,7 @@ def create_admin_app(
 
     # -- Detailed stats endpoint (observability) --
 
-    @app.get("/api/stats/detailed")
+    @app.get("/api/v1/stats/detailed")
     async def detailed_stats(db: Database = Depends(get_db)):
         """Detailed system stats for observability — entity resolution, cache, memory growth."""
         stats: dict[str, Any] = {}

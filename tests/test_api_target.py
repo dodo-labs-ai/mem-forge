@@ -12,81 +12,67 @@ from memforge.api_target import (
     Edition,
     MemForgeTarget,
     TargetConfigurationError,
-    build_host_target,
     build_target,
 )
 from memforge.plugin_config import configured_api_token, configured_target
 
 
+def test_unified_v1_target_does_not_require_a_configured_workspace():
+    target = build_target(
+        origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+    )
+
+    assert target.api_base == (
+        "https://memforge-dev.cfapps.eu12.hana.ondemand.com/api/v1"
+    )
+    assert target.resource_url("/memories/search") == (
+        "https://memforge-dev.cfapps.eu12.hana.ondemand.com/api/v1/memories/search"
+    )
+
+
+def test_unified_v1_target_adds_explicit_workspace_as_query_parameter():
+    target = build_target(origin="https://self.example")
+
+    assert target.resource_url(
+        "/memories/search?include_private=true",
+        workspace_id="mount tai/blue",
+    ) == (
+        "https://self.example/api/v1/memories/search"
+        "?include_private=true&workspace_id=mount+tai%2Fblue"
+    )
+
+
+def test_resource_url_rejects_an_embedded_workspace_selector():
+    target = build_target(origin="https://self.example")
+
+    with pytest.raises(ValueError, match="workspace_id_must_use_explicit_parameter"):
+        target.resource_url("/memories?workspace_id=ws-a")
+
+
 @pytest.mark.parametrize(
-    ("origin", "workspace_id", "edition", "resource_base"),
+    ("origin", "edition"),
     [
-        ("https://self.example", None, Edition.OSS, "https://self.example/api"),
+        ("https://self.example", Edition.OSS),
         (
             "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-            "mount_tai",
             Edition.CLOUD,
-            "https://memforge-dev.cfapps.eu12.hana.ondemand.com/api/workspaces/mount_tai/api",
         ),
     ],
 )
-def test_build_target_derives_edition_and_returns_one_resource_base(origin, workspace_id, edition, resource_base):
-    target = build_target(origin=origin, workspace_id=workspace_id)
+def test_build_target_derives_edition_without_changing_the_v1_contract(
+    origin: str,
+    edition: Edition,
+):
+    target = build_target(origin=origin)
 
     assert target.edition is edition
-    assert target.workspace_api_base == resource_base
+    assert target.api_base == f"{origin}/api/v1"
 
 
-@pytest.mark.parametrize(
-    ("origin", "workspace_id", "code"),
-    [
-        (None, "mount_tai", "memforge_origin_required"),
-        ("https://memforge-dev.cfapps.eu12.hana.ondemand.com", None, "cloud_workspace_required"),
-        ("https://self.example", "mount_tai", "workspace_not_supported_for_oss"),
-        ("https://self.example/api", None, "memforge_origin_required"),
-    ],
-)
-def test_build_target_rejects_invalid_derived_target(origin, workspace_id, code):
-    with pytest.raises(TargetConfigurationError, match=code) as exc_info:
-        build_target(origin=origin, workspace_id=workspace_id)
-
-    assert exc_info.value.code == code
-
-
-def test_build_target_defaults_only_when_all_configuration_is_absent():
-    target = build_target(origin=None, workspace_id=None)
-
-    assert target == MemForgeTarget(
+def test_build_target_defaults_to_local_oss():
+    assert build_target(origin=None) == MemForgeTarget(
         edition=Edition.OSS,
         origin="http://127.0.0.1:8765",
-        workspace_id=None,
-    )
-    assert target.workspace_api_base == "http://127.0.0.1:8765/api"
-
-
-def test_build_host_target_allows_cloud_control_plane_without_workspace():
-    target = build_host_target(
-        origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com/",
-    )
-
-    assert target == MemForgeTarget(
-        edition=Edition.CLOUD,
-        origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-        workspace_id=None,
-    )
-
-
-def test_build_target_normalizes_origin_and_quotes_workspace():
-    target = build_target(
-        origin=" https://MEMFORGE-DEV.CFAPPS.EU12.HANA.ONDEMAND.COM/ ",
-        workspace_id=" mount tai/blue ",
-    )
-
-    assert target.edition is Edition.CLOUD
-    assert target.origin == "https://MEMFORGE-DEV.CFAPPS.EU12.HANA.ONDEMAND.COM"
-    assert target.workspace_id == "mount tai/blue"
-    assert target.workspace_api_base == (
-        "https://MEMFORGE-DEV.CFAPPS.EU12.HANA.ONDEMAND.COM/api/workspaces/mount%20tai%2Fblue/api"
     )
 
 
@@ -97,253 +83,89 @@ def test_build_target_normalizes_origin_and_quotes_workspace():
         "https://:443",
         "https://self.example:notaport",
         "https://self.example/custom",
-        "https://self.example/api/workspaces/mount_tai/api",
+        "https://self.example/api/v1",
         "https://self.example?api=v1",
         "https://self.example#api",
     ],
 )
-def test_build_target_rejects_non_origin_api_urls(origin):
+def test_build_target_rejects_non_origin_api_urls(origin: str):
     with pytest.raises(TargetConfigurationError, match="memforge_origin_required"):
-        build_target(origin=origin, workspace_id=None)
+        build_target(origin=origin)
 
 
 @pytest.mark.parametrize("origin", ["https://self.example:8443", "https://[::1]:8443"])
-def test_build_target_accepts_normal_host_and_ipv6_origins(origin):
-    target = build_target(origin=origin, workspace_id=None)
-
-    assert target.origin == origin
-
-
-@pytest.mark.parametrize(
-    "origin",
-    [
-        "https://hana.ondemand.com",
-        "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-        "https://MEMFORGE-DEV.CFAPPS.EU12.HANA.ONDEMAND.COM.",
-    ],
-)
-def test_build_target_classifies_only_hana_ondemand_hosts_as_cloud(origin):
-    target = build_target(origin=origin, workspace_id="mount_tai")
-
-    assert target.edition is Edition.CLOUD
-
-
-@pytest.mark.parametrize(
-    "origin",
-    [
-        "https://hana.ondemand.com.evil.example",
-        "https://hana-ondemand.com",
-        "https://self.example",
-    ],
-)
-def test_build_target_does_not_use_substring_cloud_detection(origin):
-    target = build_target(origin=origin, workspace_id=None)
-
-    assert target.edition is Edition.OSS
+def test_build_target_accepts_normal_host_and_ipv6_origins(origin: str):
+    assert build_target(origin=origin).origin == origin
 
 
 def test_memforge_target_is_immutable():
-    target = build_target(origin="https://self.example", workspace_id=None)
+    target = build_target(origin="https://self.example")
 
     with pytest.raises(FrozenInstanceError):
         target.origin = "https://other.example"
 
 
-def test_resource_url_resolves_relative_resource_path():
-    target = build_target(
-        origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-        workspace_id="mount_tai",
-    )
-
-    assert target.resource_url("/sources") == (
-        "https://memforge-dev.cfapps.eu12.hana.ondemand.com/api/workspaces/mount_tai/api/sources"
-    )
-
-
-@pytest.mark.parametrize("relative_path", ["sources", "/api/sources"])
-def test_resource_url_rejects_paths_outside_api_base(relative_path):
-    target = build_target(origin="https://self.example", workspace_id=None)
+@pytest.mark.parametrize("relative_path", ["sources", "/api/v1/sources"])
+def test_resource_url_rejects_paths_outside_api_base(relative_path: str):
+    target = build_target(origin="https://self.example")
 
     with pytest.raises(ValueError, match="resource_path_must_be_relative_to_api_base"):
         target.resource_url(relative_path)
 
 
-def test_configured_target_reads_explicit_cloud_target(monkeypatch, tmp_path):
+def test_configured_target_reads_origin_but_ignores_obsolete_workspace_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
     from memforge import plugin_config
 
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://memforge-dev.cfapps.eu12.hana.ondemand.com/")
-    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
-    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(tmp_path / "missing-config.toml"))
+    repository = tmp_path / "repository"
+    (repository / ".memforge").mkdir(parents=True)
+    (repository / ".memforge" / "config.toml").write_text(
+        '[memforge]\nworkspace_id = "repository_workspace"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "MEMFORGE_API_URL",
+        "https://memforge-dev.cfapps.eu12.hana.ondemand.com/",
+    )
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "obsolete-process-workspace")
+    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(tmp_path / "missing.toml"))
+    monkeypatch.chdir(repository)
     monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
 
     assert configured_target() == MemForgeTarget(
         edition=Edition.CLOUD,
         origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
-        workspace_id="mount_tai",
     )
 
 
-def test_configured_target_preserves_zero_configuration_default(monkeypatch, tmp_path):
+def test_configured_target_preserves_zero_configuration_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
     from memforge import plugin_config
 
     for name in ("MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(tmp_path / "missing-config.toml"))
+    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(tmp_path / "missing.toml"))
     monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
 
     assert configured_target() == MemForgeTarget(
         edition=Edition.OSS,
         origin="http://127.0.0.1:8765",
-        workspace_id=None,
     )
 
 
-def test_repository_workspace_overrides_user_default_from_nested_path(monkeypatch, tmp_path):
+def test_repository_config_does_not_override_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
     from memforge import plugin_config
 
-    repository = tmp_path / "repository"
-    nested = repository / "src" / "package"
-    nested.mkdir(parents=True)
-    (repository / ".git").mkdir()
-    local_config = repository / ".memforge" / "config.toml"
-    local_config.parent.mkdir()
-    local_config.write_text('[memforge]\nworkspace_id = "repository_workspace"\n', encoding="utf-8")
     user_config = tmp_path / "codex-config.toml"
     user_config.write_text(
-        """
-[memforge]
-MEMFORGE_API_URL = "https://memforge.example.hana.ondemand.com"
-MEMFORGE_WORKSPACE_ID = "user_workspace"
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
-    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
-    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(user_config))
-    monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
-
-    assert configured_target([nested]) == MemForgeTarget(
-        edition=Edition.CLOUD,
-        origin="https://memforge.example.hana.ondemand.com",
-        workspace_id="repository_workspace",
-    )
-
-
-def test_repository_workspace_overrides_process_and_user_defaults(monkeypatch, tmp_path):
-    from memforge import plugin_config
-
-    repository = tmp_path / "repository"
-    (repository / ".git").mkdir(parents=True)
-    local_config = repository / ".memforge" / "config.toml"
-    local_config.parent.mkdir()
-    local_config.write_text('[memforge]\nworkspace_id = "repository_workspace"\n', encoding="utf-8")
-    user_config = tmp_path / "codex-config.toml"
-    user_config.write_text(
-        """
-[memforge]
-MEMFORGE_API_URL = "https://memforge.example.hana.ondemand.com"
-MEMFORGE_WORKSPACE_ID = "user_workspace"
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
-    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "process_workspace")
-    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(user_config))
-    monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
-
-    assert configured_target([repository]).workspace_id == "repository_workspace"
-
-
-@pytest.mark.parametrize(
-    "local_content",
-    [
-        None,
-        '[memforge]\nworkspace_id = "\\q"\n',
-    ],
-)
-def test_missing_or_malformed_repository_workspace_retains_process_default(monkeypatch, tmp_path, local_content):
-    from memforge import plugin_config
-
-    repository = tmp_path / "repository"
-    (repository / ".git").mkdir(parents=True)
-    if local_content is not None:
-        local_config = repository / ".memforge" / "config.toml"
-        local_config.parent.mkdir()
-        local_config.write_text(local_content, encoding="utf-8")
-    user_config = tmp_path / "codex-config.toml"
-    user_config.write_text(
-        """
-[memforge]
-MEMFORGE_API_URL = "https://memforge.example.hana.ondemand.com"
-MEMFORGE_WORKSPACE_ID = "user_workspace"
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
-    monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "process_workspace")
-    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(user_config))
-    monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
-
-    assert configured_target([repository]).workspace_id == "process_workspace"
-
-
-@pytest.mark.parametrize(
-    "local_content",
-    [
-        None,
-        'workspace_id = "outside_memforge_table"\n',
-        "[memforge]\nworkspace_id = 42\n",
-        '[memforge]\nworkspace_id = "\\q"\n',
-        '[memforge]\nworkspace_id = "   "\n',
-    ],
-)
-def test_missing_or_invalid_repository_workspace_retains_user_default(monkeypatch, tmp_path, local_content):
-    from memforge import plugin_config
-
-    repository = tmp_path / "repository"
-    (repository / ".git").mkdir(parents=True)
-    if local_content is not None:
-        local_config = repository / ".memforge" / "config.toml"
-        local_config.parent.mkdir()
-        local_config.write_text(local_content, encoding="utf-8")
-    user_config = tmp_path / "codex-config.toml"
-    user_config.write_text(
-        """
-[memforge]
-MEMFORGE_API_URL = "https://memforge.example.hana.ondemand.com"
-MEMFORGE_WORKSPACE_ID = "user_workspace"
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
-    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
-    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(user_config))
-    monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
-
-    assert configured_target([repository]).workspace_id == "user_workspace"
-
-
-def test_repository_config_does_not_override_credentials(monkeypatch, tmp_path):
-    from memforge import plugin_config
-
-    repository = tmp_path / "repository"
-    (repository / ".git").mkdir(parents=True)
-    local_config = repository / ".memforge" / "config.toml"
-    local_config.parent.mkdir()
-    local_config.write_text(
-        """
-[memforge]
-workspace_id = "repository_workspace"
-MEMFORGE_API_TOKEN = "repository-token"
-""",
-        encoding="utf-8",
-    )
-    user_config = tmp_path / "codex-config.toml"
-    user_config.write_text(
-        """
-[memforge]
-MEMFORGE_API_TOKEN = "user-token"
-""",
+        '[memforge]\nMEMFORGE_API_TOKEN = "user-token"\n',
         encoding="utf-8",
     )
     monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
@@ -353,51 +175,9 @@ MEMFORGE_API_TOKEN = "user-token"
     assert configured_api_token() == "user-token"
 
 
-def test_repository_workspace_still_obeys_oss_target_validation(monkeypatch, tmp_path):
-    from memforge import plugin_config
-
-    repository = tmp_path / "repository"
-    (repository / ".git").mkdir(parents=True)
-    local_config = repository / ".memforge" / "config.toml"
-    local_config.parent.mkdir()
-    local_config.write_text('[memforge]\nworkspace_id = "cloud_only"\n', encoding="utf-8")
-    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
-    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
-    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(tmp_path / "missing-config.toml"))
-    monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
-
-    with pytest.raises(TargetConfigurationError, match="workspace_not_supported_for_oss"):
-        configured_target([repository])
-
-
-def test_partial_multi_repository_override_retains_user_default(monkeypatch, tmp_path):
-    from memforge import plugin_config
-
-    configured_repository = tmp_path / "configured"
-    unconfigured_repository = tmp_path / "unconfigured"
-    (configured_repository / ".git").mkdir(parents=True)
-    (unconfigured_repository / ".git").mkdir(parents=True)
-    local_config = configured_repository / ".memforge" / "config.toml"
-    local_config.parent.mkdir()
-    local_config.write_text('[memforge]\nworkspace_id = "repository_workspace"\n', encoding="utf-8")
-    user_config = tmp_path / "codex-config.toml"
-    user_config.write_text(
-        """
-[memforge]
-MEMFORGE_API_URL = "https://memforge.example.hana.ondemand.com"
-MEMFORGE_WORKSPACE_ID = "user_workspace"
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
-    monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
-    monkeypatch.setenv("MEMFORGE_CODEX_CONFIG", str(user_config))
-    monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
-
-    assert configured_target([configured_repository, unconfigured_repository]).workspace_id == "user_workspace"
-
-
-def test_plugin_config_package_import_does_not_hide_api_target_import_error(tmp_path):
+def test_plugin_config_package_import_does_not_hide_api_target_import_error(
+    tmp_path: Path,
+):
     package = tmp_path / "broken_plugin"
     package.mkdir()
     (package / "__init__.py").write_text("", encoding="utf-8")
@@ -406,9 +186,14 @@ def test_plugin_config_package_import_does_not_hide_api_target_import_error(tmp_
         encoding="utf-8",
     )
     source = Path(__file__).parents[1] / "src" / "memforge" / "plugin_config.py"
-    (package / "plugin_config.py").write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    (package / "plugin_config.py").write_text(
+        source.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
     env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(tmp_path), env.get("PYTHONPATH"))))
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(tmp_path), env.get("PYTHONPATH")))
+    )
 
     result = subprocess.run(
         [sys.executable, "-c", "import broken_plugin.plugin_config"],
