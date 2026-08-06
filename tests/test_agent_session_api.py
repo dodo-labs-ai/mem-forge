@@ -48,6 +48,38 @@ def _config(tmp_path: Path) -> AppConfig:
     return cfg
 
 
+@pytest.mark.asyncio
+async def test_agent_session_window_client_uses_runtime_provider(tmp_path):
+    from memforge.server.admin_api import _build_agent_session_window_client
+
+    database = Database(str(tmp_path / "runtime-provider.db"))
+    await database.connect()
+    config = _config(tmp_path)
+    config.llm.enrichment_model = "gateway/structured-model"
+    config.llm.enrichment_max_concurrent = 7
+    expected_client = object()
+    captured = {}
+
+    class CapturingRuntimeProvider:
+        def build_structured_llm_client(self, llm, *, max_concurrent):
+            captured["llm"] = llm
+            captured["max_concurrent"] = max_concurrent
+            return expected_client
+
+    try:
+        client = await _build_agent_session_window_client(
+            database,
+            config,
+            CapturingRuntimeProvider(),
+        )
+    finally:
+        await database.close()
+
+    assert client is expected_client
+    assert captured["llm"].enrichment_model == "gateway/structured-model"
+    assert captured["max_concurrent"] == 7
+
+
 def _durable(
     rule: str,
     *,
