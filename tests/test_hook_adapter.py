@@ -911,9 +911,9 @@ def test_mcp_data_tools_accept_repository_context_but_workspace_directory_does_n
         assert "repository_context" in tool["inputSchema"]["properties"], tool["name"]
 
 
-def test_packaged_plugin_version_0_1_42_is_consistent():
+def test_packaged_plugin_version_0_1_43_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.42"
+    version = "0.1.43"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
@@ -1871,7 +1871,7 @@ def test_plugin_mcp_launchers_match_each_other():
     assert codex_launcher.read_text() == claude_launcher.read_text()
 
 
-def test_mcp_proxy_starts_without_memforge_executable():
+def test_packaged_mcp_proxy_starts_in_isolated_python_without_memforge_package():
     root = Path(__file__).resolve().parents[1]
     proxy = root / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_mcp.py"
     manifest = json.loads(
@@ -1879,9 +1879,22 @@ def test_mcp_proxy_starts_without_memforge_executable():
     )
     request = _mcp_initialize_request()
     frame = b"Content-Length: " + str(len(request)).encode() + b"\r\n\r\n" + request
+    launcher = (
+        "import runpy, sys; "
+        "sys.path.insert(0, sys.argv[1]); "
+        "runpy.run_path(sys.argv[2], run_name='__main__')"
+    )
 
     result = subprocess.run(
-        [sys.executable, str(proxy)],
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            launcher,
+            str(proxy.parent),
+            str(proxy),
+        ],
         input=frame,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

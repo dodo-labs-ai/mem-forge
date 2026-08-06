@@ -56,6 +56,20 @@ def test_sync_replaces_stale_copy_and_matches_canonical_mode(tmp_path):
     assert stat.S_IMODE(generated.stat().st_mode) == stat.S_IMODE(canonical.stat().st_mode)
 
 
+def test_packaged_plugin_config_rewrites_only_the_target_import_block():
+    sync_module = _load_sync_module()
+    canonical = (
+        sync_module.CANONICAL_PLUGIN_CONFIG_TARGET_IMPORT
+        + b"\nCONFIG_VALUE = 'preserved'\n"
+    )
+
+    packaged = sync_module.packaged_plugin_config_content(canonical)
+
+    assert sync_module.CANONICAL_PLUGIN_CONFIG_TARGET_IMPORT not in packaged
+    assert sync_module.PACKAGED_PLUGIN_CONFIG_TARGET_IMPORT in packaged
+    assert packaged.endswith(b"\nCONFIG_VALUE = 'preserved'\n")
+
+
 def test_repo_plugin_copies_pass_the_check_command():
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--check"],

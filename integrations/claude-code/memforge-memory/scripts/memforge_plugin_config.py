@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Mapping
 
 if __package__:
-    from .api_target import MemForgeTarget, build_target
+    from .memforge_api_target import MemForgeTarget, build_target
 else:  # pragma: no cover - direct file load used by packaged integrations
-    from memforge.api_target import MemForgeTarget, build_target
+    from memforge_api_target import MemForgeTarget, build_target
 
 
 _CONFIG_CACHE: dict[str, str] | None = None
