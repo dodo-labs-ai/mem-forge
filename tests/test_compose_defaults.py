@@ -8,6 +8,5 @@ def test_admin_ui_is_published_on_loopback_by_default():
     compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
 
     assert compose["services"]["admin-ui"]["ports"] == [
-        "${MEMFORGE_ADMIN_UI_BIND_ADDR:-127.0.0.1}:"
-        "${MEMFORGE_ADMIN_UI_HOST_PORT:-5174}:8080"
+        "127.0.0.1:${MEMFORGE_ADMIN_UI_HOST_PORT:-5174}:8080"
     ]

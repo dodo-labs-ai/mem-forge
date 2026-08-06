@@ -17,16 +17,13 @@ services:
       MEMFORGE_BASE_DIR: /data
       MEMFORGE_ADMIN_API_PORT: 8765
       MEMFORGE_CORS_ORIGINS: http://localhost:5174,http://127.0.0.1:5174
-      # A Jira session cookie is uploaded over this API. The port below is
-      # published on loopback only by default, so the upload stays on this
-      # machine and plaintext is safe; that is why this defaults to on. To
-      # expose the API to the network, set MEMFORGE_API_BIND_ADDR=0.0.0.0,
-      # then turn this off (empty) and serve over HTTPS.
+      # Session uploads may use plaintext HTTP because this Compose profile
+      # publishes both services strictly on host loopback.
       MEMFORGE_ALLOW_PLAINTEXT_SESSION_UPLOAD: ${MEMFORGE_ALLOW_PLAINTEXT_SESSION_UPLOAD:-1}
     ports:
-      # Loopback-only by default: reachable from this host (CLI, browser), not the
-      # network. Set MEMFORGE_API_BIND_ADDR=0.0.0.0 to expose it (and add HTTPS).
-      - "${MEMFORGE_API_BIND_ADDR:-127.0.0.1}:${MEMFORGE_API_HOST_PORT:-8765}:8765"
+      # The authentication-free OSS beta is a same-host profile. Port numbers
+      # may change, but the host binding is deliberately not configurable.
+      - "127.0.0.1:${MEMFORGE_API_HOST_PORT:-8765}:8765"
     volumes:
       - memforge-data:/data
     healthcheck:
@@ -53,9 +50,8 @@ services:
       api:
         condition: service_healthy
     ports:
-      # The UI proxies the authentication-free API, so keep both surfaces on
-      # this machine by default.
-      - "${MEMFORGE_ADMIN_UI_BIND_ADDR:-127.0.0.1}:${MEMFORGE_ADMIN_UI_HOST_PORT:-5174}:8080"
+      # Keep the authentication-free Admin UI unreachable from the LAN.
+      - "127.0.0.1:${MEMFORGE_ADMIN_UI_HOST_PORT:-5174}:8080"
 
 volumes:
   memforge-data:
