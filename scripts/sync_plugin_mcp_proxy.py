@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 import shutil
 import sys
-from typing import Sequence
+from typing import Callable, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,13 +41,40 @@ PLUGIN_CONFIG_GENERATED_COPIES = (
     ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
     ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
 )
+CANONICAL_PLUGIN_CONFIG_TARGET_IMPORT = b"""if __package__:
+    from .api_target import MemForgeTarget, build_target
+else:  # pragma: no cover - direct file load used by packaged integrations
+    from memforge.api_target import MemForgeTarget, build_target
+"""
+PACKAGED_PLUGIN_CONFIG_TARGET_IMPORT = b"""if __package__:
+    from .memforge_api_target import MemForgeTarget, build_target
+else:  # pragma: no cover - direct file load used by packaged integrations
+    from memforge_api_target import MemForgeTarget, build_target
+"""
+
+
+def packaged_plugin_config_content(canonical_content: bytes) -> bytes:
+    """Rewrite the canonical package import for the standalone plugin layout."""
+    if canonical_content.count(CANONICAL_PLUGIN_CONFIG_TARGET_IMPORT) != 1:
+        raise ValueError("canonical plugin config target import block is missing or ambiguous")
+    return canonical_content.replace(
+        CANONICAL_PLUGIN_CONFIG_TARGET_IMPORT,
+        PACKAGED_PLUGIN_CONFIG_TARGET_IMPORT,
+        1,
+    )
+
+
 PLUGIN_RUNTIME_FILES = (
-    (CANONICAL, GENERATED_COPIES),
-    (HOOK_CANONICAL, HOOK_GENERATED_COPIES),
-    (REPO_IDENTITY_CANONICAL, REPO_IDENTITY_GENERATED_COPIES),
-    (REPOSITORY_CONTEXT_CANONICAL, REPOSITORY_CONTEXT_GENERATED_COPIES),
-    (API_TARGET_CANONICAL, API_TARGET_GENERATED_COPIES),
-    (PLUGIN_CONFIG_CANONICAL, PLUGIN_CONFIG_GENERATED_COPIES),
+    (CANONICAL, GENERATED_COPIES, None),
+    (HOOK_CANONICAL, HOOK_GENERATED_COPIES, None),
+    (REPO_IDENTITY_CANONICAL, REPO_IDENTITY_GENERATED_COPIES, None),
+    (REPOSITORY_CONTEXT_CANONICAL, REPOSITORY_CONTEXT_GENERATED_COPIES, None),
+    (API_TARGET_CANONICAL, API_TARGET_GENERATED_COPIES, None),
+    (
+        PLUGIN_CONFIG_CANONICAL,
+        PLUGIN_CONFIG_GENERATED_COPIES,
+        packaged_plugin_config_content,
+    ),
 )
 
 
@@ -56,20 +83,22 @@ def synchronize_plugin_copies(
     generated_copies: Sequence[Path],
     *,
     check: bool,
+    transform: Callable[[bytes], bytes] | None = None,
 ) -> tuple[Path, ...]:
     """Return stale copies, updating them from canonical unless check is true."""
     canonical_content = canonical.read_bytes()
+    generated_content = transform(canonical_content) if transform else canonical_content
     stale = tuple(
         path
         for path in generated_copies
-        if not path.exists() or path.read_bytes() != canonical_content
+        if not path.exists() or path.read_bytes() != generated_content
     )
     if check:
         return stale
 
     for path in stale:
         path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(canonical, path)
+        path.write_bytes(generated_content)
         shutil.copymode(canonical, path)
     return stale
 
@@ -94,8 +123,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     stale = tuple(
         path
-        for canonical, generated_copies in PLUGIN_RUNTIME_FILES
-        for path in synchronize_plugin_copies(canonical, generated_copies, check=args.check)
+        for canonical, generated_copies, transform in PLUGIN_RUNTIME_FILES
+        for path in synchronize_plugin_copies(
+            canonical,
+            generated_copies,
+            check=args.check,
+            transform=transform,
+        )
     )
     if not stale:
         print("Packaged plugin runtime copies are already in sync.")
