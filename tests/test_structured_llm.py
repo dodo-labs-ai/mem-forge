@@ -801,6 +801,46 @@ async def test_litellm_structured_client_respects_schema_capability_for_sap_anth
 
 
 @pytest.mark.asyncio
+async def test_litellm_structured_client_uses_explicit_json_schema_response_format(
+    monkeypatch,
+):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(
+            '{"decisions":[{"action":"KEEP","canonical_index":null,"reason":"unique"}]}'
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="gateway/structured-model",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+            native_schema_transport="json_schema_response_format",
+        )
+    )
+
+    response = await client.select_memory_candidates("classify the candidate")
+
+    assert response.decisions[0].action == "KEEP"
+    assert len(calls) == 1
+    call = calls[0]
+    assert "output_config" not in call
+    assert call["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "CandidateLedgerResponse",
+            "strict": True,
+            "schema": CandidateLedgerResponse.model_json_schema(),
+        },
+    }
+
+
+@pytest.mark.asyncio
 async def test_litellm_structured_client_uses_anthropic_output_config_when_explicitly_selected(
     monkeypatch,
 ):
