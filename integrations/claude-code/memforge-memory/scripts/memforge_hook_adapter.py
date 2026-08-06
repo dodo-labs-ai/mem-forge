@@ -72,7 +72,7 @@ MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.43"
+PLUGIN_VERSION = "0.1.44"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -115,6 +115,12 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("json", re.compile(r"(?i)([\"']?(?:api[_-]?key|token|password|secret)[\"']?\s*:\s*[\"'])[^\"']+")),
     ("generic", re.compile(r"(?i)\b(api[_-]?key|token|password|secret)\b\s*[:=]\s*[^,\s\"'}]+")),
 )
+
+
+class WorkspaceSelectionRequiredError(RuntimeError):
+    """The principal has multiple workspaces and no usable default."""
+
+
 STOP_SIGNAL_TERMS = (
     "apply_patch",
     "write_file",
@@ -203,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(
                     {
                         "continue": True,
-                        "systemMessage": f"MemForge hook skipped: {_safe_exception_message(exc)}",
+                        "systemMessage": _hook_system_message(exc),
                     }
                 ),
             )
@@ -220,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "continue": True,
-                    "systemMessage": f"MemForge hook skipped: {_safe_exception_message(exc)}",
+                    "systemMessage": _hook_system_message(exc),
                 }
             ),
         )
@@ -235,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "continue": True,
-                    "systemMessage": f"MemForge hook skipped: {_safe_exception_message(exc)}",
+                    "systemMessage": _hook_system_message(exc),
                 }
             ),
         )
@@ -820,6 +826,16 @@ def _post_json(path: str, payload: dict[str, Any], *, timeout: float) -> dict[st
             response_body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 409:
+            try:
+                error_payload = json.loads(detail)
+            except json.JSONDecodeError:
+                error_payload = None
+            if (
+                isinstance(error_payload, dict)
+                and error_payload.get("code") == "workspace_selection_required"
+            ):
+                raise WorkspaceSelectionRequiredError from exc
         raise RuntimeError(f"{path} returned HTTP {exc.code}: {detail}") from exc
     if not response_body:
         return {}
@@ -1622,6 +1638,15 @@ def _safe_exception_message(exc: Exception) -> str:
     if " returned HTTP " in text:
         return text.split(":", 1)[0]
     return text.splitlines()[0][:300]
+
+
+def _hook_system_message(exc: Exception) -> str:
+    if isinstance(exc, WorkspaceSelectionRequiredError):
+        return (
+            "MemForge automatic capture is waiting for a default workspace. "
+            "Choose one with list_workspaces, then confirm set_default_workspace."
+        )
+    return f"MemForge hook skipped: {_safe_exception_message(exc)}"
 
 
 def _env_float(name: str, default: float) -> float:

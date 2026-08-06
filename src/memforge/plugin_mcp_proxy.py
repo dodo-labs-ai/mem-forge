@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.43"
+SERVER_VERSION = "0.1.44"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Repository context is optional. MemForge uses negotiated request-scoped host context when "
@@ -157,12 +157,43 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "List workspaces accessible to the current principal and identify the optional "
             "server-side default. Discovery is optional; other tools resolve omitted workspace_id "
-            "without requiring this tool to be called first."
+            "without requiring this tool to be called first. If multiple workspaces exist and no "
+            "default is set, ask which workspace to use for the current request. Separately offer "
+            "to set it as the default for automatic hooks; never change the default silently."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {},
             "additionalProperties": False,
+        },
+    },
+    {
+        "name": "set_default_workspace",
+        "description": (
+            "Persist the workspace used by automatic MemForge hooks and by requests that omit "
+            "workspace_id. Call only after the user explicitly confirms making this their default. "
+            "A workspace_id supplied to another tool is a one-request override and must never "
+            "change this preference implicitly."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "Workspace to use by default for automatic hooks and requests that omit "
+                        "workspace_id."
+                    ),
+                }
+            },
+            "required": ["workspace_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
         },
     },
     {
@@ -609,7 +640,7 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 for _tool in TOOLS:
-    if _tool["name"] == "list_workspaces":
+    if _tool["name"] in {"list_workspaces", "set_default_workspace"}:
         continue
     _tool["inputSchema"]["properties"]["repository_context"] = REPOSITORY_CONTEXT_SCHEMA
     _tool["inputSchema"]["properties"]["workspace_id"] = WORKSPACE_ID_SCHEMA
@@ -736,6 +767,20 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             "GET",
             "/workspaces",
             None,
+            target=configured_target(),
+            workspace_id=None,
+        )
+    if name == "set_default_workspace":
+        if any(key != "workspace_id" for key in args):
+            return {"error": "set_default_workspace accepts only workspace_id"}
+        try:
+            workspace_id = _required_string_arg(args, "workspace_id")
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return _http_json(
+            "PUT",
+            "/me/default-workspace",
+            {"workspace_id": workspace_id},
             target=configured_target(),
             workspace_id=None,
         )
