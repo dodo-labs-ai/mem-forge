@@ -218,7 +218,12 @@ Return ONLY a JSON object with a "memories" array."""
 
 
 class MemoryExtractor:
-    """Extract current claims without loading historical Memory rows."""
+    """Extract current claims without loading historical Memory rows.
+
+    Application runtimes inject ``structured_llm_client`` through their
+    RuntimeProvider. The ``api_key`` construction path remains only for
+    provider-neutral standalone library use.
+    """
 
     def __init__(
         self,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import gc
+import inspect
 from io import BytesIO
 import json
 import logging
@@ -765,7 +766,7 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
 
 
 @pytest.mark.asyncio
-async def test_litellm_structured_client_respects_schema_capability_for_sap_anthropic_alias(
+async def test_litellm_structured_client_supports_prompt_template_transport(
     monkeypatch,
 ):
     calls = []
@@ -780,10 +781,11 @@ async def test_litellm_structured_client_respects_schema_capability_for_sap_anth
     set_native_schema_support(monkeypatch, False)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="sap/anthropic--claude-4.6-sonnet",
+            model="gateway/templated-model",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
+            prompt_template_variable="memforge_prompt",
         )
     )
 
@@ -792,7 +794,7 @@ async def test_litellm_structured_client_respects_schema_capability_for_sap_anth
 
     assert response.memories[0].content == "Service A uses PostgreSQL 16."
     assert len(calls) == 1
-    assert calls[0]["model"] == "sap/anthropic--claude-4.6-sonnet"
+    assert calls[0]["model"] == "gateway/templated-model"
     assert calls[0]["messages"] == [{"role": "user", "content": "{{?memforge_prompt}}"}]
     assert calls[0]["placeholder_values"]["memforge_prompt"].startswith(
         f"{prompt}\n\nReturn ONLY a single JSON object"
@@ -841,104 +843,82 @@ async def test_litellm_structured_client_uses_explicit_json_schema_response_form
 
 
 @pytest.mark.asyncio
-async def test_litellm_structured_client_uses_anthropic_output_config_when_explicitly_selected(
+async def test_explicit_schema_transport_covers_every_public_structured_operation(
     monkeypatch,
 ):
-    calls = []
+    calls: list[dict[str, object]] = []
+    payloads = {
+        "SourceSupportResponse": '{"decisions":[]}',
+        "MemoryExtractionResponse": '{"memories":[]}',
+        "ProjectionMemoryExtractionResponse": '{"memories":[]}',
+        "CandidateLedgerResponse": '{"decisions":[]}',
+        "CandidateRelationResponse": '{"decisions":[]}',
+        "IncumbentSupportAuditResponse": '{"decisions":[]}',
+        "MemoryRelationResponse": '{"decisions":[]}',
+        "MemorySupportValidationResponse": '{"supported":true}',
+        "EntityValidationResponse": '{}',
+        "EntityBatchValidationResponse": '{"decisions":[]}',
+        "QueryEntityDetectionResponse": '{"entity_ids":[]}',
+        "RerankResponse": '{"ranking":[]}',
+        "AgentKnowledgePatchProposal": '{"action":"no_output"}',
+        "AgentSessionAuthorityResponse": '{"decisions":[]}',
+    }
 
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
-        return CompletionResponse(
-            '{"decisions":[{"action":"KEEP","canonical_index":null,"reason":"unique"}]}'
-        )
+        response_format = kwargs["response_format"]
+        schema_name = response_format["json_schema"]["name"]
+        return CompletionResponse(payloads[schema_name])
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
-    # The explicit transport is authoritative when a gateway's LiteLLM registry
-    # entry lags the provider capability.
-    set_native_schema_support(monkeypatch, False)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="sap/anthropic--claude-4.6-sonnet",
+            model="gateway/structured-model",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
-            native_schema_transport="anthropic_output_config",
+            native_schema_transport="json_schema_response_format",
         )
     )
-
-    response = await client.select_memory_candidates("classify the candidate")
-
-    assert response.decisions == [
-        CandidateLedgerDecision(
-            action="KEEP",
-            canonical_index=None,
-            reason="unique",
+    operations = {
+        "verify_source_support": lambda: client.verify_source_support("prompt"),
+        "extract_memories": lambda: client.extract_memories("prompt", max_tokens=512),
+        "extract_projection_memories": lambda: client.extract_projection_memories(
+            "prompt",
+            max_tokens=512,
+        ),
+        "select_memory_candidates": lambda: client.select_memory_candidates("prompt"),
+        "reconcile_candidate_relations": lambda: client.reconcile_candidate_relations("prompt"),
+        "audit_incumbent_support": lambda: client.audit_incumbent_support("prompt"),
+        "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
+        "validate_memory_support": lambda: client.validate_memory_support("prompt"),
+        "validate_entity_match": lambda: client.validate_entity_match("prompt"),
+        "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
+        "detect_query_entities": lambda: client.detect_query_entities("prompt"),
+        "rerank_memories": lambda: client.rerank_memories("prompt"),
+        "generate_agent_knowledge_patch": lambda: client.generate_agent_knowledge_patch("prompt"),
+        "classify_agent_session_evidence_authority": (
+            lambda: client.classify_agent_session_evidence_authority("prompt")
+        ),
+    }
+    public_async_operations = {
+        name
+        for name, member in inspect.getmembers(
+            LiteLlmStructuredClient,
+            inspect.iscoroutinefunction,
         )
-    ]
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["messages"] == [{"role": "user", "content": "{{?memforge_prompt}}"}]
-    assert call["placeholder_values"] == {"memforge_prompt": "classify the candidate"}
-    assert "response_format" not in call
-    output_format = call["output_config"]["format"]
-    assert output_format["type"] == "json_schema"
-    schema = output_format["schema"]
-    assert schema["properties"]["decisions"]["type"] == "array"
-    decision = schema["$defs"]["CandidateLedgerDecision"]
-    assert decision["additionalProperties"] is False
-    assert decision["required"] == ["action"]
-    canonical_index = decision["properties"]["canonical_index"]["anyOf"]
-    assert [variant["type"] for variant in canonical_index] == ["integer", "null"]
-    assert "minimum: 0" in canonical_index[0]["description"]
-    serialized = json.dumps(schema, sort_keys=True)
-    for unsupported in ('"default"', '"minimum"', '"maximum"', '"maxLength"'):
-        assert unsupported not in serialized
+        if not name.startswith("_")
+    }
 
+    assert public_async_operations == set(operations)
+    for invoke in operations.values():
+        await invoke()
 
-@pytest.mark.asyncio
-async def test_anthropic_output_config_transforms_entity_batch_schema(monkeypatch):
-    calls = []
-
-    async def fake_acompletion(**kwargs):
-        calls.append(kwargs)
-        return CompletionResponse(
-            '{"decisions":[{"matched_id":null,"confidence":0,"reason":"new entity"}]}'
-        )
-
-    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
-    set_native_schema_support(monkeypatch, False)
-    client = LiteLlmStructuredClient(
-        StructuredLlmConfig(
-            model="sap/anthropic--claude-4.6-sonnet",
-            base_url=None,
-            api_key=None,
-            timeout_s=120.0,
-            native_schema_transport="anthropic_output_config",
-        )
-    )
-
-    response = await client.validate_entity_batch("classify the entity")
-
-    assert response.decisions == [
-        EntityBatchValidationDecision(
-            matched_id=None,
-            confidence=0,
-            reason="new entity",
-        )
-    ]
-    call = calls[0]
-    assert "response_format" not in call
-    schema = call["output_config"]["format"]["schema"]
-    assert schema["properties"]["decisions"]["type"] == "array"
-    decision = schema["$defs"]["EntityBatchValidationDecision"]
-    assert decision["additionalProperties"] is False
     assert [
-        variant["type"]
-        for variant in decision["properties"]["matched_id"]["anyOf"]
-    ] == ["integer", "null"]
-    serialized = json.dumps(schema, sort_keys=True)
-    for unsupported in ('"default"', '"minimum"', '"maximum"', '"maxLength"'):
-        assert unsupported not in serialized
+        call["response_format"]["json_schema"]["name"]
+        for call in calls
+    ] == list(payloads)
+    assert all("output_config" not in call for call in calls)
 
 
 @pytest.mark.asyncio

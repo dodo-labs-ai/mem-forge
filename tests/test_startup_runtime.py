@@ -81,6 +81,43 @@ async def test_sync_runtime_wires_structured_llm_client_into_memory_engine(db, t
 
 
 @pytest.mark.asyncio
+async def test_default_runtime_provider_uses_one_structured_client_seam_for_search_and_sync(
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    from memforge import runtime
+
+    class SentinelClient:
+        max_concurrent = 1
+
+    provider = runtime.DefaultRuntimeProvider()
+    structured_client = SentinelClient()
+    calls = []
+
+    def build_client(llm, *, max_concurrent):
+        calls.append((llm.enrichment_model, max_concurrent))
+        return structured_client
+
+    monkeypatch.setattr(provider, "build_structured_llm_client", build_client)
+    monkeypatch.setattr(runtime, "get_chroma_collection", lambda **kwargs: FakeCollection())
+    config = _config(tmp_path)
+
+    search_engine = await provider.build_search_engine(db, config)
+    sync_runtime = await provider.build_sync_runtime(db, config)
+
+    assert search_engine._structured_llm_client is structured_client
+    assert sync_runtime.structured_llm_client is structured_client
+    assert sync_runtime.memory_extractor.structured_llm_client is structured_client
+    assert sync_runtime.memory_engine.structured_llm_client is structured_client
+    assert sync_runtime.source_support_detector.structured_llm_client is structured_client
+    assert calls == [
+        (config.llm.enrichment_model, config.llm.enrichment_max_concurrent),
+        (config.llm.enrichment_model, config.llm.enrichment_max_concurrent),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_direct_sync_runtime_uses_configured_process_document_admission(
     db,
     tmp_path,

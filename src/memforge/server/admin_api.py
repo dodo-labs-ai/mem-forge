@@ -2691,24 +2691,19 @@ async def _build_lifecycle_service(
     return MemoryLifecycleService(db=db, memory_store=memory_store)
 
 
-async def _build_agent_session_window_client(db: Database, config: AppConfig):
-    """Build the request-scoped LLM client for agent-session window packaging."""
+async def _build_agent_session_window_client(
+    db: Database,
+    config: AppConfig,
+    runtime_provider: RuntimeProvider,
+):
+    """Build the request-scoped client through the active runtime adapter."""
 
-    from memforge.llm.providers import is_litellm_provider_model
-    from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
     from memforge.runtime import get_effective_llm_config
 
     llm = await get_effective_llm_config(db, config)
-    if not llm.enrichment_api_key and not is_litellm_provider_model(llm.enrichment_model):
-        return None
-    return LiteLlmStructuredClient(
-        StructuredLlmConfig(
-            model=llm.enrichment_model,
-            base_url=llm.enrichment_base_url or None,
-            api_key=llm.enrichment_api_key or None,
-            timeout_s=llm.request_timeout_s,
-            max_concurrent=config.llm.enrichment_max_concurrent,
-        )
+    return runtime_provider.build_structured_llm_client(
+        llm,
+        max_concurrent=config.llm.enrichment_max_concurrent,
     )
 
 
@@ -6647,7 +6642,11 @@ def create_admin_app(
 
         structured_client = getattr(request.app.state, "agent_session_window_client", None)
         if structured_client is None:
-            structured_client = await _build_agent_session_window_client(db, config)
+            structured_client = await _build_agent_session_window_client(
+                db,
+                config,
+                runtime_provider,
+            )
         memory_store = await _build_memory_store(db, config, runtime_provider)
 
         try:

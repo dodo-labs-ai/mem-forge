@@ -16,7 +16,6 @@ from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, get_args
 from weakref import WeakKeyDictionary
 
 import litellm
-import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from memforge.llm.providers import litellm_optional_kwargs
@@ -37,7 +36,6 @@ type StructuredLlmTerminalCategory = Literal[
 type NativeSchemaTransport = Literal[
     "auto",
     "json_schema_response_format",
-    "anthropic_output_config",
 ]
 
 
@@ -462,6 +460,10 @@ class StructuredLlmConfig:
     # a deployed model, without teaching this provider-neutral client a gateway
     # or model alias.
     native_schema_transport: NativeSchemaTransport = "auto"
+    # Some LiteLLM gateways interpret message text as a prompt template. When
+    # configured by the deployment adapter, carry the complete prompt as one
+    # placeholder value so template-like source text remains data.
+    prompt_template_variable: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1017,15 +1019,6 @@ def _native_schema_request_kwargs(
                 },
             }
         }
-    if transport == "anthropic_output_config":
-        return {
-            "output_config": {
-                "format": {
-                    "type": "json_schema",
-                    "schema": anthropic.transform_schema(response_format),
-                }
-            }
-        }
     return {"response_format": response_format}
 
 def _strip_json_fences(text: str) -> str:
@@ -1542,18 +1535,19 @@ class LiteLlmStructuredClient:
         request_prompt = prompt if native_schema else _json_text_prompt(prompt, response_format)
         messages = [{"role": "user", "content": _structured_user_content(request_prompt, images)}]
         provider_kwargs: dict[str, Any] = {}
-        if model_name.startswith("sap/"):
-            # SAP AI Core treats every chat message as a prompt template. Source
-            # documents can legitimately contain examples such as {{?input}};
-            # pass the complete MemForge prompt as one placeholder value so
-            # nested template syntax remains source data rather than SAP input.
+        prompt_template_variable = self.config.prompt_template_variable
+        if prompt_template_variable:
             messages = [
                 {
                     "role": "user",
-                    "content": _structured_user_content("{{?memforge_prompt}}", images),
+                    "content": _structured_user_content(
+                        f"{{{{?{prompt_template_variable}}}}}", images
+                    ),
                 }
             ]
-            provider_kwargs["placeholder_values"] = {"memforge_prompt": request_prompt}
+            provider_kwargs["placeholder_values"] = {
+                prompt_template_variable: request_prompt
+            }
         response = await self._completion_with_retries(
             model_name=model_name,
             messages=messages,
