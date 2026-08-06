@@ -34,7 +34,11 @@ type StructuredLlmTerminalCategory = Literal[
     "provider_error",
     "invalid_response",
 ]
-type NativeSchemaTransport = Literal["auto", "anthropic_output_config"]
+type NativeSchemaTransport = Literal[
+    "auto",
+    "json_schema_response_format",
+    "anthropic_output_config",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,10 +457,10 @@ class StructuredLlmConfig:
     # Every client in the worker event loop shares this logical-call admission.
     # Callers that do not opt in remain conservatively serial.
     max_concurrent: int = 1
-    # ``auto`` follows LiteLLM's provider capability registry and uses its
-    # response_format integration. Gateways whose registry entry lags an
-    # Anthropic deployment may explicitly select the current Anthropic wire
-    # contract without teaching this provider-neutral client a gateway name.
+    # ``auto`` follows LiteLLM's provider capability registry. Integrations may
+    # instead select an explicit standard wire contract when the registry lags
+    # a deployed model, without teaching this provider-neutral client a gateway
+    # or model alias.
     native_schema_transport: NativeSchemaTransport = "auto"
 
 
@@ -1002,6 +1006,17 @@ def _native_schema_request_kwargs(
 
     if response_format is None:
         return {}
+    if transport == "json_schema_response_format":
+        return {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_format.__name__,
+                    "strict": True,
+                    "schema": response_format.model_json_schema(),
+                },
+            }
+        }
     if transport == "anthropic_output_config":
         return {
             "output_config": {
