@@ -12,10 +12,10 @@ lifecycle reconciliation.
 3. Choose the local folder or repository through the source-specific browser.
 4. Configure include and exclude patterns, then save the source.
 
-The daemon authenticates with the user's MemForge API key. Self-hosted OSS jobs
-use the unscoped local `/api` routes and do not support or require
-`MEMFORGE_WORKSPACE_ID`. Hosted jobs carry the workspace selected by the
-service, and the daemon scopes their API calls to that workspace.
+The daemon authenticates with the user's MemForge API key. Self-hosted OSS and
+Cloud both use `/api/v1`; self-hosted resolves the readable singleton workspace
+`local`. Hosted jobs persist the workspace resolved when the job is admitted,
+and the daemon scopes every later job API call to that stored workspace.
 
 ## Supported file types
 

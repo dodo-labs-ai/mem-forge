@@ -377,6 +377,7 @@ async def submit_local_markdown_document(
 async def submit_github_repo_document(
     *,
     db: Database,
+    workspace_id: str,
     config: AppConfig,
     source: dict[str, Any],
     repo_url: str,
@@ -456,6 +457,7 @@ async def submit_github_repo_document(
     else:
         retained_inputs = await db.list_source_sync_inputs(
             source_id=source_id,
+            workspace_id=workspace_id,
             input_snapshot_id=sync_snapshot_id,
         )
         retained_doc_ids = {

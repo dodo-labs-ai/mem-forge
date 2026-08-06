@@ -399,7 +399,7 @@ def test_agent_session_document_submit_api_is_retired(tmp_path):
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/documents",
+                "/api/v1/agent-sessions/documents",
                 json={
                     "client": "codex",
                     "session_id": "sess-api",
@@ -442,7 +442,7 @@ def test_agent_session_document_submit_retired_before_principal_handling(tmp_pat
         )
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/documents",
+                "/api/v1/agent-sessions/documents",
                 json={
                     "client": "codex",
                     "session_id": "sess-principal",
@@ -489,7 +489,7 @@ def test_agent_session_window_submit_uses_server_principal(tmp_path):
         app.state.agent_session_window_client = PackageClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "schema_version": "agent-session-window/v1",
                     "client": "codex",
@@ -563,7 +563,7 @@ def test_agent_session_window_holds_activity_while_llm_builds_patch(
         app.state.agent_session_window_client = MaintenanceDuringLLM()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "schema_version": "agent-session-window/v1",
                     "client": "codex",
@@ -628,7 +628,7 @@ def test_agent_session_window_does_not_build_prompt_during_active_maintenance(tm
         app.state.agent_session_window_client = MustNotGenerate()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "schema_version": "agent-session-window/v1",
                     "client": "codex",
@@ -676,7 +676,7 @@ def test_agent_session_window_uses_bounded_completion_budget(tmp_path):
         app.state.agent_session_window_client = window_client
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-budget",
@@ -749,7 +749,7 @@ def test_source_projects_endpoint_groups_agent_session_memory_by_project(tmp_pat
     try:
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
-            response = client.get(f"/api/sources/{source_id}/projects")
+            response = client.get(f"/api/v1/sources/{source_id}/projects")
 
         assert response.status_code == 200
         body = response.json()
@@ -807,7 +807,7 @@ def test_agent_session_window_api_generates_package_and_discards_raw_window(tmp_
         app.state.agent_session_window_client = FakeWindowClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-window",
@@ -885,7 +885,7 @@ def test_agent_session_window_api_canonicalizes_evidence_before_packaging(tmp_pa
         app.state.agent_session_window_client = FakeWindowClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-canonical",
@@ -966,7 +966,7 @@ def test_agent_session_window_api_queues_service_owned_sync(tmp_path):
         with TestClient(app) as client:
             client.app.state.sync_service = fake_sync
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-window-sync",
@@ -1009,7 +1009,7 @@ def test_agent_session_window_api_rejects_unknown_schema_version(tmp_path):
         app.state.agent_session_window_client = UnexpectedWindowClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "schema_version": "agent-session-window/v999",
                     "client": "codex",
@@ -1055,7 +1055,7 @@ def test_agent_session_window_api_accepts_no_output_without_creating_source(tmp_
         app.state.agent_session_window_client = NoOutputClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-window-trivial",
@@ -1095,7 +1095,7 @@ def test_agent_session_window_api_reports_missing_llm(tmp_path):
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-window-no-llm",
@@ -1133,7 +1133,7 @@ def test_agent_session_window_api_records_failed_outcome_for_invalid_patch(tmp_p
         app.state.agent_session_window_client = InvalidPatchClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-window-bad-patch",
@@ -1175,7 +1175,7 @@ def test_agent_session_window_api_records_failed_outcome_for_parse_failed_patch(
         app.state.agent_session_window_client = ParseFailedPatchClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-window-parse-failed",
@@ -1239,15 +1239,15 @@ def test_agent_session_window_api_keeps_windows_distinct_and_idempotent(tmp_path
         app.state.agent_session_window_client = EchoWindowClient()
         with TestClient(app) as client:
             first = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json=_window([{"role": "tool", "name": "apply_patch", "summary": "Edited module A."}]),
             ).json()
             second = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json=_window([{"role": "tool", "name": "apply_patch", "summary": "Edited module B."}]),
             ).json()
             repeat_first = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json=_window([{"role": "tool", "name": "apply_patch", "summary": "Edited module A."}]),
             ).json()
 
@@ -1298,15 +1298,15 @@ def test_agent_session_window_api_same_range_different_content_is_distinct(tmp_p
         app.state.agent_session_window_client = EchoWindowClient()
         with TestClient(app) as client:
             a = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json=_window([{"role": "tool", "name": "apply_patch", "summary": "edited A"}]),
             ).json()
             b = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json=_window([{"role": "tool", "name": "apply_patch", "summary": "edited B"}]),
             ).json()
             repeat_a = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json=_window([{"role": "tool", "name": "apply_patch", "summary": "edited A"}]),
             ).json()
 
@@ -1355,11 +1355,11 @@ def test_agent_session_window_retry_identity_ignores_receipt_and_submission_date
         app.state.agent_session_window_client = EchoWindowClient()
         with TestClient(app) as client:
             first = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json=_window(receipt={"attempt": 1}, submitted_at="2026-05-30T23:59:00+00:00"),
             ).json()
             retry = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json=_window(receipt={"attempt": 2}, submitted_at="2026-05-31T00:01:00+00:00"),
             ).json()
 
@@ -1424,13 +1424,13 @@ def test_agent_session_window_can_patch_existing_private_claim(tmp_path):
         app.state.agent_session_window_client = fake_client
         with TestClient(app) as client:
             first = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json=_window("scheduler startup rule"),
             ).json()
             fake_client.created_concept_id = first["concept_id"]
             fake_client.created_claim_id = first["claim_id"]
             second = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json=_window("scheduler next_run_at rule"),
             ).json()
 
@@ -1473,7 +1473,7 @@ def test_agent_session_window_api_records_no_output_receipt(tmp_path):
         app.state.agent_session_window_client = NoOutputClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-noout-receipt",
@@ -1530,7 +1530,7 @@ def test_agent_session_window_requires_primary_user_anchor_for_both_clients(tmp_
         app.state.agent_session_window_client = OverEagerClient()
         with TestClient(app) as http:
             response = http.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": client_name,
                     "session_id": f"sess-{client_name}-assistant-only",
@@ -1627,7 +1627,7 @@ def test_agent_session_window_applies_typed_authority_decision(
         app.state.agent_session_window_client = TypedDecisionClient()
         with TestClient(app) as http:
             response = http.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": client_name,
                     "session_id": f"sess-{client_name}-typed-authority-{is_authoritative}",
@@ -1701,7 +1701,7 @@ def test_agent_session_window_treats_supporting_text_as_untrusted_data(tmp_path,
         app.state.agent_session_window_client = InjectionClient()
         with TestClient(app) as http:
             response = http.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": client_name,
                     "session_id": f"sess-{client_name}-authority-injection",
@@ -1796,7 +1796,7 @@ def test_agent_session_window_treats_operational_context_as_untrusted_data(
         }
         payload[metadata_field] = metadata_value
         with TestClient(app) as http:
-            response = http.post("/api/agent-sessions/windows", json=payload)
+            response = http.post("/api/v1/agent-sessions/windows", json=payload)
 
         assert response.status_code == 200
         assert response.json()["result"] == "no_output"
@@ -1826,7 +1826,7 @@ def test_agent_session_window_fails_when_authority_classifier_omits_candidate(tm
         app.state.agent_session_window_client = IncompleteClassifierClient()
         with TestClient(app, raise_server_exceptions=False) as http:
             response = http.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-incomplete-authority-classifier",
@@ -1896,7 +1896,7 @@ def test_agent_session_window_rejects_spoofed_primary_evidence(tmp_path, spoofed
         app.state.agent_session_window_client = SpoofedPrimaryClient()
         with TestClient(app) as http:
             response = http.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-tool-actor-user",
@@ -1951,7 +1951,7 @@ def test_agent_session_memory_detail_exposes_source_updated_at(tmp_path):
         app.state.agent_session_window_client = PackageClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-source-updated",
@@ -1972,7 +1972,7 @@ def test_agent_session_memory_detail_exposes_source_updated_at(tmp_path):
             assert response.status_code == 200, response.text
             memory_id = response.json()["memory_id"]
 
-            detail = client.get(f"/api/memories/{memory_id}")
+            detail = client.get(f"/api/v1/memories/{memory_id}")
 
         assert detail.status_code == 200, detail.text
         body = detail.json()
@@ -2023,7 +2023,7 @@ def test_agent_session_window_rejects_naive_source_updated_at(tmp_path):
         app.state.agent_session_window_client = PackageClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-naive-source-updated",
@@ -2075,7 +2075,7 @@ def test_agent_session_memory_detail_does_not_fallback_source_updated_at(tmp_pat
         app.state.agent_session_window_client = PackageClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-no-source-updated",
@@ -2094,7 +2094,7 @@ def test_agent_session_memory_detail_does_not_fallback_source_updated_at(tmp_pat
             assert response.status_code == 200, response.text
             memory_id = response.json()["memory_id"]
 
-            detail = client.get(f"/api/memories/{memory_id}")
+            detail = client.get(f"/api/v1/memories/{memory_id}")
 
         assert detail.status_code == 200, detail.text
         source = detail.json()["sources"][0]
@@ -2123,7 +2123,7 @@ def test_agent_session_window_api_records_failed_receipt(tmp_path):
         app.state.agent_session_window_client = FailingClient()
         with TestClient(app, raise_server_exceptions=False) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-failed-receipt",
@@ -2163,7 +2163,7 @@ def test_hook_receipt_api_records_lineage_without_source_document(tmp_path):
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
             response = client.post(
-                "/api/hooks/receipts",
+                "/api/v1/hooks/receipts",
                 json={
                     "client": "codex",
                     "session_id": "sess-hook",
@@ -2443,7 +2443,7 @@ def test_agent_session_completeness_endpoint(tmp_path):
         asyncio.run(_seed())
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
-            response = client.get("/api/agent-sessions/completeness", params={"session_id": "sess-ep"})
+            response = client.get("/api/v1/agent-sessions/completeness", params={"session_id": "sess-ep"})
 
         assert response.status_code == 200
         body = response.json()
@@ -2509,7 +2509,7 @@ def test_agent_window_patch_writes_memory_without_package_file(tmp_path):
         app.state.agent_session_window_client = FakeWindowClient()
         with TestClient(app) as client:
             response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-atomic",
@@ -2552,7 +2552,7 @@ def test_per_client_source_split_creates_two_distinct_source_rows(tmp_path):
         app.state.agent_session_window_client = PackageClient()
         with TestClient(app) as client:
             codex_response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "codex",
                     "session_id": "sess-codex",
@@ -2564,7 +2564,7 @@ def test_per_client_source_split_creates_two_distinct_source_rows(tmp_path):
             assert codex_response.status_code == 200
 
             claude_response = client.post(
-                "/api/agent-sessions/windows",
+                "/api/v1/agent-sessions/windows",
                 json={
                     "client": "claude-code",
                     "session_id": "sess-claude-code",
@@ -2817,7 +2817,7 @@ def test_memories_endpoint_exposes_origin_client_for_agent_session_memories(tmp_
     try:
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:
-            response = client.get("/api/memories")
+            response = client.get("/api/v1/memories")
 
         assert response.status_code == 200
         data = {m["id"]: m for m in response.json()["data"]}

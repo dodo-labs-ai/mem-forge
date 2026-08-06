@@ -175,7 +175,7 @@ def test_create_source_requires_explicit_access_policy(tmp_path):
 
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
                 json=payload,
             )
@@ -191,7 +191,7 @@ def test_private_source_is_undiscoverable_to_members_and_admins(tmp_path):
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
                 json=_confluence_payload(access_policy="private"),
             )
@@ -199,15 +199,15 @@ def test_private_source_is_undiscoverable_to_members_and_admins(tmp_path):
             source_id = created.json()["id"]
 
             member_list = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "member-b", "x-test-workspace-role": "member"},
             )
             admin_list = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
             )
             direct_subscription = client.put(
-                f"/api/sources/{source_id}/subscription",
+                f"/api/v1/sources/{source_id}/subscription",
                 headers={"x-test-user": "member-b", "x-test-workspace-role": "member"},
                 json={"enabled": True},
             )
@@ -231,7 +231,7 @@ def test_owner_can_share_private_source_with_idempotent_transition(tmp_path):
         }
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers=owner_headers,
                 json=_confluence_payload(access_policy="private"),
             )
@@ -241,17 +241,17 @@ def test_owner_can_share_private_source_with_idempotent_transition(tmp_path):
                 "Idempotency-Key": "share-source-once",
             }
             started = client.post(
-                f"/api/sources/{source_id}/access-transitions",
+                f"/api/v1/sources/{source_id}/access-transitions",
                 headers=transition_headers,
                 json={"target_policy": "workspace"},
             )
             repeated = client.post(
-                f"/api/sources/{source_id}/access-transitions",
+                f"/api/v1/sources/{source_id}/access-transitions",
                 headers=transition_headers,
                 json={"target_policy": "workspace"},
             )
             member_list = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={
                     "x-test-user": "other-user",
                     "x-test-workspace-role": "member",
@@ -275,7 +275,7 @@ def test_private_source_access_transition_does_not_leak_to_workspace_admin(tmp_p
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={
                     "x-test-user": "owner-user",
                     "x-test-workspace-role": "member",
@@ -284,7 +284,7 @@ def test_private_source_access_transition_does_not_leak_to_workspace_admin(tmp_p
             )
             source_id = created.json()["id"]
             response = client.post(
-                f"/api/sources/{source_id}/access-transitions",
+                f"/api/v1/sources/{source_id}/access-transitions",
                 headers={
                     "x-test-user": "admin-b",
                     "x-test-workspace-role": "workspace_admin",
@@ -304,14 +304,14 @@ def test_source_list_exposes_capabilities_and_redacts_config_for_non_owner_membe
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
                 json=_confluence_payload(),
             )
             assert created.status_code == 200, created.text
 
             response = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
 
@@ -344,7 +344,7 @@ def test_source_creator_can_manage_and_receives_redacted_config(tmp_path):
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
                 json=_confluence_payload(),
             )
@@ -352,12 +352,12 @@ def test_source_creator_can_manage_and_receives_redacted_config(tmp_path):
             source_id = created.json()["id"]
 
             updated = client.put(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
                 json={"name": "Architecture Wiki Updated"},
             )
             listed = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
             )
 
@@ -409,22 +409,22 @@ def test_agent_session_rejects_ordinary_sync_and_hides_historical_sync_failure(t
         )
 
         with TestClient(_app(tmp_path, database)) as client:
-            listed = client.get("/api/sources", headers=owner_headers)
+            listed = client.get("/api/v1/sources", headers=owner_headers)
             synced = client.post(
-                f"/api/sources/{source_id}/sync",
+                f"/api/v1/sources/{source_id}/sync",
                 headers=owner_headers,
             )
             force_synced = client.post(
-                f"/api/sources/{source_id}/force-resync",
+                f"/api/v1/sources/{source_id}/force-resync",
                 headers=owner_headers,
             )
             scheduled = client.put(
-                f"/api/sources/{source_id}/schedule",
+                f"/api/v1/sources/{source_id}/schedule",
                 headers=owner_headers,
                 json={"enabled": True, "interval_minutes": 60},
             )
             inventory = client.get(
-                f"/api/sources/{source_id}/projection-inventory",
+                f"/api/v1/sources/{source_id}/projection-inventory",
                 headers=owner_headers,
             )
 
@@ -454,7 +454,7 @@ def test_source_list_projects_active_lifecycle_maintenance(tmp_path):
         }
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers=owner_headers,
                 json=_confluence_payload(),
             )
@@ -473,7 +473,7 @@ def test_source_list_projects_active_lifecycle_maintenance(tmp_path):
             )
             asyncio.run(database.start_lifecycle_backfill_job("maintenance-job"))
 
-            listed = client.get("/api/sources", headers=owner_headers)
+            listed = client.get("/api/v1/sources", headers=owner_headers)
 
         assert listed.status_code == 200, listed.text
         source = listed.json()["data"][0]
@@ -498,7 +498,7 @@ def test_source_list_suppresses_resolved_lifecycle_failure_but_keeps_history(tmp
         }
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers=owner_headers,
                 json=_confluence_payload(),
             )
@@ -531,12 +531,12 @@ def test_source_list_suppresses_resolved_lifecycle_failure_but_keeps_history(tmp
                     reason="maintenance failure still requires operator action",
                 )
             )
-            actionable = client.get("/api/sources", headers=owner_headers)
+            actionable = client.get("/api/v1/sources", headers=owner_headers)
             asyncio.run(database.enable_lifecycle_gate(source_id))
 
-            listed = client.get("/api/sources", headers=owner_headers)
+            listed = client.get("/api/v1/sources", headers=owner_headers)
             lifecycle = client.get(
-                f"/api/sources/{source_id}/memory-lifecycle",
+                f"/api/v1/sources/{source_id}/memory-lifecycle",
                 headers=owner_headers,
             )
 
@@ -609,7 +609,7 @@ def test_member_can_pin_source_only_for_their_own_source_list(tmp_path):
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
                 json=_confluence_payload(),
             )
@@ -617,27 +617,27 @@ def test_member_can_pin_source_only_for_their_own_source_list(tmp_path):
             source_id = created.json()["id"]
 
             pinned = client.put(
-                f"/api/sources/{source_id}/pin",
+                f"/api/v1/sources/{source_id}/pin",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
             pinned_again = client.put(
-                f"/api/sources/{source_id}/pin",
+                f"/api/v1/sources/{source_id}/pin",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
             other_list = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
             owner_list = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
             )
             unpinned = client.delete(
-                f"/api/sources/{source_id}/pin",
+                f"/api/v1/sources/{source_id}/pin",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
             unpinned_again = client.delete(
-                f"/api/sources/{source_id}/pin",
+                f"/api/v1/sources/{source_id}/pin",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
 
@@ -663,24 +663,24 @@ def test_source_list_sort_preference_is_personal_and_validated(tmp_path):
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             default_response = client.get(
-                "/api/source-list/preferences",
+                "/api/v1/source-list/preferences",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
             updated = client.put(
-                "/api/source-list/preferences",
+                "/api/v1/source-list/preferences",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
                 json={"sort_mode": "name"},
             )
             other_response = client.get(
-                "/api/source-list/preferences",
+                "/api/v1/source-list/preferences",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
             owner_response = client.get(
-                "/api/source-list/preferences",
+                "/api/v1/source-list/preferences",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
             )
             invalid = client.put(
-                "/api/source-list/preferences",
+                "/api/v1/source-list/preferences",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
                 json={"sort_mode": "manual"},
             )
@@ -702,7 +702,7 @@ def test_non_owner_member_cannot_manage_source(tmp_path):
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
                 json=_confluence_payload(),
             )
@@ -710,12 +710,12 @@ def test_non_owner_member_cannot_manage_source(tmp_path):
             source_id = created.json()["id"]
 
             updated = client.put(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
                 json={"name": "Should Not Change"},
             )
             deleted = client.delete(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
 
@@ -735,7 +735,7 @@ def test_workspace_admin_can_manage_source_they_do_not_own(tmp_path):
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
                 json=_confluence_payload(),
             )
@@ -743,12 +743,12 @@ def test_workspace_admin_can_manage_source_they_do_not_own(tmp_path):
             source_id = created.json()["id"]
 
             updated = client.put(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 headers={"x-test-user": "admin-user", "x-test-workspace-role": "workspace_admin"},
                 json={"name": "Admin Updated"},
             )
             listed = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "admin-user", "x-test-workspace-role": "workspace_admin"},
             )
 
@@ -769,7 +769,7 @@ def test_local_source_creator_becomes_execution_owner_and_client_cannot_override
         payload["execution_owner_user_id"] = "admin-b"
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=payload,
             )
@@ -781,7 +781,7 @@ def test_local_source_creator_becomes_execution_owner_and_client_cannot_override
         assert source["execution_owner_user_id"] == "owner-a"
         with TestClient(app) as client:
             listed = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
             )
         assert listed.status_code == 200, listed.text
@@ -800,7 +800,7 @@ def test_local_markdown_source_requires_root_before_execution_classification(tmp
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json={
                     "type": "local_markdown",
@@ -821,7 +821,7 @@ def test_non_owner_admin_can_manage_local_source_but_cannot_change_connection(tm
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=_teams_payload(),
             )
@@ -829,7 +829,7 @@ def test_non_owner_admin_can_manage_local_source_but_cannot_change_connection(tm
             source_id = created.json()["id"]
 
             managed = client.put(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
                 json={
                     "name": "Admin Renamed",
@@ -838,7 +838,7 @@ def test_non_owner_admin_can_manage_local_source_but_cannot_change_connection(tm
                 },
             )
             connection_update = client.put(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
                 json={
                     "config": {
@@ -867,7 +867,7 @@ def test_non_owner_admin_cannot_trigger_local_source_sync(tmp_path):
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=_teams_payload(),
             )
@@ -875,11 +875,11 @@ def test_non_owner_admin_cannot_trigger_local_source_sync(tmp_path):
             source_id = created.json()["id"]
 
             synced = client.post(
-                f"/api/sources/{source_id}/sync",
+                f"/api/v1/sources/{source_id}/sync",
                 headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
             )
             force_synced = client.post(
-                f"/api/sources/{source_id}/force-resync",
+                f"/api/v1/sources/{source_id}/force-resync",
                 headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
             )
 
@@ -899,20 +899,20 @@ def test_local_source_sync_enqueues_canonical_owner_job(tmp_path):
         payload["config"]["access_token"] = "must-not-reach-daemon"
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=payload,
             )
             assert created.status_code == 200, created.text
 
             triggered = client.post(
-                f"/api/sources/{created.json()['id']}/sync",
+                f"/api/v1/sources/{created.json()['id']}/sync",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json={"force_full_sync": True},
             )
             assert triggered.status_code == 202, triggered.text
             repeated = client.post(
-                f"/api/sources/{created.json()['id']}/sync",
+                f"/api/v1/sources/{created.json()['id']}/sync",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json={"force_full_sync": True},
             )
@@ -951,10 +951,10 @@ def test_teams_scope_transition_is_attached_to_collection_job(tmp_path):
         app = _app(tmp_path, database)
         headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
         with TestClient(app) as client:
-            created = client.post("/api/sources", headers=headers, json=_teams_payload())
+            created = client.post("/api/v1/sources", headers=headers, json=_teams_payload())
             source_id = created.json()["id"]
             updated = client.put(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 headers=headers,
                 json={
                     "config": {
@@ -965,7 +965,7 @@ def test_teams_scope_transition_is_attached_to_collection_job(tmp_path):
                     }
                 },
             )
-            triggered = client.post(f"/api/sources/{source_id}/sync", headers=headers)
+            triggered = client.post(f"/api/v1/sources/{source_id}/sync", headers=headers)
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
@@ -997,9 +997,9 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
         app = _app(tmp_path, database)
         headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
         with TestClient(app) as client:
-            created = client.post("/api/sources", headers=headers, json=_teams_payload())
+            created = client.post("/api/v1/sources", headers=headers, json=_teams_payload())
             source_id = created.json()["id"]
-            client.post(f"/api/sources/{source_id}/sync", headers=headers)
+            client.post(f"/api/v1/sources/{source_id}/sync", headers=headers)
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
@@ -1016,7 +1016,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                 window_type="time_block",
             )
             manifest = client.post(
-                f"/api/sources/{source_id}/adapter/manifest",
+                f"/api/v1/sources/{source_id}/adapter/manifest",
                 headers=headers,
                 json={
                     **context,
@@ -1037,7 +1037,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                 },
             )
             accepted = client.post(
-                f"/api/sources/{source_id}/adapter/packages",
+                f"/api/v1/sources/{source_id}/adapter/packages",
                 headers=headers,
                 json={
                     **context,
@@ -1060,12 +1060,12 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                 },
             )
             accepted_process = client.post(
-                f"/api/sources/{source_id}/process",
+                f"/api/v1/sources/{source_id}/process",
                 headers=headers,
                 json=context,
             )
             stale = client.post(
-                f"/api/sources/{source_id}/process",
+                f"/api/v1/sources/{source_id}/process",
                 headers=headers,
                 json={**context, "local_agent_attempt_count": leased["attempt_count"] + 1},
             )
@@ -1122,9 +1122,9 @@ def test_source_config_change_fences_leased_job_and_enqueues_successor(tmp_path)
         app = _app(tmp_path, database)
         headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
         with TestClient(app) as client:
-            created = client.post("/api/sources", headers=headers, json=_jira_payload(sync_mode="local_agent"))
+            created = client.post("/api/v1/sources", headers=headers, json=_jira_payload(sync_mode="local_agent"))
             source_id = created.json()["id"]
-            first = client.post(f"/api/sources/{source_id}/sync", headers=headers)
+            first = client.post(f"/api/v1/sources/{source_id}/sync", headers=headers)
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
@@ -1132,16 +1132,16 @@ def test_source_config_change_fences_leased_job_and_enqueues_successor(tmp_path)
             ).json()["jobs"][0]
             updated_payload = _jira_payload(sync_mode="local_agent")
             updated_payload["config"]["projects"] = ["PAY", "TIME"]
-            updated = client.put(f"/api/sources/{source_id}", headers=headers, json=updated_payload)
+            updated = client.put(f"/api/v1/sources/{source_id}", headers=headers, json=updated_payload)
             stale = client.post(
-                f"/api/sources/{source_id}/process",
+                f"/api/v1/sources/{source_id}/process",
                 headers=headers,
                 json={
                     "local_agent_job_id": leased["job_id"],
                     "local_agent_attempt_count": leased["attempt_count"],
                 },
             )
-            successor = client.post(f"/api/sources/{source_id}/sync", headers=headers)
+            successor = client.post(f"/api/v1/sources/{source_id}/sync", headers=headers)
 
         assert first.status_code == 202, first.text
         assert updated.status_code == 200, updated.text
@@ -1159,7 +1159,7 @@ def test_local_agent_sync_job_can_only_be_created_and_leased_by_source_owner(tmp
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=_teams_payload(),
             )
@@ -1285,7 +1285,7 @@ def test_local_source_sync_without_execution_owner_returns_contract_error(tmp_pa
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             response = client.post(
-                "/api/sources/src-ownerless-local/sync",
+                "/api/v1/sources/src-ownerless-local/sync",
                 headers={"x-test-user": "member-a", "x-test-workspace-role": "member"},
             )
 
@@ -1301,12 +1301,12 @@ def test_local_source_force_resync_collects_fresh_raw_data_before_processing(tmp
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=_teams_payload(),
             )
             force = client.post(
-                f"/api/sources/{created.json()['id']}/force-resync",
+                f"/api/v1/sources/{created.json()['id']}/force-resync",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
             )
             leased = client.post(
@@ -1334,7 +1334,7 @@ def test_projection_inventory_returns_server_owned_active_units(tmp_path):
         }
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers=owner_headers,
                 json=_teams_payload(),
             )
@@ -1379,11 +1379,11 @@ def test_projection_inventory_returns_server_owned_active_units(tmp_path):
             asyncio.run(database.record_source_projection(projection))
 
             response = client.get(
-                f"/api/sources/{source_id}/projection-inventory",
+                f"/api/v1/sources/{source_id}/projection-inventory",
                 headers=owner_headers,
             )
             forbidden = client.get(
-                f"/api/sources/{source_id}/projection-inventory",
+                f"/api/v1/sources/{source_id}/projection-inventory",
                 headers={
                     "x-test-user": "viewer-a",
                     "x-test-workspace-role": "viewer",
@@ -1416,14 +1416,14 @@ def test_local_source_owner_can_change_connection_without_transferring_ownership
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=_teams_payload(),
             )
             assert created.status_code == 200, created.text
             source_id = created.json()["id"]
             updated = client.put(
-                f"/api/sources/{source_id}",
+                f"/api/v1/sources/{source_id}",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json={
                     "config": {
@@ -1450,12 +1450,12 @@ def test_existing_source_cannot_change_between_server_and_local_execution(tmp_pa
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             cloud_source = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=_github_repo_payload(connection_mode="cloud_pull"),
             )
             local_source = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=_github_repo_payload(connection_mode="local_push"),
             )
@@ -1463,12 +1463,12 @@ def test_existing_source_cannot_change_between_server_and_local_execution(tmp_pa
             assert local_source.status_code == 200, local_source.text
 
             to_local = client.put(
-                f"/api/sources/{cloud_source.json()['id']}",
+                f"/api/v1/sources/{cloud_source.json()['id']}",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json={"config": _github_repo_payload(connection_mode="local_push")["config"]},
             )
             to_cloud = client.put(
-                f"/api/sources/{local_source.json()['id']}",
+                f"/api/v1/sources/{local_source.json()['id']}",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json={"config": _github_repo_payload(connection_mode="cloud_pull")["config"]},
             )
@@ -1487,12 +1487,12 @@ def test_existing_jira_source_cannot_change_between_cloud_and_local_agent(tmp_pa
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             cloud_source = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=_jira_payload(sync_mode="cloud"),
             )
             local_source = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=_jira_payload(sync_mode="local_agent"),
             )
@@ -1500,12 +1500,12 @@ def test_existing_jira_source_cannot_change_between_cloud_and_local_agent(tmp_pa
             assert local_source.status_code == 200, local_source.text
 
             to_local = client.put(
-                f"/api/sources/{cloud_source.json()['id']}",
+                f"/api/v1/sources/{cloud_source.json()['id']}",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json={"config": _jira_payload(sync_mode="local_agent")["config"]},
             )
             to_cloud = client.put(
-                f"/api/sources/{local_source.json()['id']}",
+                f"/api/v1/sources/{local_source.json()['id']}",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json={"config": _jira_payload(sync_mode="cloud")["config"]},
             )
@@ -1571,7 +1571,7 @@ def test_member_can_toggle_their_own_source_subscription(tmp_path):
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
                 json=_confluence_payload(),
             )
@@ -1579,20 +1579,20 @@ def test_member_can_toggle_their_own_source_subscription(tmp_path):
             source_id = created.json()["id"]
 
             default_list = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
             disabled = client.put(
-                f"/api/sources/{source_id}/subscription",
+                f"/api/v1/sources/{source_id}/subscription",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
                 json={"enabled": False},
             )
             disabled_list = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
             owner_list = client.get(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
             )
 
@@ -1619,7 +1619,7 @@ def test_disabled_source_is_removed_from_member_memory_list(tmp_path):
         app = _app(tmp_path, database)
         with TestClient(app) as client:
             created = client.post(
-                "/api/sources",
+                "/api/v1/sources",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
                 json=_confluence_payload(),
             )
@@ -1628,24 +1628,24 @@ def test_disabled_source_is_removed_from_member_memory_list(tmp_path):
             asyncio.run(_insert_source_backed_memory(database, source_id=source_id))
 
             owner_before = client.get(
-                "/api/memories",
+                "/api/v1/memories",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
             )
             member_before = client.get(
-                "/api/memories",
+                "/api/v1/memories",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
             disabled = client.put(
-                f"/api/sources/{source_id}/subscription",
+                f"/api/v1/sources/{source_id}/subscription",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
                 json={"enabled": False},
             )
             member_after = client.get(
-                "/api/memories",
+                "/api/v1/memories",
                 headers={"x-test-user": "other-user", "x-test-workspace-role": "member"},
             )
             owner_after = client.get(
-                "/api/memories",
+                "/api/v1/memories",
                 headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
             )
 

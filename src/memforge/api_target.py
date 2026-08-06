@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 _LOCAL_OSS_ORIGIN = "http://127.0.0.1:8765"
@@ -26,48 +26,48 @@ class TargetConfigurationError(ValueError):
 class MemForgeTarget:
     edition: Edition
     origin: str
-    workspace_id: str | None
 
     @property
-    def workspace_api_base(self) -> str:
-        if self.edition is Edition.OSS:
-            return f"{self.origin}/api"
-        workspace = quote(self.workspace_id or "", safe="")
-        return f"{self.origin}/api/workspaces/{workspace}/api"
+    def api_base(self) -> str:
+        return f"{self.origin}/api/v1"
 
-    def resource_url(self, relative_path: str) -> str:
+    def resource_url(
+        self,
+        relative_path: str,
+        *,
+        workspace_id: str | None = None,
+    ) -> str:
         if not relative_path.startswith("/") or relative_path.startswith("/api/"):
             raise ValueError("resource_path_must_be_relative_to_api_base")
-        return f"{self.workspace_api_base}{relative_path}"
+        parsed = urlsplit(relative_path)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        if any(key == "workspace_id" for key, _value in query):
+            raise ValueError("workspace_id_must_use_explicit_parameter")
+        normalized_workspace_id = _normalized_optional(workspace_id)
+        if normalized_workspace_id is not None:
+            query.append(("workspace_id", normalized_workspace_id))
+        resource_path = urlunsplit(("", "", parsed.path, urlencode(query), ""))
+        return f"{self.api_base}{resource_path}"
 
 
 def build_target(
     *,
     origin: str | None,
-    workspace_id: str | None,
 ) -> MemForgeTarget:
-    """Build one canonical target, deriving Cloud only from the origin hostname."""
+    """Build one canonical v1 target, deriving edition only from the hostname."""
     origin_value = _normalized_optional(origin)
-    workspace_value = _normalized_optional(workspace_id)
 
-    if origin_value is None and workspace_value is None:
-        return MemForgeTarget(Edition.OSS, _LOCAL_OSS_ORIGIN, None)
+    if origin_value is None:
+        return MemForgeTarget(Edition.OSS, _LOCAL_OSS_ORIGIN)
 
     canonical_origin = _canonical_origin(origin_value)
     target_edition = Edition.CLOUD if _is_cloud_origin(canonical_origin) else Edition.OSS
-    if target_edition is Edition.CLOUD and workspace_value is None:
-        raise TargetConfigurationError("cloud_workspace_required")
-    if target_edition is Edition.OSS and workspace_value is not None:
-        raise TargetConfigurationError("workspace_not_supported_for_oss")
-    return MemForgeTarget(target_edition, canonical_origin, workspace_value)
+    return MemForgeTarget(target_edition, canonical_origin)
 
 
 def build_host_target(*, origin: str | None) -> MemForgeTarget:
     """Build a host-level target for APIs that are not workspace-routed."""
-    origin_value = _normalized_optional(origin)
-    canonical_origin = _canonical_origin(origin_value)
-    target_edition = Edition.CLOUD if _is_cloud_origin(canonical_origin) else Edition.OSS
-    return MemForgeTarget(target_edition, canonical_origin, None)
+    return build_target(origin=origin)
 
 
 def _normalized_optional(value: str | None) -> str | None:

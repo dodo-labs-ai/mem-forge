@@ -2,15 +2,14 @@
 
 Hooks are not launched as MCP servers, so they do not automatically inherit MCP
 stdio process environment. Keep a tiny stdlib resolver here so hooks and MCP
-tools agree on the same endpoint, token, and workspace without copying secrets
-into hook command strings or registering a second manual MCP server.
+tools agree on the same endpoint and token without copying secrets into hook
+command strings or registering a second manual MCP server.
 """
 
 from __future__ import annotations
 
 import os
 import re
-from collections.abc import Iterable
 from pathlib import Path
 from typing import Mapping
 
@@ -21,30 +20,18 @@ else:  # pragma: no cover - direct file load used by packaged integrations
 
 
 _CONFIG_CACHE: dict[str, str] | None = None
-_REPOSITORY_CONFIG_PATH = Path(".memforge") / "config.toml"
 _BASIC_TOML_STRING = re.compile(
     r'(?:[^"\\\x00-\x1f]|\\(?:["\\btnfr]|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}))*\Z'
 )
 
 
-def configured_target(repository_paths: Iterable[str | os.PathLike[str]] = ()) -> MemForgeTarget:
+def configured_target() -> MemForgeTarget:
     origin = _configured_value("MEMFORGE_API_URL", "").strip() or None
-    workspace = _configured_workspace_id(repository_paths)
-    return build_target(origin=origin, workspace_id=workspace)
+    return build_target(origin=origin)
 
 
 def configured_api_token() -> str:
     return _configured_value("MEMFORGE_API_TOKEN", "").strip()
-
-
-def _configured_workspace_id(repository_paths: Iterable[str | os.PathLike[str]]) -> str | None:
-    repository_value = _repository_workspace_id(repository_paths)
-    if repository_value is not None:
-        return repository_value
-    process_value = os.getenv("MEMFORGE_WORKSPACE_ID")
-    if process_value:
-        return process_value.strip() or None
-    return _codex_memforge_config().get("MEMFORGE_WORKSPACE_ID", "").strip() or None
 
 
 def _configured_value(name: str, default: str) -> str:
@@ -52,46 +39,6 @@ def _configured_value(name: str, default: str) -> str:
     if value:
         return value
     return _codex_memforge_config().get(name, default)
-
-
-def _repository_workspace_id(repository_paths: Iterable[str | os.PathLike[str]]) -> str | None:
-    workspace_ids: set[str] = set()
-    repository_roots: set[Path] = set()
-    for raw_path in repository_paths:
-        repository_root = _repository_root(raw_path)
-        if repository_root is None:
-            return None
-        if repository_root in repository_roots:
-            continue
-        repository_roots.add(repository_root)
-        config_path = repository_root / _REPOSITORY_CONFIG_PATH
-        try:
-            text = config_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            return None
-        configured_workspace = _parse_toml_string_table(text, "memforge").get("workspace_id")
-        if configured_workspace is None:
-            return None
-        workspace_id = configured_workspace.strip()
-        if not workspace_id:
-            return None
-        workspace_ids.add(workspace_id)
-    if repository_roots and len(workspace_ids) == 1:
-        return next(iter(workspace_ids))
-    return None
-
-
-def _repository_root(raw_path: str | os.PathLike[str]) -> Path | None:
-    try:
-        candidate = Path(raw_path).expanduser().resolve(strict=False)
-    except (OSError, RuntimeError, TypeError, ValueError):
-        return None
-    if candidate.is_file():
-        candidate = candidate.parent
-    for directory in (candidate, *candidate.parents):
-        if (directory / ".git").exists():
-            return directory
-    return None
 
 
 def _codex_memforge_config() -> Mapping[str, str]:

@@ -43,25 +43,25 @@ def client(tmp_path, monkeypatch):
 
 def test_upload_then_status_then_forget(client):
     up = client.post(
-        "/api/auth/jira-session",
+        "/api/v1/auth/jira-session",
         json={"base_url": "https://jira.example.test", "cookie_header": "SESSION=good", "browser": "Chrome"},
     )
     assert up.status_code == 200, up.text
     assert up.json()["status"] == "active"
 
-    st = client.get("/api/auth/jira-session", params={"base_url": "https://jira.example.test"})
+    st = client.get("/api/v1/auth/jira-session", params={"base_url": "https://jira.example.test"})
     assert st.json()["status"] == "active"
 
-    origins = client.get("/api/auth/jira-origins")
+    origins = client.get("/api/v1/auth/jira-origins")
     assert any(o["origin"] == "https://jira.example.test" for o in origins.json()["origins"])
 
-    gone = client.request("DELETE", "/api/auth/jira-session", params={"base_url": "https://jira.example.test"})
+    gone = client.request("DELETE", "/api/v1/auth/jira-session", params={"base_url": "https://jira.example.test"})
     assert gone.json()["forgotten"] is True
 
 
 def test_upload_rejects_dead_cookie(client):
     resp = client.post(
-        "/api/auth/jira-session",
+        "/api/v1/auth/jira-session",
         json={"base_url": "https://jira.example.test", "cookie_header": "SESSION=dead"},
     )
     assert resp.status_code == 400
@@ -69,11 +69,11 @@ def test_upload_rejects_dead_cookie(client):
 
 def test_upload_principal_change_returns_409(client):
     client.post(
-        "/api/auth/jira-session",
+        "/api/v1/auth/jira-session",
         json={"base_url": "https://jira.example.test", "cookie_header": "SESSION=good"},
     )
     resp = client.post(
-        "/api/auth/jira-session",
+        "/api/v1/auth/jira-session",
         json={"base_url": "https://jira.example.test", "cookie_header": "SESSION=other"},
     )
     assert resp.status_code == 409
@@ -82,11 +82,11 @@ def test_upload_principal_change_returns_409(client):
 
 def test_expire_marks_status(client):
     client.post(
-        "/api/auth/jira-session",
+        "/api/v1/auth/jira-session",
         json={"base_url": "https://jira.example.test", "cookie_header": "SESSION=good"},
     )
-    client.post("/api/auth/jira-session/expire", json={"base_url": "https://jira.example.test", "error": "logged out"})
-    st = client.get("/api/auth/jira-session", params={"base_url": "https://jira.example.test"})
+    client.post("/api/v1/auth/jira-session/expire", json={"base_url": "https://jira.example.test", "error": "logged out"})
+    st = client.get("/api/v1/auth/jira-session", params={"base_url": "https://jira.example.test"})
     assert st.json()["status"] == "expired"
 
 

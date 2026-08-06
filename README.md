@@ -188,16 +188,14 @@ codex plugin add memory@memforge
 For normal self-hosted use, the plugin talks to the running MemForge API at
 `http://127.0.0.1:8765`. Set `MEMFORGE_API_URL` and optional
 `MEMFORGE_API_TOKEN` only when pointing the plugin at another local or hosted
-service. Hosted multi-workspace deployments also need `MEMFORGE_WORKSPACE_ID`
-so MCP calls target the workspace-scoped API path. Self-hosted OSS does not
-support workspace routing; remove `MEMFORGE_WORKSPACE_ID` from the client
-environment or MemForge client configuration when switching from Cloud to a
-local or other self-hosted origin.
+service. The same `/api/v1` contract is used by self-hosted and Cloud. MCP
+offers `list_workspaces`; every other tool accepts an optional `workspace_id`.
+Omit it when the caller has a server-side default or exactly one accessible
+workspace. Self-hosted exposes the single readable workspace id `local`.
 
 ```bash
 export MEMFORGE_API_URL=https://api.example.memforge
 export MEMFORGE_API_TOKEN=...
-export MEMFORGE_WORKSPACE_ID=team_workspace
 ```
 
 After installing, talk to your agent like a teammate with project memory:

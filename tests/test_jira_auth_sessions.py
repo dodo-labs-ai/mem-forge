@@ -300,7 +300,7 @@ def test_admin_allows_jira_browser_session_source_without_source_cookie(tmp_path
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",
@@ -315,7 +315,7 @@ def test_admin_allows_jira_browser_session_source_without_source_cookie(tmp_path
         )
         assert response.status_code == 200, response.text
         source_id = response.json()["id"]
-        sources = client.get("/api/sources").json()["data"]
+        sources = client.get("/api/v1/sources").json()["data"]
 
     stored = next(source for source in sources if source["id"] == source_id)
     assert "jira_cookie" not in stored["config"]
@@ -333,7 +333,7 @@ def test_admin_rejects_source_owned_jira_cookie(tmp_path, monkeypatch):
 
     with TestClient(app) as client:
         response = client.post(
-            "/api/sources",
+            "/api/v1/sources",
             json={
                 "type": "jira",
                 "name": "Enterprise Jira",

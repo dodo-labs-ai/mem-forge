@@ -29,7 +29,7 @@ def document_content_url(doc: DocumentRecord | None, config: AppConfig | None = 
         return None
     if config is None and document_content_uri(doc) is None:
         return None
-    return f"/api/documents/{quote(doc.doc_id, safe='')}/content"
+    return f"/api/v1/documents/{quote(doc.doc_id, safe='')}/content"
 
 
 def document_pdf_url(doc: DocumentRecord | None, config: AppConfig | None = None) -> str | None:
@@ -40,7 +40,7 @@ def document_pdf_url(doc: DocumentRecord | None, config: AppConfig | None = None
         return None
     if config is None and doc.pdf_content_uri is None:
         return None
-    return f"/api/documents/{quote(doc.doc_id, safe='')}/pdf"
+    return f"/api/v1/documents/{quote(doc.doc_id, safe='')}/pdf"
 
 
 def document_content_url_for_store(
@@ -53,7 +53,7 @@ def document_content_url_for_store(
         return None
     if select_document_artifact(doc, "content", config, artifact_store) is None:
         return None
-    return f"/api/documents/{quote(doc.doc_id, safe='')}/content"
+    return f"/api/v1/documents/{quote(doc.doc_id, safe='')}/content"
 
 
 def document_pdf_url_for_store(
@@ -66,7 +66,7 @@ def document_pdf_url_for_store(
         return None
     if select_document_artifact(doc, "pdf", config, artifact_store) is None:
         return None
-    return f"/api/documents/{quote(doc.doc_id, safe='')}/pdf"
+    return f"/api/v1/documents/{quote(doc.doc_id, safe='')}/pdf"
 
 
 @dataclass(frozen=True)
@@ -159,7 +159,7 @@ def select_document_artifact(
 
 
 def _document_artifact_url(doc_id: str, kind: str) -> str:
-    return f"/api/documents/{quote(doc_id, safe='')}/artifacts/{quote(kind, safe='')}"
+    return f"/api/v1/documents/{quote(doc_id, safe='')}/artifacts/{quote(kind, safe='')}"
 
 
 def resolve_document_artifact_path(uri: str | None, config: AppConfig) -> Path | None:

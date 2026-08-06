@@ -78,7 +78,7 @@ def test_memory_list_route_uses_storage_neutral_admin_reader(tmp_path):
 
     with TestClient(app) as client:
         response = client.get(
-            "/api/memories",
+            "/api/v1/memories",
             params={
                 "type": "fact",
                 "status": "active",
@@ -154,7 +154,7 @@ def test_memory_list_route_uses_injected_principal_resolver(tmp_path):
 
     with TestClient(app) as client:
         response = client.get(
-            "/api/memories",
+            "/api/v1/memories",
             headers={"x-cloud-user-id": "cloud-user-1"},
             params={"include_private": "true"},
         )

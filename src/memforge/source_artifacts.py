@@ -315,7 +315,7 @@ class SourceArtifactRevision:
         from urllib.parse import quote
 
         revision_id = quote(self.observation_revision_id, safe="")
-        return f"/api/source-artifacts/{revision_id}"
+        return f"/api/v1/source-artifacts/{revision_id}"
 
     def metadata(self) -> dict[str, object]:
         return {

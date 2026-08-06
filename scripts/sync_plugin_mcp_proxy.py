@@ -31,11 +31,23 @@ REPOSITORY_CONTEXT_GENERATED_COPIES = (
     ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_repository_context.py",
     ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_repository_context.py",
 )
+API_TARGET_CANONICAL = ROOT / "src" / "memforge" / "api_target.py"
+API_TARGET_GENERATED_COPIES = (
+    ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_api_target.py",
+    ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_api_target.py",
+)
+PLUGIN_CONFIG_CANONICAL = ROOT / "src" / "memforge" / "plugin_config.py"
+PLUGIN_CONFIG_GENERATED_COPIES = (
+    ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
+    ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
+)
 PLUGIN_RUNTIME_FILES = (
     (CANONICAL, GENERATED_COPIES),
     (HOOK_CANONICAL, HOOK_GENERATED_COPIES),
     (REPO_IDENTITY_CANONICAL, REPO_IDENTITY_GENERATED_COPIES),
     (REPOSITORY_CONTEXT_CANONICAL, REPOSITORY_CONTEXT_GENERATED_COPIES),
+    (API_TARGET_CANONICAL, API_TARGET_GENERATED_COPIES),
+    (PLUGIN_CONFIG_CANONICAL, PLUGIN_CONFIG_GENERATED_COPIES),
 )
 
 
