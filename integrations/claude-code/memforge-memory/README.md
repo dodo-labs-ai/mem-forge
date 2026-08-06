@@ -2,7 +2,7 @@
 
 This plugin connects Claude Code lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.43`.
+The packaged runtime and plugin version is `0.1.44`.
 
 With no routing variables, the plugin targets local OSS at
 `http://127.0.0.1:8765/api/v1`. Otherwise put the target in the top-level `env`
@@ -22,10 +22,12 @@ an API path. OSS and Cloud share the same `/api/v1` contract.
 Set `MEMFORGE_API_TOKEN` separately in the process or
 top-level agent environment when bearer authentication is required; the token
 is an identity credential, not a workspace selector. Call `list_workspaces`
-when discovery is useful and pass optional `workspace_id` to any other tool.
-It may be omitted when the account has a default or exactly one accessible
-workspace. Repository context remains provenance attribution; it never selects
-a workspace.
+when discovery is useful and pass optional `workspace_id` to any data tool for
+a one-request override. It may be omitted when the account has a default or
+exactly one accessible workspace. After the user explicitly confirms a choice,
+`set_default_workspace` persists the server-side default used by automatic
+hooks and later calls that omit `workspace_id`. Repository context remains
+provenance attribution; it never selects a workspace.
 
 Do not add a manual MCP server block for MemForge. The plugin's `.mcp.json`
 registers the MCP server; duplicating it in config can pin the agent to a stale
@@ -109,10 +111,5 @@ The bundled MCP proxy exposes tools such as `search`, `list_recent_memories`,
 `get_resource` fetches `content_url` / `pdf_url` artifacts through
 `MEMFORGE_API_URL`; in `file` mode it writes the artifact to
 `~/.memforge-agent/artifacts`.
-
-For guided workspace setup, ask Claude Code to use **MemForge Setup** to
-configure a global default, manage the current repository override, or inspect
-the effective selection. The skill previews and validates changes before asking
-for confirmation.
 
 Hooks do not write canonical memories directly.

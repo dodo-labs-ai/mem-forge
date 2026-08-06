@@ -5,6 +5,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import sqlite3
@@ -908,12 +909,16 @@ def test_mcp_data_tools_accept_repository_context_but_workspace_directory_does_n
         if tool["name"] == "list_workspaces":
             assert tool["inputSchema"]["properties"] == {}
             continue
+        if tool["name"] == "set_default_workspace":
+            assert tool["inputSchema"]["required"] == ["workspace_id"]
+            assert "repository_context" not in tool["inputSchema"]["properties"]
+            continue
         assert "repository_context" in tool["inputSchema"]["properties"], tool["name"]
 
 
-def test_packaged_plugin_version_0_1_43_is_consistent():
+def test_packaged_plugin_version_0_1_44_is_consistent():
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.43"
+    version = "0.1.44"
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
@@ -4457,6 +4462,54 @@ def test_http_error_body_is_not_echoed_into_hook_output(monkeypatch, capsys):
     assert output["continue"] is True
     assert "secret stack trace" not in output["systemMessage"]
     assert "MemForge hook skipped" in output["systemMessage"]
+
+
+def test_workspace_selection_conflict_has_actionable_hook_message(monkeypatch, capsys):
+    from memforge import hook_adapter
+
+    def fake_post_json(path: str, payload: dict, *, timeout: float):
+        raise hook_adapter.WorkspaceSelectionRequiredError
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+    monkeypatch.setattr(hook_adapter.sys, "stdin", _Stdin({"hook_event_name": "Stop"}))
+
+    exit_code = hook_adapter.main(["submit-session"])
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output == {
+        "continue": True,
+        "systemMessage": (
+            "MemForge automatic capture is waiting for a default workspace. "
+            "Choose one with list_workspaces, then confirm set_default_workspace."
+        ),
+    }
+
+
+def test_post_json_classifies_workspace_selection_conflict(monkeypatch):
+    from memforge import hook_adapter
+
+    def fake_urlopen(request, timeout: float):
+        raise hook_adapter.urllib.error.HTTPError(
+            request.full_url,
+            409,
+            "Conflict",
+            hdrs=None,
+            fp=io.BytesIO(
+                json.dumps(
+                    {
+                        "code": "workspace_selection_required",
+                        "detail": "Select a workspace for this request.",
+                        "workspace_ids": ["mount_tai", "payroll_agent"],
+                    }
+                ).encode()
+            ),
+        )
+
+    monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(hook_adapter.WorkspaceSelectionRequiredError):
+        hook_adapter._post_json("/hooks/receipts", {}, timeout=1)
 
 
 def test_post_json_targets_zero_configuration_local_oss(monkeypatch):

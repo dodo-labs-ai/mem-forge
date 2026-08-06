@@ -1342,6 +1342,10 @@ class AgentHookReceiptRequest(BaseModel):
     submitted_at: str | None = None
 
 
+class DefaultWorkspaceRequest(BaseModel):
+    workspace_id: str = Field(min_length=1)
+
+
 class AgentHookContextRequest(BaseModel):
     client: str
     hook: str
@@ -2957,7 +2961,14 @@ def create_admin_app(
     @app.middleware("http")
     async def resolve_workspace_context(request: Request, call_next):
         """Resolve the singleton workspace for every v1 data-plane request."""
-        if request.url.path.startswith("/api/v1/") and request.url.path != "/api/v1/workspaces":
+        workspace_control_plane_paths = {
+            "/api/v1/workspaces",
+            "/api/v1/me/default-workspace",
+        }
+        if (
+            request.url.path.startswith("/api/v1/")
+            and request.url.path not in workspace_control_plane_paths
+        ):
             current_workspace_id = str(request.app.state.workspace_id)
             requested_values = request.query_params.getlist("workspace_id")
             if len(requested_values) > 1:
@@ -3192,6 +3203,23 @@ def create_admin_app(
             ],
             "default_workspace_id": current_workspace_id,
         }
+
+    @health_router.put("/api/v1/me/default-workspace", response_model=None)
+    async def set_default_workspace(
+        req: DefaultWorkspaceRequest,
+        request: Request,
+    ) -> dict[str, str] | JSONResponse:
+        """Confirm the immutable singleton default exposed by self-hosted mode."""
+        current_workspace_id = str(request.app.state.workspace_id)
+        if req.workspace_id.strip() != current_workspace_id:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "code": "workspace_not_found_or_inaccessible",
+                    "detail": "Workspace not found or inaccessible.",
+                },
+            )
+        return {"default_workspace_id": current_workspace_id}
 
     @health_router.get("/api/v1/health", response_model=HealthResponse)
     async def health(request: Request, db: Database = Depends(get_db)):
