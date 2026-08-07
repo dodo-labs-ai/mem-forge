@@ -18,11 +18,16 @@ async def test_sqlite_runner_executes_core_hard_cases(tmp_path) -> None:
         db_path=tmp_path / "retrieval-eval.db",
     )
 
-    assert report.case_count == 10
+    assert report.case_count == 11
     assert report.hard_failures == ()
 
     assert report.case_results["exact_external_id_lookup"].ranked_ids[0] == "mem-blocker-hint"
     assert report.case_results["metadata_title_exact"].rank("mem-access-review") <= 3
+    wrapped_title = report.case_results["quoted_title_in_self_contained_query"]
+    assert wrapped_title.rank("mem-access-review") <= 3
+    assert wrapped_title.evidence_by_memory["mem-access-review"]["metadata_lexical"][
+        "query_paths"
+    ] == ["quoted_identity"]
     assert report.case_results["compact_trigram_metadata_recall"].rank("mem-blocker-hint") <= 10
     assert report.case_results["queryless_source_listing"].total_candidates == 17
 
@@ -30,7 +35,7 @@ async def test_sqlite_runner_executes_core_hard_cases(tmp_path) -> None:
     assert report.run["exact_external_id_lookup"]["mem-blocker-hint"] > 0
     assert report.run["exact_external_id_lookup"]["mem-blocker-hint"] == 1.0
     assert report.to_json()["summary"] == {
-        "case_count": 10,
+        "case_count": 11,
         "hard_failures": 0,
     }
     assert list(tmp_path.glob("retrieval-eval-*.db")) == []

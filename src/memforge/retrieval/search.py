@@ -83,6 +83,8 @@ _CODE_SYMBOL_RE = re.compile(
     r"|(?:\b[A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*\b)"
     r"|(?:\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b)"
 )
+_QUOTED_IDENTITY_RE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
+_MAX_QUOTED_IDENTITY_LENGTH = 256
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +320,16 @@ def sanitize_fts_query(text: str) -> str:
             # Quote each token to prevent FTS5 operator interpretation
             safe.append(f'"{cleaned}"')
     return " ".join(safe)
+
+
+def _quoted_identity_query(query: str) -> str | None:
+    """Return the first bounded identity that the caller explicitly quoted."""
+
+    for match in _QUOTED_IDENTITY_RE.finditer(query):
+        identity = " ".join(next(group for group in match.groups() if group).split())
+        if identity and len(identity) <= _MAX_QUOTED_IDENTITY_LENGTH:
+            return identity
+    return None
 
 
 def _entity_link_candidate_payload(candidate: EntityLinkCandidate) -> dict[str, Any]:
@@ -621,8 +633,9 @@ class SearchEngine:
         channel_names.append("bm25_content")
 
         tasks.append(asyncio.ensure_future(
-            self._bm25_metadata_search(
+            self._metadata_searches(
                 query,
+                requested_intent,
                 memory_types,
                 scope,
                 fetch_k,
@@ -672,9 +685,14 @@ class SearchEngine:
             elif name == "bm25_content":
                 content_results = list(result)
             elif name == "bm25_metadata_tokens":
-                hits = list(result)
+                hits, query_paths = result
+                hits = list(hits)
                 metadata_hits = hits
                 metadata_evidence.update(_best_metadata_evidence(hits))
+                for memory_id, paths in query_paths.items():
+                    evidence = metadata_evidence.get(memory_id)
+                    if evidence is not None:
+                        evidence["query_paths"] = list(paths)
             elif name == "graph":
                 per_entity_results = list(result)
                 graph_contributions = self._graph_contributions(
@@ -833,6 +851,67 @@ class SearchEngine:
             time_range=time_range,
             include_subchannel_hits=True,
         )
+
+    async def _metadata_searches(
+        self,
+        query: str,
+        requested_intent: RankedRetrievalIntent | None,
+        memory_types: list[str] | None,
+        scope: AccessScope,
+        limit: int,
+        *,
+        source_filter: MemorySourceFilter | None,
+        time_range: MemoryTimeRange | None,
+    ) -> tuple[list[KeywordCandidate], dict[str, tuple[str, ...]]]:
+        """Run the full metadata query plus one explicitly quoted identity."""
+
+        queries = [("full_query", query)]
+        quoted_identity = (
+            _quoted_identity_query(query)
+            if requested_intent == "known_item"
+            else None
+        )
+        if quoted_identity is not None and quoted_identity != query.strip():
+            queries.append(("quoted_identity", quoted_identity))
+
+        result_sets = await asyncio.gather(
+            *(
+                self._bm25_metadata_search(
+                    metadata_query,
+                    memory_types,
+                    scope,
+                    limit,
+                    source_filter=source_filter,
+                    time_range=time_range,
+                )
+                for _, metadata_query in queries
+            )
+        )
+        best_hits: dict[tuple[str, str], KeywordCandidate] = {}
+        best_hit_paths: dict[tuple[str, str], list[str]] = {}
+        for (query_path, _), hits in zip(queries, result_sets):
+            for hit in hits:
+                key = (hit.memory_id, hit.channel)
+                previous = best_hits.get(key)
+                if previous is None or hit.score > previous.score:
+                    best_hits[key] = hit
+                    best_hit_paths[key] = [query_path]
+                elif hit.score == previous.score:
+                    paths = best_hit_paths[key]
+                    if query_path not in paths:
+                        paths.append(query_path)
+        query_paths: dict[str, list[str]] = {}
+        for (memory_id, channel), paths in best_hit_paths.items():
+            if (memory_id, channel) not in best_hits:
+                continue
+            combined = query_paths.setdefault(memory_id, [])
+            for query_path in paths:
+                if query_path not in combined:
+                    combined.append(query_path)
+        return list(best_hits.values()), {
+            memory_id: tuple(paths)
+            for memory_id, paths in query_paths.items()
+        }
 
     async def _graph_search(
         self,

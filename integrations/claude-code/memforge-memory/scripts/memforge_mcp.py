@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.46"
+SERVER_VERSION = "0.1.47"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Repository context is optional. MemForge uses negotiated request-scoped host context when "
@@ -227,7 +227,8 @@ TOOLS: list[dict[str, Any]] = [
                     "description": (
                         "Optional goal hint from conversation context: general_hybrid for open-ended recall, "
                         "known_item for a specifically named item, or relationship for connected-memory "
-                        "exploration. Omit when unsure; this never sets source or time facets."
+                        "exploration. For known_item, keep the query self-contained and quote the exact title, "
+                        "name, or path when available. Omit when unsure; this never sets source or time facets."
                     ),
                 },
                 "repository_context": REPOSITORY_CONTEXT_SCHEMA,
