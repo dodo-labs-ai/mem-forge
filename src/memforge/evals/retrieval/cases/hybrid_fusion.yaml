@@ -1,0 +1,39 @@
+- id: vector_target_with_lexical_distractor
+  family: hybrid_vector_recall
+  description: vector evidence preserves a cross-language target beside a strong lexical distractor
+  query: explain why editing a rule locked by another user returns a generic error
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  ranked_channel_results:
+    vector:
+      - memory_id: mem-cross-language-lock
+        score: 0.99
+      - memory_id: mem-lexical-lock-distractor
+        score: 0.8
+    bm25_content:
+      - memory_id: mem-lexical-lock-distractor
+        score: 10.0
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-cross-language-lock: 3
+      mem-lexical-lock-distractor: 1
+    max_rank:
+      mem-cross-language-lock: 5
+    required_channels:
+      mem-cross-language-lock:
+        - vector
+      mem-lexical-lock-distractor:
+        - bm25_content
+    required_profile: semantic_lookup

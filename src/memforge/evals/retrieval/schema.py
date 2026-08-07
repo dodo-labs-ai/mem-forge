@@ -6,7 +6,7 @@ import copy
 import hashlib
 import json
 import re
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from importlib import resources
 from pathlib import Path
 from typing import Any, Mapping
@@ -21,6 +21,36 @@ class CaseSetValidationError(ValueError):
 
 
 _CASE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_INJECTABLE_RANKED_CHANNELS = {"vector", "bm25_content"}
+
+
+@dataclass(frozen=True)
+class RankedChannelResult:
+    """One deterministic adapter-boundary result injected by a golden case."""
+
+    memory_id: str
+    score: float
+
+    @classmethod
+    def from_data(cls, channel: str, data: Mapping[str, Any]) -> RankedChannelResult:
+        _reject_unknown_fields(
+            f"case.ranked_channel_results.{channel}",
+            data,
+            {"memory_id", "score"},
+        )
+        return cls(
+            memory_id=_require_str(
+                f"case.ranked_channel_results.{channel}.memory_id",
+                data.get("memory_id"),
+            ),
+            score=_require_number(
+                f"case.ranked_channel_results.{channel}.score",
+                data.get("score"),
+            ),
+        )
+
+    def to_data(self) -> dict[str, Any]:
+        return {"memory_id": self.memory_id, "score": self.score}
 
 
 @dataclass(frozen=True)
@@ -143,6 +173,7 @@ class RetrievalCase:
     entities: tuple[str, ...] = ()
     control_case_id: str | None = None
     parity_gate: str | None = None
+    ranked_channel_results: Mapping[str, tuple[RankedChannelResult, ...]] = field(default_factory=dict)
 
     @classmethod
     def from_data(cls, data: Mapping[str, Any]) -> RetrievalCase:
@@ -164,6 +195,7 @@ class RetrievalCase:
                 "expected",
                 "control_case_id",
                 "parity_gate",
+                "ranked_channel_results",
             },
         )
         _require_str("case.id", data.get("id"))
@@ -199,6 +231,9 @@ class RetrievalCase:
             _require_str("case.control_case_id", data["control_case_id"])
         if data.get("parity_gate") is not None:
             _require_str("case.parity_gate", data["parity_gate"])
+        ranked_channel_results = _parse_ranked_channel_results(
+            data.get("ranked_channel_results")
+        )
         return cls(
             id=str(data["id"]),
             family=str(data["family"]),
@@ -214,6 +249,7 @@ class RetrievalCase:
             expected=ExpectedSpec.from_data(data.get("expected")),
             control_case_id=data.get("control_case_id"),
             parity_gate=data.get("parity_gate"),
+            ranked_channel_results=ranked_channel_results,
         )
 
     def to_data(self) -> dict[str, Any]:
@@ -239,6 +275,11 @@ class RetrievalCase:
             data["control_case_id"] = self.control_case_id
         if self.parity_gate is not None:
             data["parity_gate"] = self.parity_gate
+        if self.ranked_channel_results:
+            data["ranked_channel_results"] = {
+                channel: [item.to_data() for item in results]
+                for channel, results in self.ranked_channel_results.items()
+            }
         return data
 
 
@@ -462,6 +503,11 @@ def _validate_case(case_set: RetrievalCaseSet, case: RetrievalCase) -> None:
     expected_memory_ids = set(case.expected.relevant)
     expected_memory_ids.update(case.expected.max_rank)
     expected_memory_ids.update(case.expected.required_channels)
+    expected_memory_ids.update(
+        item.memory_id
+        for results in (case.ranked_channel_results or {}).values()
+        for item in results
+    )
     missing_memory_ids = sorted(expected_memory_ids - memory_ids)
     if missing_memory_ids:
         raise CaseSetValidationError(
@@ -547,6 +593,37 @@ def _validate_scope_shape(case_id: str, scope: Mapping[str, Any]) -> None:
         )
 
 
+def _parse_ranked_channel_results(
+    value: Any,
+) -> Mapping[str, tuple[RankedChannelResult, ...]]:
+    if value is None:
+        return {}
+    payload = _require_mapping("case.ranked_channel_results", value)
+    unknown_channels = sorted(set(payload) - _INJECTABLE_RANKED_CHANNELS)
+    if unknown_channels:
+        raise CaseSetValidationError(
+            "case.ranked_channel_results contains unsupported channels: "
+            f"{unknown_channels}"
+        )
+    parsed: dict[str, tuple[RankedChannelResult, ...]] = {}
+    for channel, raw_results in payload.items():
+        results = _require_sequence(
+            f"case.ranked_channel_results.{channel}",
+            raw_results,
+        )
+        parsed[channel] = tuple(
+            RankedChannelResult.from_data(
+                channel,
+                _require_mapping(
+                    f"case.ranked_channel_results.{channel}.item",
+                    item,
+                ),
+            )
+            for item in results
+        )
+    return parsed
+
+
 def _case_resource_root() -> resources.abc.Traversable:
     return resources.files("memforge.evals.retrieval.cases")
 
@@ -592,6 +669,12 @@ def _require_int(field_name: str, value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise CaseSetValidationError(f"{field_name} must be an integer")
     return value
+
+
+def _require_number(field_name: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CaseSetValidationError(f"{field_name} must be a number")
+    return float(value)
 
 
 def _require_positive_int(field_name: str, value: Any) -> int:

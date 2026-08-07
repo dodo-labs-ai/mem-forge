@@ -16,7 +16,7 @@ async def test_sqlite_runner_executes_core_hard_cases(tmp_path) -> None:
         db_path=tmp_path / "retrieval-eval.db",
     )
 
-    assert report.case_count == 4
+    assert report.case_count == 5
     assert report.hard_failures == ()
 
     assert report.case_results["exact_external_id_lookup"].ranked_ids[0] == "mem-blocker-hint"
@@ -28,10 +28,40 @@ async def test_sqlite_runner_executes_core_hard_cases(tmp_path) -> None:
     assert report.run["exact_external_id_lookup"]["mem-blocker-hint"] > 0
     assert report.run["exact_external_id_lookup"]["mem-blocker-hint"] == 1.0
     assert report.to_json()["summary"] == {
-        "case_count": 4,
+        "case_count": 5,
         "hard_failures": 0,
     }
     assert list(tmp_path.glob("retrieval-eval-*.db")) == []
+
+
+@pytest.mark.asyncio
+async def test_sqlite_runner_injects_ranked_channels_and_reports_vector_contribution(tmp_path) -> None:
+    from memforge.evals.retrieval import load_case_set
+    from memforge.evals.retrieval.runner import run_sqlite_case_set
+
+    report = await run_sqlite_case_set(
+        load_case_set("retrieval-core-v1"),
+        db_path=tmp_path / "retrieval-eval.db",
+    )
+
+    case = report.case_results["vector_target_with_lexical_distractor"]
+    assert case.rank("mem-cross-language-lock") <= 5
+    assert case.evidence_by_memory["mem-cross-language-lock"]["rank_fusion"] == {
+        "profile": "semantic_lookup",
+        "rrf_score": pytest.approx(0.45 / 61),
+        "contributions": [
+            {
+                "channel": "vector",
+                "rank": 1,
+                "channel_weight": 0.45,
+                "multiplier": 1.0,
+                "weighted_score": pytest.approx(0.45 / 61),
+            }
+        ],
+    }
+    assert report.to_json()["case_results"]["vector_target_with_lexical_distractor"][
+        "evidence_by_memory"
+    ]["mem-cross-language-lock"]["rank_fusion"]["contributions"][0]["channel"] == "vector"
 
 
 def test_search_engine_embedding_provider_degrades_on_exception() -> None:

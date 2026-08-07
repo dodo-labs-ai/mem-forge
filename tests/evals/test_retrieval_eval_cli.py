@@ -23,11 +23,14 @@ def test_retrieval_eval_cli_runs_packaged_case_set_as_json() -> None:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["summary"] == {
-        "case_count": 4,
+        "case_count": 5,
         "hard_failures": 0,
     }
     assert payload["hard_failures"] == []
     assert payload["qrels"]["exact_external_id_lookup"] == {"mem-blocker-hint": 3}
+    assert payload["case_results"]["vector_target_with_lexical_distractor"][
+        "evidence_by_memory"
+    ]["mem-cross-language-lock"]["rank_fusion"]["contributions"][0]["channel"] == "vector"
 
 
 def test_retrieval_eval_cli_text_output_is_quiet_summary() -> None:
@@ -44,7 +47,7 @@ def test_retrieval_eval_cli_text_output_is_quiet_summary() -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert result.output.strip() == "retrieval eval retrieval-core-v1: 4 cases, 0 hard failures"
+    assert result.output.strip() == "retrieval eval retrieval-core-v1: 5 cases, 0 hard failures"
 
 
 def test_retrieval_eval_cli_can_fail_on_hard_failures(monkeypatch) -> None:
