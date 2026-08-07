@@ -12,7 +12,7 @@ from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, RetrievalCo
 from memforge.llm.structured import RerankResponse
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
-from memforge.retrieval.search import SearchEngine
+from memforge.retrieval.search import SearchEngine, _quoted_identity_query
 from memforge.storage.database import Database
 from memforge.storage.adapters.protocols import EntityLinkCandidate, KeywordCandidate
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -43,6 +43,22 @@ class RecordingRerankClient:
     async def rerank_memories(self, prompt: str, **kwargs):
         self.prompt = prompt
         return RerankResponse(ranking=[0])
+
+
+class QueryScoredKeyword:
+    def __init__(self, *, full_score: float, quoted_score: float) -> None:
+        self.full_score = full_score
+        self.quoted_score = quoted_score
+
+    async def search_metadata(self, query: str, *args, **kwargs):
+        score = self.full_score if '"Find"' in query else self.quoted_score
+        return [
+            KeywordCandidate(
+                memory_id="m-access-review",
+                score=score,
+                channel="bm25_metadata_tokens",
+            )
+        ]
 
 
 def _memory(
@@ -96,6 +112,44 @@ async def _document(
             client=client,
         )
     )
+
+
+async def _title_only_search_engine(
+    db: Database,
+) -> tuple[Memory, SearchEngine]:
+    target = _memory("m-access-review", "Durable source-backed note with different wording")
+    await db.insert_memory(target)
+    await db.upsert_source(
+        "src-teams",
+        "teams",
+        "PCC Agent Dev",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await _document(
+        db,
+        "teams-access-review",
+        "src-teams",
+        title="Create Access Review in Quarterly Payroll",
+    )
+    await db.add_memory_source(
+        target.id,
+        "teams-access-review",
+        "teams",
+        None,
+        source_updated_at=None,
+    )
+    adapters = build_sqlite_adapters(db, FakeCollection([]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+    return target, engine
 
 
 @pytest.fixture
@@ -354,6 +408,7 @@ async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch)
     assert evidence is not None
     assert evidence["metadata_lexical"] == {
         "channel": "bm25_metadata_tokens",
+        "query_paths": ["full_query"],
         "matched_fields": ["metadata_any"],
         "matched_text": [
             "SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment | "
@@ -377,6 +432,113 @@ async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch)
             "weighted_score": pytest.approx(0.15 / (DEFAULT_RRF_K + 1)),
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    [
+        'Find the memory titled "Create Access Review in Quarterly Payroll"',
+        "查找标题为“Create Access Review in Quarterly Payroll”的 memory",
+    ],
+)
+async def test_requested_known_item_recalls_quoted_title_inside_natural_language_query(
+    db,
+    query,
+):
+    target, engine = await _title_only_search_engine(db)
+
+    result = await engine.search(
+        query,
+        intent="known_item",
+        top_k=10,
+    )
+
+    assert result["retrieval_intent"] == {
+        "requested_intent": "known_item",
+        "resolved_intent": "known_item",
+        "intent_source": "requested",
+        "fallback_reason": None,
+    }
+    assert [item.memory_id for item in result["results"]] == [target.id]
+    evidence = result["results"][0].retrieval_evidence
+    assert evidence is not None
+    assert evidence["metadata_lexical"]["channel"] == "bm25_metadata_tokens"
+    assert evidence["metadata_lexical"]["query_paths"] == ["quoted_identity"]
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ('Find ""', None),
+        ('Find "First title" and "Second title"', "First title"),
+        ('Find "   " then "Second title"', "Second title"),
+        (f'Find "{"x" * 257}" then "Bounded title"', "Bounded title"),
+        ('Find "line\nbreak"', None),
+        ('查找“First   title”或“Second title”', "First title"),
+    ],
+)
+def test_quoted_identity_query_selects_first_non_empty_bounded_single_line_span(
+    query,
+    expected,
+):
+    assert _quoted_identity_query(query) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("full_score", "quoted_score", "expected_paths"),
+    [
+        (1.0, 0.5, ("full_query",)),
+        (0.5, 1.0, ("quoted_identity",)),
+        (1.0, 1.0, ("full_query", "quoted_identity")),
+    ],
+)
+async def test_metadata_query_paths_only_report_retained_channel_hits(
+    full_score,
+    quoted_score,
+    expected_paths,
+):
+    engine = SearchEngine(
+        relational=object(),
+        keyword=QueryScoredKeyword(
+            full_score=full_score,
+            quoted_score=quoted_score,
+        ),
+        vector=object(),
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+
+    hits, paths = await engine._metadata_searches(
+        'Find the memory titled "Create Access Review in Quarterly Payroll"',
+        "known_item",
+        None,
+        object(),
+        10,
+        source_filter=None,
+        time_range=None,
+    )
+
+    assert [hit.score for hit in hits] == [max(full_score, quoted_score)]
+    assert paths == {"m-access-review": expected_paths}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intent", [None, "general_hybrid"])
+async def test_quoted_title_is_not_expanded_without_requested_known_item(
+    db,
+    intent,
+):
+    _target, engine = await _title_only_search_engine(db)
+
+    result = await engine.search(
+        'Find the memory titled "Create Access Review in Quarterly Payroll"',
+        intent=intent,
+        top_k=10,
+    )
+
+    assert result["results"] == []
 
 
 @pytest.mark.asyncio

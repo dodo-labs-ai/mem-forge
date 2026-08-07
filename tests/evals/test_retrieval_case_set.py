@@ -29,6 +29,7 @@ def test_load_case_set_validates_manifest_cases_and_scope_shape() -> None:
     assert case_set.case_ids == (
         "exact_external_id_lookup",
         "metadata_title_exact",
+        "quoted_title_in_self_contained_query",
         "compact_trigram_metadata_recall",
         "queryless_source_listing",
         "vector_target_with_lexical_distractor",
@@ -43,6 +44,12 @@ def test_load_case_set_validates_manifest_cases_and_scope_shape() -> None:
     assert title_case.expected.required_intent == "known_item"
     assert title_case.expected.required_channels["mem-access-review"] == ("bm25_metadata_tokens",)
     assert set(title_case.scope.raw) == {field.name for field in fields(AccessScope)}
+
+    wrapped_title_case = case_set.get_case("quoted_title_in_self_contained_query")
+    assert wrapped_title_case.requested_intent == "known_item"
+    assert wrapped_title_case.expected.required_channels["mem-access-review"] == (
+        "bm25_metadata_tokens",
+    )
 
     access_scope = title_case.scope.to_access_scope()
     assert access_scope == AccessScope(
