@@ -18,6 +18,7 @@ DEFAULT_BASE_DIR = Path.home() / ".memforge"
 DEFAULT_ENRICHMENT_MAX_TOKENS = 8192
 DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS = 32768
 DEFAULT_RANK_WINDOW_SIZE = 50
+DEFAULT_RRF_K = 20
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +74,7 @@ class MemoryConfig:
 class RetrievalConfig:
     default_top_k: int = 10
     rank_window_size: int = DEFAULT_RANK_WINDOW_SIZE
-    rrf_k: int = 60
+    rrf_k: int = DEFAULT_RRF_K
     recency_half_life_days: int = 90
     embedding_cache_size: int = 256
     enable_reranking: bool = False

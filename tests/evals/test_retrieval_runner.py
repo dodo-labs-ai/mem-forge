@@ -5,6 +5,8 @@ from dataclasses import replace
 
 import pytest
 
+from memforge.config import DEFAULT_RRF_K
+
 
 @pytest.mark.asyncio
 async def test_sqlite_runner_executes_core_hard_cases(tmp_path) -> None:
@@ -48,14 +50,14 @@ async def test_sqlite_runner_injects_ranked_channels_and_reports_vector_contribu
     assert case.rank("mem-cross-language-lock") <= 5
     assert case.evidence_by_memory["mem-cross-language-lock"]["rank_fusion"] == {
         "intent": "general_hybrid",
-        "rrf_score": pytest.approx(0.45 / 61),
+        "rrf_score": pytest.approx(0.45 / (DEFAULT_RRF_K + 1)),
         "contributions": [
             {
                 "channel": "vector",
                 "rank": 1,
                 "channel_weight": 0.45,
                 "multiplier": 1.0,
-                "weighted_score": pytest.approx(0.45 / 61),
+                "weighted_score": pytest.approx(0.45 / (DEFAULT_RRF_K + 1)),
             }
         ],
     }

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from memforge.config import DEFAULT_RANK_WINDOW_SIZE, RetrievalConfig
+from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, RetrievalConfig
 from memforge.llm.structured import RerankResponse
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
@@ -177,34 +177,36 @@ async def test_search_exposes_rank_fusion_contributions_for_each_result(db):
     }
     assert evidence_by_id[content_target.id]["rank_fusion"] == {
         "intent": "known_item",
-        "rrf_score": pytest.approx(0.15 / 62 + 0.25 / 61),
+        "rrf_score": pytest.approx(
+            0.15 / (DEFAULT_RRF_K + 2) + 0.25 / (DEFAULT_RRF_K + 1)
+        ),
         "contributions": [
             {
                 "channel": "vector",
                 "rank": 2,
                 "channel_weight": 0.15,
                 "multiplier": 1.0,
-                "weighted_score": pytest.approx(0.15 / 62),
+                "weighted_score": pytest.approx(0.15 / (DEFAULT_RRF_K + 2)),
             },
             {
                 "channel": "bm25_content",
                 "rank": 1,
                 "channel_weight": 0.25,
                 "multiplier": 1.0,
-                "weighted_score": pytest.approx(0.25 / 61),
+                "weighted_score": pytest.approx(0.25 / (DEFAULT_RRF_K + 1)),
             },
         ],
     }
     assert evidence_by_id[vector_only.id]["rank_fusion"] == {
         "intent": "known_item",
-        "rrf_score": pytest.approx(0.15 / 61),
+        "rrf_score": pytest.approx(0.15 / (DEFAULT_RRF_K + 1)),
         "contributions": [
             {
                 "channel": "vector",
                 "rank": 1,
                 "channel_weight": 0.15,
                 "multiplier": 1.0,
-                "weighted_score": pytest.approx(0.15 / 61),
+                "weighted_score": pytest.approx(0.15 / (DEFAULT_RRF_K + 1)),
             },
         ],
     }
@@ -372,7 +374,7 @@ async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch)
             "rank": 1,
             "channel_weight": 0.15,
             "multiplier": 1.0,
-            "weighted_score": pytest.approx(0.15 / 61),
+            "weighted_score": pytest.approx(0.15 / (DEFAULT_RRF_K + 1)),
         }
     ]
 
@@ -978,7 +980,7 @@ async def test_requested_relationship_downweights_broad_entity_fanout(db, monkey
             "rank": 1,
             "channel_weight": 0.3,
             "multiplier": 1.0,
-            "weighted_score": pytest.approx(0.3 / 61),
+            "weighted_score": pytest.approx(0.3 / (DEFAULT_RRF_K + 1)),
         }
     ]
 
