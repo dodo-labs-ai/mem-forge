@@ -502,12 +502,17 @@ def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
         workspace_id="team_alpha",
     )
 
-    result = client.search(query="artifact cache")
+    result = client.search(query="artifact cache", intent="known_item")
 
     assert result == {"results": []}
     assert captured["url"] == "https://memforge.example.com/api/v1/memories/search?workspace_id=team_alpha"
     assert captured["authorization"] == "Bearer tok"
-    assert json.loads(captured["body"].decode())["query"] == "artifact cache"
+    assert json.loads(captured["body"].decode()) == {
+        "top_k": 10,
+        "include_superseded": False,
+        "query": "artifact cache",
+        "intent": "known_item",
+    }
 
 
 def test_tool_client_forwards_structured_memory_search_facets():

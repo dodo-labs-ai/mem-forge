@@ -1350,10 +1350,11 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
             "entities": None,
             "include_superseded": False,
             "top_k": 3,
-            "request_scope": expected_scope,
-            "offset": 0,
-        }
-    ]
+                "request_scope": expected_scope,
+                "offset": 0,
+                "intent": None,
+            }
+        ]
     assert payload["results"][0]["memory_id"] == "mem-proxy-search"
     result = payload["results"][0]
     for field in ("source_doc_id", "source_doc_title", "source_url", "content_url", "pdf_url", "is_document_result"):

@@ -57,6 +57,7 @@ from memforge.local_agent.source_contract import (
     local_agent_sync_snapshot_id,
     source_processing_receipt,
 )
+from memforge.retrieval.intents import RANKED_RETRIEVAL_INTENTS
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT,
@@ -1050,6 +1051,12 @@ def sync(ctx, source: str | None):
 @click.argument("query", required=False, default="")
 @click.option("--top-k", default=10, show_default=True, type=int, help="Maximum number of results.")
 @click.option(
+    "--intent",
+    type=click.Choice(RANKED_RETRIEVAL_INTENTS),
+    default=None,
+    help="Optional ranked retrieval goal hint.",
+)
+@click.option(
     "--type",
     "memory_types",
     multiple=True,
@@ -1078,6 +1085,7 @@ def search(
     ctx,
     query: str,
     top_k: int,
+    intent: str | None,
     memory_types: tuple[str, ...],
     source_ids: tuple[str, ...],
     entities: tuple[str, ...],
@@ -1097,6 +1105,8 @@ def search(
         "top_k": top_k,
         "include_superseded": include_superseded,
     }
+    if intent is not None:
+        kwargs["intent"] = intent
     if memory_types:
         kwargs["memory_types"] = list(memory_types)
     if source_ids:
