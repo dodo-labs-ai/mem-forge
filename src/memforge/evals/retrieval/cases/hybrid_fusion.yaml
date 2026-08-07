@@ -12,11 +12,19 @@
     vector:
       - memory_id: mem-cross-language-lock
         score: 0.99
-      - memory_id: mem-lexical-lock-distractor
-        score: 0.8
     bm25_content:
       - memory_id: mem-lexical-lock-distractor
         score: 10.0
+      - memory_id: mem-lexical-lock-distractor-2
+        score: 9.0
+      - memory_id: mem-lexical-lock-distractor-3
+        score: 8.0
+      - memory_id: mem-lexical-lock-distractor-4
+        score: 7.0
+      - memory_id: mem-lexical-lock-distractor-5
+        score: 6.0
+      - memory_id: mem-lexical-lock-distractor-6
+        score: 5.0
   scope:
     user_id: eval-user
     include_private: false
@@ -30,10 +38,59 @@
       mem-cross-language-lock: 3
       mem-lexical-lock-distractor: 1
     max_rank:
-      mem-cross-language-lock: 5
+      mem-cross-language-lock: 1
     required_channels:
       mem-cross-language-lock:
         - vector
       mem-lexical-lock-distractor:
         - bm25_content
-    required_profile: semantic_lookup
+    required_intent: general_hybrid
+
+- id: unicode_query_vector_target_with_lexical_distractor
+  family: hybrid_vector_recall
+  description: a Unicode query with the same meaning preserves the same vector target above lexical distractors
+  query: 编辑被其他用户锁定的规则时，为什么系统只返回通用错误
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  control_case_id: vector_target_with_lexical_distractor
+  parity_gate: hard
+  ranked_channel_results:
+    vector:
+      - memory_id: mem-cross-language-lock
+        score: 0.99
+    bm25_content:
+      - memory_id: mem-lexical-lock-distractor
+        score: 10.0
+      - memory_id: mem-lexical-lock-distractor-2
+        score: 9.0
+      - memory_id: mem-lexical-lock-distractor-3
+        score: 8.0
+      - memory_id: mem-lexical-lock-distractor-4
+        score: 7.0
+      - memory_id: mem-lexical-lock-distractor-5
+        score: 6.0
+      - memory_id: mem-lexical-lock-distractor-6
+        score: 5.0
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-cross-language-lock: 3
+      mem-lexical-lock-distractor: 1
+    max_rank:
+      mem-cross-language-lock: 1
+    required_channels:
+      mem-cross-language-lock:
+        - vector
+      mem-lexical-lock-distractor:
+        - bm25_content
+    required_intent: general_hybrid

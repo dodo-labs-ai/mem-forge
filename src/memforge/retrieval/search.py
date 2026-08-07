@@ -1,7 +1,7 @@
 """Hybrid search engine for MemForge.
 
 Vector, content BM25/FTS, metadata lexical, and entity-graph channels run in
-parallel, then fuse through query-adaptive weighted RRF before the final ranking
+parallel, then fuse through intent-specific weighted RRF before the final ranking
 and source/time page slicing.
 
 Architecture reference: docs/architecture.md Section 10.
@@ -28,6 +28,12 @@ from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
+from memforge.retrieval.intents import (
+    RankedRetrievalIntent,
+    fusion_weights,
+    resolve_retrieval_intent,
+    validate_requested_intent,
+)
 from memforge.retrieval.query_analyzer import QueryAnalysis
 from memforge.retrieval.rank_fusion import (
     RankedChannelItem,
@@ -64,34 +70,7 @@ W_RECENCY_DEFAULT = 0.15
 # normalization and clamped at zero so a penalized candidate cannot go negative.
 CROSS_PROJECT_PENALTY = 0.20
 REPO_AFFINITY_BOOST = 0.05
-QUERY_ADAPTIVE_RRF_K = 60
-
-_PROFILE_WEIGHTS: dict[str, dict[str, float]] = {
-    "identifier_lookup": {
-        "vector": 0.15,
-        "bm25_content": 0.25,
-        "metadata_lexical": 0.50,
-        "graph": 0.10,
-    },
-    "semantic_lookup": {
-        "vector": 0.45,
-        "bm25_content": 0.30,
-        "metadata_lexical": 0.15,
-        "graph": 0.10,
-    },
-    "graph_exploration": {
-        "vector": 0.25,
-        "bm25_content": 0.25,
-        "metadata_lexical": 0.20,
-        "graph": 0.30,
-    },
-    "lexical_lookup": {
-        "vector": 0.25,
-        "bm25_content": 0.35,
-        "metadata_lexical": 0.30,
-        "graph": 0.10,
-    },
-}
+DEFAULT_RRF_K = 60
 
 _METADATA_SUBCHANNEL_WEIGHTS = {
     "bm25_metadata_tokens": 0.60,
@@ -100,38 +79,11 @@ _METADATA_SUBCHANNEL_WEIGHTS = {
 }
 _METADATA_IDENTIFIER_CHANNELS = {"bm25_metadata_tokens", "metadata_alias"}
 
-_QUESTION_WORDS = {
-    "what", "why", "how", "when", "where", "which", "who", "whom", "whose",
-}
-_EXPLANATORY_VERBS = {
-    "explain", "understand", "diagnose", "debug", "troubleshoot", "analyze",
-    "compare", "cause", "causes", "caused", "reason", "reasons", "affect",
-    "affects", "affected",
-}
-_SENTENCE_CONNECTORS = {
-    "the", "a", "an", "to", "for", "of", "in", "on", "with", "after",
-    "before", "because", "when", "while", "if", "does", "did", "is", "are",
-}
-_GRAPH_ACTION_TERMS = {
-    "related", "relation", "relationship", "dependency", "dependencies",
-    "depends", "impact", "impacts", "similar", "connected", "owner",
-    "neighborhood", "upstream", "downstream", "risk", "risks", "affected",
-}
-_GRAPH_INVENTORY_TERMS = {
-    "related", "nearby", "neighbor", "neighbors", "neighborhood", "connected",
-    "around", "dependencies", "upstream", "downstream", "affected", "impact",
-    "risks", "list", "show", "find",
-}
-_METADATA_LOOKUP_MODIFIER_TOKENS = {
-    "bug", "bugs", "find", "issue", "issues", "jira", "list", "pr", "prs",
-    "pull", "request", "requests", "search", "show", "stories", "story",
-    "task", "tasks", "ticket", "tickets",
-}
-_METADATA_IDENTIFIER_COVERAGE_THRESHOLD = 0.75
 _EXTERNAL_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b|#\d+\b|\bINC\d+\b", re.IGNORECASE)
 _CODE_SYMBOL_RE = re.compile(
     r"(?:\b[A-Za-z][A-Za-z0-9]*[./][A-Za-z0-9_./-]+\b)"
     r"|(?:\b[A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*\b)"
+    r"|(?:\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b)"
 )
 
 
@@ -153,12 +105,8 @@ class _RankedCandidate:
 
 @dataclass(frozen=True)
 class _QueryFeatures:
-    tokens: tuple[str, ...]
     has_external_id: bool
     has_code_symbol: bool
-    code_symbol_terms: tuple[str, ...]
-    natural_language_ratio: float
-    graph_intent: float
 
 
 @dataclass(frozen=True)
@@ -209,136 +157,38 @@ def _recency_score(age_days: float, half_life: float = 90.0) -> float:
     return math.exp(-0.693 * age_days / half_life)
 
 
-def _query_tokens(query: str) -> tuple[str, ...]:
-    normalized = unicodedata.normalize("NFKC", query).lower()
-    return tuple(token for token in re.split(r"[^0-9a-z]+", normalized) if token)
-
-
-def _query_code_symbol_terms(query: str) -> tuple[str, ...]:
-    terms: list[str] = []
-    seen: set[str] = set()
-    for match in _CODE_SYMBOL_RE.finditer(query):
-        for token in _query_tokens(match.group(0)):
-            if token not in seen:
-                terms.append(token)
-                seen.add(token)
-    return tuple(terms)
-
-
 def _compute_query_features(
     query: str,
-    *,
-    graph_candidates: list[EntityLinkCandidate],
 ) -> _QueryFeatures:
-    tokens = _query_tokens(query)
-    code_symbol_terms = _query_code_symbol_terms(query)
-    token_set = set(tokens)
-    has_question_word = bool(token_set & _QUESTION_WORDS) or "?" in query
-    has_explanatory_verb = bool(token_set & _EXPLANATORY_VERBS)
-    has_sentence_shape = len(tokens) >= 5 and bool(token_set & _SENTENCE_CONNECTORS)
-    natural_language_ratio = min(
-        1.0,
-        min(0.30, len(tokens) / 25)
-        + (0.15 if has_question_word else 0.0)
-        + (0.15 if has_explanatory_verb else 0.0)
-        + (0.10 if has_sentence_shape else 0.0),
-    )
-
-    if graph_candidates:
-        graph_action_count = len(token_set & _GRAPH_ACTION_TERMS)
-        graph_intent = min(
-            1.0,
-            0.35 * graph_action_count
-            + (0.25 if token_set & _GRAPH_INVENTORY_TERMS else 0.0),
-        )
-    else:
-        graph_intent = 0.0
-
     return _QueryFeatures(
-        tokens=tokens,
         has_external_id=bool(_EXTERNAL_ID_RE.search(query)),
-        has_code_symbol=bool(code_symbol_terms),
-        code_symbol_terms=code_symbol_terms,
-        natural_language_ratio=natural_language_ratio,
-        graph_intent=graph_intent,
+        has_code_symbol=bool(_CODE_SYMBOL_RE.search(query)),
     )
 
 
-def _metadata_identifier_core_tokens(tokens: tuple[str, ...]) -> set[str]:
-    return {
-        token for token in tokens
-        if len(token) > 1
-        and token not in _METADATA_LOOKUP_MODIFIER_TOKENS
-        and token not in _QUESTION_WORDS
-        and token not in _SENTENCE_CONNECTORS
-    }
-
-
-def _metadata_identifier_core_query(query: str) -> str:
-    tokens = _query_tokens(query)
-    core_tokens = [
-        token for token in tokens
-        if len(token) > 1
-        and token not in _METADATA_LOOKUP_MODIFIER_TOKENS
-        and token not in _QUESTION_WORDS
-        and token not in _SENTENCE_CONNECTORS
-    ]
-    deduped_core_tokens = tuple(dict.fromkeys(core_tokens))
-    if len(deduped_core_tokens) < 2:
-        return query
-    return " ".join(deduped_core_tokens)
-
-
-def _metadata_identifier_coverage(
-    query_tokens: tuple[str, ...],
-    matched_text: tuple[str, ...],
-) -> float:
-    core_tokens = _metadata_identifier_core_tokens(query_tokens)
-    if len(core_tokens) < 2:
-        return 0.0
-    matched_tokens = set(_query_tokens(" ".join(matched_text)))
-    return len(core_tokens & matched_tokens) / len(core_tokens)
-
-
-def _metadata_supports_code_symbol(
-    features: _QueryFeatures,
-    matched_text: tuple[str, ...],
-) -> bool:
-    if not features.code_symbol_terms:
-        return False
-    matched_tokens = set(_query_tokens(" ".join(matched_text)))
-    return set(features.code_symbol_terms).issubset(matched_tokens)
-
-
-def _select_ranking_profile(
-    features: _QueryFeatures,
-    *,
+def _has_strong_metadata_identity(
+    query: str,
     metadata_hits: list[KeywordCandidate],
-    graph_candidates: list[EntityLinkCandidate],
-) -> str:
-    if features.has_external_id:
-        return "identifier_lookup"
-    if any(hit.channel in _METADATA_IDENTIFIER_CHANNELS for hit in metadata_hits):
-        if any(
-            _metadata_identifier_coverage(features.tokens, hit.matched_text)
-            >= _METADATA_IDENTIFIER_COVERAGE_THRESHOLD
-            or (
-                features.has_code_symbol
-                and _metadata_supports_code_symbol(features, hit.matched_text)
-            )
-            for hit in metadata_hits
-            if hit.channel in _METADATA_IDENTIFIER_CHANNELS and hit.matched_text
-        ):
-            return "identifier_lookup"
-    if (
-        graph_candidates
-        and features.graph_intent >= 0.65
-        and features.graph_intent >= features.natural_language_ratio + 0.15
-    ):
-        return "graph_exploration"
-    if features.natural_language_ratio >= 0.55:
-        return "semantic_lookup"
-    return "lexical_lookup"
+) -> bool:
+    """Require an exact metadata field, without language-specific query parsing."""
+
+    normalized_query = _normalize_identity_text(query)
+    if not normalized_query:
+        return False
+    return any(
+        normalized_query == _normalize_identity_text(field)
+        for hit in metadata_hits
+        if hit.channel in _METADATA_IDENTIFIER_CHANNELS
+        for matched_text in hit.matched_text
+        for field in matched_text.split("|")
+    )
+
+
+def _normalize_identity_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(
+        "".join(character if character.isalnum() else " " for character in normalized).split()
+    )
 
 
 def _metadata_lexical_channel(
@@ -370,10 +220,10 @@ def _weighted_rrf_fusion(
     content_results: list[tuple[str, float]],
     metadata_results: list[tuple[str, float]],
     graph_contributions: dict[str, _GraphContribution],
-    profile: str,
+    intent: RankedRetrievalIntent,
     k: int,
 ) -> list[_RankedCandidate]:
-    weights = _PROFILE_WEIGHTS[profile]
+    weights = fusion_weights(intent)
     fused = weighted_reciprocal_rank_fusion(
         channels={
             "vector": tuple(
@@ -407,7 +257,7 @@ def _weighted_rrf_fusion(
             rrf_score=item.score,
             retrieval_evidence={
                 "rank_fusion": {
-                    "profile": profile,
+                    "intent": intent,
                     "rrf_score": item.score,
                     "contributions": [
                         asdict(contribution)
@@ -661,6 +511,7 @@ class SearchEngine:
         source_filter: MemorySourceFilter | None = None,
         request_scope: AccessScope | None = None,
         offset: int = 0,
+        intent: RankedRetrievalIntent | None = None,
     ) -> dict:
         """Unified search: memories (primary) + documents (fallback).
 
@@ -678,11 +529,14 @@ class SearchEngine:
             ``total_candidates``: number of unique memories seen across all channels.
             ``retrieval_time_ms``: wall-clock milliseconds for the entire search.
         """
+        requested_intent = validate_requested_intent(intent)
         t0 = time.monotonic()
         scope = request_scope or _default_access_scope(include_superseded)
         combined_source_filter = source_filter
 
         if not query.strip():
+            if requested_intent is not None:
+                raise ValueError("retrieval intent requires a ranked query")
             if (
                 (combined_source_filter is None or combined_source_filter.is_empty())
                 and (time_range is None or time_range.is_empty())
@@ -832,25 +686,27 @@ class SearchEngine:
             else:
                 logger.warning("Unknown retrieval channel result ignored: %s", name)
 
-        features = _compute_query_features(query, graph_candidates=graph_candidates)
-        ranking_profile = _select_ranking_profile(
-            features,
-            metadata_hits=metadata_hits,
-            graph_candidates=graph_candidates,
+        features = _compute_query_features(query)
+        intent_resolution = resolve_retrieval_intent(
+            requested_intent,
+            has_external_id=features.has_external_id,
+            has_code_symbol=features.has_code_symbol,
+            has_strong_metadata_identity=_has_strong_metadata_identity(query, metadata_hits),
+            has_traversable_entity=bool(graph_candidates),
         )
         metadata_channel = _metadata_lexical_channel(
             metadata_hits,
-            k=getattr(self._config, "rrf_k", QUERY_ADAPTIVE_RRF_K),
+            k=getattr(self._config, "rrf_k", DEFAULT_RRF_K),
         )
 
-        # ----- 5. Fuse via query-adaptive Weighted RRF, then apply source-of-truth re-checks -----
+        # ----- 5. Fuse via intent-specific Weighted RRF, then apply source-of-truth re-checks -----
         fused = _weighted_rrf_fusion(
             vector_results=vector_results,
             content_results=content_results,
             metadata_results=metadata_channel,
             graph_contributions=graph_contributions,
-            profile=ranking_profile,
-            k=getattr(self._config, "rrf_k", QUERY_ADAPTIVE_RRF_K),
+            intent=intent_resolution.resolved_intent,
+            k=getattr(self._config, "rrf_k", DEFAULT_RRF_K),
         )
         self._attach_retrieval_evidence(fused, metadata_evidence)
         fused = await self._filter_candidates_by_status(fused, scope)
@@ -891,9 +747,9 @@ class SearchEngine:
                 ],
                 "entity_linking_channels": list(analysis.entity_linking_channels),
                 "unmatched_explicit_entities": list(analysis.unmatched_explicit_entities),
-                "ranking_profile": ranking_profile,
                 "strategies_used": channel_names,
             },
+            "retrieval_intent": intent_resolution.to_dict(),
             "results": results,
             "total_candidates": total_candidates,
             "candidate_count_kind": "windowed",
@@ -967,7 +823,7 @@ class SearchEngine:
         time_range: MemoryTimeRange | None,
     ) -> list[KeywordCandidate]:
         """Query the source-metadata keyword channel."""
-        sanitized_query = sanitize_fts_query(_metadata_identifier_core_query(query))
+        sanitized_query = sanitize_fts_query(query)
         if not sanitized_query:
             return []
         return await self._keyword.search_metadata(

@@ -36,6 +36,7 @@ class CaseRunResult:
     scores: dict[str, float]
     total_candidates: int
     query_analysis: dict[str, Any]
+    retrieval_intent: dict[str, Any] | None
     evidence_by_memory: dict[str, dict[str, Any]]
 
     def rank(self, memory_id: str) -> int:
@@ -51,6 +52,7 @@ class CaseRunResult:
             "scores": self.scores,
             "total_candidates": self.total_candidates,
             "query_analysis": self.query_analysis,
+            "retrieval_intent": self.retrieval_intent,
             "evidence_by_memory": self.evidence_by_memory,
         }
 
@@ -140,6 +142,7 @@ async def run_sqlite_case_set(
                 entities=list(case.entities),
                 source_filter=_source_filter_from_case(case),
                 request_scope=case.scope.to_access_scope(),
+                intent=case.requested_intent,
             )
         finally:
             await db.close()
@@ -169,6 +172,11 @@ def _case_run_result(case_id: str, result: dict[str, Any]) -> CaseRunResult:
         scores=_stable_run_scores(ranked_ids),
         total_candidates=int(result["total_candidates"]),
         query_analysis=dict(result["query_analysis"]),
+        retrieval_intent=(
+            dict(result["retrieval_intent"])
+            if isinstance(result.get("retrieval_intent"), dict)
+            else None
+        ),
         evidence_by_memory={
             item.memory_id: dict(item.retrieval_evidence or {})
             for item in search_results
@@ -188,13 +196,13 @@ def _assert_case(case: RetrievalCase, result: CaseRunResult) -> list[HardFailure
                 ),
             )
         )
-    if case.expected.required_profile is not None:
-        profile = result.query_analysis.get("ranking_profile")
-        if profile != case.expected.required_profile:
+    if case.expected.required_intent is not None:
+        resolved_intent = (result.retrieval_intent or {}).get("resolved_intent")
+        if resolved_intent != case.expected.required_intent:
             failures.append(
                 _failure(
                     case,
-                    f"expected ranking_profile={case.expected.required_profile}, got {profile}",
+                    f"expected resolved_intent={case.expected.required_intent}, got {resolved_intent}",
                 )
             )
     for memory_id, max_rank in case.expected.max_rank.items():

@@ -24,7 +24,7 @@
     required_channels:
       mem-blocker-hint:
         - bm25_metadata_tokens
-    required_profile: identifier_lookup
+    required_intent: known_item
 
 - id: metadata_title_exact
   family: exact_title_lookup
@@ -52,7 +52,7 @@
     required_channels:
       mem-access-review:
         - bm25_metadata_tokens
-    required_profile: identifier_lookup
+    required_intent: known_item
 
 - id: compact_trigram_metadata_recall
   family: compact_lexical_recall

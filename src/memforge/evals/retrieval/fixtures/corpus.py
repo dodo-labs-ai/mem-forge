@@ -27,6 +27,7 @@ async def seed_sqlite_fixture(
         await _seed_sources(db, fixture)
         await _seed_documents(db, fixture)
         await _seed_memories(db, fixture)
+        await _seed_entities(db, fixture)
         await _seed_memory_sources(db, fixture)
         await _seed_source_subscriptions(db, fixture)
     except Exception:
@@ -99,6 +100,21 @@ async def _seed_memories(db: Database, fixture: Mapping[str, Any]) -> None:
                 created_at=FIXED_NOW,
                 updated_at=FIXED_NOW,
             )
+        )
+
+
+async def _seed_entities(db: Database, fixture: Mapping[str, Any]) -> None:
+    entity_ids: dict[str, int] = {}
+    for entity in fixture.get("entities") or ():
+        canonical_name = str(entity["canonical_name"])
+        entity_ids[canonical_name] = await db.upsert_entity(
+            canonical_name,
+            str(_value_or_default(entity, "display_name", canonical_name)),
+        )
+    for link in fixture.get("memory_entities") or ():
+        await db.link_memory_entity(
+            str(link["memory_id"]),
+            entity_ids[str(link["entity"])],
         )
 
 

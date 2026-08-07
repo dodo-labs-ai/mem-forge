@@ -16,6 +16,7 @@ def test_retrieval_case_resources_are_importable_from_package() -> None:
     assert case_dir.joinpath("manifest.yaml").is_file()
     assert case_dir.joinpath("metadata_lexical.yaml").is_file()
     assert case_dir.joinpath("hybrid_fusion.yaml").is_file()
+    assert case_dir.joinpath("intent_resolution.yaml").is_file()
 
 
 def test_load_case_set_validates_manifest_cases_and_scope_shape() -> None:
@@ -24,16 +25,22 @@ def test_load_case_set_validates_manifest_cases_and_scope_shape() -> None:
     case_set = load_case_set("retrieval-core-v1")
 
     assert case_set.manifest.case_set_id == "retrieval-core-v1"
-    assert case_set.manifest.case_schema_version == 2
+    assert case_set.manifest.case_schema_version == 3
     assert case_set.case_ids == (
         "exact_external_id_lookup",
         "metadata_title_exact",
         "compact_trigram_metadata_recall",
         "queryless_source_listing",
         "vector_target_with_lexical_distractor",
+        "unicode_query_vector_target_with_lexical_distractor",
+        "requested_general_hybrid_overrides_identity",
+        "requested_known_item_is_honored",
+        "requested_relationship_falls_back",
+        "requested_relationship_is_honored",
     )
 
     title_case = case_set.get_case("metadata_title_exact")
+    assert title_case.expected.required_intent == "known_item"
     assert title_case.expected.required_channels["mem-access-review"] == ("bm25_metadata_tokens",)
     assert set(title_case.scope.raw) == {field.name for field in fields(AccessScope)}
 
@@ -137,6 +144,26 @@ def test_case_set_validation_rejects_unknown_case_fields() -> None:
     cases["cases.yaml"][0]["required_channel"] = ["bm25_metadata_tokens"]
 
     with pytest.raises(CaseSetValidationError, match="Unknown fields"):
+        load_case_set_from_data(manifest, cases)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "value"),
+    [
+        (("requested_intent",), "semantic_lookup"),
+        (("expected", "required_intent"), "lexical_lookup"),
+    ],
+)
+def test_case_set_validation_rejects_unknown_ranked_intent(field_path, value) -> None:
+    from memforge.evals.retrieval import CaseSetValidationError, load_case_set_from_data
+
+    manifest, cases = _minimal_valid_case_set_data()
+    target = cases["cases.yaml"][0]
+    for field_name in field_path[:-1]:
+        target = target[field_name]
+    target[field_path[-1]] = value
+
+    with pytest.raises(CaseSetValidationError, match="unsupported retrieval intent"):
         load_case_set_from_data(manifest, cases)
 
 
@@ -479,7 +506,12 @@ def test_hash_case_set_module_reports_stale_manifest_on_check(tmp_path) -> None:
     source_case_dir = resources.files("memforge.evals.retrieval.cases")
     case_dir = tmp_path / "cases"
     case_dir.mkdir()
-    for name in ("manifest.yaml", "metadata_lexical.yaml", "hybrid_fusion.yaml"):
+    for name in (
+        "manifest.yaml",
+        "metadata_lexical.yaml",
+        "hybrid_fusion.yaml",
+        "intent_resolution.yaml",
+    ):
         case_dir.joinpath(name).write_text(
             source_case_dir.joinpath(name).read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -522,7 +554,12 @@ def test_hash_case_set_module_writes_manifest_sha(tmp_path, monkeypatch) -> None
     source_case_dir = resources.files("memforge.evals.retrieval.cases")
     case_dir = tmp_path / "cases"
     case_dir.mkdir()
-    for name in ("manifest.yaml", "metadata_lexical.yaml", "hybrid_fusion.yaml"):
+    for name in (
+        "manifest.yaml",
+        "metadata_lexical.yaml",
+        "hybrid_fusion.yaml",
+        "intent_resolution.yaml",
+    ):
         case_dir.joinpath(name).write_text(
             source_case_dir.joinpath(name).read_text(encoding="utf-8"),
             encoding="utf-8",

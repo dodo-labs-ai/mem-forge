@@ -77,6 +77,7 @@ SERVER_INSTRUCTIONS = (
     "tool parameter."
 )
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
+RANKED_RETRIEVAL_INTENTS = ["general_hybrid", "known_item", "relationship"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 CURRENT_REPO_ONLY_DISABLED_ERROR = (
     "current_repo_only is not exposed by this MCP search tool. Omit the filter "
@@ -85,6 +86,7 @@ CURRENT_REPO_ONLY_DISABLED_ERROR = (
 SEARCH_ALLOWED_KEYS = frozenset(
     {
         "query",
+        "intent",
         "source_filter",
         "time_range",
         "top_k",
@@ -202,18 +204,30 @@ TOOLS: list[dict[str, Any]] = [
             "Search visible Memories. For source-specific requests, call list_sources first and "
             "pass exact source_ids; never guess IDs. For broad or cross-source requests, omit "
             "source_filter; use time_range only when explicitly requested. Use list_recent_memories "
-            "for deterministic source/time listings. Queryless compatibility uses total_candidates "
-            "and offset; never invent filler queries like 'updates'. Ranked queries are not "
-            "exhaustive. Call get_memory for provenance."
+            "for deterministic source/time listings. Send a self-contained query in the user's language; "
+            "preserve identifiers and domain terms, without retrieval-only translation or keyword stuffing. "
+            "Use total_candidates and offset only within the ranked window; ranked queries are not exhaustive. "
+            "Call get_memory for provenance."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
+                    "minLength": 1,
                     "description": (
-                        "Natural language search query. Optional when source_filter or time_range "
-                        "is provided and the user wants a deterministic list rather than semantic ranking."
+                        "Required self-contained natural-language query in the user's language. "
+                        "Resolve conversational ellipsis before calling while preserving exact identifiers "
+                        "and domain terms."
+                    ),
+                },
+                "intent": {
+                    "type": "string",
+                    "enum": RANKED_RETRIEVAL_INTENTS,
+                    "description": (
+                        "Optional goal hint from conversation context: general_hybrid for open-ended recall, "
+                        "known_item for a specifically named item, or relationship for connected-memory "
+                        "exploration. Omit when unsure; this never sets source or time facets."
                     ),
                 },
                 "repository_context": REPOSITORY_CONTEXT_SCHEMA,
@@ -282,9 +296,9 @@ TOOLS: list[dict[str, Any]] = [
                     "minimum": SEARCH_TOP_K_MIN,
                     "maximum": SEARCH_TOP_K_MAX,
                     "description": (
-                        "Page size for search results. Default is 10 for ordinary semantic search, "
-                        "not a hard cap; use a larger value up to 50 for complete list, enumeration, or inventory "
-                        "tasks, then continue with offset when total_candidates is still larger."
+                        "Page size within the bounded ranked window. Default is 10; increasing it up to 50 "
+                        "does not make ranked retrieval exhaustive. Use list_recent_memories for deterministic "
+                        "time/source enumeration."
                     ),
                 },
                 "offset": {
@@ -292,9 +306,8 @@ TOOLS: list[dict[str, Any]] = [
                     "default": 0,
                     "minimum": 0,
                     "description": (
-                        "Zero-based result offset for the next page. Use when total_candidates "
-                        "is greater than the number of returned results and the user asked for a "
-                        "complete list or inventory."
+                        "Zero-based offset within the ranked window. It paginates ranked candidates only "
+                        "and must not be treated as exhaustive enumeration."
                     ),
                 },
                 "entities": {
@@ -310,6 +323,7 @@ TOOLS: list[dict[str, Any]] = [
                     ),
                 },
             },
+            "required": ["query"],
             "additionalProperties": False,
         },
     },
@@ -1050,6 +1064,9 @@ def _search_args_with_context(
             body.pop("entities")
         else:
             body["entities"] = normalized_entities
+    intent = body.get("intent")
+    if intent is not None and intent not in RANKED_RETRIEVAL_INTENTS:
+        raise ValueError("intent must be general_hybrid, known_item, or relationship")
     body["include_private"] = True
     body["include_superseded"] = False
     if repo_identifier:
@@ -1077,8 +1094,12 @@ def _search_args_with_context(
     if time_range is not None:
         body["time_range"] = _validate_time_range(time_range)
         has_deterministic_filter = True
-    if not query and not has_deterministic_filter:
-        raise ValueError("search.query may be omitted only when source_filter or time_range is provided")
+    if not query:
+        if has_deterministic_filter:
+            raise ValueError(
+                "search.query is required; use list_recent_memories for deterministic listings"
+            )
+        raise ValueError("search.query is required")
     return body
 
 
@@ -1370,6 +1391,18 @@ def _compact_search_response(payload: dict[str, Any]) -> dict[str, Any]:
             for result in results
             if isinstance(result, dict)
         ]
+
+    retrieval_intent = payload.get("retrieval_intent")
+    if isinstance(retrieval_intent, dict):
+        compact["retrieval_intent"] = {
+            key: retrieval_intent.get(key)
+            for key in (
+                "requested_intent",
+                "resolved_intent",
+                "intent_source",
+                "fallback_reason",
+            )
+        }
 
     for key in (
         "total_candidates",

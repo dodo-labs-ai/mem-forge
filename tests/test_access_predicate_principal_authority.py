@@ -121,18 +121,33 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
                     "include_private": True,
                 },
             )
+            rejected_intent = client.post(
+                "/api/v1/memories/search",
+                json={
+                    "query": "meeting notes",
+                    "intent": "semantic_lookup",
+                },
+            )
             response = client.post(
                 "/api/v1/memories/search",
                 json={
                     "query": "meeting notes",
+                    "intent": "known_item",
                     "top_k": 10,
                     "include_private": True,
                 },
             )
 
         assert rejected.status_code == 422, rejected.text
+        assert rejected_intent.status_code == 422, rejected_intent.text
         assert response.status_code == 200, response.text
         body = response.json()
+        assert body["retrieval_intent"] == {
+            "requested_intent": "known_item",
+            "resolved_intent": "known_item",
+            "intent_source": "requested",
+            "fallback_reason": None,
+        }
         ids = {row["memory_id"] for row in body["results"]}
         assert "p-u2-private" not in ids
         assert "p-shared" in ids

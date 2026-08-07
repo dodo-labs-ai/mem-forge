@@ -105,6 +105,7 @@ from memforge.provenance import (
     select_document_artifact,
 )
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
+from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.runtime import (
     DefaultRuntimeProvider,
     RuntimeHealthComponent,
@@ -782,6 +783,7 @@ class MemorySearchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = ""
+    intent: RankedRetrievalIntent | None = None
     memory_types: list[str] | None = None
     time_range: MemoryTimeRangeRequest | None = None
     entities: list[str] | None = None
@@ -823,6 +825,8 @@ class MemorySearchRequest(BaseModel):
     def _validate_query_or_deterministic_filter(self) -> "MemorySearchRequest":
         if self.query.strip():
             return self
+        if self.intent is not None:
+            raise ValueError("intent requires a ranked query")
         has_source_filter = self.source_filter is not None and bool(
             (self.source_filter.source_ids or [])
             or (self.source_filter.clients or [])
@@ -3529,6 +3533,7 @@ def create_admin_app(
                 source_filter=(req.source_filter.to_source_filter() if req.source_filter is not None else None),
                 request_scope=scope,
                 offset=req.offset,
+                intent=req.intent,
             )
             return _json_ready(result)
         except HTTPException:

@@ -15,6 +15,7 @@ from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from memforge.api_target import MemForgeTarget
+from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.sync_progress import normalize_sync_progress_snapshot
 
 
@@ -80,6 +81,7 @@ class ToolClient:
         self,
         *,
         query: str = "",
+        intent: RankedRetrievalIntent | None = None,
         top_k: int = 10,
         memory_types: list[str] | tuple[str, ...] | None = None,
         time_range: dict[str, Any] | None = None,
@@ -96,6 +98,8 @@ class ToolClient:
         }
         if query:
             body["query"] = query
+        if intent is not None:
+            body["intent"] = intent
         if memory_types:
             body["memory_types"] = list(memory_types)
         if time_range is not None:

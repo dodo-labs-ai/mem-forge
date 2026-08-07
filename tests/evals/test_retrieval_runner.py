@@ -16,7 +16,7 @@ async def test_sqlite_runner_executes_core_hard_cases(tmp_path) -> None:
         db_path=tmp_path / "retrieval-eval.db",
     )
 
-    assert report.case_count == 5
+    assert report.case_count == 10
     assert report.hard_failures == ()
 
     assert report.case_results["exact_external_id_lookup"].ranked_ids[0] == "mem-blocker-hint"
@@ -28,7 +28,7 @@ async def test_sqlite_runner_executes_core_hard_cases(tmp_path) -> None:
     assert report.run["exact_external_id_lookup"]["mem-blocker-hint"] > 0
     assert report.run["exact_external_id_lookup"]["mem-blocker-hint"] == 1.0
     assert report.to_json()["summary"] == {
-        "case_count": 5,
+        "case_count": 10,
         "hard_failures": 0,
     }
     assert list(tmp_path.glob("retrieval-eval-*.db")) == []
@@ -47,7 +47,7 @@ async def test_sqlite_runner_injects_ranked_channels_and_reports_vector_contribu
     case = report.case_results["vector_target_with_lexical_distractor"]
     assert case.rank("mem-cross-language-lock") <= 5
     assert case.evidence_by_memory["mem-cross-language-lock"]["rank_fusion"] == {
-        "profile": "semantic_lookup",
+        "intent": "general_hybrid",
         "rrf_score": pytest.approx(0.45 / 61),
         "contributions": [
             {
@@ -62,6 +62,45 @@ async def test_sqlite_runner_injects_ranked_channels_and_reports_vector_contribu
     assert report.to_json()["case_results"]["vector_target_with_lexical_distractor"][
         "evidence_by_memory"
     ]["mem-cross-language-lock"]["rank_fusion"]["contributions"][0]["channel"] == "vector"
+
+
+@pytest.mark.asyncio
+async def test_sqlite_runner_reports_requested_and_fallback_intent_resolution(tmp_path) -> None:
+    from memforge.evals.retrieval import load_case_set
+    from memforge.evals.retrieval.runner import run_sqlite_case_set
+
+    report = await run_sqlite_case_set(
+        load_case_set("retrieval-core-v1"),
+        db_path=tmp_path / "retrieval-eval.db",
+    )
+
+    assert report.case_results[
+        "requested_general_hybrid_overrides_identity"
+    ].retrieval_intent == {
+        "requested_intent": "general_hybrid",
+        "resolved_intent": "general_hybrid",
+        "intent_source": "requested",
+        "fallback_reason": None,
+    }
+    assert report.case_results["requested_known_item_is_honored"].retrieval_intent[
+        "resolved_intent"
+    ] == "known_item"
+    assert report.case_results[
+        "requested_relationship_falls_back"
+    ].retrieval_intent == {
+        "requested_intent": "relationship",
+        "resolved_intent": "general_hybrid",
+        "intent_source": "fallback",
+        "fallback_reason": "no_traversable_entity",
+    }
+    assert report.case_results[
+        "requested_relationship_is_honored"
+    ].retrieval_intent == {
+        "requested_intent": "relationship",
+        "resolved_intent": "relationship",
+        "intent_source": "requested",
+        "fallback_reason": None,
+    }
 
 
 def test_search_engine_embedding_provider_degrades_on_exception() -> None:

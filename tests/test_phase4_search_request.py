@@ -43,6 +43,26 @@ def test_invalid_scope_mode_rejected_by_literal():
         MemorySearchRequest(query="test", scope_mode="bogus")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("intent", ["general_hybrid", "known_item", "relationship"])
+def test_search_request_accepts_ranked_retrieval_intent(intent):
+    req = MemorySearchRequest(query="payroll lock behavior", intent=intent)
+
+    assert req.intent == intent
+
+
+def test_search_request_rejects_unknown_retrieval_intent():
+    with pytest.raises(Exception):
+        MemorySearchRequest(query="payroll lock behavior", intent="semantic_lookup")
+
+
+def test_queryless_compatibility_rejects_ranked_retrieval_intent():
+    with pytest.raises(Exception, match="intent requires a ranked query"):
+        MemorySearchRequest(
+            intent="general_hybrid",
+            source_filter={"source_ids": ["src-mounttai"]},
+        )
+
+
 def test_source_filter_accepts_exact_agent_session_facets():
     req = MemorySearchRequest(
         query="agent memory last week",

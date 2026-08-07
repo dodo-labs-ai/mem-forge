@@ -1,0 +1,134 @@
+- id: requested_general_hybrid_overrides_identity
+  family: requested_intent
+  description: an explicit general hybrid goal is honored even when the query contains an external id
+  query: SFPAY-179397
+  requested_intent: general_hybrid
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-blocker-hint: 3
+    max_rank:
+      mem-blocker-hint: 5
+    required_channels:
+      mem-blocker-hint:
+        - bm25_metadata_tokens
+    required_intent: general_hybrid
+
+- id: requested_known_item_is_honored
+  family: requested_intent
+  description: an explicit known item goal uses its fixed identity-oriented fusion policy
+  query: Create Access Review in Quarterly Payroll
+  requested_intent: known_item
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-access-review: 3
+    max_rank:
+      mem-access-review: 5
+    required_channels:
+      mem-access-review:
+        - bm25_metadata_tokens
+    required_intent: known_item
+
+- id: requested_relationship_falls_back
+  family: requested_intent
+  description: relationship exploration falls back when scoped entity linking has no traversable entity
+  query: how are rule lock errors connected
+  requested_intent: relationship
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  ranked_channel_results:
+    vector:
+      - memory_id: mem-cross-language-lock
+        score: 0.99
+    bm25_content:
+      - memory_id: mem-lexical-lock-distractor
+        score: 10.0
+      - memory_id: mem-lexical-lock-distractor-2
+        score: 9.0
+      - memory_id: mem-lexical-lock-distractor-3
+        score: 8.0
+      - memory_id: mem-lexical-lock-distractor-4
+        score: 7.0
+      - memory_id: mem-lexical-lock-distractor-5
+        score: 6.0
+      - memory_id: mem-lexical-lock-distractor-6
+        score: 5.0
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-cross-language-lock: 3
+      mem-lexical-lock-distractor: 1
+    max_rank:
+      mem-cross-language-lock: 1
+    required_channels:
+      mem-cross-language-lock:
+        - vector
+    required_intent: general_hybrid
+
+- id: requested_relationship_is_honored
+  family: requested_intent
+  description: relationship exploration remains graph-primary when an explicit scoped entity is traversable
+  query: explain memories connected to rule locking
+  requested_intent: relationship
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities:
+    - rule locking
+  fixture_variant: default
+  parity_gate: hard
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-cross-language-lock: 3
+    max_rank:
+      mem-cross-language-lock: 5
+    required_channels:
+      mem-cross-language-lock:
+        - graph
+    required_intent: relationship

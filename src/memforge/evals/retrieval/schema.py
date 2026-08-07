@@ -14,6 +14,7 @@ from typing import Any, Mapping
 import yaml
 
 from memforge.storage.adapters.context import AccessScope
+from memforge.retrieval.intents import RankedRetrievalIntent, validate_requested_intent
 
 
 class CaseSetValidationError(ValueError):
@@ -80,7 +81,7 @@ class ExpectedSpec:
     relevant: Mapping[str, int]
     max_rank: Mapping[str, int]
     required_channels: Mapping[str, tuple[str, ...]]
-    required_profile: str | None = None
+    required_intent: RankedRetrievalIntent | None = None
     total_candidates: int | None = None
 
     def with_required_channels(
@@ -102,7 +103,7 @@ class ExpectedSpec:
                 "relevant",
                 "max_rank",
                 "required_channels",
-                "required_profile",
+                "required_intent",
                 "total_candidates",
             },
         )
@@ -112,8 +113,10 @@ class ExpectedSpec:
         _require_mapping("expected.relevant", relevant_payload)
         _require_mapping("expected.max_rank", max_rank_payload)
         _require_mapping("expected.required_channels", required_channels_payload)
-        if "required_profile" in payload and payload["required_profile"] is not None:
-            _require_str("expected.required_profile", payload["required_profile"])
+        required_intent = _parse_ranked_intent(
+            "expected.required_intent",
+            payload.get("required_intent"),
+        )
         if "total_candidates" in payload and payload["total_candidates"] is not None:
             _require_int("expected.total_candidates", payload["total_candidates"])
         for memory_id, channels in dict(required_channels_payload).items():
@@ -133,7 +136,7 @@ class ExpectedSpec:
                 for key, value in dict(max_rank_payload).items()
             },
             required_channels=required_channels,
-            required_profile=payload.get("required_profile"),
+            required_intent=required_intent,
             total_candidates=payload.get("total_candidates"),
         )
 
@@ -148,8 +151,8 @@ class ExpectedSpec:
                 memory_id: list(channels)
                 for memory_id, channels in self.required_channels.items()
             }
-        if self.required_profile is not None:
-            data["required_profile"] = self.required_profile
+        if self.required_intent is not None:
+            data["required_intent"] = self.required_intent
         if self.total_candidates is not None:
             data["total_candidates"] = self.total_candidates
         return data
@@ -173,6 +176,7 @@ class RetrievalCase:
     entities: tuple[str, ...] = ()
     control_case_id: str | None = None
     parity_gate: str | None = None
+    requested_intent: RankedRetrievalIntent | None = None
     ranked_channel_results: Mapping[str, tuple[RankedChannelResult, ...]] = field(default_factory=dict)
 
     @classmethod
@@ -195,6 +199,7 @@ class RetrievalCase:
                 "expected",
                 "control_case_id",
                 "parity_gate",
+                "requested_intent",
                 "ranked_channel_results",
             },
         )
@@ -231,6 +236,10 @@ class RetrievalCase:
             _require_str("case.control_case_id", data["control_case_id"])
         if data.get("parity_gate") is not None:
             _require_str("case.parity_gate", data["parity_gate"])
+        requested_intent = _parse_ranked_intent(
+            "case.requested_intent",
+            data.get("requested_intent"),
+        )
         ranked_channel_results = _parse_ranked_channel_results(
             data.get("ranked_channel_results")
         )
@@ -249,6 +258,7 @@ class RetrievalCase:
             expected=ExpectedSpec.from_data(data.get("expected")),
             control_case_id=data.get("control_case_id"),
             parity_gate=data.get("parity_gate"),
+            requested_intent=requested_intent,
             ranked_channel_results=ranked_channel_results,
         )
 
@@ -275,6 +285,8 @@ class RetrievalCase:
             data["control_case_id"] = self.control_case_id
         if self.parity_gate is not None:
             data["parity_gate"] = self.parity_gate
+        if self.requested_intent is not None:
+            data["requested_intent"] = self.requested_intent
         if self.ranked_channel_results:
             data["ranked_channel_results"] = {
                 channel: [item.to_data() for item in results]
@@ -473,6 +485,7 @@ def _validate_case_set(case_set: RetrievalCaseSet) -> None:
     for fixture_name, fixture in case_set.manifest.fixtures.items():
         _validate_fixture_source_subscriptions(fixture_name, fixture)
         _validate_fixture_documents(fixture_name, fixture)
+        _validate_fixture_entities(fixture_name, fixture)
 
 
 def _validate_case(case_set: RetrievalCaseSet, case: RetrievalCase) -> None:
@@ -579,6 +592,39 @@ def _validate_fixture_documents(fixture_name: str, fixture: Mapping[str, Any]) -
         )
 
 
+def _validate_fixture_entities(fixture_name: str, fixture: Mapping[str, Any]) -> None:
+    memory_ids = {
+        str(memory["id"]) if isinstance(memory, Mapping) else str(memory)
+        for memory in fixture.get("memories") or ()
+    }
+    entity_names = {
+        str(entity.get("canonical_name"))
+        for entity in fixture.get("entities") or ()
+        if isinstance(entity, Mapping) and str(entity.get("canonical_name") or "").strip()
+    }
+    invalid_entities = [
+        entity
+        for entity in fixture.get("entities") or ()
+        if not isinstance(entity, Mapping)
+        or not str(entity.get("canonical_name") or "").strip()
+    ]
+    if invalid_entities:
+        raise CaseSetValidationError(
+            f"Fixture {fixture_name} entities require canonical_name"
+        )
+    invalid_links = [
+        link
+        for link in fixture.get("memory_entities") or ()
+        if not isinstance(link, Mapping)
+        or str(link.get("memory_id")) not in memory_ids
+        or str(link.get("entity")) not in entity_names
+    ]
+    if invalid_links:
+        raise CaseSetValidationError(
+            f"Fixture {fixture_name} memory_entities reference undeclared memories or entities"
+        )
+
+
 def _validate_scope_shape(case_id: str, scope: Mapping[str, Any]) -> None:
     _require_str(f"case {case_id} scope.user_id", scope["user_id"])
     _require_bool(f"case {case_id} scope.include_private", scope["include_private"])
@@ -622,6 +668,19 @@ def _parse_ranked_channel_results(
             for item in results
         )
     return parsed
+
+
+def _parse_ranked_intent(
+    field_name: str,
+    value: Any,
+) -> RankedRetrievalIntent | None:
+    if value is None:
+        return None
+    _require_str(field_name, value)
+    try:
+        return validate_requested_intent(value)
+    except ValueError as exc:
+        raise CaseSetValidationError(str(exc)) from exc
 
 
 def _case_resource_root() -> resources.abc.Traversable:

@@ -176,31 +176,18 @@ async def test_search_exposes_rank_fusion_contributions_for_each_result(db):
         for item in result["results"]
     }
     assert evidence_by_id[content_target.id]["rank_fusion"] == {
-        "profile": "lexical_lookup",
-        "rrf_score": pytest.approx(0.25 / 62 + 0.35 / 61),
+        "intent": "known_item",
+        "rrf_score": pytest.approx(0.15 / 62 + 0.25 / 61),
         "contributions": [
             {
                 "channel": "vector",
                 "rank": 2,
-                "channel_weight": 0.25,
+                "channel_weight": 0.15,
                 "multiplier": 1.0,
-                "weighted_score": pytest.approx(0.25 / 62),
+                "weighted_score": pytest.approx(0.15 / 62),
             },
             {
                 "channel": "bm25_content",
-                "rank": 1,
-                "channel_weight": 0.35,
-                "multiplier": 1.0,
-                "weighted_score": pytest.approx(0.35 / 61),
-            },
-        ],
-    }
-    assert evidence_by_id[vector_only.id]["rank_fusion"] == {
-        "profile": "lexical_lookup",
-        "rrf_score": pytest.approx(0.25 / 61),
-        "contributions": [
-            {
-                "channel": "vector",
                 "rank": 1,
                 "channel_weight": 0.25,
                 "multiplier": 1.0,
@@ -208,6 +195,105 @@ async def test_search_exposes_rank_fusion_contributions_for_each_result(db):
             },
         ],
     }
+    assert evidence_by_id[vector_only.id]["rank_fusion"] == {
+        "intent": "known_item",
+        "rrf_score": pytest.approx(0.15 / 61),
+        "contributions": [
+            {
+                "channel": "vector",
+                "rank": 1,
+                "channel_weight": 0.15,
+                "multiplier": 1.0,
+                "weighted_score": pytest.approx(0.15 / 61),
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "requested_intent", "resolved_intent", "intent_source"),
+    [
+        ("edit a locked rule", None, "general_hybrid", "default"),
+        ("编辑一个被别人锁住的规则", None, "general_hybrid", "default"),
+        ("persist_cutoff_blocker_hints", None, "known_item", "deterministic"),
+        ("SFPAY-179397", "general_hybrid", "general_hybrid", "requested"),
+        ("how does this relate", "known_item", "known_item", "requested"),
+    ],
+)
+async def test_search_resolves_ranked_intent_without_language_shape_routing(
+    db,
+    query,
+    requested_intent,
+    resolved_intent,
+    intent_source,
+):
+    memory = _memory("m-intent", "Rule locking behavior")
+    await db.insert_memory(memory)
+    adapters = build_sqlite_adapters(db, FakeCollection([memory.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda value: [0.1]
+
+    result = await engine.search(query, intent=requested_intent, top_k=1)
+
+    assert result["retrieval_intent"] == {
+        "requested_intent": requested_intent,
+        "resolved_intent": resolved_intent,
+        "intent_source": intent_source,
+        "fallback_reason": None,
+    }
+    assert result["query_analysis"]["strategies_used"] == [
+        "vector",
+        "bm25_content",
+        "bm25_metadata_tokens",
+    ]
+    evidence = result["results"][0].retrieval_evidence or {}
+    assert evidence["rank_fusion"]["intent"] == resolved_intent
+    assert "profile" not in evidence["rank_fusion"]
+
+
+@pytest.mark.asyncio
+async def test_requested_relationship_falls_back_without_traversable_entity(db):
+    memory = _memory("m-fallback", "General relationship note")
+    await db.insert_memory(memory)
+    adapters = build_sqlite_adapters(db, FakeCollection([memory.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda value: [0.1]
+
+    result = await engine.search("how is this related", intent="relationship", top_k=1)
+
+    assert result["retrieval_intent"] == {
+        "requested_intent": "relationship",
+        "resolved_intent": "general_hybrid",
+        "intent_source": "fallback",
+        "fallback_reason": "no_traversable_entity",
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_unknown_intent_before_adapter_access():
+    engine = SearchEngine(
+        relational=object(),
+        keyword=object(),
+        vector=object(),
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+
+    with pytest.raises(ValueError, match="unsupported retrieval intent"):
+        await engine.search("payroll", intent="semantic_lookup")
 
 
 @pytest.mark.asyncio
@@ -279,14 +365,14 @@ async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch)
             }
         ],
     }
-    assert evidence["rank_fusion"]["profile"] == "identifier_lookup"
+    assert evidence["rank_fusion"]["intent"] == "general_hybrid"
     assert evidence["rank_fusion"]["contributions"] == [
         {
             "channel": "metadata_lexical",
             "rank": 1,
-            "channel_weight": 0.5,
+            "channel_weight": 0.15,
             "multiplier": 1.0,
-            "weighted_score": pytest.approx(0.5 / 61),
+            "weighted_score": pytest.approx(0.15 / 61),
         }
     ]
 
@@ -572,7 +658,7 @@ async def test_explicit_time_range_filters_vector_hits_before_ranking(db, monkey
 
 
 @pytest.mark.asyncio
-async def test_identifier_lookup_prefers_rank_one_metadata_over_vector_plus_content(db, monkeypatch):
+async def test_known_item_prefers_rank_one_metadata_over_vector_plus_content(db, monkeypatch):
     metadata_target = _memory("m-metadata", "Durable source-backed note with different wording")
     content_competitor = _memory("m-content", "ISSUE 12345 lifecycle blocker note from content")
     await db.insert_memory(metadata_target)
@@ -598,13 +684,13 @@ async def test_identifier_lookup_prefers_rank_one_metadata_over_vector_plus_cont
 
     result = await engine.search("ISSUE-12345 lifecycle blocker", top_k=2)
 
-    assert result["query_analysis"]["ranking_profile"] == "identifier_lookup"
+    assert result["retrieval_intent"]["resolved_intent"] == "known_item"
     assert [r.memory_id for r in result["results"]][:2] == ["m-metadata", "m-content"]
     assert result["results"][0].retrieval_evidence["metadata_lexical"]["channel"] == "bm25_metadata_tokens"
 
 
 @pytest.mark.asyncio
-async def test_code_symbol_metadata_hit_uses_identifier_profile(db, monkeypatch):
+async def test_code_symbol_metadata_hit_resolves_known_item(db, monkeypatch):
     metadata_target = _memory("m-code-symbol", "Implementation note with durable source support")
     semantic_competitor = _memory("m-semantic", "Payroll cutoff command retries after lock contention")
     await db.insert_memory(metadata_target)
@@ -638,12 +724,12 @@ async def test_code_symbol_metadata_hit_uses_identifier_profile(db, monkeypatch)
 
     result = await engine.search("PayrollCutoffCommand", top_k=2)
 
-    assert result["query_analysis"]["ranking_profile"] == "identifier_lookup"
+    assert result["retrieval_intent"]["resolved_intent"] == "known_item"
     assert result["results"][0].memory_id == "m-code-symbol"
 
 
 @pytest.mark.asyncio
-async def test_code_symbol_without_metadata_support_does_not_force_identifier_profile(db, monkeypatch):
+async def test_code_symbol_without_metadata_support_resolves_known_item(db, monkeypatch):
     metadata_target = _memory("m-metadata", "Blocker hint Jira task summary")
     semantic_competitor = _memory("m-semantic", "Command implementation retry analysis")
     await db.insert_memory(metadata_target)
@@ -689,25 +775,26 @@ async def test_code_symbol_without_metadata_support_does_not_force_identifier_pr
 
     result = await engine.search("PersistCutOffBlockerHintsCommand blocker hint", top_k=2)
 
-    assert result["query_analysis"]["ranking_profile"] == "lexical_lookup"
+    assert result["retrieval_intent"]["resolved_intent"] == "known_item"
 
 
 @pytest.mark.asyncio
-async def test_metadata_core_token_coverage_ignores_generic_work_item_modifiers(db, monkeypatch):
-    metadata_target = _memory("m-metadata", "Durable source-backed note with different wording")
-    content_competitor = _memory("m-content", "General Jira task discussion")
+@pytest.mark.parametrize(
+    ("query", "matched_title"),
+    [
+        ("edit a rule locked by another user", "Edit a rule locked by another user"),
+        ("编辑一个被其他用户锁定的规则", "编辑一个被其他用户锁定的规则"),
+    ],
+)
+async def test_exact_metadata_channel_evidence_resolves_known_item_independent_of_language(
+    db,
+    monkeypatch,
+    query,
+    matched_title,
+):
+    metadata_target = _memory("m-metadata", "Durable source-backed note")
     await db.insert_memory(metadata_target)
-    await db.insert_memory(content_competitor)
-    await db.upsert_source("src-jira", "jira", "Mount Tai Jira", "{}", access_policy="workspace", owner_user_id="dev")
-    await _document(
-        db,
-        "SFPAY-179397",
-        "src-jira",
-        title="Create Blocker Hint in On Demand Lifecycle Assignment",
-    )
-    await db.add_memory_source("m-metadata", "SFPAY-179397", "jira", None, source_updated_at=None)
-
-    adapters = build_sqlite_adapters(db, FakeCollection(["m-content", "m-metadata"]))
+    adapters = build_sqlite_adapters(db, FakeCollection([metadata_target.id]))
     engine = SearchEngine(
         relational=adapters.relational,
         keyword=adapters.keyword,
@@ -715,16 +802,68 @@ async def test_metadata_core_token_coverage_ignores_generic_work_item_modifiers(
         embed_cfg={},
         config=RetrievalConfig(),
     )
-    engine._get_or_compute_embedding = lambda query: [0.1]
+    engine._get_or_compute_embedding = lambda value: [0.1]
 
-    result = await engine.search("create blocker hint jira task", top_k=2)
+    async def metadata_results(
+        _query,
+        _memory_types,
+        _scope,
+        limit,
+        *,
+        source_filter,
+        time_range,
+    ):
+        return [
+            KeywordCandidate(
+                memory_id=metadata_target.id,
+                score=10.0,
+                channel="bm25_metadata_tokens",
+                matched_text=(matched_title,),
+            )
+        ]
 
-    assert result["query_analysis"]["ranking_profile"] == "identifier_lookup"
-    assert result["results"][0].memory_id == "m-metadata"
+    monkeypatch.setattr(engine, "_bm25_metadata_search", metadata_results)
+
+    result = await engine.search(query, top_k=1)
+
+    assert result["retrieval_intent"]["resolved_intent"] == "known_item"
+    assert result["retrieval_intent"]["intent_source"] == "deterministic"
 
 
 @pytest.mark.asyncio
-async def test_metadata_trigram_hit_does_not_force_identifier_profile(db, monkeypatch):
+async def test_generic_metadata_token_hit_does_not_force_known_item(db, monkeypatch):
+    metadata_target = _memory("m-metadata", "Durable source-backed note")
+    await db.insert_memory(metadata_target)
+    adapters = build_sqlite_adapters(db, FakeCollection([metadata_target.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda value: [0.1]
+
+    async def metadata_results(*args, **kwargs):
+        return [
+            KeywordCandidate(
+                memory_id=metadata_target.id,
+                score=10.0,
+                channel="bm25_metadata_tokens",
+                matched_text=("Payroll Jira | Quarterly payroll review",),
+            )
+        ]
+
+    monkeypatch.setattr(engine, "_bm25_metadata_search", metadata_results)
+
+    result = await engine.search("payroll", top_k=1)
+
+    assert result["retrieval_intent"]["resolved_intent"] == "general_hybrid"
+    assert result["retrieval_intent"]["intent_source"] == "default"
+
+
+@pytest.mark.asyncio
+async def test_metadata_trigram_hit_does_not_force_known_item(db, monkeypatch):
     metadata_target = _memory("m-metadata", "Durable source-backed note")
     await db.insert_memory(metadata_target)
 
@@ -760,11 +899,11 @@ async def test_metadata_trigram_hit_does_not_force_identifier_profile(db, monkey
 
     result = await engine.search("create blocker hint", top_k=1)
 
-    assert result["query_analysis"]["ranking_profile"] == "lexical_lookup"
+    assert result["retrieval_intent"]["resolved_intent"] == "general_hybrid"
 
 
 @pytest.mark.asyncio
-async def test_explanatory_query_uses_semantic_profile_instead_of_lexical_fallback(db, monkeypatch):
+async def test_explanatory_query_defaults_to_general_hybrid(db, monkeypatch):
     memory = _memory("m-semantic", "Payment retry policy after payroll cutoff")
     await db.insert_memory(memory)
 
@@ -783,11 +922,11 @@ async def test_explanatory_query_uses_semantic_profile_instead_of_lexical_fallba
         top_k=1,
     )
 
-    assert result["query_analysis"]["ranking_profile"] == "semantic_lookup"
+    assert result["retrieval_intent"]["resolved_intent"] == "general_hybrid"
 
 
 @pytest.mark.asyncio
-async def test_graph_exploration_downweights_broad_entity_fanout(db, monkeypatch):
+async def test_requested_relationship_downweights_broad_entity_fanout(db, monkeypatch):
     specific = _memory("m-specific-target", "Specific graph target")
     broad_target = _memory("m-broad-target", "Broad graph target")
     await db.insert_memory(specific)
@@ -821,17 +960,18 @@ async def test_graph_exploration_downweights_broad_entity_fanout(db, monkeypatch
     result = await engine.search(
         "related risks dependencies around",
         entities=["specific topic", "broad topic"],
+        intent="relationship",
         top_k=5,
     )
 
-    assert result["query_analysis"]["ranking_profile"] == "graph_exploration"
+    assert result["retrieval_intent"]["resolved_intent"] == "relationship"
     linked = {item["canonical_name"]: item for item in result["query_analysis"]["entity_linking"]}
     assert linked["specific topic"]["specificity"] == pytest.approx(1.0)
     assert linked["broad topic"]["visible_memory_count"] >= 100
     assert linked["broad topic"]["specificity"] < 1.0
     assert result["results"][0].memory_id == specific.id
     graph_evidence = result["results"][0].retrieval_evidence or {}
-    assert graph_evidence["rank_fusion"]["profile"] == "graph_exploration"
+    assert graph_evidence["rank_fusion"]["intent"] == "relationship"
     assert graph_evidence["rank_fusion"]["contributions"] == [
         {
             "channel": "graph",

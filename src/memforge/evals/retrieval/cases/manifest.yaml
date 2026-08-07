@@ -1,9 +1,10 @@
-case_schema_version: 2
+case_schema_version: 3
 case_set_id: retrieval-core-v1
-case_set_sha: sha256:81991592b961e099479814d3df489bb5b6902df6a197cc147835b822cad0531a
+case_set_sha: sha256:89b4dc8d2cb24f0969665c670b0622c7f70cfa00a045862577e10b0588796170
 case_files:
   - metadata_lexical.yaml
   - hybrid_fusion.yaml
+  - intent_resolution.yaml
 fixtures:
   default:
     workspace_id: ws-eval
@@ -59,6 +60,21 @@ fixtures:
       - id: mem-lexical-lock-distractor
         content: Generic error checklist for editing a rule locked by another user.
         project_key: PAY
+      - id: mem-lexical-lock-distractor-2
+        content: Generic rule editing error troubleshooting guide.
+        project_key: PAY
+      - id: mem-lexical-lock-distractor-3
+        content: Checklist for another user locking an editable rule.
+        project_key: PAY
+      - id: mem-lexical-lock-distractor-4
+        content: Common locked rule errors and generic responses.
+        project_key: PAY
+      - id: mem-lexical-lock-distractor-5
+        content: Rule editor lock diagnostics for generic failures.
+        project_key: PAY
+      - id: mem-lexical-lock-distractor-6
+        content: Editing rules locked by users troubleshooting reference.
+        project_key: PAY
       - id: mem-listing-01
         content: Payroll listing fixture memory 01.
         project_key: PAY
@@ -104,6 +120,12 @@ fixtures:
       - id: mem-listing-15
         content: Payroll listing fixture memory 15.
         project_key: PAY
+    entities:
+      - canonical_name: rule locking
+        display_name: Rule Locking
+    memory_entities:
+      - memory_id: mem-cross-language-lock
+        entity: rule locking
     memory_sources:
       - memory_id: mem-blocker-hint
         doc_id: SFPAY-179397

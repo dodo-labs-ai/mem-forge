@@ -2787,6 +2787,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "sources" not in properties
     assert set(properties) == {
         "query",
+        "intent",
         "repository_context",
         "source_filter",
         "time_range",
@@ -2810,17 +2811,17 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "keeping query unchanged" in properties["entities"]["description"]
     assert "not filters or authority" in properties["entities"]["description"]
     assert "backlog" not in tools["search"]["description"].lower()
-    assert "not a hard cap" in properties["top_k"]["description"]
+    assert "bounded ranked window" in properties["top_k"]["description"]
     assert "up to 50" in properties["top_k"]["description"]
-    assert "complete list" in properties["top_k"]["description"]
-    assert "enumeration" in properties["top_k"]["description"]
+    assert "does not make ranked retrieval exhaustive" in properties["top_k"]["description"]
+    assert "list_recent_memories" in properties["top_k"]["description"]
     assert "backlog" not in properties["top_k"]["description"].lower()
     assert properties["top_k"]["minimum"] == 1
     assert properties["top_k"]["maximum"] == 50
     assert properties["offset"]["default"] == 0
     assert properties["offset"]["minimum"] == 0
-    assert "next page" in properties["offset"]["description"]
-    assert "required" not in search_schema or "query" not in search_schema.get("required", [])
+    assert "ranked window" in properties["offset"]["description"]
+    assert search_schema["required"] == ["query"]
     time_range_schema = properties["time_range"]
     assert "Omit time_range" in time_range_schema["description"]
     assert "start_date and end_date are individually optional" in time_range_schema["description"]
@@ -2894,9 +2895,21 @@ def test_mcp_proxy_source_selection_descriptions_guide_scoped_and_global_search(
     assert "time_range only when explicitly requested" in search_description
     assert "deterministic source/time listings" in search_description
     assert "total_candidates and offset" in search_description
-    assert "Ranked queries are not exhaustive" in search_description
+    assert "ranked queries are not exhaustive" in search_description
     assert "Call get_memory for provenance" in search_description
-    assert len(search_description) <= 500
+    assert "self-contained query in the user's language" in search_description
+    assert "preserve identifiers and domain terms" in search_description
+    assert "translation or keyword stuffing" in search_description
+    assert len(search_description) <= 700
+
+    search_schema = tools["search"]["inputSchema"]
+    assert search_schema["required"] == ["query"]
+    assert search_schema["properties"]["query"]["minLength"] == 1
+    assert search_schema["properties"]["intent"]["enum"] == [
+        "general_hybrid",
+        "known_item",
+        "relationship",
+    ]
 
     assert "Use before source-specific search" in list_sources_description
     assert "exact source_ids" in list_sources_description
@@ -3102,13 +3115,17 @@ def test_mcp_proxy_forwards_search_to_hosted_workspace(monkeypatch):
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
-    result = proxy._call_tool("search", {"query": "artifact cache"})
+    result = proxy._call_tool(
+        "search",
+        {"query": "artifact cache", "intent": "known_item"},
+    )
 
     assert result == {"results": []}
     assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/v1/memories/search"
     assert captured["authorization"] == "Bearer token-123"
     assert json.loads(captured["body"].decode()) == {
         "query": "artifact cache",
+        "intent": "known_item",
         "include_private": True,
         "include_superseded": False,
     }
@@ -3632,7 +3649,7 @@ def test_mcp_proxy_rejects_invalid_memory_review_pagination():
     assert proxy._call_tool("list_memory_reviews", {"offset": "soon"}) == {"error": "offset must be an integer"}
 
 
-def test_mcp_proxy_forwards_queryless_source_id_time_range(monkeypatch):
+def test_mcp_proxy_rejects_queryless_source_id_time_range(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     captured = {}
 
@@ -3671,20 +3688,13 @@ def test_mcp_proxy_forwards_queryless_source_id_time_range(monkeypatch):
         },
     )
 
-    assert result == {"results": []}
-    assert json.loads(captured["body"].decode()) == {
-        "include_private": True,
-        "include_superseded": False,
-        "source_filter": {"source_ids": ["src-mounttai"]},
-        "time_range": {
-            "date_type": "source_updated_at",
-            "start_date": "2026-06-20",
-            "end_date": "2026-06-26",
-        },
+    assert result == {
+        "error": "search.query is required; use list_recent_memories for deterministic listings",
     }
+    assert "body" not in captured
 
 
-def test_mcp_proxy_forwards_search_offset_for_deterministic_listing(monkeypatch):
+def test_mcp_proxy_rejects_queryless_offset_compatibility(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     captured = {}
 
@@ -3721,16 +3731,10 @@ def test_mcp_proxy_forwards_search_offset_for_deterministic_listing(monkeypatch)
         },
     )
 
-    assert result["total_candidates"] == 52
-    assert result["has_more"] is True
-    assert json.loads(captured["body"].decode()) == {
-        "include_private": True,
-        "include_superseded": False,
-        "source_filter": {"source_ids": ["src-backlog"]},
-        "time_range": {"date_type": "source_updated_at", "start_date": "2026-06-29"},
-        "top_k": 10,
-        "offset": 10,
+    assert result == {
+        "error": "search.query is required; use list_recent_memories for deterministic listings",
     }
+    assert "body" not in captured
 
 
 def test_mcp_proxy_does_not_guess_has_more_for_windowed_legacy_response(monkeypatch):
@@ -3788,6 +3792,13 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
                         "entity_linking": [{"entity_id": 95, "matched_alias": "blocker hint"}],
                         "strategies_used": ["vector", "bm25_metadata_tokens", "graph"],
                     },
+                    "retrieval_intent": {
+                        "requested_intent": "relationship",
+                        "resolved_intent": "general_hybrid",
+                        "intent_source": "fallback",
+                        "fallback_reason": "no_traversable_entity",
+                        "internal": "omit",
+                    },
                     "results": [
                         {
                             "memory_id": "mem-1",
@@ -3836,6 +3847,12 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
                 "follow_up": {"suggested_tool": "get_memory"},
             }
         ],
+        "retrieval_intent": {
+            "requested_intent": "relationship",
+            "resolved_intent": "general_hybrid",
+            "intent_source": "fallback",
+            "fallback_reason": "no_traversable_entity",
+        },
         "total_candidates": 61,
         "candidate_count_kind": "windowed",
         "ranking_window_size": 50,
@@ -3958,13 +3975,39 @@ def test_mcp_proxy_rejects_invalid_search_top_k(monkeypatch, top_k):
     assert result == {"error": "top_k must be an integer from 1 to 50"}
 
 
-def test_mcp_proxy_rejects_queryless_without_deterministic_filter(monkeypatch):
+def test_mcp_proxy_rejects_queryless_search_even_with_deterministic_filter(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
 
-    result = proxy._call_tool("search", {})
+    missing = proxy._call_tool("search", {})
+    filtered = proxy._call_tool(
+        "search",
+        {"source_filter": {"source_ids": ["src-backlog"]}},
+    )
 
-    assert result == {"error": "search.query may be omitted only when source_filter or time_range is provided"}
+    assert missing == {"error": "search.query is required"}
+    assert filtered == {
+        "error": "search.query is required; use list_recent_memories for deterministic listings",
+    }
+
+
+def test_mcp_proxy_rejects_unknown_search_intent_before_http(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    monkeypatch.setattr(proxy, "_active_repo_identifier", lambda: None)
+    monkeypatch.setattr(
+        proxy,
+        "_http_json",
+        lambda *args, **kwargs: pytest.fail("HTTP must not run"),
+    )
+
+    result = proxy._call_tool(
+        "search",
+        {"query": "payroll lock", "intent": "semantic_lookup"},
+    )
+
+    assert result == {
+        "error": "intent must be general_hybrid, known_item, or relationship",
+    }
 
 
 def test_mcp_proxy_forwards_explicit_optional_date_bounds(monkeypatch):
