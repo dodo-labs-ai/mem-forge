@@ -15,6 +15,7 @@ def test_retrieval_case_resources_are_importable_from_package() -> None:
 
     assert case_dir.joinpath("manifest.yaml").is_file()
     assert case_dir.joinpath("metadata_lexical.yaml").is_file()
+    assert case_dir.joinpath("hybrid_fusion.yaml").is_file()
 
 
 def test_load_case_set_validates_manifest_cases_and_scope_shape() -> None:
@@ -23,12 +24,13 @@ def test_load_case_set_validates_manifest_cases_and_scope_shape() -> None:
     case_set = load_case_set("retrieval-core-v1")
 
     assert case_set.manifest.case_set_id == "retrieval-core-v1"
-    assert case_set.manifest.case_schema_version == 1
+    assert case_set.manifest.case_schema_version == 2
     assert case_set.case_ids == (
         "exact_external_id_lookup",
         "metadata_title_exact",
         "compact_trigram_metadata_recall",
         "queryless_source_listing",
+        "vector_target_with_lexical_distractor",
     )
 
     title_case = case_set.get_case("metadata_title_exact")
@@ -267,6 +269,39 @@ def test_case_set_validation_rejects_expected_relevant_sequence() -> None:
         load_case_set_from_data(manifest, cases)
 
 
+@pytest.mark.parametrize(
+    ("ranked_channel_results", "error"),
+    [
+        ({"graph": [{"memory_id": "mem-known", "score": 1.0}]}, "unsupported channels"),
+        ({"vector": [{"memory_id": "mem-known", "score": "high"}]}, "score"),
+        ({"vector": [{"memory_id": "mem-known"}]}, "score"),
+    ],
+)
+def test_case_set_validation_rejects_invalid_ranked_channel_results(
+    ranked_channel_results,
+    error,
+) -> None:
+    from memforge.evals.retrieval import CaseSetValidationError, load_case_set_from_data
+
+    manifest, cases = _minimal_valid_case_set_data()
+    cases["cases.yaml"][0]["ranked_channel_results"] = ranked_channel_results
+
+    with pytest.raises(CaseSetValidationError, match=error):
+        load_case_set_from_data(manifest, cases)
+
+
+def test_case_set_validation_rejects_ranked_channel_memory_absent_from_fixture() -> None:
+    from memforge.evals.retrieval import CaseSetValidationError, load_case_set_from_data
+
+    manifest, cases = _minimal_valid_case_set_data()
+    cases["cases.yaml"][0]["ranked_channel_results"] = {
+        "vector": [{"memory_id": "mem-missing", "score": 1.0}],
+    }
+
+    with pytest.raises(CaseSetValidationError, match="mem-missing"):
+        load_case_set_from_data(manifest, cases)
+
+
 def test_case_set_validation_rejects_missing_source_subscription_rows() -> None:
     from memforge.evals.retrieval import CaseSetValidationError, load_case_set_from_data
 
@@ -444,7 +479,7 @@ def test_hash_case_set_module_reports_stale_manifest_on_check(tmp_path) -> None:
     source_case_dir = resources.files("memforge.evals.retrieval.cases")
     case_dir = tmp_path / "cases"
     case_dir.mkdir()
-    for name in ("manifest.yaml", "metadata_lexical.yaml"):
+    for name in ("manifest.yaml", "metadata_lexical.yaml", "hybrid_fusion.yaml"):
         case_dir.joinpath(name).write_text(
             source_case_dir.joinpath(name).read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -487,7 +522,7 @@ def test_hash_case_set_module_writes_manifest_sha(tmp_path, monkeypatch) -> None
     source_case_dir = resources.files("memforge.evals.retrieval.cases")
     case_dir = tmp_path / "cases"
     case_dir.mkdir()
-    for name in ("manifest.yaml", "metadata_lexical.yaml"):
+    for name in ("manifest.yaml", "metadata_lexical.yaml", "hybrid_fusion.yaml"):
         case_dir.joinpath(name).write_text(
             source_case_dir.joinpath(name).read_text(encoding="utf-8"),
             encoding="utf-8",

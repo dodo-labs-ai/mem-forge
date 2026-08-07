@@ -402,7 +402,20 @@ def _weighted_rrf_fusion(
         k=k,
     )
     return [
-        _RankedCandidate(memory_id=item.item_id, rrf_score=item.score)
+        _RankedCandidate(
+            memory_id=item.item_id,
+            rrf_score=item.score,
+            retrieval_evidence={
+                "rank_fusion": {
+                    "profile": profile,
+                    "rrf_score": item.score,
+                    "contributions": [
+                        asdict(contribution)
+                        for contribution in item.contributions
+                    ],
+                }
+            },
+        )
         for item in fused
     ]
 
@@ -1059,7 +1072,10 @@ class SearchEngine:
         for candidate in candidates:
             evidence = metadata_evidence.get(candidate.memory_id)
             if evidence:
-                candidate.retrieval_evidence = {"metadata_lexical": evidence}
+                candidate.retrieval_evidence = {
+                    **(candidate.retrieval_evidence or {}),
+                    "metadata_lexical": evidence,
+                }
 
     async def _filter_candidates_by_status(
         self,

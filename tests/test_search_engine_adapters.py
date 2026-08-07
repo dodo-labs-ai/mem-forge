@@ -19,11 +19,12 @@ from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
 
 class FakeCollection:
-    def __init__(self, ids: list[str]) -> None:
+    def __init__(self, ids: list[str], distances: list[float] | None = None) -> None:
         self.ids = ids
+        self.distances = distances or [0.01 for _ in ids]
 
     def query(self, **kwargs):
-        return {"ids": [self.ids], "distances": [[0.01 for _ in self.ids]]}
+        return {"ids": [self.ids], "distances": [self.distances]}
 
     def upsert(self, **kwargs):
         pass
@@ -146,6 +147,70 @@ async def test_search_routes_vector_and_bm25_through_the_adapters(db, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_search_exposes_rank_fusion_contributions_for_each_result(db):
+    content_target = _memory("m-content-target", "PostgreSQL connection pooling guidance")
+    vector_only = _memory("m-vector-only", "Unrelated operational note")
+    await db.insert_memory(content_target)
+    await db.insert_memory(vector_only)
+
+    adapters = build_sqlite_adapters(
+        db,
+        FakeCollection(
+            [vector_only.id, content_target.id],
+            distances=[0.01, 0.02],
+        ),
+    )
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(),
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("PostgreSQL", top_k=10)
+
+    evidence_by_id = {
+        item.memory_id: item.retrieval_evidence or {}
+        for item in result["results"]
+    }
+    assert evidence_by_id[content_target.id]["rank_fusion"] == {
+        "profile": "lexical_lookup",
+        "rrf_score": pytest.approx(0.25 / 62 + 0.35 / 61),
+        "contributions": [
+            {
+                "channel": "vector",
+                "rank": 2,
+                "channel_weight": 0.25,
+                "multiplier": 1.0,
+                "weighted_score": pytest.approx(0.25 / 62),
+            },
+            {
+                "channel": "bm25_content",
+                "rank": 1,
+                "channel_weight": 0.35,
+                "multiplier": 1.0,
+                "weighted_score": pytest.approx(0.35 / 61),
+            },
+        ],
+    }
+    assert evidence_by_id[vector_only.id]["rank_fusion"] == {
+        "profile": "lexical_lookup",
+        "rrf_score": pytest.approx(0.25 / 61),
+        "contributions": [
+            {
+                "channel": "vector",
+                "rank": 1,
+                "channel_weight": 0.25,
+                "multiplier": 1.0,
+                "weighted_score": pytest.approx(0.25 / 61),
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
 async def test_search_path_uses_entity_linker_not_legacy_query_analysis(db, monkeypatch):
     active = _memory("m-active", "PostgreSQL pooling memory")
     await db.insert_memory(active)
@@ -198,23 +263,32 @@ async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch)
     assert [r.memory_id for r in result["results"]] == ["m-blocker"]
     assert "bm25_metadata_tokens" in result["query_analysis"]["strategies_used"]
     evidence = result["results"][0].retrieval_evidence
-    assert evidence == {
-        "metadata_lexical": {
-            "channel": "bm25_metadata_tokens",
-            "matched_fields": ["metadata_any"],
-            "matched_text": [
-                "SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment | "
-                "SFPAY-179397 | PAY | MountTai Defects | https://x/SFPAY-179397"
-            ],
-            "source_refs": [
-                {
-                    "source_id": "src-jira",
-                    "doc_id": "SFPAY-179397",
-                    "source_type": "jira",
-                }
-            ],
-        }
+    assert evidence is not None
+    assert evidence["metadata_lexical"] == {
+        "channel": "bm25_metadata_tokens",
+        "matched_fields": ["metadata_any"],
+        "matched_text": [
+            "SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment | "
+            "SFPAY-179397 | PAY | MountTai Defects | https://x/SFPAY-179397"
+        ],
+        "source_refs": [
+            {
+                "source_id": "src-jira",
+                "doc_id": "SFPAY-179397",
+                "source_type": "jira",
+            }
+        ],
     }
+    assert evidence["rank_fusion"]["profile"] == "identifier_lookup"
+    assert evidence["rank_fusion"]["contributions"] == [
+        {
+            "channel": "metadata_lexical",
+            "rank": 1,
+            "channel_weight": 0.5,
+            "multiplier": 1.0,
+            "weighted_score": pytest.approx(0.5 / 61),
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -756,6 +830,17 @@ async def test_graph_exploration_downweights_broad_entity_fanout(db, monkeypatch
     assert linked["broad topic"]["visible_memory_count"] >= 100
     assert linked["broad topic"]["specificity"] < 1.0
     assert result["results"][0].memory_id == specific.id
+    graph_evidence = result["results"][0].retrieval_evidence or {}
+    assert graph_evidence["rank_fusion"]["profile"] == "graph_exploration"
+    assert graph_evidence["rank_fusion"]["contributions"] == [
+        {
+            "channel": "graph",
+            "rank": 1,
+            "channel_weight": 0.3,
+            "multiplier": 1.0,
+            "weighted_score": pytest.approx(0.3 / 61),
+        }
+    ]
 
 
 def test_graph_contributions_choose_best_specific_entity_without_summing() -> None:

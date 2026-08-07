@@ -6,14 +6,20 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from memforge.config import RetrievalConfig
 from memforge.evals.retrieval.fixtures.corpus import seed_sqlite_fixture
-from memforge.evals.retrieval.schema import RetrievalCase, RetrievalCaseSet
+from memforge.evals.retrieval.schema import (
+    RankedChannelResult,
+    RetrievalCase,
+    RetrievalCaseSet,
+)
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from memforge.storage.adapters.protocols import KeywordCandidate, KeywordSearch, VectorStore
+from memforge.storage.adapters.context import AccessScope
 
 
 @dataclass(frozen=True)
@@ -37,6 +43,16 @@ class CaseRunResult:
             return self.ranked_ids.index(memory_id) + 1
         except ValueError:
             return len(self.ranked_ids) + 1
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "ranked_ids": list(self.ranked_ids),
+            "scores": self.scores,
+            "total_candidates": self.total_candidates,
+            "query_analysis": self.query_analysis,
+            "evidence_by_memory": self.evidence_by_memory,
+        }
 
 
 @dataclass(frozen=True)
@@ -70,6 +86,10 @@ class RetrievalEvalReport:
                 }
                 for failure in self.hard_failures
             ],
+            "case_results": {
+                case_id: result.to_json()
+                for case_id, result in self.case_results.items()
+            },
             "qrels": self.qrels,
             "run": self.run,
         }
@@ -94,10 +114,20 @@ async def run_sqlite_case_set(
         db = await seed_sqlite_fixture(db_path=case_db_path, fixture=fixture)
         try:
             adapters = build_sqlite_adapters(db, _EmptyVectorCollection())
+            vector_results = case.ranked_channel_results.get("vector")
+            content_results = case.ranked_channel_results.get("bm25_content")
             engine = SearchEngine(
                 relational=adapters.relational,
-                keyword=adapters.keyword,
-                vector=adapters.vector,
+                keyword=(
+                    _RankedContentKeywordSearch(adapters.keyword, content_results or ())
+                    if "bm25_content" in case.ranked_channel_results
+                    else adapters.keyword
+                ),
+                vector=(
+                    _RankedVectorStore(adapters.vector, vector_results or ())
+                    if "vector" in case.ranked_channel_results
+                    else adapters.vector
+                ),
                 embed_cfg={},
                 config=RetrievalConfig(enable_reranking=False),
                 embedding_provider=lambda _query: [0.0],
@@ -195,6 +225,15 @@ def _has_required_channel(evidence: dict[str, Any], required_channels: tuple[str
 def _has_channel(evidence: dict[str, Any], required: str) -> bool:
     if required in evidence:
         return True
+    rank_fusion = evidence.get("rank_fusion")
+    if isinstance(rank_fusion, dict):
+        contributions = rank_fusion.get("contributions")
+        if isinstance(contributions, list) and any(
+            isinstance(contribution, dict)
+            and contribution.get("channel") == required
+            for contribution in contributions
+        ):
+            return True
     metadata = evidence.get("metadata_lexical")
     if not isinstance(metadata, dict):
         return False
@@ -266,3 +305,106 @@ class _EmptyVectorCollection:
 
     def get(self, **kwargs: Any) -> dict[str, list[Any]]:
         return {"ids": []}
+
+
+class _RankedVectorStore:
+    """Eval-only VectorStore boundary with case-authored deterministic ranks."""
+
+    def __init__(
+        self,
+        delegate: VectorStore,
+        results: tuple[RankedChannelResult, ...],
+    ) -> None:
+        self._delegate = delegate
+        self._results = results
+        self.distance_metric = delegate.distance_metric
+
+    def similarity(self, distance: float) -> float:
+        return self._delegate.similarity(distance)
+
+    def within_dedup_threshold(self, distance_threshold: float, score: float) -> bool:
+        return self._delegate.within_dedup_threshold(distance_threshold, score)
+
+    async def upsert(
+        self,
+        ids: Sequence[str],
+        embeddings: Sequence[Sequence[float]],
+        metadatas: Sequence[dict[str, Any]],
+    ) -> None:
+        await self._delegate.upsert(ids, embeddings, metadatas)
+
+    async def delete(self, ids: Sequence[str]) -> None:
+        await self._delegate.delete(ids)
+
+    async def query(
+        self,
+        embedding: Sequence[float],
+        scope: AccessScope,
+        memory_types: list[str] | None,
+        limit: int,
+    ) -> list[tuple[str, float]]:
+        return _ranked_pairs(self._results, limit)
+
+    async def query_many(
+        self,
+        embeddings: Sequence[Sequence[float]],
+        scopes: Sequence[AccessScope],
+        memory_types: Sequence[list[str] | None],
+        limit: int,
+    ) -> list[list[tuple[str, float]]]:
+        return await self._delegate.query_many(embeddings, scopes, memory_types, limit)
+
+    async def get_record(self, memory_id: str) -> dict[str, Any] | None:
+        return await self._delegate.get_record(memory_id)
+
+
+class _RankedContentKeywordSearch:
+    """Eval-only BM25 boundary override that delegates metadata search."""
+
+    def __init__(
+        self,
+        delegate: KeywordSearch,
+        results: tuple[RankedChannelResult, ...],
+    ) -> None:
+        self._delegate = delegate
+        self._results = results
+
+    async def remove(self, memory_id: str) -> None:
+        await self._delegate.remove(memory_id)
+
+    async def search(
+        self,
+        fts_query: str,
+        scope: AccessScope,
+        memory_types: list[str] | None,
+        limit: int,
+    ) -> list[tuple[str, float]]:
+        return _ranked_pairs(self._results, limit)
+
+    async def search_metadata(
+        self,
+        fts_query: str,
+        scope: AccessScope,
+        memory_types: list[str] | None,
+        limit: int,
+        *,
+        source_filter: MemorySourceFilter | None = None,
+        time_range: MemoryTimeRange | None = None,
+        include_subchannel_hits: bool = False,
+    ) -> list[KeywordCandidate]:
+        return await self._delegate.search_metadata(
+            fts_query,
+            scope,
+            memory_types,
+            limit,
+            source_filter=source_filter,
+            time_range=time_range,
+            include_subchannel_hits=include_subchannel_hits,
+        )
+
+
+def _ranked_pairs(
+    results: tuple[RankedChannelResult, ...],
+    limit: int,
+) -> list[tuple[str, float]]:
+    return [(result.memory_id, result.score) for result in results[:limit]]

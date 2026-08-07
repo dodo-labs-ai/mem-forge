@@ -1,8 +1,9 @@
-case_schema_version: 1
+case_schema_version: 2
 case_set_id: retrieval-core-v1
-case_set_sha: sha256:49b6d107af86754b2e69a23926c2fce4bc75e1c72634616905c0504c08db1994
+case_set_sha: sha256:81991592b961e099479814d3df489bb5b6902df6a197cc147835b822cad0531a
 case_files:
   - metadata_lexical.yaml
+  - hybrid_fusion.yaml
 fixtures:
   default:
     workspace_id: ws-eval
@@ -51,6 +52,12 @@ fixtures:
         project_key: PAY
       - id: mem-access-review
         content: Reviewer setup is required before the quarterly payroll control can proceed.
+        project_key: PAY
+      - id: mem-cross-language-lock
+        content: 编辑一个被其他用户锁定的规则时，系统应返回明确的锁持有人错误信息，而不是通用错误。
+        project_key: PAY
+      - id: mem-lexical-lock-distractor
+        content: Generic error checklist for editing a rule locked by another user.
         project_key: PAY
       - id: mem-listing-01
         content: Payroll listing fixture memory 01.
