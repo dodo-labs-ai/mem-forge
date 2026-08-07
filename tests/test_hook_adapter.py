@@ -916,12 +916,16 @@ def test_mcp_data_tools_accept_repository_context_but_workspace_directory_does_n
         assert "repository_context" in tool["inputSchema"]["properties"], tool["name"]
 
 
-def test_packaged_plugin_version_0_1_44_is_consistent():
+def test_packaged_plugin_version_0_1_45_is_consistent():
+    import tomllib
+
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.44"
+    version = "0.1.45"
+    package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
 
+    assert package["project"]["version"] == version
     assert f'SERVER_VERSION = "{version}"' in canonical_mcp
     assert f'PLUGIN_VERSION = "{version}"' in canonical_hook
 
