@@ -3,6 +3,51 @@ from __future__ import annotations
 import pytest
 
 
+def test_default_rrf_damping_preserves_cross_language_vector_recall_against_consensus_distractors() -> None:
+    """A top vector-only hit must remain usable when lexical channels cannot cross languages."""
+
+    from memforge.config import DEFAULT_RRF_K, RetrievalConfig
+    from memforge.retrieval.intents import fusion_weights
+    from memforge.retrieval.rank_fusion import (
+        RankedChannelItem,
+        weighted_reciprocal_rank_fusion,
+    )
+
+    vector_ranks = (1, 6, 5, 15, 9, 7, 16)
+    content_ranks = (16, 33, 15, 28, 44, 21)
+    distractor_ids = tuple(f"same-language-consensus-{index}" for index in range(6))
+    channels = {
+        "vector": (
+            RankedChannelItem("cross-language-target", 0.0, rank=vector_ranks[0]),
+            *(
+                RankedChannelItem(memory_id, 0.0, rank=rank)
+                for memory_id, rank in zip(distractor_ids, vector_ranks[1:])
+            ),
+        ),
+        "bm25_content": tuple(
+            RankedChannelItem(memory_id, 0.0, rank=rank)
+            for memory_id, rank in zip(distractor_ids, content_ranks)
+        ),
+        "metadata_lexical": (),
+        "graph": (),
+    }
+
+    passing_damping_constants = []
+    for damping_constant in (10, 20, 30, 60):
+        ranked = weighted_reciprocal_rank_fusion(
+            channels=channels,
+            weights=fusion_weights("general_hybrid"),
+            k=damping_constant,
+        )
+        ranked_ids = tuple(item.item_id for item in ranked)
+        if ranked_ids.index("cross-language-target") + 1 <= 5:
+            passing_damping_constants.append(damping_constant)
+
+    assert RetrievalConfig().rrf_k == DEFAULT_RRF_K
+    assert passing_damping_constants == [10, 20]
+    assert DEFAULT_RRF_K == max(passing_damping_constants)
+
+
 def test_bounded_sweep_selects_production_policy_for_every_ranked_intent() -> None:
     from memforge.evals.retrieval.policy_sweep import run_bounded_intent_policy_sweep
     from memforge.retrieval.intents import RANKED_RETRIEVAL_INTENTS, fusion_weights

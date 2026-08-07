@@ -22,7 +22,7 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from memforge.config import DEFAULT_RANK_WINDOW_SIZE, RetrievalConfig
+from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, RetrievalConfig
 from memforge.llm.structured import StructuredLlmError
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
@@ -70,8 +70,6 @@ W_RECENCY_DEFAULT = 0.15
 # normalization and clamped at zero so a penalized candidate cannot go negative.
 CROSS_PROJECT_PENALTY = 0.20
 REPO_AFFINITY_BOOST = 0.05
-DEFAULT_RRF_K = 60
-
 _METADATA_SUBCHANNEL_WEIGHTS = {
     "bm25_metadata_tokens": 0.60,
     "metadata_alias": 0.30,

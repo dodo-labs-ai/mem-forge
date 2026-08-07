@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 from typing import Mapping
 
+from memforge.config import DEFAULT_RRF_K
 from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.retrieval.rank_fusion import (
     RankedChannelItem,
@@ -231,7 +232,7 @@ def _evaluate_scenario(
     ranked = weighted_reciprocal_rank_fusion(
         channels=scenario.channels,
         weights=weights,
-        k=60,
+        k=DEFAULT_RRF_K,
     )
     ranked_ids = tuple(item.item_id for item in ranked)
     target_rank = ranked_ids.index(scenario.target_id) + 1
