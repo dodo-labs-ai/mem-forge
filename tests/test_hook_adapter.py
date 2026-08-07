@@ -916,11 +916,11 @@ def test_mcp_data_tools_accept_repository_context_but_workspace_directory_does_n
         assert "repository_context" in tool["inputSchema"]["properties"], tool["name"]
 
 
-def test_packaged_plugin_version_0_1_46_is_consistent():
+def test_packaged_plugin_version_is_consistent():
     import tomllib
 
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.46"
+    version = "0.1.47"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
@@ -2914,6 +2914,10 @@ def test_mcp_proxy_source_selection_descriptions_guide_scoped_and_global_search(
         "known_item",
         "relationship",
     ]
+    intent_description = search_schema["properties"]["intent"]["description"]
+    assert "conversation context" in intent_description
+    assert "quote the exact title, name, or path" in intent_description
+    assert "self-contained" in intent_description
 
     assert "Use before source-specific search" in list_sources_description
     assert "exact source_ids" in list_sources_description
