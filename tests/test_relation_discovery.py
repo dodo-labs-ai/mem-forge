@@ -16,6 +16,7 @@ from memforge.memory.relation_candidate_retrieval import (
     RetrievedRelationCandidate,
 )
 from memforge.memory.relation_classifier import (
+    MEMORY_PAIR_CLASSIFIER_VERSION,
     MemoryPairClassification,
     MemoryPairClassificationError,
     MemoryPairClassificationPlan,
@@ -328,7 +329,7 @@ async def test_relation_discovery_reuses_current_identity_pair_and_only_classifi
                     relation_type=MemoryRelationType.UNRELATED,
                     direction=RelationDirection.SYMMETRIC,
                     reason="identity stage already checked this pair",
-                    classifier_version="memory-relation-v1",
+                        classifier_version=MEMORY_PAIR_CLASSIFIER_VERSION,
                 ),
             ),
         ),
@@ -379,7 +380,7 @@ async def test_relation_discovery_reclassifies_identity_seed_with_stale_context(
         relation_type=MemoryRelationType.UNRELATED,
         direction=RelationDirection.SYMMETRIC,
         reason="identity stage already checked this pair",
-        classifier_version="memory-relation-v1",
+        classifier_version=MEMORY_PAIR_CLASSIFIER_VERSION,
     )
     store.work = replace(
         store.work,

@@ -38,13 +38,24 @@ class MemoryRelationType(str, Enum):
     UNRELATED = "unrelated"
 
 
-MEMORY_PAIR_CLASSIFIER_VERSION = "memory-relation-v1"
+MEMORY_PAIR_CLASSIFIER_VERSION = "memory-relation-v2"
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryPairContext:
+    """Source and scope facts that disambiguate otherwise similar claims."""
+
+    source_id: str | None = None
+    doc_id: str | None = None
+    source_lineage_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class MemoryPair:
     challenger: Memory
     candidate: Memory
+    challenger_context: MemoryPairContext | None = None
+    candidate_context: MemoryPairContext | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -123,6 +134,15 @@ candidate_to_challenger when the candidate is more specific. For every other
 classification direction must be symmetric. Labels never imply authority,
 recency, preference, or permission to mutate either Memory.
 
+Before returning CONTRADICTS, prove that the claims concern the same subject and
+the same operational scope, including system, environment, repository, project,
+document lineage, time, and modality when those facts are present. Set
+same_subject_and_scope=true only after that proof and state the two mutually
+incompatible assertions in incompatible_assertions. If the claims concern
+different systems, environments, templates, examples, time periods, or scopes,
+return UNRELATED or REFINES as appropriate. For every non-CONTRADICTS decision,
+incompatible_assertions must be an empty string.
+
 Compare the proposition rather than presentation alone, but preserve material
 modality. A normative requirement and a descriptive state have different truth
 conditions and must not be EQUIVALENT, even when their subject, action, and value
@@ -158,15 +178,47 @@ def _coverage_retry_prompt(
     )
 
 
-def _prompt_memory(memory: Memory, *, max_content_chars: int) -> dict[str, str]:
+def _auditable_relation_reason(decision: Any) -> str:
+    reason = str(getattr(decision, "reason", "") or "").strip()
+    if str(decision.classification) != MemoryRelationType.CONTRADICTS.value:
+        return reason
+    incompatible = str(getattr(decision, "incompatible_assertions", "") or "").strip()
+    scope_proof = bool(getattr(decision, "same_subject_and_scope", False))
+    proof = (
+        f"same_subject_and_scope={str(scope_proof).lower()}; "
+        f"incompatible_assertions={incompatible}"
+    )
+    return f"{reason} [{proof}]" if reason else proof
+
+
+def _prompt_memory(
+    memory: Memory,
+    *,
+    context: MemoryPairContext | None,
+    max_content_chars: int,
+) -> dict[str, object]:
     content = memory.content
     if len(content) > max_content_chars:
         content = content[:max_content_chars] + "\n[truncated]"
-    return {
+    payload: dict[str, object] = {
         "id": memory.id,
         "content": content,
         "type": memory.memory_type,
+        "visibility": memory.visibility,
+        "project_key": memory.project_key,
+        "repo_identifier": memory.repo_identifier,
+        "valid_from": memory.valid_from.isoformat() if memory.valid_from else None,
+        "valid_until": memory.valid_until.isoformat() if memory.valid_until else None,
+        "created_at": memory.created_at.isoformat() if memory.created_at else None,
+        "updated_at": memory.updated_at.isoformat() if memory.updated_at else None,
     }
+    if context is not None:
+        payload["source_context"] = {
+            "source_id": context.source_id,
+            "doc_id": context.doc_id,
+            "source_lineage_id": context.source_lineage_id,
+        }
+    return payload
 
 
 def _grouped_pair_payload(
@@ -182,6 +234,7 @@ def _grouped_pair_payload(
             groups[challenger_id] = {
                 "challenger": _prompt_memory(
                     pair.challenger,
+                    context=pair.challenger_context,
                     max_content_chars=max_content_chars,
                 ),
                 "candidates": [],
@@ -192,6 +245,7 @@ def _grouped_pair_payload(
                 "pair_index": pair_index,
                 "candidate": _prompt_memory(
                     pair.candidate,
+                    context=pair.candidate_context,
                     max_content_chars=max_content_chars,
                 ),
             }
@@ -265,7 +319,7 @@ class StructuredMemoryPairClassifier:
                             pair=pair,
                             relation_type=MemoryRelationType(by_index[pair_index].classification),
                             direction=RelationDirection(by_index[pair_index].direction),
-                            reason=str(by_index[pair_index].reason or ""),
+                            reason=_auditable_relation_reason(by_index[pair_index]),
                         ),
                     )
                     for pair_index, pair in indexed_pairs

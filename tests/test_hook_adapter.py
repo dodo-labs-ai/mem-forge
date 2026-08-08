@@ -920,7 +920,7 @@ def test_packaged_plugin_version_is_consistent():
     import tomllib
 
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.48"
+    version = "0.1.49"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
@@ -2775,6 +2775,28 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "list_memory_reviews" in tools
     assert "get_memory_review" in tools
     assert "resolve_memory_review" in tools
+    assert "validate_memory_review_decisions" in tools
+    assert "apply_memory_review_decisions" in tools
+    validate_tool = next(tool for tool in proxy.TOOLS if tool["name"] == "validate_memory_review_decisions")
+    apply_tool = next(tool for tool in proxy.TOOLS if tool["name"] == "apply_memory_review_decisions")
+    assert validate_tool["outputSchema"] == apply_tool["outputSchema"]
+    assert apply_tool["annotations"]["destructiveHint"] is True
+    assert "validation_receipt" in apply_tool["inputSchema"]["required"]
+    assert tools["resolve_memory_review"]["annotations"] == {
+        "readOnlyHint": False,
+        "destructiveHint": True,
+    }
+    result_schema = apply_tool["outputSchema"]["properties"]["results"]["items"]
+    assert result_schema["additionalProperties"] is False
+    assert set(result_schema["required"]) == {
+        "review_id",
+        "decision",
+        "outcome",
+        "status",
+        "message",
+        "decision_label",
+        "consequence",
+    }
 
     search_schema = tools["search"]["inputSchema"]
     properties = search_schema["properties"]
@@ -2882,8 +2904,10 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "status" not in replace_schema["properties"]
 
     resolve_schema = tools["resolve_memory_review"]["inputSchema"]
-    assert resolve_schema["properties"]["decision"]["enum"] == ["approve", "reject", "refresh"]
-    assert "required when decision is reject" in resolve_schema["properties"]["note"]["description"]
+    assert resolve_schema["properties"]["decision"]["enum"] == ["approve", "reject"]
+    assert "reviewer" not in resolve_schema["properties"]
+    assert "expected_fingerprint" in resolve_schema["required"]
+    assert "requires_note=true" in resolve_schema["properties"]["note"]["description"]
 
 
 def test_mcp_proxy_source_selection_descriptions_guide_scoped_and_global_search():
@@ -3622,7 +3646,12 @@ def test_mcp_proxy_forwards_memory_review_tools(monkeypatch):
     assert proxy._call_tool("get_memory_review", {"review_id": "rev-1"}) == {"ok": True}
     assert proxy._call_tool(
         "resolve_memory_review",
-        {"review_id": "rev-1", "decision": "reject", "note": "Not durable enough."},
+        {
+            "review_id": "rev-1",
+            "decision": "reject",
+            "expected_fingerprint": "review-decision-v1:abc",
+            "note": "Not durable enough.",
+        },
     ) == {"ok": True}
 
     assert calls[0]["method"] == "GET"
@@ -3631,7 +3660,10 @@ def test_mcp_proxy_forwards_memory_review_tools(monkeypatch):
     assert calls[1]["url"] == "https://self.example/api/v1/memory-reviews/rev-1"
     assert calls[2]["method"] == "POST"
     assert calls[2]["url"] == "https://self.example/api/v1/memory-reviews/rev-1/reject"
-    assert json.loads(calls[2]["body"].decode()) == {"note": "Not durable enough."}
+    assert json.loads(calls[2]["body"].decode()) == {
+        "expected_fingerprint": "review-decision-v1:abc",
+        "note": "Not durable enough.",
+    }
 
 
 def test_mcp_proxy_requires_note_before_rejecting_memory_review(monkeypatch):
@@ -3646,8 +3678,108 @@ def test_mcp_proxy_requires_note_before_rejecting_memory_review(monkeypatch):
 
     assert proxy._call_tool(
         "resolve_memory_review",
-        {"review_id": "rev-1", "decision": "reject"},
+        {
+            "review_id": "rev-1",
+            "decision": "reject",
+            "expected_fingerprint": "review-decision-v1:abc",
+        },
     ) == {"error": "note is required when decision is reject"}
+
+
+def test_mcp_proxy_validates_and_applies_bounded_review_manifests(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    calls = []
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return b'{"mode":"validate","results":[]}'
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            calls.append((request.get_method(), request.full_url, json.loads(request.data.decode())))
+            return FakeResponse()
+
+    monkeypatch.setenv("MEMFORGE_API_URL", "https://self.example")
+    monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
+    decisions = [
+        {
+            "review_id": "rev-1",
+            "decision": "approve",
+            "expected_fingerprint": "review-decision-v1:abc",
+            "rationale": "Same subject and deployment.",
+            "confidence": 0.92,
+            "risk": "low",
+        }
+    ]
+
+    assert proxy._call_tool("validate_memory_review_decisions", {"decisions": decisions})["mode"] == "validate"
+    assert proxy._call_tool(
+        "apply_memory_review_decisions",
+        {"decisions": decisions, "validation_receipt": "review-manifest-v1:receipt"},
+    )["mode"] == "validate"
+    assert calls == [
+        (
+            "POST",
+            "https://self.example/api/v1/memory-reviews/decisions/validate",
+            {"decisions": decisions},
+        ),
+        (
+            "POST",
+            "https://self.example/api/v1/memory-reviews/decisions/apply",
+            {"decisions": decisions, "validation_receipt": "review-manifest-v1:receipt"},
+        ),
+    ]
+
+    duplicate = {"decisions": [decisions[0], decisions[0]]}
+    assert proxy._call_tool("validate_memory_review_decisions", duplicate) == {
+        "error": "duplicate review_id: rev-1"
+    }
+    assert proxy._call_tool("apply_memory_review_decisions", {"decisions": decisions}) == {
+        "error": "validation_receipt is required before apply"
+    }
+
+
+def test_mcp_proxy_returns_review_manifest_as_structured_content(monkeypatch):
+    proxy = _load_plugin_mcp_proxy()
+    payload = {
+        "mode": "validate",
+        "results": [
+            {
+                "review_id": "rev-1",
+                "decision": "approve",
+                "outcome": "ready",
+                "status": "pending",
+                "message": None,
+                "decision_label": "Conflict",
+                "consequence": "Keep both memories active.",
+            }
+        ],
+        "ready": 1,
+        "applied": 0,
+        "already_applied": 0,
+        "stale": 0,
+        "forbidden": 0,
+        "failed": 0,
+        "validation_receipt": "review-manifest-v1:receipt",
+    }
+    monkeypatch.setattr(proxy, "_call_tool", lambda *_args, **_kwargs: payload)
+
+    response = proxy._tool_call_response(
+        7,
+        "validate_memory_review_decisions",
+        {"decisions": []},
+    )
+
+    assert response["result"]["structuredContent"] == payload
+    assert json.loads(response["result"]["content"][0]["text"]) == payload
 
 
 def test_mcp_proxy_rejects_invalid_memory_review_pagination():

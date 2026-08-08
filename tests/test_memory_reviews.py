@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -13,7 +14,9 @@ from fastapi.testclient import TestClient
 from memforge.config import AppConfig
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.lifecycle_plan import LifecycleReviewStatus
+from memforge.memory.review_decision import memory_review_decision_fingerprint
 from memforge.memory.review_service import (
+    ResolvedReview,
     ReviewAlreadyResolved,
     ReviewError,
     ReviewService,
@@ -116,6 +119,28 @@ def review_service(db, memory_store) -> ReviewService:
     return ReviewService(db=db, memory_store=memory_store)
 
 
+async def _approve(review_service: ReviewService, review_id: str, **kwargs):
+    review = await review_service.db.get_memory_review(review_id)
+    assert review is not None
+    related = await review_service._load_related_challengers(review)
+    return await review_service.approve(
+        review_id,
+        expected_fingerprint=memory_review_decision_fingerprint(review, related),
+        **kwargs,
+    )
+
+
+async def _reject(review_service: ReviewService, review_id: str, **kwargs):
+    review = await review_service.db.get_memory_review(review_id)
+    assert review is not None
+    related = await review_service._load_related_challengers(review)
+    return await review_service.reject(
+        review_id,
+        expected_fingerprint=memory_review_decision_fingerprint(review, related),
+        **kwargs,
+    )
+
+
 def _config(tmp_path: Path) -> AppConfig:
     config = AppConfig(base_dir=tmp_path / "memforge")
     config.sync.worker_enabled = False
@@ -147,6 +172,14 @@ async def _upsert_doc_with_artifacts(
     pdf_content_uri: str | None = None,
 ) -> None:
     now = datetime.now(timezone.utc)
+    await db.upsert_source(
+        id="src-confluence",
+        type="confluence",
+        name="Review evidence",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
     await db.upsert_document(
         DocumentRecord(
             doc_id=doc_id,
@@ -615,9 +648,7 @@ class TestReviewCrud:
 
 class TestUnifiedLifecycleReviewApi:
     @pytest.mark.asyncio
-    async def test_queue_and_detail_present_lifecycle_review_as_two_user_decisions(
-        self, db, tmp_path
-    ):
+    async def test_queue_and_detail_present_lifecycle_review_as_two_user_decisions(self, db, tmp_path):
         review_id = await _seed_lifecycle_review(db)
         from memforge.server.admin_api import create_admin_app
 
@@ -631,9 +662,7 @@ class TestUnifiedLifecycleReviewApi:
         assert row["review_origin"] == "lifecycle"
         assert row["source_name"] == "Mount Tai Backlog"
         assert row["presentation"]["decision_label"] == "Updated"
-        assert row["presentation"]["summary"] == (
-            "Use the proposed source state or keep the current memory?"
-        )
+        assert row["presentation"]["summary"] == ("Use the proposed source state or keep the current memory?")
         assert [action["key"] for action in row["presentation"]["actions"]] == [
             "use_latest_state",
             "keep_current_state",
@@ -641,6 +670,25 @@ class TestUnifiedLifecycleReviewApi:
         assert detail.status_code == 200
         assert detail.json()["incumbent"]["content"] == "The service stays with Team Vita."
         assert detail.json()["challenger"]["content"] == "The service moves to Team Pfizer."
+
+    @pytest.mark.asyncio
+    async def test_open_queue_excludes_resolved_lifecycle_reviews(self, db, tmp_path):
+        review_id = await _seed_lifecycle_review(db)
+        await db.resolve_lifecycle_review(
+            review_id,
+            LifecycleReviewStatus.REJECTED,
+            reviewer="owner-1",
+            review_note="Keep the current state.",
+        )
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            queue = client.get("/api/v1/memory-reviews", params={"status": "open"})
+
+        assert queue.status_code == 200
+        assert queue.json()["total"] == 0
+        assert queue.json()["data"] == []
 
     @pytest.mark.asyncio
     async def test_queue_pages_one_stable_order_across_memory_and_lifecycle_reviews(
@@ -723,10 +771,15 @@ class TestUnifiedLifecycleReviewApi:
 
         app = create_admin_app(db=db, config=_config(tmp_path))
         with TestClient(app) as client:
-            missing = client.post(f"/api/v1/memory-reviews/{review_id}/reject", json={})
+            detail = client.get(f"/api/v1/memory-reviews/{review_id}").json()
+            decision = {"expected_fingerprint": detail["decision_fingerprint"]}
+            missing = client.post(f"/api/v1/memory-reviews/{review_id}/reject", json=decision)
             kept = client.post(
                 f"/api/v1/memory-reviews/{review_id}/reject",
-                json={"note": "The current ownership remains valid.", "reviewer": "alice"},
+                json={
+                    **decision,
+                    "note": "The current ownership remains valid.",
+                },
             )
 
         assert missing.status_code == 400
@@ -735,12 +788,460 @@ class TestUnifiedLifecycleReviewApi:
         stored = await db.get_lifecycle_review(review_id)
         assert stored is not None
         assert stored.review_note == "The current ownership remains valid."
-        assert stored.reviewer == "alice"
+        assert stored.reviewer == "dev"
         open_rows = await db.list_lifecycle_reviews(
             "src-lifecycle",
             status=LifecycleReviewStatus.PENDING,
         )
         assert open_rows == []
+
+    @pytest.mark.asyncio
+    async def test_open_total_excludes_dynamically_stale_rows_before_paging(
+        self,
+        db,
+        chroma,
+        tmp_path,
+    ):
+        _, _, current = await _seed_supersede_review(db, chroma, suffix="current-page")
+        stale_incumbent, _, stale = await _seed_supersede_review(db, chroma, suffix="stale-page")
+        await db.db.execute(
+            "UPDATE memories SET updated_at = ? WHERE id = ?",
+            ("2030-01-01T00:00:00+00:00", stale_incumbent.id),
+        )
+        await db.db.commit()
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            first = client.get(
+                "/api/v1/memory-reviews",
+                params={"status": "open", "limit": 1, "offset": 0},
+            )
+            beyond = client.get(
+                "/api/v1/memory-reviews",
+                params={"status": "open", "limit": 1, "offset": 1},
+            )
+            stale_page = client.get(
+                "/api/v1/memory-reviews",
+                params={"status": "stale", "limit": 1, "offset": 0},
+            )
+
+        assert first.json()["total"] == 1
+        assert [item["id"] for item in first.json()["data"]] == [current.id]
+        assert beyond.json()["data"] == []
+        assert [item["id"] for item in stale_page.json()["data"]] == [stale.id]
+        stored_stale = await db.get_memory_review(stale.id)
+        assert stored_stale.status == "pending"
+        assert stored_stale.resolved_at is None
+
+    @pytest.mark.asyncio
+    async def test_review_reads_hide_another_principals_private_participants(
+        self,
+        db,
+        chroma,
+        tmp_path,
+    ):
+        incumbent, challenger, review = await _seed_cross_source_review(db, chroma)
+        for memory in (incumbent, challenger):
+            await db.db.execute(
+                "UPDATE memories SET visibility = 'private', owner_user_id = ? WHERE id = ?",
+                ("alice", memory.id),
+            )
+        await db.db.commit()
+
+        from memforge.server.admin_api import create_admin_app
+
+        bob_app = create_admin_app(
+            db=db,
+            config=_config(tmp_path),
+            principal_resolver=lambda _request: "bob",
+        )
+        with TestClient(bob_app) as client:
+            queue = client.get("/api/v1/memory-reviews", params={"status": "open"})
+            detail = client.get(f"/api/v1/memory-reviews/{review.id}")
+
+        assert queue.json()["total"] == 0
+        assert detail.status_code == 404
+
+        alice_app = create_admin_app(
+            db=db,
+            config=_config(tmp_path),
+            principal_resolver=lambda _request: "alice",
+        )
+        with TestClient(alice_app) as client:
+            assert client.get(f"/api/v1/memory-reviews/{review.id}").status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_review_reads_and_decisions_include_related_participant_visibility(
+        self,
+        db,
+        chroma,
+        tmp_path,
+    ):
+        _, _, review = await _seed_supersede_review(db, chroma)
+        related = await _attach_related_challenger(db, review)
+        await db.db.execute(
+            "UPDATE memories SET visibility = 'private', owner_user_id = ? WHERE id = ?",
+            ("alice", related.id),
+        )
+        await db.db.commit()
+        from memforge.server.admin_api import create_admin_app
+
+        bob_app = create_admin_app(
+            db=db,
+            config=_config(tmp_path),
+            principal_resolver=lambda _request: "bob",
+        )
+        with TestClient(bob_app) as client:
+            assert client.get(f"/api/v1/memory-reviews/{review.id}").status_code == 404
+            assert client.get("/api/v1/memory-reviews", params={"status": "open"}).json()["total"] == 0
+
+    @pytest.mark.asyncio
+    async def test_related_membership_change_invalidates_validated_manifest(
+        self,
+        db,
+        chroma,
+        tmp_path,
+    ):
+        _, _, review = await _seed_supersede_review(db, chroma)
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            detail = client.get(f"/api/v1/memory-reviews/{review.id}").json()
+            decisions = [
+                {
+                    "review_id": review.id,
+                    "decision": "approve",
+                    "expected_fingerprint": detail["decision_fingerprint"],
+                }
+            ]
+            validated = client.post(
+                "/api/v1/memory-reviews/decisions/validate",
+                json={"decisions": decisions},
+            ).json()
+            await _attach_related_challenger(db, review, suffix="late-related")
+            applied = client.post(
+                "/api/v1/memory-reviews/decisions/apply",
+                json={
+                    "decisions": decisions,
+                    "validation_receipt": validated["validation_receipt"],
+                },
+            )
+
+        assert applied.status_code == 200
+        assert applied.json()["results"][0]["outcome"] == "stale"
+        assert (await db.get_memory_review(review.id)).status == "pending"
+
+    @pytest.mark.asyncio
+    async def test_single_decision_requires_current_fingerprint_and_records_principal(
+        self,
+        db,
+        chroma,
+        tmp_path,
+    ):
+        incumbent, challenger, review = await _seed_cross_source_review(db, chroma)
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            detail = client.get(f"/api/v1/memory-reviews/{review.id}").json()
+            spoofed = client.post(
+                f"/api/v1/memory-reviews/{review.id}/approve",
+                json={
+                    "expected_fingerprint": detail["decision_fingerprint"],
+                    "reviewer": "mallory",
+                },
+            )
+            stale = client.post(
+                f"/api/v1/memory-reviews/{review.id}/approve",
+                json={"expected_fingerprint": "review-decision-v1:stale"},
+            )
+            applied = client.post(
+                f"/api/v1/memory-reviews/{review.id}/approve",
+                json={"expected_fingerprint": detail["decision_fingerprint"]},
+            )
+            replayed = client.post(
+                f"/api/v1/memory-reviews/{review.id}/approve",
+                json={"expected_fingerprint": detail["decision_fingerprint"]},
+            )
+            unrelated_fingerprint = client.post(
+                f"/api/v1/memory-reviews/{review.id}/approve",
+                json={"expected_fingerprint": "review-decision-v1:unrelated"},
+            )
+
+        assert spoofed.status_code == 422
+        assert stale.status_code == 409
+        assert applied.status_code == 200
+        assert replayed.status_code == 200
+        assert unrelated_fingerprint.status_code == 409
+        stored = await db.get_memory_review(review.id)
+        assert stored is not None and stored.reviewer == "dev"
+        assert (await db.get_memory(incumbent.id)).status == "active"
+        assert (await db.get_memory(challenger.id)).status == "active"
+
+    @pytest.mark.asyncio
+    async def test_manifest_validation_is_read_only_and_apply_is_per_review(
+        self,
+        db,
+        chroma,
+        tmp_path,
+    ):
+        incumbent, challenger, cross_review = await _seed_cross_source_review(db, chroma)
+        lifecycle_review_id = await _seed_lifecycle_review(db, review_id="review-lifecycle-batch")
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            cross = client.get(f"/api/v1/memory-reviews/{cross_review.id}").json()
+            lifecycle = client.get(f"/api/v1/memory-reviews/{lifecycle_review_id}").json()
+            decisions = [
+                {
+                    "review_id": cross_review.id,
+                    "decision": "approve",
+                    "expected_fingerprint": cross["decision_fingerprint"],
+                    "rationale": "The claims concern the same deployment.",
+                    "confidence": 0.94,
+                    "risk": "low",
+                },
+                {
+                    "review_id": lifecycle_review_id,
+                    "decision": "reject",
+                    "expected_fingerprint": lifecycle["decision_fingerprint"],
+                    "note": "The current source state remains authoritative.",
+                    "risk": "high",
+                },
+                {
+                    "review_id": "missing-review",
+                    "decision": "approve",
+                    "expected_fingerprint": "review-decision-v1:missing",
+                },
+            ]
+            validated = client.post(
+                "/api/v1/memory-reviews/decisions/validate",
+                json={"decisions": decisions},
+            )
+            assert (await db.get_memory_review(cross_review.id)).status == "pending"
+            assert (await db.get_lifecycle_review(lifecycle_review_id)).status is LifecycleReviewStatus.PENDING
+            applied = client.post(
+                "/api/v1/memory-reviews/decisions/apply",
+                json={
+                    "decisions": decisions,
+                    "validation_receipt": validated.json()["validation_receipt"],
+                },
+            )
+
+        assert validated.status_code == 200
+        assert [item["outcome"] for item in validated.json()["results"]] == [
+            "ready",
+            "ready",
+            "not_found",
+        ]
+        assert applied.status_code == 200
+        assert [item["outcome"] for item in applied.json()["results"]] == [
+            "applied",
+            "applied",
+            "not_found",
+        ]
+        assert applied.json()["applied"] == 2
+        assert applied.json()["failed"] == 1
+        assert (await db.get_memory(incumbent.id)).status == "active"
+        assert (await db.get_memory(challenger.id)).status == "active"
+        assert (await db.get_memory_review(cross_review.id)).status == "approved"
+        assert (await db.get_lifecycle_review(lifecycle_review_id)).status is LifecycleReviewStatus.REJECTED
+
+    @pytest.mark.asyncio
+    async def test_manifest_apply_requires_receipt_for_the_exact_principal_and_cohort(
+        self,
+        db,
+        chroma,
+        tmp_path,
+    ):
+        _, _, review = await _seed_cross_source_review(db, chroma)
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            detail = client.get(f"/api/v1/memory-reviews/{review.id}").json()
+            decisions = [
+                {
+                    "review_id": review.id,
+                    "decision": "approve",
+                    "expected_fingerprint": detail["decision_fingerprint"],
+                }
+            ]
+            missing = client.post(
+                "/api/v1/memory-reviews/decisions/apply",
+                json={"decisions": decisions},
+            )
+            validated = client.post(
+                "/api/v1/memory-reviews/decisions/validate",
+                json={"decisions": decisions},
+            )
+            changed = client.post(
+                "/api/v1/memory-reviews/decisions/apply",
+                json={
+                    "decisions": [{**decisions[0], "decision": "reject", "note": "Different context"}],
+                    "validation_receipt": validated.json()["validation_receipt"],
+                },
+            )
+
+        assert missing.status_code == 409
+        assert changed.status_code == 409
+        assert (await db.get_memory_review(review.id)).status == "pending"
+
+    @pytest.mark.asyncio
+    async def test_manifest_receipt_cannot_be_replayed_in_another_workspace(
+        self,
+        db,
+        chroma,
+        tmp_path,
+    ):
+        _, _, review = await _seed_cross_source_review(db, chroma)
+        from memforge.server.admin_api import create_admin_app
+
+        config = _config(tmp_path)
+        workspace_a = create_admin_app(db=db, config=config, workspace_id="workspace-a")
+        workspace_b = create_admin_app(db=db, config=config, workspace_id="workspace-b")
+        with TestClient(workspace_a) as client_a:
+            detail = client_a.get(f"/api/v1/memory-reviews/{review.id}").json()
+            decisions = [
+                {
+                    "review_id": review.id,
+                    "decision": "approve",
+                    "expected_fingerprint": detail["decision_fingerprint"],
+                }
+            ]
+            receipt = client_a.post(
+                "/api/v1/memory-reviews/decisions/validate",
+                json={"decisions": decisions},
+            ).json()["validation_receipt"]
+
+        with TestClient(workspace_b) as client_b:
+            replayed = client_b.post(
+                "/api/v1/memory-reviews/decisions/apply",
+                json={"decisions": decisions, "validation_receipt": receipt},
+            )
+
+        assert replayed.status_code == 409
+        assert (await db.get_memory_review(review.id)).status == "pending"
+
+
+class TestReviewResolutionConcurrency:
+    @pytest.mark.asyncio
+    async def test_compare_and_set_allows_only_one_pending_resolution(self, db, chroma):
+        _, _, review = await _seed_cross_source_review(db, chroma)
+
+        results = await asyncio.gather(
+            db.resolve_memory_review(
+                review.id,
+                status="approved",
+                reviewer="alice",
+                review_note=None,
+            ),
+            db.resolve_memory_review(
+                review.id,
+                status="rejected",
+                reviewer="bob",
+                review_note="different context",
+            ),
+            return_exceptions=True,
+        )
+
+        assert sum(isinstance(item, ValueError) for item in results) == 1
+        stored = await db.get_memory_review(review.id)
+        assert stored is not None and stored.status in {"approved", "rejected"}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_destructive_approvals_have_one_atomic_owner(
+        self,
+        db,
+        chroma,
+        review_service,
+    ):
+        incumbent, challenger, review = await _seed_supersede_review(db, chroma)
+
+        results = await asyncio.gather(
+            _approve(review_service, review.id, reviewer="alice"),
+            _approve(review_service, review.id, reviewer="bob"),
+            return_exceptions=True,
+        )
+
+        assert sum(isinstance(item, ResolvedReview) for item in results) == 1
+        assert sum(isinstance(item, ReviewAlreadyResolved) for item in results) == 1
+        assert (await db.get_memory_review(review.id)).status == "approved"
+        assert (await db.get_memory(incumbent.id)).status == "superseded"
+        assert (await db.get_memory(challenger.id)).status == "active"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_destructive_opposite_decisions_never_compensate_winner(
+        self,
+        db,
+        chroma,
+        review_service,
+    ):
+        incumbent, challenger, review = await _seed_supersede_review(db, chroma)
+
+        results = await asyncio.gather(
+            _approve(review_service, review.id, reviewer="alice"),
+            _reject(review_service, review.id, reviewer="bob", note="Keep current"),
+            return_exceptions=True,
+        )
+
+        assert sum(isinstance(item, ResolvedReview) for item in results) == 1
+        assert sum(isinstance(item, ReviewAlreadyResolved) for item in results) == 1
+        stored = await db.get_memory_review(review.id)
+        current_incumbent = await db.get_memory(incumbent.id)
+        current_challenger = await db.get_memory(challenger.id)
+        if stored.status == "approved":
+            assert current_incumbent.status == "superseded"
+            assert current_challenger.status == "active"
+        else:
+            assert stored.status == "rejected"
+            assert current_incumbent.status == "active"
+            assert current_challenger.status == "retired"
+
+    @pytest.mark.asyncio
+    async def test_cross_connection_cannot_attach_participant_after_resolution_cohort_lock(
+        self,
+        db,
+        chroma,
+        review_service,
+        monkeypatch,
+    ):
+        _, _, review = await _seed_supersede_review(db, chroma, suffix="cohortlock")
+        related = _memory("mem-related-cohortlock", "PostgreSQL is version 17", status="pending_review")
+        await db.insert_memory(related)
+        second = Database(db.db_path)
+        await second.connect()
+        entered_guard = asyncio.Event()
+        release_guard = asyncio.Event()
+        original_guard = db._assert_no_active_source_support_unlocked
+
+        async def pause_after_cohort_lock(memory_id: str) -> None:
+            entered_guard.set()
+            await release_guard.wait()
+            await original_guard(memory_id)
+
+        monkeypatch.setattr(db, "_assert_no_active_source_support_unlocked", pause_after_cohort_lock)
+        resolution = asyncio.create_task(_approve(review_service, review.id, reviewer="alice"))
+        await entered_guard.wait()
+        attachment = asyncio.create_task(
+            second.add_memory_review_related_challenger(review.id, related.id, reason="late candidate")
+        )
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(attachment), timeout=0.05)
+        release_guard.set()
+
+        try:
+            await resolution
+            with pytest.raises(ValueError, match="not pending"):
+                await attachment
+        finally:
+            await second.close()
+
+        assert await db.list_memory_review_related_challengers(review.id) == []
+        assert (await db.get_memory_review(review.id)).status == "approved"
 
 
 class TestApprove:
@@ -748,7 +1249,7 @@ class TestApprove:
     async def test_approve_promotes_challenger_and_supersedes_incumbent(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
 
-        result = await review_service.approve(review.id, reviewer="alice", note=None)
+        result = await _approve(review_service, review.id, reviewer="alice", note=None)
 
         stored_review = result.review
         stored_incumbent = await db.get_memory(incumbent.id)
@@ -771,7 +1272,7 @@ class TestApprove:
             suffix="apprrev",
         )
 
-        await review_service.approve(review.id, reviewer="alice", note=None)
+        await _approve(review_service, review.id, reviewer="alice", note=None)
 
         stored_incumbent = await db.get_memory(incumbent.id)
         stored_challenger = await db.get_memory(challenger.id)
@@ -785,7 +1286,7 @@ class TestApprove:
     async def test_approve_keeps_search_indexes_aligned(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
 
-        await review_service.approve(review.id, reviewer="alice", note=None)
+        await _approve(review_service, review.id, reviewer="alice", note=None)
 
         async with db.db.execute("SELECT memory_id FROM memories_fts ORDER BY memory_id") as cursor:
             fts_ids = [row[0] async for row in cursor]
@@ -794,12 +1295,69 @@ class TestApprove:
         assert challenger.id in chroma.records
         assert chroma.records[challenger.id]["status"] == "active"
         assert incumbent.id not in chroma.records
+        rows = await db.db.execute_fetchall(
+            "SELECT memory_id, operation, status FROM review_vector_outbox "
+            "WHERE review_id = ? ORDER BY memory_id",
+            (review.id,),
+        )
+        assert {(row["memory_id"], row["operation"], row["status"]) for row in rows} == {
+            (incumbent.id, "delete", "completed"),
+            (challenger.id, "upsert", "completed"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_vector_failure_keeps_durable_retry_without_compensating_review(
+        self,
+        db,
+        chroma,
+        review_service,
+        memory_store,
+        monkeypatch,
+    ):
+        incumbent, challenger, review = await _seed_supersede_review(db, chroma, suffix="vectorretry")
+        original_reconcile = memory_store._reconcile_lifecycle_vector_target
+
+        async def fail_vector(_memory_id: str) -> None:
+            raise RuntimeError("vector provider unavailable")
+
+        monkeypatch.setattr(memory_store, "_reconcile_lifecycle_vector_target", fail_vector)
+        result = await _approve(review_service, review.id, reviewer="alice")
+
+        assert result.review.status == "approved"
+        assert (await db.get_memory(incumbent.id)).status == "superseded"
+        assert (await db.get_memory(challenger.id)).status == "active"
+        failed = await db.db.execute_fetchall(
+            "SELECT status, attempts, error FROM review_vector_outbox WHERE review_id = ?",
+            (review.id,),
+        )
+        assert len(failed) == 2
+        assert {row["status"] for row in failed} == {"failed"}
+        assert {row["attempts"] for row in failed} == {1}
+        assert all("vector provider unavailable" in row["error"] for row in failed)
+
+        monkeypatch.setattr(memory_store, "_reconcile_lifecycle_vector_target", original_reconcile)
+        await db.db.execute(
+            "UPDATE review_vector_outbox SET next_attempt_at = NULL WHERE review_id = ?",
+            (review.id,),
+        )
+        await db.db.commit()
+        delivery = await memory_store.attempt_review_vector_delivery(review.id)
+
+        assert delivery.pending is False
+        completed = await db.db.execute_fetchall(
+            "SELECT status, attempts FROM review_vector_outbox WHERE review_id = ?",
+            (review.id,),
+        )
+        assert {row["status"] for row in completed} == {"completed"}
+        assert {row["attempts"] for row in completed} == {2}
+        assert challenger.id in chroma.records
+        assert incumbent.id not in chroma.records
 
     @pytest.mark.asyncio
     async def test_approve_records_review_and_supersede_audit(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
 
-        await review_service.approve(review.id, reviewer="alice", note=None)
+        await _approve(review_service, review.id, reviewer="alice", note=None)
 
         challenger_rows = await db.list_memory_audit_events(memory_id=challenger.id)
         audit_rows = await db.list_memory_audit_events(operation_id=challenger_rows[0].operation_id)
@@ -817,17 +1375,17 @@ class TestApprove:
         self, db, chroma, review_service, monkeypatch
     ):
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
-        original_resolve = db.resolve_memory_review
+        original_resolve = db.apply_memory_review_resolution
 
         async def fail_resolve(*args, **kwargs):
             raise RuntimeError("resolution failed")
 
-        monkeypatch.setattr(db, "resolve_memory_review", fail_resolve)
+        monkeypatch.setattr(db, "apply_memory_review_resolution", fail_resolve)
 
         with pytest.raises(RuntimeError, match="resolution failed"):
-            await review_service.approve(review.id, reviewer="alice", note=None)
+            await _approve(review_service, review.id, reviewer="alice", note=None)
 
-        monkeypatch.setattr(db, "resolve_memory_review", original_resolve)
+        monkeypatch.setattr(db, "apply_memory_review_resolution", original_resolve)
         challenger_rows = await db.list_memory_audit_events(memory_id=challenger.id)
         audit_rows = await db.list_memory_audit_events(operation_id=challenger_rows[0].operation_id)
         stored_review = await db.get_memory_review(review.id)
@@ -847,10 +1405,10 @@ class TestApprove:
         async def fail_resolve(*args, **kwargs):
             raise RuntimeError("resolution failed")
 
-        monkeypatch.setattr(db, "resolve_memory_review", fail_resolve)
+        monkeypatch.setattr(db, "apply_memory_review_resolution", fail_resolve)
 
         with pytest.raises(RuntimeError, match="resolution failed"):
-            await review_service.approve(review.id, reviewer="alice", note=None)
+            await _approve(review_service, review.id, reviewer="alice", note=None)
 
         audit_rows = await db.list_memory_audit_events(memory_id=challenger.id)
         failure_rows = [row for row in audit_rows if row.event_type == "review_resolution_failed"]
@@ -868,7 +1426,7 @@ class TestApprove:
         )
         await db.link_memory_entity(challenger.id, entity_id)
 
-        await review_service.approve(review.id, reviewer="alice", note=None)
+        await _approve(review_service, review.id, reviewer="alice", note=None)
 
         async with db.db.execute(
             "SELECT entities_text FROM memories_fts WHERE memory_id = ?",
@@ -884,7 +1442,7 @@ class TestApprove:
         related = await _attach_related_challenger(db, review)
         chroma.upsert(ids=[related.id], metadatas=[{"status": "pending_review"}])
 
-        await review_service.approve(review.id, reviewer="alice", note=None)
+        await _approve(review_service, review.id, reviewer="alice", note=None)
 
         stored_related = await db.get_memory(related.id)
         assert stored_related.status == "retired"
@@ -892,15 +1450,43 @@ class TestApprove:
         assert related.id not in chroma.records
 
     @pytest.mark.asyncio
+    async def test_approve_fails_closed_before_mutation_when_incumbent_has_active_support(
+        self,
+        db,
+        chroma,
+        review_service,
+        monkeypatch,
+    ):
+        incumbent, challenger, review = await _seed_supersede_review(db, chroma, suffix="supportguard")
+        guarded: list[str] = []
+
+        async def active_support_guard(memory_id: str) -> None:
+            guarded.append(memory_id)
+            raise ValueError(
+                "direct terminal Memory transition rejected while active source support remains; "
+                "projected lifecycle required"
+            )
+
+        monkeypatch.setattr(db, "_assert_no_active_source_support_unlocked", active_support_guard)
+
+        with pytest.raises(ReviewError, match="active source support"):
+            await _approve(review_service, review.id, reviewer="alice")
+
+        assert guarded == [incumbent.id]
+        assert (await db.get_memory_review(review.id)).status == "pending"
+        assert (await db.get_memory(incumbent.id)).status == "active"
+        assert (await db.get_memory(challenger.id)).status == "pending_review"
+
+    @pytest.mark.asyncio
     async def test_repeated_approve_returns_clear_409_without_partial_mutation(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
-        await review_service.approve(review.id, reviewer="alice", note=None)
+        await _approve(review_service, review.id, reviewer="alice", note=None)
 
         snapshot_incumbent = await db.get_memory(incumbent.id)
         snapshot_challenger = await db.get_memory(challenger.id)
 
         with pytest.raises(ReviewAlreadyResolved):
-            await review_service.approve(review.id, reviewer="bob", note=None)
+            await _approve(review_service, review.id, reviewer="bob", note=None)
 
         assert (await db.get_memory(incumbent.id)).updated_at == snapshot_incumbent.updated_at
         assert (await db.get_memory(challenger.id)).updated_at == snapshot_challenger.updated_at
@@ -916,7 +1502,7 @@ class TestApprove:
         )
 
         with pytest.raises(ReviewAlreadyResolved, match="already stale"):
-            await review_service.approve(review.id, reviewer="alice", note=None)
+            await _approve(review_service, review.id, reviewer="alice", note=None)
 
         stored = await db.get_memory_review(review.id)
         assert stored.status == "stale"
@@ -935,7 +1521,8 @@ class TestReject:
         incumbent, challenger, review = await _seed_supersede_review(db, chroma)
         chroma.upsert(ids=[challenger.id], metadatas=[{"status": "pending_review"}])
 
-        result = await review_service.reject(
+        result = await _reject(
+            review_service,
             review.id,
             reviewer="alice",
             note="Source is unreliable",
@@ -963,7 +1550,7 @@ class TestReject:
         _, _, review = await _seed_supersede_review(db, chroma)
 
         with pytest.raises(ReviewError):
-            await review_service.reject(review.id, reviewer="alice", note="   ")
+            await _reject(review_service, review.id, reviewer="alice", note="   ")
 
         stored = await db.get_memory_review(review.id)
         assert stored.status == "pending"
@@ -972,7 +1559,7 @@ class TestReject:
     async def test_reject_records_review_audit_with_reviewer(self, db, chroma, review_service):
         _, challenger, review = await _seed_supersede_review(db, chroma)
 
-        await review_service.reject(review.id, reviewer="alice", note="bad source")
+        await _reject(review_service, review.id, reviewer="alice", note="bad source")
 
         audit_rows = await db.list_memory_audit_events(memory_id=challenger.id)
         review_rows = [row for row in audit_rows if row.event_type == "review_rejected"]
@@ -986,7 +1573,7 @@ class TestReject:
         related = await _attach_related_challenger(db, review)
         chroma.upsert(ids=[related.id], metadatas=[{"status": "pending_review"}])
 
-        await review_service.reject(review.id, reviewer="alice", note="bad source")
+        await _reject(review_service, review.id, reviewer="alice", note="bad source")
 
         stored_related = await db.get_memory(related.id)
         assert stored_related.status == "retired"
@@ -996,17 +1583,17 @@ class TestReject:
     @pytest.mark.asyncio
     async def test_reject_rolls_back_when_review_resolution_fails(self, db, chroma, review_service, monkeypatch):
         _, challenger, review = await _seed_supersede_review(db, chroma)
-        original_resolve = db.resolve_memory_review
+        original_resolve = db.apply_memory_review_resolution
 
         async def fail_resolve(*args, **kwargs):
             raise RuntimeError("resolution failed")
 
-        monkeypatch.setattr(db, "resolve_memory_review", fail_resolve)
+        monkeypatch.setattr(db, "apply_memory_review_resolution", fail_resolve)
 
         with pytest.raises(RuntimeError, match="resolution failed"):
-            await review_service.reject(review.id, reviewer="alice", note="bad source")
+            await _reject(review_service, review.id, reviewer="alice", note="bad source")
 
-        monkeypatch.setattr(db, "resolve_memory_review", original_resolve)
+        monkeypatch.setattr(db, "apply_memory_review_resolution", original_resolve)
         stored_review = await db.get_memory_review(review.id)
         stored_challenger = await db.get_memory(challenger.id)
         audit_rows = await db.list_memory_audit_events(memory_id=challenger.id)
@@ -1031,26 +1618,26 @@ class TestReject:
         async def fail_resolve(*args, **kwargs):
             raise RuntimeError("resolution failed")
 
-        monkeypatch.setattr(db, "resolve_memory_review", fail_resolve)
+        monkeypatch.setattr(db, "apply_memory_review_resolution", fail_resolve)
 
         with pytest.raises(RuntimeError, match="resolution failed"):
-            await review_service.reject(review.id, reviewer="alice", note="bad source")
+            await _reject(review_service, review.id, reviewer="alice", note="bad source")
 
         stored_challenger = await db.get_memory(challenger.id)
         stored_related = await db.get_memory(related.id)
         assert stored_challenger.status == "pending_review"
         assert stored_related.status == "pending_review"
-        assert challenger.id not in chroma.records
-        assert related.id not in chroma.records
+        assert challenger.id in chroma.records
+        assert related.id in chroma.records
 
     @pytest.mark.asyncio
     async def test_repeated_reject_returns_clear_409(self, db, chroma, review_service):
         _, _, review = await _seed_supersede_review(db, chroma)
 
-        await review_service.reject(review.id, reviewer="alice", note="bad source")
+        await _reject(review_service, review.id, reviewer="alice", note="bad source")
 
         with pytest.raises(ReviewAlreadyResolved):
-            await review_service.reject(review.id, reviewer="bob", note="again")
+            await _reject(review_service, review.id, reviewer="bob", note="again")
 
 
 # ---------------------------------------------------------------------------
@@ -1060,12 +1647,11 @@ class TestReject:
 
 class TestCrossSourceReviewResolution:
     @pytest.mark.asyncio
-    async def test_approve_acknowledges_finding_without_mutating_memories(
-        self, db, chroma, review_service
-    ):
+    async def test_approve_acknowledges_finding_without_mutating_memories(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_cross_source_review(db, chroma)
 
-        result = await review_service.approve(
+        result = await _approve(
+            review_service,
             review.id,
             reviewer="alice",
             note="confirmed conflict; no authority decision yet",
@@ -1077,12 +1663,11 @@ class TestCrossSourceReviewResolution:
         assert set(chroma.records) == {incumbent.id, challenger.id}
 
     @pytest.mark.asyncio
-    async def test_reject_dismisses_finding_without_mutating_memories(
-        self, db, chroma, review_service
-    ):
+    async def test_reject_dismisses_finding_without_mutating_memories(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_cross_source_review(db, chroma)
 
-        result = await review_service.reject(
+        result = await _reject(
+            review_service,
             review.id,
             reviewer="alice",
             note="claims apply to different deployments",

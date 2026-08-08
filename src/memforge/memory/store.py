@@ -11,7 +11,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from itertools import zip_longest
-from typing import Any, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.evidence import (
@@ -319,17 +319,70 @@ class MemoryStore:
         callers receive ``PENDING`` and must not compensate the committed graph.
         """
 
-        scope = lifecycle_plan_id or source_id or "all"
-        try:
-            tasks = await self.relational.list_ready_lifecycle_vector_tasks(
+        return await self._attempt_durable_vector_delivery(
+            scope=lifecycle_plan_id or source_id or "all",
+            owner_kind="Lifecycle",
+            load_ready=lambda: self.relational.list_ready_lifecycle_vector_tasks(
                 source_id=source_id,
                 lifecycle_plan_id=lifecycle_plan_id,
                 limit=LIFECYCLE_VECTOR_DELIVERY_BATCH_SIZE + 1,
                 max_attempts=LIFECYCLE_VECTOR_DELIVERY_MAX_ATTEMPTS,
-            )
+            ),
+            load_remaining=lambda: self.relational.list_lifecycle_vector_tasks(
+                source_id=source_id,
+                lifecycle_plan_id=lifecycle_plan_id,
+                limit=1,
+            ),
+            complete=self.relational.complete_lifecycle_vector_task,
+            fail=lambda task_id, error, next_attempt_at: self.relational.fail_lifecycle_vector_task(
+                task_id,
+                error,
+                next_attempt_at=next_attempt_at,
+            ),
+        )
+
+    async def attempt_review_vector_delivery(
+        self,
+        review_id: str | None = None,
+    ) -> LifecycleVectorDeliveryResult:
+        """Attempt Review-owned derived-index work without fake Lifecycle Plan ownership."""
+
+        return await self._attempt_durable_vector_delivery(
+            scope=review_id or "all reviews",
+            owner_kind="Review",
+            load_ready=lambda: self.relational.list_ready_review_vector_tasks(
+                review_id=review_id,
+                limit=LIFECYCLE_VECTOR_DELIVERY_BATCH_SIZE + 1,
+                max_attempts=LIFECYCLE_VECTOR_DELIVERY_MAX_ATTEMPTS,
+            ),
+            load_remaining=lambda: self.relational.list_review_vector_tasks(
+                review_id=review_id,
+                limit=1,
+            ),
+            complete=self.relational.complete_review_vector_task,
+            fail=lambda task_id, error, next_attempt_at: self.relational.fail_review_vector_task(
+                task_id,
+                error,
+                next_attempt_at=next_attempt_at,
+            ),
+        )
+
+    async def _attempt_durable_vector_delivery(
+        self,
+        *,
+        scope: str,
+        owner_kind: str,
+        load_ready: Callable[[], Awaitable[Sequence[Any]]],
+        load_remaining: Callable[[], Awaitable[Sequence[Any]]],
+        complete: Callable[[str], Awaitable[None]],
+        fail: Callable[[str, str, str], Awaitable[None]],
+    ) -> LifecycleVectorDeliveryResult:
+        try:
+            tasks = await load_ready()
         except Exception as exc:
             logger.warning(
-                "Lifecycle vector delivery lookup remains pending scope=%s error_type=%s",
+                "%s vector delivery lookup remains pending scope=%s error_type=%s",
+                owner_kind,
                 scope,
                 type(exc).__name__,
                 exc_info=True,
@@ -346,7 +399,7 @@ class MemoryStore:
         for task in selected_tasks:
             try:
                 await self._reconcile_lifecycle_vector_target(task.memory_id)
-                await self.relational.complete_lifecycle_vector_task(task.id)
+                await complete(task.id)
                 delivered_tasks += 1
             except Exception as exc:
                 error_types.append(type(exc).__name__)
@@ -358,16 +411,17 @@ class MemoryStore:
                     datetime.now(timezone.utc) + timedelta(seconds=retry_delay)
                 ).isoformat()
                 try:
-                    await self.relational.fail_lifecycle_vector_task(
+                    await fail(
                         task.id,
                         str(exc),
-                        next_attempt_at=next_attempt_at,
+                        next_attempt_at,
                     )
                 except Exception as persistence_exc:
                     error_types.append(type(persistence_exc).__name__)
                     logger.warning(
-                        "Lifecycle vector task failure could not be persisted task=%s scope=%s "
+                        "%s vector task failure could not be persisted task=%s scope=%s "
                         "error_type=%s persistence_error_type=%s",
+                        owner_kind,
                         task.id,
                         scope,
                         type(exc).__name__,
@@ -376,7 +430,8 @@ class MemoryStore:
                     )
                 else:
                     logger.warning(
-                        "Lifecycle vector task remains pending task=%s scope=%s error_type=%s",
+                        "%s vector task remains pending task=%s scope=%s error_type=%s",
+                        owner_kind,
                         task.id,
                         scope,
                         type(exc).__name__,
@@ -385,11 +440,7 @@ class MemoryStore:
         failed_tasks = len(selected_tasks) - delivered_tasks
         if failed_tasks and not delivered_tasks:
             try:
-                remaining_tasks = await self.relational.list_lifecycle_vector_tasks(
-                    source_id=source_id,
-                    lifecycle_plan_id=lifecycle_plan_id,
-                    limit=1,
-                )
+                remaining_tasks = await load_remaining()
             except Exception as exc:
                 error_types.append(type(exc).__name__)
             else:
@@ -454,6 +505,12 @@ class MemoryStore:
             if await self._current_lifecycle_vector_projection(memory_id) == projection:
                 return
         raise RuntimeError("lifecycle vector target changed during bounded delivery")
+
+    async def reconcile_memory_vector_targets(self, memory_ids: Sequence[str]) -> None:
+        """Project committed relational Memory truth to the vector adapter."""
+
+        for memory_id in dict.fromkeys(memory_ids):
+            await self._reconcile_lifecycle_vector_target(memory_id)
 
     # -------------------------------------------------------------------
     # Core: Deduplicate and Insert
