@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, is_dataclass
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -73,6 +74,10 @@ from memforge.memory.review_presentation import (
     present_lifecycle_review,
     present_memory_review,
 )
+from memforge.memory.review_decision import (
+    lifecycle_review_decision_fingerprint,
+    memory_review_decision_fingerprint,
+)
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     ConfigField,
@@ -85,6 +90,7 @@ from memforge.models import (
     SourceSyncInput,
     SourceExecutionKind,
     UNSORTED_PROJECT_KEY,
+    VIRTUAL_DOCUMENT_SOURCE_IDS,
     canonicalize_entity_name,
 )
 from memforge.sync_progress import normalize_sync_progress_snapshot
@@ -227,14 +233,26 @@ def _workspace_default_scope(request: Request, *, include_private: bool):
     )
 
 
+def _review_visibility_scope(request: Request):
+    """Allow visible Review snapshots regardless of their lifecycle status."""
+
+    from memforge.storage.adapters.context import AccessScope
+
+    return AccessScope(
+        user_id=resolve_request_principal(request),
+        include_private=True,
+        allowed_statuses=("active", "pending_review", "superseded", "retired"),
+        active_project=None,
+        scope_mode="project-first",
+    )
+
+
 def _inline_content_disposition(filename: str) -> str:
     """Return an RFC 8187 filename header with an ASCII-safe fallback."""
 
     basename = filename.replace("\\", "/").rsplit("/", 1)[-1]
     basename = "".join(
-        character
-        for character in basename
-        if character not in {"\r", "\n", "\x7f"} and ord(character) >= 0x20
+        character for character in basename if character not in {"\r", "\n", "\x7f"} and ord(character) >= 0x20
     )
     if not basename:
         basename = "artifact"
@@ -246,10 +264,7 @@ def _inline_content_disposition(filename: str) -> str:
     ascii_suffix = re.sub(r"[^A-Za-z0-9.]+", "", ascii_suffix)
     ascii_fallback = f"{ascii_stem or 'artifact'}{ascii_suffix}"
     encoded = quote(basename, safe="!#$&+-.^_`|~")
-    return (
-        f'inline; filename="{ascii_fallback}"; '
-        f"filename*=UTF-8''{encoded}"
-    )
+    return f"inline; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"
 
 
 def _verified_artifact_chunks(
@@ -448,6 +463,86 @@ async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
     from memforge.storage.adapters.sqlite.relational import SqliteRelationalStore
 
     return await SqliteRelationalStore(db).filter_visible_ids(list(ids), scope)
+
+
+async def _review_source_ids(
+    db: Database,
+    memories: list[Memory],
+    *,
+    cache: dict[str, tuple[str, ...]] | None = None,
+) -> tuple[str, ...]:
+    source_ids: list[str] = []
+    for memory in memories:
+        memory_source_ids = cache.get(memory.id) if cache is not None else None
+        if memory_source_ids is None:
+            memory_source_ids = tuple(
+                source.source_id
+                for source in await db.get_memory_sources(memory.id)
+                if source.source_id and source.source_id not in VIRTUAL_DOCUMENT_SOURCE_IDS
+            )
+            if cache is not None:
+                cache[memory.id] = memory_source_ids
+        source_ids.extend(memory_source_ids)
+    return tuple(dict.fromkeys(source_ids))
+
+
+async def _require_memory_review_visibility(
+    request: Request,
+    db: Database,
+    review: MemoryReview,
+) -> tuple[Memory, Memory, tuple[Memory, ...]]:
+    incumbent = await db.get_memory(review.incumbent_memory_id)
+    challenger = await db.get_memory(review.challenger_memory_id)
+    if incumbent is None or challenger is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+    related_memories: list[Memory] = []
+    for related in await db.list_memory_review_related_challengers(review.id):
+        memory = await db.get_memory(related.challenger_memory_id)
+        if memory is None:
+            raise HTTPException(status_code=409, detail="Review participant is unavailable")
+        related_memories.append(memory)
+    participant_ids = {incumbent.id, challenger.id, *(memory.id for memory in related_memories)}
+    visible = await _filter_visible_ids(
+        db,
+        participant_ids,
+        _review_visibility_scope(request),
+    )
+    if visible != participant_ids:
+        raise HTTPException(status_code=404, detail="Review not found")
+    return incumbent, challenger, tuple(related_memories)
+
+
+async def _require_memory_review_management(
+    request: Request,
+    db: Database,
+    review: MemoryReview,
+) -> tuple[Memory, Memory, tuple[Memory, ...]]:
+    participants = await _require_memory_review_visibility(request, db, review)
+    incumbent, challenger, related = participants
+    for source_id in await _review_source_ids(db, [incumbent, challenger, *related]):
+        source = await db.get_source(source_id)
+        if source is None:
+            raise HTTPException(status_code=409, detail="Review source is unavailable")
+        _require_source_management(request, source)
+    return participants
+
+
+async def _require_lifecycle_review_visibility(
+    request: Request,
+    db: Database,
+    review: Any,
+) -> None:
+    candidate_id, _ = _lifecycle_candidate_payload(review.staged_evidence)
+    participant_ids = [review.incumbent_memory_id]
+    if candidate_id is not None and await db.get_memory(candidate_id) is not None:
+        participant_ids.append(candidate_id)
+    visible = await _filter_visible_ids(
+        db,
+        participant_ids,
+        _review_visibility_scope(request),
+    )
+    if visible != set(participant_ids):
+        raise HTTPException(status_code=404, detail="Review not found")
 
 
 def _request_audit_context(request: Request) -> AuditContext:
@@ -1447,7 +1542,13 @@ class MemoryReviewMemorySummary(BaseModel):
 
 
 class ReviewActionPresentationResponse(BaseModel):
-    key: Literal["use_latest_state", "keep_current_state"]
+    key: Literal[
+        "use_latest_state",
+        "keep_current_state",
+        "confirm_conflict",
+        "not_a_conflict",
+    ]
+    decision: Literal["approve", "reject"]
     label: str
     consequence: str
     requires_note: bool
@@ -1482,6 +1583,7 @@ class MemoryReviewResponse(BaseModel):
     created_at: str | None = None
     resolved_at: str | None = None
     is_stale: bool = False
+    decision_fingerprint: str
     presentation: ReviewPresentationResponse
 
 
@@ -1493,6 +1595,8 @@ class MemoryReviewListItemResponse(MemoryReviewResponse):
 class MemoryReviewListResponse(BaseModel):
     data: list[MemoryReviewListItemResponse]
     total: int
+    limit: int
+    offset: int
 
 
 class MemoryReviewDetailResponse(MemoryReviewResponse):
@@ -1502,8 +1606,71 @@ class MemoryReviewDetailResponse(MemoryReviewResponse):
 
 
 class MemoryReviewDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_fingerprint: str = Field(min_length=1)
     note: str | None = None
-    reviewer: str | None = None
+
+
+class MemoryReviewManifestDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    review_id: str = Field(min_length=1)
+    decision: Literal["approve", "reject"]
+    expected_fingerprint: str = Field(min_length=1)
+    note: str | None = None
+    rationale: str | None = Field(default=None, max_length=2000)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    risk: Literal["low", "medium", "high"] = "medium"
+
+
+class MemoryReviewDecisionManifestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[MemoryReviewManifestDecision] = Field(min_length=1, max_length=50)
+    validation_receipt: str | None = Field(default=None, min_length=1)
+
+    @field_validator("decisions")
+    @classmethod
+    def _unique_review_ids(
+        cls,
+        decisions: list[MemoryReviewManifestDecision],
+    ) -> list[MemoryReviewManifestDecision]:
+        review_ids = [item.review_id for item in decisions]
+        if len(set(review_ids)) != len(review_ids):
+            raise ValueError("decision manifest contains duplicate review_id values")
+        return decisions
+
+
+class MemoryReviewDecisionResult(BaseModel):
+    review_id: str
+    decision: Literal["approve", "reject"]
+    outcome: Literal[
+        "ready",
+        "applied",
+        "already_applied",
+        "stale",
+        "forbidden",
+        "not_found",
+        "invalid",
+        "failed",
+    ]
+    status: str | None = None
+    message: str | None = None
+    decision_label: str | None = None
+    consequence: str | None = None
+
+
+class MemoryReviewDecisionManifestResponse(BaseModel):
+    mode: Literal["validate", "apply"]
+    results: list[MemoryReviewDecisionResult]
+    ready: int = 0
+    applied: int = 0
+    already_applied: int = 0
+    stale: int = 0
+    forbidden: int = 0
+    failed: int = 0
+    validation_receipt: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -2403,6 +2570,7 @@ def _review_to_response(
     *,
     incumbent: Memory | None = None,
     challenger: Memory | None = None,
+    related_challengers: tuple[Memory, ...] = (),
 ) -> MemoryReviewResponse:
     return MemoryReviewResponse(
         id=review.id,
@@ -2419,9 +2587,8 @@ def _review_to_response(
         created_at=_dt_iso(review.created_at),
         resolved_at=_dt_iso(review.resolved_at),
         is_stale=_is_review_stale(review, incumbent, challenger),
-        presentation=_presentation_response(
-            present_memory_review(kind=review.kind, reason=review.reason)
-        ),
+        decision_fingerprint=memory_review_decision_fingerprint(review, related_challengers),
+        presentation=_presentation_response(present_memory_review(kind=review.kind, reason=review.reason)),
     )
 
 
@@ -2479,7 +2646,9 @@ def _build_memory_review_list_summary(
     )
 
 
-def _lifecycle_candidate_payload(staged_evidence: Mapping[str, object]) -> tuple[str | None, Mapping[str, object] | None]:
+def _lifecycle_candidate_payload(
+    staged_evidence: Mapping[str, object],
+) -> tuple[str | None, Mapping[str, object] | None]:
     candidate_id = staged_evidence.get("replacement_memory_id")
     if not isinstance(candidate_id, str) or not candidate_id:
         candidate_id = None
@@ -2513,8 +2682,13 @@ async def _lifecycle_review_response(
     detail: bool,
     config: AppConfig | None = None,
     artifact_store: DocumentArtifactStore | None = None,
+    memory_cache: Mapping[str, Memory] | None = None,
 ) -> MemoryReviewListItemResponse | MemoryReviewDetailResponse:
-    incumbent = await db.get_memory(review.incumbent_memory_id)
+    incumbent = (
+        memory_cache.get(review.incumbent_memory_id)
+        if memory_cache is not None
+        else await db.get_memory(review.incumbent_memory_id)
+    )
     incumbent_summary = None
     if incumbent is not None:
         incumbent_summary = (
@@ -2524,7 +2698,13 @@ async def _lifecycle_review_response(
         )
 
     candidate_id, candidate_payload = _lifecycle_candidate_payload(review.staged_evidence)
-    candidate_memory = await db.get_memory(candidate_id) if candidate_id else None
+    candidate_memory = (
+        memory_cache.get(candidate_id)
+        if memory_cache is not None and candidate_id
+        else await db.get_memory(candidate_id)
+        if candidate_id
+        else None
+    )
     challenger_summary = None
     if candidate_memory is not None:
         challenger_summary = (
@@ -2558,6 +2738,7 @@ async def _lifecycle_review_response(
         "created_at": review.created_at,
         "resolved_at": review.resolved_at,
         "is_stale": review.status.value == "stale",
+        "decision_fingerprint": lifecycle_review_decision_fingerprint(review),
         "presentation": _presentation_response(
             present_lifecycle_review(
                 staged_evidence=review.staged_evidence,
@@ -2778,9 +2959,7 @@ def _validate_local_source_replay_artifact_identity(
             expected_input_sha256=expected_input_sha256,
             expected_package_sha256=expected_package_sha256,
         )
-        derived_doc_id = get_local_source_replay_adapter(
-            source_type
-        ).derive_document_id(
+        derived_doc_id = get_local_source_replay_adapter(source_type).derive_document_id(
             source_id=source_id,
             package=package,
         )
@@ -2808,10 +2987,7 @@ async def _attest_retained_local_source_input(
     top_level_hash = str(metadata.get("package_sha256") or "").strip()
     manifest_hash = str(manifest_entry.get("package_sha256") or "").strip()
     if top_level_hash and manifest_hash and top_level_hash != manifest_hash:
-        raise ValueError(
-            "source sync input artifact attestation conflict: "
-            f"{retained_input.input_id}"
-        )
+        raise ValueError(f"source sync input artifact attestation conflict: {retained_input.input_id}")
     package_hash = top_level_hash or manifest_hash
     if top_level_hash and manifest_hash:
         return retained_input, package_hash
@@ -2820,9 +2996,7 @@ async def _attest_retained_local_source_input(
     except Exception as exc:
         raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
     package_hash = hashlib.sha256(body).hexdigest()
-    expected_doc_id = str(
-        manifest_entry.get("doc_id") or metadata.get("doc_id") or ""
-    )
+    expected_doc_id = str(manifest_entry.get("doc_id") or metadata.get("doc_id") or "")
     _validate_local_source_replay_artifact_identity(
         source_type=source_type,
         source_id=source_id,
@@ -2964,10 +3138,7 @@ def create_admin_app(
             "/api/v1/workspaces",
             "/api/v1/me/default-workspace",
         }
-        if (
-            request.url.path.startswith("/api/v1/")
-            and request.url.path not in workspace_control_plane_paths
-        ):
+        if request.url.path.startswith("/api/v1/") and request.url.path not in workspace_control_plane_paths:
             current_workspace_id = str(request.app.state.workspace_id)
             requested_values = request.query_params.getlist("workspace_id")
             if len(requested_values) > 1:
@@ -3339,18 +3510,11 @@ def create_admin_app(
         if (
             source is None
             or source.get("access_state") != "active"
-            or (
-                source.get("access_policy") == "private"
-                and source.get("owner_user_id") != principal
-            )
+            or (source.get("access_policy") == "private" and source.get("owner_user_id") != principal)
         ):
             raise HTTPException(status_code=404, detail="Source Artifact not found")
         stored = artifact_store.get_artifact(artifact.uri, artifact.media_type)
-        if (
-            stored is None
-            or stored.size_bytes is not None
-            and stored.size_bytes != artifact.size_bytes
-        ):
+        if stored is None or stored.size_bytes is not None and stored.size_bytes != artifact.size_bytes:
             raise HTTPException(status_code=409, detail="Source Artifact integrity mismatch")
         headers = {
             "Content-Disposition": _inline_content_disposition(artifact.filename),
@@ -3458,11 +3622,7 @@ def create_admin_app(
                 if any(source_id not in available for source_id in req.source_ids):
                     raise HTTPException(status_code=400, detail="unknown_or_unavailable_source_id")
             result = await engine.list_recent_memories(
-                source_filter=(
-                    MemorySourceFilter(source_ids=tuple(req.source_ids))
-                    if req.source_ids
-                    else None
-                ),
+                source_filter=(MemorySourceFilter(source_ids=tuple(req.source_ids)) if req.source_ids else None),
                 time_range=req.time_range.to_time_range(),
                 memory_types=req.memory_types,
                 page_size=req.page_size,
@@ -3598,10 +3758,7 @@ def create_admin_app(
         for ms in raw_sources:
             doc = await db.get_document(ms.doc_id)
             source_details.append(_memory_source_detail(ms, doc, config, artifact_store))
-        evidence_artifacts = [
-            item.metadata()
-            for item in await db.get_memory_source_artifacts(memory_id)
-        ]
+        evidence_artifacts = [item.metadata() for item in await db.get_memory_source_artifacts(memory_id)]
 
         # Fetch linked entity names.
         entity_names = await db.get_memory_entity_names(memory_id)
@@ -4524,9 +4681,7 @@ def create_admin_app(
                 str(entry.get("version") or ""),
             ): entry
             for entry in manifest
-            if isinstance(entry, dict)
-            and str(entry.get("doc_id") or "")
-            and str(entry.get("version") or "")
+            if isinstance(entry, dict) and str(entry.get("doc_id") or "") and str(entry.get("version") or "")
         }
         manifest_doc_ids = {doc_id for doc_id, _version in manifest_by_doc_version}
         current_document_versions = await db.list_indexed_document_versions(source_id)
@@ -4789,9 +4944,7 @@ def create_admin_app(
                     f"{state.last_sync_status}: {state.error_message or 'unknown error'}"
                 )
             while True:
-                vector_delivery = await memory_store.attempt_lifecycle_vector_delivery(
-                    source_id=source_id
-                )
+                vector_delivery = await memory_store.attempt_lifecycle_vector_delivery(source_id=source_id)
                 if not vector_delivery.pending:
                     break
                 # A source maintenance fence prevents new lifecycle tasks for
@@ -5028,8 +5181,8 @@ def create_admin_app(
         db: Database,
         *,
         action: Literal["use_latest_state", "keep_current_state"],
+        expected_fingerprint: str,
         note: str | None,
-        reviewer: str | None,
         config: AppConfig | None = None,
         runtime_provider: RuntimeProvider | None = None,
     ) -> dict[str, object]:
@@ -5043,10 +5196,13 @@ def create_admin_app(
         review = await db.get_lifecycle_review(review_id)
         if review is None:
             raise HTTPException(status_code=404, detail="Lifecycle review not found")
+        if review.source_id != source_id:
+            raise HTTPException(status_code=404, detail="Lifecycle review not found")
+        await _require_lifecycle_review_visibility(request, db, review)
+        if lifecycle_review_decision_fingerprint(review) != expected_fingerprint:
+            raise HTTPException(status_code=409, detail="Review decision fingerprint is stale")
         target_status = (
-            LifecycleReviewStatus.APPROVED
-            if action == "use_latest_state"
-            else LifecycleReviewStatus.REJECTED
+            LifecycleReviewStatus.APPROVED if action == "use_latest_state" else LifecycleReviewStatus.REJECTED
         )
         if review.status is target_status:
             return {
@@ -5076,7 +5232,7 @@ def create_admin_app(
                 rejected = await db.resolve_lifecycle_review(
                     review_id,
                     LifecycleReviewStatus.REJECTED,
-                    reviewer=reviewer,
+                    reviewer=resolve_request_principal(request),
                     review_note=note.strip(),
                 )
             except ValueError as exc:
@@ -5095,7 +5251,7 @@ def create_admin_app(
             plan = build_lifecycle_review_approval_plan(
                 review,
                 payload,
-                reviewer=reviewer,
+                reviewer=resolve_request_principal(request),
                 review_note=note.strip() if note else None,
             )
             await db.apply_lifecycle_plan(plan)
@@ -5128,7 +5284,7 @@ def create_admin_app(
         source_id: str,
         review_id: str,
         request: Request,
-        req: MemoryReviewDecisionRequest = MemoryReviewDecisionRequest(),
+        req: MemoryReviewDecisionRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
@@ -5141,8 +5297,8 @@ def create_admin_app(
             request,
             db,
             action="use_latest_state",
+            expected_fingerprint=req.expected_fingerprint,
             note=req.note,
-            reviewer=req.reviewer,
             config=config,
             runtime_provider=runtime_provider,
         )
@@ -5163,8 +5319,8 @@ def create_admin_app(
             request,
             db,
             action="keep_current_state",
+            expected_fingerprint=req.expected_fingerprint,
             note=req.note,
-            reviewer=req.reviewer,
         )
 
     @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
@@ -5963,12 +6119,9 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail="source_snapshot_manifest_required")
         if (
             manifest_status["local_agent_job_id"] != (req.local_agent_job_id if req else None)
-            or manifest_status["local_agent_attempt_count"]
-            != (req.local_agent_attempt_count if req else None)
-            or manifest_status["source_activity_epoch"]
-            != int(lease_payload["source_activity_epoch"])
-            or manifest_status["source_config_revision"]
-            != str(lease_payload["source_config_revision"])
+            or manifest_status["local_agent_attempt_count"] != (req.local_agent_attempt_count if req else None)
+            or manifest_status["source_activity_epoch"] != int(lease_payload["source_activity_epoch"])
+            or manifest_status["source_config_revision"] != str(lease_payload["source_config_revision"])
         ):
             raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
         if not manifest_status["ready"]:
@@ -5989,9 +6142,7 @@ def create_admin_app(
                 ),
                 input_snapshot_id=input_snapshot_id,
                 source_config_revision=str(lease_payload["source_config_revision"]),
-                predecessor_activity_id=(
-                    req.local_agent_job_id if req else None
-                ),
+                predecessor_activity_id=(req.local_agent_job_id if req else None),
             )
         except SourcePausedError:
             raise _source_paused_http_error()
@@ -6464,17 +6615,13 @@ def create_admin_app(
                 raise
             if retained_input.raw_uri != package_uri:
                 try:
-                    retained_input, retained_package_hash = (
-                        await _attest_retained_local_source_input(
-                            db=db,
-                            artifact_store=artifact_store,
-                            source_type=source_type,
-                            source_id=source_id,
-                            retained_input=retained_input,
-                            expected_activity_epoch=int(
-                                lease_payload["source_activity_epoch"]
-                            ),
-                        )
+                    retained_input, retained_package_hash = await _attest_retained_local_source_input(
+                        db=db,
+                        artifact_store=artifact_store,
+                        source_type=source_type,
+                        source_id=source_id,
+                        retained_input=retained_input,
+                        expected_activity_epoch=int(lease_payload["source_activity_epoch"]),
                     )
                 except ValueError as exc:
                     await discard_unretained_package()
@@ -6536,10 +6683,7 @@ def create_admin_app(
                 req.local_agent_attempt_count,
                 req.sync_snapshot_id,
             )
-            manifest_items = [
-                (item.doc_id, item.revision, item.change_kind)
-                for item in req.items
-            ]
+            manifest_items = [(item.doc_id, item.revision, item.change_kind) for item in req.items]
             retained_inputs = await db.find_source_sync_input_attestations(
                 source_id=source_id,
                 workspace_id=workspace_id,
@@ -6966,50 +7110,128 @@ def create_admin_app(
 
     @review_router.get("", response_model=MemoryReviewListResponse)
     async def list_memory_reviews(
+        request: Request,
         status: str | None = "open",
         kind: str | None = None,
+        origin: Literal["memory", "lifecycle"] | None = None,
+        source_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
         db: Database = Depends(get_db),
     ):
-        """List all user-facing Reviews through one decision contract."""
+        """List caller-visible Reviews with an exact post-stale-filter total."""
         from memforge.memory.lifecycle_plan import LifecycleReviewStatus
 
         if limit < 1 or limit > 500:
             raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
         if offset < 0:
             raise HTTPException(status_code=400, detail="offset must not be negative")
+        if status not in {None, "all", "open", "pending", "stale", "approved", "rejected"}:
+            raise HTTPException(status_code=400, detail="unsupported review status")
+        if kind == "lifecycle":
+            if origin == "memory":
+                raise HTTPException(status_code=400, detail="kind and origin filters conflict")
+            origin = "lifecycle"
+            kind = None
 
         normalized_status = status if status and status != "all" else None
-        page_window = limit + offset
-        include_legacy = kind != "lifecycle"
-        include_lifecycle = kind in {None, "lifecycle"}
-        reviews = (
-            await db.list_memory_reviews(
-                status=normalized_status,
-                kind=kind,
-                limit=page_window,
-                offset=0,
+        include_legacy = origin in {None, "memory"}
+        include_lifecycle = origin in {None, "lifecycle"} and kind is None
+        reviews: list[MemoryReview] = []
+        if include_legacy:
+            review_statuses = ("pending", "stale") if normalized_status == "stale" else (normalized_status,)
+            for review_status in review_statuses:
+                review_offset = 0
+                while True:
+                    chunk = await db.list_memory_reviews(
+                        status=review_status,
+                        kind=kind,
+                        limit=500,
+                        offset=review_offset,
+                    )
+                    reviews.extend(chunk)
+                    if len(chunk) < 500:
+                        break
+                    review_offset += len(chunk)
+
+        related_by_review: dict[str, list[str]] = {}
+        if reviews:
+            related_rows = await db.list_memory_review_related_challengers_many([review.id for review in reviews])
+            for related in related_rows:
+                related_by_review.setdefault(related.review_id, []).append(related.challenger_memory_id)
+        review_memory_ids = tuple(
+            dict.fromkeys(
+                memory_id
+                for review in reviews
+                for memory_id in (
+                    review.incumbent_memory_id,
+                    review.challenger_memory_id,
+                    *related_by_review.get(review.id, ()),
+                )
             )
-            if include_legacy
-            else []
         )
-
-        review_memories: dict[str, Memory] = {}
-        for review in reviews:
-            for memory_id in (review.incumbent_memory_id, review.challenger_memory_id):
-                if memory_id not in review_memories:
-                    memory = await db.get_memory(memory_id)
-                    if memory is not None:
-                        review_memories[memory_id] = memory
-
-        origins = await _origin_source_types(db, list(review_memories)) if review_memories else {}
+        review_memories = {memory.id: memory for memory in await db.list_memories_by_ids(review_memory_ids)}
+        visible_memory_ids = (
+            await _filter_visible_ids(
+                db,
+                review_memory_ids,
+                _review_visibility_scope(request),
+            )
+            if review_memory_ids
+            else set()
+        )
+        memory_source_ids = await db.get_memory_source_ids_many(review_memory_ids) if review_memory_ids else {}
+        origins = await _origin_source_types(db, review_memory_ids) if review_memory_ids else {}
+        sources_by_id = {str(source["id"]): source for source in await db.list_sources()}
         responses: list[MemoryReviewListItemResponse] = []
         for review in reviews:
             incumbent = review_memories.get(review.incumbent_memory_id)
             challenger = review_memories.get(review.challenger_memory_id)
-            base = _review_to_response(review, incumbent=incumbent, challenger=challenger)
+            if incumbent is None or challenger is None:
+                continue
+            related_challengers = tuple(
+                review_memories[memory_id]
+                for memory_id in related_by_review.get(review.id, ())
+                if memory_id in review_memories
+            )
+            participant_ids = {
+                incumbent.id,
+                challenger.id,
+                *(memory.id for memory in related_challengers),
+            }
+            if len(related_challengers) != len(related_by_review.get(review.id, ())):
+                continue
+            if not participant_ids.issubset(visible_memory_ids):
+                continue
+            review_source_ids = tuple(
+                dict.fromkeys(
+                    source_id_value
+                    for memory_id in participant_ids
+                    for source_id_value in memory_source_ids.get(memory_id, ())
+                )
+            )
+            if source_id is not None and source_id not in review_source_ids:
+                continue
+            visible_sources = [
+                source
+                for review_source_id in review_source_ids
+                if (source := sources_by_id.get(review_source_id)) is not None
+                and source_is_discoverable(
+                    source,
+                    viewer_id=resolve_request_principal(request),
+                )
+            ]
+            if len(visible_sources) != len(review_source_ids):
+                continue
+            base = _review_to_response(
+                review,
+                incumbent=incumbent,
+                challenger=challenger,
+                related_challengers=related_challengers,
+            )
             if normalized_status == "open" and base.is_stale:
+                continue
+            if normalized_status == "stale" and review.status != "stale" and not base.is_stale:
                 continue
             incumbent_origin = origins.get(incumbent.id, (None, None)) if incumbent else (None, None)
             challenger_origin = origins.get(challenger.id, (None, None)) if challenger else (None, None)
@@ -7033,7 +7255,11 @@ def create_admin_app(
             )
             responses.append(
                 MemoryReviewListItemResponse(
-                    **base.model_dump(),
+                    **{
+                        **base.model_dump(),
+                        "source_id": (str(visible_sources[0]["id"]) if len(visible_sources) == 1 else None),
+                        "source_name": (str(visible_sources[0]["name"]) if len(visible_sources) == 1 else None),
+                    },
                     incumbent=incumbent_summary,
                     challenger=challenger_summary,
                 )
@@ -7047,33 +7273,66 @@ def create_admin_app(
                 lifecycle_status = LifecycleReviewStatus(normalized_status)
             except ValueError:
                 lifecycle_status = None
-        lifecycle_count = 0
         if include_lifecycle:
-            lifecycle_reviews = await db.list_lifecycle_reviews(
-                status=lifecycle_status,
-                limit=page_window,
-                offset=0,
-                newest_first=True,
+            lifecycle_reviews = []
+            lifecycle_offset = 0
+            while True:
+                chunk = await db.list_lifecycle_reviews(
+                    source_id=source_id,
+                    status=lifecycle_status,
+                    limit=500,
+                    offset=lifecycle_offset,
+                    newest_first=True,
+                )
+                lifecycle_reviews.extend(chunk)
+                if len(chunk) < 500:
+                    break
+                lifecycle_offset += len(chunk)
+            lifecycle_memory_ids = tuple(
+                dict.fromkeys(
+                    memory_id
+                    for review in lifecycle_reviews
+                    for memory_id in (
+                        review.incumbent_memory_id,
+                        _lifecycle_candidate_payload(review.staged_evidence)[0],
+                    )
+                    if memory_id
+                )
             )
-            lifecycle_count = await db.count_lifecycle_reviews(status=lifecycle_status)
-            sources_by_id = {
-                str(source["id"]): source
-                for source in await db.list_sources()
+            lifecycle_memory_cache = {
+                memory.id: memory for memory in await db.list_memories_by_ids(lifecycle_memory_ids)
             }
+            visible_lifecycle_memory_ids = (
+                await _filter_visible_ids(
+                    db,
+                    lifecycle_memory_ids,
+                    _review_visibility_scope(request),
+                )
+                if lifecycle_memory_ids
+                else set()
+            )
             for review in lifecycle_reviews:
                 source = sources_by_id.get(review.source_id or "")
                 if source is None:
-                    source = {
-                        "id": review.source_id,
-                        "name": None,
-                        "type": None,
-                    }
+                    continue
+                if not source_is_discoverable(
+                    source,
+                    viewer_id=resolve_request_principal(request),
+                ):
+                    continue
+                candidate_id, _ = _lifecycle_candidate_payload(review.staged_evidence)
+                participant_ids = {review.incumbent_memory_id}
+                if candidate_id in lifecycle_memory_cache:
+                    participant_ids.add(candidate_id)
+                if not participant_ids.issubset(visible_lifecycle_memory_ids):
+                    continue
                 responses.append(
                     await _lifecycle_review_response(
                         db,
                         review,
                         source,
                         detail=False,
+                        memory_cache=lifecycle_memory_cache,
                     )
                 )
 
@@ -7081,26 +7340,27 @@ def create_admin_app(
             key=lambda item: (item.created_at or "", item.id),
             reverse=True,
         )
-        total = (
-            await db.count_memory_reviews(status=normalized_status, kind=kind)
-            if include_legacy
-            else 0
-        )
+        total = len(responses)
         return MemoryReviewListResponse(
             data=responses[offset : offset + limit],
-            total=total + lifecycle_count,
+            total=total,
+            limit=limit,
+            offset=offset,
         )
 
     @review_router.get("/{review_id}", response_model=MemoryReviewDetailResponse)
     async def get_memory_review(
         review_id: str,
+        request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
         review = await db.get_memory_review(review_id)
+        lifecycle_review = await db.get_lifecycle_review(review_id)
+        if review is not None and lifecycle_review is not None:
+            raise HTTPException(status_code=409, detail="Review ID is ambiguous across storage origins")
         if review is None:
-            lifecycle_review = await db.get_lifecycle_review(review_id)
             if lifecycle_review is None:
                 raise HTTPException(status_code=404, detail="Review not found")
             payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
@@ -7112,6 +7372,8 @@ def create_admin_app(
             source = await db.get_source(source_id) if source_id else None
             if source is None:
                 raise HTTPException(status_code=409, detail="Lifecycle review source is unavailable")
+            _require_source_discoverability(request, source)
+            await _require_lifecycle_review_visibility(request, db, lifecycle_review)
             return await _lifecycle_review_response(
                 db,
                 lifecycle_review,
@@ -7121,17 +7383,23 @@ def create_admin_app(
                 artifact_store=artifact_store,
             )
 
-        incumbent = await db.get_memory(review.incumbent_memory_id)
-        challenger = await db.get_memory(review.challenger_memory_id)
-        base = _review_to_response(review, incumbent=incumbent, challenger=challenger)
+        incumbent, challenger, related_memories = await _require_memory_review_visibility(
+            request,
+            db,
+            review,
+        )
+        base = _review_to_response(
+            review,
+            incumbent=incumbent,
+            challenger=challenger,
+            related_challengers=related_memories,
+        )
         incumbent_summary = await _build_memory_summary(db, incumbent, config, artifact_store) if incumbent else None
         challenger_summary = await _build_memory_summary(db, challenger, config, artifact_store) if challenger else None
-        related_challengers: list[MemoryReviewMemorySummary] = []
-        for related in await db.list_memory_review_related_challengers(review.id):
-            related_memory = await db.get_memory(related.challenger_memory_id)
-            if related_memory is None:
-                continue
-            related_challengers.append(await _build_memory_summary(db, related_memory, config, artifact_store))
+        related_challengers = [
+            await _build_memory_summary(db, related_memory, config, artifact_store)
+            for related_memory in related_memories
+        ]
         return MemoryReviewDetailResponse(
             **base.model_dump(),
             incumbent=incumbent_summary,
@@ -7143,13 +7411,16 @@ def create_admin_app(
     async def approve_memory_review(
         review_id: str,
         request: Request,
-        req: MemoryReviewDecisionRequest = MemoryReviewDecisionRequest(),
+        req: MemoryReviewDecisionRequest,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         lifecycle_review = await db.get_lifecycle_review(review_id)
+        review_before = await db.get_memory_review(review_id)
+        if lifecycle_review is not None and review_before is not None:
+            raise HTTPException(status_code=409, detail="Review ID is ambiguous across storage origins")
         if lifecycle_review is not None:
             payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
             scope = payload.get("scope") if isinstance(payload, Mapping) else None
@@ -7160,8 +7431,8 @@ def create_admin_app(
                 request,
                 db,
                 action="use_latest_state",
+                expected_fingerprint=req.expected_fingerprint,
                 note=req.note,
-                reviewer=req.reviewer,
                 config=config,
                 runtime_provider=runtime_provider,
             )
@@ -7177,12 +7448,22 @@ def create_admin_app(
                 artifact_store=artifact_store,
             )
 
+        if review_before is None:
+            raise HTTPException(status_code=404, detail="Review not found")
+        _, _, related_before = await _require_memory_review_management(request, db, review_before)
+        if memory_review_decision_fingerprint(review_before, related_before) != req.expected_fingerprint:
+            raise HTTPException(status_code=409, detail="Review decision fingerprint is stale")
+        if review_before.status == "approved":
+            return await get_memory_review(review_id, request, db, config, artifact_store)
+        if review_before.status != "pending":
+            raise HTTPException(status_code=409, detail=f"Review is already {review_before.status}")
         service = await _build_review_service(db, config, runtime_provider)
         try:
             result = await service.approve(
                 review_id,
-                reviewer=req.reviewer,
+                reviewer=resolve_request_principal(request),
                 note=req.note,
+                expected_fingerprint=req.expected_fingerprint,
             )
         except ReviewNotFound:
             raise HTTPException(status_code=404, detail="Review not found")
@@ -7204,17 +7485,27 @@ def create_admin_app(
 
         review = result.review or await db.get_memory_review(review_id)
         assert review is not None
-        base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
+        _, _, related_after = await _require_memory_review_visibility(request, db, review)
+        base = _review_to_response(
+            review,
+            incumbent=result.incumbent,
+            challenger=result.challenger,
+            related_challengers=related_after,
+        )
         incumbent_summary = (
             await _build_memory_summary(db, result.incumbent, config, artifact_store) if result.incumbent else None
         )
         challenger_summary = (
             await _build_memory_summary(db, result.challenger, config, artifact_store) if result.challenger else None
         )
+        related_challenger_summaries = [
+            await _build_memory_summary(db, related_memory, config, artifact_store) for related_memory in related_after
+        ]
         return MemoryReviewDetailResponse(
             **base.model_dump(),
             incumbent=incumbent_summary,
             challenger=challenger_summary,
+            related_challengers=related_challenger_summaries,
         )
 
     @review_router.post("/{review_id}/reject", response_model=MemoryReviewDetailResponse)
@@ -7231,6 +7522,9 @@ def create_admin_app(
             raise HTTPException(status_code=400, detail="A note is required to keep the current state")
 
         lifecycle_review = await db.get_lifecycle_review(review_id)
+        review_before = await db.get_memory_review(review_id)
+        if lifecycle_review is not None and review_before is not None:
+            raise HTTPException(status_code=409, detail="Review ID is ambiguous across storage origins")
         if lifecycle_review is not None:
             payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
             scope = payload.get("scope") if isinstance(payload, Mapping) else None
@@ -7241,8 +7535,8 @@ def create_admin_app(
                 request,
                 db,
                 action="keep_current_state",
+                expected_fingerprint=req.expected_fingerprint,
                 note=req.note,
-                reviewer=req.reviewer,
             )
             updated = await db.get_lifecycle_review(review_id)
             source = await db.get_source(source_id)
@@ -7256,12 +7550,22 @@ def create_admin_app(
                 artifact_store=artifact_store,
             )
 
+        if review_before is None:
+            raise HTTPException(status_code=404, detail="Review not found")
+        _, _, related_before = await _require_memory_review_management(request, db, review_before)
+        if memory_review_decision_fingerprint(review_before, related_before) != req.expected_fingerprint:
+            raise HTTPException(status_code=409, detail="Review decision fingerprint is stale")
+        if review_before.status == "rejected":
+            return await get_memory_review(review_id, request, db, config, artifact_store)
+        if review_before.status != "pending":
+            raise HTTPException(status_code=409, detail=f"Review is already {review_before.status}")
         service = await _build_review_service(db, config, runtime_provider)
         try:
             result = await service.reject(
                 review_id,
-                reviewer=req.reviewer,
+                reviewer=resolve_request_principal(request),
                 note=req.note,
+                expected_fingerprint=req.expected_fingerprint,
             )
         except ReviewNotFound:
             raise HTTPException(status_code=404, detail="Review not found")
@@ -7281,18 +7585,368 @@ def create_admin_app(
 
         review = result.review or await db.get_memory_review(review_id)
         assert review is not None
-        base = _review_to_response(review, incumbent=result.incumbent, challenger=result.challenger)
+        _, _, related_after = await _require_memory_review_visibility(request, db, review)
+        base = _review_to_response(
+            review,
+            incumbent=result.incumbent,
+            challenger=result.challenger,
+            related_challengers=related_after,
+        )
         incumbent_summary = (
             await _build_memory_summary(db, result.incumbent, config, artifact_store) if result.incumbent else None
         )
         challenger_summary = (
             await _build_memory_summary(db, result.challenger, config, artifact_store) if result.challenger else None
         )
+        related_challenger_summaries = [
+            await _build_memory_summary(db, related_memory, config, artifact_store) for related_memory in related_after
+        ]
         return MemoryReviewDetailResponse(
             **base.model_dump(),
             incumbent=incumbent_summary,
             challenger=challenger_summary,
+            related_challengers=related_challenger_summaries,
         )
+
+    async def _validate_review_manifest_decision(
+        item: MemoryReviewManifestDecision,
+        request: Request,
+        db: Database,
+    ) -> MemoryReviewDecisionResult:
+        memory_review = await db.get_memory_review(item.review_id)
+        lifecycle_review = await db.get_lifecycle_review(item.review_id)
+        if memory_review is not None and lifecycle_review is not None:
+            return MemoryReviewDecisionResult(
+                review_id=item.review_id,
+                decision=item.decision,
+                outcome="invalid",
+                message="Review ID is ambiguous across storage origins",
+            )
+        if memory_review is None and lifecycle_review is None:
+            return MemoryReviewDecisionResult(
+                review_id=item.review_id,
+                decision=item.decision,
+                outcome="not_found",
+                message="Review not found",
+            )
+
+        try:
+            if lifecycle_review is not None:
+                source_id = lifecycle_review.source_id or ""
+                source = await db.get_source(source_id) if source_id else None
+                if source is None:
+                    return MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="invalid",
+                        message="Lifecycle Review source is unavailable",
+                    )
+                _require_source_management(request, source)
+                await _require_lifecycle_review_visibility(request, db, lifecycle_review)
+                fingerprint = lifecycle_review_decision_fingerprint(lifecycle_review)
+                if fingerprint != item.expected_fingerprint:
+                    return MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="stale",
+                        status=lifecycle_review.status.value,
+                        message="Review decision fingerprint is stale",
+                    )
+                target_status = "approved" if item.decision == "approve" else "rejected"
+                if lifecycle_review.status.value == target_status:
+                    return MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="already_applied",
+                        status=target_status,
+                    )
+                if lifecycle_review.status.value == "stale":
+                    return MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="stale",
+                        status=lifecycle_review.status.value,
+                        message="Lifecycle Review is stale",
+                    )
+                if lifecycle_review.status.value != "pending":
+                    return MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="invalid",
+                        status=lifecycle_review.status.value,
+                        message=f"Review is already {lifecycle_review.status.value}",
+                    )
+                presentation = present_lifecycle_review(
+                    staged_evidence=lifecycle_review.staged_evidence,
+                    reason=lifecycle_review.reason,
+                )
+            else:
+                assert memory_review is not None
+                incumbent, challenger, related_challengers = await _require_memory_review_management(
+                    request,
+                    db,
+                    memory_review,
+                )
+                fingerprint = memory_review_decision_fingerprint(
+                    memory_review,
+                    related_challengers,
+                )
+                if fingerprint != item.expected_fingerprint:
+                    return MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="stale",
+                        status=memory_review.status,
+                        message="Review decision fingerprint is stale",
+                    )
+                target_status = "approved" if item.decision == "approve" else "rejected"
+                if memory_review.status == target_status:
+                    return MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="already_applied",
+                        status=target_status,
+                    )
+                if memory_review.status != "pending":
+                    return MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="invalid",
+                        status=memory_review.status,
+                        message=f"Review is already {memory_review.status}",
+                    )
+                if _is_review_stale(memory_review, incumbent, challenger):
+                    return MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="stale",
+                        status=memory_review.status,
+                        message="Review participants changed after analysis",
+                    )
+                if any(memory.status != "pending_review" for memory in related_challengers):
+                    return MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="stale",
+                        status=memory_review.status,
+                        message="A related Review participant changed lifecycle state",
+                    )
+                presentation = present_memory_review(
+                    kind=memory_review.kind,
+                    reason=memory_review.reason,
+                )
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                outcome = "forbidden"
+            elif exc.status_code == 404:
+                outcome = "not_found"
+            else:
+                outcome = "invalid"
+            return MemoryReviewDecisionResult(
+                review_id=item.review_id,
+                decision=item.decision,
+                outcome=outcome,
+                message=str(exc.detail),
+            )
+
+        action = next(
+            (candidate for candidate in presentation.actions if candidate.decision == item.decision),
+            None,
+        )
+        if action is None:
+            return MemoryReviewDecisionResult(
+                review_id=item.review_id,
+                decision=item.decision,
+                outcome="invalid",
+                status="pending",
+                message="Decision is not valid for this Review kind",
+            )
+        if action.requires_note and not (item.note and item.note.strip()):
+            return MemoryReviewDecisionResult(
+                review_id=item.review_id,
+                decision=item.decision,
+                outcome="invalid",
+                status="pending",
+                message=f"A note is required for {action.label}",
+                decision_label=action.label,
+                consequence=action.consequence,
+            )
+        return MemoryReviewDecisionResult(
+            review_id=item.review_id,
+            decision=item.decision,
+            outcome="ready",
+            status="pending",
+            decision_label=action.label,
+            consequence=action.consequence,
+        )
+
+    def _manifest_response(
+        mode: Literal["validate", "apply"],
+        results: list[MemoryReviewDecisionResult],
+        *,
+        validation_receipt: str | None = None,
+    ) -> MemoryReviewDecisionManifestResponse:
+        counts = {
+            outcome: sum(item.outcome == outcome for item in results)
+            for outcome in {
+                "ready",
+                "applied",
+                "already_applied",
+                "stale",
+                "forbidden",
+            }
+        }
+        failed = sum(item.outcome in {"not_found", "invalid", "failed"} for item in results)
+        return MemoryReviewDecisionManifestResponse(
+            mode=mode,
+            results=results,
+            ready=counts["ready"],
+            applied=counts["applied"],
+            already_applied=counts["already_applied"],
+            stale=counts["stale"],
+            forbidden=counts["forbidden"],
+            failed=failed,
+            validation_receipt=validation_receipt,
+        )
+
+    def _review_manifest_receipt(
+        req: MemoryReviewDecisionManifestRequest,
+        request: Request,
+        config: AppConfig,
+    ) -> str:
+        payload = {
+            "principal": resolve_request_principal(request),
+            "workspace_id": get_workspace_id(request),
+            "decisions": [item.model_dump(mode="json") for item in req.decisions],
+        }
+        canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        digest = hmac.new(
+            config.server.jwt_secret.encode("utf-8"),
+            canonical.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return f"review-manifest-v1:{digest}"
+
+    @review_router.post(
+        "/decisions/validate",
+        response_model=MemoryReviewDecisionManifestResponse,
+    )
+    async def validate_memory_review_decisions(
+        req: MemoryReviewDecisionManifestRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+    ):
+        """Validate one bounded Decision Manifest without lifecycle mutation."""
+
+        results = [await _validate_review_manifest_decision(item, request, db) for item in req.decisions]
+        return _manifest_response(
+            "validate",
+            results,
+            validation_receipt=_review_manifest_receipt(req, request, config),
+        )
+
+    @review_router.post(
+        "/decisions/apply",
+        response_model=MemoryReviewDecisionManifestResponse,
+    )
+    async def apply_memory_review_decisions(
+        req: MemoryReviewDecisionManifestRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+    ):
+        """Apply a confirmed manifest through independent single-Review decisions."""
+
+        expected_receipt = _review_manifest_receipt(req, request, config)
+        if not req.validation_receipt or not hmac.compare_digest(
+            req.validation_receipt,
+            expected_receipt,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Decision Manifest must be validated unchanged before apply",
+            )
+
+        results: list[MemoryReviewDecisionResult] = []
+        for item in req.decisions:
+            validation = await _validate_review_manifest_decision(item, request, db)
+            if validation.outcome != "ready":
+                results.append(validation)
+                continue
+            try:
+                decision_request = MemoryReviewDecisionRequest(
+                    expected_fingerprint=item.expected_fingerprint,
+                    note=item.note,
+                )
+                if item.decision == "approve":
+                    detail = await approve_memory_review(
+                        item.review_id,
+                        request,
+                        decision_request,
+                        db,
+                        config,
+                        artifact_store,
+                        runtime_provider,
+                    )
+                else:
+                    detail = await reject_memory_review(
+                        item.review_id,
+                        request,
+                        decision_request,
+                        db,
+                        config,
+                        artifact_store,
+                        runtime_provider,
+                    )
+                results.append(
+                    MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="applied",
+                        status=detail.status,
+                        decision_label=validation.decision_label,
+                        consequence=validation.consequence,
+                    )
+                )
+            except HTTPException as exc:
+                detail = exc.detail
+                message = (
+                    str(detail.get("message") or detail.get("error") or detail)
+                    if isinstance(detail, Mapping)
+                    else str(detail)
+                )
+                if exc.status_code == 403:
+                    outcome = "forbidden"
+                elif exc.status_code == 404:
+                    outcome = "not_found"
+                elif exc.status_code == 409 and "stale" in message.lower():
+                    outcome = "stale"
+                elif exc.status_code in {400, 409}:
+                    outcome = "invalid"
+                else:
+                    outcome = "failed"
+                results.append(
+                    MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome=outcome,
+                        message=message,
+                    )
+                )
+            except Exception as exc:
+                logger.exception("Review manifest item failed: %s", item.review_id)
+                results.append(
+                    MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="failed",
+                        message=str(exc),
+                    )
+                )
+        return _manifest_response("apply", results)
 
     # -- Include all routers --
     # Local tool — no auth required. All routers accessible directly.

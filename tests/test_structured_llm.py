@@ -1075,7 +1075,8 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
         if schema is MemoryRelationResponse:
             return CompletionResponse(
                 '{"decisions":[{"pair_index":0,"classification":"refines",'
-                '"direction":"challenger_to_candidate","reason":"adds a condition"}]}'
+                '"direction":"challenger_to_candidate","same_subject_and_scope":true,'
+                '"incompatible_assertions":"","reason":"adds a condition"}]}'
             )
         if schema is MemorySupportValidationResponse:
             return CompletionResponse('{"supported":true,"reason":"still entailed"}')
@@ -1145,6 +1146,40 @@ def test_composed_reconciliation_schemas_reject_cross_phase_decisions() -> None:
     }
     with pytest.raises(ValidationError):
         IncumbentSupportAuditResponse.model_validate(audit_payload)
+
+
+def test_memory_relation_schema_requires_scope_proof_for_contradiction() -> None:
+    with pytest.raises(ValidationError, match="same subject and scope"):
+        MemoryRelationResponse.model_validate(
+            {
+                "decisions": [
+                    {
+                        "pair_index": 0,
+                        "classification": "contradicts",
+                        "direction": "symmetric",
+                        "same_subject_and_scope": False,
+                        "incompatible_assertions": "enabled versus disabled",
+                        "reason": "Different deployment environments.",
+                    }
+                ]
+            }
+        )
+
+    accepted = MemoryRelationResponse.model_validate(
+        {
+            "decisions": [
+                {
+                    "pair_index": 0,
+                    "classification": "contradicts",
+                    "direction": "symmetric",
+                    "same_subject_and_scope": True,
+                    "incompatible_assertions": "CI is enabled; CI is disabled",
+                    "reason": "The same repository and environment assert opposite states.",
+                }
+            ]
+        }
+    )
+    assert accepted.decisions[0].classification == "contradicts"
 
 
 def test_candidate_ledger_schema_rejects_model_owned_candidate_index() -> None:

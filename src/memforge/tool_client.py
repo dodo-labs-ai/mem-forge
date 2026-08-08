@@ -556,10 +556,26 @@ class ToolClient:
         self,
         *,
         status: str = "open",
+        origin: str | None = None,
+        kind: str | None = None,
+        source_id: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
-        query = urlencode({"status": status, "limit": limit, "offset": offset})
+        query = urlencode(
+            {
+                key: value
+                for key, value in {
+                    "status": status,
+                    "origin": origin,
+                    "kind": kind,
+                    "source_id": source_id,
+                    "limit": limit,
+                    "offset": offset,
+                }.items()
+                if value is not None
+            }
+        )
         return self._resource_json("GET", f"/memory-reviews?{query}", None)
 
     def get_memory_review(self, review_id: str) -> dict[str, Any]:
@@ -573,18 +589,38 @@ class ToolClient:
         review_id: str,
         *,
         decision: str,
+        expected_fingerprint: str,
         note: str | None = None,
-        reviewer: str | None = None,
     ) -> dict[str, Any]:
         review_id = review_id.strip()
         if not review_id:
             return {"error": "review_id is required"}
-        body: dict[str, Any] = {}
+        body: dict[str, Any] = {"expected_fingerprint": expected_fingerprint}
         if note is not None:
             body["note"] = note
-        if reviewer is not None:
-            body["reviewer"] = reviewer
         return self._resource_json("POST", f"/memory-reviews/{quote(review_id, safe='')}/{decision}", body)
+
+    def validate_memory_review_decisions(
+        self,
+        decisions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return self._resource_json(
+            "POST",
+            "/memory-reviews/decisions/validate",
+            {"decisions": decisions},
+        )
+
+    def apply_memory_review_decisions(
+        self,
+        decisions: list[dict[str, Any]],
+        *,
+        validation_receipt: str,
+    ) -> dict[str, Any]:
+        return self._resource_json(
+            "POST",
+            "/memory-reviews/decisions/apply",
+            {"decisions": decisions, "validation_receipt": validation_receipt},
+        )
 
     def create_source(self, *, source_type: str, name: str, config: dict[str, Any]) -> dict[str, Any]:
         """Create a source (gene instance) of ``source_type`` with the given config."""

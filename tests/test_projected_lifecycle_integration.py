@@ -1143,6 +1143,8 @@ class _SemanticEquivalentClient:
                     pair_index=payload[0]["candidates"][0]["pair_index"],
                     classification="equivalent",
                     direction="symmetric",
+                    same_subject_and_scope=True,
+                    incompatible_assertions="",
                     reason="Both claims state that A7 is excluded.",
                 )
             ]

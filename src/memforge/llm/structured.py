@@ -369,6 +369,8 @@ class MemoryRelationDecision(StructuredResponseModel):
         "challenger_to_candidate",
         "candidate_to_challenger",
     ]
+    same_subject_and_scope: bool
+    incompatible_assertions: str = Field(max_length=1000)
     reason: str = Field(default="", max_length=1000)
 
     @model_validator(mode="after")
@@ -376,6 +378,14 @@ class MemoryRelationDecision(StructuredResponseModel):
         directional = self.classification == "refines"
         if directional == (self.direction == "symmetric"):
             raise ValueError("REFINES must be directional and other relations symmetric")
+        incompatible = self.incompatible_assertions.strip()
+        if self.classification == "contradicts":
+            if not self.same_subject_and_scope:
+                raise ValueError("CONTRADICTS requires the same subject and scope")
+            if not incompatible:
+                raise ValueError("CONTRADICTS requires the incompatible assertions")
+        elif incompatible:
+            raise ValueError("only CONTRADICTS may provide incompatible assertions")
         return self
 
 

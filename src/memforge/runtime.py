@@ -153,10 +153,7 @@ class SyncRuntime:
             self.extraction_pool = get_process_extraction_work_pool(
                 max(
                     1,
-                    int(
-                        self.config.sync.max_extraction_workers
-                        or self.config.llm.enrichment_max_concurrent
-                    ),
+                    int(self.config.sync.max_extraction_workers or self.config.llm.enrichment_max_concurrent),
                 )
             )
         if self.document_lifecycle_admission is None:
@@ -816,14 +813,9 @@ class SourceSyncWorker:
         self.progress_flush_seconds = max(0.001, float(progress_flush_seconds))
         max_extraction_workers = max(
             1,
-            int(
-                config.sync.max_extraction_workers
-                or config.llm.enrichment_max_concurrent
-            ),
+            int(config.sync.max_extraction_workers or config.llm.enrichment_max_concurrent),
         )
-        self._extraction_pool = get_process_extraction_work_pool(
-            max_extraction_workers
-        )
+        self._extraction_pool = get_process_extraction_work_pool(max_extraction_workers)
         max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
         self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
         self._relation_runtime: SyncRuntime | None = None
@@ -860,6 +852,39 @@ class SourceSyncWorker:
             return bool(result.attempted_tasks)
         except Exception:
             logger.exception("Lifecycle vector worker slice failed")
+            return False
+
+    async def process_review_vector_delivery_once(self) -> bool:
+        """Process one bounded Review-owned vector-outbox slice."""
+
+        try:
+            from memforge.memory.store import LIFECYCLE_VECTOR_DELIVERY_MAX_ATTEMPTS
+
+            pending = await self.db.list_ready_review_vector_tasks(
+                limit=1,
+                max_attempts=LIFECYCLE_VECTOR_DELIVERY_MAX_ATTEMPTS,
+            )
+            if not pending:
+                return False
+            if self._vector_runtime is None:
+                self._vector_runtime = await self.runtime_provider.build_sync_runtime(
+                    self.db,
+                    self.config,
+                    extraction_pool=self._extraction_pool,
+                    document_lifecycle_admission=self._document_lifecycle_admission,
+                )
+            result = await self._vector_runtime.memory_store.attempt_review_vector_delivery()
+            if result.attempted_tasks:
+                logger.info(
+                    "Review vector slice attempted=%d delivered=%d failed=%d pending=%s",
+                    result.attempted_tasks,
+                    result.delivered_tasks,
+                    result.failed_tasks,
+                    result.pending,
+                )
+            return bool(result.attempted_tasks)
+        except Exception:
+            logger.exception("Review vector worker slice failed")
             return False
 
     async def _process_relation_discovery_once(self) -> bool:
@@ -1040,6 +1065,7 @@ class SourceSyncWorker:
         )
         if run is None:
             await self.process_lifecycle_vector_delivery_once()
+            await self.process_review_vector_delivery_once()
             await self._process_relation_discovery_once()
             return None
 
@@ -1135,24 +1161,21 @@ class SourceSyncWorker:
                         for source_input in inputs
                         if source_input.input_generation <= run.input_generation_watermark
                     ]
-            authoritative_collection = (
-                run.input_snapshot_id is not None
-                and local_agent_collection_is_authoritative(source["type"])
+            authoritative_collection = run.input_snapshot_id is not None and local_agent_collection_is_authoritative(
+                source["type"]
             )
             reusable_projection_doc_ids = frozenset()
             if run.input_snapshot_id is not None and not run.force_full_sync:
-                reusable_projection_doc_ids = (
-                    await self.db.find_reusable_source_projection_memberships(
-                        source_id=run.source_id,
-                        workspace_id=run.workspace_id,
-                        snapshot_id=run.input_snapshot_id,
-                        expected_access_hash=projection_access_fingerprint(
-                            {
-                                "access_policy": str(source.get("access_policy") or "workspace"),
-                                "owner_user_id": source.get("owner_user_id"),
-                            }
-                        ),
-                    )
+                reusable_projection_doc_ids = await self.db.find_reusable_source_projection_memberships(
+                    source_id=run.source_id,
+                    workspace_id=run.workspace_id,
+                    snapshot_id=run.input_snapshot_id,
+                    expected_access_hash=projection_access_fingerprint(
+                        {
+                            "access_policy": str(source.get("access_policy") or "workspace"),
+                            "owner_user_id": source.get("owner_user_id"),
+                        }
+                    ),
                 )
             source = source_with_sync_inputs(
                 source,
@@ -1196,9 +1219,7 @@ class SourceSyncWorker:
                 # the complete durable run would duplicate successful provider
                 # and lifecycle work without improving the failure boundary.
                 next_attempt_at = (
-                    self._next_retry_at(run, failed_at)
-                    if final_state.last_sync_status == "failed"
-                    else None
+                    self._next_retry_at(run, failed_at) if final_state.last_sync_status == "failed" else None
                 )
                 failed = await self.db.fail_source_sync_run(
                     run.run_id,
@@ -1266,6 +1287,7 @@ class SourceSyncWorker:
                 # Fairly interleave one bounded non-destructive slice even while
                 # source-sync work remains continuously available.
                 await self.process_lifecycle_vector_delivery_once()
+                await self.process_review_vector_delivery_once()
                 await self._process_relation_discovery_once()
             await asyncio.sleep(0 if run is not None else interval)
 
@@ -1291,14 +1313,9 @@ class SyncService:
         self._source_slots = asyncio.Semaphore(max_active_sources) if max_active_sources else None
         max_extraction_workers = max(
             1,
-            int(
-                config.sync.max_extraction_workers
-                or config.llm.enrichment_max_concurrent
-            ),
+            int(config.sync.max_extraction_workers or config.llm.enrichment_max_concurrent),
         )
-        self._extraction_pool = get_process_extraction_work_pool(
-            max_extraction_workers
-        )
+        self._extraction_pool = get_process_extraction_work_pool(max_extraction_workers)
         max_document_lifecycles = max(0, int(config.sync.max_document_lifecycles))
         self._document_lifecycle_admission = get_process_document_lifecycle_admission(max_document_lifecycles)
 

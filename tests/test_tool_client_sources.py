@@ -641,12 +641,37 @@ def test_tool_client_memory_review_methods_use_review_endpoints():
 
     client.list_memory_reviews(status="open", limit=5, offset=2)
     client.get_memory_review("rev-1")
-    client.resolve_memory_review("rev-1", decision="reject", note="Not durable", reviewer="alice")
+    client.resolve_memory_review(
+        "rev-1",
+        decision="reject",
+        expected_fingerprint="review-decision-v1:abc",
+        note="Not durable",
+    )
+    decisions = [
+        {
+            "review_id": "rev-1",
+            "decision": "reject",
+            "expected_fingerprint": "review-decision-v1:abc",
+            "note": "Not durable",
+        }
+    ]
+    client.validate_memory_review_decisions(decisions)
+    client.apply_memory_review_decisions(decisions, validation_receipt="review-manifest-v1:receipt")
 
     assert client.calls == [
         ("GET", "/api/v1/memory-reviews?status=open&limit=5&offset=2", None),
         ("GET", "/api/v1/memory-reviews/rev-1", None),
-        ("POST", "/api/v1/memory-reviews/rev-1/reject", {"note": "Not durable", "reviewer": "alice"}),
+        (
+            "POST",
+            "/api/v1/memory-reviews/rev-1/reject",
+            {"expected_fingerprint": "review-decision-v1:abc", "note": "Not durable"},
+        ),
+        ("POST", "/api/v1/memory-reviews/decisions/validate", {"decisions": decisions}),
+        (
+            "POST",
+            "/api/v1/memory-reviews/decisions/apply",
+            {"decisions": decisions, "validation_receipt": "review-manifest-v1:receipt"},
+        ),
     ]
 
 
