@@ -43,6 +43,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleVectorTask,
 )
 from memforge.memory.relation_discovery_contract import RelationDiscoveryWork
+from memforge.memory.review_decision import ReviewVectorTask
 from memforge.source_projection import (
     ProjectionCoverage,
     ProjectionScopeTransition,
@@ -268,6 +269,13 @@ class RelationalStore(Protocol):
     ) -> Mapping[str, int]: ...
     async def insert_aliases(self, aliases: Sequence[EntityAlias]) -> None: ...
     async def get_memory(self, memory_id: str) -> Memory | None: ...
+    async def list_memories_by_ids(self, memory_ids: Sequence[str]) -> list[Memory]:
+        """Return persisted rows in caller order, regardless of lifecycle status."""
+        ...
+    async def get_memory_source_ids_many(
+        self,
+        memory_ids: Sequence[str],
+    ) -> Mapping[str, tuple[str, ...]]: ...
     async def get_memory_entity_ids(self, memory_id: str) -> list[int]: ...
     async def get_current_relation_evidence_unit(
         self,
@@ -661,6 +669,28 @@ class RelationalStore(Protocol):
     ) -> list[LifecycleVectorTask]: ...
     async def complete_lifecycle_vector_task(self, task_id: str) -> None: ...
     async def fail_lifecycle_vector_task(
+        self,
+        task_id: str,
+        error: str,
+        *,
+        next_attempt_at: str | None = None,
+    ) -> None: ...
+    async def list_review_vector_tasks(
+        self,
+        *,
+        review_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ReviewVectorTask]: ...
+    async def list_ready_review_vector_tasks(
+        self,
+        *,
+        review_id: str | None = None,
+        limit: int = 100,
+        max_attempts: int,
+        now: str | None = None,
+    ) -> list[ReviewVectorTask]: ...
+    async def complete_review_vector_task(self, task_id: str) -> None: ...
+    async def fail_review_vector_task(
         self,
         task_id: str,
         error: str,

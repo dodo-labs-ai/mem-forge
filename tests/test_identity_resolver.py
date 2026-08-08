@@ -15,6 +15,7 @@ from memforge.memory.identity_resolver import (
 from memforge.memory.evidence import RelationDirection
 from memforge.memory.relation_classifier import (
     MemoryPair,
+    MemoryPairContext,
     MemoryPairClassification,
     MemoryPairClassificationError,
     MemoryPairClassificationPlan,
@@ -42,6 +43,79 @@ def test_equivalent_identity_prompt_preserves_normative_modality() -> None:
     assert "normative requirement" in prompt
     assert "descriptive state" in prompt
     assert "different truth conditions" in prompt
+
+
+@pytest.mark.asyncio
+async def test_contradiction_scope_proof_is_preserved_in_auditable_reason() -> None:
+    class ContradictionClient:
+        async def classify_memory_relations(self, _prompt: str, **_kwargs):
+            return SimpleNamespace(
+                decisions=[
+                    SimpleNamespace(
+                        pair_index=0,
+                        classification="contradicts",
+                        direction="symmetric",
+                        same_subject_and_scope=True,
+                        incompatible_assertions="Payroll area A closes Friday; Payroll area A closes Thursday",
+                        reason="Both claims govern the same payroll area and period.",
+                    )
+                ]
+            )
+
+    pair = MemoryPair(
+        _memory("challenger", "Payroll area A closes Friday."),
+        _memory("candidate", "Payroll area A closes Thursday."),
+    )
+    [decision] = (
+        await StructuredMemoryPairClassifier(
+            client=ContradictionClient(),
+            model="test-model",
+        ).classify((pair,))
+    ).decisions
+
+    assert "same_subject_and_scope=true" in decision.reason
+    assert "Payroll area A closes Friday" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_different_source_scope_context_can_suppress_false_contradiction() -> None:
+    class ScopeAwareClient:
+        async def classify_memory_relations(self, prompt: str, **_kwargs):
+            payload = json.loads(
+                prompt.split("<memory_pair_groups>\n", 1)[1].split(
+                    "\n</memory_pair_groups>",
+                    1,
+                )[0]
+            )
+            assert payload[0]["challenger"]["source_context"]["source_id"] == "payroll-prod"
+            assert payload[0]["candidates"][0]["candidate"]["source_context"]["source_id"] == "payroll-template"
+            return SimpleNamespace(
+                decisions=[
+                    SimpleNamespace(
+                        pair_index=0,
+                        classification="unrelated",
+                        direction="symmetric",
+                        same_subject_and_scope=False,
+                        incompatible_assertions="",
+                        reason="Production policy and template example have different scopes.",
+                    )
+                ]
+            )
+
+    pair = MemoryPair(
+        _memory("challenger", "The cutoff is Friday."),
+        _memory("candidate", "The cutoff is Thursday."),
+        challenger_context=MemoryPairContext(source_id="payroll-prod", doc_id="prod-policy"),
+        candidate_context=MemoryPairContext(source_id="payroll-template", doc_id="example"),
+    )
+    [decision] = (
+        await StructuredMemoryPairClassifier(
+            client=ScopeAwareClient(),
+            model="test-model",
+        ).classify((pair,))
+    ).decisions
+
+    assert decision.relation_type is MemoryRelationType.UNRELATED
 
 
 @pytest.mark.asyncio

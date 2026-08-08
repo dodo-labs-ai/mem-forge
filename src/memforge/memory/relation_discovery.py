@@ -29,6 +29,7 @@ from memforge.memory.relation_classifier import (
     MemoryPairClassification,
     MemoryPairClassifier,
     MemoryPairClassificationError,
+    MemoryPairContext,
     MEMORY_PAIR_CLASSIFIER_VERSION,
     MemoryPairDecision,
     MemoryRelationType,
@@ -253,8 +254,26 @@ class RelationDiscovery:
             source_id=request.source_id,
             excluded_source_ids=disabled_source_ids,
         )
+        candidate_contexts = {
+            item.memory.memory_id: MemoryPairContext(
+                source_id=item.memory.source_id,
+                doc_id=item.memory.doc_id,
+                source_lineage_id=item.memory.source_lineage_id,
+            )
+            for item in selection.discovery
+        }
+        challenger_context = MemoryPairContext(
+            source_id=evidence_unit.source_id,
+            doc_id=evidence_unit.doc_id,
+            source_lineage_id=evidence_unit.source_lineage_id,
+        )
         pairs = tuple(
-            MemoryPair(challenger=challenger, candidate=loaded_by_id[memory_id])
+            MemoryPair(
+                challenger=challenger,
+                candidate=loaded_by_id[memory_id],
+                challenger_context=challenger_context,
+                candidate_context=candidate_contexts.get(memory_id),
+            )
             for memory_id in selection.candidate_ids
         )
         reusable_by_candidate_id = {
