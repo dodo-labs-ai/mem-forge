@@ -819,6 +819,7 @@ async def test_source_sync_run_persists_consumed_input_boundary_and_rerun_revisi
         lease_attempt_count=leased.lease_attempt_count,
         final_state=SyncState(
             source="src-input-boundary",
+            last_sync_at=datetime.now(timezone.utc),
             last_sync_status="success",
         ),
     )
@@ -1338,6 +1339,7 @@ async def test_complete_source_sync_run_releases_active_slot_for_next_run(db: Da
         completed_at=now + timedelta(seconds=10),
     )
     completed = await db.get_source_sync_run(enqueued.run_id)
+    history = await db.get_sync_history(source="src-complete-run", limit=10)
     next_run = await db.enqueue_source_sync_run(
         source_id="src-complete-run",
         workspace_id="workspace-a",
@@ -1349,8 +1351,62 @@ async def test_complete_source_sync_run_releases_active_slot_for_next_run(db: Da
     assert completed.status == "success"
     assert completed.lease_owner is None
     assert completed.completed_at == now + timedelta(seconds=10)
+    assert [(row["run_id"], row["status"]) for row in history] == [
+        (enqueued.run_id, "success")
+    ]
     assert next_run.run_id != enqueued.run_id
     assert next_run.coalesced is False
+
+
+@pytest.mark.asyncio
+async def test_complete_source_sync_run_rolls_back_the_whole_terminal_read_model(
+    db: Database,
+):
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    source_id = "src-terminal-read-model-rollback"
+    await db.upsert_source(
+        id=source_id,
+        type="github_repo",
+        name="Rollback repo",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+    await db.db.execute(
+        f"""CREATE TRIGGER reject_terminal_history
+            BEFORE INSERT ON sync_history
+            WHEN NEW.run_id = '{enqueued.run_id}'
+            BEGIN SELECT RAISE(ABORT, 'reject terminal history'); END"""
+    )
+    await db.db.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="reject terminal history"):
+        await db.complete_source_sync_run(
+            enqueued.run_id,
+            worker_id="worker-a",
+            lease_attempt_count=leased.lease_attempt_count,
+            final_state=SyncState(
+                source=source_id,
+                last_sync_at=now + timedelta(seconds=10),
+                last_sync_status="success",
+            ),
+            completed_at=now + timedelta(seconds=10),
+        )
+
+    run = await db.get_source_sync_run(enqueued.run_id)
+    source = await db.get_source(source_id)
+    assert run is not None
+    assert run.status == "running"
+    assert source is not None
+    assert source["last_sync"] is None
+    assert await db.get_sync_state(source_id) is None
 
 
 @pytest.mark.asyncio
@@ -1564,7 +1620,11 @@ async def test_retryable_failure_folds_running_rerun_intent_into_same_run(db: Da
         active.run_id,
         worker_id="worker-b",
         lease_attempt_count=retried.lease_attempt_count,
-        final_state=SyncState(source=source_id, last_sync_status="success"),
+        final_state=SyncState(
+            source=source_id,
+            last_sync_at=now + timedelta(seconds=20),
+            last_sync_status="success",
+        ),
         completed_at=now + timedelta(seconds=20),
     )
     latest = await db.get_latest_source_sync_run(source_id=source_id)
@@ -5629,6 +5689,37 @@ async def test_auth_failure_records_failed_sync_state_without_secondary_error(db
 
 
 @pytest.mark.asyncio
+async def test_sync_pipeline_can_delegate_terminal_result_persistence(db: Database):
+    source_id = "src-delegated-terminal-result"
+    await db.upsert_source(
+        id=source_id,
+        type="local_markdown",
+        name="Delegated terminal result",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=None,
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=EmptyGene(),
+        source_name="Delegated terminal result",
+        source_id=source_id,
+        record_terminal_result=False,
+    )
+
+    assert state.last_sync_status == "success"
+    assert await db.get_sync_state(source_id) is None
+    assert await db.get_sync_history(source=source_id, limit=10) == []
+
+
+@pytest.mark.asyncio
 async def test_run_all_active_sources_enqueues_durable_runs(db: Database):
     source_id = "src-scheduled-tracked"
     await db.upsert_source(
@@ -6509,12 +6600,19 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
 
     leased = await worker.run_once()
     completed = await db.get_source_sync_run(enqueued.run_id)
+    source = await db.get_source(source_id)
+    history = await db.get_sync_history(source=source_id, limit=10)
 
     assert leased is not None
     assert leased.run_id == enqueued.run_id
     assert completed is not None
     assert completed.status == "success"
     assert completed.lease_owner is None
+    assert source is not None
+    assert source["last_sync"] == "2026-07-10T08:00:00+00:00"
+    assert [(row["run_id"], row["status"]) for row in history] == [
+        (enqueued.run_id, "success")
+    ]
     assert provider.force_full_sync_values == [True]
     assert provider.extraction_pools == [worker._extraction_pool]
     assert provider.lifecycle_cycle_ids == [f"{enqueued.run_id}:attempt:1"]
@@ -6579,6 +6677,7 @@ async def test_source_sync_worker_gives_each_retry_attempt_a_new_lifecycle_cycle
     await worker.run_once()
 
     completed = await db.get_source_sync_run(enqueued.run_id)
+    history = await db.get_sync_history(source=source_id, limit=10)
     assert completed is not None
     assert completed.status == "success"
     assert provider.lifecycle_cycle_ids == [
@@ -6588,6 +6687,9 @@ async def test_source_sync_worker_gives_each_retry_attempt_a_new_lifecycle_cycle
     assert provider.scope_transition_run_ids == [
         enqueued.run_id,
         enqueued.run_id,
+    ]
+    assert [(row["run_id"], row["status"]) for row in history] == [
+        (enqueued.run_id, "success")
     ]
 
 
@@ -6623,11 +6725,18 @@ async def test_source_sync_worker_rejects_legacy_unsupported_run_without_runtime
     await worker.run_once()
 
     failed = await db.get_source_sync_run(enqueued.run_id)
+    source = await db.get_source(source_id)
+    history = await db.get_sync_history(source=source_id, limit=10)
     assert failed is not None
     assert failed.status == "failed"
     assert failed.next_attempt_at is None
     assert failed.error_message is not None
     assert "does not support ordinary sync" in failed.error_message
+    assert source is not None
+    assert source["last_sync"] is None
+    assert [(row["run_id"], row["status"]) for row in history] == [
+        (enqueued.run_id, "failed")
+    ]
 
 
 @pytest.mark.asyncio
@@ -6940,7 +7049,11 @@ async def test_legacy_snapshot_run_uses_snapshot_membership_without_watermark(
 
         async def run_source_sync(self, **kwargs):
             self.source = kwargs["source"]
-            return SyncState(source=source_id, last_sync_status="success")
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
 
     provider = CapturingRuntimeProvider()
     worker = runtime.SourceSyncWorker(
@@ -7396,6 +7509,14 @@ async def test_source_sync_worker_does_not_replay_partial_final_state(db: Databa
         access_policy="workspace",
         owner_user_id="dev",
     )
+    successful_at = datetime(2026, 7, 9, 8, 0, tzinfo=timezone.utc)
+    await db.upsert_sync_state(
+        SyncState(
+            source=source_id,
+            last_sync_at=successful_at,
+            last_sync_status="success",
+        )
+    )
 
     class PartialStateRuntimeProvider:
         async def build_sync_runtime(self, db, config, **kwargs):
@@ -7424,6 +7545,8 @@ async def test_source_sync_worker_does_not_replay_partial_final_state(db: Databa
     await worker.run_once()
     failed = await db.get_source_sync_run(enqueued.run_id)
     sync_state = await db.get_sync_state(source_id)
+    source = await db.get_source(source_id)
+    history = await db.get_sync_history(source=source_id, limit=10)
 
     assert failed is not None
     assert failed.status == "failed"
@@ -7431,6 +7554,11 @@ async def test_source_sync_worker_does_not_replay_partial_final_state(db: Databa
     assert failed.next_attempt_at is None
     assert sync_state is not None
     assert sync_state.last_sync_status == "partial"
+    assert source is not None
+    assert source["last_sync"] == successful_at.isoformat()
+    assert [(row["run_id"], row["status"]) for row in history] == [
+        (enqueued.run_id, "partial")
+    ]
 
 
 @pytest.mark.asyncio

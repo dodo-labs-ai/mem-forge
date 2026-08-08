@@ -3213,6 +3213,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                )""",
         ],
     ),
+    (
+        74,
+        "Correlate one source sync history result per durable run",
+        [
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_history_run_id "
+            "ON sync_history(run_id) WHERE run_id IS NOT NULL",
+        ],
+    ),
 ]
 
 
@@ -16020,80 +16028,128 @@ class Database:
         *,
         worker_id: str,
         lease_attempt_count: int,
-        final_state: SyncState | None = None,
+        final_state: SyncState,
         completed_at: datetime | None = None,
     ) -> bool:
         completed_iso = _utc_iso(completed_at)
-        if final_state is not None and final_state.last_sync_status != "success":
-            raise ValueError("complete_source_sync_run requires a successful final state")
-        status = "success"
+        if final_state.last_sync_status != "success" or final_state.last_sync_at is None:
+            raise ValueError("complete_source_sync_run requires a timestamped successful final state")
         async with self._write_lock:
-            async with self.db.execute(
-                """SELECT * FROM source_sync_runs
-                   WHERE run_id = ? AND status = 'running'
-                     AND lease_owner = ? AND lease_attempt_count = ?
-                     AND lease_expires_at > ?""",
-                (run_id, worker_id, lease_attempt_count, completed_iso),
-            ) as cursor:
-                leased_run = await cursor.fetchone()
-            if leased_run is None:
-                return False
-            if final_state is not None:
-                await self.db.execute(
-                    """INSERT INTO sync_state (
-                        source, last_sync_at, last_sync_status,
-                        docs_processed, docs_updated, error_message
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(source) DO UPDATE SET
-                        last_sync_at=excluded.last_sync_at,
-                        last_sync_status=excluded.last_sync_status,
-                        docs_processed=excluded.docs_processed,
-                        docs_updated=excluded.docs_updated,
-                        error_message=excluded.error_message""",
+            try:
+                async with self.db.execute(
+                    """SELECT * FROM source_sync_runs
+                       WHERE run_id = ? AND status = 'running'
+                         AND lease_owner = ? AND lease_attempt_count = ?
+                         AND lease_expires_at > ?""",
+                    (run_id, worker_id, lease_attempt_count, completed_iso),
+                ) as cursor:
+                    leased_run = await cursor.fetchone()
+                if leased_run is None:
+                    return False
+                if final_state.source != str(leased_run["source_id"]):
+                    raise ValueError("source sync final state does not belong to the leased run")
+                await self._upsert_sync_state_unlocked(final_state)
+                await self._insert_terminal_sync_history_unlocked(
+                    run_id=run_id,
+                    state=final_state,
+                    started_at=str(leased_run["started_at"] or leased_run["created_at"]),
+                    finished_at=completed_iso,
+                )
+                cursor = await self.db.execute(
+                    """UPDATE source_sync_runs
+                       SET status = 'success',
+                           lease_owner = NULL,
+                           lease_expires_at = NULL,
+                           next_attempt_at = NULL,
+                           error_message = ?,
+                           completed_at = ?,
+                           updated_at = ?
+                       WHERE run_id = ? AND status = 'running'
+                         AND lease_owner = ? AND lease_attempt_count = ?
+                         AND lease_expires_at > ?""",
                     (
-                        final_state.source,
-                        final_state.last_sync_at.isoformat() if final_state.last_sync_at else None,
-                        final_state.last_sync_status,
-                        final_state.docs_processed,
-                        final_state.docs_updated,
                         final_state.error_message,
+                        completed_iso,
+                        completed_iso,
+                        run_id,
+                        worker_id,
+                        lease_attempt_count,
+                        completed_iso,
                     ),
                 )
-                if final_state.last_sync_at and final_state.last_sync_status == "success":
-                    await self.db.execute(
-                        "UPDATE sources SET last_sync = ? WHERE id = ?",
-                        (final_state.last_sync_at.isoformat(), final_state.source),
-                    )
-            cursor = await self.db.execute(
-                """UPDATE source_sync_runs
-                   SET status = ?,
-                       lease_owner = NULL,
-                       lease_expires_at = NULL,
-                       next_attempt_at = NULL,
-                       error_message = ?,
-                       completed_at = ?,
-                       updated_at = ?
-                   WHERE run_id = ? AND status = 'running'
-                     AND lease_owner = ? AND lease_attempt_count = ?
-                     AND lease_expires_at > ?""",
-                (
-                    status,
-                    final_state.error_message if final_state else None,
-                    completed_iso,
-                    completed_iso,
-                    run_id,
-                    worker_id,
-                    lease_attempt_count,
-                    completed_iso,
-                ),
-            )
-            if not cursor.rowcount:
-                await self.db.rollback()
-                return False
-            if status == "success":
+                if not cursor.rowcount:
+                    await self.db.rollback()
+                    return False
                 await self._enqueue_successor_for_completed_run(run_id, completed_iso)
-            await self.db.commit()
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
         return True
+
+    async def _upsert_sync_state_unlocked(self, state: SyncState) -> None:
+        await self.db.execute(
+            """INSERT INTO sync_state (
+                source, last_sync_at, last_sync_status,
+                docs_processed, docs_updated, error_message
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source) DO UPDATE SET
+                last_sync_at=excluded.last_sync_at,
+                last_sync_status=excluded.last_sync_status,
+                docs_processed=excluded.docs_processed,
+                docs_updated=excluded.docs_updated,
+                error_message=excluded.error_message""",
+            (
+                state.source,
+                state.last_sync_at.isoformat() if state.last_sync_at else None,
+                state.last_sync_status,
+                state.docs_processed,
+                state.docs_updated,
+                state.error_message,
+            ),
+        )
+        if state.last_sync_at and state.last_sync_status == "success":
+            await self.db.execute(
+                "UPDATE sources SET last_sync = ? WHERE id = ?",
+                (state.last_sync_at.isoformat(), state.source),
+            )
+
+    async def _insert_terminal_sync_history_unlocked(
+        self,
+        *,
+        run_id: str,
+        state: SyncState,
+        started_at: str,
+        finished_at: str,
+    ) -> None:
+        failed_docs = [
+            {
+                "doc_id": failed_doc.doc_id,
+                "title": failed_doc.title,
+                "error": failed_doc.error,
+            }
+            for failed_doc in state.failed_docs
+        ]
+        await self.db.execute(
+            """INSERT INTO sync_history (
+                source, status, docs_processed, docs_updated, docs_failed,
+                memories_extracted, error_message, failed_docs,
+                started_at, finished_at, run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                state.source,
+                state.last_sync_status,
+                state.docs_processed,
+                state.docs_updated,
+                state.docs_failed,
+                state.memories_extracted,
+                state.error_message,
+                json.dumps(failed_docs) if failed_docs else None,
+                started_at,
+                finished_at,
+                run_id,
+            ),
+        )
 
     async def fail_source_sync_run(
         self,
@@ -16114,6 +16170,21 @@ class Database:
         completed_at = None if retryable else failed_iso
         next_attempt_iso = _utc_iso(next_attempt_at) if retryable and next_attempt_at else None
         async with self._write_lock:
+            async with self.db.execute(
+                """SELECT * FROM source_sync_runs
+                   WHERE run_id = ? AND status = 'running'
+                     AND lease_owner = ? AND lease_attempt_count = ?
+                     AND lease_expires_at > ?""",
+                (run_id, worker_id, lease_attempt_count, failed_iso),
+            ) as cursor:
+                leased_run = await cursor.fetchone()
+            if leased_run is None:
+                return False
+            if final_state is not None:
+                if final_state.last_sync_status not in {"failed", "partial"}:
+                    raise ValueError("fail_source_sync_run requires a failed or partial final state")
+                if final_state.source != str(leased_run["source_id"]):
+                    raise ValueError("source sync final state does not belong to the leased run")
             cursor = await self.db.execute(
                 """UPDATE source_sync_runs
                    SET status = ?,
@@ -16192,30 +16263,26 @@ class Database:
             if not cursor.rowcount:
                 await self.db.rollback()
                 return False
-            if final_state is not None:
-                await self.db.execute(
-                    """INSERT INTO sync_state (
-                        source, last_sync_at, last_sync_status,
-                        docs_processed, docs_updated, error_message
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(source) DO UPDATE SET
-                        last_sync_at=excluded.last_sync_at,
-                        last_sync_status=excluded.last_sync_status,
-                        docs_processed=excluded.docs_processed,
-                        docs_updated=excluded.docs_updated,
-                        error_message=excluded.error_message""",
-                    (
-                        final_state.source,
-                        final_state.last_sync_at.isoformat() if final_state.last_sync_at else None,
-                        final_state.last_sync_status,
-                        final_state.docs_processed,
-                        final_state.docs_updated,
-                        final_state.error_message,
-                    ),
-                )
-            if not retryable:
-                await self._enqueue_successor_for_completed_run(run_id, failed_iso)
-            await self.db.commit()
+            try:
+                if final_state is not None:
+                    await self._upsert_sync_state_unlocked(final_state)
+                if not retryable:
+                    terminal_state = final_state or SyncState(
+                        source=str(leased_run["source_id"]),
+                        last_sync_status="failed",
+                        error_message=error_message,
+                    )
+                    await self._insert_terminal_sync_history_unlocked(
+                        run_id=run_id,
+                        state=terminal_state,
+                        started_at=str(leased_run["started_at"] or leased_run["created_at"]),
+                        finished_at=failed_iso,
+                    )
+                    await self._enqueue_successor_for_completed_run(run_id, failed_iso)
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
         return True
 
     async def _enqueue_successor_for_completed_run(self, run_id: str, now: str) -> None:
@@ -16930,32 +16997,33 @@ class Database:
 
     async def upsert_sync_state(self, state: SyncState) -> None:
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO sync_state (
-                    source, last_sync_at, last_sync_status,
-                    docs_processed, docs_updated, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source) DO UPDATE SET
-                    last_sync_at=excluded.last_sync_at,
-                    last_sync_status=excluded.last_sync_status,
-                    docs_processed=excluded.docs_processed,
-                    docs_updated=excluded.docs_updated,
-                    error_message=excluded.error_message""",
-                (
-                    state.source,
-                    state.last_sync_at.isoformat() if state.last_sync_at else None,
-                    state.last_sync_status,
-                    state.docs_processed,
-                    state.docs_updated,
-                    state.error_message,
-                ),
-            )
-            if state.last_sync_at and state.last_sync_status == "success":
-                await self.db.execute(
-                    "UPDATE sources SET last_sync = ? WHERE id = ?",
-                    (state.last_sync_at.isoformat(), state.source),
-                )
+            await self._upsert_sync_state_unlocked(state)
             await self.db.commit()
+
+    async def record_source_sync_result(
+        self,
+        state: SyncState,
+        *,
+        started_at: datetime,
+        finished_at: datetime,
+        run_id: str,
+    ) -> None:
+        """Commit one non-durable pipeline result as one read-model transaction."""
+        if state.last_sync_status == "success" and state.last_sync_at is None:
+            raise ValueError("successful source sync result requires last_sync_at")
+        async with self._write_lock:
+            try:
+                await self._upsert_sync_state_unlocked(state)
+                await self._insert_terminal_sync_history_unlocked(
+                    run_id=run_id,
+                    state=state,
+                    started_at=_utc_iso(started_at),
+                    finished_at=_utc_iso(finished_at),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
 
     async def get_sync_state(self, source: str) -> SyncState | None:
         async with self.db.execute("SELECT * FROM sync_state WHERE source = ?", (source,)) as cursor:

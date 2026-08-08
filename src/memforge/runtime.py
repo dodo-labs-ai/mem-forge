@@ -234,6 +234,7 @@ class RuntimeProvider(Protocol):
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
+        record_terminal_result: bool = True,
     ) -> SyncState: ...
 
 
@@ -327,6 +328,7 @@ class DefaultRuntimeProvider:
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
+        record_terminal_result: bool = True,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -342,6 +344,7 @@ class DefaultRuntimeProvider:
             lifecycle_cycle_id=lifecycle_cycle_id,
             scope_transition_run_id=scope_transition_run_id,
             reusable_projection_doc_ids=reusable_projection_doc_ids,
+            record_terminal_result=record_terminal_result,
         )
 
 
@@ -697,6 +700,7 @@ async def run_source_sync(
     lifecycle_cycle_id: str | None = None,
     scope_transition_run_id: str | None = None,
     reusable_projection_doc_ids: frozenset[str] = frozenset(),
+    record_terminal_result: bool = True,
 ) -> SyncState:
     await authorize_source_sync_maintenance(
         db,
@@ -755,6 +759,7 @@ async def run_source_sync(
             "lifecycle_cycle_id": lifecycle_cycle_id,
             "scope_transition_run_id": scope_transition_run_id,
             "reusable_projection_doc_ids": reusable_projection_doc_ids,
+            "record_terminal_result": record_terminal_result,
         }
         if execution_mode is not SourceSyncMode.NORMAL:
             sync_kwargs["execution_mode"] = execution_mode
@@ -1174,6 +1179,7 @@ class SourceSyncWorker:
                 lifecycle_cycle_id=(f"{run.run_id}:attempt:{run.lease_attempt_count}"),
                 scope_transition_run_id=run.run_id,
                 reusable_projection_doc_ids=reusable_projection_doc_ids,
+                record_terminal_result=False,
             )
             if final_state is None:
                 final_state = SyncState(
@@ -1511,18 +1517,11 @@ class SyncService:
                 last_sync_status="failed",
                 error_message=str(e),
             )
-            await self.db.upsert_sync_state(error_state)
-            await self.db.insert_sync_history(
-                source=source_id,
-                status="failed",
-                docs_processed=0,
-                docs_updated=0,
-                docs_failed=0,
-                memories_extracted=0,
-                error_message=str(e),
-                failed_docs=None,
-                started_at=started_at,
-                finished_at=datetime.now(timezone.utc).isoformat(),
+            await self.db.record_source_sync_result(
+                error_state,
+                started_at=datetime.fromisoformat(started_at),
+                finished_at=datetime.now(timezone.utc),
+                run_id=f"sync-{uuid.uuid4().hex}",
             )
             return None
         finally:

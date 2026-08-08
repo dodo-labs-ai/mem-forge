@@ -1,4 +1,6 @@
 # tests/test_visibility_migrations.py
+from datetime import datetime, timezone
+
 import pytest
 from memforge.models import SyncState
 from memforge.storage.database import Database
@@ -95,6 +97,7 @@ async def test_agent_concept_rebuild_restores_foreign_key_enforcement(tmp_path):
             lease_attempt_count=leased.lease_attempt_count,
             final_state=SyncState(
                 source="src-cascade",
+                last_sync_at=datetime.now(timezone.utc),
                 last_sync_status="success",
             ),
         )
