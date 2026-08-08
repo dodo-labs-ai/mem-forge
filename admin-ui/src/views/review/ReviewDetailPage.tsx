@@ -122,7 +122,10 @@ export function ReviewDetailPage() {
   const useLatestMutation = useMutation({
     mutationFn: () =>
       resourceClient
-        .post(`/memory-reviews/${id}/approve`, { note: note.trim() || null })
+        .post(`/memory-reviews/${id}/approve`, {
+          expected_fingerprint: detailQuery.data?.decision_fingerprint,
+          note: note.trim() || null,
+        })
         .then((response) => response.data),
     onSuccess: (data: MemoryReviewDetail) => {
       queryClient.setQueryData(["memory-review", id], data);
@@ -134,7 +137,10 @@ export function ReviewDetailPage() {
   const keepCurrentMutation = useMutation({
     mutationFn: () =>
       resourceClient
-        .post(`/memory-reviews/${id}/reject`, { note: note.trim() })
+        .post(`/memory-reviews/${id}/reject`, {
+          expected_fingerprint: detailQuery.data?.decision_fingerprint,
+          note: note.trim(),
+        })
         .then((response) => response.data),
     onSuccess: (data: MemoryReviewDetail) => {
       queryClient.setQueryData(["memory-review", id], data);
@@ -170,8 +176,11 @@ export function ReviewDetailPage() {
   const pending = review.status === "pending" && !review.is_stale;
   const expired = review.status === "stale" || review.is_stale;
   const resolved = review.status === "approved" || review.status === "rejected";
-  const useLatest = review.presentation.actions.find((action) => action.key === "use_latest_state");
-  const keepCurrent = review.presentation.actions.find((action) => action.key === "keep_current_state");
+  const approveAction = review.presentation.actions.find((action) => action.decision === "approve");
+  const rejectAction = review.presentation.actions.find((action) => action.decision === "reject");
+  const resolvedAction = review.presentation.actions.find(
+    (action) => action.decision === (review.status === "approved" ? "approve" : "reject"),
+  );
   const mutationPending = useLatestMutation.isPending || keepCurrentMutation.isPending;
   const decisionError = extractError(useLatestMutation.error) ?? extractError(keepCurrentMutation.error);
 
@@ -209,7 +218,7 @@ export function ReviewDetailPage() {
           <CheckCircle2 className="mt-0.5 size-5" />
           <div>
             <div className="font-medium">
-              {review.status === "approved" ? "Latest state is now in use" : "Current state was kept"}
+              {resolvedAction ? `${resolvedAction.label} recorded` : "Decision recorded"}
             </div>
             {review.review_note && <p className="mt-1 text-emerald-900/80">{review.review_note}</p>}
           </div>
@@ -229,15 +238,15 @@ export function ReviewDetailPage() {
         />
       </div>
 
-      {pending && useLatest && keepCurrent && (
+      {pending && approveAction && rejectAction && (
         <Card className="border-2">
           <CardHeader>
             <CardTitle className="text-base">Choose what MemForge should do</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="grid gap-3 md:grid-cols-2">
-              <ActionExplanation action={useLatest} />
-              <ActionExplanation action={keepCurrent} />
+              <ActionExplanation action={approveAction} />
+              <ActionExplanation action={rejectAction} />
             </div>
             <div>
               <label htmlFor="review-note" className="text-sm font-medium">
@@ -248,7 +257,7 @@ export function ReviewDetailPage() {
                 value={note}
                 onChange={(event) => setNote(event.target.value)}
                 rows={3}
-                placeholder="Required when keeping the current state; optional when using the latest state."
+                placeholder={`Required for ${rejectAction.label}; optional for ${approveAction.label}.`}
                 className="mt-2 w-full rounded-md border bg-background p-3 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
               />
             </div>
@@ -260,13 +269,13 @@ export function ReviewDetailPage() {
             <div className="flex flex-wrap justify-end gap-2">
               <Button
                 variant="outline"
-                disabled={mutationPending || note.trim().length === 0}
+                disabled={mutationPending || (rejectAction.requires_note && note.trim().length === 0)}
                 onClick={() => keepCurrentMutation.mutate()}
               >
-                Keep current state
+                {rejectAction.label}
               </Button>
               <Button disabled={mutationPending} onClick={() => useLatestMutation.mutate()}>
-                Use latest state
+                {approveAction.label}
               </Button>
             </div>
           </CardContent>

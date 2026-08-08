@@ -16,8 +16,11 @@ const cue = readFileSync(
   "utf8",
 );
 
-assert.match(detail, /Use latest state/);
-assert.match(detail, /Keep current state/);
+assert.match(detail, /action\.decision === "approve"/);
+assert.match(detail, /action\.decision === "reject"/);
+assert.match(detail, /expected_fingerprint: detailQuery\.data\?\.decision_fingerprint/);
+assert.match(detail, /\{rejectAction\.label\}/);
+assert.match(detail, /\{approveAction\.label\}/);
 assert.match(detail, /View technical details/);
 assert.match(detail, /This proposal expired/);
 assert.doesNotMatch(detail, /\/refresh/);
@@ -34,6 +37,9 @@ assert.match(queue, /REVIEW_QUEUE_PAGE_SIZE/);
 assert.match(queue, /offset: page \* REVIEW_QUEUE_PAGE_SIZE/);
 assert.match(queue, /<Pagination/);
 assert.match(queue, /searchParams\.get\("page"\)/);
+assert.match(queue, /review-queue-filter/);
+assert.match(queue, /cross_source_conflict/);
+assert.match(queue, /Source lifecycle/);
 assert.doesNotMatch(queue, /review\.presentation\.why_human/);
 assert.doesNotMatch(queue, /CardContent/);
 assert.doesNotMatch(queue, />\s*Review\s*</);

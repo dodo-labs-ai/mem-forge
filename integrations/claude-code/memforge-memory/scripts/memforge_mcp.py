@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.48"
+SERVER_VERSION = "0.1.49"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Repository context is optional. MemForge uses negotiated request-scoped host context when "
@@ -150,6 +150,84 @@ WORKSPACE_ID_SCHEMA = {
         "Optional workspace selected for this call. Omit it to use the server-side default or "
         "the caller's only accessible workspace."
     ),
+}
+
+REVIEW_MANIFEST_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "review_id": {"type": "string", "minLength": 1},
+        "decision": {"type": "string", "enum": ["approve", "reject"]},
+        "expected_fingerprint": {
+            "type": "string",
+            "minLength": 1,
+            "description": "decision_fingerprint returned by list_memory_reviews or get_memory_review.",
+        },
+        "note": {
+            "type": "string",
+            "description": "Audit note; required when the selected action says requires_note=true.",
+        },
+        "rationale": {
+            "type": "string",
+            "maxLength": 2000,
+            "description": "Agent explanation for the proposed decision; never grants authority.",
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "risk": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium"},
+    },
+    "required": ["review_id", "decision", "expected_fingerprint"],
+    "additionalProperties": False,
+}
+
+REVIEW_MANIFEST_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "mode": {"type": "string", "enum": ["validate", "apply"]},
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "review_id": {"type": "string"},
+                    "decision": {"type": "string", "enum": ["approve", "reject"]},
+                    "outcome": {
+                        "type": "string",
+                        "enum": [
+                            "ready",
+                            "applied",
+                            "already_applied",
+                            "stale",
+                            "forbidden",
+                            "not_found",
+                            "invalid",
+                            "failed",
+                        ],
+                    },
+                    "status": {"type": ["string", "null"]},
+                    "message": {"type": ["string", "null"]},
+                    "decision_label": {"type": ["string", "null"]},
+                    "consequence": {"type": ["string", "null"]},
+                },
+                "required": [
+                    "review_id",
+                    "decision",
+                    "outcome",
+                    "status",
+                    "message",
+                    "decision_label",
+                    "consequence",
+                ],
+                "additionalProperties": False,
+            },
+        },
+        "ready": {"type": "integer"},
+        "applied": {"type": "integer"},
+        "already_applied": {"type": "integer"},
+        "stale": {"type": "integer"},
+        "forbidden": {"type": "integer"},
+        "failed": {"type": "integer"},
+        "validation_receipt": {"type": ["string", "null"]},
+    },
+    "required": ["mode", "results", "ready", "applied", "already_applied", "stale", "forbidden", "failed"],
 }
 
 
@@ -601,8 +679,10 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "list_memory_reviews",
         "description": (
-            "List pending memory-review decisions for interactive conflict or correction review."
+            "List an exact caller-visible Review queue for agent analysis. Use filters to build "
+            "a bounded cohort, then inspect each presentation.actions entry and decision_fingerprint."
         ),
+        "annotations": {"readOnlyHint": True},
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -611,8 +691,11 @@ TOOLS: list[dict[str, Any]] = [
                     "enum": ["open", "pending", "stale", "approved", "rejected"],
                     "default": "open",
                 },
-                "limit": {"type": "integer", "default": 20},
-                "offset": {"type": "integer", "default": 0},
+                "origin": {"type": "string", "enum": ["memory", "lifecycle"]},
+                "kind": {"type": "string", "enum": ["supersede", "cross_source_conflict"]},
+                "source_id": {"type": "string", "minLength": 1},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
             },
             "additionalProperties": False,
         },
@@ -620,6 +703,7 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_memory_review",
         "description": "Fetch full current/proposed memory details for a memory-review decision.",
+        "annotations": {"readOnlyHint": True},
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -632,25 +716,80 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "resolve_memory_review",
         "description": (
-            "Resolve one memory review after explicit user confirmation. approve promotes "
-            "the challenger, reject retires it, and refresh repins stale expectations. "
-            "Show a readable current/proposed diff and confirm via request_user_input if "
-            "available, else a concise text question. Never resolve silently."
+            "Resolve one Review after explicit user confirmation using the exact action shown "
+            "in presentation.actions. Consequences vary by Review kind: lifecycle decisions may "
+            "change Memory state, while cross-source conflict decisions keep both Memories active. "
+            "Never resolve silently and never reuse a stale decision_fingerprint."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "review_id": {"type": "string", "description": "The memory review ID."},
-                "decision": {"type": "string", "enum": ["approve", "reject", "refresh"]},
+                "decision": {"type": "string", "enum": ["approve", "reject"]},
+                "expected_fingerprint": {
+                    "type": "string",
+                    "description": "Current decision_fingerprint from the Review response.",
+                },
                 "note": {
                     "type": "string",
-                    "description": "Reviewer note; required when decision is reject.",
+                    "description": "Audit note; required when the selected action says requires_note=true.",
                 },
-                "reviewer": {"type": "string", "description": "Optional reviewer display name or user id."},
             },
-            "required": ["review_id", "decision"],
+            "required": ["review_id", "decision", "expected_fingerprint"],
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True},
+    },
+    {
+        "name": "validate_memory_review_decisions",
+        "description": (
+            "Read-only validation of a bounded Review Decision Manifest. Use this after agent "
+            "analysis to detect stale fingerprints, missing notes, and authorization failures "
+            "before asking the user to confirm the exact cohort."
+        ),
+        "annotations": {"readOnlyHint": True},
+        "outputSchema": REVIEW_MANIFEST_RESPONSE_SCHEMA,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "decisions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": REVIEW_MANIFEST_DECISION_SCHEMA,
+                },
+            },
+            "required": ["decisions"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "apply_memory_review_decisions",
+        "description": (
+            "Apply one previously validated Decision Manifest only after one explicit user "
+            "confirmation of the displayed cohort. Each item keeps its own authorization, stale "
+            "guard, atomic lifecycle path, audit, and result; this tool creates no batch state."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "decisions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": REVIEW_MANIFEST_DECISION_SCHEMA,
+                },
+                "validation_receipt": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Receipt returned by validating this exact manifest as the same principal.",
+                },
+            },
+            "required": ["decisions", "validation_receipt"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True},
+        "outputSchema": REVIEW_MANIFEST_RESPONSE_SCHEMA,
     },
 ]
 
@@ -769,7 +908,16 @@ def _tool_call_response(
 ) -> dict[str, Any]:
     try:
         payload = _call_tool(name, arguments, request_meta=request_meta)
-        return _rpc_result(request_id, _tool_result(payload))
+        return _rpc_result(
+            request_id,
+            _tool_result(
+                payload,
+                structured=name in {
+                    "validate_memory_review_decisions",
+                    "apply_memory_review_decisions",
+                },
+            ),
+        )
     except Exception as exc:  # pragma: no cover - defensive MCP boundary
         return _rpc_error(request_id, -32603, f"Internal error: {exc}")
 
@@ -941,15 +1089,28 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             workspace_id=workspace_id,
         )
     if name == "list_memory_reviews":
-        allowed = {"status", "limit", "offset"}
+        allowed = {"status", "origin", "kind", "source_id", "limit", "offset"}
         unknown = sorted(set(args) - allowed)
         if unknown:
             return {"error": "Unsupported list_memory_reviews parameter(s): " + ", ".join(unknown)}
         try:
+            limit = _optional_int_arg(args, "limit", 20)
+            offset = _optional_int_arg(args, "offset", 0)
+            if not 1 <= limit <= 500:
+                raise ValueError("limit must be between 1 and 500")
+            if offset < 0:
+                raise ValueError("offset must not be negative")
             query = {
-                "status": str(args.get("status") or "open"),
-                "limit": _optional_int_arg(args, "limit", 20),
-                "offset": _optional_int_arg(args, "offset", 0),
+                key: value
+                for key, value in {
+                    "status": str(args.get("status") or "open"),
+                    "origin": _optional_string_arg(args, "origin"),
+                    "kind": _optional_string_arg(args, "kind"),
+                    "source_id": _optional_string_arg(args, "source_id"),
+                    "limit": limit,
+                    "offset": offset,
+                }.items()
+                if value is not None
             }
         except ValueError as exc:
             return {"error": str(exc)}
@@ -973,25 +1134,42 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             workspace_id=workspace_id,
         )
     if name == "resolve_memory_review":
+        unknown = sorted(set(args) - {"review_id", "decision", "expected_fingerprint", "note"})
+        if unknown:
+            return {"error": "Unsupported resolve_memory_review parameter(s): " + ", ".join(unknown)}
         try:
             review_id = _required_string_arg(args, "review_id")
             decision = _required_string_arg(args, "decision")
-            if decision not in {"approve", "reject", "refresh"}:
-                raise ValueError("decision must be approve, reject, or refresh")
+            if decision not in {"approve", "reject"}:
+                raise ValueError("decision must be approve or reject")
+            expected_fingerprint = _required_string_arg(args, "expected_fingerprint")
             note = str(args.get("note") or "").strip()
             if decision == "reject" and not note:
                 raise ValueError("note is required when decision is reject")
-            reviewer = str(args.get("reviewer") or "").strip()
-            body = {}
+            body = {"expected_fingerprint": expected_fingerprint}
             if note:
                 body["note"] = note
-            if reviewer:
-                body["reviewer"] = reviewer
         except ValueError as exc:
             return {"error": str(exc)}
         return _http_json(
             "POST",
             f"/memory-reviews/{quote(review_id, safe='')}/{decision}",
+            body,
+            target=call_context.target,
+            workspace_id=workspace_id,
+        )
+    if name in {"validate_memory_review_decisions", "apply_memory_review_decisions"}:
+        try:
+            body = _review_manifest_body(
+                args,
+                require_receipt=name == "apply_memory_review_decisions",
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        operation = "validate" if name == "validate_memory_review_decisions" else "apply"
+        return _http_json(
+            "POST",
+            f"/memory-reviews/decisions/{operation}",
             body,
             target=call_context.target,
             workspace_id=workspace_id,
@@ -1012,6 +1190,79 @@ def _optional_string_arg(args: dict[str, Any], name: str) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _review_manifest_body(
+    args: dict[str, Any],
+    *,
+    require_receipt: bool,
+) -> dict[str, Any]:
+    unknown = sorted(set(args) - {"decisions", "validation_receipt"})
+    if unknown:
+        raise ValueError("Unsupported Review manifest parameter(s): " + ", ".join(unknown))
+    raw_decisions = args.get("decisions")
+    if not isinstance(raw_decisions, list) or not 1 <= len(raw_decisions) <= 50:
+        raise ValueError("decisions must contain between 1 and 50 items")
+    allowed = {
+        "review_id",
+        "decision",
+        "expected_fingerprint",
+        "note",
+        "rationale",
+        "confidence",
+        "risk",
+    }
+    normalized: list[dict[str, Any]] = []
+    review_ids: set[str] = set()
+    for index, raw in enumerate(raw_decisions):
+        if not isinstance(raw, dict):
+            raise ValueError(f"decisions[{index}] must be an object")
+        item_unknown = sorted(set(raw) - allowed)
+        if item_unknown:
+            raise ValueError(
+                f"Unsupported decisions[{index}] parameter(s): " + ", ".join(item_unknown)
+            )
+        review_id = _required_string_arg(raw, "review_id")
+        if review_id in review_ids:
+            raise ValueError(f"duplicate review_id: {review_id}")
+        review_ids.add(review_id)
+        decision = _required_string_arg(raw, "decision")
+        if decision not in {"approve", "reject"}:
+            raise ValueError(f"decisions[{index}].decision must be approve or reject")
+        fingerprint = _required_string_arg(raw, "expected_fingerprint")
+        note = _optional_string_arg(raw, "note")
+        if decision == "reject" and not note:
+            raise ValueError(f"decisions[{index}].note is required when decision is reject")
+        risk = str(raw.get("risk") or "medium").strip()
+        if risk not in {"low", "medium", "high"}:
+            raise ValueError(f"decisions[{index}].risk must be low, medium, or high")
+        confidence = raw.get("confidence")
+        if confidence is not None and (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not 0 <= float(confidence) <= 1
+        ):
+            raise ValueError(f"decisions[{index}].confidence must be between 0 and 1")
+        item: dict[str, Any] = {
+            "review_id": review_id,
+            "decision": decision,
+            "expected_fingerprint": fingerprint,
+            "risk": risk,
+        }
+        for optional in ("note", "rationale"):
+            value = _optional_string_arg(raw, optional)
+            if value is not None:
+                item[optional] = value
+        if confidence is not None:
+            item["confidence"] = float(confidence)
+        normalized.append(item)
+    body: dict[str, Any] = {"decisions": normalized}
+    receipt = _optional_string_arg(args, "validation_receipt")
+    if require_receipt and receipt is None:
+        raise ValueError("validation_receipt is required before apply")
+    if receipt is not None:
+        body["validation_receipt"] = receipt
+    return body
 
 
 def _optional_int_arg(args: dict[str, Any], name: str, default: int) -> int:
@@ -1362,7 +1613,7 @@ def _root_path(item: Any) -> str | None:
     return uri
 
 
-def _tool_result(payload: dict[str, Any]) -> dict[str, Any]:
+def _tool_result(payload: dict[str, Any], *, structured: bool = False) -> dict[str, Any]:
     content_type = str(payload.get("content_type") or "").split(";", 1)[0].strip().lower()
     encoded = payload.get("data_base64")
     if content_type.startswith("image/") and isinstance(encoded, str):
@@ -1374,10 +1625,13 @@ def _tool_result(payload: dict[str, Any]) -> dict[str, Any]:
             ],
             "isError": False,
         }
-    return {
+    result = {
         "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
         "isError": False,
     }
+    if structured and "error" not in payload:
+        result["structuredContent"] = payload
+    return result
 
 
 def _compact_search_response(payload: dict[str, Any]) -> dict[str, Any]:

@@ -21,6 +21,7 @@ def test_lifecycle_review_exposes_exactly_two_user_decisions() -> None:
         "Use latest state",
         "Keep current state",
     ]
+    assert [action.decision for action in presentation.actions] == ["approve", "reject"]
     assert presentation.actions[0].requires_note is False
     assert presentation.actions[1].requires_note is True
     assert presentation.decision_label == "Updated"
@@ -54,12 +55,19 @@ def test_legacy_internal_reason_is_only_technical_detail() -> None:
     assert presentation.technical_reason == "deterministic_relation_conflict:v7:v8"
 
 
-def test_cross_source_conflict_is_presented_as_a_source_backed_choice() -> None:
+def test_cross_source_conflict_is_presented_as_a_non_destructive_finding() -> None:
     presentation = present_memory_review(
         kind="cross_source_conflict",
         reason="conflicting_source_authority",
     )
 
     assert presentation.decision_label == "Conflict"
-    assert presentation.summary == "Choose which source-backed memory should remain current."
-    assert presentation.proposed_label == "Conflicting memory"
+    assert presentation.summary == "Do these source-backed memories really conflict?"
+    assert presentation.current_label == "Source-backed memory"
+    assert presentation.proposed_label == "Other source-backed memory"
+    assert [action.key for action in presentation.actions] == [
+        "confirm_conflict",
+        "not_a_conflict",
+    ]
+    assert [action.decision for action in presentation.actions] == ["approve", "reject"]
+    assert all("keep both" in action.consequence for action in presentation.actions)

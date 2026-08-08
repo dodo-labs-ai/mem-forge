@@ -37,6 +37,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleVectorTask,
 )
 from memforge.memory.relation_discovery_contract import RelationDiscoveryWork
+from memforge.memory.review_decision import ReviewVectorTask
 from memforge.models import (
     DocumentRecord,
     Entity,
@@ -413,6 +414,18 @@ class SqliteRelationalStore:
 
     async def get_memory(self, memory_id: str) -> Memory | None:
         return await self._db.get_memory(memory_id)
+
+    async def list_memories_by_ids(
+        self,
+        memory_ids: Sequence[str],
+    ) -> list[Memory]:
+        return await self._db.list_memories_by_ids(memory_ids)
+
+    async def get_memory_source_ids_many(
+        self,
+        memory_ids: Sequence[str],
+    ) -> Mapping[str, tuple[str, ...]]:
+        return await self._db.get_memory_source_ids_many(memory_ids)
 
     async def list_active_memories(
         self,
@@ -1162,6 +1175,45 @@ class SqliteRelationalStore:
         next_attempt_at: str | None = None,
     ) -> None:
         await self._db.fail_lifecycle_vector_task(
+            task_id,
+            error,
+            next_attempt_at=next_attempt_at,
+        )
+
+    async def list_review_vector_tasks(
+        self,
+        *,
+        review_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ReviewVectorTask]:
+        return await self._db.list_review_vector_tasks(review_id=review_id, limit=limit)
+
+    async def list_ready_review_vector_tasks(
+        self,
+        *,
+        review_id: str | None = None,
+        limit: int = 100,
+        max_attempts: int,
+        now: str | None = None,
+    ) -> list[ReviewVectorTask]:
+        return await self._db.list_ready_review_vector_tasks(
+            review_id=review_id,
+            limit=limit,
+            max_attempts=max_attempts,
+            now=now,
+        )
+
+    async def complete_review_vector_task(self, task_id: str) -> None:
+        await self._db.complete_review_vector_task(task_id)
+
+    async def fail_review_vector_task(
+        self,
+        task_id: str,
+        error: str,
+        *,
+        next_attempt_at: str | None = None,
+    ) -> None:
+        await self._db.fail_review_vector_task(
             task_id,
             error,
             next_attempt_at=next_attempt_at,

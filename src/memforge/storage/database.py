@@ -70,6 +70,7 @@ from memforge.models import (
     SourceSyncRun,
     SyncState,
     UNSORTED_PROJECT_KEY,
+    VIRTUAL_DOCUMENT_SOURCE_IDS,
     Visibility,
     canonicalize_entity_name,
     content_hash,
@@ -138,6 +139,7 @@ from memforge.memory.relation_discovery_contract import (
 )
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
+from memforge.memory.review_decision import ReviewVectorTask
 from memforge.memory.review_contract import (
     CrossSourceReviewMemorySnapshot,
     CrossSourceReviewSupportSnapshot,
@@ -1131,6 +1133,22 @@ CREATE TABLE IF NOT EXISTS lifecycle_vector_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_vector_outbox_status
     ON lifecycle_vector_outbox(status, created_at);
+
+CREATE TABLE IF NOT EXISTS review_vector_outbox (
+    id              TEXT PRIMARY KEY,
+    review_id       TEXT NOT NULL REFERENCES memory_reviews(id) ON DELETE CASCADE,
+    memory_id       TEXT NOT NULL,
+    operation       TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+    status          TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    error           TEXT,
+    next_attempt_at TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    UNIQUE (review_id, memory_id, operation)
+);
+CREATE INDEX IF NOT EXISTS idx_review_vector_outbox_status
+    ON review_vector_outbox(status, created_at);
 
 CREATE TABLE IF NOT EXISTS relation_discovery_work (
     id                       TEXT PRIMARY KEY,
@@ -3083,8 +3101,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         69,
         "Persist reusable identity pair decisions for relation discovery",
         [
-            "ALTER TABLE relation_discovery_work ADD COLUMN "
-            "preclassified_decisions_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE relation_discovery_work ADD COLUMN preclassified_decisions_json TEXT NOT NULL DEFAULT '[]'",
         ],
     ),
     (
@@ -3191,26 +3208,6 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         [
             "ALTER TABLE lifecycle_reviews ADD COLUMN review_note TEXT",
             "ALTER TABLE lifecycle_reviews ADD COLUMN reviewer TEXT",
-            """UPDATE memory_reviews
-               SET status = 'stale', resolved_at = COALESCE(resolved_at, datetime('now'))
-               WHERE status = 'pending' AND (
-                   NOT EXISTS (
-                       SELECT 1 FROM memories incumbent
-                       WHERE incumbent.id = memory_reviews.incumbent_memory_id
-                         AND (
-                             memory_reviews.expected_incumbent_updated_at IS NULL
-                             OR memory_reviews.expected_incumbent_updated_at = incumbent.updated_at
-                         )
-                   )
-                   OR NOT EXISTS (
-                       SELECT 1 FROM memories challenger
-                       WHERE challenger.id = memory_reviews.challenger_memory_id
-                         AND (
-                             memory_reviews.expected_challenger_updated_at IS NULL
-                             OR memory_reviews.expected_challenger_updated_at = challenger.updated_at
-                         )
-                   )
-               )""",
         ],
     ),
     (
@@ -3219,6 +3216,27 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         [
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_history_run_id "
             "ON sync_history(run_id) WHERE run_id IS NOT NULL",
+        ],
+    ),
+    (
+        75,
+        "Add durable Review vector outbox",
+        [
+            """CREATE TABLE IF NOT EXISTS review_vector_outbox (
+                id TEXT PRIMARY KEY,
+                review_id TEXT NOT NULL REFERENCES memory_reviews(id) ON DELETE CASCADE,
+                memory_id TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                next_attempt_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (review_id, memory_id, operation)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_review_vector_outbox_status
+               ON review_vector_outbox(status, created_at)""",
         ],
     ),
 ]
@@ -4605,11 +4623,7 @@ class Database:
             separators=(",", ":"),
         )
         now = _now_iso()
-        initial_status = (
-            SOURCE_DERIVATION_COMPLETED
-            if not manifest.batches
-            else SOURCE_DERIVATION_PENDING
-        )
+        initial_status = SOURCE_DERIVATION_COMPLETED if not manifest.batches else SOURCE_DERIVATION_PENDING
         async with self._write_lock:
             try:
                 async with self.db.execute(
@@ -4676,26 +4690,15 @@ class Database:
                         "source_unit_id": manifest.source_unit_id,
                         "base_unit_revision_id": manifest.base_unit_revision_id,
                         "target_unit_revision_id": manifest.target_unit_revision_id,
-                        "projection_identity_hash": (
-                            manifest.projection_identity_hash
-                        ),
-                        "context_identity_hash": (
-                            manifest.context_identity_hash
-                        ),
-                        "extraction_contract_version": (
-                            manifest.extraction_contract_version
-                        ),
+                        "projection_identity_hash": (manifest.projection_identity_hash),
+                        "context_identity_hash": (manifest.context_identity_hash),
+                        "extraction_contract_version": (manifest.extraction_contract_version),
                     }
                     mismatched_columns = tuple(
-                        column
-                        for column, value in immutable_values.items()
-                        if existing[column] != value
+                        column for column, value in immutable_values.items() if existing[column] != value
                     )
                     if mismatched_columns:
-                        raise ValueError(
-                            "Source derivation retry payload mismatch: "
-                            + ", ".join(mismatched_columns)
-                        )
+                        raise ValueError("Source derivation retry payload mismatch: " + ", ".join(mismatched_columns))
                     existing_id = str(existing["id"])
                     batch_rows = await self.db.execute_fetchall(
                         """SELECT batch_id, input_payload_hash,
@@ -4725,9 +4728,7 @@ class Database:
                         for row in batch_rows
                     ]
                     if actual_batches != expected_batches:
-                        raise ValueError(
-                            "Source derivation retry batch manifest mismatch"
-                        )
+                        raise ValueError("Source derivation retry batch manifest mismatch")
                 await self.db.commit()
                 return await self._source_derivation_attempt_unlocked(
                     str(existing["id"]) if existing is not None else manifest.id
@@ -4760,9 +4761,7 @@ class Database:
 
                 if result.error_type:
                     if existing["status"] != SOURCE_DERIVATION_BATCH_COMPLETED:
-                        error_type, error_code, error_fields = (
-                            safe_derivation_error(result)
-                        )
+                        error_type, error_code, error_fields = safe_derivation_error(result)
                         await self.db.execute(
                             """UPDATE source_derivation_batches
                                SET status = ?, output_payload_json = NULL,
@@ -4777,10 +4776,7 @@ class Database:
                                 error_type,
                                 error_code,
                                 json.dumps(
-                                    [
-                                        {"location": location, "type": kind}
-                                        for location, kind in error_fields
-                                    ],
+                                    [{"location": location, "type": kind} for location, kind in error_fields],
                                     sort_keys=True,
                                     separators=(",", ":"),
                                 ),
@@ -4799,9 +4795,7 @@ class Database:
                     payload_hash = output_payload_hash(output_payload)
                     if existing["status"] == SOURCE_DERIVATION_BATCH_COMPLETED:
                         if existing["output_payload_hash"] != payload_hash:
-                            raise ValueError(
-                                "Source derivation completed batch output mismatch"
-                            )
+                            raise ValueError("Source derivation completed batch output mismatch")
                     else:
                         await self.db.execute(
                             """UPDATE source_derivation_batches
@@ -4830,9 +4824,7 @@ class Database:
                        GROUP BY status""",
                     (derivation_id,),
                 )
-                status_counts = {
-                    str(row["status"]): int(row["count"]) for row in counts
-                }
+                status_counts = {str(row["status"]): int(row["count"]) for row in counts}
                 if status_counts.get(SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE, 0):
                     attempt_status = SOURCE_DERIVATION_RETRYABLE_FAILURE
                     completed_at = None
@@ -4854,9 +4846,7 @@ class Database:
                     ),
                 )
                 await self.db.commit()
-                return await self._source_derivation_attempt_unlocked(
-                    derivation_id
-                )
+                return await self._source_derivation_attempt_unlocked(derivation_id)
             except Exception:
                 await self.db.rollback()
                 raise
@@ -4885,12 +4875,7 @@ class Database:
                    ORDER BY created_at, id""",
                 (source_id,),
             )
-        return tuple(
-            [
-                await self._source_derivation_attempt_unlocked(str(row["id"]))
-                for row in rows
-            ]
-        )
+        return tuple([await self._source_derivation_attempt_unlocked(str(row["id"])) for row in rows])
 
     async def supersede_source_derivation(
         self,
@@ -4927,9 +4912,7 @@ class Database:
         for row in rows:
             payload_json = row["output_payload_json"]
             if not isinstance(payload_json, str):
-                raise ValueError(
-                    "completed Source derivation batch lacks output payload"
-                )
+                raise ValueError("completed Source derivation batch lacks output payload")
             payload = json.loads(payload_json)
             if not isinstance(payload, Mapping):
                 raise ValueError("Source derivation output payload is invalid")
@@ -4992,27 +4975,14 @@ class Database:
                     batch_id=str(batch["batch_id"]),
                     input_payload_hash=str(batch["input_payload_hash"]),
                     primary_observation_ids=tuple(
-                        str(value)
-                        for value in json.loads(
-                            batch["primary_observation_ids_json"]
-                        )
+                        str(value) for value in json.loads(batch["primary_observation_ids_json"])
                     ),
                     status=str(batch["status"]),
                     output_payload_hash=(
-                        str(batch["output_payload_hash"])
-                        if batch["output_payload_hash"] is not None
-                        else None
+                        str(batch["output_payload_hash"]) if batch["output_payload_hash"] is not None else None
                     ),
-                    error_type=(
-                        str(batch["error_type"])
-                        if batch["error_type"] is not None
-                        else None
-                    ),
-                    error_code=(
-                        str(batch["error_code"])
-                        if batch["error_code"] is not None
-                        else None
-                    ),
+                    error_type=(str(batch["error_type"]) if batch["error_type"] is not None else None),
+                    error_code=(str(batch["error_code"]) if batch["error_code"] is not None else None),
                     error_fields=tuple(
                         (
                             str(value.get("location") or ""),
@@ -5029,35 +4999,21 @@ class Database:
             source_id=str(row["source_id"]),
             source_unit_id=str(row["source_unit_id"]),
             base_unit_revision_id=(
-                str(row["base_unit_revision_id"])
-                if row["base_unit_revision_id"] is not None
-                else None
+                str(row["base_unit_revision_id"]) if row["base_unit_revision_id"] is not None else None
             ),
             target_unit_revision_id=str(row["target_unit_revision_id"]),
-            projection=source_projection_from_payload(
-                projection_payload
-            ),
+            projection=source_projection_from_payload(projection_payload),
             projection_payload_hash=str(row["projection_payload_hash"]),
-            projection_identity_hash=str(
-                row["projection_identity_hash"]
-            ),
-            context=source_unit_derivation_context_from_payload(
-                context_payload
-            ),
+            projection_identity_hash=str(row["projection_identity_hash"]),
+            context=source_unit_derivation_context_from_payload(context_payload),
             context_payload_hash=str(row["context_payload_hash"]),
             context_identity_hash=str(row["context_identity_hash"]),
-            extraction_contract_version=str(
-                row["extraction_contract_version"]
-            ),
+            extraction_contract_version=str(row["extraction_contract_version"]),
             status=str(row["status"]),
             batches=tuple(batches),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
-            completed_at=(
-                str(row["completed_at"])
-                if row["completed_at"] is not None
-                else None
-            ),
+            completed_at=(str(row["completed_at"]) if row["completed_at"] is not None else None),
         )
 
     async def record_source_projection(
@@ -6011,9 +5967,7 @@ class Database:
                     raise ValueError("open lifecycle cutover findings block the lifecycle gate")
                 if await self.count_active_source_memories_without_support(source_id):
                     raise ValueError("source-backed Memory lacks validated support lineage")
-                if await self.count_active_supported_memories_without_source_provenance(
-                    source_id
-                ):
+                if await self.count_active_supported_memories_without_source_provenance(source_id):
                     raise ValueError("active support lacks source provenance")
                 now = _now_iso()
                 await self.db.execute(
@@ -7266,16 +7220,8 @@ class Database:
     ) -> Mapping[str, tuple[str, ...]]:
         """Return Observations named by active support-granting references."""
 
-        ids = tuple(
-            dict.fromkeys(
-                str(memory_id)
-                for memory_id in memory_ids
-                if memory_id
-            )
-        )
-        grouped: dict[str, set[str]] = {
-            memory_id: set() for memory_id in ids
-        }
+        ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
+        grouped: dict[str, set[str]] = {memory_id: set() for memory_id in ids}
         for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
             chunk = ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
             placeholders = ", ".join("?" for _ in chunk)
@@ -7293,13 +7239,8 @@ class Database:
                 (*chunk, source_id),
             )
             for row in rows:
-                grouped[str(row["memory_id"])].add(
-                    str(row["observation_id"])
-                )
-        return {
-            memory_id: tuple(sorted(grouped[memory_id]))
-            for memory_id in ids
-        }
+                grouped[str(row["memory_id"])].add(str(row["observation_id"]))
+        return {memory_id: tuple(sorted(grouped[memory_id])) for memory_id in ids}
 
     async def get_source_unit_support_reference_ids(
         self,
@@ -7364,9 +7305,7 @@ class Database:
         if projection.source_id != plan.scope.source_id:
             raise ValueError("projection and lifecycle plan belong to different sources")
         if document is not None and document.source != projection.source_id:
-            raise ValueError(
-                "Document snapshot and projection belong to different sources"
-            )
+            raise ValueError("Document snapshot and projection belong to different sources")
         if len(projection.deltas) != 1:
             raise ValueError("atomic projected lifecycle requires exactly one Revision Delta")
         delta = projection.deltas[0]
@@ -7379,13 +7318,9 @@ class Database:
             try:
                 if derivation_id is not None:
                     if document is None:
-                        raise ValueError(
-                            "Source derivation lifecycle commit requires its staged Document"
-                        )
+                        raise ValueError("Source derivation lifecycle commit requires its staged Document")
                     if derivation_context_identity_hash is None:
-                        raise ValueError(
-                            "Source derivation lifecycle commit requires its context identity"
-                        )
+                        raise ValueError("Source derivation lifecycle commit requires its context identity")
                     async with self.db.execute(
                         """SELECT source_id, source_unit_id,
                                   target_unit_revision_id, status,
@@ -7401,40 +7336,28 @@ class Database:
                         raise ValueError("unknown Source derivation")
                     if (
                         derivation["source_id"] != projection.source_id
-                        or derivation["source_unit_id"]
-                        != delta.source_unit_id
-                        or derivation["target_unit_revision_id"]
-                        != delta.current_unit_revision_id
+                        or derivation["source_unit_id"] != delta.source_unit_id
+                        or derivation["target_unit_revision_id"] != delta.current_unit_revision_id
                         or derivation["status"]
                         not in {
                             SOURCE_DERIVATION_COMPLETED,
                             "applied",
                         }
                     ):
-                        raise ValueError(
-                            "Source derivation is not ready for lifecycle commit"
-                        )
+                        raise ValueError("Source derivation is not ready for lifecycle commit")
                     if derivation["projection_identity_hash"] != (
                         source_derivation_projection_identity_hash(projection)
                     ):
-                        raise ValueError(
-                            "Source derivation projection identity mismatch"
-                        )
-                    if derivation["context_identity_hash"] != (
-                        derivation_context_identity_hash
-                    ):
-                        raise ValueError(
-                            "Source derivation context identity mismatch"
-                        )
+                        raise ValueError("Source derivation projection identity mismatch")
+                    if derivation["context_identity_hash"] != (derivation_context_identity_hash):
+                        raise ValueError("Source derivation context identity mismatch")
                     staged_context = source_unit_derivation_context_from_payload(
                         json.loads(derivation["context_payload_json"])
                     )
                     if source_derivation_document_identity_hash(
                         staged_context.document
                     ) != source_derivation_document_identity_hash(document):
-                        raise ValueError(
-                            "Source derivation Document identity mismatch"
-                        )
+                        raise ValueError("Source derivation Document identity mismatch")
                 if document is not None:
                     await self._assert_document_source_writable_unlocked(
                         document.source,
@@ -8294,6 +8217,26 @@ class Database:
             (task_id, plan_id, memory_id, operation.value, now, now),
         )
 
+    async def _enqueue_review_vector_task_unlocked(
+        self,
+        review_id: str,
+        memory_id: str,
+        operation: LifecycleVectorOperation,
+        *,
+        now: str,
+    ) -> None:
+        task_id = (
+            "rvout-"
+            + hashlib.sha256(f"{review_id}\x1f{memory_id}\x1f{operation.value}".encode("utf-8")).hexdigest()[:20]
+        )
+        await self.db.execute(
+            """INSERT OR IGNORE INTO review_vector_outbox (
+                   id, review_id, memory_id, operation, status,
+                   attempts, error, next_attempt_at, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, 'pending', 0, NULL, NULL, ?, ?)""",
+            (task_id, review_id, memory_id, operation.value, now, now),
+        )
+
     async def _enqueue_relation_discovery_work_unlocked(
         self,
         lifecycle_plan_id: str,
@@ -8402,10 +8345,7 @@ class Database:
         if status is not None:
             conditions.append("lr.status = ?")
             params.append(status.value)
-        query = (
-            "SELECT COUNT(*) FROM lifecycle_reviews lr "
-            "JOIN lifecycle_plans lp ON lp.id = lr.lifecycle_plan_id"
-        )
+        query = "SELECT COUNT(*) FROM lifecycle_reviews lr JOIN lifecycle_plans lp ON lp.id = lr.lifecycle_plan_id"
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         async with self.db.execute(query, tuple(params)) as cursor:
@@ -8622,6 +8562,120 @@ class Database:
                 )
                 if not rows or rows[0]["status"] != "completed":
                     raise ValueError("lifecycle vector task is not pending")
+            await self.db.commit()
+
+    async def list_review_vector_tasks(
+        self,
+        *,
+        review_id: str | None = None,
+        limit: int = 100,
+    ) -> list[ReviewVectorTask]:
+        conditions = "WHERE status IN ('pending', 'failed')"
+        params: list[object] = []
+        if review_id is not None:
+            conditions += " AND review_id = ?"
+            params.append(review_id)
+        params.append(limit)
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM review_vector_outbox "
+            + conditions
+            + " ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, "
+            "CASE status WHEN 'failed' THEN updated_at ELSE created_at END, id LIMIT ?",
+            tuple(params),
+        )
+        return [
+            ReviewVectorTask(
+                id=str(row["id"]),
+                review_id=str(row["review_id"]),
+                memory_id=str(row["memory_id"]),
+                operation=row["operation"],
+                status=row["status"],
+                attempts=int(row["attempts"]),
+                error=row["error"],
+            )
+            for row in rows
+        ]
+
+    async def list_ready_review_vector_tasks(
+        self,
+        *,
+        review_id: str | None = None,
+        limit: int = 100,
+        max_attempts: int,
+        now: str | None = None,
+    ) -> list[ReviewVectorTask]:
+        if limit < 1 or max_attempts < 1:
+            raise ValueError("Review vector readiness requires positive bounds")
+        ready_at = now or _now_iso()
+        conditions = """WHERE (
+            status = 'pending'
+            OR (status = 'failed' AND attempts < ?
+                AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+        )"""
+        params: list[object] = [max_attempts, ready_at]
+        if review_id is not None:
+            conditions += " AND review_id = ?"
+            params.append(review_id)
+        params.append(limit)
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM review_vector_outbox "
+            + conditions
+            + " ORDER BY CASE status WHEN 'failed' THEN updated_at ELSE created_at END, id LIMIT ?",
+            tuple(params),
+        )
+        return [
+            ReviewVectorTask(
+                id=str(row["id"]),
+                review_id=str(row["review_id"]),
+                memory_id=str(row["memory_id"]),
+                operation=row["operation"],
+                status=row["status"],
+                attempts=int(row["attempts"]),
+                error=row["error"],
+            )
+            for row in rows
+        ]
+
+    async def complete_review_vector_task(self, task_id: str) -> None:
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE review_vector_outbox
+                   SET status = 'completed', attempts = attempts + 1,
+                       next_attempt_at = NULL, updated_at = ?
+                   WHERE id = ? AND status IN ('pending', 'failed')""",
+                (_now_iso(), task_id),
+            )
+            if cursor.rowcount != 1:
+                rows = await self.db.execute_fetchall(
+                    "SELECT status FROM review_vector_outbox WHERE id = ?",
+                    (task_id,),
+                )
+                if not rows or rows[0]["status"] != "completed":
+                    raise ValueError("Review vector task is not pending")
+            await self.db.commit()
+
+    async def fail_review_vector_task(
+        self,
+        task_id: str,
+        error: str,
+        *,
+        next_attempt_at: str | None = None,
+    ) -> None:
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE review_vector_outbox
+                   SET status = 'failed', attempts = attempts + 1,
+                       error = COALESCE(error, ?), next_attempt_at = ?, updated_at = ?
+                   WHERE id = ? AND status IN ('pending', 'failed')""",
+                (error[:4000], next_attempt_at, _now_iso(), task_id),
+            )
+            if cursor.rowcount != 1:
+                rows = await self.db.execute_fetchall(
+                    "SELECT status FROM review_vector_outbox WHERE id = ?",
+                    (task_id,),
+                )
+                if not rows or rows[0]["status"] != "completed":
+                    raise ValueError("Review vector task is not pending")
             await self.db.commit()
 
     async def has_ready_relation_discovery_work(self, *, max_attempts: int) -> bool:
@@ -8985,8 +9039,7 @@ class Database:
             raise ValueError("relation discovery candidate Support fence is incomplete")
         current_support = await self.get_active_memory_support_states(candidate_ids)
         if any(
-            current_support[memory_id].current_support_set_hash
-            != expected_support_hashes[memory_id]
+            current_support[memory_id].current_support_set_hash != expected_support_hashes[memory_id]
             for memory_id in candidate_ids
         ):
             raise ValueError("relation discovery candidate current Support is stale")
@@ -9824,9 +9877,7 @@ class Database:
                 ),
             )
         preserve_authoritative_relations = projection_plane is RelationProjectionPlane.DISCOVERY
-        if preserve_authoritative_relations and any(
-            relation.is_authoritative_support for relation in bundle.relations
-        ):
+        if preserve_authoritative_relations and any(relation.is_authoritative_support for relation in bundle.relations):
             raise ValueError("relation discovery cannot publish authoritative support")
         relation_delete_sql = "DELETE FROM evidence_relations WHERE evidence_unit_id = ?"
         if preserve_authoritative_relations:
@@ -10338,6 +10389,23 @@ class Database:
                 return None
             return self._row_to_memory(row)
 
+    async def list_memories_by_ids(self, memory_ids: Sequence[str]) -> list[Memory]:
+        """Return persisted Memories in caller order, regardless of lifecycle status."""
+
+        ordered_ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
+        rows: dict[str, Memory] = {}
+        for offset in range(0, len(ordered_ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ordered_ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            async with self.db.execute(
+                f"SELECT * FROM memories WHERE id IN ({placeholders})",
+                chunk,
+            ) as cursor:
+                async for row in cursor:
+                    memory = self._row_to_memory(row)
+                    rows[memory.id] = memory
+        return [rows[memory_id] for memory_id in ordered_ids if memory_id in rows]
+
     async def find_active_exact_claim_candidate(
         self,
         memory_content_hash: str,
@@ -10405,11 +10473,7 @@ class Database:
                 repo_identifier,
             ]
             if exclusions:
-                exclusion_clause = (
-                    " AND m.id NOT IN ("
-                    + ", ".join("?" for _ in exclusions)
-                    + ")"
-                )
+                exclusion_clause = " AND m.id NOT IN (" + ", ".join("?" for _ in exclusions) + ")"
                 params.extend(exclusions)
             async with self.db.execute(
                 f"""SELECT m.* FROM memories AS m
@@ -10583,11 +10647,7 @@ class Database:
                 async for row in cursor:
                     memory = self._row_to_memory(row)
                     by_hash.setdefault(memory.content_hash, memory)
-        return [
-            by_hash[content_hash]
-            for content_hash in ordered_hashes
-            if content_hash in by_hash
-        ]
+        return [by_hash[content_hash] for content_hash in ordered_hashes if content_hash in by_hash]
 
     async def get_memories_by_source_doc(
         self,
@@ -11920,6 +11980,29 @@ class Database:
                 )
         return results
 
+    async def get_memory_source_ids_many(
+        self,
+        memory_ids: Sequence[str],
+    ) -> Mapping[str, tuple[str, ...]]:
+        """Return configured Source IDs for many Memories in bounded queries."""
+
+        ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
+        grouped: dict[str, list[str]] = {memory_id: [] for memory_id in ids}
+        for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            async with self.db.execute(
+                f"""SELECT memory_id, source_id FROM memory_sources
+                    WHERE memory_id IN ({placeholders}) AND source_id IS NOT NULL
+                    ORDER BY memory_id, source_id""",
+                chunk,
+            ) as cursor:
+                async for row in cursor:
+                    source_id = str(row["source_id"])
+                    if source_id and source_id not in VIRTUAL_DOCUMENT_SOURCE_IDS:
+                        grouped[str(row["memory_id"])].append(source_id)
+        return {memory_id: tuple(dict.fromkeys(grouped[memory_id])) for memory_id in ids}
+
     async def get_memory_ids_for_doc(self, doc_id: str) -> list[str]:
         ids: list[str] = []
         async with self.db.execute(
@@ -12611,9 +12694,7 @@ class Database:
             if retired:
                 now = _now_iso()
                 plan_id = f"support-removal-{uuid.uuid4().hex}"
-                scope_hash = hashlib.sha256(
-                    f"{memory_id}\x1f{source_id}\x1f{doc_id}".encode("utf-8")
-                ).hexdigest()[:20]
+                scope_hash = hashlib.sha256(f"{memory_id}\x1f{source_id}\x1f{doc_id}".encode("utf-8")).hexdigest()[:20]
                 payload_json = json.dumps(
                     {
                         "operation": "remove_source_support",
@@ -12817,11 +12898,7 @@ class Database:
             async for row in cursor:
                 data = dict(row)
                 source_priority = (
-                    0
-                    if data["source"] in {"manual", "admin_manual"}
-                    else 1
-                    if data["source"] == "deterministic"
-                    else 2
+                    0 if data["source"] in {"manual", "admin_manual"} else 1 if data["source"] == "deterministic" else 2
                 )
                 eligible_aliases.setdefault(data["alias_normalized"], []).append(
                     (
@@ -12851,24 +12928,19 @@ class Database:
             if len(canonical_ids) == 1:
                 aliases[name] = highest[0][1]
             else:
-                alias_conflict_candidates[name] = tuple(
-                    {row[2].id: row[2] for row in highest}.values()
-                )
+                alias_conflict_candidates[name] = tuple({row[2].id: row[2] for row in highest}.values())
 
         unresolved = tuple(name for name in names if name not in exact and name not in aliases)
         candidates: dict[str, tuple[Entity, ...]] = {
-            name: alias_conflict_candidates.get(name, ())[:candidate_limit]
-            for name in unresolved
+            name: alias_conflict_candidates.get(name, ())[:candidate_limit] for name in unresolved
         }
         terms = tuple(
             dict.fromkeys(
                 token
                 for name in unresolved
-                for token in tuple(
-                    item
-                    for item in name.split()
-                    if len(item) >= 3 and item.replace(".", "").isalnum()
-                )[:4]
+                for token in tuple(item for item in name.split() if len(item) >= 3 and item.replace(".", "").isalnum())[
+                    :4
+                ]
             )
         )
         if terms:
@@ -12877,14 +12949,9 @@ class Database:
             for start in range(0, len(terms), 400):
                 term_batch = terms[start : start + 400]
                 term_predicate = " OR ".join(
-                    "LOWER(canonical_name) LIKE ? OR LOWER(display_name) LIKE ?"
-                    for _term in term_batch
+                    "LOWER(canonical_name) LIKE ? OR LOWER(display_name) LIKE ?" for _term in term_batch
                 )
-                term_params = tuple(
-                    value
-                    for term in term_batch
-                    for value in (f"%{term}%", f"%{term}%")
-                )
+                term_params = tuple(value for term in term_batch for value in (f"%{term}%", f"%{term}%"))
                 async with self.db.execute(
                     f"""SELECT * FROM entities
                         WHERE {term_predicate}
@@ -12904,14 +12971,10 @@ class Database:
                         entity.canonical_name,
                     ),
                 )
-                lexical = tuple(
-                    entity
-                    for entity in ranked
-                    if name_tokens.intersection(entity.canonical_name.split())
-                )
-                candidates[name] = tuple(
-                    {entity.id: entity for entity in (*candidates[name], *lexical)}.values()
-                )[:candidate_limit]
+                lexical = tuple(entity for entity in ranked if name_tokens.intersection(entity.canonical_name.split()))
+                candidates[name] = tuple({entity.id: entity for entity in (*candidates[name], *lexical)}.values())[
+                    :candidate_limit
+                ]
         return EntityResolutionContext(exact, aliases, candidates)
 
     async def upsert_entities(
@@ -12968,8 +13031,7 @@ class Database:
                 )
                 if any(
                     source == "resolver_confirmed" and not access_context_hash
-                    for _alias, _normalized, _canonical_id, source, access_context_hash
-                    in normalized_values
+                    for _alias, _normalized, _canonical_id, source, access_context_hash in normalized_values
                 ):
                     raise ValueError("resolver-confirmed aliases require an access context")
                 await self.db.executemany(
@@ -13054,11 +13116,7 @@ class Database:
                     int(row["id"]),
                     str(row["canonical_name"]),
                     str(row["canonical_name"]),
-                    " ".join(
-                        part
-                        for part in (row["canonical_name"] or "", row["display_name"] or "")
-                        if part
-                    ),
+                    " ".join(part for part in (row["canonical_name"] or "", row["display_name"] or "") if part),
                 )
                 for row in entity_rows
             ]
@@ -13067,11 +13125,7 @@ class Database:
                     int(row["canonical_id"]),
                     canonical_by_id[int(row["canonical_id"])],
                     str(row["alias_normalized"]),
-                    " ".join(
-                        part
-                        for part in (row["alias"] or "", row["alias_normalized"] or "")
-                        if part
-                    ),
+                    " ".join(part for part in (row["alias"] or "", row["alias_normalized"] or "") if part),
                 )
                 for row in aliases
                 if int(row["canonical_id"]) in canonical_by_id
@@ -14743,16 +14797,10 @@ class Database:
                         else:
                             surviving_sources[doc_id] = survivor
                 shared_artifact_uris = {
-                    uri
-                    for doc_id, uris in document_artifacts.items()
-                    if doc_id in surviving_sources
-                    for uri in uris
+                    uri for doc_id, uris in document_artifacts.items() if doc_id in surviving_sources for uri in uris
                 }
                 artifact_uris = [
-                    uri
-                    for doc_id, uris in document_artifacts.items()
-                    if doc_id in exclusive_doc_ids
-                    for uri in uris
+                    uri for doc_id, uris in document_artifacts.items() if doc_id in exclusive_doc_ids for uri in uris
                 ]
                 async with self.db.execute(
                     "SELECT raw_uri FROM source_sync_inputs WHERE source_id = ?",
@@ -16498,8 +16546,7 @@ class Database:
 
         identities = tuple(
             dict.fromkeys(
-                (str(doc_id), str(revision), str(change_kind))
-                for doc_id, revision, change_kind in manifest_items
+                (str(doc_id), str(revision), str(change_kind)) for doc_id, revision, change_kind in manifest_items
             )
         )
         if not identities:
@@ -16508,8 +16555,7 @@ class Database:
         for offset in range(0, len(identities), MANIFEST_ATTESTATION_LOOKUP_CHUNK_SIZE):
             chunk = identities[offset : offset + MANIFEST_ATTESTATION_LOOKUP_CHUNK_SIZE]
             predicates = " OR ".join(
-                "(mi.doc_id = ? AND mi.revision = ? AND mi.change_kind = ?)"
-                for _identity in chunk
+                "(mi.doc_id = ? AND mi.revision = ? AND mi.change_kind = ?)" for _identity in chunk
             )
             params: tuple[Any, ...] = (
                 workspace_id,
@@ -16702,8 +16748,7 @@ class Database:
                         and leased_until is not None
                         and leased_until > datetime.now(timezone.utc)
                         and str(job_payload.get("source_config_revision") or "") == source_config_revision
-                        and int(job_payload.get("source_activity_epoch", -1))
-                        == int(source["activity_epoch"] or 0)
+                        and int(job_payload.get("source_activity_epoch", -1)) == int(source["activity_epoch"] or 0)
                     ):
                         raise SourceActivityConflict("local agent lease changed")
                 async with self.db.execute(
@@ -16714,23 +16759,16 @@ class Database:
                 ) as cursor:
                     lifecycle_job = await cursor.fetchone()
                 if lifecycle_job is not None:
-                    raise SourceActivityConflict(
-                        f"source lifecycle maintenance active: {lifecycle_job['id']}"
-                    )
+                    raise SourceActivityConflict(f"source lifecycle maintenance active: {lifecycle_job['id']}")
                 async with self.db.execute(
                     """SELECT input_id FROM source_sync_inputs
                        WHERE workspace_id = ? AND source_id = ?""",
                     (workspace_id, source_id),
                 ) as cursor:
                     valid_input_ids = {str(row["input_id"]) async for row in cursor}
-                missing_input_ids = {
-                    input_id for _doc_id, input_id in memberships
-                    if input_id not in valid_input_ids
-                }
+                missing_input_ids = {input_id for _doc_id, input_id in memberships if input_id not in valid_input_ids}
                 if missing_input_ids:
-                    raise ValueError(
-                        f"Source sync input not found: {sorted(missing_input_ids)[0]}"
-                    )
+                    raise ValueError(f"Source sync input not found: {sorted(missing_input_ids)[0]}")
                 async with self.db.execute(
                     """SELECT coverage, item_count, manifest_sha256,
                               local_agent_job_id, local_agent_attempt_count,
@@ -16769,8 +16807,7 @@ class Database:
                         (workspace_id, source_id, normalized_snapshot_id),
                     ) as cursor:
                         existing_items = [
-                            (str(row["doc_id"]), str(row["revision"]), str(row["change_kind"]))
-                            async for row in cursor
+                            (str(row["doc_id"]), str(row["revision"]), str(row["change_kind"])) async for row in cursor
                         ]
                     if existing_items != sorted(manifest_items):
                         raise SourceActivityConflict("source snapshot manifest changed")
@@ -16980,10 +17017,7 @@ class Database:
                 raise ValueError("snapshot input requires manifest_entry metadata")
             revision = str(entry.get("provider_revision") or entry.get("version") or "").strip()
             change_kind = str(entry.get("change_kind") or "upsert").strip()
-            if (
-                str(expected["revision"]) != revision
-                or str(expected["change_kind"]) != change_kind
-            ):
+            if str(expected["revision"]) != revision or str(expected["change_kind"]) != change_kind:
                 raise ValueError("snapshot input revision or change kind does not match manifest")
         await self.db.execute(
             """INSERT INTO source_sync_snapshot_items (
@@ -17564,33 +17598,44 @@ class Database:
     ) -> None:
         """Attach an additional challenger to an existing visible review case."""
         async with self._write_lock:
-            async with self.db.execute(
-                """SELECT review_id FROM memory_review_related_challengers
-                   WHERE challenger_memory_id = ?""",
-                (challenger_memory_id,),
-            ) as cursor:
-                existing = await cursor.fetchone()
-            if existing:
-                existing_review_id = existing["review_id"]
-                if existing_review_id != review_id:
-                    raise ValueError(
-                        f"Challenger {challenger_memory_id} is already attached to review {existing_review_id}"
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                async with self.db.execute(
+                    "SELECT status FROM memory_reviews WHERE id = ?",
+                    (review_id,),
+                ) as cursor:
+                    target_review = await cursor.fetchone()
+                if target_review is None or target_review["status"] != "pending":
+                    raise ValueError("memory review is not pending")
+                async with self.db.execute(
+                    """SELECT review_id FROM memory_review_related_challengers
+                       WHERE challenger_memory_id = ?""",
+                    (challenger_memory_id,),
+                ) as cursor:
+                    existing = await cursor.fetchone()
+                if existing:
+                    existing_review_id = existing["review_id"]
+                    if existing_review_id != review_id:
+                        raise ValueError(
+                            f"Challenger {challenger_memory_id} is already attached to review {existing_review_id}"
+                        )
+                    await self.db.execute(
+                        """UPDATE memory_review_related_challengers
+                           SET reason = COALESCE(?, reason)
+                           WHERE review_id = ? AND challenger_memory_id = ?""",
+                        (reason, review_id, challenger_memory_id),
                     )
-                await self.db.execute(
-                    """UPDATE memory_review_related_challengers
-                       SET reason = COALESCE(?, reason)
-                       WHERE review_id = ? AND challenger_memory_id = ?""",
-                    (reason, review_id, challenger_memory_id),
-                )
+                else:
+                    await self.db.execute(
+                        """INSERT INTO memory_review_related_challengers (
+                            review_id, challenger_memory_id, reason, created_at
+                        ) VALUES (?, ?, ?, ?)""",
+                        (review_id, challenger_memory_id, reason, _now_iso()),
+                    )
                 await self.db.commit()
-                return
-            await self.db.execute(
-                """INSERT INTO memory_review_related_challengers (
-                    review_id, challenger_memory_id, reason, created_at
-                ) VALUES (?, ?, ?, ?)""",
-                (review_id, challenger_memory_id, reason, _now_iso()),
-            )
-            await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def mark_memory_pending_review_with_case(
         self,
@@ -17606,6 +17651,7 @@ class Database:
             raise ValueError("review and related_review_id are mutually exclusive")
         async with self._write_lock:
             try:
+                await self.db.execute("BEGIN IMMEDIATE")
                 if review is not None:
                     async with self.db.execute(
                         "SELECT status FROM memory_reviews WHERE id = ?",
@@ -17616,6 +17662,14 @@ class Database:
                         raise RuntimeError(
                             f"memory review {review.id} already exists with status {existing_review['status']}"
                         )
+                if related_review_id is not None:
+                    async with self.db.execute(
+                        "SELECT status FROM memory_reviews WHERE id = ?",
+                        (related_review_id,),
+                    ) as cursor:
+                        related_review = await cursor.fetchone()
+                    if related_review is None or related_review["status"] != "pending":
+                        raise ValueError("memory review is not pending")
                 now = _now_iso()
                 await self.db.execute(
                     """UPDATE memories
@@ -17722,6 +17776,34 @@ class Database:
                 )
         return results
 
+    async def list_memory_review_related_challengers_many(
+        self,
+        review_ids: Sequence[str],
+    ) -> list[MemoryReviewRelatedChallenger]:
+        """Load related Review participants in bounded queries."""
+
+        ids = tuple(dict.fromkeys(str(review_id) for review_id in review_ids if review_id))
+        results: list[MemoryReviewRelatedChallenger] = []
+        for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            async with self.db.execute(
+                f"""SELECT * FROM memory_review_related_challengers
+                    WHERE review_id IN ({placeholders})
+                    ORDER BY review_id, created_at, challenger_memory_id""",
+                chunk,
+            ) as cursor:
+                async for row in cursor:
+                    results.append(
+                        MemoryReviewRelatedChallenger(
+                            review_id=row["review_id"],
+                            challenger_memory_id=row["challenger_memory_id"],
+                            reason=row["reason"],
+                            created_at=_parse_dt(row["created_at"]),
+                        )
+                    )
+        return results
+
     async def list_memory_reviews(
         self,
         status: str | None = None,
@@ -17779,13 +17861,190 @@ class Database:
     ) -> None:
         async with self._write_lock:
             now = _now_iso()
-            await self.db.execute(
+            cursor = await self.db.execute(
                 """UPDATE memory_reviews SET
                     status = ?, reviewer = ?, review_note = ?, resolved_at = ?
-                   WHERE id = ?""",
+                   WHERE id = ? AND status = 'pending'""",
                 (status, reviewer, review_note, now, review_id),
             )
+            if cursor.rowcount != 1:
+                await self.db.rollback()
+                raise ValueError("memory review is not pending")
             await self.db.commit()
+
+    async def apply_memory_review_resolution(
+        self,
+        review: MemoryReview,
+        *,
+        status: str,
+        reviewer: str | None,
+        review_note: str | None,
+        incumbent: Memory,
+        challenger: Memory,
+        related_challengers: Sequence[Memory],
+    ) -> None:
+        """Commit one destructive workbench decision as one relational transaction."""
+
+        if review.kind != "supersede":
+            raise ValueError("atomic workbench resolution only supports supersede Reviews")
+        if status not in {"approved", "rejected"}:
+            raise ValueError("unsupported memory review resolution status")
+        if incumbent.updated_at is None or challenger.updated_at is None:
+            raise ValueError("review participants require persisted versions")
+        expected_related = {memory.id: memory for memory in related_challengers}
+        if len(expected_related) != len(related_challengers):
+            raise ValueError("duplicate related Review participant")
+
+        async with self._write_lock:
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                async with self.db.execute(
+                    "SELECT * FROM memory_reviews WHERE id = ?",
+                    (review.id,),
+                ) as cursor:
+                    stored_review = await cursor.fetchone()
+                if (
+                    stored_review is None
+                    or stored_review["status"] != "pending"
+                    or stored_review["kind"] != review.kind
+                    or stored_review["incumbent_memory_id"] != incumbent.id
+                    or stored_review["challenger_memory_id"] != challenger.id
+                ):
+                    raise ValueError("memory review is not pending")
+
+                related_rows = await self.db.execute_fetchall(
+                    "SELECT challenger_memory_id FROM memory_review_related_challengers "
+                    "WHERE review_id = ? ORDER BY challenger_memory_id",
+                    (review.id,),
+                )
+                if {str(row["challenger_memory_id"]) for row in related_rows} != set(expected_related):
+                    raise ValueError("memory review related participants changed")
+
+                now = _now_iso()
+
+                terminal_participants = (
+                    (incumbent, *related_challengers) if status == "approved" else (challenger, *related_challengers)
+                )
+                for memory in terminal_participants:
+                    await self._assert_no_active_source_support_unlocked(memory.id)
+
+                async def guarded_status_update(
+                    sql: str,
+                    params: Sequence[object],
+                    *,
+                    participant: str,
+                ) -> None:
+                    cursor = await self.db.execute(sql, tuple(params))
+                    if cursor.rowcount != 1:
+                        raise ValueError(f"memory review participant changed: {participant}")
+
+                if status == "approved":
+                    await guarded_status_update(
+                        """UPDATE memories SET
+                               status = 'active', retirement_reason = NULL, retired_at = NULL,
+                               superseded_by = NULL, superseded_at = NULL,
+                               replacement_reason = NULL, replacement_kind = NULL,
+                               updated_at = ?
+                             WHERE id = ? AND status = 'pending_review' AND updated_at = ?""",
+                        (now, challenger.id, challenger.updated_at.isoformat()),
+                        participant=challenger.id,
+                    )
+                    await guarded_status_update(
+                        """UPDATE memories SET
+                               status = 'superseded', superseded_by = ?, superseded_at = ?,
+                               valid_until = ?, replacement_reason = ?, replacement_kind = ?,
+                               updated_at = ?
+                             WHERE id = ? AND status = 'active' AND updated_at = ?""",
+                        (
+                            challenger.id,
+                            now,
+                            _today_iso(),
+                            review.reason,
+                            _validate_replacement_kind(review.replacement_kind),
+                            now,
+                            incumbent.id,
+                            incumbent.updated_at.isoformat(),
+                        ),
+                        participant=incumbent.id,
+                    )
+                    await self.db.execute(
+                        "DELETE FROM memories_fts WHERE memory_id IN (?, ?)",
+                        (incumbent.id, challenger.id),
+                    )
+                    await self._rebuild_memory_fts_unlocked(
+                        challenger.id,
+                        search_visible_statuses=set(allowed_search_statuses()),
+                    )
+                    related_reason = "review_redundant"
+                else:
+                    await guarded_status_update(
+                        """UPDATE memories SET
+                               status = 'retired', retirement_reason = 'rejected',
+                               retired_at = ?, updated_at = ?
+                             WHERE id = ? AND status = 'pending_review' AND updated_at = ?""",
+                        (now, now, challenger.id, challenger.updated_at.isoformat()),
+                        participant=challenger.id,
+                    )
+                    await self.db.execute(
+                        "DELETE FROM memories_fts WHERE memory_id = ?",
+                        (challenger.id,),
+                    )
+                    related_reason = "rejected"
+
+                for related in sorted(related_challengers, key=lambda item: item.id):
+                    if related.updated_at is None:
+                        raise ValueError("related Review participant requires a persisted version")
+                    await guarded_status_update(
+                        """UPDATE memories SET
+                               status = 'retired', retirement_reason = ?,
+                               retired_at = ?, updated_at = ?
+                             WHERE id = ? AND status = 'pending_review' AND updated_at = ?""",
+                        (
+                            related_reason,
+                            now,
+                            now,
+                            related.id,
+                            related.updated_at.isoformat(),
+                        ),
+                        participant=related.id,
+                    )
+                    await self.db.execute(
+                        "DELETE FROM memories_fts WHERE memory_id = ?",
+                        (related.id,),
+                    )
+
+                vector_operations = (
+                    (
+                        (incumbent.id, LifecycleVectorOperation.DELETE),
+                        (challenger.id, LifecycleVectorOperation.UPSERT),
+                        *((related.id, LifecycleVectorOperation.DELETE) for related in related_challengers),
+                    )
+                    if status == "approved"
+                    else (
+                        (challenger.id, LifecycleVectorOperation.DELETE),
+                        *((related.id, LifecycleVectorOperation.DELETE) for related in related_challengers),
+                    )
+                )
+                for memory_id, operation in vector_operations:
+                    await self._enqueue_review_vector_task_unlocked(
+                        review.id,
+                        memory_id,
+                        operation,
+                        now=now,
+                    )
+
+                resolution = await self.db.execute(
+                    """UPDATE memory_reviews
+                          SET status = ?, reviewer = ?, review_note = ?, resolved_at = ?
+                        WHERE id = ? AND status = 'pending'""",
+                    (status, reviewer, review_note, now, review.id),
+                )
+                if resolution.rowcount != 1:
+                    raise ValueError("memory review is not pending")
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     def _row_to_review(self, row) -> MemoryReview:
         d = dict(row)

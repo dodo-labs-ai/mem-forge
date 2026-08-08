@@ -17,14 +17,21 @@ import {
   type ReviewCueExcerpt,
 } from "@/views/review/reviewQueueCue";
 
-function useReviewQueue(page: number) {
+type ReviewQueueFilter = "all" | "lifecycle" | "cross_source_conflict" | "supersede";
+
+function useReviewQueue(page: number, filter: ReviewQueueFilter) {
   return useQuery<MemoryReviewListResponse>({
-    queryKey: ["memory-reviews", "open", "queue", page],
+    queryKey: ["memory-reviews", "open", "queue", page, filter],
     queryFn: () =>
       resourceClient
         .get("/memory-reviews", {
           params: {
             status: "open",
+            origin: filter === "lifecycle" ? "lifecycle" : undefined,
+            kind:
+              filter === "cross_source_conflict" || filter === "supersede"
+                ? filter
+                : undefined,
             limit: REVIEW_QUEUE_PAGE_SIZE,
             offset: page * REVIEW_QUEUE_PAGE_SIZE,
           },
@@ -59,7 +66,14 @@ export function ReviewQueuePage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const page = pageFromSearchParams(searchParams);
-  const queueQuery = useReviewQueue(page);
+  const rawFilter = searchParams.get("filter");
+  const filter: ReviewQueueFilter =
+    rawFilter === "lifecycle" ||
+    rawFilter === "cross_source_conflict" ||
+    rawFilter === "supersede"
+      ? rawFilter
+      : "all";
+  const queueQuery = useReviewQueue(page, filter);
   const reviews = queueQuery.data?.data ?? [];
   const total = queueQuery.data?.total ?? 0;
 
@@ -73,16 +87,40 @@ export function ReviewQueuePage() {
     setSearchParams(next);
   };
 
+  const setFilter = (nextFilter: ReviewQueueFilter) => {
+    const next = new URLSearchParams(searchParams);
+    next.delete("page");
+    if (nextFilter === "all") next.delete("filter");
+    else next.set("filter", nextFilter);
+    setSearchParams(next);
+  };
+
   return (
     <div className="space-y-4">
       <PageHeader
         title="Review queue"
-        description="Decide which memory state MemForge should use. Open a Review for evidence and technical details."
+        description="Resolve lifecycle proposals and conflict findings. Open a Review for evidence, consequences, and technical details."
         actions={
-          <Button type="button" variant="outline" onClick={() => queueQuery.refetch()}>
-            <RefreshCw className="size-4" />
-            Refresh list
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="sr-only" htmlFor="review-queue-filter">
+              Filter reviews
+            </label>
+            <select
+              id="review-queue-filter"
+              value={filter}
+              onChange={(event) => setFilter(event.target.value as ReviewQueueFilter)}
+              className="h-9 rounded-md border bg-background px-3 text-sm"
+            >
+              <option value="all">All decisions</option>
+              <option value="lifecycle">Source lifecycle</option>
+              <option value="cross_source_conflict">Cross-source conflicts</option>
+              <option value="supersede">Memory updates</option>
+            </select>
+            <Button type="button" variant="outline" onClick={() => queueQuery.refetch()}>
+              <RefreshCw className="size-4" />
+              Refresh list
+            </Button>
+          </div>
         }
       />
 
