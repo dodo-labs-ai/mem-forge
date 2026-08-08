@@ -210,7 +210,11 @@ class TestSupportAwareRetirement:
             run.run_id,
             worker_id="test-worker",
             lease_attempt_count=leased.lease_attempt_count,
-            final_state=SyncState(source=source_id, last_sync_status="success"),
+            final_state=SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            ),
         )
 
         await db.delete_source_cascade(source_id)

@@ -670,6 +670,7 @@ class GeneSyncOrchestrator:
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
+        record_terminal_result: bool = True,
     ) -> SyncState:
         """Run the full sync pipeline for a gene.
 
@@ -702,6 +703,10 @@ class GeneSyncOrchestrator:
             lifecycle reset, so it may remove legacy documents that predate
             persisted Source Unit lineage when complete discovery proves their
             absence.
+        record_terminal_result:
+            Persist the terminal SyncState and history here. Durable workers
+            disable this so their lease-fenced completion transaction owns the
+            complete terminal read model.
 
         Returns
         -------
@@ -1304,32 +1309,13 @@ class GeneSyncOrchestrator:
             failed_docs=failed_docs,
         )
 
-        if not non_mutating_run:
-            try:
-                await self.db.upsert_sync_state(sync_state)
-            except Exception as e:
-                logger.error("Failed to upsert sync state: %s", e)
-
-        # Record in sync_history for audit trail
-        if not non_mutating_run:
-            try:
-                await self.db.insert_sync_history(
-                    source=source_id,
-                    status=status,
-                    docs_processed=docs_processed,
-                    docs_updated=docs_updated,
-                    docs_failed=docs_failed,
-                    memories_extracted=memories_extracted,
-                    error_message=error_message,
-                    failed_docs=[{"doc_id": fd.doc_id, "title": fd.title, "error": fd.error} for fd in failed_docs]
-                    if failed_docs
-                    else None,
-                    started_at=started_at.isoformat(),
-                    finished_at=finished_at.isoformat(),
-                    run_id=run_id,
-                )
-            except Exception as e:
-                logger.error("Failed to insert sync history: %s", e)
+        if record_terminal_result and not non_mutating_run:
+            await self.db.record_source_sync_result(
+                sync_state,
+                started_at=started_at,
+                finished_at=finished_at,
+                run_id=run_id,
+            )
 
         if progress_callback:
             progress_callback(
