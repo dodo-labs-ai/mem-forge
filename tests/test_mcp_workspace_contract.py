@@ -6,10 +6,11 @@ from memforge import plugin_mcp_proxy as proxy
 def test_mcp_exposes_workspace_directory_and_optional_workspace_selector() -> None:
     tools = {tool["name"]: tool for tool in proxy.TOOLS}
 
-    assert len(tools) == 15
+    assert len(tools) == 16
     assert "list_workspaces" in tools
     assert "validate_memory_review_decisions" in tools
     assert "apply_memory_review_decisions" in tools
+    assert "refresh_memory_review" in tools
     assert tools["list_workspaces"]["inputSchema"]["properties"] == {}
     assert tools["set_default_workspace"]["inputSchema"] == {
         "type": "object",

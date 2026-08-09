@@ -492,7 +492,9 @@ def build_lifecycle_plan(
                 memory_id: support_set_hashes[memory_id] for memory_id in (*incumbent_ids, *sorted(attached_target_ids))
             },
             memory_versions={
-                memory_id: _memory_version(incumbents.get(memory_id) or corroboration_targets_by_id[memory_id])
+                memory_id: lifecycle_memory_version(
+                    incumbents.get(memory_id) or corroboration_targets_by_id[memory_id]
+                )
                 for memory_id in (*incumbent_ids, *sorted(attached_target_ids))
             },
         ),
@@ -631,7 +633,9 @@ def _new_memory_id(scope_id: str, raw: RawMemory) -> str:
     return _stable_id("mem", scope_id, raw.memory_type, raw.content.strip())
 
 
-def _memory_version(memory: Memory) -> str:
+def lifecycle_memory_version(memory: Memory) -> str:
+    """Return the adapter-neutral stale-guard identity for one Memory."""
+
     updated_at = memory.updated_at.isoformat() if memory.updated_at is not None else ""
     return _stable_id(
         "memory-version",

@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.50"
+SERVER_VERSION = "0.1.51"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Repository context is optional. MemForge uses negotiated request-scoped host context when "
@@ -714,6 +714,27 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "refresh_memory_review",
+        "description": (
+            "Reissue one stale Lifecycle Review against the current Memory and Support snapshot. "
+            "This preserves the stale Review as audit history and creates a new pending Review; "
+            "it does not approve, reject, or apply the proposed lifecycle changes."
+        ),
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "review_id": {"type": "string", "description": "The stale Lifecycle Review ID."},
+                "expected_fingerprint": {
+                    "type": "string",
+                    "description": "Current decision_fingerprint from the stale Review response.",
+                },
+            },
+            "required": ["review_id", "expected_fingerprint"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "resolve_memory_review",
         "description": (
             "Resolve one Review after explicit user confirmation using the exact action shown "
@@ -1125,6 +1146,22 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             "GET",
             f"/memory-reviews/{quote(review_id, safe='')}",
             None,
+            target=call_context.target,
+            workspace_id=workspace_id,
+        )
+    if name == "refresh_memory_review":
+        unknown = sorted(set(args) - {"review_id", "expected_fingerprint"})
+        if unknown:
+            return {"error": "Unsupported refresh_memory_review parameter(s): " + ", ".join(unknown)}
+        try:
+            review_id = _required_string_arg(args, "review_id")
+            expected_fingerprint = _required_string_arg(args, "expected_fingerprint")
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return _http_json(
+            "POST",
+            f"/memory-reviews/{quote(review_id, safe='')}/refresh",
+            {"expected_fingerprint": expected_fingerprint},
             target=call_context.target,
             workspace_id=workspace_id,
         )
