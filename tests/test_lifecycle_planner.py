@@ -12,8 +12,15 @@ from memforge.memory.lifecycle_plan import (
     ReconciliationScope,
     lifecycle_plan_to_payload,
 )
-from memforge.memory.lifecycle_planner import NewMemoryDefaults, build_lifecycle_plan
-from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
+from memforge.memory.lifecycle_planner import (
+    NewMemoryDefaults,
+    build_lifecycle_plan,
+    lifecycle_memory_version,
+)
+from memforge.memory.lifecycle_review import (
+    build_lifecycle_review_approval_plan,
+    build_lifecycle_review_refresh_plan,
+)
 from memforge.memory.relation_discovery_contract import relation_discovery_request_id
 from memforge.models import Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
 
@@ -246,6 +253,99 @@ def test_pending_review_without_activation_does_not_enqueue_relation_discovery()
     )
 
     assert approval.relation_discovery_requests == ()
+
+
+def test_stale_review_refresh_creates_only_a_new_pending_decision() -> None:
+    original = _build(
+        gate=LifecycleGateState.ENABLED,
+        all_support=("eref-old", "eref-other-source"),
+    )
+    mutation = original.mutations[0]
+    review = LifecycleReview(
+        id=str(mutation.payload["review_id"]),
+        lifecycle_plan_id=original.id,
+        incumbent_memory_id=mutation.memory_id,
+        status=LifecycleReviewStatus.STALE,
+        staged_evidence=mutation.payload["staged_evidence"],
+        reason=str(mutation.payload["reason"]),
+        source_id="src-1",
+    )
+
+    refreshed, refreshed_review_id = build_lifecycle_review_refresh_plan(
+        review,
+        lifecycle_plan_to_payload(original),
+        gate_state=LifecycleGateState.ENABLED,
+        current_support_set_hash="current-support-hash",
+        current_memory_version=lifecycle_memory_version(_memory()),
+    )
+    retried, retried_review_id = build_lifecycle_review_refresh_plan(
+        review,
+        lifecycle_plan_to_payload(original),
+        gate_state=LifecycleGateState.ENABLED,
+        current_support_set_hash="current-support-hash",
+        current_memory_version=lifecycle_memory_version(_memory()),
+    )
+
+    assert retried == refreshed
+    assert retried_review_id == refreshed_review_id
+    assert refreshed.id.startswith("lifecycle-review-refresh-")
+    assert refreshed.coverage_proof.incumbent_decisions[0].disposition.value == "review"
+    assert refreshed.stale_guard.support_set_hashes == {"mem-old": "current-support-hash"}
+    assert [item.mutation_type for item in refreshed.mutations] == [
+        LifecycleMutationType.CREATE_REVIEW,
+    ]
+    [create_review] = refreshed.mutations
+    assert create_review.payload["review_id"] == refreshed_review_id
+    assert create_review.payload["staged_evidence"]["refreshed_from_review_id"] == review.id
+
+
+def test_refresh_rejects_a_non_stale_lifecycle_review() -> None:
+    original = _build(
+        gate=LifecycleGateState.ENABLED,
+        all_support=("eref-old", "eref-other-source"),
+    )
+    mutation = original.mutations[0]
+    review = LifecycleReview(
+        id=str(mutation.payload["review_id"]),
+        lifecycle_plan_id=original.id,
+        incumbent_memory_id=mutation.memory_id,
+        status=LifecycleReviewStatus.PENDING,
+        staged_evidence=mutation.payload["staged_evidence"],
+        reason=str(mutation.payload["reason"]),
+        source_id="src-1",
+    )
+
+    with pytest.raises(ValueError, match="only a stale lifecycle review"):
+        build_lifecycle_review_refresh_plan(
+            review,
+            lifecycle_plan_to_payload(original),
+            gate_state=LifecycleGateState.ENABLED,
+            current_support_set_hash="current-support-hash",
+            current_memory_version=lifecycle_memory_version(_memory()),
+        )
+
+
+def test_refresh_rejects_a_terminal_proposal_that_needs_replanning() -> None:
+    original = _build(gate=LifecycleGateState.GATED)
+    mutation = original.mutations[0]
+    review = LifecycleReview(
+        id=str(mutation.payload["review_id"]),
+        lifecycle_plan_id=original.id,
+        incumbent_memory_id=mutation.memory_id,
+        status=LifecycleReviewStatus.STALE,
+        staged_evidence=mutation.payload["staged_evidence"],
+        reason=str(mutation.payload["reason"]),
+        source_id="src-1",
+    )
+
+    with pytest.raises(ValueError, match="requires source replanning"):
+        build_lifecycle_review_refresh_plan(
+            review,
+            lifecycle_plan_to_payload(original),
+            gate_state=LifecycleGateState.ENABLED,
+            current_support_set_hash="changed-support-hash",
+            current_memory_version=lifecycle_memory_version(_memory()),
+        )
 
 
 def test_enabled_local_replacement_is_create_attach_remove_supersede() -> None:

@@ -35,9 +35,17 @@ from memforge.memory.lifecycle_plan import (
     LifecycleReviewStatus,
     ReconciliationScope,
     StaleGuard,
+    lifecycle_plan_to_payload,
 )
-from memforge.memory.lifecycle_planner import NewMemoryDefaults, build_lifecycle_plan
-from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
+from memforge.memory.lifecycle_planner import (
+    NewMemoryDefaults,
+    build_lifecycle_plan,
+    lifecycle_memory_version,
+)
+from memforge.memory.lifecycle_review import (
+    build_lifecycle_review_approval_plan,
+    build_lifecycle_review_refresh_plan,
+)
 from memforge.genes.local_markdown_gene import LocalMarkdownGene
 from memforge.memory.cutover import (
     list_agent_session_lifecycle_migration_candidates,
@@ -1564,6 +1572,100 @@ async def test_gated_review_approval_applies_proposal_and_resolves_review_atomic
     assert retired is not None and retired.status == "retired"
     tasks = await db.list_lifecycle_vector_tasks(source_id="src-1")
     assert {(task.memory_id, task.operation.value) for task in tasks} == {(incumbent.id, "delete")}
+
+
+@pytest.mark.asyncio
+async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
+    db: Database,
+) -> None:
+    source_reference = await _persist_exact_support_and_provenance(db)
+    _, other_reference = await _attach_overlapping_source_support(
+        db,
+        plan_id="plan-review-refresh-other-source",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    incumbent = await db.get_memory("mem-legacy")
+    assert incumbent is not None
+    support_state = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
+    original = build_lifecycle_plan(
+        plan_id="plan-review-refresh-original",
+        scope=ReconciliationScope(
+            id="scope-review-refresh-original",
+            source_id="src-1",
+            source_unit_id="unit-page-1",
+            base_unit_revision_id="unitrev-page-1-v1",
+            target_unit_revision_id="unitrev-page-1-v2",
+        ),
+        gate_state=LifecycleGateState.ENABLED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.DELETE,
+                memory_id=incumbent.id,
+                reason="source no longer supports claim",
+                flag_for_review=True,
+            ),
+        ),
+        incumbents={incumbent.id: incumbent},
+        source_support_reference_ids={incumbent.id: (source_reference.id or "",)},
+        all_active_support_reference_ids={incumbent.id: support_state.reference_ids},
+        support_set_hashes={incumbent.id: support_state.support_set_hash},
+        observation_revision_ids=("obsrev-page-1-v2",),
+        new_evidence_reference_ids=(),
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key=None,
+            repo_identifier=None,
+            doc_id="legacy-gate-doc",
+            source_type="confluence",
+            access_context_hash="workspace",
+        ),
+    )
+    assert [mutation.mutation_type for mutation in original.mutations] == [
+        LifecycleMutationType.CREATE_REVIEW,
+    ]
+    await db.apply_lifecycle_plan(original)
+    [stale_review] = await db.list_lifecycle_reviews(
+        "src-1",
+        status=LifecycleReviewStatus.PENDING,
+    )
+
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id="support-review-refresh-other-source",
+            memory_id=incumbent.id,
+            evidence_reference_id=other_reference.id or "",
+            source_id="src-2",
+            access_context_hash="workspace-updated",
+        )
+    )
+    await db.resolve_lifecycle_review(stale_review.id, LifecycleReviewStatus.STALE)
+    incumbent = await db.get_memory(incumbent.id)
+    assert incumbent is not None
+    payload = await db.get_lifecycle_plan_payload(original.id)
+    assert payload is not None
+    refreshed_plan, refreshed_review_id = build_lifecycle_review_refresh_plan(
+        await db.get_lifecycle_review(stale_review.id),  # type: ignore[arg-type]
+        payload,
+        gate_state=LifecycleGateState.ENABLED,
+        current_support_set_hash=await db.get_memory_support_set_hash(incumbent.id),
+        current_memory_version=lifecycle_memory_version(incumbent),
+    )
+
+    await db.apply_lifecycle_plan(refreshed_plan)
+    await db.apply_lifecycle_plan(refreshed_plan)
+    refreshed_review = await db.get_lifecycle_review(refreshed_review_id)
+    assert refreshed_review is not None
+    assert refreshed_review.status is LifecycleReviewStatus.PENDING
+    assert (await db.get_lifecycle_review(stale_review.id)).status is LifecycleReviewStatus.STALE  # type: ignore[union-attr]
+
+    approval = build_lifecycle_review_approval_plan(refreshed_review, lifecycle_plan_to_payload(refreshed_plan))
+    await db.apply_lifecycle_plan(approval)
+
+    assert (await db.get_lifecycle_review(refreshed_review_id)).status is LifecycleReviewStatus.APPROVED  # type: ignore[union-attr]
+    remaining = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
+    assert remaining.reference_ids == (other_reference.id,)
+    assert (await db.get_memory(incumbent.id)).status == "active"  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio

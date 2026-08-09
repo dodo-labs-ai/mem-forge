@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from memforge.config import AppConfig
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.lifecycle_plan import LifecycleReviewStatus
+from memforge.memory.lifecycle_planner import lifecycle_memory_version
 from memforge.memory.review_decision import memory_review_decision_fingerprint
 from memforge.memory.review_service import (
     ResolvedReview,
@@ -320,6 +321,59 @@ async def _seed_lifecycle_review(db: Database, *, review_id: str = "review-lifec
             "candidate_supersede_vs_audit_keep",
             now,
         ),
+    )
+    await db.db.commit()
+    return review_id
+
+
+async def _seed_refreshable_stale_lifecycle_review(db: Database) -> str:
+    review_id = await _seed_lifecycle_review(db, review_id="review-lifecycle-stale")
+    incumbent = await db.get_memory("mem-lifecycle-current")
+    assert incumbent is not None
+    support_hash = await db.get_memory_support_set_hash(incumbent.id)
+    payload = await db.get_lifecycle_plan_payload("plan-lifecycle-review")
+    assert payload is not None
+    payload["stale_guard"] = {
+        "observation_revision_ids": [],
+        "support_set_hashes": {incumbent.id: support_hash},
+        "memory_versions": {incumbent.id: lifecycle_memory_version(incumbent)},
+    }
+    staged = {
+        "proposed_disposition": "keep",
+        "replacement_memory_id": None,
+        "candidate": {
+            "content": "The service moves to Team Pfizer.",
+            "memory_type": "fact",
+            "confidence": 0.91,
+        },
+        "proposed_mutations": [
+            {
+                "mutation_type": "refresh_memory_index",
+                "memory_id": incumbent.id,
+                "source_id": "src-lifecycle",
+                "evidence_reference_ids": [],
+                "replacement_memory_id": None,
+                "payload": {},
+            }
+        ],
+    }
+    now = datetime.now(timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO source_units (
+               id, source_id, unit_type, provider_key, locator_json,
+               current_revision_id, updated_at
+           ) VALUES ('unit-jira-1', 'src-lifecycle', 'issue', 'PAY-1', '{}', 'unitrev-2', ?)""",
+        (now,),
+    )
+    await db.db.execute(
+        "UPDATE lifecycle_plans SET payload_json = ? WHERE id = 'plan-lifecycle-review'",
+        (json.dumps(payload),),
+    )
+    await db.db.execute(
+        """UPDATE lifecycle_reviews
+              SET status = 'stale', staged_evidence_json = ?, resolved_at = ?
+            WHERE id = ?""",
+        (json.dumps(staged), now, review_id),
     )
     await db.db.commit()
     return review_id
@@ -689,6 +743,39 @@ class TestUnifiedLifecycleReviewApi:
         assert queue.status_code == 200
         assert queue.json()["total"] == 0
         assert queue.json()["data"] == []
+
+    @pytest.mark.asyncio
+    async def test_stale_lifecycle_review_refresh_is_guarded_and_idempotent(self, db, tmp_path):
+        review_id = await _seed_refreshable_stale_lifecycle_review(db)
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            stale_detail = client.get(f"/api/v1/memory-reviews/{review_id}").json()
+            rejected = client.post(
+                f"/api/v1/memory-reviews/{review_id}/refresh",
+                json={"expected_fingerprint": "review-decision-v1:outdated"},
+            )
+            refreshed = client.post(
+                f"/api/v1/memory-reviews/{review_id}/refresh",
+                json={"expected_fingerprint": stale_detail["decision_fingerprint"]},
+            )
+            replayed = client.post(
+                f"/api/v1/memory-reviews/{review_id}/refresh",
+                json={"expected_fingerprint": stale_detail["decision_fingerprint"]},
+            )
+
+        assert rejected.status_code == 409
+        assert refreshed.status_code == 200
+        assert replayed.status_code == 200
+        assert refreshed.json()["id"] == replayed.json()["id"]
+        assert refreshed.json()["status"] == "pending"
+        assert refreshed.json()["review_origin"] == "lifecycle"
+        old_review = await db.get_lifecycle_review(review_id)
+        assert old_review is not None and old_review.status is LifecycleReviewStatus.STALE
+        new_review = await db.get_lifecycle_review(refreshed.json()["id"])
+        assert new_review is not None
+        assert new_review.staged_evidence["refreshed_from_review_id"] == review_id
 
     @pytest.mark.asyncio
     async def test_queue_pages_one_stable_order_across_memory_and_lifecycle_reviews(

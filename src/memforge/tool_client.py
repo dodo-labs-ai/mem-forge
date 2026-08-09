@@ -584,6 +584,21 @@ class ToolClient:
             return {"error": "review_id is required"}
         return self._resource_json("GET", f"/memory-reviews/{quote(review_id, safe='')}", None)
 
+    def refresh_memory_review(
+        self,
+        review_id: str,
+        *,
+        expected_fingerprint: str,
+    ) -> dict[str, Any]:
+        review_id = review_id.strip()
+        if not review_id:
+            return {"error": "review_id is required"}
+        return self._resource_json(
+            "POST",
+            f"/memory-reviews/{quote(review_id, safe='')}/refresh",
+            {"expected_fingerprint": expected_fingerprint},
+        )
+
     def resolve_memory_review(
         self,
         review_id: str,
