@@ -18,6 +18,7 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
+    MemoryConflictContext,
     MemoryReview,
     MemorySource,
     Project,
@@ -127,9 +128,7 @@ def build_active_memory_support_states(
 
     ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
     grouped: dict[str, list[tuple[str, str, str]]] = {memory_id: [] for memory_id in ids}
-    current_grouped: dict[str, list[tuple[str, str, str]]] = {
-        memory_id: [] for memory_id in ids
-    }
+    current_grouped: dict[str, list[tuple[str, str, str]]] = {memory_id: [] for memory_id in ids}
     for row in sorted(
         rows,
         key=lambda item: (
@@ -149,8 +148,7 @@ def build_active_memory_support_states(
             reference_ids=tuple(reference_id for reference_id, _source_id, _access_hash in state_rows),
             support_set_hash=active_support_rows_hash(state_rows),
             current_reference_ids=tuple(
-                reference_id
-                for reference_id, _source_id, _access_hash in current_grouped[memory_id]
+                reference_id for reference_id, _source_id, _access_hash in current_grouped[memory_id]
             ),
             current_support_set_hash=active_support_rows_hash(current_grouped[memory_id]),
         )
@@ -161,9 +159,7 @@ def build_active_memory_support_states(
 def active_support_rows_hash(rows: Sequence[tuple[str, str, str]]) -> str:
     """Hash canonical current Evidence support without adapter-specific drift."""
 
-    return hashlib.sha256(
-        json.dumps(list(rows), separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(list(rows), separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 DEFAULT_ENTITY_LINK_LIMIT = 5
@@ -272,10 +268,16 @@ class RelationalStore(Protocol):
     async def list_memories_by_ids(self, memory_ids: Sequence[str]) -> list[Memory]:
         """Return persisted rows in caller order, regardless of lifecycle status."""
         ...
+
     async def get_memory_source_ids_many(
         self,
         memory_ids: Sequence[str],
     ) -> Mapping[str, tuple[str, ...]]: ...
+    async def list_memory_conflict_contexts(
+        self,
+        memory_ids: Sequence[str],
+        scope: AccessScope,
+    ) -> Mapping[str, tuple[MemoryConflictContext, ...]]: ...
     async def get_memory_entity_ids(self, memory_id: str) -> list[int]: ...
     async def get_current_relation_evidence_unit(
         self,
@@ -288,6 +290,7 @@ class RelationalStore(Protocol):
     async def list_active_memories(self, memory_ids: Sequence[str]) -> list[Memory]:
         """Return active rows in caller order, chunked by each adapter's bind limit."""
         ...
+
     async def list_active_candidate_memories(
         self,
         memory_ids: Sequence[str],
@@ -584,6 +587,7 @@ class RelationalStore(Protocol):
     ) -> Mapping[str, tuple[ActiveSupportEvidence, ...]]:
         """Map every requested id to active Evidence using adapter-bounded chunks."""
         ...
+
     async def get_active_memory_support_observation_ids_many(
         self,
         memory_ids: Sequence[str],

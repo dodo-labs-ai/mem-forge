@@ -16,6 +16,7 @@ from memforge.memory.relation_discovery_contract import (
 from memforge.models import (
     DocumentRecord,
     Memory,
+    MemoryReview,
     MemorySource,
     Visibility,
     content_hash,
@@ -204,10 +205,7 @@ async def test_sqlite_active_memories_chunk_large_bind_sets(
                id, memory_type, content, content_hash, visibility,
                confidence, status, created_at, updated_at
            ) VALUES (?, 'fact', ?, ?, 'workspace', 0.9, 'active', ?, ?)""",
-        tuple(
-            (memory_id, f"content for {memory_id}", f"hash-{memory_id}", now, now)
-            for memory_id in memory_ids
-        ),
+        tuple((memory_id, f"content for {memory_id}", f"hash-{memory_id}", now, now) for memory_id in memory_ids),
     )
     await db.db.commit()
     calls = 0
@@ -264,21 +262,14 @@ async def test_sqlite_active_support_observations_are_bounded(
 
     async def execute_fetchall(sql, parameters=None):
         nonlocal calls
-        if (
-            "FROM memory_support_assertions msa" in sql
-            and "JOIN evidence_references supported_er" in sql
-        ):
+        if "FROM memory_support_assertions msa" in sql and "JOIN evidence_references supported_er" in sql:
             calls += 1
         return await original(sql, parameters)
 
     monkeypatch.setattr(db.db, "execute_fetchall", execute_fetchall)
-    memory_ids = tuple(
-        f"mem-bundle-{index}" for index in range(501)
-    )
+    memory_ids = tuple(f"mem-bundle-{index}" for index in range(501))
 
-    observations = await SqliteRelationalStore(
-        db
-    ).get_active_memory_support_observation_ids_many(
+    observations = await SqliteRelationalStore(db).get_active_memory_support_observation_ids_many(
         memory_ids,
         source_id="src-1",
     )
@@ -399,6 +390,131 @@ async def db(tmp_path):
 @pytest.mark.asyncio
 async def test_satisfies_relational_store_protocol(db):
     assert isinstance(SqliteRelationalStore(db), RelationalStore)
+
+
+@pytest.mark.asyncio
+async def test_conflict_contexts_derive_approved_and_rejected_review_dispositions(db):
+    incumbent = _memory("mem-conflict-incumbent")
+    approved_counterpart = _memory("mem-conflict-approved")
+    rejected_counterpart = _memory("mem-conflict-rejected")
+    for memory in (incumbent, approved_counterpart, rejected_counterpart):
+        await db.insert_memory(memory)
+    await db.insert_memory_review(
+        MemoryReview(
+            id="review-conflict-approved",
+            kind="cross_source_conflict",
+            status="approved",
+            incumbent_memory_id=incumbent.id,
+            challenger_memory_id=approved_counterpart.id,
+            reason="The claims assert incompatible payroll deadlines.",
+            review_note="Confirmed after comparing both source policies.",
+            reviewer="reviewer-1",
+            resolved_at=datetime.now(timezone.utc),
+        )
+    )
+    await db.insert_memory_review(
+        MemoryReview(
+            id="review-conflict-rejected",
+            kind="cross_source_conflict",
+            status="rejected",
+            incumbent_memory_id=incumbent.id,
+            challenger_memory_id=rejected_counterpart.id,
+            reason="The claims appeared inconsistent before scope review.",
+            review_note="Different payroll areas; not a conflict.",
+            reviewer="reviewer-2",
+            resolved_at=datetime.now(timezone.utc),
+        )
+    )
+
+    contexts = await SqliteRelationalStore(db).list_memory_conflict_contexts(
+        (incumbent.id, approved_counterpart.id),
+        AccessScope(
+            user_id=LOCAL_DEV_USER_ID,
+            include_private=False,
+            allowed_statuses=("active",),
+            active_project=None,
+            scope_mode="workspace",
+        ),
+    )
+
+    assert [(item.review_id, item.disposition) for item in contexts[incumbent.id]] == [
+        ("review-conflict-rejected", "dismissed"),
+        ("review-conflict-approved", "confirmed"),
+    ]
+    [reverse] = contexts[approved_counterpart.id]
+    assert reverse.counterpart_memory_id == incumbent.id
+    assert reverse.counterpart_summary == incumbent.content
+    assert reverse.disposition == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_conflict_contexts_do_not_expose_an_invisible_counterpart(db):
+    visible = _memory("mem-conflict-visible")
+    private = _memory(
+        "mem-conflict-private",
+        visibility=Visibility.PRIVATE.value,
+        owner_user_id="another-user",
+    )
+    await db.insert_memory(visible)
+    await db.insert_memory(private)
+    await db.insert_memory_review(
+        MemoryReview(
+            id="review-conflict-private",
+            kind="cross_source_conflict",
+            status="approved",
+            incumbent_memory_id=visible.id,
+            challenger_memory_id=private.id,
+            reason="Private counterpart must not leak.",
+        )
+    )
+
+    contexts = await SqliteRelationalStore(db).list_memory_conflict_contexts(
+        (visible.id,),
+        AccessScope(
+            user_id=LOCAL_DEV_USER_ID,
+            include_private=True,
+            allowed_statuses=("active",),
+            active_project=None,
+            scope_mode="workspace",
+        ),
+    )
+
+    assert contexts == {visible.id: ()}
+
+
+@pytest.mark.asyncio
+async def test_conflict_contexts_derive_dynamic_staleness_without_mutating_review(db):
+    incumbent = _memory("mem-conflict-stale-a")
+    counterpart = _memory("mem-conflict-stale-b")
+    await db.insert_memory(incumbent)
+    await db.insert_memory(counterpart)
+    await db.insert_memory_review(
+        MemoryReview(
+            id="review-conflict-stale",
+            kind="cross_source_conflict",
+            status="pending",
+            incumbent_memory_id=incumbent.id,
+            challenger_memory_id=counterpart.id,
+            expected_incumbent_updated_at="2000-01-01T00:00:00+00:00",
+            expected_challenger_updated_at=counterpart.updated_at.isoformat(),
+        )
+    )
+
+    contexts = await SqliteRelationalStore(db).list_memory_conflict_contexts(
+        (incumbent.id,),
+        AccessScope(
+            user_id=LOCAL_DEV_USER_ID,
+            include_private=False,
+            allowed_statuses=("active",),
+            active_project=None,
+            scope_mode="workspace",
+        ),
+    )
+
+    [context] = contexts[incumbent.id]
+    assert context.review_status == "stale"
+    assert context.disposition == "stale"
+    assert (await db.get_memory_review("review-conflict-stale")).status == "pending"
 
 
 @pytest.mark.asyncio

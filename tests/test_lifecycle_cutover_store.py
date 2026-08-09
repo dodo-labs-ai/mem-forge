@@ -942,6 +942,179 @@ async def _attach_overlapping_source_support(
     return unit, reference
 
 
+async def _attach_same_source_incarnation_support(
+    db: Database,
+) -> tuple[EvidenceReference, EvidenceReference]:
+    """Attach two active Support edges sharing one Memory/source/document.
+
+    Source Unit identity can be reincarnated for a reused document locator, so
+    the doc-level ``memory_sources`` row must remain until both Unit-owned
+    Support edges are gone.
+    """
+
+    first_reference = await _persist_exact_support_and_provenance(db)
+    original = _projection()
+    second_unit = replace(
+        original.source_units[0],
+        id="unit-page-1-incarnation-2",
+        provider_key="page-1-incarnation-2",
+    )
+    second_observation = replace(
+        original.observations[0],
+        id="obs-page-1-body-incarnation-2",
+        source_unit_id=second_unit.id,
+        provider_key="page-1-incarnation-2:body",
+    )
+    second_observation_revision = replace(
+        original.observation_revisions[0],
+        id="obsrev-page-1-v2-incarnation-2",
+        observation_id=second_observation.id,
+    )
+    second_unit_revision = replace(
+        original.source_unit_revisions[0],
+        id="unitrev-page-1-v2-incarnation-2",
+        source_unit_id=second_unit.id,
+        observation_revision_ids=(second_observation_revision.id,),
+    )
+    await db.record_source_projection(
+        replace(
+            original,
+            run_id="projection-run-incarnation-2",
+            observations=(second_observation,),
+            observation_revisions=(second_observation_revision,),
+            source_units=(second_unit,),
+            source_unit_revisions=(second_unit_revision,),
+            relations=(),
+            deltas=(),
+        )
+    )
+    second_evidence_unit = replace(
+        _unit(),
+        id="eu-page-1-incarnation-2",
+        doc_revision_id=second_observation_revision.id,
+        source_lineage_id=second_unit.id,
+    )
+    await db.upsert_evidence_unit(second_evidence_unit)
+    second_reference = EvidenceReference(
+        role=EvidenceRole.PRIMARY,
+        anchor=SourceAnchor(
+            kind=AnchorKind.WHOLE_OBSERVATION,
+            observation_id=second_observation.id,
+            observation_revision_id=second_observation_revision.id,
+        ),
+        evidence_unit_id=second_evidence_unit.id,
+    )
+    second_reference = replace(
+        second_reference,
+        id=evidence_reference_id_for(second_evidence_unit.id, second_reference),
+    )
+    await db.record_evidence_references(second_evidence_unit.id, (second_reference,))
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id="support-page-1-incarnation-2",
+            memory_id="mem-legacy",
+            evidence_reference_id=second_reference.id or "",
+            source_id="src-1",
+            access_context_hash="workspace",
+        )
+    )
+    await db.enable_lifecycle_gate("src-1")
+    return first_reference, second_reference
+
+
+def _remove_support_plan(
+    *,
+    plan_id: str,
+    scope_source_unit_id: str,
+    target_unit_revision_id: str,
+    observation_revision_id: str,
+    reference_id: str,
+    support_hash: str,
+) -> LifecyclePlan:
+    return LifecyclePlan(
+        id=plan_id,
+        scope=ReconciliationScope(
+            id=f"scope-{plan_id}",
+            source_id="src-1",
+            source_unit_id=scope_source_unit_id,
+            base_unit_revision_id=None,
+            target_unit_revision_id=target_unit_revision_id,
+        ),
+        gate_state=LifecycleGateState.ENABLED,
+        coverage_proof=CoverageProof(
+            mandatory_incumbent_ids=("mem-legacy",),
+            incumbent_decisions=(
+                IncumbentDecision(
+                    "mem-legacy",
+                    IncumbentDisposition.REMOVE_SUPPORT,
+                    "one Source Unit no longer supports the claim",
+                ),
+            ),
+            batch_ids=(f"batch-{plan_id}",),
+            completed_batch_ids=(f"batch-{plan_id}",),
+        ),
+        stale_guard=StaleGuard(
+            observation_revision_ids=(observation_revision_id,),
+            support_set_hashes={"mem-legacy": support_hash},
+        ),
+        mutations=(
+            LifecycleMutation(
+                LifecycleMutationType.REMOVE_SUPPORT,
+                memory_id="mem-legacy",
+                source_id="src-1",
+                evidence_reference_ids=(reference_id,),
+                payload={"document_id": "legacy-gate-doc"},
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_remove_support_preserves_shared_same_source_document_projection(
+    db: Database,
+) -> None:
+    first_reference, second_reference = await _attach_same_source_incarnation_support(db)
+    plan = _remove_support_plan(
+        plan_id="plan-remove-first-incarnation",
+        scope_source_unit_id="unit-page-1",
+        target_unit_revision_id="unitrev-page-1-v2",
+        observation_revision_id="obsrev-page-1-v2",
+        reference_id=first_reference.id or "",
+        support_hash=await db.get_memory_support_set_hash("mem-legacy"),
+    )
+
+    await db.apply_lifecycle_plan(plan)
+
+    assert await db.get_active_memory_support_reference_ids("mem-legacy") == (second_reference.id,)
+    assert [(source.source_id, source.doc_id) for source in await db.get_memory_sources("mem-legacy")] == [
+        ("src-1", "legacy-gate-doc")
+    ]
+    assert await db.count_active_supported_memories_without_source_provenance("src-1") == 0
+
+
+@pytest.mark.asyncio
+async def test_remove_support_rejects_reference_owned_by_another_source_unit(
+    db: Database,
+) -> None:
+    first_reference, second_reference = await _attach_same_source_incarnation_support(db)
+    plan = _remove_support_plan(
+        plan_id="plan-cross-unit-remove",
+        scope_source_unit_id="unit-page-1",
+        target_unit_revision_id="unitrev-page-1-v2",
+        observation_revision_id="obsrev-page-1-v2",
+        reference_id=second_reference.id or "",
+        support_hash=await db.get_memory_support_set_hash("mem-legacy"),
+    )
+
+    with pytest.raises(ValueError, match="another Source Unit"):
+        await db.apply_lifecycle_plan(plan)
+
+    assert set(await db.get_active_memory_support_reference_ids("mem-legacy")) == {
+        first_reference.id,
+        second_reference.id,
+    }
+
+
 @pytest.mark.asyncio
 async def test_overlapping_configured_sources_keep_independent_support_projection(
     db: Database,
@@ -1043,6 +1216,53 @@ async def test_remove_memory_source_removes_only_the_named_configured_source(
         ("mem-legacy", "legacy-gate-doc"),
     )
     assert [row["source_id"] for row in metadata_rows] == ["src-1"]
+
+
+@pytest.mark.asyncio
+async def test_remove_memory_source_fails_closed_when_other_support_lacks_projection(
+    db: Database,
+) -> None:
+    _, other_reference = await _attach_overlapping_source_support(
+        db,
+        plan_id="plan-overlapping-drift",
+    )
+    await db.db.execute(
+        "DELETE FROM memory_sources WHERE memory_id = ? AND source_id = ?",
+        ("mem-legacy", "src-2"),
+    )
+    await db.db.commit()
+
+    with pytest.raises(ValueError, match="active support lacks source provenance"):
+        await db.remove_memory_source(
+            "mem-legacy",
+            "legacy-gate-doc",
+            source_id="src-1",
+        )
+
+    stored = await db.get_memory("mem-legacy")
+    assert stored is not None
+    assert stored.status == "active"
+    support_ids = set(await db.get_active_memory_support_reference_ids("mem-legacy"))
+    assert other_reference.id in support_ids
+    assert len(support_ids) == 2
+    assert [(source.source_id, source.doc_id) for source in await db.get_memory_sources("mem-legacy")] == [
+        ("src-1", "legacy-gate-doc")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remove_memory_source_is_noop_for_missing_memory(db: Database) -> None:
+    retired = await db.remove_memory_source(
+        "mem-missing",
+        "missing-doc",
+        source_id="src-1",
+    )
+
+    assert retired is False
+    async with db.db.execute(
+        "SELECT COUNT(*) FROM lifecycle_plans WHERE reconciliation_scope_id = 'direct_support_removal'"
+    ) as cursor:
+        assert int((await cursor.fetchone())[0]) == 0
 
 
 @pytest.mark.asyncio
@@ -1656,9 +1876,7 @@ async def test_backfill_single_observation_without_exact_excerpt_does_not_copy_r
             ),
         ),
     )
-    await db.record_source_projection(
-        replace(projection, run_id="projection-run-limited-backfill")
-    )
+    await db.record_source_projection(replace(projection, run_id="projection-run-limited-backfill"))
 
     result = await run_source_lifecycle_backfill(db, "src-1")
 

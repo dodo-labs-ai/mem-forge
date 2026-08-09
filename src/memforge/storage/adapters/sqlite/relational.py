@@ -43,6 +43,7 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
+    MemoryConflictContext,
     MemoryReview,
     MemorySource,
     Project,
@@ -426,6 +427,13 @@ class SqliteRelationalStore:
         memory_ids: Sequence[str],
     ) -> Mapping[str, tuple[str, ...]]:
         return await self._db.get_memory_source_ids_many(memory_ids)
+
+    async def list_memory_conflict_contexts(
+        self,
+        memory_ids: Sequence[str],
+        scope: AccessScope,
+    ) -> Mapping[str, tuple[MemoryConflictContext, ...]]:
+        return await self._db.list_memory_conflict_contexts(memory_ids, scope)
 
     async def list_active_memories(
         self,
@@ -994,11 +1002,9 @@ class SqliteRelationalStore:
         *,
         source_id: str,
     ) -> Mapping[str, tuple[str, ...]]:
-        return (
-            await self._db.get_active_memory_support_observation_ids_many(
-                memory_ids,
-                source_id=source_id,
-            )
+        return await self._db.get_active_memory_support_observation_ids_many(
+            memory_ids,
+            source_id=source_id,
         )
 
     async def get_source_unit_support_reference_ids(
@@ -1022,9 +1028,7 @@ class SqliteRelationalStore:
             plan,
             document=document,
             derivation_id=derivation_id,
-            derivation_context_identity_hash=(
-                derivation_context_identity_hash
-            ),
+            derivation_context_identity_hash=(derivation_context_identity_hash),
             expected_source_activity_epoch=expected_source_activity_epoch,
         )
 
@@ -1472,9 +1476,7 @@ class SqliteRelationalStore:
             clauses.append(f"ms.source_id NOT IN ({placeholders})")
             params.extend(disabled_source_ids)
         elif not has_source_row_join:
-            source_visibility_sql, source_visibility_params = _current_source_visibility_condition(
-                disabled_source_ids
-            )
+            source_visibility_sql, source_visibility_params = _current_source_visibility_condition(disabled_source_ids)
             clauses.append(source_visibility_sql)
             params.extend(source_visibility_params)
         join_sql = " ".join(joins)
@@ -1535,9 +1537,7 @@ class SqliteRelationalStore:
                 clauses.append(f"ms.source_id NOT IN ({placeholders})")
                 params.extend(disabled_source_ids)
         else:
-            source_visibility_sql, source_visibility_params = _current_source_visibility_condition(
-                disabled_source_ids
-            )
+            source_visibility_sql, source_visibility_params = _current_source_visibility_condition(disabled_source_ids)
             clauses.append(source_visibility_sql)
             params.extend(source_visibility_params)
 
@@ -1553,10 +1553,7 @@ class SqliteRelationalStore:
         join_sql = " ".join(joins)
         where_sql = " AND ".join(clauses)
         group_sql = "GROUP BY m.id" if joins else ""
-        count_sql = (
-            f"SELECT COUNT(*) FROM (SELECT m.id FROM memories m {join_sql} "
-            f"WHERE {where_sql} {group_sql}) q"
-        )
+        count_sql = f"SELECT COUNT(*) FROM (SELECT m.id FROM memories m {join_sql} WHERE {where_sql} {group_sql}) q"
         async with self._db.db.execute(count_sql, params) as cursor:
             row = await cursor.fetchone()
             total = int(row[0]) if row else 0
@@ -1565,10 +1562,7 @@ class SqliteRelationalStore:
         having_sql = ""
         if after is not None:
             if joins:
-                having_sql = (
-                    f"HAVING ({sort_expression} < ? OR "
-                    f"({sort_expression} = ? AND m.id < ?))"
-                )
+                having_sql = f"HAVING ({sort_expression} < ? OR ({sort_expression} = ? AND m.id < ?))"
                 page_params.extend((after.sort_at.isoformat(), after.sort_at.isoformat(), after.memory_id))
             else:
                 where_sql += " AND (m.updated_at < ? OR (m.updated_at = ? AND m.id < ?))"

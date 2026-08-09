@@ -56,6 +56,7 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
+    MemoryConflictContext,
     MemoryExtractionResult,
     MemoryReview,
     MemoryReviewRelatedChallenger,
@@ -73,6 +74,7 @@ from memforge.models import (
     VIRTUAL_DOCUMENT_SOURCE_IDS,
     Visibility,
     canonicalize_entity_name,
+    conflict_disposition_for_review_status,
     content_hash,
     slugify,
     source_artifact_cleanup_task_id,
@@ -7584,7 +7586,12 @@ class Database:
                 )
                 await self._stage_lifecycle_evidence_unlocked(plan, now=now)
                 for mutation in plan.mutations:
-                    await self._apply_lifecycle_mutation_unlocked(plan.id, mutation, now=now)
+                    await self._apply_lifecycle_mutation_unlocked(
+                        plan.id,
+                        mutation,
+                        source_unit_id=plan.scope.source_unit_id,
+                        now=now,
+                    )
                 for request in plan.relation_discovery_requests:
                     await self._enqueue_relation_discovery_work_unlocked(
                         plan.id,
@@ -7711,7 +7718,13 @@ class Database:
                           so.source_unit_id,
                           er.observation_revision_id,
                           sor.observation_id AS revision_observation_id,
-                          so.current_revision_id
+                          so.current_revision_id,
+                          CASE WHEN EXISTS (
+                              SELECT 1 FROM memory_sources ms
+                               WHERE ms.memory_id = msa.memory_id
+                                 AND ms.source_id = msa.source_id
+                                 AND ms.doc_id = eu.doc_id
+                          ) THEN 1 ELSE 0 END AS has_source_provenance
                    FROM memory_support_assertions msa
                    LEFT JOIN evidence_references er ON er.id = msa.evidence_reference_id
                    LEFT JOIN evidence_units eu ON eu.id = er.evidence_unit_id
@@ -7731,6 +7744,7 @@ class Database:
                 and support["unit_source_id"] == plan.scope.source_id
                 and support["source_lineage_id"] == support["source_unit_id"]
                 and support["revision_observation_id"] == support["observation_id"]
+                and int(support["has_source_provenance"] or 0) == 1
             ]
             current_supports = [
                 support
@@ -7867,7 +7881,14 @@ class Database:
                 ),
             )
 
-    async def _apply_lifecycle_mutation_unlocked(self, plan_id: str, mutation, *, now: str) -> None:
+    async def _apply_lifecycle_mutation_unlocked(
+        self,
+        plan_id: str,
+        mutation,
+        *,
+        source_unit_id: str,
+        now: str,
+    ) -> None:
         mutation_type = mutation.mutation_type
         if mutation_type is LifecycleMutationType.CREATE_MEMORY:
             raw = mutation.payload.get("memory")
@@ -7978,6 +7999,7 @@ class Database:
                         access_context_hash, active, created_at, removed_at
                     ) VALUES (?, ?, ?, ?, ?, 1, ?, NULL)
                     ON CONFLICT(memory_id, evidence_reference_id) DO UPDATE SET
+                        source_id=excluded.source_id,
                         access_context_hash=excluded.access_context_hash,
                         active=1, removed_at=NULL""",
                     (
@@ -8001,6 +8023,21 @@ class Database:
             return
         if mutation_type is LifecycleMutationType.REMOVE_SUPPORT:
             placeholders = ", ".join("?" for _ in mutation.evidence_reference_ids)
+            rows = await self.db.execute_fetchall(
+                f"""SELECT msa.evidence_reference_id, so.source_unit_id, eu.doc_id
+                       FROM memory_support_assertions msa
+                       JOIN evidence_references er ON er.id = msa.evidence_reference_id
+                       JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                       JOIN source_observations so ON so.id = er.observation_id
+                      WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
+                        AND msa.evidence_reference_id IN ({placeholders})""",
+                (mutation.memory_id, mutation.source_id, *mutation.evidence_reference_ids),
+            )
+            if len(rows) != len(set(mutation.evidence_reference_ids)):
+                raise ValueError("remove_support mutation did not match complete active support set")
+            if any(str(row["source_unit_id"]) != source_unit_id for row in rows):
+                raise ValueError("remove_support evidence belongs to another Source Unit")
+            support_doc_ids = {str(row["doc_id"]) for row in rows if row["doc_id"]}
             cursor = await self.db.execute(
                 f"""UPDATE memory_support_assertions
                     SET active = 0, removed_at = ?
@@ -8010,10 +8047,22 @@ class Database:
             )
             if cursor.rowcount != len(set(mutation.evidence_reference_ids)):
                 raise ValueError("remove_support mutation did not match complete active support set")
-            document_id = mutation.payload.get("document_id")
-            if isinstance(document_id, str) and document_id:
+            for document_id in sorted(support_doc_ids):
                 await self.db.execute(
-                    "DELETE FROM memory_sources WHERE memory_id = ? AND doc_id = ? AND source_id = ?",
+                    """DELETE FROM memory_sources
+                        WHERE memory_id = ? AND doc_id = ? AND source_id = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM memory_support_assertions msa
+                              JOIN evidence_references er
+                                ON er.id = msa.evidence_reference_id
+                              JOIN evidence_units eu
+                                ON eu.id = er.evidence_unit_id
+                              WHERE msa.memory_id = memory_sources.memory_id
+                                AND msa.source_id = memory_sources.source_id
+                                AND msa.active = 1
+                                AND eu.source_id = msa.source_id
+                                AND eu.doc_id = memory_sources.doc_id
+                          )""",
                     (mutation.memory_id, document_id, mutation.source_id),
                 )
                 await self._refresh_memory_metadata_fts_unlocked(
@@ -12003,6 +12052,99 @@ class Database:
                         grouped[str(row["memory_id"])].append(source_id)
         return {memory_id: tuple(dict.fromkeys(grouped[memory_id])) for memory_id in ids}
 
+    async def list_memory_conflict_contexts(
+        self,
+        memory_ids: Sequence[str],
+        scope,
+    ) -> Mapping[str, tuple[MemoryConflictContext, ...]]:
+        """Return bounded cross-source Review dispositions visible at both ends."""
+
+        ordered_ids = tuple(dict.fromkeys(memory_ids))
+        if not ordered_ids:
+            return {}
+        contexts: dict[str, list[MemoryConflictContext]] = {
+            memory_id: [] for memory_id in ordered_ids
+        }
+        target_visibility_sql, target_visibility_params = visible_sql(scope, "target")
+        counterpart_visibility_sql, counterpart_visibility_params = visible_sql(scope, "counterpart")
+        for start in range(0, len(ordered_ids), STORAGE_BIND_CHUNK_SIZE):
+            batch = ordered_ids[start : start + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            sql = f"""
+                WITH review_participants AS (
+                    SELECT r.id AS review_id,
+                           r.incumbent_memory_id AS memory_id,
+                           r.challenger_memory_id AS counterpart_memory_id,
+                           r.status AS review_status,
+                           r.reason, r.review_note, r.reviewer,
+                           r.expected_incumbent_updated_at AS expected_memory_updated_at,
+                           r.expected_challenger_updated_at AS expected_counterpart_updated_at,
+                           r.created_at, r.resolved_at
+                      FROM memory_reviews r
+                     WHERE r.kind = 'cross_source_conflict'
+                    UNION ALL
+                    SELECT r.id AS review_id,
+                           r.challenger_memory_id AS memory_id,
+                           r.incumbent_memory_id AS counterpart_memory_id,
+                           r.status AS review_status,
+                           r.reason, r.review_note, r.reviewer,
+                           r.expected_challenger_updated_at AS expected_memory_updated_at,
+                           r.expected_incumbent_updated_at AS expected_counterpart_updated_at,
+                           r.created_at, r.resolved_at
+                      FROM memory_reviews r
+                     WHERE r.kind = 'cross_source_conflict'
+                ), visible_pairs AS (
+                    SELECT rp.review_id, rp.memory_id, rp.counterpart_memory_id,
+                           CASE WHEN rp.review_status = 'pending' AND (
+                               (rp.expected_memory_updated_at IS NOT NULL
+                                AND rp.expected_memory_updated_at <> target.updated_at)
+                               OR (rp.expected_counterpart_updated_at IS NOT NULL
+                                   AND rp.expected_counterpart_updated_at <> counterpart.updated_at)
+                           ) THEN 'stale' ELSE rp.review_status END AS review_status,
+                           rp.reason, rp.review_note, rp.reviewer,
+                           rp.created_at, rp.resolved_at,
+                           counterpart.content AS counterpart_summary
+                      FROM review_participants rp
+                      JOIN memories target ON target.id = rp.memory_id
+                      JOIN memories counterpart ON counterpart.id = rp.counterpart_memory_id
+                     WHERE rp.memory_id IN ({placeholders})
+                       AND {target_visibility_sql}
+                       AND {counterpart_visibility_sql}
+                ), ranked AS (
+                    SELECT visible_pairs.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY memory_id
+                               ORDER BY created_at DESC, review_id
+                           ) AS position
+                      FROM visible_pairs
+                )
+                SELECT * FROM ranked
+                 WHERE position <= 10
+                 ORDER BY memory_id, created_at DESC, review_id
+            """
+            params = [
+                *batch,
+                *target_visibility_params,
+                *counterpart_visibility_params,
+            ]
+            async with self.db.execute(sql, params) as cursor:
+                async for row in cursor:
+                    review_status = str(row["review_status"])
+                    contexts[str(row["memory_id"])].append(
+                        MemoryConflictContext(
+                            review_id=str(row["review_id"]),
+                            counterpart_memory_id=str(row["counterpart_memory_id"]),
+                            counterpart_summary=str(row["counterpart_summary"]),
+                            review_status=review_status,
+                            disposition=conflict_disposition_for_review_status(review_status),
+                            reason=row["reason"],
+                            review_note=row["review_note"],
+                            reviewer=row["reviewer"],
+                            resolved_at=row["resolved_at"],
+                        )
+                    )
+        return {memory_id: tuple(items) for memory_id, items in contexts.items()}
+
     async def get_memory_ids_for_doc(self, doc_id: str) -> list[str]:
         ids: list[str] = []
         async with self.db.execute(
@@ -12670,8 +12812,17 @@ class Database:
         Returns ``True`` when the memory was retired.
         """
         async with self._write_lock:
-            await self.db.execute(
-                """DELETE FROM memory_support_assertions
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                async with self.db.execute(
+                    "SELECT id FROM memories WHERE id = ?",
+                    (memory_id,),
+                ) as cursor:
+                    if await cursor.fetchone() is None:
+                        await self.db.commit()
+                        return False
+                await self.db.execute(
+                    """DELETE FROM memory_support_assertions
                    WHERE memory_id = ? AND source_id = ?
                      AND evidence_reference_id IN (
                          SELECT er.id
@@ -12679,56 +12830,65 @@ class Database:
                            JOIN evidence_units eu ON eu.id = er.evidence_unit_id
                           WHERE eu.doc_id = ? AND eu.source_id = ?
                      )""",
-                (memory_id, source_id, doc_id, source_id),
-            )
-            await self._delete_current_evidence_relation_for_memory_doc_unlocked(memory_id, source_id, doc_id)
-            await self.db.execute(
-                "DELETE FROM memory_sources WHERE memory_id = ? AND source_id = ? AND doc_id = ?",
-                (memory_id, source_id, doc_id),
-            )
-            await self._refresh_memory_metadata_fts_unlocked(memory_id, doc_id)
-            retired = await self._refresh_memory_support_state_unlocked(
-                memory_id,
-                retire_reason=retire_reason,
-            )
-            if retired:
-                now = _now_iso()
-                plan_id = f"support-removal-{uuid.uuid4().hex}"
-                scope_hash = hashlib.sha256(f"{memory_id}\x1f{source_id}\x1f{doc_id}".encode("utf-8")).hexdigest()[:20]
-                payload_json = json.dumps(
-                    {
-                        "operation": "remove_source_support",
-                        "memory_id": memory_id,
-                        "source_id": source_id,
-                        "doc_id": doc_id,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
+                    (memory_id, source_id, doc_id, source_id),
+                )
+                await self._delete_current_evidence_relation_for_memory_doc_unlocked(
+                    memory_id,
+                    source_id,
+                    doc_id,
                 )
                 await self.db.execute(
-                    """INSERT INTO lifecycle_plans (
+                    "DELETE FROM memory_sources WHERE memory_id = ? AND source_id = ? AND doc_id = ?",
+                    (memory_id, source_id, doc_id),
+                )
+                await self._refresh_memory_metadata_fts_unlocked(memory_id, doc_id)
+                retired = await self._refresh_memory_support_state_unlocked(
+                    memory_id,
+                    retire_reason=retire_reason,
+                )
+                if retired:
+                    now = _now_iso()
+                    plan_id = f"support-removal-{uuid.uuid4().hex}"
+                    scope_hash = hashlib.sha256(f"{memory_id}\x1f{source_id}\x1f{doc_id}".encode("utf-8")).hexdigest()[
+                        :20
+                    ]
+                    payload_json = json.dumps(
+                        {
+                            "operation": "remove_source_support",
+                            "memory_id": memory_id,
+                            "source_id": source_id,
+                            "doc_id": doc_id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    await self.db.execute(
+                        """INSERT INTO lifecycle_plans (
                            id, reconciliation_scope_id, source_id, source_unit_id,
                            target_unit_revision_id, status, payload_json, payload_hash,
                            created_at, applied_at, error
                        ) VALUES (?, 'direct_support_removal', ?, ?, NULL, 'applied', ?, ?, ?, ?, NULL)""",
-                    (
+                        (
+                            plan_id,
+                            source_id,
+                            f"support-removal:{scope_hash}",
+                            payload_json,
+                            hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+                            now,
+                            now,
+                        ),
+                    )
+                    await self._enqueue_lifecycle_vector_task_unlocked(
                         plan_id,
-                        source_id,
-                        f"support-removal:{scope_hash}",
-                        payload_json,
-                        hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
-                        now,
-                        now,
-                    ),
-                )
-                await self._enqueue_lifecycle_vector_task_unlocked(
-                    plan_id,
-                    memory_id,
-                    LifecycleVectorOperation.DELETE,
-                    now=now,
-                )
-            await self.db.commit()
-            return retired
+                        memory_id,
+                        LifecycleVectorOperation.DELETE,
+                        now=now,
+                    )
+                await self.db.commit()
+                return retired
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def refresh_memory_support_state(
         self,
@@ -12753,17 +12913,39 @@ class Database:
     ) -> bool:
         async with self.db.execute(
             """SELECT
-                   COUNT(*) AS total_count
-               FROM memory_sources ms
-               JOIN documents d ON ms.doc_id = d.doc_id
-               WHERE ms.memory_id = ?""",
-            (memory_id,),
+                   (SELECT COUNT(*)
+                      FROM memory_sources ms
+                      JOIN documents d ON ms.doc_id = d.doc_id
+                     WHERE ms.memory_id = ?) AS total_count,
+                   (SELECT COUNT(*)
+                      FROM memory_support_assertions msa
+                     WHERE msa.memory_id = ? AND msa.active = 1) AS active_support_count,
+                   (SELECT COUNT(*)
+                      FROM memory_support_assertions msa
+                      LEFT JOIN evidence_references er
+                        ON er.id = msa.evidence_reference_id
+                      LEFT JOIN evidence_units eu
+                        ON eu.id = er.evidence_unit_id
+                     WHERE msa.memory_id = ? AND msa.active = 1
+                       AND (
+                           eu.id IS NULL OR eu.doc_id IS NULL OR NOT EXISTS (
+                               SELECT 1 FROM memory_sources ms
+                                WHERE ms.memory_id = msa.memory_id
+                                  AND ms.source_id = msa.source_id
+                                  AND ms.doc_id = eu.doc_id
+                           )
+                       )) AS missing_projection_count""",
+            (memory_id, memory_id, memory_id),
         ) as cursor:
             row = await cursor.fetchone()
 
         total_count = int(row["total_count"] or 0) if row else 0
+        active_support_count = int(row["active_support_count"] or 0) if row else 0
+        missing_projection_count = int(row["missing_projection_count"] or 0) if row else 0
+        if missing_projection_count:
+            raise ValueError("active support lacks source provenance")
         now = _now_iso()
-        retired = total_count == 0
+        retired = total_count == 0 and active_support_count == 0
         if retired:
             await self.db.execute(
                 """UPDATE memories SET
