@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from memforge.config import AppConfig, RetrievalConfig
-from memforge.models import DocumentRecord, Memory, content_hash
+from memforge.models import DocumentRecord, Memory, MemoryReview, content_hash
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -117,6 +117,86 @@ async def test_default_search_returns_only_active_memories(db, monkeypatch):
     result = await engine.search("PostgreSQL", top_k=10)
 
     assert [r.memory_id for r in result["results"]] == [active.id]
+
+
+@pytest.mark.asyncio
+async def test_search_exposes_reviewed_cross_source_conflict_context(db, tmp_path):
+    incumbent = _memory("mem-conflict-search-a", "Payroll closes on the 20th", "active")
+    counterpart = _memory("mem-conflict-search-b", "Payroll closes on the 25th", "active")
+    await db.insert_memory(incumbent)
+    await db.insert_memory(counterpart)
+    await db.insert_memory_review(
+        MemoryReview(
+            id="review-conflict-search",
+            kind="cross_source_conflict",
+            status="approved",
+            incumbent_memory_id=incumbent.id,
+            challenger_memory_id=counterpart.id,
+            reason="Both claims govern the same payroll area and period.",
+            review_note="Confirmed as a source disagreement.",
+            reviewer="reviewer-1",
+            resolved_at=datetime.now(timezone.utc),
+        )
+    )
+    adapters = build_sqlite_adapters(db, FakeCollection([incumbent.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=_config(tmp_path).retrieval,
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("Payroll closes", top_k=1)
+
+    [search_result] = result["results"]
+    [context] = search_result.conflict_contexts
+    assert context.review_id == "review-conflict-search"
+    assert context.counterpart_memory_id == counterpart.id
+    assert context.counterpart_summary == counterpart.content
+    assert context.review_status == "approved"
+    assert context.disposition == "confirmed"
+    assert "reviewed cross-source conflict" in search_result.contradiction_warning
+
+
+@pytest.mark.asyncio
+async def test_search_exposes_dismissed_cross_source_finding_without_warning(db, tmp_path):
+    incumbent = _memory("mem-dismissed-search-a", "Payroll closes on the 20th", "active")
+    counterpart = _memory("mem-dismissed-search-b", "A pilot closes on the 25th", "active")
+    await db.insert_memory(incumbent)
+    await db.insert_memory(counterpart)
+    await db.insert_memory_review(
+        MemoryReview(
+            id="review-dismissed-search",
+            kind="cross_source_conflict",
+            status="rejected",
+            incumbent_memory_id=incumbent.id,
+            challenger_memory_id=counterpart.id,
+            reason="The deadline wording looked inconsistent.",
+            review_note="Different payroll populations; not a conflict.",
+            reviewer="reviewer-1",
+            resolved_at=datetime.now(timezone.utc),
+        )
+    )
+    adapters = build_sqlite_adapters(db, FakeCollection([incumbent.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=_config(tmp_path).retrieval,
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+
+    result = await engine.search("Payroll closes", top_k=1)
+
+    [search_result] = result["results"]
+    [context] = search_result.conflict_contexts
+    assert context.review_status == "rejected"
+    assert context.disposition == "dismissed"
+    assert context.review_note == "Different payroll populations; not a conflict."
+    assert search_result.contradiction_warning is None
 
 
 @pytest.mark.asyncio

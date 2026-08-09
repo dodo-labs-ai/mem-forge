@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.memory.store import MemoryStore
-from memforge.models import DocumentRecord, Memory, RawMemory, content_hash
+from memforge.models import DocumentRecord, Memory, MemoryReview, RawMemory, content_hash
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -43,18 +43,11 @@ ATTACHMENT_EVENT_CONTENT = (
     "(attachment ID 11786339) to the payroll run timeout ticket on 2026-06-25."
 )
 ATTACHMENT_EVENT_CONTEXT = (
-    '{"field":"Attachment","fieldtype":"jira","from":null,'
-    '"to":"11786339","toString":"screenshot-8.png"}'
+    '{"field":"Attachment","fieldtype":"jira","from":null,"to":"11786339","toString":"screenshot-8.png"}'
 )
 
-OPERATIONAL_HISTORY_CONTENT = (
-    "In SFPay, the payroll timeout ticket due date changed from 2026-06-23 "
-    "to 2026-06-17."
-)
-OPERATIONAL_HISTORY_CONTEXT = (
-    '{"field":"duedate","fieldtype":"jira","fromString":"2026-06-23",'
-    '"toString":"2026-06-17"}'
-)
+OPERATIONAL_HISTORY_CONTENT = "In SFPay, the payroll timeout ticket due date changed from 2026-06-23 to 2026-06-17."
+OPERATIONAL_HISTORY_CONTEXT = '{"field":"duedate","fieldtype":"jira","fromString":"2026-06-23","toString":"2026-06-17"}'
 
 CONDITIONAL_RULE_CONTENT = (
     "If an employee's regular pay date is changed via a deviating payroll process and the employee is "
@@ -227,10 +220,7 @@ def test_classifier_keeps_claim_extracted_from_attachment_content():
     quality = classify_memory_candidate(
         _raw(
             "The attached screenshot shows that payroll triggers remained OPEN for ten minutes.",
-            (
-                '{"artifact_type":"image/png","attachment_id":"11786339",'
-                '"fragment_id":"image-analysis-1"}'
-            ),
+            ('{"artifact_type":"image/png","attachment_id":"11786339","fragment_id":"image-analysis-1"}'),
         )
     )
 
@@ -484,6 +474,46 @@ async def test_admin_memory_detail_exposes_service_artifact_urls_only(db: Databa
 
 
 @pytest.mark.asyncio
+async def test_admin_memory_detail_exposes_reviewed_cross_source_conflict(db: Database, tmp_path: Path):
+    from memforge.server.admin_api import create_admin_app
+
+    incumbent = await _insert_memory(
+        db,
+        mem_id="mem-detail-conflict-a",
+        content="Payroll closes on the 20th.",
+    )
+    counterpart = await _insert_memory(
+        db,
+        mem_id="mem-detail-conflict-b",
+        content="Payroll closes on the 25th.",
+    )
+    await db.insert_memory_review(
+        MemoryReview(
+            id="review-detail-conflict",
+            kind="cross_source_conflict",
+            status="approved",
+            incumbent_memory_id=incumbent.id,
+            challenger_memory_id=counterpart.id,
+            reason="Both claims govern the same payroll scope.",
+            review_note="Confirmed source disagreement.",
+            reviewer="reviewer-1",
+            resolved_at=datetime.now(timezone.utc),
+        )
+    )
+
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        response = client.get(f"/api/v1/memories/{incumbent.id}")
+
+    assert response.status_code == 200
+    [context] = response.json()["conflict_contexts"]
+    assert context["review_id"] == "review-detail-conflict"
+    assert context["counterpart_memory_id"] == counterpart.id
+    assert context["counterpart_summary"] == counterpart.content
+    assert context["disposition"] == "confirmed"
+
+
+@pytest.mark.asyncio
 async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Database, tmp_path: Path):
     from memforge.server.admin_api import create_admin_app
 
@@ -527,7 +557,9 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
     assert "pdf_uri" not in source
     assert manifest.status_code == 200
     artifacts = manifest.json()["artifacts"]
-    assert artifacts["normalized_markdown"]["url"] == ("/api/v1/documents/doc-artifact-url/artifacts/normalized_markdown")
+    assert artifacts["normalized_markdown"]["url"] == (
+        "/api/v1/documents/doc-artifact-url/artifacts/normalized_markdown"
+    )
     assert artifacts["pdf"]["url"] == "/api/v1/documents/doc-artifact-url/artifacts/pdf"
     assert markdown_artifact.status_code == 200
     assert markdown_artifact.text == "# Source\n\nDurable memory evidence."
@@ -589,13 +621,13 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
             "filename": "diagram\u202foverview.png",
             "media_type": "image/png",
             "size_bytes": len(image),
-                "sha256": digest,
-                "uri": uri,
-                "inference_eligible": True,
-                "inference_ineligible_reason": None,
-                "summary": "Service case review screen showing the investigation areas.",
-            }
+            "sha256": digest,
+            "uri": uri,
+            "inference_eligible": True,
+            "inference_ineligible_reason": None,
+            "summary": "Service case review screen showing the investigation areas.",
         }
+    }
     await db.db.execute(
         """INSERT INTO source_units
            (id, source_id, unit_type, provider_key, locator_json, current_revision_id, updated_at)
@@ -724,9 +756,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     assert artifact["evidence_role"] == "context"
     assert artifact["content_type"] == "image/png"
     assert artifact["sha256"] == digest
-    assert artifact["summary"] == (
-        "Service case review screen showing the investigation areas."
-    )
+    assert artifact["summary"] == ("Service case review screen showing the investigation areas.")
     assert artifact["url"] == "/api/v1/source-artifacts/obsrev-image"
 
     await db.db.execute(
@@ -747,8 +777,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     assert resource_head.headers["x-content-sha256"] == digest
     assert resource_head.content == b""
     assert (
-        resource.headers["content-disposition"]
-        == "inline; filename=\"diagram_overview.png\"; "
+        resource.headers["content-disposition"] == 'inline; filename="diagram_overview.png"; '
         "filename*=UTF-8''diagram%E2%80%AFoverview.png"
     )
     assert resource.content == image
@@ -789,8 +818,7 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
         ),
         (
             'bad\r\nX-Evil: yes".png',
-            "inline; filename=\"badX-Evil_yes.png\"; "
-            "filename*=UTF-8''badX-Evil%3A%20yes%22.png",
+            "inline; filename=\"badX-Evil_yes.png\"; filename*=UTF-8''badX-Evil%3A%20yes%22.png",
         ),
     ],
 )
@@ -1350,11 +1378,11 @@ async def test_admin_memory_search_endpoint_uses_service_search_engine(
             "entities": None,
             "include_superseded": False,
             "top_k": 3,
-                "request_scope": expected_scope,
-                "offset": 0,
-                "intent": None,
-            }
-        ]
+            "request_scope": expected_scope,
+            "offset": 0,
+            "intent": None,
+        }
+    ]
     assert payload["results"][0]["memory_id"] == "mem-proxy-search"
     result = payload["results"][0]
     for field in ("source_doc_id", "source_doc_title", "source_url", "content_url", "pdf_url", "is_document_result"):

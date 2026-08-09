@@ -91,9 +91,11 @@ _MAX_QUOTED_IDENTITY_LENGTH = 256
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _RankedCandidate:
     """Intermediate result used during fusion and ranking."""
+
     memory_id: str
     rrf_score: float = 0.0
     final_score: float = 0.0
@@ -364,6 +366,7 @@ def _default_access_scope(include_superseded: bool) -> AccessScope:
 # SearchEngine
 # ---------------------------------------------------------------------------
 
+
 class SearchEngine:
     """Hybrid retrieval engine: vector + BM25 + graph, fused via RRF.
 
@@ -471,10 +474,9 @@ class SearchEngine:
             )
             for index, item in enumerate(page.items)
         ]
-        enriched_results = await self._enrich_results(ids, ranked)
+        enriched_results = await self._enrich_results(ids, ranked, scope=scope)
         matched_at_by_memory_id = {
-            item.memory_id: item.sort_at.astimezone(timezone.utc).isoformat()
-            for item in page.items
+            item.memory_id: item.sort_at.astimezone(timezone.utc).isoformat() for item in page.items
         }
         results: list[dict[str, Any]] = []
         for result in enriched_results:
@@ -547,9 +549,8 @@ class SearchEngine:
         if not query.strip():
             if requested_intent is not None:
                 raise ValueError("retrieval intent requires a ranked query")
-            if (
-                (combined_source_filter is None or combined_source_filter.is_empty())
-                and (time_range is None or time_range.is_empty())
+            if (combined_source_filter is None or combined_source_filter.is_empty()) and (
+                time_range is None or time_range.is_empty()
             ):
                 raise ValueError("queryless search requires source_filter or time_range")
             ids, total_candidates = await self._relational.list_ids_by_source_and_time(
@@ -564,7 +565,7 @@ class SearchEngine:
                 _RankedCandidate(memory_id=memory_id, rrf_score=float(top_k - index), final_score=float(top_k - index))
                 for index, memory_id in enumerate(ids)
             ]
-            results = await self._enrich_results(ids, ranked)
+            results = await self._enrich_results(ids, ranked, scope=scope)
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             return {
                 "query_analysis": {
@@ -726,9 +727,8 @@ class SearchEngine:
         )
         self._attach_retrieval_evidence(fused, metadata_evidence)
         fused = await self._filter_candidates_by_status(fused, scope)
-        if (
-            (combined_source_filter is not None and not combined_source_filter.is_empty())
-            or (time_range is not None and not time_range.is_empty())
+        if (combined_source_filter is not None and not combined_source_filter.is_empty()) or (
+            time_range is not None and not time_range.is_empty()
         ):
             supported = await self._relational.filter_ids_by_source_and_time(
                 [c.memory_id for c in fused],
@@ -746,21 +746,18 @@ class SearchEngine:
 
         # ----- 7. Collapse duplicate families and apply the requested page -----
         ranked_count = len(ranked)
-        ranked = ranked[offset: offset + top_k]
+        ranked = ranked[offset : offset + top_k]
 
         # ----- 8. Enrich results -----
         memory_ids = [c.memory_id for c in ranked]
-        results = await self._enrich_results(memory_ids, ranked)
+        results = await self._enrich_results(memory_ids, ranked, scope=scope)
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
         return {
             "query_analysis": {
                 "detected_entities": analysis.detected_entities,
-                "entity_linking": [
-                    _entity_link_candidate_payload(candidate)
-                    for candidate in analysis.entity_linking
-                ],
+                "entity_linking": [_entity_link_candidate_payload(candidate) for candidate in analysis.entity_linking],
                 "entity_linking_channels": list(analysis.entity_linking_channels),
                 "unmatched_explicit_entities": list(analysis.unmatched_explicit_entities),
                 "strategies_used": channel_names,
@@ -814,18 +811,12 @@ class SearchEngine:
         sanitized_query = sanitize_fts_query(query)
         if not sanitized_query:
             return []
-        alias_clause = await self._build_alias_clause(
-            analysis.detected_entity_ids, query
-        )
+        alias_clause = await self._build_alias_clause(analysis.detected_entity_ids, query)
         # When aliases contribute new terms, broaden recall by ORing them
         # against the user's phrase list. The user side is wrapped in parens
         # so its implicit AND binds tighter than the top-level OR; without
         # the parens FTS5 would attach OR only to the last user phrase.
-        fts_query = (
-            sanitized_query
-            if not alias_clause
-            else f"({sanitized_query}) OR {alias_clause}"
-        )
+        fts_query = sanitized_query if not alias_clause else f"({sanitized_query}) OR {alias_clause}"
         return await self._keyword.search(fts_query, scope, memory_types, limit)
 
     async def _bm25_metadata_search(
@@ -866,11 +857,7 @@ class SearchEngine:
         """Run the full metadata query plus one explicitly quoted identity."""
 
         queries = [("full_query", query)]
-        quoted_identity = (
-            _quoted_identity_query(query)
-            if requested_intent == "known_item"
-            else None
-        )
+        quoted_identity = _quoted_identity_query(query) if requested_intent == "known_item" else None
         if quoted_identity is not None and quoted_identity != query.strip():
             queries.append(("quoted_identity", quoted_identity))
 
@@ -1185,6 +1172,8 @@ class SearchEngine:
         self,
         memory_ids: list[str],
         ranked: list[_RankedCandidate],
+        *,
+        scope: AccessScope,
     ) -> list[SearchResult]:
         """Fetch full Memory objects for each result."""
         if not memory_ids:
@@ -1192,6 +1181,10 @@ class SearchEngine:
 
         # Build a lookup of candidate scores
         score_map = {c.memory_id: c for c in ranked}
+        conflict_contexts_by_memory = await self.list_memory_conflict_contexts(
+            memory_ids,
+            scope=scope,
+        )
 
         results: list[SearchResult] = []
         for mid in memory_ids:
@@ -1219,36 +1212,55 @@ class SearchEngine:
             freshness = _compute_freshness(memory, has_source)
 
             # Contradiction warning
+            conflict_contexts = conflict_contexts_by_memory.get(mid, ())
+            confirmed_conflicts = sum(item.disposition == "confirmed" for item in conflict_contexts)
+            pending_conflicts = sum(item.disposition == "pending" for item in conflict_contexts)
             contradiction_warning = None
-            if memory.contradiction_count > 0:
+            if confirmed_conflicts:
                 contradiction_warning = (
-                    f"This memory has {memory.contradiction_count} "
-                    f"contradiction(s) recorded."
+                    f"This memory has {confirmed_conflicts} reviewed cross-source conflict(s). See conflict_contexts."
                 )
+            elif pending_conflicts:
+                contradiction_warning = (
+                    f"This memory has {pending_conflicts} pending cross-source "
+                    f"conflict review(s). See conflict_contexts."
+                )
+            elif memory.contradiction_count > 0:
+                contradiction_warning = f"This memory has {memory.contradiction_count} contradiction(s) recorded."
 
-            results.append(SearchResult(
-                memory_id=memory.id,
-                memory_type=memory.memory_type,
-                summary=memory.content,
-                confidence=memory.confidence,
-                relevance_score=round(candidate.final_score, 4),
-                corroborated_by=memory.corroboration_count,
-                last_observed_at=(
-                    memory.updated_at.isoformat()
-                    if memory.updated_at else None
-                ),
-                freshness=freshness,
-                contradiction_warning=contradiction_warning,
-                status=memory.status,
-                repo_identifier=candidate.repo_identifier or memory.repo_identifier,
-                follow_up=_search_follow_up_for_memory(
-                    memory,
+            results.append(
+                SearchResult(
+                    memory_id=memory.id,
+                    memory_type=memory.memory_type,
+                    summary=memory.content,
+                    confidence=memory.confidence,
+                    relevance_score=round(candidate.final_score, 4),
+                    corroborated_by=memory.corroboration_count,
+                    last_observed_at=(memory.updated_at.isoformat() if memory.updated_at else None),
+                    freshness=freshness,
                     contradiction_warning=contradiction_warning,
-                ),
-                retrieval_evidence=candidate.retrieval_evidence,
-            ))
+                    conflict_contexts=conflict_contexts,
+                    status=memory.status,
+                    repo_identifier=candidate.repo_identifier or memory.repo_identifier,
+                    follow_up=_search_follow_up_for_memory(
+                        memory,
+                        contradiction_warning=contradiction_warning,
+                    ),
+                    retrieval_evidence=candidate.retrieval_evidence,
+                )
+            )
 
         return results
+
+    async def list_memory_conflict_contexts(
+        self,
+        memory_ids: list[str] | tuple[str, ...],
+        *,
+        scope: AccessScope,
+    ):
+        """Expose the adapter-owned, visibility-safe conflict read model."""
+
+        return await self._relational.list_memory_conflict_contexts(memory_ids, scope)
 
     # ==================================================================
     # Query expansion
@@ -1338,6 +1350,7 @@ class SearchEngine:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
 
 def _recent_listing_fingerprint(
     *,

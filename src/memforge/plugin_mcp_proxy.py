@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.49"
+SERVER_VERSION = "0.1.50"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Repository context is optional. MemForge uses negotiated request-scoped host context when "
@@ -80,8 +80,7 @@ AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 RANKED_RETRIEVAL_INTENTS = ["general_hybrid", "known_item", "relationship"]
 ROOTS_LIST_REQUEST_ID = "memforge-roots-list-1"
 CURRENT_REPO_ONLY_DISABLED_ERROR = (
-    "current_repo_only is not exposed by this MCP search tool. Omit the filter "
-    "to search all visible memories."
+    "current_repo_only is not exposed by this MCP search tool. Omit the filter to search all visible memories."
 )
 SEARCH_ALLOWED_KEYS = frozenset(
     {
@@ -262,8 +261,7 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "minLength": 1,
                     "description": (
-                        "Workspace to use by default for automatic hooks and requests that omit "
-                        "workspace_id."
+                        "Workspace to use by default for automatic hooks and requests that omit workspace_id."
                     ),
                 }
             },
@@ -279,12 +277,13 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "search",
         "description": (
-            "Search visible Memories. For source-specific requests, call list_sources first and "
-            "pass exact source_ids; never guess IDs. For broad or cross-source requests, omit "
-            "source_filter; use time_range only when explicitly requested. Use list_recent_memories "
-            "for deterministic source/time listings. Send a self-contained query in the user's language; "
-            "preserve identifiers and domain terms, without retrieval-only translation or keyword stuffing. "
-            "Use total_candidates and offset only within the ranked window; ranked queries are not exhaustive. "
+            "Search visible Memories. For source-specific requests, call list_sources first and pass "
+            "exact source_ids. For broad or cross-source requests, omit source_filter; use time_range only "
+            "when explicitly requested. Use list_recent_memories for deterministic source/time listings. "
+            "Send a self-contained query in the user's language; preserve identifiers and domain terms, "
+            "without retrieval-only translation or keyword stuffing. Use total_candidates and offset only "
+            "within the ranked window; ranked queries are not exhaustive. In conflict_contexts, confirmed "
+            "means reviewed contradiction and dismissed means reviewed non-conflict; neither retires a claim. "
             "Call get_memory for provenance."
         ),
         "inputSchema": {
@@ -498,7 +497,8 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Fetch full memory detail by ID when a search result is insufficient. Returns "
             "canonical content together with claim-local provenance in sources[].excerpt, "
-            "supporting source and artifact locators, entity links, and lifecycle metadata."
+            "supporting source and artifact locators, entity links, lifecycle metadata, and "
+            "visibility-safe cross-source Review dispositions in conflict_contexts."
         ),
         "inputSchema": {
             "type": "object",
@@ -879,9 +879,7 @@ def _handle_rpc_message(message: dict[str, Any]) -> dict[str, Any] | list[dict[s
             name = str(params.get("name") or "")
             arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
             request_meta = params.get("_meta")
-            if _PENDING_ROOTS_REQUEST_ID is not None and not _has_request_repository_context(
-                arguments, request_meta
-            ):
+            if _PENDING_ROOTS_REQUEST_ID is not None and not _has_request_repository_context(arguments, request_meta):
                 if len(_DEFERRED_TOOL_CALLS) >= MAX_DEFERRED_TOOL_CALLS:
                     return _rpc_error(
                         request_id,
@@ -912,7 +910,8 @@ def _tool_call_response(
             request_id,
             _tool_result(
                 payload,
-                structured=name in {
+                structured=name
+                in {
                     "validate_memory_review_decisions",
                     "apply_memory_review_decisions",
                 },
@@ -958,11 +957,7 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
         workspace_id = _optional_string_arg(args, "workspace_id")
     except ValueError as exc:
         return {"error": str(exc)}
-    args = {
-        key: value
-        for key, value in args.items()
-        if key not in {"repository_context", "workspace_id"}
-    }
+    args = {key: value for key, value in args.items() if key not in {"repository_context", "workspace_id"}}
     if name == "search":
         try:
             body = _search_args_with_context(args, repo_identifier=call_context.repo_identifier)
@@ -1219,9 +1214,7 @@ def _review_manifest_body(
             raise ValueError(f"decisions[{index}] must be an object")
         item_unknown = sorted(set(raw) - allowed)
         if item_unknown:
-            raise ValueError(
-                f"Unsupported decisions[{index}] parameter(s): " + ", ".join(item_unknown)
-            )
+            raise ValueError(f"Unsupported decisions[{index}] parameter(s): " + ", ".join(item_unknown))
         review_id = _required_string_arg(raw, "review_id")
         if review_id in review_ids:
             raise ValueError(f"duplicate review_id: {review_id}")
@@ -1238,9 +1231,7 @@ def _review_manifest_body(
             raise ValueError(f"decisions[{index}].risk must be low, medium, or high")
         confidence = raw.get("confidence")
         if confidence is not None and (
-            isinstance(confidence, bool)
-            or not isinstance(confidence, (int, float))
-            or not 0 <= float(confidence) <= 1
+            isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= float(confidence) <= 1
         ):
             raise ValueError(f"decisions[{index}].confidence must be between 0 and 1")
         item: dict[str, Any] = {
@@ -1289,9 +1280,7 @@ def _required_bounded_int_arg(args: dict[str, Any], name: str, *, minimum: int, 
     return value
 
 
-def _search_args_with_context(
-    args: dict[str, Any], *, repo_identifier: str | None = None
-) -> dict[str, Any]:
+def _search_args_with_context(args: dict[str, Any], *, repo_identifier: str | None = None) -> dict[str, Any]:
     unknown = sorted(set(args) - SEARCH_ALLOWED_KEYS)
     if unknown:
         raise ValueError(
@@ -1334,8 +1323,10 @@ def _search_args_with_context(
             )
         source_ids = source_filter.get("source_ids")
         if source_ids is not None:
-            if not isinstance(source_ids, list) or not source_ids or not all(
-                isinstance(item, str) and item.strip() for item in source_ids
+            if (
+                not isinstance(source_ids, list)
+                or not source_ids
+                or not all(isinstance(item, str) and item.strip() for item in source_ids)
             ):
                 raise ValueError("source_filter.source_ids must be a non-empty array of source IDs from list_sources")
         if "current_repo_only" in source_filter:
@@ -1348,9 +1339,7 @@ def _search_args_with_context(
         has_deterministic_filter = True
     if not query:
         if has_deterministic_filter:
-            raise ValueError(
-                "search.query is required; use list_recent_memories for deterministic listings"
-            )
+            raise ValueError("search.query is required; use list_recent_memories for deterministic listings")
         raise ValueError("search.query is required")
     return body
 
@@ -1362,16 +1351,21 @@ def _recent_memory_args(args: dict[str, Any]) -> dict[str, Any]:
     body = dict(args)
     source_ids = body.get("source_ids")
     if source_ids is not None:
-        if not isinstance(source_ids, list) or not source_ids or not all(
-            isinstance(source_id, str) and source_id.strip() for source_id in source_ids
+        if (
+            not isinstance(source_ids, list)
+            or not source_ids
+            or not all(isinstance(source_id, str) and source_id.strip() for source_id in source_ids)
         ):
             raise ValueError("source_ids must be a non-empty array of source IDs from list_sources")
         body["source_ids"] = list(dict.fromkeys(source_id.strip() for source_id in source_ids))
     memory_types = body.get("memory_types")
     if memory_types is not None:
-        if not isinstance(memory_types, list) or not memory_types or not all(
-            isinstance(memory_type, str) and memory_type in RECENT_MEMORY_TYPES
-            for memory_type in memory_types
+        if (
+            not isinstance(memory_types, list)
+            or not memory_types
+            or not all(
+                isinstance(memory_type, str) and memory_type in RECENT_MEMORY_TYPES for memory_type in memory_types
+            )
         ):
             raise ValueError("memory_types must contain fact, decision, convention, or procedure")
         body["memory_types"] = list(dict.fromkeys(memory_types))
@@ -1502,9 +1496,7 @@ def _tool_call_context_from_working_directory(
     context = value if isinstance(value, dict) else {"working_directory": value}
     unknown = sorted(set(context) - {"working_directory"})
     if unknown:
-        raise ValueError(
-            "Unsupported repository_context parameter(s): " + ", ".join(unknown)
-        )
+        raise ValueError("Unsupported repository_context parameter(s): " + ", ".join(unknown))
     working_directory = context.get("working_directory")
     if not isinstance(working_directory, str) or not working_directory.strip():
         raise ValueError(f"{field_name} must be an absolute path or file:// URI")
@@ -1515,9 +1507,7 @@ def _tool_call_context_from_working_directory(
         working_directory=working_directory,
     )
     if repository_context.state != "exact" or not repository_context.repo_identifier:
-        raise ValueError(
-            f"{field_name} must resolve to a Git repository with an origin remote"
-        )
+        raise ValueError(f"{field_name} must resolve to a Git repository with an origin remote")
     return ToolCallContext(
         target=configured_target(),
         repo_identifier=repository_context.repo_identifier,
@@ -1533,16 +1523,10 @@ def _codex_sandbox_cwd(request_meta: Any) -> str | None:
         return None
     sandbox_state = request_meta.get(CODEX_SANDBOX_STATE_META_CAPABILITY)
     if not isinstance(sandbox_state, dict):
-        raise ValueError(
-            f"{CODEX_SANDBOX_STATE_META_CAPABILITY}.sandboxCwd must be an absolute path or "
-            "file:// URI"
-        )
+        raise ValueError(f"{CODEX_SANDBOX_STATE_META_CAPABILITY}.sandboxCwd must be an absolute path or file:// URI")
     sandbox_cwd = sandbox_state.get("sandboxCwd")
     if not isinstance(sandbox_cwd, str) or not sandbox_cwd.strip():
-        raise ValueError(
-            f"{CODEX_SANDBOX_STATE_META_CAPABILITY}.sandboxCwd must be an absolute path or "
-            "file:// URI"
-        )
+        raise ValueError(f"{CODEX_SANDBOX_STATE_META_CAPABILITY}.sandboxCwd must be an absolute path or file:// URI")
     return sandbox_cwd
 
 
@@ -1641,11 +1625,7 @@ def _compact_search_response(payload: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     results = payload.get("results")
     if isinstance(results, list):
-        compact["results"] = [
-            _compact_search_result(result)
-            for result in results
-            if isinstance(result, dict)
-        ]
+        compact["results"] = [_compact_search_result(result) for result in results if isinstance(result, dict)]
 
     retrieval_intent = payload.get("retrieval_intent")
     if isinstance(retrieval_intent, dict):
@@ -1686,11 +1666,7 @@ def _compact_recent_memories_response(payload: dict[str, Any]) -> dict[str, Any]
     compact: dict[str, Any] = {}
     results = payload.get("results")
     if isinstance(results, list):
-        compact["results"] = [
-            _compact_recent_memory_result(result)
-            for result in results
-            if isinstance(result, dict)
-        ]
+        compact["results"] = [_compact_recent_memory_result(result) for result in results if isinstance(result, dict)]
     for key in (
         "result_kind",
         "is_changelog",
@@ -1729,6 +1705,8 @@ def _compact_search_result(result: dict[str, Any]) -> dict[str, Any]:
         "relevance_score",
         "freshness",
         "status",
+        "contradiction_warning",
+        "conflict_contexts",
         "follow_up",
     ):
         if key in result:
@@ -1749,23 +1727,18 @@ def _compact_memory_response(payload: dict[str, Any]) -> dict[str, Any]:
         "confidence",
         "status",
         "entity_refs",
+        "conflict_contexts",
     ):
         if key in payload:
             compact[key] = payload[key]
 
     sources = payload.get("sources")
     if isinstance(sources, list):
-        compact["sources"] = [
-            _compact_memory_source(source)
-            for source in sources
-            if isinstance(source, dict)
-        ]
+        compact["sources"] = [_compact_memory_source(source) for source in sources if isinstance(source, dict)]
     evidence_artifacts = payload.get("evidence_artifacts")
     if isinstance(evidence_artifacts, list):
         compact["evidence_artifacts"] = [
-            _compact_memory_evidence_artifact(artifact)
-            for artifact in evidence_artifacts
-            if isinstance(artifact, dict)
+            _compact_memory_evidence_artifact(artifact) for artifact in evidence_artifacts if isinstance(artifact, dict)
         ]
     return compact
 

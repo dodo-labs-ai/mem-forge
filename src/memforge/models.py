@@ -70,6 +70,7 @@ VIRTUAL_DOCUMENT_SOURCE_IDS = frozenset({"user_memory", "user_correction"})
 # Enums
 # ---------------------------------------------------------------------------
 
+
 class MemoryType(str, Enum):
     FACT = "fact"
     DECISION = "decision"
@@ -141,6 +142,7 @@ class ConfigFieldType(str, Enum):
 # Entity models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Entity:
     id: int
@@ -163,16 +165,17 @@ class EntityAlias:
 # Memory models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Memory:
-    id: str                          # "mem-{uuid8}"
-    memory_type: str                 # fact | decision | convention | procedure
+    id: str  # "mem-{uuid8}"
+    memory_type: str  # fact | decision | convention | procedure
     content: str
-    content_hash: str                # SHA-256 for dedup
+    content_hash: str  # SHA-256 for dedup
 
     # Scoping
     visibility: str = Visibility.WORKSPACE.value  # team-visible by default
-    owner_user_id: str | None = None              # set iff visibility is private
+    owner_user_id: str | None = None  # set iff visibility is private
     project_key: str | None = None
     repo_identifier: str | None = None
 
@@ -202,6 +205,7 @@ class Memory:
 @dataclass
 class RawMemory:
     """A memory candidate extracted by the LLM, before dedup/insertion."""
+
     content: str
     memory_type: str
     confidence: float = 0.7
@@ -219,6 +223,7 @@ class RawMemory:
 @dataclass
 class MemorySource:
     """Provenance: links a memory to a source document."""
+
     memory_id: str
     doc_id: str
     source_type: str
@@ -232,6 +237,7 @@ class MemorySource:
 @dataclass
 class AgentSessionReceipt:
     """Lineage for a client-generated agent session document."""
+
     doc_id: str
     source_id: str
     client: str
@@ -273,9 +279,11 @@ class AgentHookReceipt:
 # Document models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class DocRef:
     """Reference to a document discovered by a gene."""
+
     doc_id: str
     source: str  # source instance ID
     source_url: str
@@ -288,6 +296,7 @@ class DocRef:
 @dataclass
 class RawDocument:
     """Raw fetched content from a gene."""
+
     ref: DocRef
     content: bytes
     content_type: str
@@ -298,6 +307,7 @@ class RawDocument:
 @dataclass
 class DocumentRecord:
     """Full document record stored in the database."""
+
     doc_id: str
     source: str
     source_url: str
@@ -322,6 +332,7 @@ class DocumentRecord:
 @dataclass
 class MemoryExtractionResult:
     """Output of Call 2 (memory extraction)."""
+
     memories: list[RawMemory] = field(default_factory=list)
     artifact_summaries: tuple[SourceArtifactSummary, ...] = ()
     protected_source_observation_ids: tuple[str, ...] = ()
@@ -335,9 +346,11 @@ class MemoryExtractionResult:
 # Gene data models
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class ContentItem:
     """A content item discovered by a gene (the unit of sync)."""
+
     item_id: str  # becomes doc_id
     title: str
     source_url: str
@@ -364,6 +377,7 @@ class ContentItem:
 @dataclass
 class RawContent:
     """Raw content fetched by a gene."""
+
     item: ContentItem
     body: bytes
     content_type: str
@@ -379,6 +393,7 @@ class RawContent:
 @dataclass
 class NormalizedContent:
     """Normalized content produced by a gene's normalizer."""
+
     item: ContentItem
     markdown_body: str
     source_semantics: dict = field(default_factory=dict)
@@ -390,12 +405,13 @@ SourceExecutionKind = Literal["server", "local_agent"]
 @dataclass
 class GeneMetadata:
     """Static metadata for a gene type."""
-    name: str                            # "confluence", "jira", "teams", "outlook"
-    display_name: str                    # "Microsoft Teams"
+
+    name: str  # "confluence", "jira", "teams", "outlook"
+    display_name: str  # "Microsoft Teams"
     description: str
     default_sync_interval_minutes: int
-    auth_method: str                     # "pat" | "oauth2" | "api_key" | "browser_cookie"
-    data_shape: str                      # "document" | "ticket" | "message" | "email"
+    auth_method: str  # "pat" | "oauth2" | "api_key" | "browser_cookie"
+    data_shape: str  # "document" | "ticket" | "message" | "email"
     # Where source collection may run. Memory processing remains server-side.
     execution_kinds: tuple[SourceExecutionKind, ...] = ("server",)
 
@@ -403,6 +419,7 @@ class GeneMetadata:
 @dataclass
 class ConfigField:
     """A single configuration field for a gene's config schema."""
+
     key: str
     label: str
     field_type: ConfigFieldType
@@ -419,6 +436,7 @@ class ConfigField:
 @dataclass
 class ConfigGroup:
     """A group of config fields displayed together in the UI."""
+
     key: str
     label: str
     order: int = 0
@@ -434,6 +452,7 @@ class GeneConfigSchema:
     UI uses this to scope the binding editor to fields the gene actually
     populates.
     """
+
     groups: list[ConfigGroup] = field(default_factory=list)
     fields: list[ConfigField] = field(default_factory=list)
     project_field: str | None = None
@@ -442,6 +461,7 @@ class GeneConfigSchema:
 # ---------------------------------------------------------------------------
 # Sync models
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class FailedDoc:
@@ -540,10 +560,13 @@ _SOURCE_ARTIFACT_CLEANUP_NAMESPACE = uuid.UUID("8d83ca08-5d8c-45f4-8e50-0cd9964a
 
 def source_artifact_cleanup_task_id(source_id: str, artifact_uri: str) -> str:
     """Return the stable idempotency key for one deleted source artifact."""
-    return "sac-" + uuid.uuid5(
-        _SOURCE_ARTIFACT_CLEANUP_NAMESPACE,
-        f"{source_id}\0{artifact_uri}",
-    ).hex
+    return (
+        "sac-"
+        + uuid.uuid5(
+            _SOURCE_ARTIFACT_CLEANUP_NAMESPACE,
+            f"{source_id}\0{artifact_uri}",
+        ).hex
+    )
 
 
 @dataclass
@@ -564,9 +587,37 @@ class ChangelogEntry:
 # Search models
 # ---------------------------------------------------------------------------
 
+
+@dataclass(frozen=True, slots=True)
+class MemoryConflictContext:
+    """A visibility-safe Review disposition for one cross-source claim pair."""
+
+    review_id: str
+    counterpart_memory_id: str
+    counterpart_summary: str
+    review_status: str
+    disposition: str
+    reason: str | None = None
+    review_note: str | None = None
+    reviewer: str | None = None
+    resolved_at: str | None = None
+
+
+def conflict_disposition_for_review_status(review_status: str) -> str:
+    """Map durable Review status to the retrieval-facing pair disposition."""
+
+    return {
+        "approved": "confirmed",
+        "rejected": "dismissed",
+        "pending": "pending",
+        "stale": "stale",
+    }.get(review_status, "stale")
+
+
 @dataclass
 class SearchResult:
     """A single memory search result."""
+
     memory_id: str
     memory_type: str
     summary: str
@@ -577,6 +628,7 @@ class SearchResult:
     last_observed_at: str | None = None
     freshness: str = "current"  # current | stale | unverified
     contradiction_warning: str | None = None
+    conflict_contexts: tuple[MemoryConflictContext, ...] = ()
     status: str = "active"
     repo_identifier: str | None = None
     follow_up: dict[str, str] | None = None
@@ -586,6 +638,7 @@ class SearchResult:
 @dataclass
 class ReconcileOperation:
     """A single reconciliation operation from the LLM."""
+
     action: ReconcileAction
     memory_id: str | None = None  # existing memory ID (for UPDATE/SUPERSEDE/DELETE/NOOP)
     memory: RawMemory | None = None  # new or updated memory (for ADD/UPDATE/SUPERSEDE)
@@ -596,6 +649,7 @@ class ReconcileOperation:
 # ---------------------------------------------------------------------------
 # Memory reviews — workbench records for human-gated reconciliation
 # ---------------------------------------------------------------------------
+
 
 class ReviewStatus(str, Enum):
     PENDING = "pending"
@@ -641,6 +695,7 @@ def generate_deterministic_review_id(
 @dataclass
 class MemoryReview:
     """A pending or resolved human-review decision for a memory lifecycle change."""
+
     id: str
     kind: str
     status: str
@@ -659,6 +714,7 @@ class MemoryReview:
 @dataclass
 class MemoryReviewRelatedChallenger:
     """Additional challenger memory attached to a visible review case."""
+
     review_id: str
     challenger_memory_id: str
     reason: str | None = None

@@ -625,6 +625,18 @@ class MemoryEvidenceArtifactDetail(BaseModel):
     url: str
 
 
+class MemoryConflictContextDetail(BaseModel):
+    review_id: str
+    counterpart_memory_id: str
+    counterpart_summary: str
+    review_status: Literal["pending", "approved", "rejected", "stale"]
+    disposition: Literal["pending", "confirmed", "dismissed", "stale"]
+    reason: str | None = None
+    review_note: str | None = None
+    reviewer: str | None = None
+    resolved_at: str | None = None
+
+
 class MemoryResponse(BaseModel):
     id: str
     memory_type: str
@@ -660,6 +672,7 @@ class MemoryDetailResponse(MemoryResponse):
     entity_refs: list[str] = []
     sources: list[MemorySourceDetail] = []
     evidence_artifacts: list[MemoryEvidenceArtifactDetail] = []
+    conflict_contexts: list[MemoryConflictContextDetail] = []
 
 
 class MemoryListResponse(BaseModel):
@@ -3765,6 +3778,10 @@ def create_admin_app(
 
         origin_info = (await _origin_source_types(db, [memory_id])).get(memory_id, (None, None))
         origin_source_type, origin_client = origin_info
+        conflict_contexts = await db.list_memory_conflict_contexts(
+            [memory_id],
+            scope,
+        )
 
         return MemoryDetailResponse(
             id=mem.id,
@@ -3792,6 +3809,9 @@ def create_admin_app(
             entity_refs=entity_names,
             sources=source_details,
             evidence_artifacts=evidence_artifacts,
+            conflict_contexts=[
+                MemoryConflictContextDetail(**asdict(item)) for item in conflict_contexts.get(memory_id, ())
+            ],
             origin_source_type=origin_source_type,
             origin_client=origin_client,
         )
