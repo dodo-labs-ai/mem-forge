@@ -920,7 +920,7 @@ def test_packaged_plugin_version_is_consistent():
     import tomllib
 
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.51"
+    version = "0.1.52"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
@@ -2774,7 +2774,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "replace_memory" in tools
     assert "list_memory_reviews" in tools
     assert "get_memory_review" in tools
-    assert "refresh_memory_review" in tools
+    assert "refresh_memory_review" not in tools
     assert "resolve_memory_review" in tools
     assert "validate_memory_review_decisions" in tools
     assert "apply_memory_review_decisions" in tools
@@ -2786,10 +2786,6 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert tools["resolve_memory_review"]["annotations"] == {
         "readOnlyHint": False,
         "destructiveHint": True,
-    }
-    assert tools["refresh_memory_review"]["annotations"] == {
-        "readOnlyHint": False,
-        "destructiveHint": False,
     }
     result_schema = apply_tool["outputSchema"]["properties"]["results"]["items"]
     assert result_schema["additionalProperties"] is False
@@ -3655,7 +3651,7 @@ def test_mcp_proxy_forwards_memory_review_tools(monkeypatch):
             "review_id": "review-stale-1",
             "expected_fingerprint": "review-decision-v1:stale",
         },
-    ) == {"ok": True}
+    ) == {"error": "Unknown tool: refresh_memory_review"}
     assert proxy._call_tool(
         "resolve_memory_review",
         {
@@ -3671,13 +3667,8 @@ def test_mcp_proxy_forwards_memory_review_tools(monkeypatch):
     assert calls[1]["method"] == "GET"
     assert calls[1]["url"] == "https://self.example/api/v1/memory-reviews/rev-1"
     assert calls[2]["method"] == "POST"
-    assert calls[2]["url"] == "https://self.example/api/v1/memory-reviews/review-stale-1/refresh"
+    assert calls[2]["url"] == "https://self.example/api/v1/memory-reviews/rev-1/reject"
     assert json.loads(calls[2]["body"].decode()) == {
-        "expected_fingerprint": "review-decision-v1:stale",
-    }
-    assert calls[3]["method"] == "POST"
-    assert calls[3]["url"] == "https://self.example/api/v1/memory-reviews/rev-1/reject"
-    assert json.loads(calls[3]["body"].decode()) == {
         "expected_fingerprint": "review-decision-v1:abc",
         "note": "Not durable enough.",
     }
