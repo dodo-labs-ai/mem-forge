@@ -35,37 +35,25 @@ def test_self_hosted_workspace_directory_exposes_readable_local_workspace(
                     "role": "owner",
                     "status": "active",
                     "selectable": True,
-                    "is_default": True,
                 }
-            ],
-            "default_workspace_id": "local",
+            ]
         }
     finally:
         asyncio.run(database.close())
 
 
-def test_self_hosted_default_workspace_route_accepts_only_local(
+def test_self_hosted_default_workspace_route_is_absent(
     tmp_path: Path,
 ) -> None:
     app, database = _app(tmp_path)
     try:
         with TestClient(app) as client:
-            selected = client.put(
+            response = client.put(
                 "/api/v1/me/default-workspace",
                 json={"workspace_id": "local"},
             )
-            inaccessible = client.put(
-                "/api/v1/me/default-workspace",
-                json={"workspace_id": "another-workspace"},
-            )
 
-        assert selected.status_code == 200
-        assert selected.json() == {"default_workspace_id": "local"}
-        assert inaccessible.status_code == 404
-        assert inaccessible.json() == {
-            "code": "workspace_not_found_or_inaccessible",
-            "detail": "Workspace not found or inaccessible.",
-        }
+        assert response.status_code == 404
     finally:
         asyncio.run(database.close())
 
@@ -86,9 +74,7 @@ def test_self_hosted_data_plane_resolves_omitted_or_explicit_local_workspace(
                 params={"workspace_id": "another-workspace"},
             )
             empty = client.get("/api/v1/projects?workspace_id=")
-            duplicate = client.get(
-                "/api/v1/projects?workspace_id=local&workspace_id=local"
-            )
+            duplicate = client.get("/api/v1/projects?workspace_id=local&workspace_id=local")
             obsolete = client.get("/api/projects")
 
         assert implicit.status_code == 200

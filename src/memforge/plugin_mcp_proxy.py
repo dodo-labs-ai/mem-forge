@@ -87,7 +87,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.53"
+SERVER_VERSION = "0.1.54"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Local project context is optional. MemForge uses negotiated request-scoped host context when "
@@ -258,8 +258,7 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "list_workspaces",
         "description": (
-            "List workspaces accessible to the current principal and identify the optional "
-            "server-side hook fallback. Discovery is optional; other tools resolve omitted "
+            "List workspaces accessible to the current principal. Discovery is optional; other tools resolve omitted "
             "workspace_id from a user-confirmed local project binding or a singleton workspace. "
             "If multiple workspaces exist and the project is unbound, ask which workspace to use. "
             "Never change a binding or hook fallback silently."
@@ -268,31 +267,6 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {},
             "additionalProperties": False,
-        },
-    },
-    {
-        "name": "set_default_workspace",
-        "description": (
-            "Persist the server-side compatibility fallback used only by automatic MemForge hooks. "
-            "Interactive requests that omit workspace_id never use it. Call only after the user "
-            "explicitly confirms the change; prefer memforge-setup for local project bindings."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workspace_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": ("Workspace to use as the server-side compatibility fallback for automatic hooks."),
-                }
-            },
-            "required": ["workspace_id"],
-            "additionalProperties": False,
-        },
-        "annotations": {
-            "readOnlyHint": False,
-            "destructiveHint": False,
-            "idempotentHint": True,
         },
     },
     {
@@ -815,7 +789,7 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 for _tool in TOOLS:
-    if _tool["name"] in {"list_workspaces", "set_default_workspace"}:
+    if _tool["name"] == "list_workspaces":
         continue
     _tool["inputSchema"]["properties"]["repository_context"] = REPOSITORY_CONTEXT_SCHEMA
     _tool["inputSchema"]["properties"]["workspace_id"] = WORKSPACE_ID_SCHEMA
@@ -956,20 +930,6 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             "GET",
             "/workspaces",
             None,
-            target=configured_target(),
-            workspace_id=None,
-        )
-    if name == "set_default_workspace":
-        if any(key != "workspace_id" for key in args):
-            return {"error": "set_default_workspace accepts only workspace_id"}
-        try:
-            workspace_id = _required_string_arg(args, "workspace_id")
-        except ValueError as exc:
-            return {"error": str(exc)}
-        return _http_json(
-            "PUT",
-            "/me/default-workspace",
-            {"workspace_id": workspace_id},
             target=configured_target(),
             workspace_id=None,
         )

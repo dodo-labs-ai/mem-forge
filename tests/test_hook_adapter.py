@@ -910,10 +910,6 @@ def test_mcp_data_tools_accept_repository_context_but_workspace_directory_does_n
         if tool["name"] == "list_workspaces":
             assert tool["inputSchema"]["properties"] == {}
             continue
-        if tool["name"] == "set_default_workspace":
-            assert tool["inputSchema"]["required"] == ["workspace_id"]
-            assert "repository_context" not in tool["inputSchema"]["properties"]
-            continue
         assert "repository_context" in tool["inputSchema"]["properties"], tool["name"]
 
 
@@ -921,7 +917,7 @@ def test_packaged_plugin_version_is_consistent():
     import tomllib
 
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.53"
+    version = "0.1.54"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
@@ -4593,8 +4589,8 @@ def test_workspace_selection_conflict_has_actionable_hook_message(monkeypatch, c
     assert output == {
         "continue": True,
         "systemMessage": (
-            "MemForge automatic capture is waiting for a default workspace. "
-            "Choose one with list_workspaces, then confirm set_default_workspace."
+            "MemForge automatic capture is waiting for a local workspace binding. "
+            "Use the memforge-setup skill to bind this project or configure the hook fallback."
         ),
     }
 

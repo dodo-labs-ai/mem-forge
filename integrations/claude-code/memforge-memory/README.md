@@ -2,7 +2,7 @@
 
 This plugin connects Claude Code lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.53`.
+The packaged runtime and plugin version is `0.1.54`.
 
 With no routing variables, the plugin targets local OSS at
 `http://127.0.0.1:8765/api/v1`. Otherwise put the target in the top-level `env`
@@ -23,11 +23,11 @@ Set `MEMFORGE_API_TOKEN` separately in the process or
 top-level agent environment when bearer authentication is required; the token
 is an identity credential, not a workspace selector. Call `list_workspaces`
 when discovery is useful and pass optional `workspace_id` to any data tool for
-a one-request override. It may be omitted when the account has a default or
-exactly one accessible workspace. After the user explicitly confirms a choice,
-`set_default_workspace` persists the server-side default used by automatic
-hooks and later calls that omit `workspace_id`. Repository context remains
-provenance attribution; it never selects a workspace.
+a one-request override. It may be omitted when the account has exactly one
+accessible workspace or the project has a user-confirmed local binding. Use the
+`memforge-setup` skill to bind a Git repository or ordinary directory and, when
+desired, configure the client-local hook fallback. Repository context remains
+provenance attribution; it never selects or authorizes a workspace.
 
 Do not add a manual MCP server block for MemForge. The plugin's `.mcp.json`
 registers the MCP server; duplicating it in config can pin the agent to a stale
