@@ -94,7 +94,7 @@ MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.53"
+PLUGIN_VERSION = "0.1.54"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -1704,8 +1704,8 @@ def _safe_exception_message(exc: Exception) -> str:
 def _hook_system_message(exc: Exception) -> str:
     if isinstance(exc, WorkspaceSelectionRequiredError):
         return (
-            "MemForge automatic capture is waiting for a default workspace. "
-            "Choose one with list_workspaces, then confirm set_default_workspace."
+            "MemForge automatic capture is waiting for a local workspace binding. "
+            "Use the memforge-setup skill to bind this project or configure the hook fallback."
         )
     return f"MemForge hook skipped: {_safe_exception_message(exc)}"
 
