@@ -60,6 +60,28 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
         configured_target = _config_module.configured_target
 
 try:
+    from .workspace_bindings import resolve_workspace_binding
+except ImportError:  # pragma: no cover - copied plugin package or direct file load
+    try:
+        from memforge_workspace_bindings import resolve_workspace_binding
+    except ImportError:
+        import importlib.util
+
+        _workspace_bindings_path = Path(__file__).with_name("memforge_workspace_bindings.py")
+        if not _workspace_bindings_path.exists():
+            _workspace_bindings_path = Path(__file__).with_name("workspace_bindings.py")
+        _workspace_bindings_spec = importlib.util.spec_from_file_location(
+            "memforge_workspace_bindings",
+            _workspace_bindings_path,
+        )
+        if _workspace_bindings_spec is None or _workspace_bindings_spec.loader is None:
+            raise
+        _workspace_bindings_module = importlib.util.module_from_spec(_workspace_bindings_spec)
+        sys.modules[_workspace_bindings_spec.name] = _workspace_bindings_module
+        _workspace_bindings_spec.loader.exec_module(_workspace_bindings_module)
+        resolve_workspace_binding = _workspace_bindings_module.resolve_workspace_binding
+
+try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None
@@ -72,7 +94,7 @@ MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.52"
+PLUGIN_VERSION = "0.1.53"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -407,18 +429,26 @@ def request_session_capture(
     db_path = _agent_queue_db_path(queue_db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     now = _now_iso()
+    target = configured_target()
+    workspace_resolution = resolve_workspace_binding(
+        origin=target.origin,
+        working_directory=workspace,
+        allow_hook_default=True,
+    )
+    workspace_id = workspace_resolution.workspace_id
     with sqlite3.connect(db_path) as connection:
         _ensure_session_cursor(connection)
         connection.execute(
             """
             INSERT INTO session_cursor (
-                client, session_id, transcript_path, workspace,
+                client, session_id, transcript_path, workspace, workspace_id,
                 captured_through, capture_pending, pending_trigger, request_seq, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, 0, 1, ?, 1, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 0, 1, ?, 1, ?, ?)
             ON CONFLICT(client, session_id) DO UPDATE SET
                 transcript_path = excluded.transcript_path,
                 workspace = excluded.workspace,
+                workspace_id = COALESCE(session_cursor.workspace_id, excluded.workspace_id),
                 capture_pending = 1,
                 request_seq = session_cursor.request_seq + 1,
                 pending_trigger = CASE
@@ -429,7 +459,7 @@ def request_session_capture(
                 END,
                 updated_at = excluded.updated_at
             """,
-            (client, session_id, transcript_path, workspace, trigger, now, now),
+            (client, session_id, transcript_path, workspace, workspace_id, trigger, now, now),
         )
 
 
@@ -615,7 +645,8 @@ def _claim_pending_sessions(
     try:
         rows = connection.execute(
             """
-            SELECT client, session_id, transcript_path, workspace, captured_through, pending_trigger, request_seq
+            SELECT client, session_id, transcript_path, workspace, workspace_id,
+                   captured_through, pending_trigger, request_seq
             FROM session_cursor
             WHERE capture_pending = 1 AND (lease_until IS NULL OR lease_until < ?)
             ORDER BY updated_at
@@ -654,6 +685,7 @@ def _process_session_captures(db_path: Path, *, timeout: float, max_sessions: in
             session_id,
             transcript_path,
             workspace,
+            workspace_id,
             captured_through,
             trigger,
             request_seq,
@@ -701,7 +733,15 @@ def _process_session_captures(db_path: Path, *, timeout: float, max_sessions: in
                     to_line=count,
                     trigger=trigger,
                 )
-                _post_json("/agent-sessions/windows", window_payload, timeout=timeout)
+                if workspace_id is None:
+                    _post_json("/agent-sessions/windows", window_payload, timeout=timeout)
+                else:
+                    _post_json(
+                        "/agent-sessions/windows",
+                        window_payload,
+                        timeout=timeout,
+                        workspace_id=workspace_id,
+                    )
             except Exception as exc:
                 # Keep capture_pending set so the next pass retries; release the lease.
                 connection.execute(
@@ -808,8 +848,27 @@ def _agent_worker_timeout() -> float:
     return _env_float("MEMFORGE_AGENT_WORKER_TIMEOUT_SECONDS", DEFAULT_AGENT_WORKER_TIMEOUT_SECONDS)
 
 
-def _post_json(path: str, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
-    url = _resource_url(path, repository_paths=_target_repository_paths(payload))
+def _post_json(
+    path: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float,
+    workspace_id: str | None = None,
+) -> dict[str, Any]:
+    target = configured_target()
+    if workspace_id is None:
+        resolution = resolve_workspace_binding(
+            origin=target.origin,
+            root_paths=_target_repository_paths(payload),
+            allow_hook_default=True,
+        )
+        workspace_id = resolution.workspace_id
+    url = _resource_url(
+        path,
+        repository_paths=_target_repository_paths(payload),
+        workspace_id=workspace_id,
+        target=target,
+    )
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     api_token = configured_api_token()
@@ -831,10 +890,7 @@ def _post_json(path: str, payload: dict[str, Any], *, timeout: float) -> dict[st
                 error_payload = json.loads(detail)
             except json.JSONDecodeError:
                 error_payload = None
-            if (
-                isinstance(error_payload, dict)
-                and error_payload.get("code") == "workspace_selection_required"
-            ):
+            if isinstance(error_payload, dict) and error_payload.get("code") == "workspace_selection_required":
                 raise WorkspaceSelectionRequiredError from exc
         raise RuntimeError(f"{path} returned HTTP {exc.code}: {detail}") from exc
     if not response_body:
@@ -845,8 +901,15 @@ def _post_json(path: str, payload: dict[str, Any], *, timeout: float) -> dict[st
     return data
 
 
-def _resource_url(path: str, *, repository_paths: tuple[str, ...] = ()) -> str:
-    return configured_target().resource_url(path)
+def _resource_url(
+    path: str,
+    *,
+    repository_paths: tuple[str, ...] = (),
+    workspace_id: str | None = None,
+    target: Any = None,
+) -> str:
+    del repository_paths  # retained for compatibility with packaged callers
+    return (target or configured_target()).resource_url(path, workspace_id=workspace_id)
 
 
 def _target_repository_paths(payload: dict[str, Any]) -> tuple[str, ...]:
@@ -869,11 +932,7 @@ def _repo_name(payload: dict[str, Any]) -> str | None:
     normalized_remote = normalize_repo_identifier(remote)
     if normalized_remote:
         return normalized_remote
-    root = _git_value(payload, ["git", "rev-parse", "--show-toplevel"])
-    if root:
-        return Path(root).name
-    workspace = _workspace(payload)
-    return Path(workspace).name if workspace else None
+    return None
 
 
 def _git_value(payload: dict[str, Any], command: list[str]) -> str | None:
@@ -1584,6 +1643,7 @@ def _ensure_session_cursor(connection: sqlite3.Connection) -> None:
             session_id TEXT NOT NULL,
             transcript_path TEXT,
             workspace TEXT,
+            workspace_id TEXT,
             captured_through INTEGER NOT NULL DEFAULT 0,
             capture_pending INTEGER NOT NULL DEFAULT 0,
             pending_trigger TEXT,
@@ -1600,6 +1660,7 @@ def _ensure_session_cursor(connection: sqlite3.Connection) -> None:
     )
     _ensure_column(connection, "session_cursor", "lease_token", "TEXT")
     _ensure_column(connection, "session_cursor", "request_seq", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(connection, "session_cursor", "workspace_id", "TEXT")
 
 
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:

@@ -41,6 +41,37 @@ PLUGIN_CONFIG_GENERATED_COPIES = (
     ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
     ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
 )
+WORKSPACE_BINDINGS_CANONICAL = ROOT / "src" / "memforge" / "workspace_bindings.py"
+WORKSPACE_BINDINGS_GENERATED_COPIES = (
+    ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_workspace_bindings.py",
+    ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_workspace_bindings.py",
+)
+SETUP_SKILL_CANONICAL = (
+    ROOT / "integrations" / "codex" / "memforge-memory" / "skills" / "memforge-setup" / "SKILL.md"
+)
+SETUP_SKILL_GENERATED_COPIES = (
+    ROOT / "integrations" / "claude-code" / "memforge-memory" / "skills" / "memforge-setup" / "SKILL.md",
+)
+SETUP_HELPER_CANONICAL = (
+    ROOT
+    / "integrations"
+    / "codex"
+    / "memforge-memory"
+    / "skills"
+    / "memforge-setup"
+    / "scripts"
+    / "workspace_config.py"
+)
+SETUP_HELPER_GENERATED_COPIES = (
+    ROOT
+    / "integrations"
+    / "claude-code"
+    / "memforge-memory"
+    / "skills"
+    / "memforge-setup"
+    / "scripts"
+    / "workspace_config.py",
+)
 CANONICAL_PLUGIN_CONFIG_TARGET_IMPORT = b"""if __package__:
     from .api_target import MemForgeTarget, build_target
 else:  # pragma: no cover - direct file load used by packaged integrations
@@ -75,6 +106,9 @@ PLUGIN_RUNTIME_FILES = (
         PLUGIN_CONFIG_GENERATED_COPIES,
         packaged_plugin_config_content,
     ),
+    (WORKSPACE_BINDINGS_CANONICAL, WORKSPACE_BINDINGS_GENERATED_COPIES, None),
+    (SETUP_SKILL_CANONICAL, SETUP_SKILL_GENERATED_COPIES, None),
+    (SETUP_HELPER_CANONICAL, SETUP_HELPER_GENERATED_COPIES, None),
 )
 
 
