@@ -50,8 +50,8 @@ class QueryScoredKeyword:
         self.full_score = full_score
         self.quoted_score = quoted_score
 
-    async def search_metadata(self, query: str, *args, **kwargs):
-        score = self.full_score if '"Find"' in query else self.quoted_score
+    async def search_metadata(self, query, *args, **kwargs):
+        score = self.full_score if query.exact_anchors else self.quoted_score
         return [
             KeywordCandidate(
                 memory_id="m-access-review",
@@ -414,6 +414,13 @@ async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch)
             "SFPAY-179397: Create Blocker Hint in On Demand Lifecycle Assignment | "
             "SFPAY-179397 | PAY | MountTai Defects | https://x/SFPAY-179397"
         ],
+        "matched_terms": ["create", "blocker", "hint"],
+        "term_coverage": 1.0,
+        "term_weights": {
+            "create": pytest.approx(0.28768207245178085),
+            "blocker": pytest.approx(0.28768207245178085),
+            "hint": pytest.approx(0.28768207245178085),
+        },
         "source_refs": [
             {
                 "source_id": "src-jira",
@@ -464,7 +471,10 @@ async def test_requested_known_item_recalls_quoted_title_inside_natural_language
     evidence = result["results"][0].retrieval_evidence
     assert evidence is not None
     assert evidence["metadata_lexical"]["channel"] == "bm25_metadata_tokens"
-    assert evidence["metadata_lexical"]["query_paths"] == ["quoted_identity"]
+    assert evidence["metadata_lexical"]["query_paths"] == [
+        "full_query",
+        "quoted_identity",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -526,7 +536,7 @@ async def test_metadata_query_paths_only_report_retained_channel_hits(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("intent", [None, "general_hybrid"])
-async def test_quoted_title_is_not_expanded_without_requested_known_item(
+async def test_exact_quoted_title_is_an_anchor_without_requested_known_item(
     db,
     intent,
 ):
@@ -538,7 +548,7 @@ async def test_quoted_title_is_not_expanded_without_requested_known_item(
         top_k=10,
     )
 
-    assert result["results"] == []
+    assert [item.memory_id for item in result["results"]] == ["m-access-review"]
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 case_schema_version: 3
 case_set_id: retrieval-core-v1
-case_set_sha: sha256:0e6573a90ce76b1fb20d24c532306550aeb019860af309c47d4539a13223ae7f
+case_set_sha: sha256:67695d465764066971c60c12d4f112b0bb629a3df2d65f6885d5190c27b000ce
 case_files:
   - metadata_lexical.yaml
   - hybrid_fusion.yaml
@@ -46,6 +46,11 @@ fixtures:
         source_id: src-payroll
         title: Payroll Listing Evaluation Source
         source_url: https://eval.example/doc-listing
+        space_or_project: PAY
+      - doc_id: SFPAY-181363
+        source_id: src-payroll
+        title: Command failure No process tree found before a new vector process map is ready
+        source_url: https://eval.example/SFPAY-181363
         space_or_project: PAY
     memories:
       - id: mem-blocker-hint
@@ -120,6 +125,24 @@ fixtures:
       - id: mem-listing-15
         content: Payroll listing fixture memory 15.
         project_key: PAY
+      - id: mem-process-tree-01
+        content: No process tree found is classified as non-retryable before persistence completes.
+        project_key: PAY
+      - id: mem-process-tree-02
+        content: The new vector reaches validation before its tree is persisted.
+        project_key: PAY
+      - id: mem-process-tree-03
+        content: VALIDATION_STATE records the permanent initialization outcome.
+        project_key: PAY
+      - id: mem-process-tree-04
+        content: HandlePeriodInitializationCommand arrives before durable tree creation.
+        project_key: PAY
+      - id: mem-process-tree-05
+        content: The timing gap is approximately one hundred seconds.
+        project_key: PAY
+      - id: mem-process-tree-06
+        content: Retrying is disabled after the validation classification is persisted.
+        project_key: PAY
     entities:
       - canonical_name: rule locking
         display_name: Rule Locking
@@ -177,4 +200,22 @@ fixtures:
         source_type: jira
       - memory_id: mem-listing-15
         doc_id: doc-listing
+        source_type: jira
+      - memory_id: mem-process-tree-01
+        doc_id: SFPAY-181363
+        source_type: jira
+      - memory_id: mem-process-tree-02
+        doc_id: SFPAY-181363
+        source_type: jira
+      - memory_id: mem-process-tree-03
+        doc_id: SFPAY-181363
+        source_type: jira
+      - memory_id: mem-process-tree-04
+        doc_id: SFPAY-181363
+        source_type: jira
+      - memory_id: mem-process-tree-05
+        doc_id: SFPAY-181363
+        source_type: jira
+      - memory_id: mem-process-tree-06
+        doc_id: SFPAY-181363
         source_type: jira

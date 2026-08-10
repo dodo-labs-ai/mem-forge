@@ -8,6 +8,7 @@ import pytest
 
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
+from memforge.retrieval.query_plan import build_lexical_query_plan
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch
@@ -129,6 +130,161 @@ async def test_metadata_title_tokens_recall_source_title(db):
     assert "metadata_any" in hits[0].matched_fields
     assert hits[0].source_refs[0].source_id == "src-jira"
     assert hits[0].source_refs[0].doc_id == "SFPAY-179397"
+
+
+@pytest.mark.asyncio
+async def test_metadata_ordinary_terms_use_shared_three_of_five_coverage(db):
+    await db.insert_memory(_memory("m-process-map", "Different extracted wording"))
+    await db.upsert_source(
+        "src-jira",
+        "jira",
+        "MountTai Defects",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await _upsert_doc(
+        db,
+        doc_id="SFPAY-181363",
+        source="src-jira",
+        title="Command failed before process initialization",
+    )
+    await db.add_memory_source(
+        "m-process-map",
+        "SFPAY-181363",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    hits = await SqliteKeywordSearch(db).search_metadata(
+        build_lexical_query_plan("process map failed command error").metadata,
+        _scope(),
+        None,
+        limit=10,
+    )
+
+    assert [hit.memory_id for hit in hits] == ["m-process-map"]
+    assert hits[0].matched_terms == ("process", "failed", "command")
+    assert hits[0].term_coverage == pytest.approx(0.6)
+
+
+@pytest.mark.asyncio
+async def test_metadata_coverage_does_not_combine_different_support_rows(db):
+    await db.insert_memory(_memory("m-split", "Different extracted wording"))
+    await db.upsert_source(
+        "src-jira",
+        "jira",
+        "MountTai Defects",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await _upsert_doc(
+        db,
+        doc_id="SFPAY-181363",
+        source="src-jira",
+        title="Process map initialization",
+    )
+    await _upsert_doc(
+        db,
+        doc_id="SFPAY-181364",
+        source="src-jira",
+        title="Failed command initialization",
+    )
+    for doc_id in ("SFPAY-181363", "SFPAY-181364"):
+        await db.add_memory_source(
+            "m-split",
+            doc_id,
+            "jira",
+            support_kind="extracted",
+            source_updated_at=datetime.now(timezone.utc),
+        )
+
+    hits = await SqliteKeywordSearch(db).search_metadata(
+        build_lexical_query_plan("process map failed command error").metadata,
+        _scope(),
+        None,
+        limit=10,
+    )
+
+    assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_idf_ranks_rarer_matched_term_first_after_coverage_gate(db):
+    await db.upsert_source(
+        "src-jira",
+        "jira",
+        "MountTai Defects",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    titles = {
+        "m-rare": "Process non-retryable initialization",
+        "m-common": "Process command initialization",
+        "m-background": "Process command operations",
+    }
+    for index, (memory_id, title) in enumerate(titles.items(), start=1):
+        doc_id = f"SFPAY-18136{index}"
+        await db.insert_memory(_memory(memory_id, "Different extracted wording"))
+        await _upsert_doc(db, doc_id=doc_id, source="src-jira", title=title)
+        await db.add_memory_source(
+            memory_id,
+            doc_id,
+            "jira",
+            support_kind="extracted",
+            source_updated_at=datetime.now(timezone.utc),
+        )
+
+    hits = await SqliteKeywordSearch(db).search_metadata(
+        build_lexical_query_plan("process command non-retryable").metadata,
+        _scope(),
+        None,
+        limit=10,
+    )
+
+    assert hits[0].memory_id == "m-rare"
+    assert {hit.memory_id for hit in hits[1:]} == {"m-common", "m-background"}
+    assert dict(hits[0].term_weights)["non-retryable"] > dict(hits[1].term_weights)["command"]
+
+
+@pytest.mark.asyncio
+async def test_metadata_exact_anchor_qualifies_without_ordinary_term_coverage(db):
+    await db.insert_memory(_memory("m-ticket", "Different extracted wording"))
+    await db.upsert_source(
+        "src-jira",
+        "jira",
+        "MountTai Defects",
+        "{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await _upsert_doc(
+        db,
+        doc_id="SFPAY-181363",
+        source="src-jira",
+        title="Command failure before process tree is ready",
+    )
+    await db.add_memory_source(
+        "m-ticket",
+        "SFPAY-181363",
+        "jira",
+        support_kind="extracted",
+        source_updated_at=datetime.now(timezone.utc),
+    )
+
+    hits = await SqliteKeywordSearch(db).search_metadata(
+        build_lexical_query_plan("SFPAY-181363 unrelated ordinary words").metadata,
+        _scope(),
+        None,
+        limit=10,
+    )
+
+    assert [hit.memory_id for hit in hits] == ["m-ticket"]
+    assert hits[0].matched_fields == ("metadata_exact_anchor",)
+    assert hits[0].matched_terms == ("SFPAY-181363",)
 
 
 @pytest.mark.asyncio
