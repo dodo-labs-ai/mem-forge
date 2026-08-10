@@ -22,7 +22,7 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, RetrievalConfig
+from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, DEFAULT_SEARCH_TOP_K, RetrievalConfig
 from memforge.llm.structured import StructuredLlmError
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
@@ -519,7 +519,7 @@ class SearchEngine:
         time_range: MemoryTimeRange | None = None,
         entities: list[str] | None = None,
         include_superseded: bool = False,
-        top_k: int = 10,
+        top_k: int = DEFAULT_SEARCH_TOP_K,
         *,
         source_filter: MemorySourceFilter | None = None,
         request_scope: AccessScope | None = None,
