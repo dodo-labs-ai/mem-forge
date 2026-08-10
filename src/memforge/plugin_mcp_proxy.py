@@ -63,18 +63,41 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
         configured_api_token = _config_module.configured_api_token
         configured_target = _config_module.configured_target
 
+try:
+    from .workspace_bindings import resolve_workspace_binding
+except ImportError:  # pragma: no cover - copied plugin package or direct file load
+    try:
+        from memforge_workspace_bindings import resolve_workspace_binding
+    except ImportError:
+        import importlib.util
+
+        _workspace_bindings_path = Path(__file__).with_name("memforge_workspace_bindings.py")
+        if not _workspace_bindings_path.exists():
+            _workspace_bindings_path = Path(__file__).with_name("workspace_bindings.py")
+        _workspace_bindings_spec = importlib.util.spec_from_file_location(
+            "memforge_workspace_bindings",
+            _workspace_bindings_path,
+        )
+        if _workspace_bindings_spec is None or _workspace_bindings_spec.loader is None:
+            raise
+        _workspace_bindings_module = importlib.util.module_from_spec(_workspace_bindings_spec)
+        sys.modules[_workspace_bindings_spec.name] = _workspace_bindings_module
+        _workspace_bindings_spec.loader.exec_module(_workspace_bindings_module)
+        resolve_workspace_binding = _workspace_bindings_module.resolve_workspace_binding
+
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.52"
+SERVER_VERSION = "0.1.53"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
-    "Repository context is optional. MemForge uses negotiated request-scoped host context when "
+    "Local project context is optional. MemForge uses negotiated request-scoped host context when "
     "available. Otherwise, when the coding host exposes an exact current working directory, pass "
     "it as repository_context.working_directory. Never guess or use a plugin/install directory. "
     "Omit it when unavailable; the operation must continue. Explicit repository_context takes "
     "precedence. MemForge derives repository attribution locally and never sends the local path "
     "to the service. Workspace selection is request-scoped through the optional workspace_id "
-    "tool parameter."
+    "tool parameter or a user-confirmed local project binding. The hook fallback is never used "
+    "for interactive tool calls."
 )
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 RANKED_RETRIEVAL_INTENTS = ["general_hybrid", "known_item", "relationship"]
@@ -146,8 +169,9 @@ WORKSPACE_ID_SCHEMA = {
     "type": "string",
     "minLength": 1,
     "description": (
-        "Optional workspace selected for this call. Omit it to use the server-side default or "
-        "the caller's only accessible workspace."
+        "Optional workspace selected for this call. It overrides any local project binding. "
+        "When omitted, MemForge uses a local binding or the caller's only accessible workspace; "
+        "it never uses the hook fallback for interactive calls."
     ),
 }
 
@@ -235,10 +259,10 @@ TOOLS: list[dict[str, Any]] = [
         "name": "list_workspaces",
         "description": (
             "List workspaces accessible to the current principal and identify the optional "
-            "server-side default. Discovery is optional; other tools resolve omitted workspace_id "
-            "without requiring this tool to be called first. If multiple workspaces exist and no "
-            "default is set, ask which workspace to use for the current request. Separately offer "
-            "to set it as the default for automatic hooks; never change the default silently."
+            "server-side hook fallback. Discovery is optional; other tools resolve omitted "
+            "workspace_id from a user-confirmed local project binding or a singleton workspace. "
+            "If multiple workspaces exist and the project is unbound, ask which workspace to use. "
+            "Never change a binding or hook fallback silently."
         ),
         "inputSchema": {
             "type": "object",
@@ -249,10 +273,9 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "set_default_workspace",
         "description": (
-            "Persist the workspace used by automatic MemForge hooks and by requests that omit "
-            "workspace_id. Call only after the user explicitly confirms making this their default. "
-            "A workspace_id supplied to another tool is a one-request override and must never "
-            "change this preference implicitly."
+            "Persist the server-side compatibility fallback used only by automatic MemForge hooks. "
+            "Interactive requests that omit workspace_id never use it. Call only after the user "
+            "explicitly confirms the change; prefer memforge-setup for local project bindings."
         ),
         "inputSchema": {
             "type": "object",
@@ -260,9 +283,7 @@ TOOLS: list[dict[str, Any]] = [
                 "workspace_id": {
                     "type": "string",
                     "minLength": 1,
-                    "description": (
-                        "Workspace to use by default for automatic hooks and requests that omit workspace_id."
-                    ),
+                    "description": ("Workspace to use as the server-side compatibility fallback for automatic hooks."),
                 }
             },
             "required": ["workspace_id"],
@@ -823,11 +844,17 @@ class ResourceTarget:
 
 
 class ToolCallContext:
-    __slots__ = ("target", "repo_identifier")
+    __slots__ = ("target", "repo_identifier", "workspace_id")
 
-    def __init__(self, target: Any, repo_identifier: str | None) -> None:
+    def __init__(
+        self,
+        target: Any,
+        repo_identifier: str | None,
+        workspace_id: str | None,
+    ) -> None:
         self.target = target
         self.repo_identifier = repo_identifier
+        self.workspace_id = workspace_id
 
 
 def main() -> int:
@@ -957,6 +984,7 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
         workspace_id = _optional_string_arg(args, "workspace_id")
     except ValueError as exc:
         return {"error": str(exc)}
+    workspace_id = workspace_id or call_context.workspace_id
     args = {key: value for key, value in args.items() if key not in {"repository_context", "workspace_id"}}
     if name == "search":
         try:
@@ -1461,6 +1489,7 @@ def _validate_time_range(value: Any) -> dict[str, str]:
 
 
 def _active_repo_identifier() -> str | None:
+    """Compatibility seam for callers/tests that override negotiated repo attribution."""
     return resolve_repository_context(root_paths=_CLIENT_ROOT_PATHS).repo_identifier
 
 
@@ -1474,9 +1503,16 @@ def _tool_call_context(value: Any, *, request_meta: Any = None) -> ToolCallConte
 
     sandbox_cwd = _codex_sandbox_cwd(request_meta)
     if sandbox_cwd is None:
+        target = configured_target()
+        resolution = resolve_workspace_binding(
+            origin=target.origin,
+            root_paths=_CLIENT_ROOT_PATHS,
+            allow_hook_default=False,
+        )
         return ToolCallContext(
-            target=configured_target(),
-            repo_identifier=_active_repo_identifier(),
+            target=target,
+            repo_identifier=_active_repo_identifier() or resolution.repo_identifier,
+            workspace_id=resolution.workspace_id,
         )
 
     return _tool_call_context_from_working_directory(
@@ -1506,11 +1542,21 @@ def _tool_call_context_from_working_directory(
     repository_context = resolve_repository_context(
         working_directory=working_directory,
     )
-    if repository_context.state != "exact" or not repository_context.repo_identifier:
-        raise ValueError(f"{field_name} must resolve to a Git repository with an origin remote")
+    if repository_context.state not in {"exact", "absent"}:
+        raise ValueError(f"{field_name} must resolve to one local directory")
+    target = configured_target()
+    try:
+        resolution = resolve_workspace_binding(
+            origin=target.origin,
+            working_directory=working_directory,
+            allow_hook_default=False,
+        )
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must resolve to one existing local directory") from exc
     return ToolCallContext(
-        target=configured_target(),
-        repo_identifier=repository_context.repo_identifier,
+        target=target,
+        repo_identifier=resolution.repo_identifier,
+        workspace_id=resolution.workspace_id,
     )
 
 
@@ -1609,11 +1655,12 @@ def _tool_result(payload: dict[str, Any], *, structured: bool = False) -> dict[s
             ],
             "isError": False,
         }
+    is_error = "error" in payload
     result = {
         "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
-        "isError": False,
+        "isError": is_error,
     }
-    if structured and "error" not in payload:
+    if structured and not is_error:
         result["structuredContent"] = payload
     return result
 
