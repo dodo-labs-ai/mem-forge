@@ -305,7 +305,7 @@ def test_search_cli_forwards_exact_source_ids(monkeypatch):
                 "api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
                 "api_token": "token-1",
                 "query": "",
-                "top_k": 10,
+                "top_k": 20,
                 "include_superseded": False,
                 "source_filter": {"source_ids": ["src-mounttai"]},
                 "time_range": {

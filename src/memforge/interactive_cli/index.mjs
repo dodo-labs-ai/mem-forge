@@ -365,7 +365,7 @@ async function actionSearch() {
   const answers = await group(
     {
       query: () => text({ message: "Search query", validate: required }),
-      topK: () => text({ message: "Top K", placeholder: "10" }),
+      topK: () => text({ message: "Top K", placeholder: "20" }),
       includeSuperseded: () => confirm({ message: "Include superseded memories?", initialValue: false }),
     },
     { onCancel: goBack },

@@ -2768,6 +2768,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "does not make ranked retrieval exhaustive" in properties["top_k"]["description"]
     assert "list_recent_memories" in properties["top_k"]["description"]
     assert "backlog" not in properties["top_k"]["description"].lower()
+    assert properties["top_k"]["default"] == 20
     assert properties["top_k"]["minimum"] == 1
     assert properties["top_k"]["maximum"] == 50
     assert properties["offset"]["default"] == 0

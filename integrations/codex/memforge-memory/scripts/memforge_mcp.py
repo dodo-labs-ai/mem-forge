@@ -127,6 +127,7 @@ TIME_RANGE_ALLOWED_KEYS = frozenset({"date_type", "start_date", "end_date"})
 DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SEARCH_TOP_K_MIN = 1
 SEARCH_TOP_K_MAX = 50
+SEARCH_TOP_K_DEFAULT = 20
 RECENT_MEMORY_ALLOWED_KEYS = frozenset(
     {
         "source_ids",
@@ -365,11 +366,11 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "top_k": {
                     "type": "integer",
-                    "default": 10,
+                    "default": SEARCH_TOP_K_DEFAULT,
                     "minimum": SEARCH_TOP_K_MIN,
                     "maximum": SEARCH_TOP_K_MAX,
                     "description": (
-                        "Page size within the bounded ranked window. Default is 10; increasing it up to 50 "
+                        "Page size within the bounded ranked window. Default is 20; increasing it up to 50 "
                         "does not make ranked retrieval exhaustive. Use list_recent_memories for deterministic "
                         "time/source enumeration."
                     ),
