@@ -35,6 +35,7 @@ from memforge.retrieval.intents import (
     validate_requested_intent,
 )
 from memforge.retrieval.query_analyzer import QueryAnalysis
+from memforge.retrieval.query_plan import build_lexical_query_plan
 from memforge.retrieval.rank_fusion import (
     RankedChannelItem,
     weighted_reciprocal_rank_fusion,
@@ -830,11 +831,11 @@ class SearchEngine:
         time_range: MemoryTimeRange | None,
     ) -> list[KeywordCandidate]:
         """Query the source-metadata keyword channel."""
-        sanitized_query = sanitize_fts_query(query)
-        if not sanitized_query:
+        query_plan = build_lexical_query_plan(query).metadata
+        if not query_plan.ordinary_terms and not query_plan.exact_anchors:
             return []
         return await self._keyword.search_metadata(
-            sanitized_query,
+            query_plan,
             scope,
             memory_types,
             limit,
@@ -1433,6 +1434,9 @@ def _metadata_keyword_evidence(hit: KeywordCandidate) -> dict[str, Any]:
         "channel": hit.channel,
         "matched_fields": list(hit.matched_fields),
         "matched_text": list(hit.matched_text),
+        "matched_terms": list(hit.matched_terms),
+        "term_coverage": hit.term_coverage,
+        "term_weights": dict(hit.term_weights),
         "source_refs": [
             {
                 "source_id": ref.source_id,

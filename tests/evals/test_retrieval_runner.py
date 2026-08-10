@@ -18,7 +18,7 @@ async def test_sqlite_runner_executes_core_hard_cases(tmp_path) -> None:
         db_path=tmp_path / "retrieval-eval.db",
     )
 
-    assert report.case_count == 11
+    assert report.case_count == 12
     assert report.hard_failures == ()
 
     assert report.case_results["exact_external_id_lookup"].ranked_ids[0] == "mem-blocker-hint"
@@ -27,15 +27,19 @@ async def test_sqlite_runner_executes_core_hard_cases(tmp_path) -> None:
     assert wrapped_title.rank("mem-access-review") <= 3
     assert wrapped_title.evidence_by_memory["mem-access-review"]["metadata_lexical"][
         "query_paths"
-    ] == ["quoted_identity"]
+    ] == ["full_query", "quoted_identity"]
     assert report.case_results["compact_trigram_metadata_recall"].rank("mem-blocker-hint") <= 10
-    assert report.case_results["queryless_source_listing"].total_candidates == 17
+    cluster_case = report.case_results["metadata_three_of_five_source_cluster_recall"]
+    assert {
+        f"mem-process-tree-{index:02d}" for index in range(1, 7)
+    }.issubset(cluster_case.ranked_ids[:10])
+    assert report.case_results["queryless_source_listing"].total_candidates == 23
 
     assert report.qrels["metadata_title_exact"] == {"mem-access-review": 3}
     assert report.run["exact_external_id_lookup"]["mem-blocker-hint"] > 0
     assert report.run["exact_external_id_lookup"]["mem-blocker-hint"] == 1.0
     assert report.to_json()["summary"] == {
-        "case_count": 11,
+        "case_count": 12,
         "hard_failures": 0,
     }
     assert list(tmp_path.glob("retrieval-eval-*.db")) == []
