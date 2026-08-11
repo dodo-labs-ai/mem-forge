@@ -57,6 +57,7 @@ from memforge.source_projection import (
 )
 from memforge.source_artifacts import SourceArtifactEvidence, SourceArtifactRevision
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
+from memforge.retrieval.query_plan import MetadataLexicalQueryPlan
 from memforge.source_activity import SourceActivityLease
 from memforge.storage.adapters.context import AccessScope
 
@@ -80,6 +81,9 @@ class KeywordCandidate:
     matched_fields: tuple[str, ...] = ()
     source_refs: tuple[KeywordSourceRef, ...] = ()
     matched_text: tuple[str, ...] = ()
+    matched_terms: tuple[str, ...] = ()
+    term_coverage: float = 0.0
+    term_weights: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -880,7 +884,7 @@ class KeywordSearch(Protocol):
 
     async def search_metadata(
         self,
-        fts_query: str,
+        query_plan: MetadataLexicalQueryPlan,
         scope: AccessScope,
         memory_types: list[str] | None,
         limit: int,

@@ -32,7 +32,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from memforge.config import AppConfig
+from memforge.config import DEFAULT_SEARCH_TOP_K, AppConfig
 from memforge.auth import browser_session
 from memforge.auth.jira_auth import (
     JiraAuthSessionError,
@@ -896,7 +896,7 @@ class MemorySearchRequest(BaseModel):
     time_range: MemoryTimeRangeRequest | None = None
     entities: list[str] | None = None
     include_superseded: bool = False
-    top_k: int = Field(default=10, ge=1, le=50)
+    top_k: int = Field(default=DEFAULT_SEARCH_TOP_K, ge=1, le=50)
     offset: int = Field(default=0, ge=0)
     active_project: str | None = None
     active_repo_identifier: str | None = None

@@ -15,6 +15,7 @@ from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from memforge.api_target import MemForgeTarget
+from memforge.config import DEFAULT_SEARCH_TOP_K
 from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.sync_progress import normalize_sync_progress_snapshot
 
@@ -82,7 +83,7 @@ class ToolClient:
         *,
         query: str = "",
         intent: RankedRetrievalIntent | None = None,
-        top_k: int = 10,
+        top_k: int = DEFAULT_SEARCH_TOP_K,
         memory_types: list[str] | tuple[str, ...] | None = None,
         time_range: dict[str, Any] | None = None,
         entities: list[str] | tuple[str, ...] | None = None,

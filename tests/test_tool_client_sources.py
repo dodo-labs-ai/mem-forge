@@ -508,7 +508,7 @@ def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
     assert captured["url"] == "https://memforge.example.hana.ondemand.com/api/v1/memories/search?workspace_id=mount_tai"
     assert captured["authorization"] == "Bearer tok"
     assert json.loads(captured["body"].decode()) == {
-        "top_k": 10,
+        "top_k": 20,
         "include_superseded": False,
         "query": "artifact cache",
         "intent": "known_item",
@@ -536,7 +536,7 @@ def test_tool_client_forwards_structured_memory_search_facets():
             "/api/v1/memories/search",
             {
                 "query": "scheduler fixes last week",
-                "top_k": 10,
+                "top_k": 20,
                 "include_superseded": False,
                 "source_filter": {
                     "source_ids": ["src-codex-session"],

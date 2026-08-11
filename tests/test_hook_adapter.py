@@ -917,7 +917,7 @@ def test_packaged_plugin_version_is_consistent():
     import tomllib
 
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.54"
+    version = "0.1.55"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
@@ -2768,6 +2768,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "does not make ranked retrieval exhaustive" in properties["top_k"]["description"]
     assert "list_recent_memories" in properties["top_k"]["description"]
     assert "backlog" not in properties["top_k"]["description"].lower()
+    assert properties["top_k"]["default"] == 20
     assert properties["top_k"]["minimum"] == 1
     assert properties["top_k"]["maximum"] == 50
     assert properties["offset"]["default"] == 0

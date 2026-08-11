@@ -17,6 +17,12 @@ def test_project_first_without_active_project_coerces_to_workspace():
     assert req.active_project is None
 
 
+def test_search_request_defaults_to_twenty_results():
+    req = MemorySearchRequest(query="test")
+
+    assert req.top_k == 20
+
+
 def test_project_mode_without_active_project_coerces_to_workspace():
     req = MemorySearchRequest(query="test", scope_mode="project")
     assert req.scope_mode == "workspace"

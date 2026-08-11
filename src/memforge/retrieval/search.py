@@ -22,7 +22,7 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, RetrievalConfig
+from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, DEFAULT_SEARCH_TOP_K, RetrievalConfig
 from memforge.llm.structured import StructuredLlmError
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
@@ -35,6 +35,7 @@ from memforge.retrieval.intents import (
     validate_requested_intent,
 )
 from memforge.retrieval.query_analyzer import QueryAnalysis
+from memforge.retrieval.query_plan import build_lexical_query_plan
 from memforge.retrieval.rank_fusion import (
     RankedChannelItem,
     weighted_reciprocal_rank_fusion,
@@ -518,7 +519,7 @@ class SearchEngine:
         time_range: MemoryTimeRange | None = None,
         entities: list[str] | None = None,
         include_superseded: bool = False,
-        top_k: int = 10,
+        top_k: int = DEFAULT_SEARCH_TOP_K,
         *,
         source_filter: MemorySourceFilter | None = None,
         request_scope: AccessScope | None = None,
@@ -830,11 +831,11 @@ class SearchEngine:
         time_range: MemoryTimeRange | None,
     ) -> list[KeywordCandidate]:
         """Query the source-metadata keyword channel."""
-        sanitized_query = sanitize_fts_query(query)
-        if not sanitized_query:
+        query_plan = build_lexical_query_plan(query).metadata
+        if not query_plan.ordinary_terms and not query_plan.exact_anchors:
             return []
         return await self._keyword.search_metadata(
-            sanitized_query,
+            query_plan,
             scope,
             memory_types,
             limit,
@@ -1433,6 +1434,9 @@ def _metadata_keyword_evidence(hit: KeywordCandidate) -> dict[str, Any]:
         "channel": hit.channel,
         "matched_fields": list(hit.matched_fields),
         "matched_text": list(hit.matched_text),
+        "matched_terms": list(hit.matched_terms),
+        "term_coverage": hit.term_coverage,
+        "term_weights": dict(hit.term_weights),
         "source_refs": [
             {
                 "source_id": ref.source_id,
