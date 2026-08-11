@@ -31,6 +31,7 @@ def test_load_case_set_validates_manifest_cases_and_scope_shape() -> None:
         "metadata_title_exact",
         "quoted_title_in_self_contained_query",
         "compact_trigram_metadata_recall",
+        "metadata_three_of_five_source_cluster_recall",
         "queryless_source_listing",
         "vector_target_with_lexical_distractor",
         "unicode_query_vector_target_with_lexical_distractor",

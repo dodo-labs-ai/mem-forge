@@ -32,7 +32,7 @@ from rich.table import Table
 
 from memforge.api_target import Edition, MemForgeTarget, build_target
 from memforge.auth import browser_session
-from memforge.config import AppConfig, load_config
+from memforge.config import DEFAULT_SEARCH_TOP_K, AppConfig, load_config
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSION_LIST,
     build_github_repo_doc_id,
@@ -1049,7 +1049,7 @@ def sync(ctx, source: str | None):
 
 @cli.command("search")
 @click.argument("query", required=False, default="")
-@click.option("--top-k", default=10, show_default=True, type=int, help="Maximum number of results.")
+@click.option("--top-k", default=DEFAULT_SEARCH_TOP_K, show_default=True, type=int, help="Maximum number of results.")
 @click.option(
     "--intent",
     type=click.Choice(RANKED_RETRIEVAL_INTENTS),
@@ -1153,7 +1153,7 @@ def memory():
 
 @memory.command("search")
 @click.argument("query", required=False, default="")
-@click.option("--top-k", default=10, show_default=True, type=int, help="Maximum number of results.")
+@click.option("--top-k", default=DEFAULT_SEARCH_TOP_K, show_default=True, type=int, help="Maximum number of results.")
 @click.option(
     "--type",
     "memory_types",

@@ -110,6 +110,47 @@
       mem-blocker-hint:
         - metadata_trigram
 
+- id: metadata_three_of_five_source_cluster_recall
+  family: metadata_partial_lexical_recall
+  description: three of five ordinary query terms in one Jira support row recall its full memory cluster
+  query: process map failed command error
+  top_k: 10
+  source_filter: null
+  time_range: null
+  entities: []
+  fixture_variant: default
+  parity_gate: hard
+  scope:
+    user_id: eval-user
+    include_private: false
+    allowed_statuses:
+      - active
+    active_project: PAY
+    scope_mode: project-first
+    active_repo_identifier: null
+  expected:
+    relevant:
+      mem-process-tree-01: 3
+      mem-process-tree-02: 3
+      mem-process-tree-03: 3
+      mem-process-tree-04: 3
+      mem-process-tree-05: 3
+      mem-process-tree-06: 3
+    max_rank:
+      mem-process-tree-01: 10
+      mem-process-tree-02: 10
+      mem-process-tree-03: 10
+      mem-process-tree-04: 10
+      mem-process-tree-05: 10
+      mem-process-tree-06: 10
+    required_channels:
+      mem-process-tree-01: [bm25_metadata_tokens]
+      mem-process-tree-02: [bm25_metadata_tokens]
+      mem-process-tree-03: [bm25_metadata_tokens]
+      mem-process-tree-04: [bm25_metadata_tokens]
+      mem-process-tree-05: [bm25_metadata_tokens]
+      mem-process-tree-06: [bm25_metadata_tokens]
+
 - id: queryless_source_listing
   family: source_scoped_lookup
   description: queryless source listing honors exact visible pre-page count
@@ -132,6 +173,6 @@
     scope_mode: project-first
     active_repo_identifier: null
   expected:
-    total_candidates: 17
+    total_candidates: 23
     relevant:
       mem-access-review: 3

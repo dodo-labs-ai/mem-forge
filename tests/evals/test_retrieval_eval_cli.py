@@ -23,7 +23,7 @@ def test_retrieval_eval_cli_runs_packaged_case_set_as_json() -> None:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["summary"] == {
-        "case_count": 11,
+        "case_count": 12,
         "hard_failures": 0,
     }
     assert payload["hard_failures"] == []
@@ -47,7 +47,7 @@ def test_retrieval_eval_cli_text_output_is_quiet_summary() -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert result.output.strip() == "retrieval eval retrieval-core-v1: 11 cases, 0 hard failures"
+    assert result.output.strip() == "retrieval eval retrieval-core-v1: 12 cases, 0 hard failures"
 
 
 def test_retrieval_eval_cli_can_fail_on_hard_failures(monkeypatch) -> None:
