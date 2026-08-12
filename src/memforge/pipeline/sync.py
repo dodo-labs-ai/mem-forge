@@ -1539,6 +1539,9 @@ class GeneSyncOrchestrator:
             protected_source_observation_ids=(extraction.protected_source_observation_ids),
             document=context.document,
             derivation_id=attempt.id,
+            derivation_reprocess_all_current_observations=(
+                context.reprocess_all_current_observations
+            ),
             expected_source_activity_epoch=source_activity_epoch,
         )
 
@@ -2283,6 +2286,7 @@ class GeneSyncOrchestrator:
             user_id=actor_user_id,
             source_activity_epoch=expected_source_activity_epoch,
             current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
+            reprocess_all_current_observations=force_reprocess,
         )
         # Extraction owns the only document-content model call. Historical
         # cross-document/cross-source discovery remains post-commit Relation
@@ -2299,6 +2303,7 @@ class GeneSyncOrchestrator:
             document_title=item.title,
             document_url=item.source_url,
             derivation_context=derivation_context,
+            reprocess_current_observations=force_reprocess,
         )
 
         raw_memories = extraction_result.memories
@@ -2352,6 +2357,9 @@ class GeneSyncOrchestrator:
             protected_source_observation_ids=(extraction_result.protected_source_observation_ids),
             document=doc_record,
             derivation_id=extraction_result.derivation_id,
+            derivation_reprocess_all_current_observations=(
+                derivation_context.reprocess_all_current_observations
+            ),
             expected_source_activity_epoch=expected_source_activity_epoch,
         )
         stats["memories_extracted"] = memory_stats.get("added", 0)
@@ -2448,6 +2456,7 @@ class GeneSyncOrchestrator:
         document_title: str,
         document_url: str,
         derivation_context: SourceUnitDerivationContext | None = None,
+        reprocess_current_observations: bool = False,
     ) -> MemoryExtractionResult:
         """Run full extraction or diff-guided extraction for a document."""
         changed_observation_ids = {
@@ -2456,7 +2465,7 @@ class GeneSyncOrchestrator:
         changed_observation_ids.update(
             observation_id for delta in projection.deltas for observation_id in delta.added_observation_ids
         )
-        if not changed_observation_ids:
+        if not changed_observation_ids and not reprocess_current_observations:
             result = MemoryExtractionResult(
                 memories=[],
                 metadata={"projection_changed_observation_count": 0},
@@ -2472,7 +2481,7 @@ class GeneSyncOrchestrator:
                 extraction_metadata=result.metadata,
             )
             return result
-        if changed_observation_ids and hasattr(
+        if (changed_observation_ids or reprocess_current_observations) and hasattr(
             self.memory_extractor,
             "extract_projection_batch_memories",
         ):

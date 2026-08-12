@@ -3064,6 +3064,10 @@ class NoopMemoryEngine:
                             "current_changed_ranges",
                             (),
                         ),
+                        reprocess_all_current_observations=kwargs.get(
+                            "derivation_reprocess_all_current_observations",
+                            False,
+                        ),
                     )
                 )
                 if kwargs.get("derivation_id") is not None
@@ -5600,6 +5604,56 @@ async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope
     assert extractor.full_calls == []
     assert extractor.unit_calls == []
     assert memory_engine.projected_lifecycle_calls == []
+
+
+@pytest.mark.asyncio
+async def test_targeted_reprocess_extracts_unchanged_current_projection(
+    db: Database,
+) -> None:
+    source_id = "src-targeted-current-projection"
+    markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
+    doc_store = StubDocumentStore()
+    normalized_content_uri = doc_store.store_normalized(
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=markdown,
+    )
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=markdown,
+        version="2",
+        normalized_content_uri=normalized_content_uri,
+        projection_source_type="docs",
+    )
+    extractor = ProjectionBatchRecordingExtractor()
+    memory_engine = RecordingMemoryEngine()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        memory_extractor=extractor,
+        memory_engine=memory_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UpdatingDocumentGene(markdown, version="2"),
+        source_name="Documents",
+        source_id=source_id,
+        force_full_sync=True,
+        reprocess_doc_ids=frozenset({"doc-1"}),
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == 1
+    assert state.docs_updated == 1
+    assert len(extractor.projection_calls) == 1
+    assert extractor.projection_calls[0].primary_observation_ids
+    assert len(memory_engine.projected_lifecycle_calls) == 1
 
 
 @pytest.mark.asyncio

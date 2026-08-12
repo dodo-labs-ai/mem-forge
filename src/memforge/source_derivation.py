@@ -122,6 +122,7 @@ class SourceUnitDerivationContext:
     user_id: str | None
     source_activity_epoch: int | None
     current_changed_ranges: tuple[tuple[int, int], ...] = ()
+    reprocess_all_current_observations: bool = False
     work_strategy: Literal["auto", "structural"] = "auto"
 
 
@@ -333,7 +334,16 @@ def plan_source_derivation_work(
 ) -> tuple[SourceDerivationBatch, ...]:
     """Plan provider-neutral extraction work for one immutable Source Unit."""
 
-    projection_batches = plan_projection_extraction_batches(projection)
+    projection_batches = plan_projection_extraction_batches(
+        projection,
+        primary_observation_ids=(
+            tuple(observation.id for observation in projection.observations)
+            if context.reprocess_all_current_observations
+            else None
+        ),
+    )
+    if context.reprocess_all_current_observations:
+        return projection_batches
     if len(projection.observations) != 1 or len(projection.observation_revisions) != 1:
         return projection_batches
 
@@ -492,6 +502,9 @@ def source_unit_derivation_context_to_payload(
         "user_id": context.user_id,
         "source_activity_epoch": context.source_activity_epoch,
         "current_changed_ranges": [[start, end] for start, end in context.current_changed_ranges],
+        "reprocess_all_current_observations": (
+            context.reprocess_all_current_observations
+        ),
         "work_strategy": context.work_strategy,
     }
 
@@ -606,6 +619,9 @@ def source_unit_derivation_context_from_payload(
             (int(value[0]), int(value[1]))
             for value in payload.get("current_changed_ranges", [])
             if isinstance(value, list) and len(value) == 2
+        ),
+        reprocess_all_current_observations=bool(
+            payload.get("reprocess_all_current_observations", False)
         ),
         work_strategy=(
             "structural"
@@ -879,6 +895,10 @@ def _derivation_context_identity_payload(
         "user_id": context_payload.get("user_id"),
         "source_activity_epoch": context_payload.get("source_activity_epoch"),
         "current_changed_ranges": context_payload.get("current_changed_ranges"),
+        "reprocess_all_current_observations": context_payload.get(
+            "reprocess_all_current_observations",
+            False,
+        ),
     }
 
 
