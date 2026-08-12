@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Awaitable, Callable
 from time import perf_counter
@@ -19,6 +20,7 @@ from memforge.pipeline.document_update import DEFAULT_MAX_DIFF_CHARS
 from memforge.pipeline.evidence_catalog import (
     EvidenceAuthoritySpan,
     EvidenceCatalog,
+    EvidenceResolution,
 )
 from memforge.pipeline.extraction_contract import DURABLE_MEMORY_QUALITY_RULES
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
@@ -30,6 +32,8 @@ from memforge.source_artifacts import (
 logger = logging.getLogger(__name__)
 
 __all__ = ["MemoryExtractor"]
+
+_EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT = 16
 
 # ---------------------------------------------------------------------------
 # Caps and bands shared by the extraction prompts and runtime truncation. Both
@@ -340,6 +344,8 @@ class MemoryExtractor:
             return result
         localized_memories = []
         refinement_counts: dict[str, int] = {}
+        fallback_samples: list[dict[str, object]] = []
+        fallback_sample_truncated_count = 0
         for memory in result.memories:
             resolved = catalog.resolve(memory)
             if resolved is None:
@@ -351,12 +357,27 @@ class MemoryExtractor:
                 resolved.memory.evidence_range_end = None
             localized_memories.append(resolved.memory)
             refinement_counts[resolved.refinement] = refinement_counts.get(resolved.refinement, 0) + 1
+            if resolved.refinement == "block_fallback":
+                if len(fallback_samples) < _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT:
+                    fallback_samples.append(
+                        _block_fallback_sample(
+                            original=memory,
+                            resolved=resolved,
+                            extraction_metadata=result.metadata,
+                        )
+                    )
+                else:
+                    fallback_sample_truncated_count += 1
         return MemoryExtractionResult(
             memories=localized_memories,
             artifact_summaries=result.artifact_summaries,
             metadata={
                 **result.metadata,
                 "evidence_refinement_counts": refinement_counts,
+                "evidence_block_fallback_samples": fallback_samples,
+                "evidence_block_fallback_sample_truncated_count": (
+                    fallback_sample_truncated_count
+                ),
                 "invalid_evidence_block_count": len(result.memories) - len(localized_memories),
             },
         )
@@ -456,6 +477,9 @@ class MemoryExtractor:
         if result.error_type:
             return result
         kept = []
+        refinement_counts: dict[str, int] = {}
+        fallback_samples: list[dict[str, object]] = []
+        fallback_sample_truncated_count = 0
         context_by_primary = dict(batch.context_observation_ids_by_primary)
         visual_observation_ids = {
             image.source_observation_id
@@ -498,12 +522,31 @@ class MemoryExtractor:
             ):
                 continue
             localized_memory.required_source_observation_ids = list(required_ids)
+            refinement_counts[resolved.refinement] = (
+                refinement_counts.get(resolved.refinement, 0) + 1
+            )
+            if resolved.refinement == "block_fallback":
+                if len(fallback_samples) < _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT:
+                    fallback_samples.append(
+                        _block_fallback_sample(
+                            original=memory,
+                            resolved=resolved,
+                            extraction_metadata=result.metadata,
+                        )
+                    )
+                else:
+                    fallback_sample_truncated_count += 1
             kept.append(localized_memory)
         return MemoryExtractionResult(
             memories=kept,
             artifact_summaries=result.artifact_summaries,
             metadata={
                 **result.metadata,
+                "evidence_refinement_counts": refinement_counts,
+                "evidence_block_fallback_samples": fallback_samples,
+                "evidence_block_fallback_sample_truncated_count": (
+                    fallback_sample_truncated_count
+                ),
                 "invalid_evidence_block_count": (
                     len(result.memories) - len(kept)
                 ),
@@ -521,6 +564,8 @@ class MemoryExtractor:
         started = perf_counter()
         metrics = {
             "structured_llm_calls": 1,
+            "extraction_model": self.model,
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "prompt_chars": len(prompt),
             "image_count": len(images),
             "image_bytes": sum(len(image.body) for image in images),
@@ -630,3 +675,34 @@ class MemoryExtractor:
                     ),
                 },
             )
+
+
+def _block_fallback_sample(
+    *,
+    original: RawMemory,
+    resolved: EvidenceResolution,
+    extraction_metadata: dict[str, object],
+) -> dict[str, object]:
+    """Return content-free evidence telemetry for one whole-Block fallback."""
+
+    submitted_quote = original.evidence_quote or ""
+    return {
+        "candidate_content_sha256": hashlib.sha256(
+            original.content.encode("utf-8")
+        ).hexdigest(),
+        "source_observation_id": resolved.block.observation_id,
+        "evidence_range_start": resolved.memory.evidence_range_start,
+        "evidence_range_end": resolved.memory.evidence_range_end,
+        "block_text_sha256": hashlib.sha256(
+            resolved.block.text.encode("utf-8")
+        ).hexdigest(),
+        "block_chars": len(resolved.block.text),
+        "submitted_quote_sha256": (
+            hashlib.sha256(submitted_quote.encode("utf-8")).hexdigest()
+            if submitted_quote
+            else None
+        ),
+        "submitted_quote_chars": len(submitted_quote),
+        "extraction_model": extraction_metadata.get("extraction_model"),
+        "prompt_sha256": extraction_metadata.get("prompt_sha256"),
+    }

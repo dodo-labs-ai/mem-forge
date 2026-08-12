@@ -155,6 +155,42 @@ def test_batch_local_block_id_is_not_persisted_in_derivation_output() -> None:
     assert restored.memories[0].evidence_range_end == len("A durable rule.")
 
 
+def test_block_fallback_telemetry_survives_derivation_replay_without_content() -> None:
+    metadata = {
+        "evidence_refinement_counts": {"block_fallback": 1},
+        "evidence_block_fallback_samples": [
+            {
+                "candidate_content_sha256": "c" * 64,
+                "source_derivation_batch_id": "xbatch-current",
+                "source_observation_id": "obs-current",
+                "source_observation_revision_id": "obsrev-current",
+                "evidence_range_start": 20,
+                "evidence_range_end": 80,
+                "block_text_sha256": "b" * 64,
+                "block_chars": 60,
+                "submitted_quote_sha256": "q" * 64,
+                "submitted_quote_chars": 41,
+                "extraction_model": "model-current",
+                "prompt_sha256": "p" * 64,
+                "raw_quote": "must never persist",
+            }
+        ],
+        "evidence_block_fallback_sample_truncated_count": 0,
+        "invalid_evidence_block_count": 0,
+    }
+
+    payload = memory_extraction_output_payload(
+        MemoryExtractionResult(metadata=metadata)
+    )
+    restored = memory_extraction_result_from_output_payload(payload)
+
+    assert "raw_quote" not in str(payload)
+    assert restored.metadata == payload["evidence_telemetry"]
+    assert restored.metadata["evidence_refinement_counts"] == {
+        "block_fallback": 1
+    }
+
+
 def test_quote_only_compatibility_rebinds_one_unique_block_despite_stale_hint() -> None:
     catalog = EvidenceCatalog.from_spans(
         (

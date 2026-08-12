@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from memforge.llm.structured import MemoryCandidate, MemoryExtractionResponse, StructuredLlmError
@@ -123,6 +125,27 @@ async def test_memory_extractor_uses_block_as_nonempty_fallback_for_changed_quot
 
     assert [memory.evidence_quote for memory in result.memories] == [source]
     assert result.metadata["evidence_refinement_counts"] == {"block_fallback": 1}
+    assert result.metadata["evidence_block_fallback_samples"] == [
+        {
+            "candidate_content_sha256": hashlib.sha256(
+                "Use the recorded traceId for later CLS lookup.".encode()
+            ).hexdigest(),
+            "source_observation_id": None,
+            "evidence_range_start": 0,
+            "evidence_range_end": len(source),
+            "block_text_sha256": hashlib.sha256(source.encode()).hexdigest(),
+            "block_chars": len(source),
+            "submitted_quote_sha256": hashlib.sha256(
+                "validation_rule_agent records a trace ID.".encode()
+            ).hexdigest(),
+            "submitted_quote_chars": len(
+                "validation_rule_agent records a trace ID."
+            ),
+            "extraction_model": "claude-sonnet-4-20250514",
+            "prompt_sha256": result.metadata["prompt_sha256"],
+        }
+    ]
+    assert source not in str(result.metadata)
     assert 'id="EB-001"' in client.calls[0]["prompt"]
 
 
