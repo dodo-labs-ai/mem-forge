@@ -318,6 +318,31 @@ assert.deepEqual(
     {
       kind: "sync",
       state: "failed",
+      error: {
+        message: (
+          "GitHub Pages discovery reached Max Pages (200) before the configured "
+          + "subtree was exhausted. Increase Max Pages or narrow the configured scope "
+          + "with Subtree Root URL or Exclude URL Patterns, then retry."
+        ),
+      },
+    },
+    "GitHub Pages",
+    "pages",
+  ),
+  {
+    message: "Action needed",
+    detail: (
+      "GitHub Pages reached Max Pages. Increase Max Pages or narrow the configured "
+      + "scope, then retry."
+    ),
+  },
+);
+
+assert.deepEqual(
+  presentSourceSyncActivity(
+    {
+      kind: "sync",
+      state: "failed",
       error: { message: "Embedding provider unreachable: connection refused" },
     },
     "Confluence",

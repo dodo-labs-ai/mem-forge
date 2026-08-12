@@ -9,6 +9,7 @@ import pytest
 import requests
 
 from memforge.genes import GENE_REGISTRY
+from memforge.genes.base import SourceConfigurationError
 from memforge.genes.github_pages_gene import GitHubPagesGene
 from memforge.models import ContentItem, RawContent
 
@@ -569,7 +570,10 @@ async def test_github_pat_subtree_honors_max_pages(monkeypatch):
     )
 
     await gene.authenticate()
-    with pytest.raises(RuntimeError, match="max_pages=1"):
+    with pytest.raises(
+        SourceConfigurationError,
+        match=r"found 2 pages.*Max Pages \(1\).*Increase Max Pages.*narrow",
+    ):
         [item async for item in gene.discover()]
 
 

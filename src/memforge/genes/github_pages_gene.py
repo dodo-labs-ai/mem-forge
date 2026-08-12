@@ -18,7 +18,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from memforge.genes.atlassian_auth import require_https_base_url, resolve_pat, tls_verify
-from memforge.genes.base import Gene
+from memforge.genes.base import Gene, SourceConfigurationError
 from memforge.github_repo_utils import (
     decode_github_contents_payload,
     validate_github_tree_payload,
@@ -576,7 +576,12 @@ class GitHubPagesGene(Gene):
                 continue
             seen.add(url)
             if discovered >= max_pages:
-                raise RuntimeError(f"GitHub Pages discovery reached max_pages={max_pages}")
+                raise SourceConfigurationError(
+                    "GitHub Pages discovery reached Max Pages "
+                    f"({max_pages}) before the configured subtree was exhausted. "
+                    "Increase Max Pages or narrow the configured scope with Subtree Root URL "
+                    "or Exclude URL Patterns, then retry."
+                )
             discovered += 1
             response = await self._client.get(url)
             response.raise_for_status()
@@ -959,7 +964,11 @@ def _links_from_html(html: str, *, base_url: str) -> list[str]:
 
 def _limit_urls(urls: list[str], max_pages: int) -> list[str]:
     if len(urls) > max_pages:
-        raise RuntimeError(f"GitHub Pages discovery reached max_pages={max_pages}")
+        raise SourceConfigurationError(
+            f"GitHub Pages discovery found {len(urls)} pages, exceeding Max Pages ({max_pages}). "
+            "Increase Max Pages or narrow the configured scope with Subtree Root URL "
+            "or Exclude URL Patterns, then retry."
+        )
     return urls
 
 

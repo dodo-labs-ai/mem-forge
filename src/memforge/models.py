@@ -482,6 +482,7 @@ class SyncState:
     memories_corroborated: int = 0
     error_message: str | None = None
     failed_docs: list[FailedDoc] = field(default_factory=list)
+    failure_retryable: bool = True
 
 
 @dataclass

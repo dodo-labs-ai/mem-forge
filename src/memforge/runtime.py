@@ -1219,7 +1219,9 @@ class SourceSyncWorker:
                 # the complete durable run would duplicate successful provider
                 # and lifecycle work without improving the failure boundary.
                 next_attempt_at = (
-                    self._next_retry_at(run, failed_at) if final_state.last_sync_status == "failed" else None
+                    self._next_retry_at(run, failed_at)
+                    if final_state.last_sync_status == "failed" and final_state.failure_retryable
+                    else None
                 )
                 failed = await self.db.fail_source_sync_run(
                     run.run_id,

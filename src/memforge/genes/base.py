@@ -37,6 +37,7 @@ from memforge.source_artifacts import (
 
 __all__ = [
     "Gene",
+    "SourceConfigurationError",
     # Re-exports from models
     "GeneMetadata",
     "GeneConfigSchema",
@@ -49,6 +50,10 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+class SourceConfigurationError(RuntimeError):
+    """A source cannot sync successfully until its configuration changes."""
 
 
 class Gene(ABC):
