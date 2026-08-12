@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 import tiktoken
 
+from memforge.genes.base import SourceConfigurationError
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
     StructuredLlmMetricsCollector,
@@ -765,6 +766,7 @@ class GeneSyncOrchestrator:
         run_coverage = ProjectionCoverage.PARTIAL_PROJECTION
         reused_projection_count = 0
         total_item_count = 0
+        failure_retryable = True
 
         try:
             if execution_mode is SourceSyncMode.NORMAL:
@@ -1253,6 +1255,7 @@ class GeneSyncOrchestrator:
             )
             status = "failed"
             error_message = str(e)
+            failure_retryable = not isinstance(e, SourceConfigurationError)
             if scope_transition is not None and transition_started:
                 try:
                     await self.db.fail_projection_scope_transition(
@@ -1307,6 +1310,7 @@ class GeneSyncOrchestrator:
             memories_corroborated=memories_corroborated,
             error_message=error_message,
             failed_docs=failed_docs,
+            failure_retryable=failure_retryable,
         )
 
         if record_terminal_result and not non_mutating_run:

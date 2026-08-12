@@ -20,6 +20,7 @@ from memforge.llm.structured import (
     StructuredLlmConfig,
     StructuredLlmError,
 )
+from memforge.genes.base import SourceConfigurationError
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.lifecycle_planner import lifecycle_plan_id
@@ -2822,6 +2823,16 @@ class FailingAuthGene:
 
     async def authenticate(self) -> None:
         raise RuntimeError("auth failed")
+
+
+class InvalidSourceConfigurationGene(EmptyGene):
+    async def discover(self, since=None):
+        del since
+        raise SourceConfigurationError(
+            "GitHub Pages discovery found 202 pages, exceeding Max Pages (200). "
+            "Increase Max Pages or narrow the configured scope, then retry."
+        )
+        yield
 
 
 class StubDocumentStore:
@@ -5689,6 +5700,38 @@ async def test_auth_failure_records_failed_sync_state_without_secondary_error(db
 
 
 @pytest.mark.asyncio
+async def test_source_configuration_failure_is_returned_as_non_retryable(db: Database):
+    source_id = "src-invalid-source-config"
+    await db.upsert_source(
+        id=source_id,
+        type="github_pages",
+        name="Invalid source configuration",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=None,
+        memory_extractor=None,
+        memory_engine=None,
+        memory_store=None,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=InvalidSourceConfigurationGene(),
+        source_name="Invalid source configuration",
+        source_id=source_id,
+        record_terminal_result=False,
+    )
+
+    assert state.last_sync_status == "failed"
+    assert state.failure_retryable is False
+    assert state.error_message is not None
+    assert "Increase Max Pages or narrow the configured scope" in state.error_message
+
+
+@pytest.mark.asyncio
 async def test_sync_pipeline_can_delegate_terminal_result_persistence(db: Database):
     source_id = "src-delegated-terminal-result"
     await db.upsert_source(
@@ -7494,6 +7537,59 @@ async def test_source_sync_worker_retries_failed_final_state(db: Database):
     assert sync_state is not None
     assert sync_state.last_sync_status == "failed"
     assert sync_state.error_message == "temporary final-state failure"
+
+
+@pytest.mark.asyncio
+async def test_source_sync_worker_terminalizes_non_retryable_final_state(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-worker-final-state-terminal"
+    await db.upsert_source(
+        id=source_id,
+        type="github_pages",
+        name="Worker terminal final state",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+
+    class TerminalStateRuntimeProvider:
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return object()
+
+        async def run_source_sync(self, **kwargs):
+            del kwargs
+            return SyncState(
+                source=source_id,
+                last_sync_at=None,
+                last_sync_status="failed",
+                error_message=(
+                    "GitHub Pages discovery found 202 pages, exceeding Max Pages (200). "
+                    "Increase Max Pages or narrow the configured scope, then retry."
+                ),
+                failure_retryable=False,
+            )
+
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(sync=SyncConfig(worker_retry_base_seconds=120)),
+        runtime_provider=TerminalStateRuntimeProvider(),
+        worker_id="worker-a",
+    )
+
+    await worker.run_once()
+    failed = await db.get_source_sync_run(enqueued.run_id)
+    history = await db.get_sync_history(source=source_id, limit=10)
+
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.lease_attempt_count == 1
+    assert failed.next_attempt_at is None
+    assert failed.error_message is not None
+    assert "Increase Max Pages or narrow the configured scope" in failed.error_message
+    assert [(row["run_id"], row["status"]) for row in history] == [(enqueued.run_id, "failed")]
 
 
 @pytest.mark.asyncio
