@@ -218,6 +218,7 @@ class MemoryCandidate(StructuredResponseModel):
     valid_until: str | None = None
     extraction_context: str | None = None
     evidence_quote: str | None = None
+    evidence_block_id: str | None = None
     evidence_anchor: Literal["unit", "glossary", "preamble", "outline", "document", "unknown"] = "unknown"
     source_observation_id: str | None = None
     required_source_observation_ids: list[str] = Field(default_factory=list)
@@ -280,6 +281,7 @@ class ProjectionMemoryCandidate(StructuredResponseModel):
     valid_from: str | None = None
     valid_until: str | None = None
     evidence_quote: str | None = None
+    evidence_block_id: str | None = None
     source_observation_id: str | None = None
     required_source_observation_ids: list[str] = Field(default_factory=list)
 

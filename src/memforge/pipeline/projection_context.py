@@ -28,6 +28,9 @@ class ProjectionExtractionBatch:
     context_observation_ids_by_primary: tuple[tuple[str, tuple[str, ...]], ...]
     primary_markdown: str
     context_markdown: str
+    # Exact segment coordinates in immutable Observation revisions. Kept
+    # transient so EvidenceCatalog never creates a block across overlap seams.
+    primary_authority_spans: tuple[tuple[str, int, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +221,16 @@ def plan_projection_extraction_batches(
                 context_observation_ids_by_primary=context_by_primary,
                 primary_markdown=primary_markdown,
                 context_markdown=context_markdown,
+                primary_authority_spans=tuple(
+                    (
+                        segment.observation_id,
+                        segment.start,
+                        revisions[segment.observation_id].content[
+                            segment.start : segment.end
+                        ],
+                    )
+                    for segment in group
+                ),
             )
         )
     return tuple(batches)

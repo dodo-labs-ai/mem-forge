@@ -231,6 +231,43 @@ def test_whole_small_document_observation_is_not_used_as_a_claim_excerpt() -> No
     assert canonical.extraction_context is None
 
 
+def test_block_resolved_whole_small_observation_keeps_excerpt_and_range() -> None:
+    body = "# Design\n\nThe service keeps one canonical evidence excerpt."
+    projection = _github_projection(body)
+    raw = RawMemory(
+        content="The service keeps one canonical evidence excerpt.",
+        memory_type="decision",
+        evidence_quote=body,
+        extraction_context=body,
+        evidence_resolved_from_block=True,
+        evidence_range_start=0,
+        evidence_range_end=len(body),
+        source_observation_id=projection.observations[0].id,
+    )
+
+    staged = build_projected_claim_evidence(
+        projection=projection,
+        raw_memories=(raw,),
+        doc_id="github-repo-docs-large",
+        source_type="github_repo",
+        project_key=None,
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier="acme/repo",
+        access_context_hash="workspace-repo",
+        extractor_run_id="sync-small-whole-block",
+    )
+
+    assert staged.units[0].content == body
+    assert staged.units[0].excerpt == body
+    [primary] = [
+        item for item in staged.references if item.role.value == "primary"
+    ]
+    assert primary.anchor.kind.value == "revision_range"
+    assert primary.anchor.range_start == 0
+    assert primary.anchor.range_end == len(body)
+
+
 def test_unlocalized_claim_does_not_claim_or_copy_a_source_excerpt() -> None:
     body = "# Single observation\n\nOnly the revision reference is authoritative."
     projection = _github_projection(body)

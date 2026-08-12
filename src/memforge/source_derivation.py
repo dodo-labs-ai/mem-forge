@@ -650,6 +650,11 @@ def memory_extraction_result_from_output_payload(
                 valid_until=_optional_string(value.get("valid_until")),
                 extraction_context=_optional_string(value.get("extraction_context")),
                 evidence_quote=_optional_string(value.get("evidence_quote")),
+                evidence_resolved_from_block=(
+                    value.get("evidence_resolved_from_block") is True
+                ),
+                evidence_range_start=_optional_int(value.get("evidence_range_start")),
+                evidence_range_end=_optional_int(value.get("evidence_range_end")),
                 evidence_anchor=_optional_string(value.get("evidence_anchor")),
                 source_observation_id=_optional_string(value.get("source_observation_id")),
                 required_source_observation_ids=_string_list(value.get("required_source_observation_ids")),
@@ -781,6 +786,11 @@ def _raw_memory_payload(memory: RawMemory) -> dict[str, object]:
         "valid_until": memory.valid_until,
         "extraction_context": memory.extraction_context,
         "evidence_quote": memory.evidence_quote,
+        # evidence_block_id is deliberately absent: batch-local addresses are
+        # resolved to exact source excerpts before durable output is staged.
+        "evidence_resolved_from_block": memory.evidence_resolved_from_block,
+        "evidence_range_start": memory.evidence_range_start,
+        "evidence_range_end": memory.evidence_range_end,
         "evidence_anchor": memory.evidence_anchor,
         "source_observation_id": memory.source_observation_id,
         "required_source_observation_ids": list(memory.required_source_observation_ids),
@@ -796,6 +806,10 @@ def _string_list(value: object) -> list[str]:
 
 def _optional_string(value: object) -> str | None:
     return str(value) if value is not None else None
+
+
+def _optional_int(value: object) -> int | None:
+    return int(value) if value is not None else None
 
 
 def _canonical_json(value: Any) -> str:
