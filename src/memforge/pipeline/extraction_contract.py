@@ -8,7 +8,7 @@ __all__ = [
 ]
 
 
-PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v5"
+PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v6"
 
 DURABLE_MEMORY_QUALITY_RULES = """Top rules (apply these first; reject candidates that fail any of them):
 
@@ -25,5 +25,7 @@ DURABLE_MEMORY_QUALITY_RULES = """Top rules (apply these first; reject candidate
 5. NO META-MEMORIES. Do not emit Memories about the act of working: commit structure, diff splitting, tools used, validation output, work-in-progress state, or whether a project rule was followed. Memory is about the project's durable domain knowledge, not the editing process.
 
 6. OWNED EVIDENCE SETS THE LANGUAGE. For each candidate, preserve the language of its owned source evidence. When that evidence is primarily Chinese, write memory.content in Chinese. Do not translate it to English unless the evidence itself is English or mixed-language phrasing is necessary to preserve exact technical identifiers. Read-only context may resolve meaning but must not change the candidate's language.
+
+7. OPERATIONAL DOES NOT MEAN TRANSIENT. Keep an explicitly stated, repeatable procedure when it remains useful beyond the immediate event. Skip one-off observations, current status, and instance-specific details.
 
 """

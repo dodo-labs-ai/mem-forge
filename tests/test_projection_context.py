@@ -368,6 +368,11 @@ def test_one_large_document_is_range_sliced_without_creating_finer_source_units(
     rendered = "\n".join(batch.primary_markdown for batch in batches)
     assert "line-0000" in rendered
     assert "line-0299" in rendered
+    revision = projection.observation_revisions[0]
+    for batch in batches:
+        for observation_id, start, text in batch.primary_authority_spans:
+            assert observation_id == projection.observations[0].id
+            assert revision.content[start : start + len(text)] == text
 
 
 def test_default_large_page_batches_bound_primary_output_pressure() -> None:

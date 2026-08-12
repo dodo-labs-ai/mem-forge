@@ -2526,6 +2526,7 @@ class GeneSyncOrchestrator:
                     result = await self.memory_extractor.extract_memory_changes(
                         changed_hunks=update_plan.changed_hunks or "",
                         updated_document=markdown_body,
+                        current_changed_ranges=update_plan.current_changed_ranges,
                         source_type=source_type,
                         doc_type=doc_type,
                     )
@@ -2695,6 +2696,7 @@ class GeneSyncOrchestrator:
                     result = await self.memory_extractor.extract_memory_changes(
                         changed_hunks=batch.changed_hunks,
                         updated_document=batch.updated_document,
+                        current_changed_ranges=current_changed_ranges,
                         source_type=source_type,
                         doc_type=doc_type,
                     )
