@@ -436,6 +436,7 @@ class MemoryEngine:
         protected_source_observation_ids: tuple[str, ...] = (),
         document: DocumentRecord | None = None,
         derivation_id: str | None = None,
+        derivation_reprocess_all_current_observations: bool = False,
         expected_source_activity_epoch: int | None = None,
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
     ) -> dict[str, int]:
@@ -873,6 +874,9 @@ class MemoryEngine:
                         user_id=user_id,
                         source_activity_epoch=(expected_source_activity_epoch),
                         current_changed_ranges=current_changed_ranges,
+                        reprocess_all_current_observations=(
+                            derivation_reprocess_all_current_observations
+                        ),
                     )
                 )
                 if derivation_id is not None and document is not None

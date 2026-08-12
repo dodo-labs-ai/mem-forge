@@ -218,6 +218,39 @@ def test_many_messages_use_bounded_transient_batches_not_persisted_units() -> No
     assert {batch.source_unit_id for batch in batches} == {projection.source_units[0].id}
 
 
+def test_scoped_replay_can_select_all_current_observations_without_a_delta() -> None:
+    initial = _jira_projection(3)
+    current = replace(
+        initial,
+        run_id="run-current",
+        deltas=(
+            replace(
+                initial.deltas[0],
+                previous_unit_revision_id=initial.source_unit_revisions[0].id,
+                axes=frozenset(),
+                changed_anchors=(),
+                added_observation_ids=(),
+            ),
+        ),
+    )
+
+    assert not current.deltas[0].requires_extraction
+
+    batches = plan_projection_extraction_batches(
+        current,
+        primary_observation_ids=tuple(
+            observation.id for observation in current.observations
+        ),
+        max_primary_observations=1,
+    )
+
+    assert {
+        observation_id
+        for batch in batches
+        for observation_id in batch.primary_observation_ids
+    } == {observation.id for observation in current.observations}
+
+
 def test_many_images_use_bounded_multimodal_batches_without_losing_artifacts() -> None:
     projection = _confluence_projection_with_images(56)
 

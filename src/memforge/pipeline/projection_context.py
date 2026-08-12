@@ -44,6 +44,7 @@ class _PrimarySegment:
 def plan_projection_extraction_batches(
     projection: SourceProjection,
     *,
+    primary_observation_ids: tuple[str, ...] | None = None,
     max_primary_observations: int = 8,
     max_primary_chars: int = 30_000,
     max_context_chars: int = 20_000,
@@ -52,7 +53,9 @@ def plan_projection_extraction_batches(
 ) -> tuple[ProjectionExtractionBatch, ...]:
     """Build bounded batches using only generic deltas and relations.
 
-    Changed/added observations are Primary. Directly related observations,
+    Changed/added observations are Primary by default. A bounded operator
+    replay may explicitly select current observations as Primary without
+    changing Source Projection truth. Directly related observations,
     immediate sequence neighbors, and the first observation in a unit are
     Context. Context is never promoted to extraction authority here.
     """
@@ -86,7 +89,19 @@ def plan_projection_extraction_batches(
             revisions[item].metadata,
         )
     )
-    primary_ids = tuple(item for item in eligible_ordered_ids if item in changed)
+    if primary_observation_ids is None:
+        selected_primary_ids = changed
+    else:
+        requested_primary_ids = set(primary_observation_ids)
+        unknown_primary_ids = requested_primary_ids - set(ordered_ids)
+        if unknown_primary_ids:
+            raise ValueError(
+                "projection extraction Primary observations must belong to the current projection"
+            )
+        selected_primary_ids = requested_primary_ids
+    primary_ids = tuple(
+        item for item in eligible_ordered_ids if item in selected_primary_ids
+    )
     if not primary_ids:
         return ()
 
