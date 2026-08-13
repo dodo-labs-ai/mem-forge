@@ -1667,6 +1667,8 @@ class LiteLlmStructuredClient:
             return response
 
     def _emit_telemetry(self, telemetry: StructuredLlmCallTelemetry) -> None:
+        from memforge.evals.agent_events import QualitySignal, record_quality_signal
+
         payload = {
             "event": "structured_llm_call",
             "operation": telemetry.operation,
@@ -1682,6 +1684,31 @@ class LiteLlmStructuredClient:
             "total_tokens": telemetry.total_tokens,
         }
         logger.info("structured_llm_call %s", json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        recovered_with_fallback = telemetry.terminal_category == "success" and telemetry.fallback_count > 0
+        if telemetry.terminal_category == "success":
+            outcome = "degraded" if recovered_with_fallback else "expected"
+            reason_code = "schema_fallback_recovered" if recovered_with_fallback else "schema_conformant"
+        else:
+            outcome = "rejected" if telemetry.terminal_category == "invalid_response" else "failed"
+            reason_code = (
+                "schema_validation_failed"
+                if telemetry.terminal_category == "invalid_response"
+                else telemetry.terminal_category
+            )
+        record_quality_signal(
+            QualitySignal(
+                event_type="structured_output_outcome",
+                outcome=outcome,
+                reason_code=reason_code,
+                operation=telemetry.operation,
+                attempt_count=telemetry.attempt_count,
+                retry_count=telemetry.retry_count,
+                fallback_count=telemetry.fallback_count,
+                structured_mode=telemetry.final_mode,
+                terminal_category=telemetry.terminal_category,
+                error_code=telemetry.error_code,
+            )
+        )
         scoped_collector = self._scoped_metrics_collector.get()
         if scoped_collector is not None:
             scoped_collector.record(telemetry)
