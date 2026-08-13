@@ -1741,6 +1741,8 @@ async def test_source_deriver_binds_provider_neutral_quality_events_to_current_l
         AgentRuntimeEventQuery(
             occurred_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
             occurred_to=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            requesting_user_id="user-1",
+            include_private=True,
             source_type=source_type,
             event_name="evidence_admission_outcome",
         )

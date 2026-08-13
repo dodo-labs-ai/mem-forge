@@ -190,6 +190,8 @@ async def test_sqlite_event_store_is_idempotent_and_supports_bounded_cohorts(db)
         AgentRuntimeEventQuery(
             occurred_from=NOW - timedelta(seconds=1),
             occurred_to=NOW + timedelta(seconds=1),
+            requesting_user_id="user-1",
+            include_private=True,
             source_id="src-teams",
             event_name="evidence_localization_outcome",
             reason_code="whole_block_fallback",
@@ -198,6 +200,38 @@ async def test_sqlite_event_store_is_idempotent_and_supports_bounded_cohorts(db)
     )
 
     assert rows == [events[1]]
+
+
+@pytest.mark.asyncio
+async def test_private_runtime_events_require_the_source_owner_scope(db) -> None:
+    events = _events(
+        QualitySignal(
+            event_name="extraction_batch_outcome",
+            outcome="expected",
+            reason_code="zero_candidates",
+        )
+    )
+    await db.record_agent_runtime_events(events)
+    window = {
+        "occurred_from": NOW - timedelta(seconds=1),
+        "occurred_to": NOW + timedelta(seconds=1),
+    }
+
+    assert await db.list_agent_runtime_events(AgentRuntimeEventQuery(**window)) == []
+    assert await db.list_agent_runtime_events(
+        AgentRuntimeEventQuery(
+            **window,
+            requesting_user_id="someone-else",
+            include_private=True,
+        )
+    ) == []
+    assert await db.list_agent_runtime_events(
+        AgentRuntimeEventQuery(
+            **window,
+            requesting_user_id="user-1",
+            include_private=True,
+        )
+    ) == list(events)
 
 
 def test_cohort_report_uses_event_name_denominators() -> None:

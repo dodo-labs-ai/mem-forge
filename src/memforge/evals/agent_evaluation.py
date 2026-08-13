@@ -156,6 +156,8 @@ class AgentRuntimeEventQuery:
 
     occurred_from: datetime
     occurred_to: datetime
+    requesting_user_id: str | None = None
+    include_private: bool = False
     source_id: str | None = None
     source_type: str | None = None
     event_name: str | None = None
