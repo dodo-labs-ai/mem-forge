@@ -1296,9 +1296,49 @@ async def test_litellm_structured_client_fails_closed_after_both_strategies_are_
 
     with pytest.raises(StructuredLlmError):
         await client.extract_memories("prompt", max_tokens=8192)
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert calls[0]["response_format"] is MemoryExtractionResponse
     assert "response_format" not in calls[1]
+    assert "response_format" not in calls[2]
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_retries_invalid_json_fallback_once(monkeypatch):
+    calls = []
+    telemetry: list[StructuredLlmCallTelemetry] = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) < 3:
+            return CompletionResponse("{}")
+        return CompletionResponse(
+            '{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}'
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+            num_retries=1,
+        ),
+        telemetry_sink=telemetry.append,
+    )
+
+    response = await client.extract_memories("prompt", max_tokens=1024)
+
+    assert response.memories[0].content == "A durable fact."
+    assert len(calls) == 3
+    assert calls[0]["response_format"] is MemoryExtractionResponse
+    assert "response_format" not in calls[1]
+    assert "response_format" not in calls[2]
+    assert telemetry[0].attempt_count == 3
+    assert telemetry[0].retry_count == 1
+    assert telemetry[0].fallback_count == 1
+    assert telemetry[0].terminal_category == "success"
 
 
 @pytest.mark.asyncio

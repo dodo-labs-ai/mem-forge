@@ -1527,6 +1527,37 @@ class LiteLlmStructuredClient:
             )
         except Exception as exc:
             fallback_failure = _structured_failure(exc)
+        if (
+            fallback_failure is not None
+            and fallback_failure.terminal_category == "invalid_response"
+            and fallback_failure.error_code == "ValidationError"
+            and state.retry_budget > 0
+        ):
+            state.retry_budget -= 1
+            state.retry_count += 1
+            logger.warning(
+                "Structured LLM JSON-text response was invalid for model %s and schema %s; "
+                "retrying once within the logical deadline (error_code=%s)",
+                model_name,
+                response_format.__name__,
+                fallback_failure.error_code,
+            )
+            try:
+                result = await self._attempt_schema(
+                    prompt=prompt,
+                    response_format=response_format,
+                    model_name=model_name,
+                    max_tokens=max_tokens,
+                    native_schema=False,
+                    native_schema_transport=native_schema_transport,
+                    deadline=deadline,
+                    state=state,
+                    images=images,
+                )
+            except Exception as exc:
+                fallback_failure = _structured_failure(exc)
+            else:
+                fallback_failure = None
         if fallback_failure is not None:
             raise fallback_failure.to_error()
         return result
