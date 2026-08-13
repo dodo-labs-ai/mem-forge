@@ -16,10 +16,11 @@ from memforge.evals.agent_evaluation import (
     AgentRuntimeEvent,
     QualitySignal,
     QualitySignalCollector,
+    RuntimeEventTraceSink,
     bind_quality_signals,
     current_deployment_revision,
-    current_trace_context,
-    project_runtime_events_to_current_span,
+    NoOpRuntimeEventTraceSink,
+    publish_runtime_events,
     quality_signal_scope,
 )
 from memforge.pipeline.bounded_work import collect_bounded
@@ -222,9 +223,11 @@ class SourceUnitDeriver:
             tuple[SourceDerivationBatch, ...],
         ]
         | None = None,
+        runtime_event_trace_sink: RuntimeEventTraceSink | None = None,
     ) -> None:
         self._store = store
         self._plan_work = plan_work or plan_source_derivation_work
+        self._runtime_event_trace_sink = runtime_event_trace_sink or NoOpRuntimeEventTraceSink()
 
     async def derive(
         self,
@@ -313,7 +316,6 @@ class SourceUnitDeriver:
                 extraction_contract_version=derivation.extraction_contract_version,
                 occurred_at=datetime.now().astimezone(),
                 deployment_revision=current_deployment_revision(),
-                trace_context=current_trace_context(),
                 observation_revision_ids=revision_by_observation,
             )
             await self._store.record_source_derivation_batch_result(
@@ -322,7 +324,7 @@ class SourceUnitDeriver:
                 result=result,
                 runtime_events=events,
             )
-            project_runtime_events_to_current_span(events)
+            publish_runtime_events(self._runtime_event_trace_sink, events)
             return result
 
         pending_results = await collect_bounded(

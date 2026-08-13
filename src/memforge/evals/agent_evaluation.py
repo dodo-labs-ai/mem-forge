@@ -8,7 +8,9 @@ signal remains actionable even when no Memory was created.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
+import logging
 import os
 from collections import Counter
 from contextlib import contextmanager
@@ -21,6 +23,7 @@ from typing import Iterator, Literal, Mapping, Protocol
 
 AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v1"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +162,7 @@ class AgentRuntimeEventQuery:
     occurred_to: datetime
     requesting_user_id: str | None = None
     include_private: bool = False
+    event_id: str | None = None
     source_id: str | None = None
     source_type: str | None = None
     event_name: str | None = None
@@ -214,6 +218,111 @@ class AgentRuntimeEventStore(Protocol):
         self,
         query: AgentRuntimeEventQuery,
     ) -> list[AgentRuntimeEvent]: ...
+
+    async def purge_agent_runtime_events(
+        self,
+        *,
+        occurred_before: datetime,
+        limit: int,
+    ) -> int: ...
+
+
+class RuntimeEventTraceSink(Protocol):
+    """Best-effort post-commit projection seam for one durable event batch."""
+
+    def publish(self, events: tuple[AgentRuntimeEvent, ...]) -> None: ...
+
+
+class LangfuseObservation(Protocol):
+    def start_observation(self, **kwargs: object) -> "LangfuseObservation": ...
+
+    def end(self) -> None: ...
+
+
+class LangfuseClient(Protocol):
+    def start_observation(self, **kwargs: object) -> LangfuseObservation: ...
+
+
+class NoOpRuntimeEventTraceSink:
+    def publish(self, events: tuple[AgentRuntimeEvent, ...]) -> None:
+        del events
+
+
+class LangfuseRuntimeEventTraceSink:
+    """Metadata-only Langfuse projection isolated from product correctness."""
+
+    def __init__(self, client: LangfuseClient) -> None:
+        self._client = client
+
+    def publish(self, events: tuple[AgentRuntimeEvent, ...]) -> None:
+        if not events:
+            return
+        first = events[0]
+        trace_id = first.trace_id or runtime_trace_id(
+            derivation_id=first.derivation_id,
+            batch_id=first.batch_id,
+            batch_attempt=first.batch_attempt,
+        )
+        root = self._client.start_observation(
+            name="memforge.agent.extraction_batch",
+            as_type="span",
+            trace_context={"trace_id": trace_id},
+            metadata=_langfuse_batch_metadata(first, len(events)),
+        )
+        try:
+            for event in events:
+                child = root.start_observation(
+                    name=event.event_name,
+                    as_type="span",
+                    metadata=_langfuse_event_metadata(event),
+                    level=_langfuse_level(event.outcome),
+                    status_message=event.reason_code,
+                )
+                child.end()
+        finally:
+            root.end()
+
+
+def runtime_event_trace_sink_from_env() -> RuntimeEventTraceSink:
+    """Build the optional sink without importing Langfuse when disabled."""
+
+    if os.environ.get("MEMFORGE_LANGFUSE_ENABLED", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return NoOpRuntimeEventTraceSink()
+    if not os.environ.get("LANGFUSE_PUBLIC_KEY", "").strip() or not os.environ.get(
+        "LANGFUSE_SECRET_KEY", ""
+    ).strip():
+        logger.warning("Langfuse tracing is enabled but credentials are incomplete")
+        return NoOpRuntimeEventTraceSink()
+    try:
+        module = importlib.import_module("langfuse")
+        client = module.get_client()
+    except Exception as exc:
+        logger.warning(
+            "Langfuse tracing is enabled but client initialization failed error_type=%s",
+            type(exc).__name__,
+        )
+        return NoOpRuntimeEventTraceSink()
+    return LangfuseRuntimeEventTraceSink(client)
+
+
+def publish_runtime_events(
+    sink: RuntimeEventTraceSink,
+    events: tuple[AgentRuntimeEvent, ...],
+) -> None:
+    """Publish after commit; sink failure never changes the product result."""
+
+    try:
+        sink.publish(events)
+    except Exception as exc:
+        logger.warning(
+            "Agent runtime trace projection failed error_type=%s",
+            type(exc).__name__,
+        )
 
 
 class QualitySignalCollector:
@@ -295,6 +404,18 @@ def bind_quality_signals(
     if batch_attempt < 1:
         raise ValueError("batch_attempt must be positive")
     timestamp = occurred_at or datetime.now(timezone.utc)
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("agent runtime event timestamp requires a timezone")
+    timestamp = timestamp.astimezone(timezone.utc)
+    resolved_trace_context = trace_context or RuntimeTraceContext(
+        trace_id=runtime_trace_id(
+            derivation_id=derivation_id,
+            batch_id=batch_id,
+            batch_attempt=batch_attempt,
+        ),
+        span_id="0" * 16,
+        trace_flags=None,
+    )
     events = []
     for index, signal in enumerate(signals):
         if (
@@ -331,30 +452,29 @@ def bind_quality_signals(
                 batch_attempt=batch_attempt,
                 extraction_contract_version=extraction_contract_version,
                 deployment_revision=deployment_revision,
-                trace_id=trace_context.trace_id if trace_context else None,
-                span_id=trace_context.span_id if trace_context else None,
-                trace_flags=trace_context.trace_flags if trace_context else None,
+                trace_id=resolved_trace_context.trace_id,
+                span_id=(
+                    resolved_trace_context.span_id
+                    if resolved_trace_context.span_id != "0" * 16
+                    else None
+                ),
+                trace_flags=resolved_trace_context.trace_flags,
                 **asdict(signal),
             )
         )
     return tuple(events)
 
 
-def current_trace_context() -> RuntimeTraceContext | None:
-    """Read the active OTel span when the optional API is installed."""
+def runtime_trace_id(
+    *,
+    derivation_id: str,
+    batch_id: str,
+    batch_attempt: int,
+) -> str:
+    """Return the stable W3C-compatible trace correlation for one attempt."""
 
-    try:
-        from opentelemetry import trace  # type: ignore[import-not-found]
-    except ImportError:
-        return None
-    span_context = trace.get_current_span().get_span_context()
-    if not span_context.is_valid:
-        return None
-    return RuntimeTraceContext(
-        trace_id=f"{span_context.trace_id:032x}",
-        span_id=f"{span_context.span_id:016x}",
-        trace_flags=int(span_context.trace_flags),
-    )
+    seed = f"memforge-agent-runtime-trace-v1:{derivation_id}:{batch_id}:{batch_attempt}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
 
 
 def current_deployment_revision() -> str | None:
@@ -402,34 +522,66 @@ def runtime_event_otel_attributes(event: AgentRuntimeEvent) -> Mapping[str, obje
     return {name: value for name, value in values.items() if value is not None}
 
 
-def project_runtime_events_to_current_span(
-    events: tuple[AgentRuntimeEvent, ...],
-) -> None:
-    """Best-effort OTel projection after the durable product transaction."""
-
-    if not events:
-        return
-    try:
-        from opentelemetry import trace  # type: ignore[import-not-found]
-    except ImportError:
-        return
-    span = trace.get_current_span()
-    if not span.is_recording():
-        return
-    for event in events:
-        span.add_event(
-            event.event_name,
-            attributes=dict(runtime_event_otel_attributes(event)),
-            timestamp=int(event.occurred_at.timestamp() * 1_000_000_000),
-        )
-
-
 def event_public_payload(event: AgentRuntimeEvent) -> Mapping[str, object]:
     """Return the fixed, content-free payload suitable for logs and exports."""
 
     payload = asdict(event)
     payload["occurred_at"] = event.occurred_at.isoformat()
     return payload
+
+
+def _langfuse_batch_metadata(
+    event: AgentRuntimeEvent,
+    event_count: int,
+) -> dict[str, object]:
+    values: dict[str, object | None] = {
+        "schema_version": event.schema_version,
+        "source_type": event.source_type,
+        "extraction_contract_version": event.extraction_contract_version,
+        "deployment_revision": event.deployment_revision,
+        "provider": event.provider,
+        "model": event.model,
+        "batch_attempt": event.batch_attempt,
+        "event_count": event_count,
+    }
+    return {name: value for name, value in values.items() if value is not None}
+
+
+def _langfuse_event_metadata(event: AgentRuntimeEvent) -> dict[str, object]:
+    """Return the allowlisted, content-free Langfuse event projection."""
+
+    values: dict[str, object | None] = {
+        "event_id": event.event_id,
+        "schema_version": event.schema_version,
+        "outcome": event.outcome,
+        "reason_code": event.reason_code,
+        "source_type": event.source_type,
+        "extraction_contract_version": event.extraction_contract_version,
+        "deployment_revision": event.deployment_revision,
+        "operation": event.operation,
+        "provider": event.provider,
+        "model": event.model,
+        "batch_attempt": event.batch_attempt,
+        "localization_mode": event.localization_mode,
+        "attempt_count": event.attempt_count,
+        "retry_count": event.retry_count,
+        "fallback_count": event.fallback_count,
+        "structured_mode": event.structured_mode,
+        "terminal_category": event.terminal_category,
+        "error_code": event.error_code,
+        "candidate_count": event.candidate_count,
+        "rejected_count": event.rejected_count,
+        "occurrence_count": event.occurrence_count,
+    }
+    return {name: value for name, value in values.items() if value is not None}
+
+
+def _langfuse_level(outcome: AgentRuntimeOutcome) -> str:
+    if outcome == "failed":
+        return "ERROR"
+    if outcome in {"degraded", "rejected"}:
+        return "WARNING"
+    return "DEFAULT"
 
 
 def summarize_agent_runtime_events(

@@ -1757,6 +1757,7 @@ async def test_source_deriver_binds_provider_neutral_quality_events_to_current_l
     assert event.target_unit_revision_id == projection.source_unit_revisions[0].id
     assert event.observation_revision_id == projection.observation_revisions[0].id
     assert event.model == "anthropic/claude-sonnet"
+    assert len(event.trace_id or "") == 32
     assert not hasattr(event, "memory_content")
 
 

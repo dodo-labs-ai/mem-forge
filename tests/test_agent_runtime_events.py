@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,10 +11,14 @@ from memforge.evals.agent_evaluation import (
     QualitySignal,
     QualitySignalCollector,
     RuntimeTraceContext,
+    LangfuseRuntimeEventTraceSink,
+    NoOpRuntimeEventTraceSink,
     bind_quality_signals,
     current_deployment_revision,
     event_public_payload,
     runtime_event_otel_attributes,
+    publish_runtime_events,
+    runtime_event_trace_sink_from_env,
     summarize_agent_runtime_events,
 )
 from memforge.storage.database import Database
@@ -76,6 +81,7 @@ def test_bind_quality_signal_is_replay_stable_without_memory_id() -> None:
     assert first.derivation_id == "sda-current"
     assert first.batch_id == "batch-1"
     assert not hasattr(first, "memory_content")
+    assert len(first.trace_id or "") == 32
 
 
 def test_retry_attempt_and_trace_correlation_do_not_alias_runtime_identity() -> None:
@@ -105,6 +111,19 @@ def test_retry_attempt_and_trace_correlation_do_not_alias_runtime_identity() -> 
     assert retry.trace_id == "1" * 32
     assert retry.span_id == "2" * 16
     assert "trace_id" not in runtime_event_otel_attributes(retry)
+
+
+def test_default_trace_id_is_deterministic_but_not_event_identity() -> None:
+    first, second = _events(
+        QualitySignal("structured_output_outcome", "expected", "schema_conformant"),
+        QualitySignal("extraction_batch_outcome", "expected", "candidates_extracted"),
+    )
+
+    assert first.event_id != second.event_id
+    assert first.trace_id == second.trace_id
+    assert first.trace_id == _events(
+        QualitySignal("structured_output_outcome", "expected", "schema_conformant")
+    )[0].trace_id
 
 
 def test_deployment_revision_prefers_explicit_and_safely_reads_vcap(monkeypatch) -> None:
@@ -204,6 +223,7 @@ async def test_sqlite_event_store_is_idempotent_and_supports_bounded_cohorts(db)
             occurred_to=NOW + timedelta(seconds=1),
             requesting_user_id="user-1",
             include_private=True,
+            event_id=events[1].event_id,
             source_id="src-teams",
             event_name="evidence_localization_outcome",
             reason_code="whole_block_fallback",
@@ -244,6 +264,157 @@ async def test_private_runtime_events_require_the_source_owner_scope(db) -> None
             include_private=True,
         )
     ) == list(events)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_runtime_event_retention_is_bounded_and_exclusive(db) -> None:
+    old_event = _events(
+        QualitySignal(
+            event_name="extraction_batch_outcome",
+            outcome="expected",
+            reason_code="zero_candidates",
+        )
+    )[0]
+    cutoff_event = bind_quality_signals(
+        (QualitySignal("extraction_batch_outcome", "expected", "zero_candidates"),),
+        source_id=old_event.source_id,
+        source_type=old_event.source_type,
+        doc_id=old_event.doc_id,
+        source_unit_id=old_event.source_unit_id,
+        target_unit_revision_id=old_event.target_unit_revision_id,
+        projection_run_id=old_event.projection_run_id,
+        derivation_id="sda-cutoff",
+        batch_id="batch-cutoff",
+        batch_attempt=1,
+        extraction_contract_version=old_event.extraction_contract_version,
+        occurred_at=NOW + timedelta(days=1),
+    )[0]
+    await db.record_agent_runtime_events((old_event, cutoff_event))
+
+    assert await db.purge_agent_runtime_events(
+        occurred_before=NOW + timedelta(days=1),
+        limit=1,
+    ) == 1
+    remaining = await db.list_agent_runtime_events(
+        AgentRuntimeEventQuery(
+            occurred_from=NOW - timedelta(seconds=1),
+            occurred_to=NOW + timedelta(days=2),
+            requesting_user_id="user-1",
+            include_private=True,
+        )
+    )
+    assert remaining == [cutoff_event]
+
+
+class _FakeObservation:
+    def __init__(self, calls: list[tuple[str, dict]], kind: str, kwargs: dict) -> None:
+        self._calls = calls
+        self._kind = kind
+        self._kwargs = kwargs
+
+    def start_observation(self, **kwargs):
+        self._calls.append(("child", kwargs))
+        return _FakeObservation(self._calls, "child", kwargs)
+
+    def end(self) -> None:
+        self._calls.append((f"{self._kind}_end", self._kwargs))
+
+
+class _FakeLangfuseClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def start_observation(self, **kwargs):
+        self.calls.append(("root", kwargs))
+        return _FakeObservation(self.calls, "root", kwargs)
+
+
+def test_langfuse_sink_projects_allowlisted_metadata_and_event_id() -> None:
+    [event] = _events(
+        QualitySignal(
+            event_name="evidence_localization_outcome",
+            outcome="degraded",
+            reason_code="whole_block_fallback",
+            block_hash="b" * 64,
+            quote_hash="a" * 64,
+            localization_mode="block_fallback",
+        )
+    )
+    client = _FakeLangfuseClient()
+
+    LangfuseRuntimeEventTraceSink(client).publish((event,))
+
+    child = next(payload for kind, payload in client.calls if kind == "child")
+    assert child["metadata"]["event_id"] == event.event_id
+    assert child["metadata"]["reason_code"] == "whole_block_fallback"
+    assert not {
+        "source_id",
+        "doc_id",
+        "source_unit_id",
+        "prompt_hash",
+        "block_hash",
+        "quote_hash",
+        "observation_id",
+    }.intersection(child["metadata"])
+
+
+def test_runtime_trace_sink_failure_is_best_effort(caplog) -> None:
+    class FailingSink:
+        def publish(self, events):
+            raise RuntimeError("backend unavailable")
+
+    publish_runtime_events(FailingSink(), _events(QualitySignal("batch", "failed", "provider_error")))
+    NoOpRuntimeEventTraceSink().publish(())
+    assert "trace projection failed" in caplog.text
+
+
+def test_runtime_trace_sink_is_disabled_without_importing_langfuse(monkeypatch) -> None:
+    def unexpected_import(name: str):
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.delenv("MEMFORGE_LANGFUSE_ENABLED", raising=False)
+    monkeypatch.setattr("memforge.evals.agent_evaluation.importlib.import_module", unexpected_import)
+
+    assert isinstance(runtime_event_trace_sink_from_env(), NoOpRuntimeEventTraceSink)
+
+
+def test_runtime_trace_sink_uses_langfuse_only_when_enabled(monkeypatch) -> None:
+    client = _FakeLangfuseClient()
+    monkeypatch.setenv("MEMFORGE_LANGFUSE_ENABLED", "true")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+    monkeypatch.setattr(
+        "memforge.evals.agent_evaluation.importlib.import_module",
+        lambda name: SimpleNamespace(get_client=lambda: client) if name == "langfuse" else None,
+    )
+
+    sink = runtime_event_trace_sink_from_env()
+
+    assert isinstance(sink, LangfuseRuntimeEventTraceSink)
+    sink.publish(_events(QualitySignal("batch", "expected", "candidates_extracted")))
+    assert any(kind == "root" for kind, _ in client.calls)
+
+
+def test_runtime_trace_sink_initialization_failure_is_nonfatal(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("MEMFORGE_LANGFUSE_ENABLED", "true")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+    monkeypatch.setattr(
+        "memforge.evals.agent_evaluation.importlib.import_module",
+        lambda _name: SimpleNamespace(get_client=lambda: (_ for _ in ()).throw(RuntimeError("bad config"))),
+    )
+
+    assert isinstance(runtime_event_trace_sink_from_env(), NoOpRuntimeEventTraceSink)
+    assert "client initialization failed" in caplog.text
+
+
+def test_runtime_trace_sink_requires_credentials_when_enabled(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("MEMFORGE_LANGFUSE_ENABLED", "true")
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+
+    assert isinstance(runtime_event_trace_sink_from_env(), NoOpRuntimeEventTraceSink)
+    assert "credentials are incomplete" in caplog.text
 
 
 def test_cohort_report_uses_event_name_denominators() -> None:
