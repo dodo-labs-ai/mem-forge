@@ -7,7 +7,9 @@ import logging
 from collections.abc import Awaitable, Callable
 from time import perf_counter
 from typing import Any
+
 from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
+from memforge.evals.agent_evaluation import QualitySignal, record_quality_signal
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
     StructuredLlmConfig,
@@ -349,7 +351,17 @@ class MemoryExtractor:
         for memory in result.memories:
             resolved = catalog.resolve(memory)
             if resolved is None:
+                _record_evidence_signal(
+                    original=memory,
+                    resolved=None,
+                    extraction_metadata=result.metadata,
+                )
                 continue
+            _record_evidence_signal(
+                original=memory,
+                resolved=resolved,
+                extraction_metadata=result.metadata,
+            )
             resolved.memory.evidence_anchor = evidence_anchor
             if evidence_anchor == "unit":
                 # Unit coordinates are not Observation-revision coordinates.
@@ -507,7 +519,17 @@ class MemoryExtractor:
                 continue
             resolved = catalog.resolve(memory)
             if resolved is None or resolved.block.observation_id is None:
+                _record_evidence_signal(
+                    original=memory,
+                    resolved=None,
+                    extraction_metadata=result.metadata,
+                )
                 continue
+            _record_evidence_signal(
+                original=memory,
+                resolved=resolved,
+                extraction_metadata=result.metadata,
+            )
             localized_memory = resolved.memory
             source_observation_id = resolved.block.observation_id
             localized_memory.evidence_anchor = "projection_batch"
@@ -706,3 +728,68 @@ def _block_fallback_sample(
         "extraction_model": extraction_metadata.get("extraction_model"),
         "prompt_sha256": extraction_metadata.get("prompt_sha256"),
     }
+
+
+def _record_evidence_signal(
+    *,
+    original: RawMemory,
+    resolved: EvidenceResolution | None,
+    extraction_metadata: dict[str, object],
+) -> None:
+    """Emit one content-free admission/localization result for evaluation."""
+
+    candidate_hash = hashlib.sha256(original.content.encode("utf-8")).hexdigest()
+    submitted_quote = original.evidence_quote or ""
+    quote_hash = (
+        hashlib.sha256(submitted_quote.encode("utf-8")).hexdigest()
+        if submitted_quote
+        else None
+    )
+    if resolved is None:
+        if original.evidence_block_id:
+            reason_code = "unknown_evidence_block_id"
+        elif submitted_quote:
+            reason_code = "legacy_quote_unresolved"
+        else:
+            reason_code = "missing_evidence_reference"
+        record_quality_signal(
+            QualitySignal(
+                event_name="evidence_admission_outcome",
+                outcome="rejected",
+                reason_code=reason_code,
+                prompt_hash=_optional_hash(extraction_metadata.get("prompt_sha256")),
+                candidate_hash=candidate_hash,
+                quote_hash=quote_hash,
+                quote_chars=len(submitted_quote),
+            )
+        )
+        return
+
+    block_text = resolved.block.text
+    record_quality_signal(
+        QualitySignal(
+            event_name="evidence_localization_outcome",
+            outcome="degraded" if resolved.refinement == "block_fallback" else "expected",
+            reason_code=(
+                "whole_block_fallback"
+                if resolved.refinement == "block_fallback"
+                else resolved.refinement
+            ),
+            prompt_hash=_optional_hash(extraction_metadata.get("prompt_sha256")),
+            candidate_hash=candidate_hash,
+            observation_id=resolved.block.observation_id,
+            range_start=resolved.memory.evidence_range_start,
+            range_end=resolved.memory.evidence_range_end,
+            block_hash=hashlib.sha256(block_text.encode("utf-8")).hexdigest(),
+            quote_hash=quote_hash,
+            quote_chars=len(submitted_quote),
+            localization_mode=resolved.refinement,
+        )
+    )
+
+
+def _optional_hash(value: object) -> str | None:
+    text = value if isinstance(value, str) else None
+    if text is None or len(text) != 64 or any(ch not in "0123456789abcdef" for ch in text):
+        return None
+    return text

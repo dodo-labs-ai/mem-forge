@@ -140,6 +140,10 @@ from memforge.memory.relation_discovery_contract import (
     resolve_relation_discovery_actor_user_id,
 )
 from memforge.memory.audit import MemoryAuditEvent
+from memforge.evals.agent_evaluation import (
+    AgentRuntimeEvent,
+    AgentRuntimeEventQuery,
+)
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
 from memforge.memory.review_decision import ReviewVectorTask
 from memforge.memory.review_contract import (
@@ -1634,6 +1638,60 @@ CREATE INDEX IF NOT EXISTS idx_memory_audit_operation ON memory_audit_events(ope
 CREATE INDEX IF NOT EXISTS idx_memory_audit_memory ON memory_audit_events(memory_id);
 CREATE INDEX IF NOT EXISTS idx_memory_audit_doc ON memory_audit_events(doc_id);
 CREATE INDEX IF NOT EXISTS idx_memory_audit_type ON memory_audit_events(event_type);
+
+-- ---------------------------------------------------------------
+-- Agent runtime events - append-only, content-free quality signals
+-- ---------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS agent_runtime_events (
+    event_id                    TEXT PRIMARY KEY,
+    schema_version              TEXT NOT NULL,
+    event_name                  TEXT NOT NULL,
+    outcome                     TEXT NOT NULL,
+    reason_code                 TEXT NOT NULL,
+    occurred_at                 TEXT NOT NULL,
+    deployment_revision         TEXT,
+    source_id                   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    source_type                 TEXT NOT NULL,
+    doc_id                      TEXT NOT NULL,
+    source_unit_id              TEXT NOT NULL,
+    target_unit_revision_id     TEXT NOT NULL,
+    projection_run_id           TEXT NOT NULL,
+    derivation_id               TEXT NOT NULL,
+    batch_id                    TEXT NOT NULL,
+    batch_attempt               INTEGER NOT NULL,
+    extraction_contract_version TEXT NOT NULL,
+    operation                   TEXT,
+    provider                    TEXT,
+    model                       TEXT,
+    prompt_hash                 TEXT,
+    candidate_hash              TEXT,
+    observation_id              TEXT,
+    observation_revision_id     TEXT,
+    range_start                 INTEGER,
+    range_end                   INTEGER,
+    block_hash                  TEXT,
+    quote_hash                  TEXT,
+    quote_chars                 INTEGER,
+    localization_mode           TEXT,
+    attempt_count               INTEGER,
+    retry_count                 INTEGER,
+    fallback_count              INTEGER,
+    structured_mode             TEXT,
+    terminal_category           TEXT,
+    error_code                  TEXT,
+    candidate_count             INTEGER,
+    rejected_count              INTEGER,
+    occurrence_count            INTEGER NOT NULL DEFAULT 1,
+    trace_id                    TEXT,
+    span_id                     TEXT,
+    trace_flags                 INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_agent_runtime_time
+    ON agent_runtime_events(occurred_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runtime_source_time
+    ON agent_runtime_events(source_id, occurred_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runtime_type_reason
+    ON agent_runtime_events(event_name, reason_code, occurred_at);
 """
 
 # ---------------------------------------------------------------------------
@@ -3241,6 +3299,62 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                ON review_vector_outbox(status, created_at)""",
         ],
     ),
+    (
+        76,
+        "Add correlated agent runtime event ledger",
+        [
+            """CREATE TABLE IF NOT EXISTS agent_runtime_events (
+                event_id                    TEXT PRIMARY KEY,
+                schema_version              TEXT NOT NULL,
+                event_name                  TEXT NOT NULL,
+                outcome                     TEXT NOT NULL,
+                reason_code                 TEXT NOT NULL,
+                occurred_at                 TEXT NOT NULL,
+                deployment_revision         TEXT,
+                source_id                   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                source_type                 TEXT NOT NULL,
+                doc_id                      TEXT NOT NULL,
+                source_unit_id              TEXT NOT NULL,
+                target_unit_revision_id     TEXT NOT NULL,
+                projection_run_id           TEXT NOT NULL,
+                derivation_id               TEXT NOT NULL,
+                batch_id                    TEXT NOT NULL,
+                batch_attempt               INTEGER NOT NULL,
+                extraction_contract_version TEXT NOT NULL,
+                operation                   TEXT,
+                provider                    TEXT,
+                model                       TEXT,
+                prompt_hash                 TEXT,
+                candidate_hash              TEXT,
+                observation_id              TEXT,
+                observation_revision_id     TEXT,
+                range_start                 INTEGER,
+                range_end                   INTEGER,
+                block_hash                  TEXT,
+                quote_hash                  TEXT,
+                quote_chars                 INTEGER,
+                localization_mode           TEXT,
+                attempt_count               INTEGER,
+                retry_count                 INTEGER,
+                fallback_count              INTEGER,
+                structured_mode             TEXT,
+                terminal_category           TEXT,
+                error_code                  TEXT,
+                candidate_count             INTEGER,
+                rejected_count              INTEGER,
+                occurrence_count            INTEGER NOT NULL DEFAULT 1,
+                trace_id                    TEXT,
+                span_id                     TEXT,
+                trace_flags                 INTEGER
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_runtime_time
+               ON agent_runtime_events(occurred_at, event_id)""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_runtime_source_time
+               ON agent_runtime_events(source_id, occurred_at, event_id)""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_runtime_type_reason
+               ON agent_runtime_events(event_name, reason_code, occurred_at)""",
+        ],
+    ),
 ]
 
 
@@ -4745,8 +4859,9 @@ class Database:
         derivation_id: str,
         batch_id: str,
         result: MemoryExtractionResult,
+        runtime_events: tuple[AgentRuntimeEvent, ...] = (),
     ) -> SourceDerivationAttempt:
-        """Persist one validated batch output or safe retryable failure."""
+        """Atomically persist one batch outcome and its runtime facts."""
 
         now = _now_iso()
         async with self._write_lock:
@@ -4847,6 +4962,7 @@ class Database:
                         derivation_id,
                     ),
                 )
+                await self._insert_agent_runtime_events_unlocked(runtime_events)
                 await self.db.commit()
                 return await self._source_derivation_attempt_unlocked(derivation_id)
             except Exception:
@@ -17412,6 +17528,227 @@ class Database:
                 (json.dumps([]), json.dumps({"redacted": True}), memory_id),
             )
             await self.db.commit()
+
+    # ==================================================================
+    # Agent runtime event ledger
+    # ==================================================================
+
+    async def record_agent_runtime_events(
+        self,
+        events: tuple[AgentRuntimeEvent, ...],
+    ) -> None:
+        """Append content-free events; deterministic IDs make replay idempotent."""
+
+        if not events:
+            return
+        async with self._write_lock:
+            await self._insert_agent_runtime_events_unlocked(events)
+            await self.db.commit()
+
+    async def _insert_agent_runtime_events_unlocked(
+        self,
+        events: tuple[AgentRuntimeEvent, ...],
+    ) -> None:
+        if not events:
+            return
+        await self.db.executemany(
+            """INSERT OR IGNORE INTO agent_runtime_events (
+                    event_id, schema_version, event_name, outcome, reason_code,
+                    occurred_at, deployment_revision, source_id, source_type,
+                    doc_id, source_unit_id, target_unit_revision_id,
+                    projection_run_id, derivation_id, batch_id, batch_attempt,
+                    extraction_contract_version, operation, provider, model, prompt_hash,
+                    candidate_hash, observation_id, observation_revision_id,
+                    range_start, range_end, block_hash, quote_hash, quote_chars,
+                    localization_mode, attempt_count, retry_count, fallback_count,
+                    structured_mode, terminal_category, error_code,
+                    candidate_count, rejected_count, occurrence_count,
+                    trace_id, span_id, trace_flags
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?
+                )""",
+            [
+                (
+                        event.event_id,
+                        event.schema_version,
+                        event.event_name,
+                        event.outcome,
+                        event.reason_code,
+                        _utc_iso(event.occurred_at),
+                        event.deployment_revision,
+                        event.source_id,
+                        event.source_type,
+                        event.doc_id,
+                        event.source_unit_id,
+                        event.target_unit_revision_id,
+                        event.projection_run_id,
+                        event.derivation_id,
+                        event.batch_id,
+                        event.batch_attempt,
+                        event.extraction_contract_version,
+                        event.operation,
+                        event.provider,
+                        event.model,
+                        event.prompt_hash,
+                        event.candidate_hash,
+                        event.observation_id,
+                        event.observation_revision_id,
+                        event.range_start,
+                        event.range_end,
+                        event.block_hash,
+                        event.quote_hash,
+                        event.quote_chars,
+                        event.localization_mode,
+                        event.attempt_count,
+                        event.retry_count,
+                        event.fallback_count,
+                        event.structured_mode,
+                        event.terminal_category,
+                        event.error_code,
+                        event.candidate_count,
+                        event.rejected_count,
+                        event.occurrence_count,
+                        event.trace_id,
+                        event.span_id,
+                        event.trace_flags,
+                )
+                for event in events
+            ],
+        )
+
+    async def list_agent_runtime_events(
+        self,
+        query: AgentRuntimeEventQuery,
+    ) -> list[AgentRuntimeEvent]:
+        """Return one deterministic, bounded online evaluation cohort."""
+
+        clauses = ["E.occurred_at >= ?", "E.occurred_at < ?"]
+        params: list[object] = [
+            _utc_iso(query.occurred_from),
+            _utc_iso(query.occurred_to),
+        ]
+        clauses.append(
+            "((S.access_state = 'active' AND (S.access_policy = 'workspace' OR "
+            "(? = 1 AND S.access_policy = 'private' AND S.owner_user_id = ?))) OR "
+            "(S.access_state = 'changing' AND ? = 1 AND S.owner_user_id = ?))"
+        )
+        params.extend(
+            (
+                int(query.include_private),
+                query.requesting_user_id,
+                int(query.include_private),
+                query.requesting_user_id,
+            )
+        )
+        for column, value in (
+            ("event_id", query.event_id),
+            ("source_id", query.source_id),
+            ("source_type", query.source_type),
+            ("event_name", query.event_name),
+            ("outcome", query.outcome),
+            ("reason_code", query.reason_code),
+            ("trace_id", query.trace_id),
+            ("model", query.model),
+            ("provider", query.provider),
+            ("deployment_revision", query.deployment_revision),
+            ("extraction_contract_version", query.extraction_contract_version),
+        ):
+            if value is not None:
+                clauses.append(f"E.{column} = ?")
+                params.append(value)
+        params.extend((query.limit, query.offset))
+        sql = (
+            "SELECT E.* FROM agent_runtime_events E "
+            "JOIN sources S ON S.id = E.source_id WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY occurred_at ASC, event_id ASC LIMIT ? OFFSET ?"
+        )
+        rows = await self.db.execute_fetchall(sql, tuple(params))
+        return [self._row_to_agent_runtime_event(row) for row in rows]
+
+    async def purge_agent_runtime_events(
+        self,
+        *,
+        occurred_before: datetime,
+        limit: int,
+    ) -> int:
+        """Delete one deterministic retention batch before an exclusive cutoff."""
+
+        if occurred_before.tzinfo is None or occurred_before.utcoffset() is None:
+            raise ValueError("agent runtime retention cutoff requires a timezone")
+        if not 1 <= limit <= 10_000:
+            raise ValueError("agent runtime retention limit must be between 1 and 10000")
+        cutoff = occurred_before.astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            try:
+                rows = await self.db.execute_fetchall(
+                    """SELECT event_id FROM agent_runtime_events
+                       WHERE occurred_at < ?
+                       ORDER BY occurred_at, event_id
+                       LIMIT ?""",
+                    (cutoff, limit),
+                )
+                event_ids = tuple(str(row["event_id"]) for row in rows)
+                if event_ids:
+                    placeholders = ",".join("?" for _ in event_ids)
+                    await self.db.execute(
+                        f"DELETE FROM agent_runtime_events WHERE event_id IN ({placeholders})",
+                        event_ids,
+                    )
+                await self.db.commit()
+                return len(event_ids)
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    @staticmethod
+    def _row_to_agent_runtime_event(row: Mapping[str, object]) -> AgentRuntimeEvent:
+        return AgentRuntimeEvent(
+            event_id=str(row["event_id"]),
+            schema_version=str(row["schema_version"]),
+            event_name=str(row["event_name"]),
+            outcome=str(row["outcome"]),  # type: ignore[arg-type]
+            reason_code=str(row["reason_code"]),
+            occurred_at=datetime.fromisoformat(str(row["occurred_at"]).replace("Z", "+00:00")),
+            deployment_revision=row["deployment_revision"],  # type: ignore[arg-type]
+            source_id=str(row["source_id"]),
+            source_type=str(row["source_type"]),
+            doc_id=str(row["doc_id"]),
+            source_unit_id=str(row["source_unit_id"]),
+            target_unit_revision_id=str(row["target_unit_revision_id"]),
+            projection_run_id=str(row["projection_run_id"]),
+            derivation_id=str(row["derivation_id"]),
+            batch_id=str(row["batch_id"]),
+            batch_attempt=int(row["batch_attempt"]),
+            extraction_contract_version=str(row["extraction_contract_version"]),
+            operation=row["operation"],  # type: ignore[arg-type]
+            provider=row["provider"],  # type: ignore[arg-type]
+            model=row["model"],  # type: ignore[arg-type]
+            prompt_hash=row["prompt_hash"],  # type: ignore[arg-type]
+            candidate_hash=row["candidate_hash"],  # type: ignore[arg-type]
+            observation_id=row["observation_id"],  # type: ignore[arg-type]
+            observation_revision_id=row["observation_revision_id"],  # type: ignore[arg-type]
+            range_start=row["range_start"],  # type: ignore[arg-type]
+            range_end=row["range_end"],  # type: ignore[arg-type]
+            block_hash=row["block_hash"],  # type: ignore[arg-type]
+            quote_hash=row["quote_hash"],  # type: ignore[arg-type]
+            quote_chars=row["quote_chars"],  # type: ignore[arg-type]
+            localization_mode=row["localization_mode"],  # type: ignore[arg-type]
+            attempt_count=row["attempt_count"],  # type: ignore[arg-type]
+            retry_count=row["retry_count"],  # type: ignore[arg-type]
+            fallback_count=row["fallback_count"],  # type: ignore[arg-type]
+            structured_mode=row["structured_mode"],  # type: ignore[arg-type]
+            terminal_category=row["terminal_category"],  # type: ignore[arg-type]
+            error_code=row["error_code"],  # type: ignore[arg-type]
+            candidate_count=row["candidate_count"],  # type: ignore[arg-type]
+            rejected_count=row["rejected_count"],  # type: ignore[arg-type]
+            occurrence_count=int(row["occurrence_count"]),
+            trace_id=row["trace_id"],  # type: ignore[arg-type]
+            span_id=row["span_id"],  # type: ignore[arg-type]
+            trace_flags=row["trace_flags"],  # type: ignore[arg-type]
+        )
 
     # ==================================================================
     # Config - schedule

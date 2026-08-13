@@ -21,6 +21,12 @@ from memforge.llm.structured import (
     MemorySupportValidationResponse,
     StructuredLlmError,
 )
+from memforge.evals.agent_evaluation import (
+    AgentRuntimeEventQuery,
+    QualitySignal,
+    bind_quality_signals,
+    record_quality_signal,
+)
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.evidence import (
@@ -1676,6 +1682,86 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_type",
+    ("confluence", "jira", "github", "local_markdown", "teams", "agent_session", "extension"),
+)
+async def test_source_deriver_binds_provider_neutral_quality_events_to_current_lineage(
+    db: Database,
+    source_type: str,
+) -> None:
+    projection = replace(
+        _projection(
+            run_id=f"projection-agent-eval-{source_type}",
+            body="The payroll tracing procedure remains active.",
+        ),
+        source_type=source_type,
+    )
+    document = await db.get_document("confluence-123")
+    assert document is not None
+
+    async def extract(batch):
+        record_quality_signal(
+            QualitySignal(
+                event_name="evidence_admission_outcome",
+                outcome="rejected",
+                reason_code="unknown_evidence_block_id",
+                observation_id=batch.primary_observation_ids[0],
+                candidate_hash="a" * 64,
+            )
+        )
+        return MemoryExtractionResult(
+            metadata={
+                "extraction_model": "anthropic/claude-sonnet",
+                "invalid_evidence_block_count": 1,
+            }
+        )
+
+    result = await SourceUnitDeriver(db).derive(
+        SourceUnitDerivationRequest(
+            projection=projection,
+            context=SourceUnitDerivationContext(
+                document=document,
+                doc_type=source_type,
+                project_key="ENG",
+                repo_identifier=None,
+                document_content="The payroll tracing procedure remains active.",
+                update_mode="full_document",
+                changed_hunks=None,
+                update_plan_stats=None,
+                source_updated_at=None,
+                user_id=None,
+                source_activity_epoch=None,
+            ),
+            extract_batch=extract,
+            max_concurrent=1,
+        )
+    )
+    rows = await db.list_agent_runtime_events(
+        AgentRuntimeEventQuery(
+            occurred_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            occurred_to=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            requesting_user_id="user-1",
+            include_private=True,
+            source_type=source_type,
+            event_name="evidence_admission_outcome",
+        )
+    )
+
+    assert len(rows) == 1
+    event = rows[0]
+    assert event.source_id == projection.source_id
+    assert event.source_type == source_type
+    assert event.projection_run_id == projection.run_id
+    assert event.derivation_id == result.derivation.id
+    assert event.target_unit_revision_id == projection.source_unit_revisions[0].id
+    assert event.observation_revision_id == projection.observation_revisions[0].id
+    assert event.model == "anthropic/claude-sonnet"
+    assert len(event.trace_id or "") == 32
+    assert not hasattr(event, "memory_content")
+
+
+@pytest.mark.asyncio
 async def test_source_derivation_separates_exact_payload_hash_from_stable_identity(
     db: Database,
 ) -> None:
@@ -1869,6 +1955,63 @@ async def test_projection_extraction_contract_change_invalidates_staged_derivati
     assert result.reused_batch_count == 0
     assert result.executed_batch_count == len(current_batches)
     assert executed_batch_ids == [batch.id for batch in current_batches]
+
+
+@pytest.mark.asyncio
+async def test_batch_result_and_runtime_events_rollback_together(db: Database) -> None:
+    projection = _projection(
+        run_id="projection-agent-runtime-transaction",
+        body="The payroll tracing procedure remains active.",
+    )
+    document = await db.get_document("confluence-123")
+    assert document is not None
+    context = SourceUnitDerivationContext(
+        document=document,
+        doc_type="confluence",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="The payroll tracing procedure remains active.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=None,
+        user_id=None,
+        source_activity_epoch=None,
+    )
+    batches = plan_source_derivation_work(projection, context)
+    manifest = source_derivation_manifest(projection, batches, context=context)
+    await db.stage_source_derivation(manifest)
+    [event] = bind_quality_signals(
+        (
+            QualitySignal(
+                event_name="extraction_batch_outcome",
+                outcome="expected",
+                reason_code="zero_candidates",
+            ),
+        ),
+        source_id=projection.source_id,
+        source_type=projection.source_type,
+        doc_id=document.doc_id,
+        source_unit_id=manifest.source_unit_id,
+        target_unit_revision_id=manifest.target_unit_revision_id,
+        projection_run_id=projection.run_id,
+        derivation_id=manifest.id,
+        batch_id=batches[0].id,
+        batch_attempt=1,
+        extraction_contract_version=manifest.extraction_contract_version,
+    )
+    invalid_event = replace(event, source_id="missing-source")
+
+    with pytest.raises(Exception, match="FOREIGN KEY"):
+        await db.record_source_derivation_batch_result(
+            derivation_id=manifest.id,
+            batch_id=batches[0].id,
+            result=MemoryExtractionResult(memories=[]),
+            runtime_events=(invalid_event,),
+        )
+
+    attempt = await db.stage_source_derivation(manifest)
+    assert attempt.batches[0].status == "pending"
 
 
 def test_source_derivation_diagnostics_reject_content_and_bound_field_count() -> None:

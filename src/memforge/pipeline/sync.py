@@ -96,6 +96,7 @@ from memforge.source_derivation import (
 from memforge.source_projection_config import canonical_projection_scope
 
 if TYPE_CHECKING:
+    from memforge.evals.agent_evaluation import RuntimeEventTraceSink
     from memforge.genes.base import Gene
     from memforge.memory.engine import MemoryEngine
     from memforge.memory.store import MemoryStore
@@ -568,6 +569,7 @@ class GeneSyncOrchestrator:
         source_projection_adapter: SourceProjectionAdapter | None = None,
         retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         structured_llm_client: LiteLlmStructuredClient | None = None,
+        runtime_event_trace_sink: RuntimeEventTraceSink | None = None,
     ) -> None:
         self.db = db
         self.doc_store = doc_store
@@ -583,6 +585,7 @@ class GeneSyncOrchestrator:
         self.source_projection_adapter = source_projection_adapter or DEFAULT_SOURCE_PROJECTION_ADAPTER
         self._retry_sleep = retry_sleep
         self.structured_llm_client = structured_llm_client
+        self.runtime_event_trace_sink = runtime_event_trace_sink
 
         self._db_lock = asyncio.Lock()
 
@@ -2768,7 +2771,10 @@ class GeneSyncOrchestrator:
                     )
                 return result
 
-        result = await SourceUnitDeriver(self.db).derive(
+        result = await SourceUnitDeriver(
+            self.db,
+            runtime_event_trace_sink=self.runtime_event_trace_sink,
+        ).derive(
             SourceUnitDerivationRequest(
                 projection=projection,
                 context=derivation_context,

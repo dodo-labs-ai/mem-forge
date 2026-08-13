@@ -82,7 +82,7 @@ from memforge.source_derivation import (
     source_derivation_context_identity_hash,
     source_derivation_manifest,
 )
-from memforge.config import AppConfig, SyncConfig
+from memforge.config import AgentEvaluationConfig, AppConfig, SyncConfig
 from memforge.storage.database import Database
 from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -6639,6 +6639,34 @@ async def test_scheduler_excludes_sources_without_sync_execution(
     await SyncScheduler(db, SyncService(db, AppConfig()))._sync_due_sources()
 
     assert server_scan_calls == [("default", {"src-agent-session-schedule-policy"})]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_applies_bounded_agent_runtime_retention(monkeypatch) -> None:
+    calls: list[tuple[datetime, int]] = []
+
+    class RetentionDatabase:
+        async def purge_agent_runtime_events(self, *, occurred_before, limit):
+            calls.append((occurred_before, limit))
+            return 3
+
+    config = AppConfig(
+        agent_evaluation=AgentEvaluationConfig(
+            runtime_event_retention_days=30,
+            runtime_event_purge_batch_size=77,
+        )
+    )
+    database = RetentionDatabase()
+    scheduler = SyncScheduler(database, SyncService(database, config))  # type: ignore[arg-type]
+
+    await scheduler._purge_agent_runtime_events()
+
+    [(cutoff, limit)] = calls
+    assert limit == 77
+    assert timedelta(days=29, hours=23) < datetime.now(timezone.utc) - cutoff < timedelta(
+        days=30,
+        hours=1,
+    )
 
 
 @pytest.mark.asyncio
