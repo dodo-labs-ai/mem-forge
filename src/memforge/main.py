@@ -689,6 +689,8 @@ async def _run_retrieval_eval_cli(
 @click.option("--to", "occurred_to", required=True, help="Exclusive RFC 3339 timestamp.")
 @click.option("--source-id")
 @click.option("--source-type")
+@click.option("--user-id", "requesting_user_id")
+@click.option("--include-private", is_flag=True)
 @click.option("--event-name")
 @click.option("--outcome", type=click.Choice(["expected", "degraded", "rejected", "failed"]))
 @click.option("--reason-code")
@@ -705,6 +707,8 @@ def eval_online_report(
     occurred_to: str,
     source_id: str | None,
     source_type: str | None,
+    requesting_user_id: str | None,
+    include_private: bool,
     event_name: str | None,
     outcome: str | None,
     reason_code: str | None,
@@ -730,6 +734,8 @@ def eval_online_report(
             occurred_to=time_to,
             source_id=source_id,
             source_type=source_type,
+            requesting_user_id=requesting_user_id,
+            include_private=include_private,
             event_name=event_name,
             outcome=outcome,
             reason_code=reason_code,
@@ -751,6 +757,8 @@ async def _run_online_evaluation_report(
     occurred_to: datetime,
     source_id: str | None,
     source_type: str | None,
+    requesting_user_id: str | None,
+    include_private: bool,
     event_name: str | None,
     outcome: str | None,
     reason_code: str | None,
@@ -775,6 +783,8 @@ async def _run_online_evaluation_report(
                 occurred_to=occurred_to,
                 source_id=source_id,
                 source_type=source_type,
+                requesting_user_id=requesting_user_id,
+                include_private=include_private,
                 event_name=event_name,
                 outcome=outcome,
                 reason_code=reason_code,

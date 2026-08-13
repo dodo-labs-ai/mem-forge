@@ -17624,11 +17624,16 @@ class Database:
     ) -> list[AgentRuntimeEvent]:
         """Return one deterministic, bounded online evaluation cohort."""
 
-        clauses = ["occurred_at >= ?", "occurred_at < ?"]
+        clauses = ["E.occurred_at >= ?", "E.occurred_at < ?"]
         params: list[object] = [
             _utc_iso(query.occurred_from),
             _utc_iso(query.occurred_to),
         ]
+        clauses.append(
+            "(S.access_policy = 'workspace' OR "
+            "(? = 1 AND S.access_policy = 'private' AND S.owner_user_id = ?))"
+        )
+        params.extend((int(query.include_private), query.requesting_user_id))
         for column, value in (
             ("source_id", query.source_id),
             ("source_type", query.source_type),
@@ -17642,11 +17647,12 @@ class Database:
             ("extraction_contract_version", query.extraction_contract_version),
         ):
             if value is not None:
-                clauses.append(f"{column} = ?")
+                clauses.append(f"E.{column} = ?")
                 params.append(value)
         params.extend((query.limit, query.offset))
         sql = (
-            "SELECT * FROM agent_runtime_events WHERE "
+            "SELECT E.* FROM agent_runtime_events E "
+            "JOIN sources S ON S.id = E.source_id WHERE "
             + " AND ".join(clauses)
             + " ORDER BY occurred_at ASC, event_id ASC LIMIT ? OFFSET ?"
         )

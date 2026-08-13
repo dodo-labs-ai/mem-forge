@@ -61,6 +61,9 @@ def test_online_agent_evaluation_report_is_bounded_and_content_free(tmp_path) ->
             "2026-08-13T07:00:00Z",
             "--source-type",
             "teams",
+            "--user-id",
+            "user-1",
+            "--include-private",
         ],
         env={"MEMFORGE_BASE_DIR": str(base_dir)},
     )
