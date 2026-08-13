@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -356,6 +357,28 @@ def current_trace_context() -> RuntimeTraceContext | None:
     )
 
 
+def current_deployment_revision() -> str | None:
+    """Return a bounded deploy identity without depending on a Cloud adapter."""
+
+    configured = os.environ.get("MEMFORGE_DEPLOYMENT_REVISION", "").strip()
+    if configured:
+        return _safe_revision(configured)
+    raw_vcap = os.environ.get("VCAP_APPLICATION", "").strip()
+    if not raw_vcap:
+        return None
+    try:
+        payload = json.loads(raw_vcap)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    for key in ("application_version", "version"):
+        value = payload.get(key)
+        if isinstance(value, str) and (revision := _safe_revision(value)) is not None:
+            return revision
+    return None
+
+
 def runtime_event_otel_attributes(event: AgentRuntimeEvent) -> Mapping[str, object]:
     """Return a bounded, content-free projection for an OTLP exporter."""
 
@@ -377,6 +400,28 @@ def runtime_event_otel_attributes(event: AgentRuntimeEvent) -> Mapping[str, obje
         "memforge.agent.occurrence_count": event.occurrence_count,
     }
     return {name: value for name, value in values.items() if value is not None}
+
+
+def project_runtime_events_to_current_span(
+    events: tuple[AgentRuntimeEvent, ...],
+) -> None:
+    """Best-effort OTel projection after the durable product transaction."""
+
+    if not events:
+        return
+    try:
+        from opentelemetry import trace  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    span = trace.get_current_span()
+    if not span.is_recording():
+        return
+    for event in events:
+        span.add_event(
+            event.event_name,
+            attributes=dict(runtime_event_otel_attributes(event)),
+            timestamp=int(event.occurred_at.timestamp() * 1_000_000_000),
+        )
 
 
 def event_public_payload(event: AgentRuntimeEvent) -> Mapping[str, object]:
@@ -444,3 +489,12 @@ def _require_model(value: str | None) -> None:
         for ch in value
     ):
         raise ValueError("model must be a bounded machine-readable identifier")
+
+
+def _safe_revision(value: str) -> str | None:
+    if not value or len(value) > 255 or any(
+        ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
+        for ch in value
+    ):
+        return None
+    return value

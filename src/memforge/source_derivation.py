@@ -17,7 +17,9 @@ from memforge.evals.agent_evaluation import (
     QualitySignal,
     QualitySignalCollector,
     bind_quality_signals,
+    current_deployment_revision,
     current_trace_context,
+    project_runtime_events_to_current_span,
     quality_signal_scope,
 )
 from memforge.pipeline.bounded_work import collect_bounded
@@ -310,6 +312,7 @@ class SourceUnitDeriver:
                 batch_attempt=batch_record.attempt_count + 1,
                 extraction_contract_version=derivation.extraction_contract_version,
                 occurred_at=datetime.now().astimezone(),
+                deployment_revision=current_deployment_revision(),
                 trace_context=current_trace_context(),
                 observation_revision_ids=revision_by_observation,
             )
@@ -319,6 +322,7 @@ class SourceUnitDeriver:
                 result=result,
                 runtime_events=events,
             )
+            project_runtime_events_to_current_span(events)
             return result
 
         pending_results = await collect_bounded(
