@@ -140,9 +140,9 @@ from memforge.memory.relation_discovery_contract import (
     resolve_relation_discovery_actor_user_id,
 )
 from memforge.memory.audit import MemoryAuditEvent
-from memforge.evals.agent_events import (
-    AgentEvaluationEvent,
-    AgentEvaluationEventQuery,
+from memforge.evals.agent_evaluation import (
+    AgentRuntimeEvent,
+    AgentRuntimeEventQuery,
 )
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
 from memforge.memory.review_decision import ReviewVectorTask
@@ -1640,12 +1640,12 @@ CREATE INDEX IF NOT EXISTS idx_memory_audit_doc ON memory_audit_events(doc_id);
 CREATE INDEX IF NOT EXISTS idx_memory_audit_type ON memory_audit_events(event_type);
 
 -- ---------------------------------------------------------------
--- Agent evaluation events - append-only, content-free quality signals
+-- Agent runtime events - append-only, content-free quality signals
 -- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS agent_evaluation_events (
+CREATE TABLE IF NOT EXISTS agent_runtime_events (
     event_id                    TEXT PRIMARY KEY,
     schema_version              TEXT NOT NULL,
-    event_type                  TEXT NOT NULL,
+    event_name                  TEXT NOT NULL,
     outcome                     TEXT NOT NULL,
     reason_code                 TEXT NOT NULL,
     occurred_at                 TEXT NOT NULL,
@@ -1658,8 +1658,10 @@ CREATE TABLE IF NOT EXISTS agent_evaluation_events (
     projection_run_id           TEXT NOT NULL,
     derivation_id               TEXT NOT NULL,
     batch_id                    TEXT NOT NULL,
+    batch_attempt               INTEGER NOT NULL,
     extraction_contract_version TEXT NOT NULL,
     operation                   TEXT,
+    provider                    TEXT,
     model                       TEXT,
     prompt_hash                 TEXT,
     candidate_hash              TEXT,
@@ -1678,14 +1680,18 @@ CREATE TABLE IF NOT EXISTS agent_evaluation_events (
     terminal_category           TEXT,
     error_code                  TEXT,
     candidate_count             INTEGER,
-    rejected_count              INTEGER
+    rejected_count              INTEGER,
+    occurrence_count            INTEGER NOT NULL DEFAULT 1,
+    trace_id                    TEXT,
+    span_id                     TEXT,
+    trace_flags                 INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_agent_eval_time
-    ON agent_evaluation_events(occurred_at, event_id);
-CREATE INDEX IF NOT EXISTS idx_agent_eval_source_time
-    ON agent_evaluation_events(source_id, occurred_at, event_id);
-CREATE INDEX IF NOT EXISTS idx_agent_eval_type_reason
-    ON agent_evaluation_events(event_type, reason_code, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_agent_runtime_time
+    ON agent_runtime_events(occurred_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runtime_source_time
+    ON agent_runtime_events(source_id, occurred_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runtime_type_reason
+    ON agent_runtime_events(event_name, reason_code, occurred_at);
 """
 
 # ---------------------------------------------------------------------------
@@ -3295,12 +3301,12 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     ),
     (
         76,
-        "Add correlated agent evaluation event ledger",
+        "Add correlated agent runtime event ledger",
         [
-            """CREATE TABLE IF NOT EXISTS agent_evaluation_events (
+            """CREATE TABLE IF NOT EXISTS agent_runtime_events (
                 event_id                    TEXT PRIMARY KEY,
                 schema_version              TEXT NOT NULL,
-                event_type                  TEXT NOT NULL,
+                event_name                  TEXT NOT NULL,
                 outcome                     TEXT NOT NULL,
                 reason_code                 TEXT NOT NULL,
                 occurred_at                 TEXT NOT NULL,
@@ -3313,8 +3319,10 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                 projection_run_id           TEXT NOT NULL,
                 derivation_id               TEXT NOT NULL,
                 batch_id                    TEXT NOT NULL,
+                batch_attempt               INTEGER NOT NULL,
                 extraction_contract_version TEXT NOT NULL,
                 operation                   TEXT,
+                provider                    TEXT,
                 model                       TEXT,
                 prompt_hash                 TEXT,
                 candidate_hash              TEXT,
@@ -3333,14 +3341,18 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                 terminal_category           TEXT,
                 error_code                  TEXT,
                 candidate_count             INTEGER,
-                rejected_count              INTEGER
+                rejected_count              INTEGER,
+                occurrence_count            INTEGER NOT NULL DEFAULT 1,
+                trace_id                    TEXT,
+                span_id                     TEXT,
+                trace_flags                 INTEGER
             )""",
-            """CREATE INDEX IF NOT EXISTS idx_agent_eval_time
-               ON agent_evaluation_events(occurred_at, event_id)""",
-            """CREATE INDEX IF NOT EXISTS idx_agent_eval_source_time
-               ON agent_evaluation_events(source_id, occurred_at, event_id)""",
-            """CREATE INDEX IF NOT EXISTS idx_agent_eval_type_reason
-               ON agent_evaluation_events(event_type, reason_code, occurred_at)""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_runtime_time
+               ON agent_runtime_events(occurred_at, event_id)""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_runtime_source_time
+               ON agent_runtime_events(source_id, occurred_at, event_id)""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_runtime_type_reason
+               ON agent_runtime_events(event_name, reason_code, occurred_at)""",
         ],
     ),
 ]
@@ -4847,8 +4859,9 @@ class Database:
         derivation_id: str,
         batch_id: str,
         result: MemoryExtractionResult,
+        runtime_events: tuple[AgentRuntimeEvent, ...] = (),
     ) -> SourceDerivationAttempt:
-        """Persist one validated batch output or safe retryable failure."""
+        """Atomically persist one batch outcome and its runtime facts."""
 
         now = _now_iso()
         async with self._write_lock:
@@ -4949,6 +4962,7 @@ class Database:
                         derivation_id,
                     ),
                 )
+                await self._insert_agent_runtime_events_unlocked(runtime_events)
                 await self.db.commit()
                 return await self._source_derivation_attempt_unlocked(derivation_id)
             except Exception:
@@ -17516,39 +17530,50 @@ class Database:
             await self.db.commit()
 
     # ==================================================================
-    # Agent evaluation event ledger
+    # Agent runtime event ledger
     # ==================================================================
 
-    async def record_agent_evaluation_events(
+    async def record_agent_runtime_events(
         self,
-        events: tuple[AgentEvaluationEvent, ...],
+        events: tuple[AgentRuntimeEvent, ...],
     ) -> None:
         """Append content-free events; deterministic IDs make replay idempotent."""
 
         if not events:
             return
         async with self._write_lock:
-            await self.db.executemany(
-                """INSERT OR IGNORE INTO agent_evaluation_events (
-                    event_id, schema_version, event_type, outcome, reason_code,
+            await self._insert_agent_runtime_events_unlocked(events)
+            await self.db.commit()
+
+    async def _insert_agent_runtime_events_unlocked(
+        self,
+        events: tuple[AgentRuntimeEvent, ...],
+    ) -> None:
+        if not events:
+            return
+        await self.db.executemany(
+            """INSERT OR IGNORE INTO agent_runtime_events (
+                    event_id, schema_version, event_name, outcome, reason_code,
                     occurred_at, deployment_revision, source_id, source_type,
                     doc_id, source_unit_id, target_unit_revision_id,
-                    projection_run_id, derivation_id, batch_id,
-                    extraction_contract_version, operation, model, prompt_hash,
+                    projection_run_id, derivation_id, batch_id, batch_attempt,
+                    extraction_contract_version, operation, provider, model, prompt_hash,
                     candidate_hash, observation_id, observation_revision_id,
                     range_start, range_end, block_hash, quote_hash, quote_chars,
                     localization_mode, attempt_count, retry_count, fallback_count,
                     structured_mode, terminal_category, error_code,
-                    candidate_count, rejected_count
+                    candidate_count, rejected_count, occurrence_count,
+                    trace_id, span_id, trace_flags
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?
                 )""",
-                [
-                    (
+            [
+                (
                         event.event_id,
                         event.schema_version,
-                        event.event_type,
+                        event.event_name,
                         event.outcome,
                         event.reason_code,
                         _utc_iso(event.occurred_at),
@@ -17561,8 +17586,10 @@ class Database:
                         event.projection_run_id,
                         event.derivation_id,
                         event.batch_id,
+                        event.batch_attempt,
                         event.extraction_contract_version,
                         event.operation,
+                        event.provider,
                         event.model,
                         event.prompt_hash,
                         event.candidate_hash,
@@ -17582,16 +17609,19 @@ class Database:
                         event.error_code,
                         event.candidate_count,
                         event.rejected_count,
-                    )
-                    for event in events
-                ],
-            )
-            await self.db.commit()
+                        event.occurrence_count,
+                        event.trace_id,
+                        event.span_id,
+                        event.trace_flags,
+                )
+                for event in events
+            ],
+        )
 
-    async def list_agent_evaluation_events(
+    async def list_agent_runtime_events(
         self,
-        query: AgentEvaluationEventQuery,
-    ) -> list[AgentEvaluationEvent]:
+        query: AgentRuntimeEventQuery,
+    ) -> list[AgentRuntimeEvent]:
         """Return one deterministic, bounded online evaluation cohort."""
 
         clauses = ["occurred_at >= ?", "occurred_at < ?"]
@@ -17602,10 +17632,13 @@ class Database:
         for column, value in (
             ("source_id", query.source_id),
             ("source_type", query.source_type),
-            ("event_type", query.event_type),
+            ("event_name", query.event_name),
             ("outcome", query.outcome),
             ("reason_code", query.reason_code),
+            ("trace_id", query.trace_id),
             ("model", query.model),
+            ("provider", query.provider),
+            ("deployment_revision", query.deployment_revision),
             ("extraction_contract_version", query.extraction_contract_version),
         ):
             if value is not None:
@@ -17613,19 +17646,19 @@ class Database:
                 params.append(value)
         params.extend((query.limit, query.offset))
         sql = (
-            "SELECT * FROM agent_evaluation_events WHERE "
+            "SELECT * FROM agent_runtime_events WHERE "
             + " AND ".join(clauses)
             + " ORDER BY occurred_at ASC, event_id ASC LIMIT ? OFFSET ?"
         )
         rows = await self.db.execute_fetchall(sql, tuple(params))
-        return [self._row_to_agent_evaluation_event(row) for row in rows]
+        return [self._row_to_agent_runtime_event(row) for row in rows]
 
     @staticmethod
-    def _row_to_agent_evaluation_event(row: Mapping[str, object]) -> AgentEvaluationEvent:
-        return AgentEvaluationEvent(
+    def _row_to_agent_runtime_event(row: Mapping[str, object]) -> AgentRuntimeEvent:
+        return AgentRuntimeEvent(
             event_id=str(row["event_id"]),
             schema_version=str(row["schema_version"]),
-            event_type=str(row["event_type"]),
+            event_name=str(row["event_name"]),
             outcome=str(row["outcome"]),  # type: ignore[arg-type]
             reason_code=str(row["reason_code"]),
             occurred_at=datetime.fromisoformat(str(row["occurred_at"]).replace("Z", "+00:00")),
@@ -17638,8 +17671,10 @@ class Database:
             projection_run_id=str(row["projection_run_id"]),
             derivation_id=str(row["derivation_id"]),
             batch_id=str(row["batch_id"]),
+            batch_attempt=int(row["batch_attempt"]),
             extraction_contract_version=str(row["extraction_contract_version"]),
             operation=row["operation"],  # type: ignore[arg-type]
+            provider=row["provider"],  # type: ignore[arg-type]
             model=row["model"],  # type: ignore[arg-type]
             prompt_hash=row["prompt_hash"],  # type: ignore[arg-type]
             candidate_hash=row["candidate_hash"],  # type: ignore[arg-type]
@@ -17659,6 +17694,10 @@ class Database:
             error_code=row["error_code"],  # type: ignore[arg-type]
             candidate_count=row["candidate_count"],  # type: ignore[arg-type]
             rejected_count=row["rejected_count"],  # type: ignore[arg-type]
+            occurrence_count=int(row["occurrence_count"]),
+            trace_id=row["trace_id"],  # type: ignore[arg-type]
+            span_id=row["span_id"],  # type: ignore[arg-type]
+            trace_flags=row["trace_flags"],  # type: ignore[arg-type]
         )
 
     # ==================================================================

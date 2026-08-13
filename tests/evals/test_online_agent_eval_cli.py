@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from click.testing import CliRunner
 
-from memforge.evals.agent_events import QualitySignal, bind_quality_signals
+from memforge.evals.agent_evaluation import QualitySignal, bind_quality_signals
 from memforge.main import cli
 from memforge.storage.database import Database
 
@@ -24,11 +24,11 @@ def test_online_agent_evaluation_report_is_bounded_and_content_free(tmp_path) ->
                ) VALUES (?, ?, ?, ?, ?, ?)""",
             ("src-teams", "teams", "Teams", "{}", "user-1", "private"),
         )
-        await db.record_agent_evaluation_events(
+        await db.record_agent_runtime_events(
             bind_quality_signals(
                 (
                     QualitySignal(
-                        event_type="evidence_admission_outcome",
+                        event_name="evidence_admission_outcome",
                         outcome="rejected",
                         reason_code="unknown_evidence_block_id",
                         candidate_hash="a" * 64,
@@ -42,6 +42,7 @@ def test_online_agent_evaluation_report_is_bounded_and_content_free(tmp_path) ->
                 projection_run_id="spr-1",
                 derivation_id="sda-1",
                 batch_id="batch-1",
+                batch_attempt=1,
                 extraction_contract_version="projection-extraction-v8",
                 occurred_at=datetime(2026, 8, 13, 6, tzinfo=timezone.utc),
             )
@@ -66,7 +67,7 @@ def test_online_agent_evaluation_report_is_bounded_and_content_free(tmp_path) ->
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["cohort"]["event_type_counts"] == {
+    assert payload["cohort"]["event_name_counts"] == {
         "evidence_admission_outcome": 1,
     }
     [event] = payload["events"]

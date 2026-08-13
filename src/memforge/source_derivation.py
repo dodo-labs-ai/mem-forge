@@ -12,11 +12,12 @@ from datetime import datetime
 from typing import Any, Literal, Protocol
 
 from memforge.models import DocumentRecord, MemoryExtractionResult, RawMemory
-from memforge.evals.agent_events import (
-    AgentEvaluationEvent,
+from memforge.evals.agent_evaluation import (
+    AgentRuntimeEvent,
     QualitySignal,
     QualitySignalCollector,
     bind_quality_signals,
+    current_trace_context,
     quality_signal_scope,
 )
 from memforge.pipeline.bounded_work import collect_bounded
@@ -180,18 +181,13 @@ class SourceDerivationStore(Protocol):
         derivation_id: str,
         batch_id: str,
         result: MemoryExtractionResult,
+        runtime_events: tuple[AgentRuntimeEvent, ...] = (),
     ) -> SourceDerivationAttempt: ...
 
     async def supersede_source_derivation(
         self,
         derivation_id: str,
     ) -> None: ...
-
-    async def record_agent_evaluation_events(
-        self,
-        events: tuple[AgentEvaluationEvent, ...],
-    ) -> None: ...
-
 
 @dataclass(frozen=True, slots=True)
 class SourceUnitDerivationRequest:
@@ -261,7 +257,7 @@ class SourceUnitDeriver:
             try:
                 quality_signals.record(
                     QualitySignal(
-                        event_type="extraction_batch_outcome",
+                        event_name="extraction_batch_outcome",
                         outcome="failed" if result.error_type else "expected",
                         reason_code=result.error_type or (
                             "candidates_extracted" if result.memories else "zero_candidates"
@@ -275,7 +271,7 @@ class SourceUnitDeriver:
                 )
             except (TypeError, ValueError):
                 logger.warning(
-                    "agent evaluation batch outcome was not recordable for derivation=%s batch=%s",
+                    "agent runtime batch outcome was not recordable for derivation=%s batch=%s",
                     derivation.id,
                     batch.id,
                 )
@@ -285,50 +281,44 @@ class SourceUnitDeriver:
             ):
                 if isinstance(sample, dict):
                     sample["source_derivation_batch_id"] = batch.id
+            revision_by_observation = {
+                revision.observation_id: revision.id
+                for revision in request.projection.observation_revisions
+            }
+            extraction_model = _safe_model_identifier(
+                result.metadata.get("extraction_model")
+            )
+            signals = tuple(
+                replace(signal, model=str(extraction_model))
+                if signal.model is None and extraction_model
+                else signal
+                for signal in quality_signals.snapshot()
+            )
+            batch_record = next(
+                record for record in derivation.batches if record.batch_id == batch.id
+            )
+            events = bind_quality_signals(
+                signals,
+                source_id=request.projection.source_id,
+                source_type=request.projection.source_type,
+                doc_id=request.context.document.doc_id,
+                source_unit_id=batch.source_unit_id,
+                target_unit_revision_id=derivation.target_unit_revision_id,
+                projection_run_id=request.projection.run_id,
+                derivation_id=derivation.id,
+                batch_id=batch.id,
+                batch_attempt=batch_record.attempt_count + 1,
+                extraction_contract_version=derivation.extraction_contract_version,
+                occurred_at=datetime.now().astimezone(),
+                trace_context=current_trace_context(),
+                observation_revision_ids=revision_by_observation,
+            )
             await self._store.record_source_derivation_batch_result(
                 derivation_id=derivation.id,
                 batch_id=batch.id,
                 result=result,
+                runtime_events=events,
             )
-            recorder = getattr(self._store, "record_agent_evaluation_events", None)
-            if recorder is not None:
-                revision_by_observation = {
-                    revision.observation_id: revision.id
-                    for revision in request.projection.observation_revisions
-                }
-                extraction_model = _safe_model_identifier(
-                    result.metadata.get("extraction_model")
-                )
-                signals = tuple(
-                    replace(signal, model=str(extraction_model))
-                    if signal.model is None and extraction_model
-                    else signal
-                    for signal in quality_signals.snapshot()
-                )
-                events = bind_quality_signals(
-                    signals,
-                    source_id=request.projection.source_id,
-                    source_type=request.projection.source_type,
-                    doc_id=request.context.document.doc_id,
-                    source_unit_id=batch.source_unit_id,
-                    target_unit_revision_id=derivation.target_unit_revision_id,
-                    projection_run_id=request.projection.run_id,
-                    derivation_id=derivation.id,
-                    batch_id=batch.id,
-                    extraction_contract_version=derivation.extraction_contract_version,
-                    occurred_at=datetime.fromisoformat(
-                        derivation.created_at.replace("Z", "+00:00")
-                    ),
-                    observation_revision_ids=revision_by_observation,
-                )
-                try:
-                    await recorder(events)
-                except Exception:
-                    logger.exception(
-                        "agent evaluation event persistence failed for derivation=%s batch=%s",
-                        derivation.id,
-                        batch.id,
-                    )
             return result
 
         pending_results = await collect_bounded(
