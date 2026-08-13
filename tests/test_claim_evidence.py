@@ -97,3 +97,27 @@ def test_changed_range_rejects_whole_document_as_false_localization() -> None:
     assert localized.omission_reason == "whole_authority_not_claim_local"
     assert localized.memory.evidence_quote is None
     assert localized.memory.extraction_context is None
+
+
+def test_changed_range_accepts_whole_short_document_resolved_from_block() -> None:
+    whole_document = "New durable decision."
+    raw = RawMemory(
+        content="A new durable decision was adopted.",
+        memory_type="decision",
+        evidence_quote=whole_document,
+        extraction_context=whole_document,
+        evidence_resolved_from_block=True,
+        evidence_range_start=0,
+        evidence_range_end=len(whole_document),
+    )
+
+    localized = localize_claim_evidence(
+        raw,
+        authority_text=whole_document,
+        work_kind=ClaimEvidenceWorkKind.CHANGED_RANGE,
+        current_changed_ranges=((0, len(whole_document)),),
+    )
+
+    assert localized.accepted is True
+    assert localized.omission_reason is None
+    assert localized.memory.evidence_quote == whole_document

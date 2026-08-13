@@ -103,6 +103,27 @@ class _ObservationInput:
     semantic_hash: str | None = None
 
 
+_REVISION_SEMANTIC_METADATA_KEYS = ("claim_evidence_scope",)
+
+
+def _observation_semantic_hash(value: _ObservationInput) -> str:
+    if value.semantic_hash is not None:
+        return value.semantic_hash
+    inference_contract = {
+        key: value.metadata[key]
+        for key in _REVISION_SEMANTIC_METADATA_KEYS
+        if key in value.metadata
+    }
+    if not inference_contract:
+        return _canonical_hash(value.semantic_value)
+    return _canonical_hash(
+        {
+            "semantic_value": value.semantic_value,
+            "inference_contract": inference_contract,
+        }
+    )
+
+
 class GeneSourceProjectionAdapter:
     """Unified adapter used by every Gene-backed document/conversation source."""
 
@@ -302,7 +323,7 @@ def project_source_item(
     carried_revision_ids: list[str] = []
     for value in observations_input:
         observation_id = _stable_id("obs", unit_id, value.observation_type, value.provider_key)
-        semantic_hash = value.semantic_hash or _canonical_hash(value.semantic_value)
+        semantic_hash = _observation_semantic_hash(value)
         revision_id = _stable_id("obsrev", observation_id, semantic_hash)
         observations.append(
             SourceObservation(

@@ -10,6 +10,8 @@ from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.source_projection_adapters import (
     BUILTIN_SPECIALIZED_SOURCE_TYPES,
     GeneSourceProjectionAdapter,
+    _canonical_hash,
+    _stable_id,
     project_source_item,
     project_source_unit_tombstone,
     source_run_projection_coverage,
@@ -866,6 +868,164 @@ def test_operational_message_metadata_does_not_create_semantic_revision(source_t
     assert second.observation_revisions == first.observation_revisions
     assert second.deltas[0].axes == frozenset()
     assert second.deltas[0].requires_extraction is False
+
+
+@pytest.mark.parametrize("source_type", ["jira", "teams"])
+@pytest.mark.asyncio
+async def test_claim_evidence_scope_upgrade_creates_a_new_immutable_revision(
+    tmp_path,
+    source_type: str,
+) -> None:
+    database = Database(str(tmp_path / f"{source_type}-evidence-scope.db"))
+    await database.connect()
+    await database.upsert_source(
+        id=f"src-{source_type}",
+        type=source_type,
+        name=source_type,
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    try:
+        if source_type == "jira":
+            item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
+            payload = _jira_payload(
+                comments=[
+                    {
+                        "id": "501",
+                        "body": "Keep A7",
+                        "updated": "2026-07-14T10:00:00Z",
+                    }
+                ]
+            )
+            observation_type = "comment"
+        else:
+            item = _item(extra={"conversation_id": "conv-1", "window_id": "window-1"})
+            payload = {
+                "messages": [
+                    {
+                        "id": "msg-1",
+                        "content": "Keep A7",
+                        "time": "2026-07-14T10:00:00Z",
+                    }
+                ]
+            }
+            observation_type = "message"
+        raw, normalized = _inputs(item, payload)
+        current = project_source_item(
+            source_id=f"src-{source_type}",
+            source_type=source_type,
+            run_id="run-current",
+            item=item,
+            raw=raw,
+            normalized=normalized,
+        )
+        current_observation = next(
+            observation
+            for observation in current.observations
+            if observation.observation_type == observation_type
+        )
+        current_revision = next(
+            revision
+            for revision in current.observation_revisions
+            if revision.observation_id == current_observation.id
+        )
+        legacy_semantic_hash = _canonical_hash(json.loads(current_revision.content))
+        legacy_revision = replace(
+            current_revision,
+            id=_stable_id(
+                "obsrev",
+                current_revision.observation_id,
+                legacy_semantic_hash,
+            ),
+            semantic_hash=legacy_semantic_hash,
+            metadata={"provider_key": current_revision.metadata["provider_key"]},
+        )
+        # Build a self-consistent historical projection using the legacy
+        # revision as prior authority, then persist it before the upgrade.
+        legacy = project_source_item(
+            source_id=f"src-{source_type}",
+            source_type=source_type,
+            run_id="run-legacy",
+            item=item,
+            raw=raw,
+            normalized=normalized,
+        )
+        legacy_observation_revisions = tuple(
+            legacy_revision if revision.id == current_revision.id else revision
+            for revision in legacy.observation_revisions
+        )
+        legacy_observation_hashes = sorted(
+            (revision.observation_id, revision.semantic_hash)
+            for revision in legacy_observation_revisions
+        )
+        legacy_unit_semantic_hash = _canonical_hash(legacy_observation_hashes)
+        current_unit_revision = legacy.source_unit_revisions[0]
+        legacy_observation_revision_ids = tuple(
+            legacy_revision.id if revision_id == current_revision.id else revision_id
+            for revision_id in current_unit_revision.observation_revision_ids
+        )
+        legacy_unit_revision = replace(
+            current_unit_revision,
+            id=_stable_id(
+                "unitrev",
+                current_unit_revision.source_unit_id,
+                legacy_unit_semantic_hash,
+                current_unit_revision.location_hash,
+                current_unit_revision.membership_hash,
+                current_unit_revision.access_hash,
+            ),
+            semantic_hash=legacy_unit_semantic_hash,
+            observation_revision_ids=legacy_observation_revision_ids,
+        )
+        legacy = replace(
+            legacy,
+            observation_revisions=legacy_observation_revisions,
+            source_unit_revisions=(legacy_unit_revision,),
+            deltas=(
+                replace(
+                    legacy.deltas[0],
+                    current_unit_revision_id=legacy_unit_revision.id,
+                    changed_anchors=tuple(
+                        replace(
+                            anchor,
+                            observation_revision_id=(
+                                legacy_revision.id
+                                if anchor.observation_revision_id == current_revision.id
+                                else anchor.observation_revision_id
+                            ),
+                        )
+                        for anchor in legacy.deltas[0].changed_anchors
+                    ),
+                ),
+            ),
+        )
+        await database.record_source_projection(legacy)
+
+        upgraded = project_source_item(
+            source_id=f"src-{source_type}",
+            source_type=source_type,
+            run_id="run-upgraded",
+            item=item,
+            raw=raw,
+            normalized=normalized,
+            prior_unit_revision=legacy_unit_revision,
+            prior_observation_revisions={
+                revision.observation_id: revision
+                for revision in legacy_observation_revisions
+            },
+        )
+        upgraded_revision = next(
+            revision
+            for revision in upgraded.observation_revisions
+            if revision.observation_id == current_observation.id
+        )
+
+        assert upgraded_revision.id != legacy_revision.id
+        assert upgraded_revision.metadata["claim_evidence_scope"] == "atomic"
+        await database.record_source_projection(upgraded)
+    finally:
+        await database.close()
 
 
 @pytest.mark.parametrize(

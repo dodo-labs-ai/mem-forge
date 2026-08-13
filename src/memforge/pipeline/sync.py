@@ -85,11 +85,13 @@ from memforge.source_artifacts import (
 )
 from memforge.source_derivation import (
     DiffGuidedExtractionBatch,
+    SOURCE_DERIVATION_CONTRACT_VERSION,
     SourceDerivationAttempt,
     StructuralExtractionBatch,
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
     SourceUnitDeriver,
+    aggregate_extraction_metrics,
 )
 from memforge.source_projection_config import canonical_projection_scope
 
@@ -133,25 +135,10 @@ class SourceSyncMode(str, Enum):
 
 def _aggregate_extraction_metrics(
     results: list[MemoryExtractionResult],
-) -> dict[str, int]:
+) -> dict[str, object]:
     """Aggregate content-free LLM cost signals across one bounded extraction fan-out."""
 
-    keys = (
-        "structured_llm_calls",
-        "prompt_chars",
-        "structured_llm_elapsed_ms",
-        "extraction_queue_wait_ms",
-        "input_binary_bytes",
-        "multimodal_calls",
-        "artifact_summary_count",
-        "discarded_orphan_artifact_summary_count",
-    )
-    aggregated = {key: sum(int((result.metadata or {}).get(key, 0) or 0) for result in results) for key in keys}
-    aggregated["max_active_multimodal"] = max(
-        (int((result.metadata or {}).get("max_active_multimodal", 0) or 0) for result in results),
-        default=0,
-    )
-    return aggregated
+    return aggregate_extraction_metrics(results)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1393,7 +1380,11 @@ class GeneSyncOrchestrator:
         ] = {}
         superseded_attempts: list[SourceDerivationAttempt] = []
         for attempt in attempts:
-            if attempt.context.source_activity_epoch != source_activity_epoch:
+            if (
+                attempt.context.source_activity_epoch != source_activity_epoch
+                or attempt.extraction_contract_version
+                != SOURCE_DERIVATION_CONTRACT_VERSION
+            ):
                 superseded_attempts.append(attempt)
                 continue
             projection_scope = (
@@ -1553,6 +1544,9 @@ class GeneSyncOrchestrator:
             protected_source_observation_ids=(extraction.protected_source_observation_ids),
             document=context.document,
             derivation_id=attempt.id,
+            derivation_reprocess_all_current_observations=(
+                context.reprocess_all_current_observations
+            ),
             expected_source_activity_epoch=source_activity_epoch,
         )
 
@@ -2297,6 +2291,7 @@ class GeneSyncOrchestrator:
             user_id=actor_user_id,
             source_activity_epoch=expected_source_activity_epoch,
             current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
+            reprocess_all_current_observations=force_reprocess,
         )
         # Extraction owns the only document-content model call. Historical
         # cross-document/cross-source discovery remains post-commit Relation
@@ -2313,6 +2308,7 @@ class GeneSyncOrchestrator:
             document_title=item.title,
             document_url=item.source_url,
             derivation_context=derivation_context,
+            reprocess_current_observations=force_reprocess,
         )
 
         raw_memories = extraction_result.memories
@@ -2366,6 +2362,9 @@ class GeneSyncOrchestrator:
             protected_source_observation_ids=(extraction_result.protected_source_observation_ids),
             document=doc_record,
             derivation_id=extraction_result.derivation_id,
+            derivation_reprocess_all_current_observations=(
+                derivation_context.reprocess_all_current_observations
+            ),
             expected_source_activity_epoch=expected_source_activity_epoch,
         )
         stats["memories_extracted"] = memory_stats.get("added", 0)
@@ -2462,6 +2461,7 @@ class GeneSyncOrchestrator:
         document_title: str,
         document_url: str,
         derivation_context: SourceUnitDerivationContext | None = None,
+        reprocess_current_observations: bool = False,
     ) -> MemoryExtractionResult:
         """Run full extraction or diff-guided extraction for a document."""
         changed_observation_ids = {
@@ -2470,7 +2470,7 @@ class GeneSyncOrchestrator:
         changed_observation_ids.update(
             observation_id for delta in projection.deltas for observation_id in delta.added_observation_ids
         )
-        if not changed_observation_ids:
+        if not changed_observation_ids and not reprocess_current_observations:
             result = MemoryExtractionResult(
                 memories=[],
                 metadata={"projection_changed_observation_count": 0},
@@ -2480,12 +2480,13 @@ class GeneSyncOrchestrator:
                 plan=update_plan,
                 doc_id=doc_id,
                 source_id=source_id,
+                source_type=source_type,
                 run_id=run_id,
                 result=result,
                 extraction_metadata=result.metadata,
             )
             return result
-        if changed_observation_ids and hasattr(
+        if (changed_observation_ids or reprocess_current_observations) and hasattr(
             self.memory_extractor,
             "extract_projection_batch_memories",
         ):
@@ -2510,6 +2511,7 @@ class GeneSyncOrchestrator:
                 plan=update_plan,
                 doc_id=doc_id,
                 source_id=source_id,
+                source_type=source_type,
                 run_id=run_id,
                 result=result,
                 extraction_metadata=result.metadata,
@@ -2526,6 +2528,7 @@ class GeneSyncOrchestrator:
                     result = await self.memory_extractor.extract_memory_changes(
                         changed_hunks=update_plan.changed_hunks or "",
                         updated_document=markdown_body,
+                        current_changed_ranges=update_plan.current_changed_ranges,
                         source_type=source_type,
                         doc_type=doc_type,
                     )
@@ -2542,6 +2545,7 @@ class GeneSyncOrchestrator:
                     plan=update_plan,
                     doc_id=doc_id,
                     source_id=source_id,
+                    source_type=source_type,
                     run_id=run_id,
                     result=result,
                     extraction_metadata={
@@ -2593,6 +2597,7 @@ class GeneSyncOrchestrator:
                 plan=update_plan,
                 doc_id=doc_id,
                 source_id=source_id,
+                source_type=source_type,
                 run_id=run_id,
                 result=result,
                 extraction_metadata={
@@ -2622,6 +2627,7 @@ class GeneSyncOrchestrator:
             plan=update_plan,
             doc_id=doc_id,
             source_id=source_id,
+            source_type=source_type,
             run_id=run_id,
             result=result,
         )
@@ -2695,6 +2701,7 @@ class GeneSyncOrchestrator:
                     result = await self.memory_extractor.extract_memory_changes(
                         changed_hunks=batch.changed_hunks,
                         updated_document=batch.updated_document,
+                        current_changed_ranges=current_changed_ranges,
                         source_type=source_type,
                         doc_type=doc_type,
                     )
@@ -2745,6 +2752,20 @@ class GeneSyncOrchestrator:
                     "multimodal_calls": int(admission.multimodal),
                     "max_active_multimodal": admission.active_multimodal,
                 }
+                revisions = {
+                    revision.observation_id: revision.id
+                    for revision in projection.observation_revisions
+                }
+                for sample in result.metadata.get(
+                    "evidence_block_fallback_samples",
+                    [],
+                ):
+                    if not isinstance(sample, dict):
+                        continue
+                    observation_id = sample.get("source_observation_id")
+                    sample["source_observation_revision_id"] = revisions.get(
+                        observation_id
+                    )
                 return result
 
         result = await SourceUnitDeriver(self.db).derive(
@@ -2756,6 +2777,15 @@ class GeneSyncOrchestrator:
             )
         )
         result.extraction.derivation_id = result.derivation.id
+        result.extraction.metadata = {
+            **(result.extraction.metadata or {}),
+            "derivation_id": result.derivation.id,
+            "source_unit_id": result.derivation.source_unit_id,
+            "target_unit_revision_id": result.derivation.target_unit_revision_id,
+            "extraction_contract_version": (
+                result.derivation.extraction_contract_version
+            ),
+        }
         return result.extraction
 
     def _projection_images(
@@ -3014,6 +3044,7 @@ class GeneSyncOrchestrator:
         plan: DocumentUpdatePlan | None,
         doc_id: str,
         source_id: str,
+        source_type: str,
         run_id: str | None,
         result: MemoryExtractionResult,
         extraction_metadata: dict[str, Any] | None = None,
@@ -3040,6 +3071,7 @@ class GeneSyncOrchestrator:
         payload: dict[str, Any] = {
             "extraction_mode": mode,
             "extracted_count": len(result.memories),
+            "source_type": source_type,
         }
         if result.metadata:
             payload.update(result.metadata)
@@ -3067,6 +3099,40 @@ class GeneSyncOrchestrator:
             payload=payload,
             error=result.error,
         )
+        fallback_count = int(
+            payload.get("evidence_refinement_counts", {}).get(
+                "block_fallback",
+                0,
+            )
+            if isinstance(payload.get("evidence_refinement_counts"), dict)
+            else 0
+        )
+        if fallback_count:
+            await self.memory_store.record_audit_event(
+                "memory_evidence_block_fallback",
+                "committed",
+                context=context,
+                doc_id=doc_id,
+                source_id=source_id,
+                decision="block_fallback",
+                reason="quote_not_localized_in_selected_block",
+                payload={
+                    key: payload[key]
+                    for key in (
+                        "source_type",
+                        "extraction_mode",
+                        "derivation_id",
+                        "source_unit_id",
+                        "target_unit_revision_id",
+                        "extraction_contract_version",
+                        "evidence_refinement_counts",
+                        "evidence_block_fallback_samples",
+                        "evidence_block_fallback_sample_truncated_count",
+                        "invalid_evidence_block_count",
+                    )
+                    if key in payload
+                },
+            )
 
     async def _record_source_unit_llm_summary(
         self,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Awaitable, Callable
 from time import perf_counter
@@ -14,12 +15,13 @@ from memforge.llm.structured import (
     StructuredLlmImage,
 )
 from memforge.models import MemoryExtractionResult, RawMemory
-from memforge.pipeline.claim_evidence import (
-    ClaimEvidenceWorkKind,
-    localize_claim_evidence,
-)
 from memforge.pipeline.document_units import ExtractionContext
 from memforge.pipeline.document_update import DEFAULT_MAX_DIFF_CHARS
+from memforge.pipeline.evidence_catalog import (
+    EvidenceAuthoritySpan,
+    EvidenceCatalog,
+    EvidenceResolution,
+)
 from memforge.pipeline.extraction_contract import DURABLE_MEMORY_QUALITY_RULES
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
 from memforge.source_artifacts import (
@@ -30,6 +32,8 @@ from memforge.source_artifacts import (
 logger = logging.getLogger(__name__)
 
 __all__ = ["MemoryExtractor"]
+
+_EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT = 16
 
 # ---------------------------------------------------------------------------
 # Caps and bands shared by the extraction prompts and runtime truncation. Both
@@ -54,9 +58,10 @@ MEMORY_EXTRACTION_PROMPT = """You are extracting atomic knowledge from a documen
 
 <source_type>{source_type}</source_type>
 <doc_type>{doc_type}</doc_type>
-<document>
-{content}
-</document>
+Only the following Evidence Blocks may support a Memory:
+<evidence_catalog>
+{evidence_catalog}
+</evidence_catalog>
 
 Extract durable atomic knowledge units justified by the document. Returning an empty "memories" array IS the correct answer when the document contains no durable team memory; do not invent memories to fill output. Each memory must be a JSON object with:
 - "content": self-contained factual sentence (understandable without the source document)
@@ -65,7 +70,8 @@ Extract durable atomic knowledge units justified by the document. Returning an e
 - "entity_refs": list of key entity mentions copied from the owned evidence
 - "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
-- "evidence_quote": exact quote copied from the document (guidance maximum {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix (e.g. "**Alice** (10:05): the actual message content")
+- "evidence_block_id": exactly one Evidence Block ID copied from <evidence_catalog>
+- "evidence_quote": optional claim-local text copied from that block (guidance maximum {quote_max} chars). It helps produce a narrower excerpt but is not required.
 
 """ + DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
 - Each memory must be SELF-CONTAINED (understandable without the source document).
@@ -78,7 +84,7 @@ Extract durable atomic knowledge units justified by the document. Returning an e
 - For design docs: extract decisions, dependencies, constraints.
 - For agent_session sources: keep only durable, reusable project knowledge from the submitted summary — confirmed decisions, conventions, procedures, and architectural rules that stay true beyond this session AND are not visible by reading the current code. Record the durable OUTCOME and the WHY of a change as a single fact; do NOT emit before/after/verified play-by-play, prior or superseded code states, or step-by-step narration of one edit. Do NOT create memories about the memory system, the agent's own tooling or context injection, or session mechanics, and never include internal memory ids (for example "memories are loaded at SessionStart" or "mem-1a2b3c"). Skip one-off run output and smoke-test/verification results (for example "the command printed 6"); a passing check is evidence, not durable knowledge unless it states a lasting behavior. Skip receipt/session metadata, validation commands, runtime notes, service start/stop state, local paths, and working-tree state. When the project being worked on IS a memory or tooling system, treat its symbol names, ID strings, and column names as code-recoverable per rule 1; only emit memories that state a rule about how the system must behave (e.g., "push-based source types must not be user-configurable in the dialog") rather than what the code currently does.
 - For discussions: extract DECISIONS and CONVENTIONS that reached consensus — skip unresolved opinions, tentative suggestions, and questions without answers.
-- For chat sources: skip transient status updates, review-in-progress notes, and temporary caveats. Focus on decisions, persistent facts, and action items.
+- For chat sources: skip transient status updates, review-in-progress notes, and temporary caveats. Focus on decisions, persistent facts, action items, and repeatable procedures.
 - Do not extract document metadata as memories: author names, last modified dates, document status, revision-history rows, reviewer lists, and link list rows belong to provenance/source metadata.
 - Do not infer relationships from reference/link-only evidence. If a source only provides a link or label, skip it or preserve the weaker relationship exactly as stated.
 - Preserve conditional language. If the source says "if", "provided", "as long as", "would", or "should", keep that condition in the memory. Do not turn open questions into decisions.
@@ -95,6 +101,10 @@ MEMORY_CHANGE_EXTRACTION_PROMPT = """You are extracting memory changes from an u
 <changed_hunks>
 {changed_hunks}
 </changed_hunks>
+Only the following blocks from inserted or replaced current text may support a Memory:
+<changed_evidence_catalog>
+{changed_evidence_catalog}
+</changed_evidence_catalog>
 <updated_document>
 {updated_document}
 </updated_document>
@@ -110,7 +120,8 @@ For changed durable knowledge, return JSON objects with:
 - "entity_refs": list of key entity mentions copied from the changed evidence
 - "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
-- "evidence_quote": exact quote copied from the updated document that supports this change (guidance maximum {quote_max} chars). For chat/message sources, include the sender name and timestamp prefix from the updated document.
+- "evidence_block_id": exactly one Evidence Block ID copied from <changed_evidence_catalog>
+- "evidence_quote": optional claim-local text copied from that block (guidance maximum {quote_max} chars). It helps produce a narrower excerpt but is not required.
 
 """ + DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
 - Focus ONLY on durable memory changes caused by <changed_hunks>.
@@ -144,23 +155,23 @@ Do not extract facts that appear only in this context.
 {glossary_appendix}
 </glossary_appendix>
 
-Extract memories only from this owned unit:
-<unit_markdown>
-{unit_markdown}
-</unit_markdown>
+Extract memories only from the Evidence Blocks derived from this owned unit:
+<evidence_catalog>
+{evidence_catalog}
+</evidence_catalog>
 
 Each memory must be a JSON object with:
 - "content": self-contained factual sentence
 - "memory_type": one of "fact", "decision", "convention", "procedure"
 - "confidence": 0.0-1.0
-- "entity_refs": list of key entity mentions copied from <unit_markdown>
+- "entity_refs": list of key entity mentions copied from <evidence_catalog>
 - "valid_from": YYYY-MM-DD calendar date if time-bound, null otherwise
 - "valid_until": YYYY-MM-DD calendar date if time-bound, null otherwise
-- "evidence_quote": exact quote copied from <unit_markdown> (guidance maximum {quote_max} chars)
-- "evidence_anchor": "unit"
+- "evidence_block_id": exactly one Evidence Block ID copied from <evidence_catalog>
+- "evidence_quote": optional claim-local text copied from that block (guidance maximum {quote_max} chars). It helps produce a narrower excerpt but is not required.
 
 """ + DURABLE_MEMORY_QUALITY_RULES + """Standard rules:
-- Extract only durable team knowledge grounded in <unit_markdown>.
+- Extract only durable team knowledge grounded in <evidence_catalog>.
 - Extraction emits each current durable claim once with exact evidence.
   Reconciliation owns historical identity and support decisions.
 - Do not extract document outline, glossary, title, URL, or source metadata as memories.
@@ -177,7 +188,7 @@ PROJECTION_BATCH_EXTRACTION_PROMPT = """You are extracting durable atomic knowle
 <doc_type>{doc_type}</doc_type>
 Only PRIMARY observations grant extraction authority:
 <primary_observations>
-{primary_observations}
+{primary_evidence_catalog}
 </primary_observations>
 
 The following observations are CONTEXT only. Use them to resolve references and chronology, but do not extract a claim stated only here:
@@ -185,7 +196,7 @@ The following observations are CONTEXT only. Use them to resolve references and 
 {context_observations}
 </context_observations>
 
-""" + DURABLE_MEMORY_QUALITY_RULES + """Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY observations. Each item must include one exact `evidence_quote` copied from PRIMARY observations. Each item must also include `source_observation_id`, copied exactly from the `Observation <id>` header containing that quote. Never use a CONTEXT observation as the source observation. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
+""" + DURABLE_MEMORY_QUALITY_RULES + """Return durable, self-contained facts, decisions, conventions, or procedures grounded in PRIMARY Evidence Blocks. Each textual item must include exactly one `evidence_block_id` copied from <primary_observations>. It may also include an optional claim-local `evidence_quote` copied from that block; the quote improves excerpt precision but never replaces the Block ID. The selected block determines `source_observation_id`; do not invent or repeat that identity for textual evidence. Never use a CONTEXT observation as primary Evidence. If the claim would become invalid or ambiguous without specific CONTEXT observations, include their exact Observation IDs in `required_source_observation_ids`; otherwise return an empty list. Do not mark merely helpful reading context as required.
 
 For a PRIMARY `binary_artifact` observation with separately supplied image
 evidence, inspect the image itself. A claim grounded in that image must set
@@ -261,10 +272,11 @@ class MemoryExtractor:
                 error="No LLM client configured for memory extraction",
             )
 
+        catalog = EvidenceCatalog.from_text(content[:DOC_CONTENT_CHAR_CAP])
         prompt = MEMORY_EXTRACTION_PROMPT.format(
             source_type=source_type,
             doc_type=doc_type,
-            content=content[:DOC_CONTENT_CHAR_CAP],
+            evidence_catalog=catalog.render(),
             quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
 
@@ -273,16 +285,14 @@ class MemoryExtractor:
             label="memory extraction",
             invoke=self.structured_llm_client.extract_memories,
         )
-        return self._localize_text_result(
-            result,
-            authority_text=content[:DOC_CONTENT_CHAR_CAP],
-        )
+        return self._resolve_text_result(result, catalog=catalog, evidence_anchor="document")
 
     async def extract_memory_changes(
         self,
         *,
         changed_hunks: str,
         updated_document: str,
+        current_changed_ranges: tuple[tuple[int, int], ...] = (),
         source_type: str = "unknown",
         doc_type: str = "unknown",
     ) -> MemoryExtractionResult:
@@ -294,11 +304,25 @@ class MemoryExtractor:
                 error="No LLM client configured for memory change extraction",
             )
 
+        # The document prefix is bounded read-only context. Selectable changed
+        # Evidence must still cover authoritative ranges anywhere in the full
+        # current revision.
+        context_document = updated_document[:UPDATED_DOC_CHAR_CAP]
+        spans = tuple(
+            EvidenceAuthoritySpan(
+                text=updated_document[start:end],
+                source_start=start,
+            )
+            for start, end in current_changed_ranges
+            if 0 <= start < end <= len(updated_document)
+        )
+        catalog = EvidenceCatalog.from_spans(spans)
         prompt = MEMORY_CHANGE_EXTRACTION_PROMPT.format(
             source_type=source_type,
             doc_type=doc_type,
             changed_hunks=changed_hunks[:CHANGED_HUNK_CHAR_CAP],
-            updated_document=updated_document[:UPDATED_DOC_CHAR_CAP],
+            changed_evidence_catalog=catalog.render(),
+            updated_document=context_document,
             quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
 
@@ -307,32 +331,55 @@ class MemoryExtractor:
             label="memory change extraction",
             invoke=self.structured_llm_client.extract_memories,
         )
-        return self._localize_text_result(
-            result,
-            authority_text=updated_document[:UPDATED_DOC_CHAR_CAP],
-        )
+        return self._resolve_text_result(result, catalog=catalog, evidence_anchor="changed_range")
 
     @staticmethod
-    def _localize_text_result(
+    def _resolve_text_result(
         result: MemoryExtractionResult,
         *,
-        authority_text: str,
+        catalog: EvidenceCatalog,
+        evidence_anchor: str,
     ) -> MemoryExtractionResult:
         if result.error_type:
             return result
         localized_memories = []
+        refinement_counts: dict[str, int] = {}
+        fallback_samples: list[dict[str, object]] = []
+        fallback_sample_truncated_count = 0
         for memory in result.memories:
-            localized = localize_claim_evidence(
-                memory,
-                authority_text=authority_text,
-                work_kind=ClaimEvidenceWorkKind.OBSERVATION,
-            )
-            if localized.accepted:
-                localized_memories.append(localized.memory)
+            resolved = catalog.resolve(memory)
+            if resolved is None:
+                continue
+            resolved.memory.evidence_anchor = evidence_anchor
+            if evidence_anchor == "unit":
+                # Unit coordinates are not Observation-revision coordinates.
+                resolved.memory.evidence_range_start = None
+                resolved.memory.evidence_range_end = None
+            localized_memories.append(resolved.memory)
+            refinement_counts[resolved.refinement] = refinement_counts.get(resolved.refinement, 0) + 1
+            if resolved.refinement == "block_fallback":
+                if len(fallback_samples) < _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT:
+                    fallback_samples.append(
+                        _block_fallback_sample(
+                            original=memory,
+                            resolved=resolved,
+                            extraction_metadata=result.metadata,
+                        )
+                    )
+                else:
+                    fallback_sample_truncated_count += 1
         return MemoryExtractionResult(
             memories=localized_memories,
             artifact_summaries=result.artifact_summaries,
-            metadata=result.metadata,
+            metadata={
+                **result.metadata,
+                "evidence_refinement_counts": refinement_counts,
+                "evidence_block_fallback_samples": fallback_samples,
+                "evidence_block_fallback_sample_truncated_count": (
+                    fallback_sample_truncated_count
+                ),
+                "invalid_evidence_block_count": len(result.memories) - len(localized_memories),
+            },
         )
 
     async def extract_unit_memories(
@@ -349,6 +396,9 @@ class MemoryExtractor:
                 error="No LLM client configured for memory extraction",
             )
 
+        catalog = EvidenceCatalog.from_text(
+            context.unit.unit_markdown[:UNIT_MARKDOWN_CHAR_CAP]
+        )
         prompt = UNIT_MEMORY_EXTRACTION_PROMPT.format(
             source_type=context.source_type,
             doc_type=doc_type,
@@ -357,7 +407,7 @@ class MemoryExtractor:
             heading_path=" > ".join(context.unit.heading_path),
             document_outline=context.document_outline[:DOCUMENT_OUTLINE_CHAR_CAP],
             glossary_appendix=context.glossary_appendix[:GLOSSARY_APPENDIX_CHAR_CAP],
-            unit_markdown=context.unit.unit_markdown[:UNIT_MARKDOWN_CHAR_CAP],
+            evidence_catalog=catalog.render(),
             quote_max=EXTRACTION_QUOTE_MAX_CHARS,
         )
         result = await self._extract_with_schema(
@@ -368,21 +418,16 @@ class MemoryExtractor:
         if result.error_type:
             return result
 
-        kept: list[RawMemory] = []
-        for memory in result.memories:
-            if memory.evidence_anchor != "unit":
-                continue
-            localized = localize_claim_evidence(
-                memory,
-                authority_text=context.unit.unit_markdown,
-                work_kind=ClaimEvidenceWorkKind.STRUCTURAL_UNIT,
-                allow_short_whole_authority=True,
-            )
-            if not localized.accepted:
-                continue
-            localized.memory.evidence_anchor = "unit"
-            kept.append(localized.memory)
-        return MemoryExtractionResult(memories=kept, metadata=result.metadata)
+        # Compatibility for in-flight v5 responses. New v6 prompts do not ask
+        # the model to emit an evidence_anchor.
+        result.memories = [
+            memory
+            for memory in result.memories
+            if memory.evidence_block_id
+            or memory.evidence_anchor in {None, "unit"}
+        ]
+
+        return self._resolve_text_result(result, catalog=catalog, evidence_anchor="unit")
 
     async def extract_projection_batch_memories(
         self,
@@ -399,10 +444,27 @@ class MemoryExtractor:
                 error_type="llm_client_unavailable",
                 error="No LLM client configured for memory extraction",
             )
+        catalog = EvidenceCatalog.from_spans(
+            tuple(
+                EvidenceAuthoritySpan(
+                    text=content,
+                    observation_id=observation_id,
+                    source_start=source_start,
+                )
+                for observation_id, source_start, content in (
+                    batch.primary_authority_spans
+                    or tuple(
+                        (observation_id, 0, content)
+                        for observation_id, content in batch.primary_content_by_observation_id
+                    )
+                )
+                if content
+            )
+        )
         prompt = PROJECTION_BATCH_EXTRACTION_PROMPT.format(
             source_type=source_type,
             doc_type=doc_type,
-            primary_observations=batch.primary_markdown[:UNIT_MARKDOWN_CHAR_CAP],
+            primary_evidence_catalog=catalog.render(),
             context_observations=batch.context_markdown[:PROJECTION_CONTEXT_CHAR_CAP],
             artifact_summary_max=MAX_SOURCE_ARTIFACT_SUMMARY_CHARS,
         )
@@ -415,7 +477,9 @@ class MemoryExtractor:
         if result.error_type:
             return result
         kept = []
-        primary_content = dict(batch.primary_content_by_observation_id)
+        refinement_counts: dict[str, int] = {}
+        fallback_samples: list[dict[str, object]] = []
+        fallback_sample_truncated_count = 0
         context_by_primary = dict(batch.context_observation_ids_by_primary)
         visual_observation_ids = {
             image.source_observation_id
@@ -423,9 +487,9 @@ class MemoryExtractor:
             if image.source_observation_id in batch.primary_observation_ids
         }
         for memory in result.memories:
-            quote = memory.evidence_quote or ""
             explicit_observation_id = memory.source_observation_id
             if explicit_observation_id in visual_observation_ids:
+                quote = memory.evidence_quote or ""
                 if quote.strip():
                     continue
                 memory.evidence_quote = None
@@ -441,30 +505,11 @@ class MemoryExtractor:
                 memory.required_source_observation_ids = list(required_ids)
                 kept.append(memory)
                 continue
-            if not quote.strip() or quote not in batch.primary_markdown:
+            resolved = catalog.resolve(memory)
+            if resolved is None or resolved.block.observation_id is None:
                 continue
-            if explicit_observation_id is not None:
-                if quote not in primary_content.get(explicit_observation_id, ""):
-                    continue
-                source_observation_id = explicit_observation_id
-            else:
-                matching_observations = [
-                    observation_id
-                    for observation_id, content in primary_content.items()
-                    if quote in content
-                ]
-                if len(matching_observations) != 1:
-                    continue
-                source_observation_id = matching_observations[0]
-            localized = localize_claim_evidence(
-                memory,
-                authority_text=primary_content[source_observation_id],
-                work_kind=ClaimEvidenceWorkKind.OBSERVATION,
-                allow_short_whole_authority=True,
-            )
-            if not localized.accepted:
-                continue
-            localized_memory = localized.memory
+            localized_memory = resolved.memory
+            source_observation_id = resolved.block.observation_id
             localized_memory.evidence_anchor = "projection_batch"
             localized_memory.source_observation_id = source_observation_id
             required_ids = tuple(
@@ -477,11 +522,35 @@ class MemoryExtractor:
             ):
                 continue
             localized_memory.required_source_observation_ids = list(required_ids)
+            refinement_counts[resolved.refinement] = (
+                refinement_counts.get(resolved.refinement, 0) + 1
+            )
+            if resolved.refinement == "block_fallback":
+                if len(fallback_samples) < _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT:
+                    fallback_samples.append(
+                        _block_fallback_sample(
+                            original=memory,
+                            resolved=resolved,
+                            extraction_metadata=result.metadata,
+                        )
+                    )
+                else:
+                    fallback_sample_truncated_count += 1
             kept.append(localized_memory)
         return MemoryExtractionResult(
             memories=kept,
             artifact_summaries=result.artifact_summaries,
-            metadata=result.metadata,
+            metadata={
+                **result.metadata,
+                "evidence_refinement_counts": refinement_counts,
+                "evidence_block_fallback_samples": fallback_samples,
+                "evidence_block_fallback_sample_truncated_count": (
+                    fallback_sample_truncated_count
+                ),
+                "invalid_evidence_block_count": (
+                    len(result.memories) - len(kept)
+                ),
+            },
         )
 
     async def _extract_with_schema(
@@ -495,6 +564,8 @@ class MemoryExtractor:
         started = perf_counter()
         metrics = {
             "structured_llm_calls": 1,
+            "extraction_model": self.model,
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "prompt_chars": len(prompt),
             "image_count": len(images),
             "image_bytes": sum(len(image.body) for image in images),
@@ -550,6 +621,7 @@ class MemoryExtractor:
                     valid_until=memory.valid_until,
                     extraction_context=memory.extraction_context,
                     evidence_quote=memory.evidence_quote,
+                    evidence_block_id=memory.evidence_block_id,
                     evidence_anchor=memory.evidence_anchor,
                     source_observation_id=memory.source_observation_id,
                     required_source_observation_ids=list(memory.required_source_observation_ids),
@@ -603,3 +675,34 @@ class MemoryExtractor:
                     ),
                 },
             )
+
+
+def _block_fallback_sample(
+    *,
+    original: RawMemory,
+    resolved: EvidenceResolution,
+    extraction_metadata: dict[str, object],
+) -> dict[str, object]:
+    """Return content-free evidence telemetry for one whole-Block fallback."""
+
+    submitted_quote = original.evidence_quote or ""
+    return {
+        "candidate_content_sha256": hashlib.sha256(
+            original.content.encode("utf-8")
+        ).hexdigest(),
+        "source_observation_id": resolved.block.observation_id,
+        "evidence_range_start": resolved.memory.evidence_range_start,
+        "evidence_range_end": resolved.memory.evidence_range_end,
+        "block_text_sha256": hashlib.sha256(
+            resolved.block.text.encode("utf-8")
+        ).hexdigest(),
+        "block_chars": len(resolved.block.text),
+        "submitted_quote_sha256": (
+            hashlib.sha256(submitted_quote.encode("utf-8")).hexdigest()
+            if submitted_quote
+            else None
+        ),
+        "submitted_quote_chars": len(submitted_quote),
+        "extraction_model": extraction_metadata.get("extraction_model"),
+        "prompt_sha256": extraction_metadata.get("prompt_sha256"),
+    }

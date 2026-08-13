@@ -117,6 +117,50 @@ def test_projection_fanout_aggregates_discarded_orphan_summary_metric() -> None:
     assert metrics["discarded_orphan_artifact_summary_count"] == 3
 
 
+def test_projection_fanout_aggregates_bounded_block_fallback_telemetry() -> None:
+    sample = {
+        "candidate_content_sha256": "c" * 64,
+        "source_derivation_batch_id": "xbatch-current",
+        "source_observation_id": "obs-current",
+        "source_observation_revision_id": "obsrev-current",
+        "evidence_range_start": 20,
+        "evidence_range_end": 80,
+        "block_text_sha256": "b" * 64,
+        "block_chars": 60,
+        "submitted_quote_sha256": "q" * 64,
+        "submitted_quote_chars": 41,
+        "extraction_model": "model-current",
+        "prompt_sha256": "p" * 64,
+    }
+    metrics = _aggregate_extraction_metrics(
+        (
+            MemoryExtractionResult(
+                metadata={
+                    "evidence_refinement_counts": {"block_fallback": 1},
+                    "evidence_block_fallback_samples": [sample],
+                    "invalid_evidence_block_count": 1,
+                }
+            ),
+            MemoryExtractionResult(
+                metadata={
+                    "evidence_refinement_counts": {
+                        "block_fallback": 2,
+                        "exact": 1,
+                    },
+                    "evidence_block_fallback_samples": [sample],
+                }
+            ),
+        )
+    )
+
+    assert metrics["evidence_refinement_counts"] == {
+        "block_fallback": 3,
+        "exact": 1,
+    }
+    assert metrics["evidence_block_fallback_samples"] == [sample, sample]
+    assert metrics["invalid_evidence_block_count"] == 1
+
+
 @pytest.mark.asyncio
 async def test_expired_source_activity_can_be_reacquired_with_same_id(
     db: Database,
@@ -3020,6 +3064,10 @@ class NoopMemoryEngine:
                             "current_changed_ranges",
                             (),
                         ),
+                        reprocess_all_current_observations=kwargs.get(
+                            "derivation_reprocess_all_current_observations",
+                            False,
+                        ),
                     )
                 )
                 if kwargs.get("derivation_id") is not None
@@ -4431,6 +4479,84 @@ def _audited_memory_store(db: Database) -> MemoryStore:
 
 
 @pytest.mark.asyncio
+async def test_block_fallback_writes_correlated_content_free_audit(
+    db: Database,
+) -> None:
+    source_id = "src-teams-fallback-audit"
+    doc_id = "teams-window-fallback-audit"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Teams",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    store = _audited_memory_store(db)
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=store,
+    )
+    sample = {
+        "candidate_content_sha256": "c" * 64,
+        "source_derivation_batch_id": "xbatch-current",
+        "source_observation_id": "obs-current",
+        "source_observation_revision_id": "obsrev-current",
+        "evidence_range_start": 20,
+        "evidence_range_end": 80,
+        "block_text_sha256": "b" * 64,
+        "block_chars": 60,
+        "submitted_quote_sha256": "q" * 64,
+        "submitted_quote_chars": 41,
+        "extraction_model": "model-current",
+        "prompt_sha256": "p" * 64,
+    }
+    result = MemoryExtractionResult(
+        memories=[RawMemory(content="Durable procedure.", memory_type="procedure")],
+        derivation_id="derive-current",
+        metadata={
+            "derivation_id": "derive-current",
+            "source_unit_id": "unit-current",
+            "target_unit_revision_id": "unitrev-current",
+            "extraction_contract_version": "projection-extraction-v6",
+            "evidence_refinement_counts": {"block_fallback": 1},
+            "evidence_block_fallback_samples": [sample],
+            "evidence_block_fallback_sample_truncated_count": 0,
+            "invalid_evidence_block_count": 0,
+        },
+    )
+
+    await orchestrator._record_memory_extraction_result(
+        mode="projection_batches",
+        plan=None,
+        doc_id=doc_id,
+        source_id=source_id,
+        source_type="teams",
+        run_id="run-current",
+        result=result,
+        extraction_metadata=result.metadata,
+    )
+
+    [row] = await db.list_memory_audit_events(
+        event_type="memory_evidence_block_fallback"
+    )
+    assert row.run_id == "run-current"
+    assert row.source_id == source_id
+    assert row.doc_id == doc_id
+    assert row.decision == "block_fallback"
+    assert row.reason == "quote_not_localized_in_selected_block"
+    assert row.payload["source_type"] == "teams"
+    assert row.payload["derivation_id"] == "derive-current"
+    assert row.payload["source_unit_id"] == "unit-current"
+    assert row.payload["target_unit_revision_id"] == "unitrev-current"
+    assert row.payload["evidence_block_fallback_samples"] == [sample]
+    assert "Durable procedure." not in str(row.payload)
+
+
+@pytest.mark.asyncio
 async def test_large_single_observation_uses_bounded_structural_units(db: Database) -> None:
     source_id = "src-large-confluence"
     await db.upsert_source(
@@ -4618,6 +4744,71 @@ async def test_failed_structural_unit_stages_target_and_preserves_completed_sibl
     assert recovery_order.index("resume_extraction") < recovery_order.index("provider_authenticate")
     [lifecycle_call] = memory_engine.projected_lifecycle_calls
     assert len(lifecycle_call["raw_memories"]) == len(extractor.unit_calls)
+
+
+@pytest.mark.asyncio
+async def test_derivation_recovery_supersedes_an_old_extraction_contract(
+    db: Database,
+) -> None:
+    source_id = "src-stale-extraction-contract"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Stale extraction contract",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    body = "\n".join(f"design-line-{index:05d}" for index in range(6_000))
+    first = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=PartiallyFailingStructuralUnitExtractor(),
+        memory_engine=RecordingMemoryEngine(),
+        memory_store=None,
+        max_concurrent=2,
+        retry_sleep=_skip_retry_delay,
+    )
+
+    failed = await first.sync_gene(
+        gene=LargeConfluenceGene(body),
+        source_name="Stale extraction contract",
+        source_id=source_id,
+    )
+
+    assert failed.last_sync_status == "failed"
+    [attempt] = await db.list_source_derivation_attempts(source_id=source_id)
+    await db.db.execute(
+        """UPDATE source_derivation_attempts
+           SET extraction_contract_version = ?
+           WHERE id = ?""",
+        ("projection-extraction-v6", attempt.id),
+    )
+    await db.db.commit()
+
+    recovery = GeneSyncOrchestrator(
+        db=db,
+        doc_store=first.doc_store,
+        memory_extractor=FailingMemoryExtractor(),
+        memory_engine=FailingProjectedMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    )
+    stats = await recovery._resume_source_derivations(
+        source_id=source_id,
+        source_activity_epoch=attempt.context.source_activity_epoch,
+        run_id="run-contract-upgrade",
+    )
+
+    assert stats == {
+        "processed": 0,
+        "updated": 0,
+        "memories_extracted": 0,
+        "memories_corroborated": 0,
+    }
+    [superseded] = await db.list_source_derivation_attempts(source_id=source_id)
+    assert superseded.status == "superseded"
 
 
 @pytest.mark.asyncio
@@ -5478,6 +5669,56 @@ async def test_targeted_recovery_skips_unchanged_documents_outside_finding_scope
     assert extractor.full_calls == []
     assert extractor.unit_calls == []
     assert memory_engine.projected_lifecycle_calls == []
+
+
+@pytest.mark.asyncio
+async def test_targeted_reprocess_extracts_unchanged_current_projection(
+    db: Database,
+) -> None:
+    source_id = "src-targeted-current-projection"
+    markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
+    doc_store = StubDocumentStore()
+    normalized_content_uri = doc_store.store_normalized(
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=markdown,
+    )
+    await _insert_document_with_metadata(
+        db,
+        source_id=source_id,
+        doc_id="doc-1",
+        title="Design Doc",
+        markdown=markdown,
+        version="2",
+        normalized_content_uri=normalized_content_uri,
+        projection_source_type="docs",
+    )
+    extractor = ProjectionBatchRecordingExtractor()
+    memory_engine = RecordingMemoryEngine()
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=doc_store,
+        memory_extractor=extractor,
+        memory_engine=memory_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    state = await orchestrator.sync_gene(
+        gene=UpdatingDocumentGene(markdown, version="2"),
+        source_name="Documents",
+        source_id=source_id,
+        force_full_sync=True,
+        reprocess_doc_ids=frozenset({"doc-1"}),
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_processed == 1
+    assert state.docs_updated == 1
+    assert len(extractor.projection_calls) == 1
+    assert extractor.projection_calls[0].primary_observation_ids
+    assert len(memory_engine.projected_lifecycle_calls) == 1
 
 
 @pytest.mark.asyncio
