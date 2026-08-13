@@ -11,6 +11,7 @@ from memforge.evals.agent_evaluation import (
     QualitySignalCollector,
     RuntimeTraceContext,
     bind_quality_signals,
+    current_deployment_revision,
     event_public_payload,
     runtime_event_otel_attributes,
     summarize_agent_runtime_events,
@@ -104,6 +105,17 @@ def test_retry_attempt_and_trace_correlation_do_not_alias_runtime_identity() -> 
     assert retry.trace_id == "1" * 32
     assert retry.span_id == "2" * 16
     assert "trace_id" not in runtime_event_otel_attributes(retry)
+
+
+def test_deployment_revision_prefers_explicit_and_safely_reads_vcap(monkeypatch) -> None:
+    monkeypatch.setenv("VCAP_APPLICATION", '{"application_version":"cf-version"}')
+    assert current_deployment_revision() == "cf-version"
+
+    monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "cloud-pr-338")
+    assert current_deployment_revision() == "cloud-pr-338"
+
+    monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "private revision text")
+    assert current_deployment_revision() is None
 
 
 def test_bounded_collector_coalesces_overflow_without_losing_denominator() -> None:
