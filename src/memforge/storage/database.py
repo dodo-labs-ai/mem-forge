@@ -17643,6 +17643,7 @@ class Database:
             )
         )
         for column, value in (
+            ("event_id", query.event_id),
             ("source_id", query.source_id),
             ("source_type", query.source_type),
             ("event_name", query.event_name),
@@ -17666,6 +17667,41 @@ class Database:
         )
         rows = await self.db.execute_fetchall(sql, tuple(params))
         return [self._row_to_agent_runtime_event(row) for row in rows]
+
+    async def purge_agent_runtime_events(
+        self,
+        *,
+        occurred_before: datetime,
+        limit: int,
+    ) -> int:
+        """Delete one deterministic retention batch before an exclusive cutoff."""
+
+        if occurred_before.tzinfo is None or occurred_before.utcoffset() is None:
+            raise ValueError("agent runtime retention cutoff requires a timezone")
+        if not 1 <= limit <= 10_000:
+            raise ValueError("agent runtime retention limit must be between 1 and 10000")
+        cutoff = occurred_before.astimezone(timezone.utc).isoformat()
+        async with self._write_lock:
+            try:
+                rows = await self.db.execute_fetchall(
+                    """SELECT event_id FROM agent_runtime_events
+                       WHERE occurred_at < ?
+                       ORDER BY occurred_at, event_id
+                       LIMIT ?""",
+                    (cutoff, limit),
+                )
+                event_ids = tuple(str(row["event_id"]) for row in rows)
+                if event_ids:
+                    placeholders = ",".join("?" for _ in event_ids)
+                    await self.db.execute(
+                        f"DELETE FROM agent_runtime_events WHERE event_id IN ({placeholders})",
+                        event_ids,
+                    )
+                await self.db.commit()
+                return len(event_ids)
+            except Exception:
+                await self.db.rollback()
+                raise
 
     @staticmethod
     def _row_to_agent_runtime_event(row: Mapping[str, object]) -> AgentRuntimeEvent:

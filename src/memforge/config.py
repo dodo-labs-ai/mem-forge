@@ -12,7 +12,7 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
-__all__ = ["AppConfig", "SyncConfig", "load_config"]
+__all__ = ["AgentEvaluationConfig", "AppConfig", "SyncConfig", "load_config"]
 
 DEFAULT_BASE_DIR = Path.home() / ".memforge"
 DEFAULT_ENRICHMENT_MAX_TOKENS = 8192
@@ -107,6 +107,12 @@ class SyncConfig:
 
 
 @dataclass
+class AgentEvaluationConfig:
+    runtime_event_retention_days: int = 90
+    runtime_event_purge_batch_size: int = 1000
+
+
+@dataclass
 class AppConfig:
     base_dir: Path = field(default_factory=lambda: DEFAULT_BASE_DIR)
     storage: StorageConfig = field(default_factory=StorageConfig)
@@ -115,6 +121,7 @@ class AppConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
+    agent_evaluation: AgentEvaluationConfig = field(default_factory=AgentEvaluationConfig)
 
     def __post_init__(self) -> None:
         if os.environ.get("MEMFORGE_BASE_DIR"):
@@ -236,6 +243,23 @@ class AppConfig:
             int(
                 os.environ.get("MEMFORGE_SYNC_WORKER_MAX_ATTEMPTS")
                 or self.sync.worker_max_attempts
+            ),
+        )
+        self.agent_evaluation.runtime_event_retention_days = max(
+            1,
+            int(
+                os.environ.get("MEMFORGE_AGENT_RUNTIME_EVENT_RETENTION_DAYS")
+                or self.agent_evaluation.runtime_event_retention_days
+            ),
+        )
+        self.agent_evaluation.runtime_event_purge_batch_size = min(
+            10_000,
+            max(
+                1,
+                int(
+                    os.environ.get("MEMFORGE_AGENT_RUNTIME_EVENT_PURGE_BATCH_SIZE")
+                    or self.agent_evaluation.runtime_event_purge_batch_size
+                ),
             ),
         )
         self.server.jwt_secret = (
