@@ -17630,10 +17630,18 @@ class Database:
             _utc_iso(query.occurred_to),
         ]
         clauses.append(
-            "(S.access_policy = 'workspace' OR "
-            "(? = 1 AND S.access_policy = 'private' AND S.owner_user_id = ?))"
+            "((S.access_state = 'active' AND (S.access_policy = 'workspace' OR "
+            "(? = 1 AND S.access_policy = 'private' AND S.owner_user_id = ?))) OR "
+            "(S.access_state = 'changing' AND ? = 1 AND S.owner_user_id = ?))"
         )
-        params.extend((int(query.include_private), query.requesting_user_id))
+        params.extend(
+            (
+                int(query.include_private),
+                query.requesting_user_id,
+                int(query.include_private),
+                query.requesting_user_id,
+            )
+        )
         for column, value in (
             ("source_id", query.source_id),
             ("source_type", query.source_type),
