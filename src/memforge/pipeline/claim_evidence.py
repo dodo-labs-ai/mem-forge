@@ -7,6 +7,7 @@ from enum import Enum
 
 from memforge.models import RawMemory
 from memforge.pipeline.document_update import quote_overlaps_current_changes
+from memforge.pipeline.evidence_catalog import localize_quote
 
 
 MAX_INLINE_WHOLE_AUTHORITY_BYTES = 4_096
@@ -42,15 +43,18 @@ def localize_claim_evidence(
 ) -> ClaimEvidenceLocalization:
     """Return one canonical excerpt derived only from the proposed quote."""
 
-    quote = memory.evidence_quote or ""
-    exact_match = bool(quote.strip() and quote in authority_text)
+    proposed_quote = memory.evidence_quote or ""
+    quote = proposed_quote
+    localized_quote = localize_quote(authority_text, proposed_quote)
+    if localized_quote is not None:
+        quote = localized_quote[0]
     exact_required = work_kind in {
         ClaimEvidenceWorkKind.CHANGED_RANGE,
         ClaimEvidenceWorkKind.STRUCTURAL_UNIT,
         ClaimEvidenceWorkKind.OBSERVATION,
         ClaimEvidenceWorkKind.REVALIDATED,
     }
-    if exact_required and not exact_match:
+    if exact_required and localized_quote is None:
         return ClaimEvidenceLocalization(
             memory=replace(
                 memory,
@@ -63,10 +67,24 @@ def localize_claim_evidence(
 
     quote_bytes = len(quote.encode("utf-8"))
     omission_reason = None
-    if quote == authority_text and (
-        work_kind is ClaimEvidenceWorkKind.CHANGED_RANGE
-        or not allow_short_whole_authority
-        or quote_bytes > MAX_INLINE_WHOLE_AUTHORITY_BYTES
+    resolved_start = memory.evidence_range_start
+    resolved_end = memory.evidence_range_end
+    range_authority_text = authority_text[resolved_start:resolved_end] if (
+        resolved_start is not None
+        and resolved_end is not None
+        and 0 <= resolved_start < resolved_end <= len(authority_text)
+    ) else None
+    has_resolved_range = (
+        range_authority_text == quote
+    )
+    proposed_is_whole_authority = proposed_quote == authority_text
+    if proposed_is_whole_authority and (
+        not memory.evidence_resolved_from_block
+        and (
+            work_kind is ClaimEvidenceWorkKind.CHANGED_RANGE
+            or not allow_short_whole_authority
+            or quote_bytes > MAX_INLINE_WHOLE_AUTHORITY_BYTES
+        )
     ):
         omission_reason = "whole_authority_not_claim_local"
     elif quote_bytes > MAX_INLINE_CLAIM_EVIDENCE_BYTES:
@@ -82,11 +100,19 @@ def localize_claim_evidence(
             omission_reason=omission_reason,
         )
 
-    if work_kind is ClaimEvidenceWorkKind.CHANGED_RANGE and not quote_overlaps_current_changes(
-        authority_text,
-        quote,
-        current_changed_ranges,
-    ):
+    overlaps_change = (
+        any(
+            resolved_start < range_end and resolved_end > range_start
+            for range_start, range_end in current_changed_ranges
+        )
+        if has_resolved_range
+        else quote_overlaps_current_changes(
+            authority_text,
+            quote,
+            current_changed_ranges,
+        )
+    )
+    if work_kind is ClaimEvidenceWorkKind.CHANGED_RANGE and not overlaps_change:
         return ClaimEvidenceLocalization(
             memory=replace(
                 memory,

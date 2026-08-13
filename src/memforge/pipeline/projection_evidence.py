@@ -188,6 +188,8 @@ def build_projected_claim_evidence(
                 anchor=_primary_evidence_anchor(
                     revision=primary_revision,
                     quote=quote,
+                    resolved_range_start=canonical_memory.evidence_range_start,
+                    resolved_range_end=canonical_memory.evidence_range_end,
                 ),
                 evidence_unit_id=unit.id,
             )
@@ -247,8 +249,24 @@ def _primary_evidence_anchor(
     *,
     revision: SourceObservationRevision,
     quote: str,
+    resolved_range_start: int | None = None,
+    resolved_range_end: int | None = None,
 ) -> SourceAnchor:
     """Use an exact unique quote range; otherwise retain conservative authority."""
+
+    if (
+        resolved_range_start is not None
+        and resolved_range_end is not None
+        and 0 <= resolved_range_start < resolved_range_end <= len(revision.content)
+        and revision.content[resolved_range_start:resolved_range_end] == quote
+    ):
+        return SourceAnchor(
+            kind=AnchorKind.REVISION_RANGE,
+            observation_id=revision.observation_id,
+            observation_revision_id=revision.id,
+            range_start=resolved_range_start,
+            range_end=resolved_range_end,
+        )
 
     start = revision.content.find(quote) if quote else -1
     if start >= 0 and revision.content.find(quote, start + 1) < 0:

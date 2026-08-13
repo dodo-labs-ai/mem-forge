@@ -47,6 +47,7 @@ SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE = "retryable_failure"
 
 _SAFE_DERIVATION_DIAGNOSTIC_RE = re.compile(r"^[A-Za-z0-9_.\[\]$-]+$")
 _MAX_SAFE_DERIVATION_ERROR_FIELDS = 32
+_EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +122,7 @@ class SourceUnitDerivationContext:
     user_id: str | None
     source_activity_epoch: int | None
     current_changed_ranges: tuple[tuple[int, int], ...] = ()
+    reprocess_all_current_observations: bool = False
     work_strategy: Literal["auto", "structural"] = "auto"
 
 
@@ -239,6 +241,12 @@ class SourceUnitDeriver:
                     error_type="diff_guided_extraction_error",
                     metadata={"safe_error_code": type(exc).__name__},
                 )
+            for sample in result.metadata.get(
+                "evidence_block_fallback_samples",
+                [],
+            ):
+                if isinstance(sample, dict):
+                    sample["source_derivation_batch_id"] = batch.id
             await self._store.record_source_derivation_batch_result(
                 derivation_id=derivation.id,
                 batch_id=batch.id,
@@ -326,7 +334,16 @@ def plan_source_derivation_work(
 ) -> tuple[SourceDerivationBatch, ...]:
     """Plan provider-neutral extraction work for one immutable Source Unit."""
 
-    projection_batches = plan_projection_extraction_batches(projection)
+    projection_batches = plan_projection_extraction_batches(
+        projection,
+        primary_observation_ids=(
+            tuple(observation.id for observation in projection.observations)
+            if context.reprocess_all_current_observations
+            else None
+        ),
+    )
+    if context.reprocess_all_current_observations:
+        return projection_batches
     if len(projection.observations) != 1 or len(projection.observation_revisions) != 1:
         return projection_batches
 
@@ -353,6 +370,14 @@ def plan_source_derivation_work(
         or context.update_mode != "diff_guided"
         or not context.changed_hunks
     ):
+        # Structural units are derived from the rendered Document view. They
+        # are valid selectable Evidence only when that complete view maps into
+        # the single immutable Observation authority. Conversational and
+        # issue renderers may add author, timestamp, or field labels that are
+        # intentionally absent from Observation content; those sources must
+        # use projection batches built directly from Observation revisions.
+        if not context.document_content or context.document_content not in revision.content:
+            return projection_batches
         policy = UnitizationPolicy()
         units = unitize_markdown(
             context.document_content,
@@ -485,6 +510,9 @@ def source_unit_derivation_context_to_payload(
         "user_id": context.user_id,
         "source_activity_epoch": context.source_activity_epoch,
         "current_changed_ranges": [[start, end] for start, end in context.current_changed_ranges],
+        "reprocess_all_current_observations": (
+            context.reprocess_all_current_observations
+        ),
         "work_strategy": context.work_strategy,
     }
 
@@ -600,6 +628,9 @@ def source_unit_derivation_context_from_payload(
             for value in payload.get("current_changed_ranges", [])
             if isinstance(value, list) and len(value) == 2
         ),
+        reprocess_all_current_observations=bool(
+            payload.get("reprocess_all_current_observations", False)
+        ),
         work_strategy=(
             "structural"
             if payload.get("work_strategy") == "structural"
@@ -624,6 +655,7 @@ def memory_extraction_output_payload(
             }
             for summary in result.artifact_summaries
         ],
+        "evidence_telemetry": _safe_evidence_telemetry(result.metadata),
     }
 
 
@@ -650,6 +682,11 @@ def memory_extraction_result_from_output_payload(
                 valid_until=_optional_string(value.get("valid_until")),
                 extraction_context=_optional_string(value.get("extraction_context")),
                 evidence_quote=_optional_string(value.get("evidence_quote")),
+                evidence_resolved_from_block=(
+                    value.get("evidence_resolved_from_block") is True
+                ),
+                evidence_range_start=_optional_int(value.get("evidence_range_start")),
+                evidence_range_end=_optional_int(value.get("evidence_range_end")),
                 evidence_anchor=_optional_string(value.get("evidence_anchor")),
                 source_observation_id=_optional_string(value.get("source_observation_id")),
                 required_source_observation_ids=_string_list(value.get("required_source_observation_ids")),
@@ -673,6 +710,7 @@ def memory_extraction_result_from_output_payload(
     return MemoryExtractionResult(
         memories=memories,
         artifact_summaries=tuple(summaries),
+        metadata=_safe_evidence_telemetry(payload.get("evidence_telemetry")),
     )
 
 
@@ -781,6 +819,11 @@ def _raw_memory_payload(memory: RawMemory) -> dict[str, object]:
         "valid_until": memory.valid_until,
         "extraction_context": memory.extraction_context,
         "evidence_quote": memory.evidence_quote,
+        # evidence_block_id is deliberately absent: batch-local addresses are
+        # resolved to exact source excerpts before durable output is staged.
+        "evidence_resolved_from_block": memory.evidence_resolved_from_block,
+        "evidence_range_start": memory.evidence_range_start,
+        "evidence_range_end": memory.evidence_range_end,
         "evidence_anchor": memory.evidence_anchor,
         "source_observation_id": memory.source_observation_id,
         "required_source_observation_ids": list(memory.required_source_observation_ids),
@@ -796,6 +839,10 @@ def _string_list(value: object) -> list[str]:
 
 def _optional_string(value: object) -> str | None:
     return str(value) if value is not None else None
+
+
+def _optional_int(value: object) -> int | None:
+    return int(value) if value is not None else None
 
 
 def _canonical_json(value: Any) -> str:
@@ -856,6 +903,10 @@ def _derivation_context_identity_payload(
         "user_id": context_payload.get("user_id"),
         "source_activity_epoch": context_payload.get("source_activity_epoch"),
         "current_changed_ranges": context_payload.get("current_changed_ranges"),
+        "reprocess_all_current_observations": context_payload.get(
+            "reprocess_all_current_observations",
+            False,
+        ),
     }
 
 
@@ -926,7 +977,15 @@ def _assemble_derivation_results(
 
 def _aggregate_extraction_metrics(
     results: tuple[MemoryExtractionResult, ...],
-) -> dict[str, int]:
+) -> dict[str, object]:
+    return aggregate_extraction_metrics(results)
+
+
+def aggregate_extraction_metrics(
+    results: tuple[MemoryExtractionResult, ...] | list[MemoryExtractionResult],
+) -> dict[str, object]:
+    """Aggregate bounded cost and evidence-quality signals across one fan-out."""
+
     keys = (
         "structured_llm_calls",
         "prompt_chars",
@@ -952,4 +1011,94 @@ def _aggregate_extraction_metrics(
         ),
         default=0,
     )
+    refinement_counts: dict[str, int] = {}
+    fallback_samples: list[dict[str, object]] = []
+    fallback_sample_truncated_count = 0
+    for result in results:
+        telemetry = _safe_evidence_telemetry(result.metadata)
+        for refinement, count in telemetry.get(
+            "evidence_refinement_counts",
+            {},
+        ).items():
+            refinement_counts[refinement] = refinement_counts.get(refinement, 0) + count
+        for sample in telemetry.get("evidence_block_fallback_samples", []):
+            if len(fallback_samples) < _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT:
+                fallback_samples.append(sample)
+            else:
+                fallback_sample_truncated_count += 1
+        fallback_sample_truncated_count += int(
+            telemetry.get(
+                "evidence_block_fallback_sample_truncated_count",
+                0,
+            )
+        )
+    aggregated["evidence_refinement_counts"] = refinement_counts
+    aggregated["evidence_block_fallback_samples"] = fallback_samples
+    aggregated["evidence_block_fallback_sample_truncated_count"] = (
+        fallback_sample_truncated_count
+    )
+    aggregated["invalid_evidence_block_count"] = sum(
+        int((result.metadata or {}).get("invalid_evidence_block_count", 0) or 0)
+        for result in results
+    )
     return aggregated
+
+
+def _safe_evidence_telemetry(value: object) -> dict[str, object]:
+    """Keep only bounded, content-free evidence diagnostics across replay."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    raw_counts = value.get("evidence_refinement_counts")
+    counts = (
+        {
+            str(name): max(0, int(count))
+            for name, count in raw_counts.items()
+            if isinstance(name, str) and isinstance(count, int)
+        }
+        if isinstance(raw_counts, Mapping)
+        else {}
+    )
+    raw_samples = value.get("evidence_block_fallback_samples")
+    samples: list[dict[str, object]] = []
+    if isinstance(raw_samples, list):
+        for sample in raw_samples[:_EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT]:
+            if not isinstance(sample, Mapping):
+                continue
+            samples.append(
+                {
+                    key: sample.get(key)
+                    for key in (
+                        "candidate_content_sha256",
+                        "source_derivation_batch_id",
+                        "source_observation_id",
+                        "source_observation_revision_id",
+                        "evidence_range_start",
+                        "evidence_range_end",
+                        "block_text_sha256",
+                        "block_chars",
+                        "submitted_quote_sha256",
+                        "submitted_quote_chars",
+                        "extraction_model",
+                        "prompt_sha256",
+                    )
+                }
+            )
+    return {
+        "evidence_refinement_counts": counts,
+        "evidence_block_fallback_samples": samples,
+        "evidence_block_fallback_sample_truncated_count": max(
+            0,
+            int(
+                value.get(
+                    "evidence_block_fallback_sample_truncated_count",
+                    0,
+                )
+                or 0
+            ),
+        ),
+        "invalid_evidence_block_count": max(
+            0,
+            int(value.get("invalid_evidence_block_count", 0) or 0),
+        ),
+    }
