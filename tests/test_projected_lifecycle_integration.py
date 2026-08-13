@@ -176,6 +176,48 @@ def _projection(
     )
 
 
+def _teams_projection(*, run_id: str, message_content: str) -> SourceProjection:
+    item = ContentItem(
+        item_id="teams-window-1",
+        title="Group: PCC Agent Dev -- Jul 30, 10:00-10:00",
+        source_url="https://teams.example.test/message/1",
+        last_modified=datetime(2026, 7, 30, 10, tzinfo=timezone.utc),
+        version="1",
+        extra={
+            "conversation_id": "19:conversation@thread.v2",
+            "window_id": "teams-window-1",
+        },
+    )
+    raw_payload = {
+        "conversation_id": "19:conversation@thread.v2",
+        "window_id": "teams-window-1",
+        "messages": [
+            {
+                "id": "message-1",
+                "content": message_content,
+                "time": "2026-07-30T10:00:00+00:00",
+            }
+        ],
+    }
+    rendered_document = (
+        f"# {item.title}\n\n"
+        "**Group Chat**: PCC Agent Dev\n"
+        "**Messages**: 1\n\n---\n\n"
+        "**Alex** (2026-07-30T10:00):\n"
+        f"{message_content}\n"
+    )
+    return project_source_item(
+        source_id="src-teams",
+        source_type="teams",
+        run_id=run_id,
+        item=item,
+        raw=RawContent(
+            item=item,
+            body=json.dumps(raw_payload).encode(),
+            content_type="application/json",
+        ),
+        normalized=NormalizedContent(item=item, markdown_body=rendered_document),
+    )
 def _projection_with_artifact(
     *,
     run_id: str,
@@ -1715,6 +1757,45 @@ async def test_source_derivation_separates_exact_payload_hash_from_stable_identi
     assert next_epoch_attempt.id != first_attempt.id
     assert next_epoch_attempt.target_unit_revision_id == (first_attempt.target_unit_revision_id)
     assert next_epoch_attempt.context.source_activity_epoch == 2
+
+
+def test_single_observation_uses_projection_authority_when_document_view_differs():
+    message_content = "Use contextId to find the traceId before following the request logs."
+    projection = _teams_projection(
+        run_id="teams-authority-view",
+        message_content=message_content,
+    )
+    rendered_document = (
+        "# Group: PCC Agent Dev -- Jul 30, 10:00-10:00\n\n"
+        "**Group Chat**: PCC Agent Dev\n**Messages**: 1\n\n---\n\n"
+        f"**Alex** (2026-07-30T10:00):\n{message_content}\n"
+    )
+    context = SourceUnitDerivationContext(
+        document=SimpleNamespace(
+            doc_id="teams-window-1",
+            title="Group: PCC Agent Dev -- Jul 30, 10:00-10:00",
+            source_url="https://teams.example.test/message/1",
+        ),
+        doc_type="teams",
+        project_key=None,
+        repo_identifier=None,
+        document_content=rendered_document,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=None,
+        user_id=None,
+        source_activity_epoch=None,
+    )
+
+    batches = plan_source_derivation_work(projection, context)
+
+    assert len(batches) == 1
+    assert isinstance(batches[0], ProjectionExtractionBatch)
+    [revision] = projection.observation_revisions
+    assert batches[0].primary_authority_spans == (
+        (revision.observation_id, 0, revision.content),
+    )
 
 
 @pytest.mark.asyncio
