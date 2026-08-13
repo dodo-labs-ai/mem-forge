@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
@@ -11,6 +12,13 @@ from datetime import datetime
 from typing import Any, Literal, Protocol
 
 from memforge.models import DocumentRecord, MemoryExtractionResult, RawMemory
+from memforge.evals.agent_events import (
+    AgentEvaluationEvent,
+    QualitySignal,
+    QualitySignalCollector,
+    bind_quality_signals,
+    quality_signal_scope,
+)
 from memforge.pipeline.bounded_work import collect_bounded
 from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
@@ -48,6 +56,8 @@ SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE = "retryable_failure"
 _SAFE_DERIVATION_DIAGNOSTIC_RE = re.compile(r"^[A-Za-z0-9_.\[\]$-]+$")
 _MAX_SAFE_DERIVATION_ERROR_FIELDS = 32
 _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT = 16
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +187,11 @@ class SourceDerivationStore(Protocol):
         derivation_id: str,
     ) -> None: ...
 
+    async def record_agent_evaluation_events(
+        self,
+        events: tuple[AgentEvaluationEvent, ...],
+    ) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class SourceUnitDerivationRequest:
@@ -232,14 +247,37 @@ class SourceUnitDeriver:
         async def extract_and_persist(
             batch: SourceDerivationBatch,
         ) -> MemoryExtractionResult:
+            quality_signals = QualitySignalCollector()
             try:
-                result = await request.extract_batch(batch)
+                with quality_signal_scope(quality_signals):
+                    result = await request.extract_batch(batch)
             except Exception as exc:
                 if not isinstance(batch, DiffGuidedExtractionBatch):
                     raise
                 result = MemoryExtractionResult(
                     error_type="diff_guided_extraction_error",
                     metadata={"safe_error_code": type(exc).__name__},
+                )
+            try:
+                quality_signals.record(
+                    QualitySignal(
+                        event_type="extraction_batch_outcome",
+                        outcome="failed" if result.error_type else "expected",
+                        reason_code=result.error_type or (
+                            "candidates_extracted" if result.memories else "zero_candidates"
+                        ),
+                        error_code=_safe_diagnostic_label(result.metadata.get("safe_error_code")),
+                        candidate_count=len(result.memories),
+                        rejected_count=_safe_non_negative_int(
+                            result.metadata.get("invalid_evidence_block_count")
+                        ),
+                    )
+                )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "agent evaluation batch outcome was not recordable for derivation=%s batch=%s",
+                    derivation.id,
+                    batch.id,
                 )
             for sample in result.metadata.get(
                 "evidence_block_fallback_samples",
@@ -252,6 +290,45 @@ class SourceUnitDeriver:
                 batch_id=batch.id,
                 result=result,
             )
+            recorder = getattr(self._store, "record_agent_evaluation_events", None)
+            if recorder is not None:
+                revision_by_observation = {
+                    revision.observation_id: revision.id
+                    for revision in request.projection.observation_revisions
+                }
+                extraction_model = _safe_model_identifier(
+                    result.metadata.get("extraction_model")
+                )
+                signals = tuple(
+                    replace(signal, model=str(extraction_model))
+                    if signal.model is None and extraction_model
+                    else signal
+                    for signal in quality_signals.snapshot()
+                )
+                events = bind_quality_signals(
+                    signals,
+                    source_id=request.projection.source_id,
+                    source_type=request.projection.source_type,
+                    doc_id=request.context.document.doc_id,
+                    source_unit_id=batch.source_unit_id,
+                    target_unit_revision_id=derivation.target_unit_revision_id,
+                    projection_run_id=request.projection.run_id,
+                    derivation_id=derivation.id,
+                    batch_id=batch.id,
+                    extraction_contract_version=derivation.extraction_contract_version,
+                    occurred_at=datetime.fromisoformat(
+                        derivation.created_at.replace("Z", "+00:00")
+                    ),
+                    observation_revision_ids=revision_by_observation,
+                )
+                try:
+                    await recorder(events)
+                except Exception:
+                    logger.exception(
+                        "agent evaluation event persistence failed for derivation=%s batch=%s",
+                        derivation.id,
+                        batch.id,
+                    )
             return result
 
         pending_results = await collect_bounded(
@@ -326,6 +403,32 @@ class SourceUnitDeriver:
             reused_batch_count=len(completed_results),
             executed_batch_count=len(pending_batches),
         )
+
+
+def _safe_diagnostic_label(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if not value or len(value) > 128 or any(
+        ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
+        for ch in value
+    ):
+        return None
+    return value
+
+
+def _safe_model_identifier(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if not value or len(value) > 256 or any(
+        ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:-"
+        for ch in value
+    ):
+        return None
+    return value
+
+
+def _safe_non_negative_int(value: object) -> int | None:
+    return value if isinstance(value, int) and value >= 0 else None
 
 
 def plan_source_derivation_work(

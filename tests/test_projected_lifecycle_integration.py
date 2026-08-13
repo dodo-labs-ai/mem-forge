@@ -21,6 +21,7 @@ from memforge.llm.structured import (
     MemorySupportValidationResponse,
     StructuredLlmError,
 )
+from memforge.evals.agent_events import AgentEvaluationEventQuery, QualitySignal, record_quality_signal
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.evidence import (
@@ -1673,6 +1674,83 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
         "batch-first": "completed",
         "batch-second": "pending",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_type",
+    ("confluence", "jira", "github", "local_markdown", "teams", "agent_session", "extension"),
+)
+async def test_source_deriver_binds_provider_neutral_quality_events_to_current_lineage(
+    db: Database,
+    source_type: str,
+) -> None:
+    projection = replace(
+        _projection(
+            run_id=f"projection-agent-eval-{source_type}",
+            body="The payroll tracing procedure remains active.",
+        ),
+        source_type=source_type,
+    )
+    document = await db.get_document("confluence-123")
+    assert document is not None
+
+    async def extract(batch):
+        record_quality_signal(
+            QualitySignal(
+                event_type="evidence_admission_outcome",
+                outcome="rejected",
+                reason_code="unknown_evidence_block_id",
+                observation_id=batch.primary_observation_ids[0],
+                candidate_hash="a" * 64,
+            )
+        )
+        return MemoryExtractionResult(
+            metadata={
+                "extraction_model": "anthropic/claude-sonnet",
+                "invalid_evidence_block_count": 1,
+            }
+        )
+
+    result = await SourceUnitDeriver(db).derive(
+        SourceUnitDerivationRequest(
+            projection=projection,
+            context=SourceUnitDerivationContext(
+                document=document,
+                doc_type=source_type,
+                project_key="ENG",
+                repo_identifier=None,
+                document_content="The payroll tracing procedure remains active.",
+                update_mode="full_document",
+                changed_hunks=None,
+                update_plan_stats=None,
+                source_updated_at=None,
+                user_id=None,
+                source_activity_epoch=None,
+            ),
+            extract_batch=extract,
+            max_concurrent=1,
+        )
+    )
+    rows = await db.list_agent_evaluation_events(
+        AgentEvaluationEventQuery(
+            occurred_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            occurred_to=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            source_type=source_type,
+            event_type="evidence_admission_outcome",
+        )
+    )
+
+    assert len(rows) == 1
+    event = rows[0]
+    assert event.source_id == projection.source_id
+    assert event.source_type == source_type
+    assert event.projection_run_id == projection.run_id
+    assert event.derivation_id == result.derivation.id
+    assert event.target_unit_revision_id == projection.source_unit_revisions[0].id
+    assert event.observation_revision_id == projection.observation_revisions[0].id
+    assert event.model == "anthropic/claude-sonnet"
+    assert not hasattr(event, "memory_content")
 
 
 @pytest.mark.asyncio

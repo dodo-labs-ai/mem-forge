@@ -684,6 +684,106 @@ async def _run_retrieval_eval_cli(
     return 1 if fail_on_hard_failure and report.hard_failures else 0
 
 
+@eval_group.command("online-report")
+@click.option("--from", "occurred_from", required=True, help="Inclusive RFC 3339 timestamp.")
+@click.option("--to", "occurred_to", required=True, help="Exclusive RFC 3339 timestamp.")
+@click.option("--source-id")
+@click.option("--source-type")
+@click.option("--event-type")
+@click.option("--outcome", type=click.Choice(["expected", "degraded", "rejected", "failed"]))
+@click.option("--reason-code")
+@click.option("--model")
+@click.option("--contract-version", "extraction_contract_version")
+@click.option("--limit", type=click.IntRange(1, 1000), default=1000, show_default=True)
+@click.pass_context
+def eval_online_report(
+    ctx: click.Context,
+    occurred_from: str,
+    occurred_to: str,
+    source_id: str | None,
+    source_type: str | None,
+    event_type: str | None,
+    outcome: str | None,
+    reason_code: str | None,
+    model: str | None,
+    extraction_contract_version: str | None,
+    limit: int,
+) -> None:
+    """Report a bounded local online agent-evaluation cohort."""
+
+    config: AppConfig = ctx.obj["config"]
+    try:
+        time_from = datetime.fromisoformat(occurred_from.replace("Z", "+00:00"))
+        time_to = datetime.fromisoformat(occurred_to.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise click.ClickException("--from and --to must be RFC 3339 timestamps") from exc
+    payload = asyncio.run(
+        _run_online_evaluation_report(
+            config=config,
+            occurred_from=time_from,
+            occurred_to=time_to,
+            source_id=source_id,
+            source_type=source_type,
+            event_type=event_type,
+            outcome=outcome,
+            reason_code=reason_code,
+            model=model,
+            extraction_contract_version=extraction_contract_version,
+            limit=limit,
+        )
+    )
+    click.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+async def _run_online_evaluation_report(
+    *,
+    config: AppConfig,
+    occurred_from: datetime,
+    occurred_to: datetime,
+    source_id: str | None,
+    source_type: str | None,
+    event_type: str | None,
+    outcome: str | None,
+    reason_code: str | None,
+    model: str | None,
+    extraction_contract_version: str | None,
+    limit: int,
+) -> dict[str, object]:
+    from memforge.evals.agent_events import (
+        AgentEvaluationEventQuery,
+        event_public_payload,
+        summarize_agent_evaluation_events,
+    )
+
+    db = await _get_db(config)
+    try:
+        events = await db.list_agent_evaluation_events(
+            AgentEvaluationEventQuery(
+                occurred_from=occurred_from,
+                occurred_to=occurred_to,
+                source_id=source_id,
+                source_type=source_type,
+                event_type=event_type,
+                outcome=outcome,
+                reason_code=reason_code,
+                model=model,
+                extraction_contract_version=extraction_contract_version,
+                limit=limit,
+            )
+        )
+    finally:
+        await db.close()
+    return {
+        "window": {
+            "from": occurred_from.isoformat(),
+            "to": occurred_to.isoformat(),
+            "kind": "half_open",
+        },
+        "cohort": summarize_agent_evaluation_events(events).to_payload(),
+        "events": [event_public_payload(event) for event in events],
+    }
+
+
 def _interactive_resource_dir() -> Path:
     return Path(__file__).resolve().parent / INTERACTIVE_RESOURCE_DIR
 
