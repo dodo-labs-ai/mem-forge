@@ -4747,6 +4747,71 @@ async def test_failed_structural_unit_stages_target_and_preserves_completed_sibl
 
 
 @pytest.mark.asyncio
+async def test_derivation_recovery_supersedes_an_old_extraction_contract(
+    db: Database,
+) -> None:
+    source_id = "src-stale-extraction-contract"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Stale extraction contract",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    body = "\n".join(f"design-line-{index:05d}" for index in range(6_000))
+    first = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=PartiallyFailingStructuralUnitExtractor(),
+        memory_engine=RecordingMemoryEngine(),
+        memory_store=None,
+        max_concurrent=2,
+        retry_sleep=_skip_retry_delay,
+    )
+
+    failed = await first.sync_gene(
+        gene=LargeConfluenceGene(body),
+        source_name="Stale extraction contract",
+        source_id=source_id,
+    )
+
+    assert failed.last_sync_status == "failed"
+    [attempt] = await db.list_source_derivation_attempts(source_id=source_id)
+    await db.db.execute(
+        """UPDATE source_derivation_attempts
+           SET extraction_contract_version = ?
+           WHERE id = ?""",
+        ("projection-extraction-v6", attempt.id),
+    )
+    await db.db.commit()
+
+    recovery = GeneSyncOrchestrator(
+        db=db,
+        doc_store=first.doc_store,
+        memory_extractor=FailingMemoryExtractor(),
+        memory_engine=FailingProjectedMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    )
+    stats = await recovery._resume_source_derivations(
+        source_id=source_id,
+        source_activity_epoch=attempt.context.source_activity_epoch,
+        run_id="run-contract-upgrade",
+    )
+
+    assert stats == {
+        "processed": 0,
+        "updated": 0,
+        "memories_extracted": 0,
+        "memories_corroborated": 0,
+    }
+    [superseded] = await db.list_source_derivation_attempts(source_id=source_id)
+    assert superseded.status == "superseded"
+
+
+@pytest.mark.asyncio
 async def test_sync_supersedes_completed_derivation_when_its_lifecycle_plan_is_applied(
     db: Database,
 ) -> None:

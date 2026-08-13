@@ -85,6 +85,7 @@ from memforge.source_artifacts import (
 )
 from memforge.source_derivation import (
     DiffGuidedExtractionBatch,
+    SOURCE_DERIVATION_CONTRACT_VERSION,
     SourceDerivationAttempt,
     StructuralExtractionBatch,
     SourceUnitDerivationContext,
@@ -1379,7 +1380,11 @@ class GeneSyncOrchestrator:
         ] = {}
         superseded_attempts: list[SourceDerivationAttempt] = []
         for attempt in attempts:
-            if attempt.context.source_activity_epoch != source_activity_epoch:
+            if (
+                attempt.context.source_activity_epoch != source_activity_epoch
+                or attempt.extraction_contract_version
+                != SOURCE_DERIVATION_CONTRACT_VERSION
+            ):
                 superseded_attempts.append(attempt)
                 continue
             projection_scope = (
