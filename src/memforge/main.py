@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib import metadata
 from itertools import chain
 from pathlib import Path, PurePosixPath
@@ -682,6 +682,185 @@ async def _run_retrieval_eval_cli(
         for failure in payload["hard_failures"]:
             click.echo(f"- {failure['case_id']}: {failure['message']}")
     return 1 if fail_on_hard_failure and report.hard_failures else 0
+
+
+@eval_group.command("online-report")
+@click.option("--from", "occurred_from", required=True, help="Inclusive RFC 3339 timestamp.")
+@click.option("--to", "occurred_to", required=True, help="Exclusive RFC 3339 timestamp.")
+@click.option("--event-id")
+@click.option("--source-id")
+@click.option("--source-type")
+@click.option("--user-id", "requesting_user_id")
+@click.option("--include-private", is_flag=True)
+@click.option("--event-name")
+@click.option("--outcome", type=click.Choice(["expected", "degraded", "rejected", "failed"]))
+@click.option("--reason-code")
+@click.option("--model")
+@click.option("--provider")
+@click.option("--deployment-revision")
+@click.option("--trace-id")
+@click.option("--contract-version", "extraction_contract_version")
+@click.option("--limit", type=click.IntRange(1, 1000), default=1000, show_default=True)
+@click.pass_context
+def eval_online_report(
+    ctx: click.Context,
+    occurred_from: str,
+    occurred_to: str,
+    event_id: str | None,
+    source_id: str | None,
+    source_type: str | None,
+    requesting_user_id: str | None,
+    include_private: bool,
+    event_name: str | None,
+    outcome: str | None,
+    reason_code: str | None,
+    model: str | None,
+    provider: str | None,
+    deployment_revision: str | None,
+    trace_id: str | None,
+    extraction_contract_version: str | None,
+    limit: int,
+) -> None:
+    """Report a bounded local online agent-evaluation cohort."""
+
+    config: AppConfig = ctx.obj["config"]
+    try:
+        time_from = datetime.fromisoformat(occurred_from.replace("Z", "+00:00"))
+        time_to = datetime.fromisoformat(occurred_to.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise click.ClickException("--from and --to must be RFC 3339 timestamps") from exc
+    payload = asyncio.run(
+        _run_online_evaluation_report(
+            config=config,
+            occurred_from=time_from,
+            occurred_to=time_to,
+            event_id=event_id,
+            source_id=source_id,
+            source_type=source_type,
+            requesting_user_id=requesting_user_id,
+            include_private=include_private,
+            event_name=event_name,
+            outcome=outcome,
+            reason_code=reason_code,
+            model=model,
+            provider=provider,
+            deployment_revision=deployment_revision,
+            trace_id=trace_id,
+            extraction_contract_version=extraction_contract_version,
+            limit=limit,
+        )
+    )
+    click.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+async def _run_online_evaluation_report(
+    *,
+    config: AppConfig,
+    occurred_from: datetime,
+    occurred_to: datetime,
+    event_id: str | None,
+    source_id: str | None,
+    source_type: str | None,
+    requesting_user_id: str | None,
+    include_private: bool,
+    event_name: str | None,
+    outcome: str | None,
+    reason_code: str | None,
+    model: str | None,
+    provider: str | None,
+    deployment_revision: str | None,
+    trace_id: str | None,
+    extraction_contract_version: str | None,
+    limit: int,
+) -> dict[str, object]:
+    from memforge.evals.agent_evaluation import (
+        AgentRuntimeEventQuery,
+        event_public_payload,
+        summarize_agent_runtime_events,
+    )
+
+    db = await _get_db(config)
+    try:
+        events = await db.list_agent_runtime_events(
+            AgentRuntimeEventQuery(
+                occurred_from=occurred_from,
+                occurred_to=occurred_to,
+                event_id=event_id,
+                source_id=source_id,
+                source_type=source_type,
+                requesting_user_id=requesting_user_id,
+                include_private=include_private,
+                event_name=event_name,
+                outcome=outcome,
+                reason_code=reason_code,
+                model=model,
+                provider=provider,
+                deployment_revision=deployment_revision,
+                trace_id=trace_id,
+                extraction_contract_version=extraction_contract_version,
+                limit=limit,
+            )
+        )
+    finally:
+        await db.close()
+    return {
+        "window": {
+            "from": occurred_from.isoformat(),
+            "to": occurred_to.isoformat(),
+            "kind": "half_open",
+        },
+        "cohort": summarize_agent_runtime_events(events).to_payload(),
+        "events": [event_public_payload(event) for event in events],
+    }
+
+
+@eval_group.command("purge-runtime-events")
+@click.option("--before", "occurred_before", help="Exclusive RFC 3339 cutoff; defaults to configured retention.")
+@click.option("--limit", type=click.IntRange(1, 10_000), help="Bounded delete count.")
+@click.pass_context
+def eval_purge_runtime_events(
+    ctx: click.Context,
+    occurred_before: str | None,
+    limit: int | None,
+) -> None:
+    """Apply one bounded AgentRuntimeEvent retention batch."""
+
+    config: AppConfig = ctx.obj["config"]
+    if occurred_before:
+        try:
+            cutoff = datetime.fromisoformat(occurred_before.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise click.ClickException("--before must be an RFC 3339 timestamp") from exc
+    else:
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=config.agent_evaluation.runtime_event_retention_days
+        )
+    if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+        raise click.ClickException("--before must include an explicit timezone")
+    deleted = asyncio.run(
+        _purge_runtime_events(
+            config=config,
+            occurred_before=cutoff,
+            limit=limit or config.agent_evaluation.runtime_event_purge_batch_size,
+        )
+    )
+    click.echo(json.dumps({"deleted": deleted, "before": cutoff.isoformat()}, sort_keys=True))
+
+
+async def _purge_runtime_events(
+    *,
+    config: AppConfig,
+    occurred_before: datetime,
+    limit: int,
+) -> int:
+    db = await _get_db(config)
+    try:
+        return await db.purge_agent_runtime_events(
+            occurred_before=occurred_before,
+            limit=limit,
+        )
+    finally:
+        await db.close()
 
 
 def _interactive_resource_dir() -> Path:

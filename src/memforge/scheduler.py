@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -22,6 +23,7 @@ SYNC_JOB_ID = "memforge-sync-all"
 EXPIRY_JOB_ID = "memforge-retire-expired"
 INDEX_HEALTH_JOB_ID = "memforge-index-health"
 SOURCE_SCHEDULE_SCAN_JOB_ID = "memforge-source-schedule-scan"
+AGENT_RUNTIME_RETENTION_JOB_ID = "memforge-agent-runtime-retention"
 
 
 def build_schedule_trigger(schedule: dict) -> CronTrigger:
@@ -58,6 +60,7 @@ class SyncScheduler:
         self._ensure_expiry_job()
         self._ensure_index_health_job()
         self._ensure_source_schedule_scan_job()
+        self._ensure_agent_runtime_retention_job()
         await self.reload()
 
     async def reload(self) -> None:
@@ -123,6 +126,19 @@ class SyncScheduler:
             max_instances=1,
         )
 
+    def _ensure_agent_runtime_retention_job(self) -> None:
+        if self.scheduler.get_job(AGENT_RUNTIME_RETENTION_JOB_ID):
+            return
+        self.scheduler.add_job(
+            self._run_tracked,
+            trigger=CronTrigger(hour=1, minute=0, timezone="UTC"),
+            id=AGENT_RUNTIME_RETENTION_JOB_ID,
+            args=(self._purge_agent_runtime_events,),
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+
     async def _run_tracked(self, operation: Callable[[], Awaitable[Any]]) -> Any:
         task = asyncio.current_task()
         assert task is not None
@@ -166,6 +182,18 @@ class SyncScheduler:
             )
         except Exception:
             logger.exception("Scheduled server source sync scan failed")
+
+    async def _purge_agent_runtime_events(self) -> None:
+        policy = self.sync_service.config.agent_evaluation
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=policy.runtime_event_retention_days
+        )
+        purged = await self.db.purge_agent_runtime_events(
+            occurred_before=cutoff,
+            limit=policy.runtime_event_purge_batch_size,
+        )
+        if purged:
+            logger.info("Purged %d expired agent runtime events", purged)
 
     async def shutdown(self) -> None:
         if self.scheduler.running:

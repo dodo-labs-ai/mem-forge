@@ -52,6 +52,7 @@ from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.sync_progress import SourceSyncProgressAccumulator, source_sync_progress_from_pipeline
 
 if TYPE_CHECKING:
+    from memforge.evals.agent_evaluation import RuntimeEventTraceSink
     from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,7 @@ class SyncRuntime:
     extraction_pool: ExtractionWorkPool | None = None
     document_lifecycle_admission: DocumentLifecycleAdmission | None = None
     memory_observer: SyncMemoryObserver | None = None
+    runtime_event_trace_sink: "RuntimeEventTraceSink | None" = None
     orchestrator_factory: Callable[["SyncRuntime"], GeneSyncOrchestrator] | None = None
 
     def __post_init__(self) -> None:
@@ -176,6 +178,7 @@ class SyncRuntime:
             document_lifecycle_admission=self.document_lifecycle_admission,
             memory_observer=self.memory_observer,
             structured_llm_client=self.structured_llm_client,
+            runtime_event_trace_sink=self.runtime_event_trace_sink,
         )
 
 
@@ -607,6 +610,7 @@ def _build_default_sync_runtime(
     extraction_pool: ExtractionWorkPool | None,
     document_lifecycle_admission: DocumentLifecycleAdmission | None,
 ) -> SyncRuntime:
+    from memforge.evals.agent_evaluation import runtime_event_trace_sink_from_env
     doc_store = LocalDocumentStore(config.storage.docs_path)
 
     memory_extractor = MemoryExtractor(
@@ -680,6 +684,7 @@ def _build_default_sync_runtime(
         extraction_pool=extraction_pool,
         document_lifecycle_admission=document_lifecycle_admission,
         memory_observer=SyncMemoryObserver(),
+        runtime_event_trace_sink=runtime_event_trace_sink_from_env(),
     )
 
 
