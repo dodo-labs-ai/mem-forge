@@ -407,15 +407,11 @@ class _TeamsAPIClient:
         await self._ensure_clients()
         all_messages: list[dict] = []
         url = f"/conversations/{conversation_id}/messages"
-        params = {"pageSize": page_size}
-        requested_urls: set[str] = set()
+        params = _teams_message_page_params(page_size=page_size)
+        previous_end_time: int | None = None
         seen_message_keys: set[tuple[str, str, str]] = set()
 
         while url:
-            if url in requested_urls:
-                self.mark_poll_incomplete(conversation_id, stop_reason="repeated_backward_link")
-                break
-            requested_urls.add(url)
             resp = await self._request(self._chat_client, "GET", url, params=params)
             data = resp.json()
             try:
@@ -446,15 +442,26 @@ class _TeamsAPIClient:
                         all_messages.append(parsed)
             self._record_message_poll_page(conversation_id, data, parsed_page)
 
-            # Pagination: check for next link
-            url = None
-            params = {}
-            if isinstance(data, dict):
-                next_link = data.get("_metadata", {}).get("backwardLink")
-                if next_link:
-                    url = next_link
-            if not url:
+            try:
+                next_end_time = _next_teams_message_end_time(
+                    messages,
+                    page_size=page_size,
+                    previous_end_time=previous_end_time,
+                )
+            except TeamsMessagePaginationError:
+                self.mark_poll_incomplete(
+                    conversation_id,
+                    stop_reason="non_advancing_time_cursor",
+                )
+                raise
+            if next_end_time is None:
                 self.mark_poll_complete(conversation_id, stop_reason="no_backward_link")
+                break
+            previous_end_time = next_end_time
+            params = _teams_message_page_params(
+                page_size=page_size,
+                end_time=next_end_time,
+            )
 
         return all_messages
 
@@ -467,16 +474,12 @@ class _TeamsAPIClient:
         await self._ensure_clients()
         all_messages: list[dict] = []
         url = f"/conversations/{conversation_id}/messages"
-        params: dict = {"pageSize": _MAX_PAGE_SIZE}
+        params = _teams_message_page_params(page_size=_MAX_PAGE_SIZE)
         page_count = 0
-        requested_urls: set[str] = set()
+        previous_end_time: int | None = None
         seen_message_keys: set[tuple[str, str, str]] = set()
 
         while url:
-            if url in requested_urls:
-                self.mark_poll_incomplete(conversation_id, stop_reason="repeated_backward_link")
-                break
-            requested_urls.add(url)
             # Rate-limit: Teams allows 15 req/10s — pace at ~1 req/s
             if page_count > 0:
                 await asyncio.sleep(1.0)
@@ -498,14 +501,12 @@ class _TeamsAPIClient:
                 )
                 raise
 
-            hit_cutoff = False
             parsed_page: list[dict] = []
             if isinstance(messages, list):
                 for m in messages:
                     parsed = self._parse_message(m)
                     if parsed:
                         if parsed["time"] < cutoff:
-                            hit_cutoff = True
                             continue
                         parsed_page.append(parsed)
                         message_key = _parsed_message_key(conversation_id, parsed)
@@ -515,6 +516,10 @@ class _TeamsAPIClient:
                         all_messages.append(parsed)
             self._record_message_poll_page(conversation_id, data, parsed_page)
 
+            hit_cutoff = bool(
+                messages
+                and _teams_message_timestamp(messages[-1]) < cutoff
+            )
             if hit_cutoff:
                 audit = self._poll_audits.setdefault(
                     conversation_id,
@@ -525,14 +530,26 @@ class _TeamsAPIClient:
                 self.mark_poll_incomplete(conversation_id, stop_reason="cutoff_reached")
                 break
 
-            url = None
-            params = {}
-            if isinstance(data, dict):
-                next_link = data.get("_metadata", {}).get("backwardLink")
-                if next_link:
-                    url = next_link
-            if not url:
+            try:
+                next_end_time = _next_teams_message_end_time(
+                    messages,
+                    page_size=_MAX_PAGE_SIZE,
+                    previous_end_time=previous_end_time,
+                )
+            except TeamsMessagePaginationError:
+                self.mark_poll_incomplete(
+                    conversation_id,
+                    stop_reason="non_advancing_time_cursor",
+                )
+                raise
+            if next_end_time is None:
                 self.mark_poll_complete(conversation_id, stop_reason="no_backward_link")
+                break
+            previous_end_time = next_end_time
+            params = _teams_message_page_params(
+                page_size=_MAX_PAGE_SIZE,
+                end_time=next_end_time,
+            )
 
         return all_messages
 
@@ -581,16 +598,12 @@ class _TeamsAPIClient:
         """Yield pages of messages from newest to oldest."""
         await self._ensure_clients()
         url = f"/conversations/{conversation_id}/messages"
-        params: dict = {"pageSize": _MAX_PAGE_SIZE}
+        params = _teams_message_page_params(page_size=_MAX_PAGE_SIZE)
         page_count = 0
-        requested_urls: set[str] = set()
+        previous_end_time: int | None = None
         seen_message_keys: set[tuple[str, str, str]] = set()
 
         while url:
-            if url in requested_urls:
-                self.mark_poll_incomplete(conversation_id, stop_reason="repeated_backward_link")
-                break
-            requested_urls.add(url)
             if page_count > 0:
                 await asyncio.sleep(1.0)
             resp = await self._request(self._chat_client, "GET", url, params=params)
@@ -628,15 +641,26 @@ class _TeamsAPIClient:
             if page:
                 yield page
 
-            # Next page via backward link
-            url = None
-            params = {}
-            if isinstance(data, dict):
-                next_link = data.get("_metadata", {}).get("backwardLink")
-                if next_link:
-                    url = next_link
-            if not url:
+            try:
+                next_end_time = _next_teams_message_end_time(
+                    raw_messages,
+                    page_size=_MAX_PAGE_SIZE,
+                    previous_end_time=previous_end_time,
+                )
+            except TeamsMessagePaginationError:
+                self.mark_poll_incomplete(
+                    conversation_id,
+                    stop_reason="non_advancing_time_cursor",
+                )
+                raise
+            if next_end_time is None:
                 self.mark_poll_complete(conversation_id, stop_reason="no_backward_link")
+                break
+            previous_end_time = next_end_time
+            params = _teams_message_page_params(
+                page_size=_MAX_PAGE_SIZE,
+                end_time=next_end_time,
+            )
 
     def _record_message_poll_page(
         self,
@@ -936,6 +960,10 @@ class TeamsMessagePageSchemaError(ValueError):
 
 class TeamsMessageRecordSchemaError(ValueError):
     """Raised when a memory-relevant message lacks stable source identity."""
+
+
+class TeamsMessagePaginationError(ValueError):
+    """Raised when Chatsvc pagination cannot prove forward progress."""
 
 
 # ============================================================================
@@ -1928,6 +1956,45 @@ def _validated_teams_message_page(data: object) -> list[dict]:
         except TeamsMessageEvidenceError as exc:
             raise TeamsMessageRecordSchemaError(str(exc)) from exc
     return messages
+
+
+def _teams_message_page_params(*, page_size: int, end_time: int | None = None) -> dict:
+    params: dict[str, int | str] = {
+        "pageSize": page_size,
+        "view": "msnp24Equivalent",
+        "startTime": 0,
+    }
+    if end_time is not None:
+        params["endTime"] = end_time
+    return params
+
+
+def _next_teams_message_end_time(
+    messages: list[dict],
+    *,
+    page_size: int,
+    previous_end_time: int | None,
+) -> int | None:
+    """Return the next exclusive millisecond cursor for newest-first pages."""
+
+    if len(messages) < page_size:
+        return None
+    boundary = _teams_message_timestamp(messages[-1])
+    end_time = int(boundary.timestamp() * 1000) - 1
+    if previous_end_time is not None and end_time >= previous_end_time:
+        raise TeamsMessagePaginationError("Teams message time cursor did not advance")
+    return end_time
+
+
+def _teams_message_timestamp(message: Mapping[str, object]) -> datetime:
+    timestamp = parse_teams_source_timestamp(
+        message.get("composetime") or message.get("originalarrivaltime")
+    )
+    if timestamp is None:
+        raise TeamsMessageRecordSchemaError(
+            "Teams text message is missing a stable id or source timestamp"
+        )
+    return timestamp
 
 
 def _teams_message_is_memory_relevant(message: dict) -> bool:
