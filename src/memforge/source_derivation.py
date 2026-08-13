@@ -370,6 +370,14 @@ def plan_source_derivation_work(
         or context.update_mode != "diff_guided"
         or not context.changed_hunks
     ):
+        # Structural units are derived from the rendered Document view. They
+        # are valid selectable Evidence only when that complete view maps into
+        # the single immutable Observation authority. Conversational and
+        # issue renderers may add author, timestamp, or field labels that are
+        # intentionally absent from Observation content; those sources must
+        # use projection batches built directly from Observation revisions.
+        if not context.document_content or context.document_content not in revision.content:
+            return projection_batches
         policy = UnitizationPolicy()
         units = unitize_markdown(
             context.document_content,

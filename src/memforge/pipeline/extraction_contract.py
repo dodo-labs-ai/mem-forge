@@ -8,7 +8,7 @@ __all__ = [
 ]
 
 
-PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v6"
+PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v7"
 
 DURABLE_MEMORY_QUALITY_RULES = """Top rules (apply these first; reject candidates that fail any of them):
 
