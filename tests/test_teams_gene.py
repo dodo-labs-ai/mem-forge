@@ -13,6 +13,7 @@ import pytest
 
 from memforge.genes.teams_gene import (
     AuthenticationError,
+    TeamsMessagePaginationError,
     TeamsGene,
     _TeamsAPIClient,
     _group_into_blocks,
@@ -831,35 +832,49 @@ class TestMessageParsing:
         assert audits[0]["raw_messages_seen"] == 2
         assert audits[0]["selected_message_keys_seen"] == 1
         assert audits[0]["parse_filtered_messages"] == 1
-        assert audits[0]["stop_reason"] == "cutoff_reached"
+        assert audits[0]["stop_reason"] == "no_backward_link"
+        assert audits[0]["pagination_complete"] is True
 
     @pytest.mark.asyncio
-    async def test_get_messages_until_stops_repeated_backward_link_and_deduplicates_messages(self):
+    async def test_get_messages_until_uses_time_cursor_instead_of_backward_link(
+        self,
+        monkeypatch,
+    ):
         client = _TeamsAPIClient(region="emea")
         client._ensure_clients = AsyncMock()
         client._chat_client = object()
+        monkeypatch.setattr("memforge.genes.teams_gene._MAX_PAGE_SIZE", 2)
 
-        def response(message_id: str, backward_link: str) -> MagicMock:
+        def response(messages: list[dict], backward_link: str) -> MagicMock:
             value = MagicMock()
             value.json.return_value = {
                 "_metadata": {"backwardLink": backward_link},
-                "messages": [
-                    {
-                        "id": message_id,
-                        "conversationid": "19:conversation@thread.v2",
-                        "content": f"<p>{message_id}</p>",
-                        "messagetype": "RichText/Html",
-                        "composetime": NOW.isoformat(),
-                    }
-                ],
+                "messages": messages,
             }
             return value
 
+        def message(message_id: str, created_at: datetime) -> dict:
+            return {
+                "id": message_id,
+                "conversationid": "19:conversation@thread.v2",
+                "content": f"<p>{message_id}</p>",
+                "messagetype": "RichText/Html",
+                "composetime": created_at.isoformat(),
+            }
+
+        newest = NOW
+        older = NOW - timedelta(hours=1)
+        before_cutoff = NOW - timedelta(days=15)
         client._request = AsyncMock(
             side_effect=[
-                response("newest", "https://teams.cloud.microsoft/page-2"),
-                response("older", "https://teams.cloud.microsoft/repeated-page"),
-                response("older", "https://teams.cloud.microsoft/repeated-page"),
+                response(
+                    [message("newest", newest), message("older", older)],
+                    "https://teams.cloud.microsoft/repeated-page",
+                ),
+                response(
+                    [message("before-cutoff", before_cutoff)],
+                    "https://teams.cloud.microsoft/repeated-page",
+                ),
             ]
         )
 
@@ -869,11 +884,53 @@ class TestMessageParsing:
         )
 
         assert [message["id"] for message in messages] == ["newest", "older"]
-        assert client._request.await_count == 3
+        assert client._request.await_count == 2
+        second_request = client._request.await_args_list[1]
+        assert second_request.args[2] == "/conversations/19:conversation@thread.v2/messages"
+        assert second_request.kwargs["params"] == {
+            "pageSize": 2,
+            "view": "msnp24Equivalent",
+            "startTime": 0,
+            "endTime": int(older.timestamp() * 1000) - 1,
+        }
         audits = client.get_poll_audits()
-        assert audits[0]["duplicate_raw_messages"] == 1
-        assert audits[0]["stop_reason"] == "repeated_backward_link"
+        assert audits[0]["duplicate_raw_messages"] == 0
+        assert audits[0]["stop_reason"] == "cutoff_reached"
         assert audits[0]["pagination_complete"] is False
+
+    @pytest.mark.asyncio
+    async def test_get_messages_until_fails_closed_when_time_cursor_does_not_advance(
+        self,
+        monkeypatch,
+    ):
+        client = _TeamsAPIClient(region="emea")
+        client._ensure_clients = AsyncMock()
+        client._chat_client = object()
+        monkeypatch.setattr("memforge.genes.teams_gene._MAX_PAGE_SIZE", 1)
+
+        response = MagicMock()
+        response.json.return_value = {
+            "messages": [
+                {
+                    "id": "same-boundary",
+                    "conversationid": "19:conversation@thread.v2",
+                    "content": "<p>same boundary</p>",
+                    "messagetype": "RichText/Html",
+                    "composetime": NOW.isoformat(),
+                }
+            ]
+        }
+        client._request = AsyncMock(side_effect=[response, response])
+
+        with pytest.raises(TeamsMessagePaginationError, match="did not advance"):
+            await client.get_messages_until(
+                "19:conversation@thread.v2",
+                NOW - timedelta(days=14),
+            )
+
+        audit = client.get_poll_audits()[0]
+        assert audit["stop_reason"] == "non_advancing_time_cursor"
+        assert audit["pagination_complete"] is False
 
     @pytest.mark.asyncio
     async def test_message_page_schema_error_never_proves_empty_conversation(self):
