@@ -9,7 +9,7 @@ from time import perf_counter
 from typing import Any
 
 from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
-from memforge.evals.agent_events import QualitySignal, record_quality_signal
+from memforge.evals.agent_evaluation import QualitySignal, record_quality_signal
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
     StructuredLlmConfig,
@@ -754,7 +754,7 @@ def _record_evidence_signal(
             reason_code = "missing_evidence_reference"
         record_quality_signal(
             QualitySignal(
-                event_type="evidence_admission_outcome",
+                event_name="evidence_admission_outcome",
                 outcome="rejected",
                 reason_code=reason_code,
                 prompt_hash=_optional_hash(extraction_metadata.get("prompt_sha256")),
@@ -768,7 +768,7 @@ def _record_evidence_signal(
     block_text = resolved.block.text
     record_quality_signal(
         QualitySignal(
-            event_type="evidence_localization_outcome",
+            event_name="evidence_localization_outcome",
             outcome="degraded" if resolved.refinement == "block_fallback" else "expected",
             reason_code=(
                 "whole_block_fallback"

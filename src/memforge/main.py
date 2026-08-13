@@ -689,10 +689,13 @@ async def _run_retrieval_eval_cli(
 @click.option("--to", "occurred_to", required=True, help="Exclusive RFC 3339 timestamp.")
 @click.option("--source-id")
 @click.option("--source-type")
-@click.option("--event-type")
+@click.option("--event-name")
 @click.option("--outcome", type=click.Choice(["expected", "degraded", "rejected", "failed"]))
 @click.option("--reason-code")
 @click.option("--model")
+@click.option("--provider")
+@click.option("--deployment-revision")
+@click.option("--trace-id")
 @click.option("--contract-version", "extraction_contract_version")
 @click.option("--limit", type=click.IntRange(1, 1000), default=1000, show_default=True)
 @click.pass_context
@@ -702,10 +705,13 @@ def eval_online_report(
     occurred_to: str,
     source_id: str | None,
     source_type: str | None,
-    event_type: str | None,
+    event_name: str | None,
     outcome: str | None,
     reason_code: str | None,
     model: str | None,
+    provider: str | None,
+    deployment_revision: str | None,
+    trace_id: str | None,
     extraction_contract_version: str | None,
     limit: int,
 ) -> None:
@@ -724,10 +730,13 @@ def eval_online_report(
             occurred_to=time_to,
             source_id=source_id,
             source_type=source_type,
-            event_type=event_type,
+            event_name=event_name,
             outcome=outcome,
             reason_code=reason_code,
             model=model,
+            provider=provider,
+            deployment_revision=deployment_revision,
+            trace_id=trace_id,
             extraction_contract_version=extraction_contract_version,
             limit=limit,
         )
@@ -742,31 +751,37 @@ async def _run_online_evaluation_report(
     occurred_to: datetime,
     source_id: str | None,
     source_type: str | None,
-    event_type: str | None,
+    event_name: str | None,
     outcome: str | None,
     reason_code: str | None,
     model: str | None,
+    provider: str | None,
+    deployment_revision: str | None,
+    trace_id: str | None,
     extraction_contract_version: str | None,
     limit: int,
 ) -> dict[str, object]:
-    from memforge.evals.agent_events import (
-        AgentEvaluationEventQuery,
+    from memforge.evals.agent_evaluation import (
+        AgentRuntimeEventQuery,
         event_public_payload,
-        summarize_agent_evaluation_events,
+        summarize_agent_runtime_events,
     )
 
     db = await _get_db(config)
     try:
-        events = await db.list_agent_evaluation_events(
-            AgentEvaluationEventQuery(
+        events = await db.list_agent_runtime_events(
+            AgentRuntimeEventQuery(
                 occurred_from=occurred_from,
                 occurred_to=occurred_to,
                 source_id=source_id,
                 source_type=source_type,
-                event_type=event_type,
+                event_name=event_name,
                 outcome=outcome,
                 reason_code=reason_code,
                 model=model,
+                provider=provider,
+                deployment_revision=deployment_revision,
+                trace_id=trace_id,
                 extraction_contract_version=extraction_contract_version,
                 limit=limit,
             )
@@ -779,7 +794,7 @@ async def _run_online_evaluation_report(
             "to": occurred_to.isoformat(),
             "kind": "half_open",
         },
-        "cohort": summarize_agent_evaluation_events(events).to_payload(),
+        "cohort": summarize_agent_runtime_events(events).to_payload(),
         "events": [event_public_payload(event) for event in events],
     }
 

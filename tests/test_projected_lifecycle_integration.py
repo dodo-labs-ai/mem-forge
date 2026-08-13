@@ -21,7 +21,12 @@ from memforge.llm.structured import (
     MemorySupportValidationResponse,
     StructuredLlmError,
 )
-from memforge.evals.agent_events import AgentEvaluationEventQuery, QualitySignal, record_quality_signal
+from memforge.evals.agent_evaluation import (
+    AgentRuntimeEventQuery,
+    QualitySignal,
+    bind_quality_signals,
+    record_quality_signal,
+)
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.evidence import (
@@ -1698,7 +1703,7 @@ async def test_source_deriver_binds_provider_neutral_quality_events_to_current_l
     async def extract(batch):
         record_quality_signal(
             QualitySignal(
-                event_type="evidence_admission_outcome",
+                event_name="evidence_admission_outcome",
                 outcome="rejected",
                 reason_code="unknown_evidence_block_id",
                 observation_id=batch.primary_observation_ids[0],
@@ -1732,12 +1737,12 @@ async def test_source_deriver_binds_provider_neutral_quality_events_to_current_l
             max_concurrent=1,
         )
     )
-    rows = await db.list_agent_evaluation_events(
-        AgentEvaluationEventQuery(
+    rows = await db.list_agent_runtime_events(
+        AgentRuntimeEventQuery(
             occurred_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
             occurred_to=datetime(2027, 1, 1, tzinfo=timezone.utc),
             source_type=source_type,
-            event_type="evidence_admission_outcome",
+            event_name="evidence_admission_outcome",
         )
     )
 
@@ -1947,6 +1952,63 @@ async def test_projection_extraction_contract_change_invalidates_staged_derivati
     assert result.reused_batch_count == 0
     assert result.executed_batch_count == len(current_batches)
     assert executed_batch_ids == [batch.id for batch in current_batches]
+
+
+@pytest.mark.asyncio
+async def test_batch_result_and_runtime_events_rollback_together(db: Database) -> None:
+    projection = _projection(
+        run_id="projection-agent-runtime-transaction",
+        body="The payroll tracing procedure remains active.",
+    )
+    document = await db.get_document("confluence-123")
+    assert document is not None
+    context = SourceUnitDerivationContext(
+        document=document,
+        doc_type="confluence",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="The payroll tracing procedure remains active.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=None,
+        user_id=None,
+        source_activity_epoch=None,
+    )
+    batches = plan_source_derivation_work(projection, context)
+    manifest = source_derivation_manifest(projection, batches, context=context)
+    await db.stage_source_derivation(manifest)
+    [event] = bind_quality_signals(
+        (
+            QualitySignal(
+                event_name="extraction_batch_outcome",
+                outcome="expected",
+                reason_code="zero_candidates",
+            ),
+        ),
+        source_id=projection.source_id,
+        source_type=projection.source_type,
+        doc_id=document.doc_id,
+        source_unit_id=manifest.source_unit_id,
+        target_unit_revision_id=manifest.target_unit_revision_id,
+        projection_run_id=projection.run_id,
+        derivation_id=manifest.id,
+        batch_id=batches[0].id,
+        batch_attempt=1,
+        extraction_contract_version=manifest.extraction_contract_version,
+    )
+    invalid_event = replace(event, source_id="missing-source")
+
+    with pytest.raises(Exception, match="FOREIGN KEY"):
+        await db.record_source_derivation_batch_result(
+            derivation_id=manifest.id,
+            batch_id=batches[0].id,
+            result=MemoryExtractionResult(memories=[]),
+            runtime_events=(invalid_event,),
+        )
+
+    attempt = await db.stage_source_derivation(manifest)
+    assert attempt.batches[0].status == "pending"
 
 
 def test_source_derivation_diagnostics_reject_content_and_bound_field_count() -> None:
