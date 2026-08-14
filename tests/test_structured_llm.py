@@ -15,6 +15,7 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
+from memforge.evals.agent_evaluation import QualitySignalCollector, quality_signal_scope
 from memforge.llm.structured import (
     ArtifactSelectionSummary,
     AgentSessionAuthorityResponse,
@@ -1303,6 +1304,68 @@ async def test_litellm_structured_client_fails_closed_after_both_strategies_are_
 
 
 @pytest.mark.asyncio
+async def test_litellm_structured_client_records_each_invalid_provider_attempt(monkeypatch):
+    collector = QualitySignalCollector()
+    response = CompletionResponse("{")
+    response.id = "msg-provider-123"
+    response._hidden_params = {
+        "additional_headers": {"x-request-id": "sap-request-456"}
+    }
+    response.choices[0].finish_reason = "max_tokens"
+    response.choices[0].stop_reason = "max_tokens"
+    response.usage = {
+        "prompt_tokens": 11,
+        "completion_tokens": 32_768,
+        "total_tokens": 32_779,
+    }
+
+    async def fake_acompletion(**_kwargs):
+        return response
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+            num_retries=1,
+        )
+    )
+
+    with quality_signal_scope(collector):
+        with pytest.raises(StructuredLlmError):
+            await client.extract_memories("prompt", max_tokens=32_768)
+
+    attempts = [
+        signal
+        for signal in collector.snapshot()
+        if signal.event_name == "structured_llm_attempt_outcome"
+    ]
+    assert len(attempts) == 3
+    assert [attempt.attempt_index for attempt in attempts] == [1, 2, 3]
+    assert [attempt.structured_mode for attempt in attempts] == [
+        "native_schema",
+        "json_text",
+        "json_text",
+    ]
+    assert attempts[0].schema_transport == "auto"
+    assert attempts[1].schema_transport == "json_text"
+    assert all(attempt.requested_max_tokens == 32_768 for attempt in attempts)
+    assert all(attempt.finish_reason == "max_tokens" for attempt in attempts)
+    assert all(attempt.stop_reason == "max_tokens" for attempt in attempts)
+    assert all(attempt.provider_request_id == "sap-request-456" for attempt in attempts)
+    assert all(attempt.completion_tokens == 32_768 for attempt in attempts)
+    assert all(attempt.response_chars == 1 for attempt in attempts)
+    assert all(len(attempt.response_hash or "") == 64 for attempt in attempts)
+    assert all(attempt.validation_location == "$" for attempt in attempts)
+    assert all(attempt.validation_rule == "json_invalid" for attempt in attempts)
+    assert all(attempt.json_error_line == 1 for attempt in attempts)
+    assert all(attempt.json_error_column is not None for attempt in attempts)
+
+
+@pytest.mark.asyncio
 async def test_litellm_structured_client_retries_invalid_json_fallback_once(monkeypatch):
     calls = []
     telemetry: list[StructuredLlmCallTelemetry] = []
@@ -1419,21 +1482,21 @@ async def test_litellm_structured_client_bounds_native_and_json_fallback_by_one_
     assert calls[1]["timeout"] < calls[0]["timeout"]
     assert calls[0]["num_retries"] == 0
     assert calls[1]["num_retries"] == 0
-    assert telemetry == [
-        StructuredLlmCallTelemetry(
-            operation="memory_extraction",
-            attempt_count=2,
-            retry_count=0,
-            fallback_count=1,
-            final_mode="json_text",
-            elapsed_ms=pytest.approx(50, abs=40),
-            terminal_category="deadline_exceeded",
-            error_code="logical_deadline_exceeded",
-            prompt_tokens=None,
-            completion_tokens=None,
-            total_tokens=None,
-        )
-    ]
+    assert len(telemetry) == 1
+    terminal = telemetry[0]
+    assert terminal.operation == "memory_extraction"
+    assert terminal.attempt_count == 2
+    assert terminal.retry_count == 0
+    assert terminal.fallback_count == 1
+    assert terminal.final_mode == "json_text"
+    assert terminal.elapsed_ms == pytest.approx(50, abs=40)
+    assert terminal.terminal_category == "deadline_exceeded"
+    assert terminal.error_code == "logical_deadline_exceeded"
+    assert terminal.prompt_tokens is None
+    assert terminal.completion_tokens is None
+    assert terminal.total_tokens is None
+    assert len(terminal.diagnostic_attempts) == 1
+    assert terminal.diagnostic_attempts[0].attempt_index == 1
 
 
 @pytest.mark.asyncio
@@ -1548,6 +1611,15 @@ async def test_litellm_structured_client_does_not_use_schema_fallback_for_provid
     assert telemetry[0].retry_count == 1
     assert telemetry[0].fallback_count == 0
     assert telemetry[0].terminal_category == "provider_error"
+    assert [attempt.attempt_index for attempt in telemetry[0].diagnostic_attempts] == [1, 2]
+    assert all(
+        attempt.terminal_category == "provider_error"
+        for attempt in telemetry[0].diagnostic_attempts
+    )
+    assert all(
+        attempt.provider_request_id is None
+        for attempt in telemetry[0].diagnostic_attempts
+    )
 
 
 @pytest.mark.asyncio

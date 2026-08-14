@@ -235,6 +235,51 @@ async def test_sqlite_event_store_is_idempotent_and_supports_bounded_cohorts(db)
 
 
 @pytest.mark.asyncio
+async def test_sqlite_structured_attempt_diagnostics_round_trip(db) -> None:
+    [event] = _events(
+        QualitySignal(
+            event_name="structured_llm_attempt_outcome",
+            outcome="rejected",
+            reason_code="schema_validation_failed",
+            operation="memory_extraction",
+            provider="sap",
+            model="sap/anthropic--claude-4.6-sonnet",
+            attempt_index=1,
+            structured_mode="native_schema",
+            schema_transport="json_schema_response_format",
+            requested_max_tokens=32_768,
+            terminal_category="invalid_response",
+            error_code="ValidationError",
+            finish_reason="max_tokens",
+            stop_reason="max_tokens",
+            provider_request_id="msg-provider-123",
+            prompt_tokens=1_864,
+            completion_tokens=32_768,
+            total_tokens=34_632,
+            response_chars=98_304,
+            response_hash="c" * 64,
+            validation_location="$",
+            validation_rule="json_invalid",
+            json_error_line=1,
+            json_error_column=98_305,
+        )
+    )
+
+    await db.record_agent_runtime_events((event,))
+    rows = await db.list_agent_runtime_events(
+        AgentRuntimeEventQuery(
+            occurred_from=NOW - timedelta(seconds=1),
+            occurred_to=NOW + timedelta(seconds=1),
+            requesting_user_id="user-1",
+            include_private=True,
+            event_id=event.event_id,
+        )
+    )
+
+    assert rows == [event]
+
+
+@pytest.mark.asyncio
 async def test_private_runtime_events_require_the_source_owner_scope(db) -> None:
     events = _events(
         QualitySignal(
@@ -356,6 +401,36 @@ def test_langfuse_sink_projects_allowlisted_metadata_and_event_id() -> None:
         "quote_hash",
         "observation_id",
     }.intersection(child["metadata"])
+
+
+def test_langfuse_sink_omits_durable_only_structured_attempt_identifiers() -> None:
+    [event] = _events(
+        QualitySignal(
+            event_name="structured_llm_attempt_outcome",
+            outcome="rejected",
+            reason_code="schema_validation_failed",
+            operation="memory_extraction",
+            attempt_index=1,
+            structured_mode="native_schema",
+            schema_transport="json_schema_response_format",
+            requested_max_tokens=32_768,
+            terminal_category="invalid_response",
+            error_code="ValidationError",
+            provider_request_id="sap-request-456",
+            response_hash="c" * 64,
+            response_chars=98_304,
+        )
+    )
+    client = _FakeLangfuseClient()
+
+    LangfuseRuntimeEventTraceSink(client).publish((event,))
+
+    child = next(payload for kind, payload in client.calls if kind == "child")
+    assert child["metadata"]["attempt_index"] == 1
+    assert child["metadata"]["requested_max_tokens"] == 32_768
+    assert child["metadata"]["response_chars"] == 98_304
+    assert "provider_request_id" not in child["metadata"]
+    assert "response_hash" not in child["metadata"]
 
 
 def test_runtime_trace_sink_failure_is_best_effort(caplog) -> None:

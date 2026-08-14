@@ -21,7 +21,7 @@ from threading import Lock
 from typing import Iterator, Literal, Mapping, Protocol
 
 
-AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v1"
+AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v2"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
 logger = logging.getLogger(__name__)
 
@@ -58,9 +58,24 @@ class QualitySignal:
     attempt_count: int | None = None
     retry_count: int | None = None
     fallback_count: int | None = None
+    attempt_index: int | None = None
     structured_mode: str | None = None
+    schema_transport: str | None = None
+    requested_max_tokens: int | None = None
     terminal_category: str | None = None
     error_code: str | None = None
+    finish_reason: str | None = None
+    stop_reason: str | None = None
+    provider_request_id: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    response_chars: int | None = None
+    response_hash: str | None = None
+    validation_location: str | None = None
+    validation_rule: str | None = None
+    json_error_line: int | None = None
+    json_error_column: int | None = None
     candidate_count: int | None = None
     rejected_count: int | None = None
     occurrence_count: int = 1
@@ -73,16 +88,23 @@ class QualitySignal:
             "provider",
             "localization_mode",
             "structured_mode",
+            "schema_transport",
             "terminal_category",
             "error_code",
+            "finish_reason",
+            "stop_reason",
+            "validation_rule",
         ):
             _require_safe_label(name, getattr(self, name))
         _require_model(self.model)
+        _require_safe_identifier("provider_request_id", self.provider_request_id)
+        _require_safe_diagnostic_path("validation_location", self.validation_location)
         for name in (
             "prompt_hash",
             "candidate_hash",
             "block_hash",
             "quote_hash",
+            "response_hash",
         ):
             _require_hash(name, getattr(self, name))
         if (self.range_start is None) != (self.range_end is None):
@@ -96,6 +118,14 @@ class QualitySignal:
             "attempt_count",
             "retry_count",
             "fallback_count",
+            "attempt_index",
+            "requested_max_tokens",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "response_chars",
+            "json_error_line",
+            "json_error_column",
             "candidate_count",
             "rejected_count",
         ):
@@ -146,9 +176,24 @@ class AgentRuntimeEvent:
     attempt_count: int | None = None
     retry_count: int | None = None
     fallback_count: int | None = None
+    attempt_index: int | None = None
     structured_mode: str | None = None
+    schema_transport: str | None = None
+    requested_max_tokens: int | None = None
     terminal_category: str | None = None
     error_code: str | None = None
+    finish_reason: str | None = None
+    stop_reason: str | None = None
+    provider_request_id: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    response_chars: int | None = None
+    response_hash: str | None = None
+    validation_location: str | None = None
+    validation_rule: str | None = None
+    json_error_line: int | None = None
+    json_error_column: int | None = None
     candidate_count: int | None = None
     rejected_count: int | None = None
     occurrence_count: int = 1
@@ -514,6 +559,17 @@ def runtime_event_otel_attributes(event: AgentRuntimeEvent) -> Mapping[str, obje
         "gen_ai.provider.name": event.provider,
         "gen_ai.request.model": event.model,
         "memforge.batch.attempt": event.batch_attempt,
+        "gen_ai.request.max_tokens": event.requested_max_tokens,
+        "gen_ai.response.finish_reasons": (
+            [event.finish_reason] if event.finish_reason is not None else None
+        ),
+        "gen_ai.usage.input_tokens": event.prompt_tokens,
+        "gen_ai.usage.output_tokens": event.completion_tokens,
+        "memforge.structured.attempt_index": event.attempt_index,
+        "memforge.structured.mode": event.structured_mode,
+        "memforge.structured.schema_transport": event.schema_transport,
+        "memforge.structured.terminal_category": event.terminal_category,
+        "memforge.structured.response_chars": event.response_chars,
         "memforge.evidence.localization_mode": event.localization_mode,
         "memforge.agent.candidate_count": event.candidate_count,
         "memforge.agent.rejected_count": event.rejected_count,
@@ -566,9 +622,22 @@ def _langfuse_event_metadata(event: AgentRuntimeEvent) -> dict[str, object]:
         "attempt_count": event.attempt_count,
         "retry_count": event.retry_count,
         "fallback_count": event.fallback_count,
+        "attempt_index": event.attempt_index,
         "structured_mode": event.structured_mode,
+        "schema_transport": event.schema_transport,
+        "requested_max_tokens": event.requested_max_tokens,
         "terminal_category": event.terminal_category,
         "error_code": event.error_code,
+        "finish_reason": event.finish_reason,
+        "stop_reason": event.stop_reason,
+        "prompt_tokens": event.prompt_tokens,
+        "completion_tokens": event.completion_tokens,
+        "total_tokens": event.total_tokens,
+        "response_chars": event.response_chars,
+        "validation_location": event.validation_location,
+        "validation_rule": event.validation_rule,
+        "json_error_line": event.json_error_line,
+        "json_error_column": event.json_error_column,
         "candidate_count": event.candidate_count,
         "rejected_count": event.rejected_count,
         "occurrence_count": event.occurrence_count,
@@ -624,6 +693,26 @@ def _require_safe_label(name: str, value: str | None) -> None:
         for ch in value
     ):
         raise ValueError(f"{name} must be a bounded machine-readable label")
+
+
+def _require_safe_identifier(name: str, value: str | None) -> None:
+    if value is None:
+        return
+    if not value or len(value) > 255 or any(
+        ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:/-"
+        for ch in value
+    ):
+        raise ValueError(f"{name} must be a bounded machine-readable identifier")
+
+
+def _require_safe_diagnostic_path(name: str, value: str | None) -> None:
+    if value is None:
+        return
+    if not value or len(value) > 255 or any(
+        ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.$[]:-"
+        for ch in value
+    ):
+        raise ValueError(f"{name} must be a bounded diagnostic path")
 
 
 def _require_hash(name: str, value: str | None) -> None:
