@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import re
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from threading import Lock
 from time import perf_counter
 from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, get_args, get_origin
@@ -479,6 +480,30 @@ class StructuredLlmConfig:
 
 
 @dataclass(frozen=True)
+class StructuredLlmAttemptTelemetry:
+    """Content-free diagnostic for one non-conformant provider attempt."""
+
+    attempt_index: int
+    structured_mode: Literal["native_schema", "json_text"]
+    schema_transport: str
+    requested_max_tokens: int
+    terminal_category: StructuredLlmTerminalCategory
+    error_code: str
+    finish_reason: str | None
+    stop_reason: str | None
+    provider_request_id: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    response_chars: int | None
+    response_hash: str | None
+    validation_location: str | None
+    validation_rule: str | None
+    json_error_line: int | None
+    json_error_column: int | None
+
+
+@dataclass(frozen=True)
 class StructuredLlmCallTelemetry:
     """Content-free outcome for one complete logical structured call."""
 
@@ -493,6 +518,7 @@ class StructuredLlmCallTelemetry:
     prompt_tokens: int | None
     completion_tokens: int | None
     total_tokens: int | None
+    diagnostic_attempts: tuple[StructuredLlmAttemptTelemetry, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -599,6 +625,9 @@ class _StructuredCallState:
     total_tokens: int = 0
     usage_complete: bool = True
     usage_seen: bool = False
+    diagnostic_attempts: list[StructuredLlmAttemptTelemetry] = dataclass_field(
+        default_factory=list
+    )
 
     def record_response(self, response: object) -> None:
         usage = _response_usage(response)
@@ -614,6 +643,75 @@ class _StructuredCallState:
         # A provider may have consumed tokens before surfacing an error. Without
         # an explicit usage object the logical total is unknown, never estimated.
         self.usage_complete = False
+
+    def record_provider_failure_attempt(
+        self,
+        *,
+        attempt_index: int,
+        structured_mode: Literal["native_schema", "json_text"],
+        schema_transport: str,
+        requested_max_tokens: int,
+        failure: _StructuredLlmFailure,
+    ) -> None:
+        self.diagnostic_attempts.append(
+            StructuredLlmAttemptTelemetry(
+                attempt_index=attempt_index,
+                structured_mode=structured_mode,
+                schema_transport=schema_transport,
+                requested_max_tokens=requested_max_tokens,
+                terminal_category=failure.terminal_category,
+                error_code=failure.error_code,
+                finish_reason=None,
+                stop_reason=None,
+                provider_request_id=None,
+                prompt_tokens=None,
+                completion_tokens=None,
+                total_tokens=None,
+                response_chars=None,
+                response_hash=None,
+                validation_location=(failure.validation_fields[0][0] if failure.validation_fields else None),
+                validation_rule=(failure.validation_fields[0][1] if failure.validation_fields else None),
+                json_error_line=None,
+                json_error_column=None,
+            )
+        )
+
+    def record_invalid_response_attempt(
+        self,
+        response: object,
+        *,
+        attempt_index: int,
+        structured_mode: Literal["native_schema", "json_text"],
+        schema_transport: str,
+        requested_max_tokens: int,
+        exc: BaseException,
+    ) -> None:
+        failure = _structured_failure(exc, terminal_category="invalid_response")
+        usage = _response_usage(response)
+        response_chars, response_hash = _response_content_fingerprint(response)
+        json_error_line, json_error_column = _safe_json_error_position(exc)
+        self.diagnostic_attempts.append(
+            StructuredLlmAttemptTelemetry(
+                attempt_index=attempt_index,
+                structured_mode=structured_mode,
+                schema_transport=schema_transport,
+                requested_max_tokens=requested_max_tokens,
+                terminal_category=failure.terminal_category,
+                error_code=failure.error_code,
+                finish_reason=_response_finish_reason(response),
+                stop_reason=_response_stop_reason(response),
+                provider_request_id=_response_provider_request_id(response),
+                prompt_tokens=usage[0] if usage is not None else None,
+                completion_tokens=usage[1] if usage is not None else None,
+                total_tokens=usage[2] if usage is not None else None,
+                response_chars=response_chars,
+                response_hash=response_hash,
+                validation_location=(failure.validation_fields[0][0] if failure.validation_fields else None),
+                validation_rule=(failure.validation_fields[0][1] if failure.validation_fields else None),
+                json_error_line=json_error_line,
+                json_error_column=json_error_column,
+            )
+        )
 
     def telemetry(
         self,
@@ -635,6 +733,7 @@ class _StructuredCallState:
             prompt_tokens=self.prompt_tokens if usage_known else None,
             completion_tokens=self.completion_tokens if usage_known else None,
             total_tokens=self.total_tokens if usage_known else None,
+            diagnostic_attempts=tuple(self.diagnostic_attempts),
         )
 
 
@@ -964,6 +1063,117 @@ def _response_usage(response: object) -> tuple[int, int, int] | None:
     if prompt_tokens is None or completion_tokens is None or total_tokens is None:
         return None
     return prompt_tokens, completion_tokens, total_tokens
+
+
+def _object_value(value: object, name: str) -> object | None:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _safe_response_label(value: object, *, max_length: int = 128) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > max_length:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.:/-]+", normalized):
+        return None
+    return normalized
+
+
+def _first_response_choice(response: object) -> object | None:
+    choices = _object_value(response, "choices")
+    if not isinstance(choices, (list, tuple)) or not choices:
+        return None
+    return choices[0]
+
+
+def _response_finish_reason(response: object) -> str | None:
+    choice = _first_response_choice(response)
+    return _safe_response_label(_object_value(choice, "finish_reason"))
+
+
+def _response_stop_reason(response: object) -> str | None:
+    choice = _first_response_choice(response)
+    candidates = [
+        _object_value(choice, "stop_reason"),
+        _object_value(_object_value(choice, "provider_specific_fields"), "stop_reason"),
+        _object_value(
+            _object_value(_object_value(choice, "message"), "provider_specific_fields"),
+            "stop_reason",
+        ),
+        _object_value(_object_value(response, "provider_specific_fields"), "stop_reason"),
+        _object_value(
+            _object_value(_object_value(response, "_hidden_params"), "original_response"),
+            "stop_reason",
+        ),
+    ]
+    for candidate in candidates:
+        if normalized := _safe_response_label(candidate):
+            return normalized
+    return None
+
+
+_PROVIDER_REQUEST_HEADER_NAMES = (
+    "x-request-id",
+    "request-id",
+    "apim-request-id",
+    "x-amzn-requestid",
+    "x-correlation-id",
+)
+
+
+def _response_provider_request_id(response: object) -> str | None:
+    hidden = _object_value(response, "_hidden_params")
+    headers = _object_value(hidden, "additional_headers")
+    if isinstance(headers, Mapping):
+        normalized_headers = {str(key).lower(): value for key, value in headers.items()}
+        for name in _PROVIDER_REQUEST_HEADER_NAMES:
+            if request_id := _safe_response_label(
+                normalized_headers.get(name),
+                max_length=255,
+            ):
+                return request_id
+    return _safe_response_label(_object_value(response, "id"), max_length=255)
+
+
+def _response_content_fingerprint(response: object) -> tuple[int | None, str | None]:
+    try:
+        content = _message_content(response)
+    except StructuredLlmError:
+        return None, None
+    if isinstance(content, BaseModel):
+        serialized = content.model_dump_json()
+    elif isinstance(content, (dict, list, tuple)):
+        serialized = json.dumps(
+            content,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+    else:
+        serialized = str(content)
+    return len(serialized), hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+_JSON_ERROR_POSITION_RE = re.compile(
+    r"\bline\s+(\d+)\s+column\s+(\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _safe_json_error_position(exc: BaseException) -> tuple[int | None, int | None]:
+    if not isinstance(exc, ValidationError):
+        return None, None
+    for error in exc.errors(include_url=False, include_input=False):
+        context = error.get("ctx")
+        if not isinstance(context, Mapping):
+            continue
+        match = _JSON_ERROR_POSITION_RE.search(str(context.get("error") or "")[:512])
+        if match is not None:
+            return int(match.group(1)), int(match.group(2))
+    return None, None
 
 
 def _schema_operation_name(response_format: type[BaseModel]) -> str:
@@ -1602,7 +1812,7 @@ class LiteLlmStructuredClient:
             provider_kwargs["placeholder_values"] = {
                 prompt_template_variable: request_prompt
             }
-        response = await self._completion_with_retries(
+        response, attempt_index = await self._completion_with_retries(
             model_name=model_name,
             messages=messages,
             max_tokens=max_tokens,
@@ -1612,12 +1822,27 @@ class LiteLlmStructuredClient:
             deadline=deadline,
             state=state,
         )
-        raw_content = _message_content(response)
-        if isinstance(raw_content, response_format):
-            return raw_content
-        if isinstance(raw_content, dict):
-            return response_format.model_validate(raw_content)
-        return _validate_structured_json_text(str(raw_content), response_format)
+        structured_mode: Literal["native_schema", "json_text"] = (
+            "native_schema" if native_schema else "json_text"
+        )
+        schema_transport = native_schema_transport if native_schema else "json_text"
+        try:
+            raw_content = _message_content(response)
+            if isinstance(raw_content, response_format):
+                return raw_content
+            if isinstance(raw_content, dict):
+                return response_format.model_validate(raw_content)
+            return _validate_structured_json_text(str(raw_content), response_format)
+        except Exception as exc:
+            state.record_invalid_response_attempt(
+                response,
+                attempt_index=attempt_index,
+                structured_mode=structured_mode,
+                schema_transport=schema_transport,
+                requested_max_tokens=max_tokens,
+                exc=exc,
+            )
+            raise
 
     async def _completion_with_retries(
         self,
@@ -1639,6 +1864,7 @@ class LiteLlmStructuredClient:
         while True:
             remaining_s = max(0.001, deadline - loop.time())
             state.attempt_count += 1
+            attempt_index = state.attempt_count
             failure: _StructuredLlmFailure | None = None
             retry = False
             try:
@@ -1666,6 +1892,17 @@ class LiteLlmStructuredClient:
                         "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
                     ),
                 )
+                state.record_provider_failure_attempt(
+                    attempt_index=attempt_index,
+                    structured_mode=(
+                        "native_schema" if response_format is not None else "json_text"
+                    ),
+                    schema_transport=(
+                        native_schema_transport if response_format is not None else "json_text"
+                    ),
+                    requested_max_tokens=max_tokens,
+                    failure=failure,
+                )
             if failure is not None and not retry:
                 raise failure.to_error()
             if retry:
@@ -1675,7 +1912,7 @@ class LiteLlmStructuredClient:
                 await asyncio.sleep(min(backoff_s, max(0.0, deadline - loop.time())))
                 continue
             state.record_response(response)
-            return response
+            return response, attempt_index
 
     def _emit_telemetry(self, telemetry: StructuredLlmCallTelemetry) -> None:
         from memforge.evals.agent_evaluation import QualitySignal, record_quality_signal
@@ -1693,6 +1930,7 @@ class LiteLlmStructuredClient:
             "prompt_tokens": telemetry.prompt_tokens,
             "completion_tokens": telemetry.completion_tokens,
             "total_tokens": telemetry.total_tokens,
+            "diagnostic_attempt_count": len(telemetry.diagnostic_attempts),
         }
         logger.info("structured_llm_call %s", json.dumps(payload, sort_keys=True, separators=(",", ":")))
         recovered_with_fallback = telemetry.terminal_category == "success" and telemetry.fallback_count > 0
@@ -1720,8 +1958,48 @@ class LiteLlmStructuredClient:
                 structured_mode=telemetry.final_mode,
                 terminal_category=telemetry.terminal_category,
                 error_code=telemetry.error_code,
+                prompt_tokens=telemetry.prompt_tokens,
+                completion_tokens=telemetry.completion_tokens,
+                total_tokens=telemetry.total_tokens,
             )
         )
+        for attempt in telemetry.diagnostic_attempts:
+            attempt_outcome = (
+                "rejected" if attempt.terminal_category == "invalid_response" else "failed"
+            )
+            attempt_reason = (
+                "schema_validation_failed"
+                if attempt.terminal_category == "invalid_response"
+                else attempt.terminal_category
+            )
+            record_quality_signal(
+                QualitySignal(
+                    event_name="structured_llm_attempt_outcome",
+                    outcome=attempt_outcome,
+                    reason_code=attempt_reason,
+                    operation=telemetry.operation,
+                    provider=_safe_llm_provider(self.config.model),
+                    model=self.config.model,
+                    attempt_index=attempt.attempt_index,
+                    structured_mode=attempt.structured_mode,
+                    schema_transport=attempt.schema_transport,
+                    requested_max_tokens=attempt.requested_max_tokens,
+                    terminal_category=attempt.terminal_category,
+                    error_code=attempt.error_code,
+                    finish_reason=attempt.finish_reason,
+                    stop_reason=attempt.stop_reason,
+                    provider_request_id=attempt.provider_request_id,
+                    prompt_tokens=attempt.prompt_tokens,
+                    completion_tokens=attempt.completion_tokens,
+                    total_tokens=attempt.total_tokens,
+                    response_chars=attempt.response_chars,
+                    response_hash=attempt.response_hash,
+                    validation_location=attempt.validation_location,
+                    validation_rule=attempt.validation_rule,
+                    json_error_line=attempt.json_error_line,
+                    json_error_column=attempt.json_error_column,
+                )
+            )
         scoped_collector = self._scoped_metrics_collector.get()
         if scoped_collector is not None:
             scoped_collector.record(telemetry)
