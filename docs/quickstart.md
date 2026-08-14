@@ -39,6 +39,17 @@ proxies `/api/*` requests to the `api` container.
 
 The API is also available directly at `http://localhost:8765`.
 
+Install the host-side CLI separately when you want to run local-source adapters
+or query the service from a terminal:
+
+```bash
+pipx install memforge-ai
+memforge --help
+```
+
+The distribution is named `memforge-ai`; it installs the `memforge` command and
+Python import package.
+
 This OSS public-beta profile is single-user and authentication-free. Compose
 publishes both ports strictly on host loopback, so the browser, CLI, local-agent
 daemon, and host-side agent plugins work while other LAN devices cannot connect.

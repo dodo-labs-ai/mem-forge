@@ -16,6 +16,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --extra dev
+      - run: uv build
+      - run: uv run python scripts/verify_release_artifacts.py dist
       - run: uv run python scripts/sync_plugin_mcp_proxy.py --check
       - run: uv run ruff check src tests scripts/sync_plugin_mcp_proxy.py
       - run: uv run pytest -q -n 4 --dist worksteal --durations=25 --durations-min=0.2

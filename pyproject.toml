@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "memforge"
+name = "memforge-ai"
 version = "0.1.55"
 description = "Evidence-based agent memory layer for Codex, Claude Code, and development teams"
 readme = "README.md"

@@ -85,6 +85,25 @@ def test_interactive_resources_are_packaged_with_python_distribution():
     assert (resources / "package-lock.json").is_file()
 
 
+def test_interactive_cache_key_uses_public_distribution_name(monkeypatch, tmp_path):
+    resource_dir = tmp_path / "interactive_cli"
+    resource_dir.mkdir()
+    for name in ("index.mjs", "package.json", "package-lock.json"):
+        (resource_dir / name).write_text(name, encoding="utf-8")
+    requested: list[str] = []
+
+    def fake_version(distribution_name: str) -> str:
+        requested.append(distribution_name)
+        return "1.2.3"
+
+    monkeypatch.setattr(main.metadata, "version", fake_version)
+
+    cache_key = main._interactive_cache_key(resource_dir)
+
+    assert requested == ["memforge-ai"]
+    assert cache_key.startswith("1.2.3-")
+
+
 def test_interactive_script_path_resolves_to_packaged_resource(monkeypatch):
     monkeypatch.delenv(main.INTERACTIVE_SCRIPT_ENV, raising=False)
     resolved = main._interactive_script_path(main._interactive_resource_dir())

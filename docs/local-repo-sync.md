@@ -7,10 +7,14 @@ lifecycle reconciliation.
 
 ## Setup
 
-1. Start the local daemon with `uv run memforge adapter daemon run`.
-2. In the Sources UI, add a Local Markdown or GitHub Repository source.
-3. Choose the local folder or repository through the source-specific browser.
-4. Configure include and exclude patterns, then save the source.
+1. Install the host-side CLI with `pipx install memforge-ai`.
+2. Start the local daemon with `memforge adapter daemon run`.
+3. In the Sources UI, add a Local Markdown or GitHub Repository source.
+4. Choose the local folder or repository through the source-specific browser.
+5. Configure include and exclude patterns, then save the source.
+
+When developing MemForge from a checkout, use
+`uv run memforge adapter daemon run` instead of the installed command.
 
 The daemon authenticates with the user's MemForge API key. Self-hosted OSS and
 Cloud both use `/api/v1`; self-hosted resolves the readable singleton workspace
