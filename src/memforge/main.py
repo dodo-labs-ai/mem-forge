@@ -111,6 +111,7 @@ INTERACTIVE_INSTALL_LOCK = ".install.lock"
 INTERACTIVE_INSTALL_LOCK_TIMEOUT_SECONDS = 120
 INTERACTIVE_INSTALL_LOCK_STALE_SECONDS = 600
 INTERACTIVE_DEPENDENCY_SENTINEL = Path("node_modules") / "@clack" / "prompts"
+PYPI_DISTRIBUTION_NAME = "memforge-ai"
 
 
 @dataclass(frozen=True)
@@ -948,7 +949,7 @@ def _interactive_cache_root() -> Path:
 
 def _interactive_cache_key(resource_dir: Path) -> str:
     try:
-        package_version = metadata.version("memforge")
+        package_version = metadata.version(PYPI_DISTRIBUTION_NAME)
     except metadata.PackageNotFoundError:
         package_version = "0.0.0"
     digest = hashlib.sha256()

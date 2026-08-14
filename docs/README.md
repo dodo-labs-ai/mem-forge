@@ -9,6 +9,8 @@ Start here if you are new to the repository:
   storage, retrieval, MCP tools, and admin UI boundaries.
 - [Agent client integrations](integrations/agent-clients.md): Codex and Claude
   Code adapter responsibilities, MCP request flow, and service boundaries.
+- [Python distribution release](releasing-python-distribution.md): package
+  naming, Trusted Publisher configuration, release tags, and install smoke.
 
 Design notes under `docs/design/` capture current subsystem decisions. Some
 files include older rationale, but the active agent-session workflow is

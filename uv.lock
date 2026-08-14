@@ -1549,7 +1549,7 @@ wheels = [
 ]
 
 [[package]]
-name = "memforge"
+name = "memforge-ai"
 version = "0.1.55"
 source = { editable = "." }
 dependencies = [

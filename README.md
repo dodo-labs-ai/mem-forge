@@ -17,7 +17,7 @@
 > **Status:** alpha. APIs, storage formats, and integration packaging may change
 > while the project settles.
 
-MemForge (`mem-forge`) is a self-evolving memory layer for AI coding agents. It
+MemForge is a self-evolving memory layer for AI coding agents. It
 turns scattered team context into structured, source-traced memories that agents
 can search, verify, and reuse.
 
@@ -148,13 +148,24 @@ For detailed setup, configuration, and first-source examples, see
 
 The complete docs map is in [docs/README.md](docs/README.md).
 
+Install the host-side CLI in an isolated environment when you want to query a
+running MemForge service or run local-source adapters from this machine:
+
+```bash
+pipx install memforge-ai
+memforge --help
+```
+
+`memforge-ai` is the Python distribution name; the installed command and import
+package remain `memforge`.
+
 You can also exercise the same read path from the CLI:
 
 ```bash
-uv run memforge
-uv run memforge search "docker artifact provenance"
-uv run memforge get-memory mem-123
-uv run memforge get-resource /api/documents/doc-456/pdf --mode file
+memforge
+memforge search "docker artifact provenance"
+memforge get-memory mem-123
+memforge get-resource /api/documents/doc-456/pdf --mode file
 ```
 
 The CLI uses `MEMFORGE_API_URL` and optional `MEMFORGE_API_TOKEN` when set;
