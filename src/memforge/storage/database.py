@@ -1676,9 +1676,24 @@ CREATE TABLE IF NOT EXISTS agent_runtime_events (
     attempt_count               INTEGER,
     retry_count                 INTEGER,
     fallback_count              INTEGER,
+    attempt_index               INTEGER,
     structured_mode             TEXT,
+    schema_transport            TEXT,
+    requested_max_tokens        INTEGER,
     terminal_category           TEXT,
     error_code                  TEXT,
+    finish_reason               TEXT,
+    stop_reason                 TEXT,
+    provider_request_id         TEXT,
+    prompt_tokens               INTEGER,
+    completion_tokens           INTEGER,
+    total_tokens                INTEGER,
+    response_chars              INTEGER,
+    response_hash               TEXT,
+    validation_location         TEXT,
+    validation_rule             TEXT,
+    json_error_line             INTEGER,
+    json_error_column           INTEGER,
     candidate_count             INTEGER,
     rejected_count              INTEGER,
     occurrence_count            INTEGER NOT NULL DEFAULT 1,
@@ -3337,9 +3352,24 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                 attempt_count               INTEGER,
                 retry_count                 INTEGER,
                 fallback_count              INTEGER,
+                attempt_index               INTEGER,
                 structured_mode             TEXT,
+                schema_transport            TEXT,
+                requested_max_tokens        INTEGER,
                 terminal_category           TEXT,
                 error_code                  TEXT,
+                finish_reason               TEXT,
+                stop_reason                 TEXT,
+                provider_request_id         TEXT,
+                prompt_tokens               INTEGER,
+                completion_tokens           INTEGER,
+                total_tokens                INTEGER,
+                response_chars              INTEGER,
+                response_hash               TEXT,
+                validation_location         TEXT,
+                validation_rule             TEXT,
+                json_error_line             INTEGER,
+                json_error_column           INTEGER,
                 candidate_count             INTEGER,
                 rejected_count              INTEGER,
                 occurrence_count            INTEGER NOT NULL DEFAULT 1,
@@ -3353,6 +3383,27 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                ON agent_runtime_events(source_id, occurred_at, event_id)""",
             """CREATE INDEX IF NOT EXISTS idx_agent_runtime_type_reason
                ON agent_runtime_events(event_name, reason_code, occurred_at)""",
+        ],
+    ),
+    (
+        77,
+        "Record content-free structured LLM attempt diagnostics",
+        [
+            "ALTER TABLE agent_runtime_events ADD COLUMN attempt_index INTEGER",
+            "ALTER TABLE agent_runtime_events ADD COLUMN schema_transport TEXT",
+            "ALTER TABLE agent_runtime_events ADD COLUMN requested_max_tokens INTEGER",
+            "ALTER TABLE agent_runtime_events ADD COLUMN finish_reason TEXT",
+            "ALTER TABLE agent_runtime_events ADD COLUMN stop_reason TEXT",
+            "ALTER TABLE agent_runtime_events ADD COLUMN provider_request_id TEXT",
+            "ALTER TABLE agent_runtime_events ADD COLUMN prompt_tokens INTEGER",
+            "ALTER TABLE agent_runtime_events ADD COLUMN completion_tokens INTEGER",
+            "ALTER TABLE agent_runtime_events ADD COLUMN total_tokens INTEGER",
+            "ALTER TABLE agent_runtime_events ADD COLUMN response_chars INTEGER",
+            "ALTER TABLE agent_runtime_events ADD COLUMN response_hash TEXT",
+            "ALTER TABLE agent_runtime_events ADD COLUMN validation_location TEXT",
+            "ALTER TABLE agent_runtime_events ADD COLUMN validation_rule TEXT",
+            "ALTER TABLE agent_runtime_events ADD COLUMN json_error_line INTEGER",
+            "ALTER TABLE agent_runtime_events ADD COLUMN json_error_column INTEGER",
         ],
     ),
 ]
@@ -17561,14 +17612,17 @@ class Database:
                     candidate_hash, observation_id, observation_revision_id,
                     range_start, range_end, block_hash, quote_hash, quote_chars,
                     localization_mode, attempt_count, retry_count, fallback_count,
-                    structured_mode, terminal_category, error_code,
+                    attempt_index, structured_mode, schema_transport,
+                    requested_max_tokens, terminal_category, error_code,
+                    finish_reason, stop_reason, provider_request_id,
+                    prompt_tokens, completion_tokens, total_tokens,
+                    response_chars, response_hash, validation_location,
+                    validation_rule, json_error_line, json_error_column,
                     candidate_count, rejected_count, occurrence_count,
                     trace_id, span_id, trace_flags
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?
-                )""",
+                ) VALUES ("""
+            + ", ".join("?" for _ in range(57))
+            + ")",
             [
                 (
                         event.event_id,
@@ -17604,9 +17658,24 @@ class Database:
                         event.attempt_count,
                         event.retry_count,
                         event.fallback_count,
+                        event.attempt_index,
                         event.structured_mode,
+                        event.schema_transport,
+                        event.requested_max_tokens,
                         event.terminal_category,
                         event.error_code,
+                        event.finish_reason,
+                        event.stop_reason,
+                        event.provider_request_id,
+                        event.prompt_tokens,
+                        event.completion_tokens,
+                        event.total_tokens,
+                        event.response_chars,
+                        event.response_hash,
+                        event.validation_location,
+                        event.validation_rule,
+                        event.json_error_line,
+                        event.json_error_column,
                         event.candidate_count,
                         event.rejected_count,
                         event.occurrence_count,
@@ -17739,9 +17808,24 @@ class Database:
             attempt_count=row["attempt_count"],  # type: ignore[arg-type]
             retry_count=row["retry_count"],  # type: ignore[arg-type]
             fallback_count=row["fallback_count"],  # type: ignore[arg-type]
+            attempt_index=row["attempt_index"],  # type: ignore[arg-type]
             structured_mode=row["structured_mode"],  # type: ignore[arg-type]
+            schema_transport=row["schema_transport"],  # type: ignore[arg-type]
+            requested_max_tokens=row["requested_max_tokens"],  # type: ignore[arg-type]
             terminal_category=row["terminal_category"],  # type: ignore[arg-type]
             error_code=row["error_code"],  # type: ignore[arg-type]
+            finish_reason=row["finish_reason"],  # type: ignore[arg-type]
+            stop_reason=row["stop_reason"],  # type: ignore[arg-type]
+            provider_request_id=row["provider_request_id"],  # type: ignore[arg-type]
+            prompt_tokens=row["prompt_tokens"],  # type: ignore[arg-type]
+            completion_tokens=row["completion_tokens"],  # type: ignore[arg-type]
+            total_tokens=row["total_tokens"],  # type: ignore[arg-type]
+            response_chars=row["response_chars"],  # type: ignore[arg-type]
+            response_hash=row["response_hash"],  # type: ignore[arg-type]
+            validation_location=row["validation_location"],  # type: ignore[arg-type]
+            validation_rule=row["validation_rule"],  # type: ignore[arg-type]
+            json_error_line=row["json_error_line"],  # type: ignore[arg-type]
+            json_error_column=row["json_error_column"],  # type: ignore[arg-type]
             candidate_count=row["candidate_count"],  # type: ignore[arg-type]
             rejected_count=row["rejected_count"],  # type: ignore[arg-type]
             occurrence_count=int(row["occurrence_count"]),
