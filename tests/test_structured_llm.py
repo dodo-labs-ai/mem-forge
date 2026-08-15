@@ -21,8 +21,6 @@ from memforge.llm.structured import (
     AgentSessionAuthorityResponse,
     CandidateLedgerDecision,
     CandidateLedgerResponse,
-    CandidateRelationDecision,
-    CandidateRelationResponse,
     EntityBatchValidationDecision,
     EntityBatchValidationResponse,
     EntityValidationResponse,
@@ -34,6 +32,8 @@ from memforge.llm.structured import (
     MemoryRelationResponse,
     MemorySupportValidationResponse,
     ProjectionMemoryExtractionResponse,
+    RevisionCompositionDecision,
+    RevisionCompositionResponse,
     RerankResponse,
     SourceSupportDecision,
     SourceSupportResponse,
@@ -853,8 +853,8 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "MemoryExtractionResponse": '{"memories":[]}',
         "ProjectionMemoryExtractionResponse": '{"memories":[]}',
         "CandidateLedgerResponse": '{"decisions":[]}',
-        "CandidateRelationResponse": '{"decisions":[]}',
         "IncumbentSupportAuditResponse": '{"decisions":[]}',
+        "RevisionCompositionResponse": '{"decisions":[]}',
         "MemoryRelationResponse": '{"decisions":[]}',
         "MemorySupportValidationResponse": '{"supported":true}',
         "EntityValidationResponse": '{}',
@@ -889,8 +889,8 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
             max_tokens=512,
         ),
         "select_memory_candidates": lambda: client.select_memory_candidates("prompt"),
-        "reconcile_candidate_relations": lambda: client.reconcile_candidate_relations("prompt"),
         "audit_incumbent_support": lambda: client.audit_incumbent_support("prompt"),
+        "prove_revision_compositions": lambda: client.prove_revision_compositions("prompt"),
         "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
         "validate_memory_support": lambda: client.validate_memory_support("prompt"),
         "validate_entity_match": lambda: client.validate_entity_match("prompt"),
@@ -1057,13 +1057,15 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         schema = kwargs["response_format"]
-        if schema is CandidateRelationResponse:
-            return CompletionResponse(
-                '{"decisions":[{"action":"ADD","reason":"new"}]}'
-            )
         if schema is IncumbentSupportAuditResponse:
             return CompletionResponse(
-                '{"decisions":[{"action":"NOOP","reason":"supported"}]}'
+                '{"decisions":[{"supported":true,"reason":"supported"}]}'
+            )
+        if schema is RevisionCompositionResponse:
+            return CompletionResponse(
+                '{"decisions":[{"pair_index":0,"same_memory_identity":true,'
+                '"preserves_incumbent_truth":true,"candidate_is_canonical_composite":true,'
+                '"current_evidence_entails_candidate":true}]}'
             )
         if schema is CandidateLedgerResponse:
             return CompletionResponse(
@@ -1099,12 +1101,8 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     )
 
     assert (await client.select_memory_candidates("prompt")).decisions[0].action == "KEEP"
-    assert (
-        await client.reconcile_candidate_relations("prompt")
-    ).decisions[0].action == "ADD"
-    assert (
-        await client.audit_incumbent_support("prompt")
-    ).decisions[0].action == "NOOP"
+    assert (await client.audit_incumbent_support("prompt")).decisions[0].supported is True
+    assert (await client.prove_revision_compositions("prompt")).decisions[0].same_memory_identity is True
     assert (await client.classify_memory_relations("prompt")).decisions[0].direction == "challenger_to_candidate"
     assert (await client.validate_memory_support("prompt")).supported is True
     assert (await client.validate_entity_match("prompt")).matched_id == 7
@@ -1113,8 +1111,8 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
 
     assert [call["response_format"] for call in calls] == [
         CandidateLedgerResponse,
-        CandidateRelationResponse,
         IncumbentSupportAuditResponse,
+        RevisionCompositionResponse,
         MemoryRelationResponse,
         MemorySupportValidationResponse,
         EntityValidationResponse,
@@ -1123,19 +1121,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     ]
 
 
-def test_composed_reconciliation_schemas_reject_cross_phase_decisions() -> None:
-    candidate_payload = {
-        "decisions": [
-            {
-                "action": "NOOP",
-                "memory_id": "mem-1",
-                "reason": "model-owned datastore identity",
-            }
-        ]
-    }
-    with pytest.raises(ValidationError):
-        CandidateRelationResponse.model_validate(candidate_payload)
-
+def test_relation_first_support_schema_rejects_lifecycle_actions() -> None:
     audit_payload = {
         "decisions": [
             {
@@ -1199,30 +1185,35 @@ def test_transient_batch_schemas_use_ordered_decision_arrays() -> None:
             EntityBatchValidationDecision(matched_id=7, confidence=0.99)
         ]
     )
-    candidate_relations = CandidateRelationResponse(
-        decisions=[CandidateRelationDecision(action="ADD")]
-    )
     incumbent_audits = IncumbentSupportAuditResponse(
-        decisions=[IncumbentSupportAuditDecision(action="NOOP")]
+        decisions=[IncumbentSupportAuditDecision(supported=True)]
+    )
+    revision_proofs = RevisionCompositionResponse(
+        decisions=[
+            RevisionCompositionDecision(
+                pair_index=0,
+                same_memory_identity=True,
+                preserves_incumbent_truth=True,
+                candidate_is_canonical_composite=True,
+                current_evidence_entails_candidate=True,
+            )
+        ]
     )
 
     assert ledger.decisions[0].action == "KEEP"
     assert entities.decisions[0].matched_id == 7
-    assert candidate_relations.decisions[0].action == "ADD"
-    assert incumbent_audits.decisions[0].action == "NOOP"
+    assert incumbent_audits.decisions[0].supported is True
+    assert revision_proofs.decisions[0].same_memory_identity is True
     assert set(CandidateLedgerResponse.model_json_schema()["properties"]) == {
         "decisions"
     }
     assert set(EntityBatchValidationResponse.model_json_schema()["properties"]) == {
         "decisions"
     }
-    assert set(CandidateRelationResponse.model_json_schema()["properties"]) == {
-        "decisions"
-    }
     assert set(IncumbentSupportAuditResponse.model_json_schema()["properties"]) == {
         "decisions"
     }
-    assert json.dumps(CandidateRelationResponse.model_json_schema()).count('"anyOf"') <= 16
+    assert set(RevisionCompositionResponse.model_json_schema()["properties"]) == {"decisions"}
     assert json.dumps(IncumbentSupportAuditResponse.model_json_schema()).count('"anyOf"') <= 16
     with pytest.raises(ValidationError):
         CandidateLedgerResponse.model_validate({"slot_00": {"action": "KEEP"}})

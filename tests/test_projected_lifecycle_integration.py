@@ -12,13 +12,13 @@ import pytest_asyncio
 from memforge.llm.structured import (
     CandidateLedgerDecision,
     CandidateLedgerResponse,
-    CandidateRelationDecision,
-    CandidateRelationResponse,
     IncumbentSupportAuditDecision,
     IncumbentSupportAuditResponse,
     MemoryRelationDecision,
     MemoryRelationResponse,
     MemorySupportValidationResponse,
+    RevisionCompositionDecision,
+    RevisionCompositionResponse,
     StructuredLlmError,
 )
 from memforge.evals.agent_evaluation import (
@@ -331,60 +331,127 @@ def _jira_projection(
     )
 
 
-def _candidate_response(
-    *decisions: CandidateRelationDecision,
-) -> CandidateRelationResponse:
-    return CandidateRelationResponse(decisions=list(decisions))
-
-
 def _audit_response(
     *decisions: IncumbentSupportAuditDecision,
 ) -> IncumbentSupportAuditResponse:
     return IncumbentSupportAuditResponse(decisions=list(decisions))
 
 
+def _uniform_relation_response(
+    prompt: str,
+    *,
+    classification: str,
+    reason: str,
+) -> MemoryRelationResponse:
+    groups_json = prompt.split("<memory_pair_groups>\n", 1)[1].split(
+        "\n</memory_pair_groups>",
+        1,
+    )[0]
+    groups = json.loads(groups_json)
+    pair_indices = [
+        item["pair_index"]
+        for group in groups
+        for item in group["candidates"]
+    ]
+    return MemoryRelationResponse(
+        decisions=[
+            MemoryRelationDecision(
+                pair_index=pair_index,
+                classification=classification,
+                direction="symmetric",
+                same_subject_and_scope=classification == "contradicts",
+                incompatible_assertions=("current assertions are incompatible" if classification == "contradicts" else ""),
+                reason=reason,
+            )
+            for pair_index in pair_indices
+        ]
+    )
+
+
 class _ReplacementClient:
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
 
-    async def reconcile_candidate_relations(self, prompt: str, **kwargs):
-        del prompt, kwargs
-        return _candidate_response(
-            CandidateRelationDecision(
-                action="SUPERSEDE",
-                incumbent_slot=0,
-                reason="The source now retains A7.",
-            )
+    async def classify_memory_relations(self, prompt: str, **kwargs):
+        del kwargs
+        return _uniform_relation_response(
+            prompt,
+            classification="contradicts",
+            reason="The source now retains A7.",
         )
 
     async def audit_incumbent_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         return _audit_response(
             IncumbentSupportAuditDecision(
-                action="DELETE",
+                supported=False,
                 reason="The old claim is replaced.",
             )
         )
 
 
 class _ConflictingReplacementClient:
-    async def reconcile_candidate_relations(self, prompt: str, **kwargs):
-        del prompt, kwargs
-        return _candidate_response(
-            CandidateRelationDecision(
-                action="SUPERSEDE",
-                incumbent_slot=0,
-                reason="The candidate appears to replace the incumbent.",
-            )
+    async def classify_memory_relations(self, prompt: str, **kwargs):
+        del kwargs
+        return _uniform_relation_response(
+            prompt,
+            classification="contradicts",
+            reason="The candidate appears to replace the incumbent.",
         )
 
     async def audit_incumbent_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         return _audit_response(
             IncumbentSupportAuditDecision(
-                action="NOOP",
+                supported=True,
                 reason="The incumbent still appears supported.",
             )
+        )
+
+
+class _AdditiveRevisionClient:
+    async def classify_memory_relations(self, prompt: str, **kwargs):
+        del kwargs
+        groups_json = prompt.split("<memory_pair_groups>\n", 1)[1].split(
+            "\n</memory_pair_groups>",
+            1,
+        )[0]
+        pair_index = json.loads(groups_json)[0]["candidates"][0]["pair_index"]
+        return MemoryRelationResponse(
+            decisions=[
+                MemoryRelationDecision(
+                    pair_index=pair_index,
+                    classification="refines",
+                    direction="challenger_to_candidate",
+                    same_subject_and_scope=True,
+                    incompatible_assertions="",
+                    reason="The configuration key adds detail to the same timeout claim.",
+                )
+            ]
+        )
+
+    async def audit_incumbent_support(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return _audit_response(
+            IncumbentSupportAuditDecision(
+                supported=True,
+                reason="The 30 second timeout remains current.",
+            )
+        )
+
+    async def prove_revision_compositions(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        return RevisionCompositionResponse(
+            decisions=[
+                RevisionCompositionDecision(
+                    pair_index=0,
+                    same_memory_identity=True,
+                    preserves_incumbent_truth=True,
+                    candidate_is_canonical_composite=True,
+                    current_evidence_entails_candidate=True,
+                    reason="The candidate is the complete current timeout claim.",
+                )
+            ]
         )
 
 
@@ -396,7 +463,7 @@ class _NoopClient:
         del prompt, kwargs
         return _audit_response(
             IncumbentSupportAuditDecision(
-                action="NOOP",
+                supported=True,
                 reason="The exact claim remains in the revised page.",
             )
         )
@@ -410,14 +477,14 @@ class _DeleteClient:
         del prompt, kwargs
         return _audit_response(
             IncumbentSupportAuditDecision(
-                action="DELETE",
+                supported=False,
                 reason="The incomplete rendering appears to omit the claim.",
             )
         )
 
 
 class _UnexpectedReconciliationClient:
-    async def reconcile_candidate_relations(self, prompt: str, **kwargs):
+    async def classify_memory_relations(self, prompt: str, **kwargs):
         del prompt, kwargs
         raise AssertionError("proven-disjoint incumbent must not require LLM reconciliation")
 
@@ -506,6 +573,90 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
     assert (
         second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id
     )
+
+
+@pytest.mark.asyncio
+async def test_additive_refinement_commits_revision_with_candidate_local_evidence(
+    db: Database,
+) -> None:
+    first_text = "The client timeout is 30 seconds."
+    first = _projection(run_id="projection-revision-1", body=first_text)
+    adapters = build_sqlite_adapters(db, object())
+    initial_engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+    await initial_engine.apply_projected_lifecycle(
+        projection=first,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content=first_text,
+                memory_type="fact",
+                evidence_quote=first_text,
+                evidence_anchor="projection_batch",
+                source_observation_id=first.observations[0].id,
+            )
+        ],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=first_text,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    [incumbent] = await db.list_memories()
+    await db.enable_lifecycle_gate("src-1")
+
+    second_text = "The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT."
+    second = _projection(
+        run_id="projection-revision-2",
+        body=second_text,
+        prior=first.source_unit_revisions[0],
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
+    )
+    revision_engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_AdditiveRevisionClient(),
+    )
+    stats = await revision_engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content=second_text,
+                memory_type="fact",
+                evidence_quote=second_text,
+                evidence_anchor="projection_batch",
+                evidence_resolved_from_block=True,
+                source_observation_id=second.observations[0].id,
+            )
+        ],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=second_text,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    old = await db.get_memory(incumbent.id)
+    assert old is not None and old.status == "superseded"
+    assert old.replacement_kind == "revision"
+    replacement = await db.get_memory(old.superseded_by or "")
+    assert replacement is not None and replacement.content == second_text
+    support = await db.get_active_memory_support_evidence(replacement.id, source_id="src-1")
+    assert len([item for item in support if item.role is EvidenceRole.PRIMARY]) == 1
+    assert support[0].excerpt == second_text
+    assert stats["updated"] == 1
+    assert stats["superseded"] == 0
 
 
 @pytest.mark.asyncio
@@ -745,21 +896,20 @@ class _RecordingAddClient:
         self.incumbent_id = incumbent_id
         self.prompts: list[str] = []
 
-    async def reconcile_candidate_relations(self, prompt: str, **kwargs):
+    async def classify_memory_relations(self, prompt: str, **kwargs):
         del kwargs
         self.prompts.append(prompt)
-        return _candidate_response(
-            CandidateRelationDecision(
-                action="ADD",
-                reason="The changed observation states a separate durable claim.",
-            )
+        return _uniform_relation_response(
+            prompt,
+            classification="unrelated",
+            reason="The changed observation states a separate durable claim.",
         )
 
     async def audit_incumbent_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         return _audit_response(
             IncumbentSupportAuditDecision(
-                action="NOOP",
+                supported=True,
                 reason="The unchanged incumbent remains supported.",
             )
         )
@@ -1166,13 +1316,9 @@ class _SemanticEquivalentClient:
     def __init__(self) -> None:
         self.relation_calls = 0
 
-    async def reconcile_candidate_relations(self, prompt: str, **kwargs):
-        del prompt, kwargs
-        return _candidate_response(CandidateRelationDecision(action="ADD"))
-
     async def audit_incumbent_support(self, prompt: str, **kwargs):
         del prompt, kwargs
-        return _audit_response(IncumbentSupportAuditDecision(action="NOOP", reason="still supported"))
+        return _audit_response(IncumbentSupportAuditDecision(supported=True, reason="still supported"))
 
     async def classify_memory_relations(self, prompt: str, **kwargs):
         del kwargs
@@ -3047,7 +3193,7 @@ async def test_persistent_incomplete_incumbent_audit_fails_closed_without_mutati
 
     with pytest.raises(
         RuntimeError,
-        match="incumbent audit response count 0 does not match expected count 1",
+        match="incumbent support response count 0 does not match expected count 1",
     ):
         await engine.apply_projected_lifecycle(
             projection=second,

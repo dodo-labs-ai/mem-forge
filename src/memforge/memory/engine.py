@@ -216,21 +216,49 @@ class MemoryEngine:
         operations: tuple[ReconcileOperation, ...],
         protected_memory_ids: frozenset[str],
     ) -> tuple[ReconcileOperation, ...]:
-        destructive = {
-            ReconcileAction.UPDATE,
-            ReconcileAction.SUPERSEDE,
-            ReconcileAction.DELETE,
-        }
-        return tuple(
-            ReconcileOperation(
-                action=ReconcileAction.NOOP,
-                memory_id=operation.memory_id,
-                reason="partial projection has no deterministic affected-anchor proof",
-            )
-            if operation.memory_id in protected_memory_ids and operation.action in destructive
-            else operation
-            for operation in operations
-        )
+        """Keep unproven incumbents while preserving non-destructive candidates."""
+
+        protected: list[ReconcileOperation] = []
+        for operation in operations:
+            if operation.memory_id not in protected_memory_ids:
+                protected.append(operation)
+                continue
+            if operation.action is ReconcileAction.UPDATE and operation.memory is not None:
+                protected.append(
+                    ReconcileOperation(
+                        action=ReconcileAction.ADD,
+                        memory=operation.memory,
+                        reason="partial projection preserves candidate without mutating unproven incumbent",
+                    )
+                )
+                protected.append(
+                    ReconcileOperation(
+                        action=ReconcileAction.NOOP,
+                        memory_id=operation.memory_id,
+                        reason="partial projection has no deterministic affected-anchor proof",
+                    )
+                )
+                continue
+            if operation.action is ReconcileAction.SUPERSEDE:
+                protected.append(
+                    replace(
+                        operation,
+                        reason="partial projection contradiction requires lifecycle review",
+                        flag_for_review=True,
+                    )
+                )
+                continue
+            if operation.action is ReconcileAction.DELETE:
+                protected.append(
+                    ReconcileOperation(
+                        action=ReconcileAction.NOOP,
+                        memory_id=operation.memory_id,
+                        reason="partial projection has no deterministic affected-anchor proof",
+                    )
+                )
+                continue
+            protected.append(operation)
+        return tuple(protected)
 
     async def _derivation_protected_incumbents(
         self,
@@ -584,6 +612,16 @@ class MemoryEngine:
             structured_llm_call_count = reconciliation_metrics.structured_llm_calls
             structured_llm_elapsed_ms = reconciliation_metrics.structured_llm_elapsed_ms
             bounded_reconciliation_elapsed_ms = reconciliation_metrics.reconciliation_elapsed_ms
+            stats.update(
+                {
+                    "reconciliation_relation_pair_count": reconciliation_metrics.relation_pair_count,
+                    "reconciliation_relation_prompt_chars": reconciliation_metrics.relation_prompt_chars,
+                    "reconciliation_revision_proof_count": reconciliation_metrics.revision_proof_count,
+                    "reconciliation_revision_proof_failure_count": (
+                        reconciliation_metrics.revision_proof_failure_count
+                    ),
+                }
+            )
             if result.failure is not None:
                 raise RuntimeError(
                     f"complete lifecycle reconciliation failed: {result.failure.error_type}: {result.failure.error}"
@@ -627,6 +665,18 @@ class MemoryEngine:
                     "reconciliation_llm_call_count": structured_llm_call_count,
                     "reconciliation_llm_elapsed_ms": structured_llm_elapsed_ms,
                     "reconciliation_bounded_elapsed_ms": (bounded_reconciliation_elapsed_ms),
+                    "reconciliation_relation_pair_count": stats.get(
+                        "reconciliation_relation_pair_count", 0
+                    ),
+                    "reconciliation_relation_prompt_chars": stats.get(
+                        "reconciliation_relation_prompt_chars", 0
+                    ),
+                    "reconciliation_revision_proof_count": stats.get(
+                        "reconciliation_revision_proof_count", 0
+                    ),
+                    "reconciliation_revision_proof_failure_count": stats.get(
+                        "reconciliation_revision_proof_failure_count", 0
+                    ),
                     "reconciliation_total_elapsed_ms": max(
                         0,
                         round((perf_counter() - reconciliation_started) * 1000),
@@ -895,7 +945,10 @@ class MemoryEngine:
             elif mutation.mutation_type.value == "reactivate_memory":
                 stats["reactivated"] += 1
             elif mutation.mutation_type.value == "supersede_memory":
-                stats["superseded"] += 1
+                if mutation.payload.get("replacement_kind") == "revision":
+                    stats["updated"] += 1
+                else:
+                    stats["superseded"] += 1
             elif mutation.mutation_type.value == "retire_memory":
                 stats["deleted"] += 1
             elif mutation.mutation_type.value == "create_review":
