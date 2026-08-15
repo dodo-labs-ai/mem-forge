@@ -7,6 +7,7 @@ signal remains actionable even when no Memory was created.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import importlib
 import json
@@ -17,6 +18,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from threading import Lock
 from typing import Iterator, Literal, Mapping, Protocol
 
@@ -279,13 +281,18 @@ class RuntimeEventTraceSink(Protocol):
 
 
 class LangfuseObservation(Protocol):
-    def start_observation(self, **kwargs: object) -> "LangfuseObservation": ...
+    @property
+    def id(self) -> str: ...
 
     def end(self) -> None: ...
 
 
 class LangfuseClient(Protocol):
     def start_observation(self, **kwargs: object) -> LangfuseObservation: ...
+
+    def create_event(self, **kwargs: object) -> object: ...
+
+    def shutdown(self) -> None: ...
 
 
 class NoOpRuntimeEventTraceSink:
@@ -316,20 +323,23 @@ class LangfuseRuntimeEventTraceSink:
         )
         try:
             for event in events:
-                child = root.start_observation(
+                self._client.create_event(
                     name=event.event_name,
-                    as_type="span",
+                    trace_context={
+                        "trace_id": trace_id,
+                        "parent_span_id": root.id,
+                    },
                     metadata=_langfuse_event_metadata(event),
                     level=_langfuse_level(event.outcome),
                     status_message=event.reason_code,
                 )
-                child.end()
         finally:
             root.end()
 
 
+@lru_cache(maxsize=1)
 def runtime_event_trace_sink_from_env() -> RuntimeEventTraceSink:
-    """Build the optional sink without importing Langfuse when disabled."""
+    """Build one process-level sink; environment changes require a restart."""
 
     if os.environ.get("MEMFORGE_LANGFUSE_ENABLED", "").strip().lower() not in {
         "1",
@@ -338,20 +348,30 @@ def runtime_event_trace_sink_from_env() -> RuntimeEventTraceSink:
         "on",
     }:
         return NoOpRuntimeEventTraceSink()
-    if not os.environ.get("LANGFUSE_PUBLIC_KEY", "").strip() or not os.environ.get(
-        "LANGFUSE_SECRET_KEY", ""
-    ).strip():
-        logger.warning("Langfuse tracing is enabled but credentials are incomplete")
+    required_config = (
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "LANGFUSE_BASE_URL",
+    )
+    if any(not os.environ.get(name, "").strip() for name in required_config):
+        logger.warning("Langfuse tracing is enabled but configuration is incomplete")
         return NoOpRuntimeEventTraceSink()
     try:
-        module = importlib.import_module("langfuse")
-        client = module.get_client()
+        langfuse_module = importlib.import_module("langfuse")
+        span_filter_module = importlib.import_module("langfuse.span_filter")
+        otel_trace_module = importlib.import_module("opentelemetry.sdk.trace")
+        client = langfuse_module.Langfuse(
+            tracer_provider=otel_trace_module.TracerProvider(),
+            should_export_span=span_filter_module.is_langfuse_span,
+            release=current_deployment_revision(),
+        )
     except Exception as exc:
         logger.warning(
             "Langfuse tracing is enabled but client initialization failed error_type=%s",
             type(exc).__name__,
         )
         return NoOpRuntimeEventTraceSink()
+    atexit.register(client.shutdown)
     return LangfuseRuntimeEventTraceSink(client)
 
 

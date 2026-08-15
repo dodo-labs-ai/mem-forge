@@ -356,10 +356,7 @@ class _FakeObservation:
         self._calls = calls
         self._kind = kind
         self._kwargs = kwargs
-
-    def start_observation(self, **kwargs):
-        self._calls.append(("child", kwargs))
-        return _FakeObservation(self._calls, "child", kwargs)
+        self.id = "root-span-id"
 
     def end(self) -> None:
         self._calls.append((f"{self._kind}_end", self._kwargs))
@@ -372,6 +369,19 @@ class _FakeLangfuseClient:
     def start_observation(self, **kwargs):
         self.calls.append(("root", kwargs))
         return _FakeObservation(self.calls, "root", kwargs)
+
+    def create_event(self, **kwargs):
+        self.calls.append(("event", kwargs))
+
+    def shutdown(self) -> None:
+        self.calls.append(("shutdown", {}))
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_trace_sink_cache():
+    runtime_event_trace_sink_from_env.cache_clear()
+    yield
+    runtime_event_trace_sink_from_env.cache_clear()
 
 
 def test_langfuse_sink_projects_allowlisted_metadata_and_event_id() -> None:
@@ -389,9 +399,13 @@ def test_langfuse_sink_projects_allowlisted_metadata_and_event_id() -> None:
 
     LangfuseRuntimeEventTraceSink(client).publish((event,))
 
-    child = next(payload for kind, payload in client.calls if kind == "child")
-    assert child["metadata"]["event_id"] == event.event_id
-    assert child["metadata"]["reason_code"] == "whole_block_fallback"
+    projected_event = next(payload for kind, payload in client.calls if kind == "event")
+    assert projected_event["metadata"]["event_id"] == event.event_id
+    assert projected_event["metadata"]["reason_code"] == "whole_block_fallback"
+    assert projected_event["trace_context"] == {
+        "trace_id": event.trace_id,
+        "parent_span_id": "root-span-id",
+    }
     assert not {
         "source_id",
         "doc_id",
@@ -400,7 +414,7 @@ def test_langfuse_sink_projects_allowlisted_metadata_and_event_id() -> None:
         "block_hash",
         "quote_hash",
         "observation_id",
-    }.intersection(child["metadata"])
+    }.intersection(projected_event["metadata"])
 
 
 def test_langfuse_sink_omits_durable_only_structured_attempt_identifiers() -> None:
@@ -425,12 +439,12 @@ def test_langfuse_sink_omits_durable_only_structured_attempt_identifiers() -> No
 
     LangfuseRuntimeEventTraceSink(client).publish((event,))
 
-    child = next(payload for kind, payload in client.calls if kind == "child")
-    assert child["metadata"]["attempt_index"] == 1
-    assert child["metadata"]["requested_max_tokens"] == 32_768
-    assert child["metadata"]["response_chars"] == 98_304
-    assert "provider_request_id" not in child["metadata"]
-    assert "response_hash" not in child["metadata"]
+    projected_event = next(payload for kind, payload in client.calls if kind == "event")
+    assert projected_event["metadata"]["attempt_index"] == 1
+    assert projected_event["metadata"]["requested_max_tokens"] == 32_768
+    assert projected_event["metadata"]["response_chars"] == 98_304
+    assert "provider_request_id" not in projected_event["metadata"]
+    assert "response_hash" not in projected_event["metadata"]
 
 
 def test_runtime_trace_sink_failure_is_best_effort(caplog) -> None:
@@ -455,17 +469,48 @@ def test_runtime_trace_sink_is_disabled_without_importing_langfuse(monkeypatch) 
 
 def test_runtime_trace_sink_uses_langfuse_only_when_enabled(monkeypatch) -> None:
     client = _FakeLangfuseClient()
+    tracer_provider = object()
+    span_filter = object()
+    registered: list[object] = []
     monkeypatch.setenv("MEMFORGE_LANGFUSE_ENABLED", "true")
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "https://langfuse.example.invalid")
+
+    def fake_import(name: str):
+        if name == "langfuse":
+            return SimpleNamespace(
+                Langfuse=lambda **kwargs: (
+                    client
+                    if kwargs
+                    == {
+                        "tracer_provider": tracer_provider,
+                        "should_export_span": span_filter,
+                        "release": None,
+                    }
+                    else (_ for _ in ()).throw(AssertionError(kwargs))
+                )
+            )
+        if name == "langfuse.span_filter":
+            return SimpleNamespace(is_langfuse_span=span_filter)
+        if name == "opentelemetry.sdk.trace":
+            return SimpleNamespace(TracerProvider=lambda: tracer_provider)
+        raise AssertionError(name)
+
     monkeypatch.setattr(
         "memforge.evals.agent_evaluation.importlib.import_module",
-        lambda name: SimpleNamespace(get_client=lambda: client) if name == "langfuse" else None,
+        fake_import,
+    )
+    monkeypatch.setattr(
+        "memforge.evals.agent_evaluation.atexit.register",
+        registered.append,
     )
 
     sink = runtime_event_trace_sink_from_env()
 
     assert isinstance(sink, LangfuseRuntimeEventTraceSink)
+    assert runtime_event_trace_sink_from_env() is sink
+    assert registered == [client.shutdown]
     sink.publish(_events(QualitySignal("batch", "expected", "candidates_extracted")))
     assert any(kind == "root" for kind, _ in client.calls)
 
@@ -474,9 +519,10 @@ def test_runtime_trace_sink_initialization_failure_is_nonfatal(monkeypatch, capl
     monkeypatch.setenv("MEMFORGE_LANGFUSE_ENABLED", "true")
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "https://langfuse.example.invalid")
     monkeypatch.setattr(
         "memforge.evals.agent_evaluation.importlib.import_module",
-        lambda _name: SimpleNamespace(get_client=lambda: (_ for _ in ()).throw(RuntimeError("bad config"))),
+        lambda _name: (_ for _ in ()).throw(RuntimeError("bad config")),
     )
 
     assert isinstance(runtime_event_trace_sink_from_env(), NoOpRuntimeEventTraceSink)
@@ -487,9 +533,10 @@ def test_runtime_trace_sink_requires_credentials_when_enabled(monkeypatch, caplo
     monkeypatch.setenv("MEMFORGE_LANGFUSE_ENABLED", "true")
     monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_BASE_URL", raising=False)
 
     assert isinstance(runtime_event_trace_sink_from_env(), NoOpRuntimeEventTraceSink)
-    assert "credentials are incomplete" in caplog.text
+    assert "configuration is incomplete" in caplog.text
 
 
 def test_cohort_report_uses_event_name_denominators() -> None:
