@@ -1,7 +1,8 @@
-"""Classify a complete Source Unit incumbent ledger in bounded LLM batches.
+"""Derive lifecycle operations from semantic relations and Source Unit support.
 
-This module produces decisions only. It never mutates Memory lifecycle state;
-the Lifecycle Planner validates the complete ledger and builds the atomic plan.
+The model classifies facts only: exact candidate/incumbent relations, current
+support, and (only for REFINES) revision eligibility. This module owns the
+deterministic action matrix and never mutates durable lifecycle state.
 """
 
 from __future__ import annotations
@@ -10,13 +11,24 @@ import json
 import logging
 from dataclasses import dataclass
 from time import perf_counter
-from typing import TYPE_CHECKING
 
 from memforge.llm.structured import StructuredLlmError
-from memforge.models import Memory, RawMemory, ReconcileAction, ReconcileOperation
-
-if TYPE_CHECKING:
-    pass
+from memforge.memory.evidence import RelationDirection
+from memforge.memory.relation_classifier import (
+    MemoryPair,
+    MemoryPairClassificationError,
+    MemoryPairDecision,
+    MemoryRelationType,
+    StructuredMemoryPairClassifier,
+)
+from memforge.models import (
+    Memory,
+    RawMemory,
+    ReconcileAction,
+    ReconcileOperation,
+    content_hash,
+    parse_memory_validity_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,19 +36,74 @@ __all__ = [
     "ReconciliationFailure",
     "ReconciliationMetrics",
     "ReconciliationResult",
+    "RelationLedgerEntry",
+    "RevisionCompositionProof",
+    "SupportAuditEntry",
     "reconcile_memories",
+    "reduce_relation_ledger",
 ]
 
+RECONCILIATION_INCUMBENT_BATCH_SIZE = 30
+REVISION_COMPOSITION_BATCH_SIZE = 64
+RECONCILIATION_BATCH_VALIDATION_ATTEMPTS = 2
 
-@dataclass(frozen=True)
+INCUMBENT_SUPPORT_AUDIT_PROMPT = """Audit whether the current Source Unit still supports every incumbent Memory.
+
+This is a factual support judgment, not a lifecycle action. Return supported=true
+when the exact claim remains entailed by the current Source Unit or is provably
+disjoint from the changed evidence. Return supported=false only when the current
+Source Unit removed, replaced, or contradicts the claim. Do not decide KEEP,
+DELETE, UPDATE, or SUPERSEDE.
+
+When update_mode is diff_guided, changed_hunks are authoritative for what
+changed. Absence from an incomplete excerpt is not proof of unsupported status.
+Return exactly one ordered decision for every listed incumbent.
+
+<update_mode>{update_mode}</update_mode>
+<diff_stats>{diff_stats}</diff_stats>
+<changed_hunks>{changed_hunks}</changed_hunks>
+<doc_type>{doc_type}</doc_type>
+<updated_document>{updated_document}</updated_document>
+<incumbents>{incumbents}</incumbents>
+"""
+
+REVISION_COMPOSITION_PROMPT = """Decide whether each exact REFINES pair may become one automatic Memory revision.
+
+This proof is stricter than REFINES. Return true for all four booleans only when:
+1. both texts are successive materializations of the same durable Memory identity;
+2. the challenger preserves every durable truth carried by the incumbent while
+   adding a compatible material detail (it does not merely narrow the old claim);
+3. the challenger text itself is a complete canonical current claim, so it can
+   be stored verbatim without model-written merging or historical narration.
+4. the supplied exact current Primary Evidence excerpt entails the whole
+   challenger claim, including the incumbent truth and the added detail.
+
+Memory type and validity bounds are part of the claim. A change in modality or
+validity must be justified as part of the same identity and truth-preservation
+proof; otherwise return false.
+
+If current Primary Evidence is empty, supports only the added detail, or the
+claim depends on Required Evidence that is not supplied, set
+current_evidence_entails_candidate=false.
+
+Return false when the challenger is a sibling scenario, a narrower independent
+claim, or would need text from the incumbent copied into a synthesized merge.
+Do not return lifecycle actions or rewritten content. Return every pair_index
+exactly once.
+
+<refinement_pairs>{pairs_json}</refinement_pairs>
+"""
+
+
+@dataclass(frozen=True, slots=True)
 class ReconciliationFailure:
-    """Failure metadata for a reconciliation call that produced no safe decisions."""
+    """Failure metadata for a reconciliation that produced no safe ledger."""
 
     error_type: str
     error: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReconciliationMetrics:
     """Transport and latency measurements for one bounded reconciliation."""
 
@@ -44,123 +111,63 @@ class ReconciliationMetrics:
     model_batch_count: int = 0
     structured_llm_elapsed_ms: int = 0
     reconciliation_elapsed_ms: int = 0
+    relation_pair_count: int = 0
+    relation_prompt_chars: int = 0
+    revision_proof_count: int = 0
+    revision_proof_failure_count: int = 0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReconciliationResult:
-    """Reconciliation call result with operations and optional failure metadata."""
+    """Reconciliation result with operations and optional failure metadata."""
 
     operations: list[ReconcileOperation]
     failure: ReconciliationFailure | None = None
     metrics: ReconciliationMetrics = ReconciliationMetrics()
 
 
-RECONCILIATION_PROMPT = """You are reconciling team knowledge. A document was updated and new facts
-were extracted. Compare them against existing memories from the same document
-and the updated document content.
+@dataclass(frozen=True, slots=True)
+class RelationLedgerEntry:
+    """One complete, datastore-bound candidate/incumbent relation."""
 
-<update_mode>{update_mode}</update_mode>
-<diff_stats>
-{diff_stats}
-</diff_stats>
-<changed_hunks>
-{changed_hunks}
-</changed_hunks>
-
-<ledger_contract>
-{ledger_contract}
-</ledger_contract>
-
-For each new extraction listed for this phase, decide ONE action:
-
-- ADD: Genuinely new information not covered by any existing memory.
-- UPDATE: An existing memory covers the same durable claim, but the new evidence
-  adds a real factual detail that must be present in the canonical text. Provide
-  the merged current text. This is not a wording cleanup: the durable information
-  carried by the Memory has increased. The old materialization will be preserved
-  with a timestamp but hidden from default search.
-- SUPERSEDE: An existing memory covers the same topic but is now materially wrong.
-  The old fact was true before but is no longer. The new fact replaces the old meaning.
-  The old memory will be preserved with a timestamp but hidden from search.
-- DELETE: An existing memory is demonstrably false or was extracted in error.
-- NOOP: The new extraction adds nothing beyond what existing memories capture.
-  Use NOOP when it is semantically equivalent to an incumbent, including
-  paraphrases, synonyms, reordered wording, stylistic rewrites, and extraction
-  wording variance. Preserve the incumbent memory ID even when the source text
-  or the newly extracted candidate is worded differently.
-
-When the ledger contract requests an incumbent audit, audit EVERY existing memory
-in the batch against the updated document and return exactly one explicit
-decision at the same array position:
-- NOOP when it remains supported or is disjoint from the changed evidence.
-- DELETE when this source unit no longer supports it and there is no replacement.
-Never omit a decision. A response count that differs from the request count
-invalidates the whole batch.
-
-When update_mode is diff_guided, use changed_hunks as the authority for what
-changed. Use the full updated document only to validate support and understand
-context. Do not update, supersede, or delete memories from other documents.
-In diff_guided mode, DELETE or SUPERSEDE an existing memory only when <changed_hunks>
-removes, replaces, or contradicts the supporting text, or when the updated
-document clearly shows the relevant section now states a different current fact.
-Do not DELETE solely because support is absent from unrelated context or because
-the updated document excerpt may be incomplete.
-
-<doc_type>{doc_type}</doc_type>
-
-<updated_document>
-{updated_document}
-</updated_document>
-
-<new_extractions>
-{new_extractions}
-</new_extractions>
-
-<existing_memories>
-{existing_memories}
-</existing_memories>
-
-Rules:
-1. Return decisions in the exact request order required by the ledger contract.
-2. Never echo a candidate index or datastore memory ID. Identity is bound by the
-   decision's array position; matching an incumbent uses only its bounded incumbent_slot.
-3. For UPDATE, SUPERSEDE, and NOOP candidate relations, specify the affected
-   incumbent_slot.
-4. For UPDATE, provide the merged current text as "updated_content".
-5. If uncertain between UPDATE and SUPERSEDE, prefer SUPERSEDE when the old meaning is materially wrong.
-6. If an existing memory has corroboration_count >= 3 and you want to SUPERSEDE it,
-   set "flag_for_review": true.
-7. For UPDATE updated_content and SUPERSEDE replacement memory content, write the
-   canonical current memory, not the edit history. The replacement memory content must state the current durable fact as it should appear in search results.
-   Do not write replacement content as edit history such as "no longer marked",
-   "was removed", "the document changed", or "previously". Put that rationale in
-   the reason field instead. Only mention a historical transition in memory
-   content when the updated document itself says the transition is a durable fact.
-8. Never use UPDATE only to improve phrasing or to mirror a semantically
-   equivalent source rewrite. That is NOOP. UPDATE requires at least one durable
-   factual detail in updated_content that the incumbent did not already carry.
-
-Return ONLY the ordered decisions JSON object required by the response schema."""
+    candidate_index: int
+    incumbent_id: str
+    relation_type: MemoryRelationType
+    direction: RelationDirection
+    reason: str = ""
 
 
-RECONCILIATION_INCUMBENT_BATCH_SIZE = 30
-RECONCILIATION_CANDIDATE_BATCH_SIZE = 24
-RECONCILIATION_BATCH_VALIDATION_ATTEMPTS = 2
+@dataclass(frozen=True, slots=True)
+class SupportAuditEntry:
+    """One current Source Unit support judgment for an incumbent."""
 
-_CANDIDATE_RELATION_CONTRACT = """This is one cell of a complete candidate-by-incumbent
-relation matrix:
-- Return exactly one judgment for every listed candidate, in list order.
-- Compare each candidate only with the listed incumbents.
-- Use ADD when the candidate does not match an incumbent in this cell; the deterministic
-  reducer will authorize a global ADD only after every incumbent cell is complete.
-- For NOOP, UPDATE, or SUPERSEDE, select one listed incumbent_slot.
-- Do not emit unindexed incumbent lifecycle decisions and do not use DELETE."""
+    incumbent_id: str
+    supported: bool
+    reason: str = ""
 
-_INCUMBENT_AUDIT_CONTRACT = """This is the independent incumbent-support audit:
-- There are no new extractions in this phase.
-- Return exactly one NOOP or DELETE judgment for every listed incumbent, in list order.
-- Decide only whether the updated Source Unit still supports the incumbent.
-- Do not emit ADD, UPDATE, or SUPERSEDE."""
+
+@dataclass(frozen=True, slots=True)
+class RevisionCompositionProof:
+    """Transient proof that one candidate may revise one incumbent losslessly."""
+
+    candidate_index: int
+    incumbent_id: str
+    same_memory_identity: bool
+    preserves_incumbent_truth: bool
+    candidate_is_canonical_composite: bool
+    current_evidence_entails_candidate: bool
+    complete_current_evidence: bool
+    reason: str = ""
+
+    @property
+    def eligible(self) -> bool:
+        return (
+            self.same_memory_identity
+            and self.preserves_incumbent_truth
+            and self.candidate_is_canonical_composite
+            and self.current_evidence_entails_candidate
+            and self.complete_current_evidence
+        )
 
 
 async def reconcile_memories(
@@ -175,30 +182,31 @@ async def reconcile_memories(
     update_plan_stats: dict | None = None,
     include_metadata: bool = False,
 ) -> list[ReconcileOperation] | ReconciliationResult:
-    """Classify new candidates and every incumbent, failing closed on ambiguity."""
+    """Classify a complete relation/support ledger and reduce it deterministically."""
+
     started = perf_counter()
     structured_llm_calls = 0
-    structured_llm_elapsed_seconds = 0.0
     model_batch_count = 0
+    structured_llm_elapsed_seconds = 0.0
+    relation_pair_count = 0
+    relation_prompt_chars = 0
+    revision_proof_count = 0
+    revision_proof_failure_count = 0
 
     def metrics() -> ReconciliationMetrics:
         return ReconciliationMetrics(
             structured_llm_calls=structured_llm_calls,
             model_batch_count=model_batch_count,
-            structured_llm_elapsed_ms=max(
-                0,
-                round(structured_llm_elapsed_seconds * 1000),
-            ),
-            reconciliation_elapsed_ms=max(
-                0,
-                round((perf_counter() - started) * 1000),
-            ),
+            structured_llm_elapsed_ms=max(0, round(structured_llm_elapsed_seconds * 1000)),
+            reconciliation_elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
+            relation_pair_count=relation_pair_count,
+            relation_prompt_chars=relation_prompt_chars,
+            revision_proof_count=revision_proof_count,
+            revision_proof_failure_count=revision_proof_failure_count,
         )
 
     if not new_extractions and not existing_memories:
         return _return_result([], metrics=metrics(), include_metadata=include_metadata)
-
-    # If no existing memories, everything is ADD (skip LLM call)
     if not existing_memories:
         return _return_result(
             [ReconcileOperation(action=ReconcileAction.ADD, memory=raw) for raw in new_extractions],
@@ -206,273 +214,460 @@ async def reconcile_memories(
             include_metadata=include_metadata,
         )
 
-    indexed_extractions = list(enumerate(new_extractions))
-    candidate_batches = [
-        indexed_extractions[offset : offset + RECONCILIATION_CANDIDATE_BATCH_SIZE]
-        for offset in range(0, len(indexed_extractions), RECONCILIATION_CANDIDATE_BATCH_SIZE)
-    ]
-
     try:
-        decisions: list[dict] = []
-        incumbent_batches = [
-            existing_memories[offset : offset + RECONCILIATION_INCUMBENT_BATCH_SIZE]
-            for offset in range(0, len(existing_memories), RECONCILIATION_INCUMBENT_BATCH_SIZE)
+        classifier = StructuredMemoryPairClassifier(client=structured_llm_client, model=llm_model)
+        transient_candidates = tuple(_transient_candidate(index, raw) for index, raw in enumerate(new_extractions))
+        pairs = tuple(
+            MemoryPair(challenger=candidate, candidate=incumbent)
+            for candidate in transient_candidates
+            for incumbent in existing_memories
+        )
+        relation_started = perf_counter()
+        classification = await classifier.classify(pairs)
+        structured_llm_elapsed_seconds += perf_counter() - relation_started
+        structured_llm_calls += classification.llm_calls
+        model_batch_count += classification.llm_calls
+        relation_pair_count += len(pairs)
+        relation_prompt_chars += classification.prompt_chars
+        relation_entries = _bind_relation_entries(
+            classification.decisions,
+            candidate_count=len(new_extractions),
+            incumbents=existing_memories,
+        )
+
+        audits, calls, elapsed = await _audit_incumbent_support(
+            incumbents=existing_memories,
+            structured_llm_client=structured_llm_client,
+            llm_model=llm_model,
+            doc_type=doc_type,
+            updated_document=updated_document,
+            update_mode=update_mode,
+            changed_hunks=changed_hunks,
+            update_plan_stats=update_plan_stats,
+        )
+        structured_llm_calls += calls
+        model_batch_count += calls
+        structured_llm_elapsed_seconds += elapsed
+
+        refiners_by_incumbent = _supported_revision_candidates(relation_entries, audits)
+        conditional_pairs = tuple(
+            MemoryPair(challenger=transient_candidates[left], candidate=transient_candidates[right])
+            for indices in refiners_by_incumbent.values()
+            if len(indices) > 1
+            for offset, left in enumerate(indices)
+            for right in indices[offset + 1 :]
+        )
+        if conditional_pairs:
+            conditional_started = perf_counter()
+            conditional = await classifier.classify(conditional_pairs)
+            structured_llm_elapsed_seconds += perf_counter() - conditional_started
+            structured_llm_calls += conditional.llm_calls
+            model_batch_count += conditional.llm_calls
+            relation_pair_count += len(conditional_pairs)
+            relation_prompt_chars += conditional.prompt_chars
+            if any(decision.relation_type is MemoryRelationType.CONTRADICTS for decision in conditional.decisions):
+                raise ValueError("multiple refinement candidates contain incompatible current assertions")
+
+        proof_requests = [
+            (indices[0], incumbent_id)
+            for incumbent_id, indices in refiners_by_incumbent.items()
+            if len(indices) == 1
         ]
-        # Every input size uses the same two phase-specific protocols. Candidate
-        # and incumbent identity is bound by ordered response position rather
-        # than echoed by the model.
-        for incumbent_batch in incumbent_batches:
-            for candidate_batch in candidate_batches:
-                batch_decisions, calls, elapsed = await _run_reconciliation_batch(
-                    structured_llm_method=(structured_llm_client.reconcile_candidate_relations),
-                    llm_model=llm_model,
-                    prompt=_render_reconciliation_prompt(
-                        ledger_contract=_CANDIDATE_RELATION_CONTRACT,
-                        indexed_extractions=candidate_batch,
-                        incumbents=incumbent_batch,
-                        doc_type=doc_type,
-                        updated_document=updated_document,
-                        update_mode=update_mode,
-                        changed_hunks=changed_hunks,
-                        update_plan_stats=update_plan_stats,
-                    ),
-                    expected_indices=tuple(index for index, _ in candidate_batch),
-                    incumbents=incumbent_batch,
-                    require_incumbent_coverage=False,
-                    allow_unindexed_incumbents=False,
-                    decision_phase="candidate_relation",
-                )
-                model_batch_count += 1
-                structured_llm_calls += calls
-                structured_llm_elapsed_seconds += elapsed
-                decisions.extend(batch_decisions)
+        proofs, calls, elapsed = await _prove_revision_compositions(
+            requests=proof_requests,
+            new_extractions=new_extractions,
+            incumbents={memory.id: memory for memory in existing_memories},
+            structured_llm_client=structured_llm_client,
+            llm_model=llm_model,
+        )
+        revision_proof_count = len(proofs)
+        revision_proof_failure_count = len(proof_requests) - len(proofs)
+        structured_llm_calls += calls
+        model_batch_count += calls
+        structured_llm_elapsed_seconds += elapsed
 
-            audit_decisions, calls, elapsed = await _run_reconciliation_batch(
-                structured_llm_method=(structured_llm_client.audit_incumbent_support),
-                llm_model=llm_model,
-                prompt=_render_reconciliation_prompt(
-                    ledger_contract=_INCUMBENT_AUDIT_CONTRACT,
-                    indexed_extractions=[],
-                    incumbents=incumbent_batch,
-                    doc_type=doc_type,
-                    updated_document=updated_document,
-                    update_mode=update_mode,
-                    changed_hunks=changed_hunks,
-                    update_plan_stats=update_plan_stats,
-                ),
-                expected_indices=(),
-                incumbents=incumbent_batch,
-                require_incumbent_coverage=True,
-                allow_unindexed_incumbents=True,
-                incumbent_audit=True,
-                decision_phase="incumbent_audit",
-            )
-            model_batch_count += 1
-            structured_llm_calls += calls
-            structured_llm_elapsed_seconds += elapsed
-            decisions.extend(audit_decisions)
-
+        operations = reduce_relation_ledger(
+            new_extractions=new_extractions,
+            existing_memories=existing_memories,
+            relations=relation_entries,
+            support_audits=audits,
+            revision_proofs=proofs,
+        )
+        return _return_result(operations, metrics=metrics(), include_metadata=include_metadata)
+    except (StructuredLlmError, MemoryPairClassificationError, KeyError, ValueError) as error:
+        logger.warning("Relation-first reconciliation failed closed: %s", error)
         return _return_result(
-            _merge_complete_batch_decisions(decisions, new_extractions, existing_memories),
+            [],
+            failure=ReconciliationFailure(error_type="relation_first_error", error=str(error)),
             metrics=metrics(),
             include_metadata=include_metadata,
         )
-
-    except (StructuredLlmError, KeyError) as e:
-        logger.warning("Structured reconciliation failed: %s — skipping reconciliation mutations", e)
-        operations = [] if existing_memories else _fallback_add_all(new_extractions)
+    except Exception as error:  # pragma: no cover - defensive provider boundary
+        logger.exception("Unexpected relation-first reconciliation failure")
         return _return_result(
-            operations,
-            failure=ReconciliationFailure(error_type="structured_llm_error", error=str(e)),
-            metrics=metrics(),
-            include_metadata=include_metadata,
-        )
-    except Exception as e:
-        logger.error("Reconciliation LLM call failed: %s — skipping reconciliation mutations", e)
-        operations = [] if existing_memories else _fallback_add_all(new_extractions)
-        return _return_result(
-            operations,
-            failure=ReconciliationFailure(error_type="unexpected_error", error=str(e)),
+            [],
+            failure=ReconciliationFailure(error_type="unexpected_error", error=str(error)),
             metrics=metrics(),
             include_metadata=include_metadata,
         )
 
 
-def _render_reconciliation_prompt(
+def reduce_relation_ledger(
     *,
-    ledger_contract: str,
-    indexed_extractions: list[tuple[int, RawMemory]],
+    new_extractions: list[RawMemory],
+    existing_memories: list[Memory],
+    relations: list[RelationLedgerEntry],
+    support_audits: list[SupportAuditEntry],
+    revision_proofs: list[RevisionCompositionProof] | None = None,
+) -> list[ReconcileOperation]:
+    """Apply the complete relation/support matrix to one deterministic action table."""
+
+    incumbent_ids = {memory.id for memory in existing_memories}
+    expected_pairs = {
+        (candidate_index, memory.id)
+        for candidate_index in range(len(new_extractions))
+        for memory in existing_memories
+    }
+    actual_pairs = {(entry.candidate_index, entry.incumbent_id) for entry in relations}
+    if len(actual_pairs) != len(relations) or actual_pairs != expected_pairs:
+        raise ValueError("relation ledger does not cover every exact candidate/incumbent pair once")
+    audits_by_id = {entry.incumbent_id: entry for entry in support_audits}
+    if len(audits_by_id) != len(support_audits) or set(audits_by_id) != incumbent_ids:
+        raise ValueError("support audit does not cover every incumbent exactly once")
+    proofs = revision_proofs or []
+    proofs_by_pair = {(proof.candidate_index, proof.incumbent_id): proof for proof in proofs}
+    if len(proofs_by_pair) != len(proofs):
+        raise ValueError("duplicate revision composition proof")
+
+    by_incumbent: dict[str, list[RelationLedgerEntry]] = {memory_id: [] for memory_id in incumbent_ids}
+    identity_targets: dict[int, list[RelationLedgerEntry]] = {
+        index: [] for index in range(len(new_extractions))
+    }
+    for entry in relations:
+        by_incumbent[entry.incumbent_id].append(entry)
+        if entry.relation_type in {MemoryRelationType.EQUIVALENT, MemoryRelationType.CONTRADICTS} or (
+            entry.relation_type is MemoryRelationType.REFINES
+            and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
+        ):
+            identity_targets[entry.candidate_index].append(entry)
+    ambiguous = {
+        index: {entry.incumbent_id for entry in entries}
+        for index, entries in identity_targets.items()
+        if len(entries) > 1
+    }
+    if ambiguous:
+        raise ValueError(f"candidate relates materially to multiple incumbents: {ambiguous}")
+
+    consumed_candidates: set[int] = set()
+    incumbent_operations: list[ReconcileOperation] = []
+    for incumbent in existing_memories:
+        audit = audits_by_id[incumbent.id]
+        entries = by_incumbent[incumbent.id]
+        equivalents = [entry for entry in entries if entry.relation_type is MemoryRelationType.EQUIVALENT]
+        contradictions = [entry for entry in entries if entry.relation_type is MemoryRelationType.CONTRADICTS]
+        refiners = [
+            entry
+            for entry in entries
+            if entry.relation_type is MemoryRelationType.REFINES
+            and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
+        ]
+        related = [entry for entry in entries if entry.relation_type is not MemoryRelationType.UNRELATED]
+
+        if contradictions:
+            if len(contradictions) != 1 or len(related) != 1:
+                raise ValueError(f"incumbent {incumbent.id} has no unique contradiction proposal")
+            challenger = contradictions[0]
+            consumed_candidates.add(challenger.candidate_index)
+            incumbent_operations.append(
+                ReconcileOperation(
+                    action=ReconcileAction.SUPERSEDE,
+                    memory_id=incumbent.id,
+                    memory=new_extractions[challenger.candidate_index],
+                    reason=challenger.reason or audit.reason or "current claim contradicts incumbent",
+                    flag_for_review=audit.supported,
+                )
+            )
+            continue
+
+        if equivalents and not audit.supported:
+            consumed_candidates.update(entry.candidate_index for entry in equivalents)
+            incumbent_operations.append(
+                ReconcileOperation(
+                    action=ReconcileAction.DELETE,
+                    memory_id=incumbent.id,
+                    reason=(
+                        "semantic equivalence conflicts with unsupported audit: "
+                        f"{audit.reason or equivalents[0].reason}"
+                    ),
+                    flag_for_review=True,
+                )
+            )
+            continue
+
+        if audit.supported and len(refiners) == 1:
+            refiner = refiners[0]
+            proof = proofs_by_pair.get((refiner.candidate_index, incumbent.id))
+            if proof is not None and proof.eligible:
+                consumed_candidates.update(entry.candidate_index for entry in equivalents)
+                consumed_candidates.add(refiner.candidate_index)
+                incumbent_operations.append(
+                    ReconcileOperation(
+                        action=ReconcileAction.UPDATE,
+                        memory_id=incumbent.id,
+                        memory=new_extractions[refiner.candidate_index],
+                        reason=proof.reason or refiner.reason or "lossless additive revision",
+                    )
+                )
+                continue
+
+        if equivalents and audit.supported:
+            consumed_candidates.update(entry.candidate_index for entry in equivalents)
+            selected = equivalents[0]
+            incumbent_operations.append(
+                ReconcileOperation(
+                    action=ReconcileAction.NOOP,
+                    memory_id=incumbent.id,
+                    memory=new_extractions[selected.candidate_index],
+                    reason=selected.reason or audit.reason or "equivalent current claim",
+                )
+            )
+            continue
+
+        incumbent_operations.append(
+            ReconcileOperation(
+                action=ReconcileAction.NOOP if audit.supported else ReconcileAction.DELETE,
+                memory_id=incumbent.id,
+                reason=audit.reason or ("current Source Unit support retained" if audit.supported else "support removed"),
+            )
+        )
+
+    candidate_operations = [
+        ReconcileOperation(action=ReconcileAction.ADD, memory=raw, reason="independent current claim")
+        for index, raw in enumerate(new_extractions)
+        if index not in consumed_candidates
+    ]
+    return [*candidate_operations, *incumbent_operations]
+
+
+def _transient_candidate(index: int, raw: RawMemory) -> Memory:
+    return Memory(
+        id=f"candidate:{index}",
+        memory_type=raw.memory_type,
+        content=raw.content,
+        content_hash=content_hash(raw.content),
+        entity_refs=list(raw.entity_refs),
+        confidence=raw.confidence,
+        valid_from=parse_memory_validity_date(raw.valid_from),
+        valid_until=parse_memory_validity_date(raw.valid_until),
+    )
+
+
+def _bind_relation_entries(
+    decisions: tuple[MemoryPairDecision, ...],
+    *,
+    candidate_count: int,
     incumbents: list[Memory],
+) -> list[RelationLedgerEntry]:
+    incumbent_ids = {memory.id for memory in incumbents}
+    entries: list[RelationLedgerEntry] = []
+    for decision in decisions:
+        challenger_id = decision.pair.challenger.id
+        if not challenger_id.startswith("candidate:"):
+            raise ValueError("relation classifier returned an unknown challenger")
+        candidate_index = int(challenger_id.split(":", 1)[1])
+        if not 0 <= candidate_index < candidate_count or decision.pair.candidate.id not in incumbent_ids:
+            raise ValueError("relation classifier returned an out-of-scope pair")
+        entries.append(
+            RelationLedgerEntry(
+                candidate_index=candidate_index,
+                incumbent_id=decision.pair.candidate.id,
+                relation_type=decision.relation_type,
+                direction=decision.direction,
+                reason=decision.reason,
+            )
+        )
+    return entries
+
+
+async def _audit_incumbent_support(
+    *,
+    incumbents: list[Memory],
+    structured_llm_client,
+    llm_model: str,
     doc_type: str,
     updated_document: str | None,
     update_mode: str,
     changed_hunks: str | None,
     update_plan_stats: dict | None,
-) -> str:
-    new_json = json.dumps(
-        [
-            {
-                "request_position": slot_index,
-                "content": raw.content,
-                "memory_type": raw.memory_type,
-                "confidence": raw.confidence,
-                "entity_refs": raw.entity_refs,
-            }
-            for slot_index, (_, raw) in enumerate(indexed_extractions)
-        ],
-        indent=2,
-    )
-    existing_json = json.dumps(
-        [
-            {
-                "request_position": slot_index,
-                "incumbent_slot": slot_index,
-                "content": memory.content,
-                "memory_type": memory.memory_type,
-                "confidence": memory.confidence,
-                "corroboration_count": memory.corroboration_count,
-            }
-            for slot_index, memory in enumerate(incumbents)
-        ],
-        indent=2,
-    )
-    return RECONCILIATION_PROMPT.format(
-        ledger_contract=ledger_contract,
-        update_mode=update_mode,
-        diff_stats=json.dumps(update_plan_stats or {}, indent=2),
-        changed_hunks=(changed_hunks or "")[:40_000],
-        doc_type=doc_type,
-        updated_document=(updated_document or "")[:100_000],
-        new_extractions=new_json,
-        existing_memories=existing_json,
-    )
-
-
-def _bind_candidate_relation_decisions(
-    judgments,
-    *,
-    expected_indices: tuple[int, ...],
-    incumbents: list[Memory],
-) -> list[dict]:
-    """Bind model judgments to candidate and incumbent identities owned by the request."""
-
-    if len(judgments) != len(expected_indices):
-        raise ValueError(
-            "candidate relation response count "
-            f"{len(judgments)} does not match expected count {len(expected_indices)}"
-        )
-    decisions: list[dict] = []
-    for position, judgment in enumerate(judgments):
-        data = judgment.model_dump()
-        incumbent_slot = data.pop("incumbent_slot")
-        action = str(data.get("action", "")).upper()
-        if action == "ADD":
-            if incumbent_slot is not None:
-                raise ValueError(
-                    f"ADD candidate relation position {position} must not select an incumbent"
-                )
-        else:
-            if not isinstance(incumbent_slot, int) or incumbent_slot >= len(incumbents):
-                raise ValueError(
-                    f"candidate relation position {position} selected an inactive incumbent slot"
-                )
-            data["memory_id"] = incumbents[incumbent_slot].id
-        if action == "UPDATE" and not data.get("updated_content"):
-            raise ValueError(
-                f"UPDATE candidate relation position {position} requires updated_content"
-            )
-        data["index"] = expected_indices[position]
-        decisions.append(data)
-    return decisions
-
-
-def _bind_incumbent_audit_decisions(
-    judgments,
-    *,
-    incumbents: list[Memory],
-) -> list[dict]:
-    """Bind incumbent support judgments to datastore identities by request order."""
-
-    if len(judgments) != len(incumbents):
-        raise ValueError(
-            "incumbent audit response count "
-            f"{len(judgments)} does not match expected count {len(incumbents)}"
-        )
-    decisions: list[dict] = []
-    for position, judgment in enumerate(judgments):
-        decisions.append(
-            {
-                **judgment.model_dump(),
-                "memory_id": incumbents[position].id,
-            }
-        )
-    return decisions
-
-
-async def _run_reconciliation_batch(
-    *,
-    structured_llm_method,
-    llm_model: str,
-    prompt: str,
-    expected_indices: tuple[int, ...],
-    incumbents: list[Memory],
-    require_incumbent_coverage: bool,
-    allow_unindexed_incumbents: bool,
-    decision_phase: str,
-    incumbent_audit: bool = False,
-) -> tuple[list[dict], int, float]:
+) -> tuple[list[SupportAuditEntry], int, float]:
+    results: list[SupportAuditEntry] = []
     calls = 0
-    elapsed_seconds = 0.0
-    batch_decisions: list[dict] = []
-    for validation_attempt in range(RECONCILIATION_BATCH_VALIDATION_ATTEMPTS):
-        calls += 1
-        llm_started = perf_counter()
-        try:
-            response = await structured_llm_method(
-                prompt,
-                max_tokens=4096,
-                model=llm_model,
-            )
-        finally:
-            elapsed_seconds += perf_counter() - llm_started
-        try:
-            if decision_phase == "candidate_relation":
-                batch_decisions = _bind_candidate_relation_decisions(
-                    response.decisions,
-                    expected_indices=expected_indices,
-                    incumbents=incumbents,
+    elapsed = 0.0
+    for offset in range(0, len(incumbents), RECONCILIATION_INCUMBENT_BATCH_SIZE):
+        batch = incumbents[offset : offset + RECONCILIATION_INCUMBENT_BATCH_SIZE]
+        prompt = INCUMBENT_SUPPORT_AUDIT_PROMPT.format(
+            update_mode=update_mode,
+            diff_stats=json.dumps(update_plan_stats or {}, ensure_ascii=False),
+            changed_hunks=(changed_hunks or "")[:40_000],
+            doc_type=doc_type,
+            updated_document=(updated_document or "")[:100_000],
+            incumbents=json.dumps(
+                [
+                    {"request_position": index, "content": memory.content, "memory_type": memory.memory_type}
+                    for index, memory in enumerate(batch)
+                ],
+                ensure_ascii=False,
+            ),
+        )
+        for attempt in range(RECONCILIATION_BATCH_VALIDATION_ATTEMPTS):
+            calls += 1
+            call_started = perf_counter()
+            try:
+                response = await structured_llm_client.audit_incumbent_support(
+                    prompt,
+                    max_tokens=4096,
+                    model=llm_model,
                 )
-            elif decision_phase == "incumbent_audit":
-                batch_decisions = _bind_incumbent_audit_decisions(
-                    response.decisions,
-                    incumbents=incumbents,
+            finally:
+                elapsed += perf_counter() - call_started
+            if len(response.decisions) == len(batch):
+                break
+            if attempt + 1 == RECONCILIATION_BATCH_VALIDATION_ATTEMPTS:
+                raise ValueError(
+                    f"incumbent support response count {len(response.decisions)} "
+                    f"does not match expected count {len(batch)}"
                 )
-            else:
-                raise ValueError(f"unknown reconciliation decision phase: {decision_phase}")
-            _validate_complete_reconciliation_batch(
-                batch_decisions,
-                incumbents,
-                expected_indices=set(expected_indices),
-                require_incumbent_coverage=require_incumbent_coverage,
-                allow_unindexed_incumbents=allow_unindexed_incumbents,
-                incumbent_audit=incumbent_audit,
+            prompt += "\nReturn the complete ordered support ledger; the previous response count was invalid."
+        results.extend(
+            SupportAuditEntry(incumbent_id=memory.id, supported=bool(decision.supported), reason=decision.reason)
+            for memory, decision in zip(batch, response.decisions, strict=True)
+        )
+    return results, calls, elapsed
+
+
+def _supported_revision_candidates(
+    relations: list[RelationLedgerEntry],
+    audits: list[SupportAuditEntry],
+) -> dict[str, tuple[int, ...]]:
+    supported = {entry.incumbent_id for entry in audits if entry.supported}
+    grouped: dict[str, list[int]] = {}
+    for entry in relations:
+        if (
+            entry.incumbent_id in supported
+            and entry.relation_type is MemoryRelationType.REFINES
+            and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
+        ):
+            grouped.setdefault(entry.incumbent_id, []).append(entry.candidate_index)
+    return {memory_id: tuple(sorted(indices)) for memory_id, indices in grouped.items()}
+
+
+async def _prove_revision_compositions(
+    *,
+    requests: list[tuple[int, str]],
+    new_extractions: list[RawMemory],
+    incumbents: dict[str, Memory],
+    structured_llm_client,
+    llm_model: str,
+) -> tuple[list[RevisionCompositionProof], int, float]:
+    if not requests:
+        return [], 0, 0.0
+    method = getattr(structured_llm_client, "prove_revision_compositions", None)
+    if not callable(method):
+        return [], 0, 0.0
+    proofs: list[RevisionCompositionProof] = []
+    calls = 0
+    elapsed = 0.0
+    for offset in range(0, len(requests), REVISION_COMPOSITION_BATCH_SIZE):
+        batch = requests[offset : offset + REVISION_COMPOSITION_BATCH_SIZE]
+        prompt = REVISION_COMPOSITION_PROMPT.format(
+            pairs_json=json.dumps(
+                [
+                    {
+                        "pair_index": pair_index,
+                        "incumbent": {
+                            "content": incumbents[incumbent_id].content,
+                            "memory_type": incumbents[incumbent_id].memory_type,
+                            "valid_from": (
+                                incumbents[incumbent_id].valid_from.isoformat()
+                                if incumbents[incumbent_id].valid_from
+                                else None
+                            ),
+                            "valid_until": (
+                                incumbents[incumbent_id].valid_until.isoformat()
+                                if incumbents[incumbent_id].valid_until
+                                else None
+                            ),
+                        },
+                        "challenger": {
+                            "content": new_extractions[candidate_index].content,
+                            "memory_type": new_extractions[candidate_index].memory_type,
+                            "valid_from": new_extractions[candidate_index].valid_from,
+                            "valid_until": new_extractions[candidate_index].valid_until,
+                        },
+                        "current_primary_evidence_excerpt": (
+                            new_extractions[candidate_index].evidence_quote or ""
+                        ),
+                        "required_evidence_count": len(
+                            new_extractions[candidate_index].required_source_observation_ids
+                        ),
+                    }
+                    for pair_index, (candidate_index, incumbent_id) in enumerate(batch)
+                ],
+                ensure_ascii=False,
             )
-        except ValueError as exc:
-            if validation_attempt + 1 >= RECONCILIATION_BATCH_VALIDATION_ATTEMPTS:
-                raise
-            logger.warning(
-                "Reconciliation batch validation failed: %s — retrying only this batch",
-                exc,
-            )
-            prompt = (
-                f"{prompt}\n\n<validation_feedback>\n"
-                f"The previous response was rejected: {exc}. "
-                "Return a complete corrected decisions ledger that satisfies every rule.\n"
-                "</validation_feedback>"
-            )
+        )
+        by_index = None
+        for attempt in range(RECONCILIATION_BATCH_VALIDATION_ATTEMPTS):
+            calls += 1
+            call_started = perf_counter()
+            try:
+                response = await method(prompt, max_tokens=4096, model=llm_model)
+            except Exception as error:  # proof failure is a non-destructive fallback
+                logger.warning(
+                    "Revision composition proof failed; falling back to KEEP + ADD: %s",
+                    error,
+                )
+                break
+            finally:
+                elapsed += perf_counter() - call_started
+            candidate_by_index = {decision.pair_index: decision for decision in response.decisions}
+            if (
+                len(candidate_by_index) == len(response.decisions) == len(batch)
+                and set(candidate_by_index) == set(range(len(batch)))
+            ):
+                by_index = candidate_by_index
+                break
+            if attempt + 1 == RECONCILIATION_BATCH_VALIDATION_ATTEMPTS:
+                logger.warning(
+                    "Revision composition coverage invalid; falling back to KEEP + ADD"
+                )
+                break
+            prompt += "\nReturn every requested pair_index exactly once; the previous ledger was incomplete."
+        if by_index is None:
             continue
-        break
-    return batch_decisions, calls, elapsed_seconds
+        for pair_index, (candidate_index, incumbent_id) in enumerate(batch):
+            raw = new_extractions[candidate_index]
+            decision = by_index[pair_index]
+            proofs.append(
+                RevisionCompositionProof(
+                    candidate_index=candidate_index,
+                    incumbent_id=incumbent_id,
+                    same_memory_identity=decision.same_memory_identity,
+                    preserves_incumbent_truth=decision.preserves_incumbent_truth,
+                    candidate_is_canonical_composite=decision.candidate_is_canonical_composite,
+                    current_evidence_entails_candidate=(
+                        decision.current_evidence_entails_candidate
+                    ),
+                    complete_current_evidence=bool(
+                        raw.source_observation_id
+                        and raw.evidence_resolved_from_block
+                        and (raw.evidence_quote or "").strip()
+                        and not raw.required_source_observation_ids
+                    ),
+                    reason=decision.reason,
+                )
+            )
+    return proofs, calls, elapsed
 
 
 def _return_result(
@@ -483,431 +678,5 @@ def _return_result(
     include_metadata: bool,
 ) -> list[ReconcileOperation] | ReconciliationResult:
     if include_metadata:
-        return ReconciliationResult(
-            operations=operations,
-            failure=failure,
-            metrics=metrics,
-        )
+        return ReconciliationResult(operations=operations, failure=failure, metrics=metrics)
     return operations
-
-
-def _parse_decisions(
-    decisions: list[dict],
-    new_extractions: list[RawMemory],
-    existing_memories: list[Memory],
-    *,
-    add_uncovered: bool = True,
-) -> list[ReconcileOperation]:
-    """Parse LLM decisions into ReconcileOperations."""
-    ops: list[ReconcileOperation] = []
-    existing_ids = {mem.id for mem in existing_memories}
-
-    # Track which indices we've seen
-    seen_indices: set[int] = set()
-
-    for dec in decisions:
-        idx = dec.get("index", -1)
-        if not isinstance(idx, int) or idx < 0 or idx >= len(new_extractions) or idx in seen_indices:
-            memory_id = dec.get("memory_id")
-            if memory_id not in existing_ids:
-                continue
-            action_str = dec.get("action", "").upper()
-            try:
-                action = ReconcileAction(action_str)
-            except ValueError:
-                continue
-            if action not in (ReconcileAction.DELETE, ReconcileAction.NOOP):
-                continue
-            ops.append(
-                ReconcileOperation(
-                    action=action,
-                    memory_id=memory_id,
-                    reason=dec.get("reason", ""),
-                    flag_for_review=bool(dec.get("flag_for_review")),
-                )
-            )
-            continue
-        seen_indices.add(idx)
-
-        action_str = dec.get("action", "ADD").upper()
-        try:
-            action = ReconcileAction(action_str)
-        except ValueError:
-            action = ReconcileAction.ADD
-
-        raw = new_extractions[idx]
-        memory_id = dec.get("memory_id")
-        reason = dec.get("reason", "")
-
-        if action == ReconcileAction.UPDATE and memory_id and dec.get("updated_content"):
-            # UPDATE: create a modified version of the raw memory with merged content
-            updated_raw = RawMemory(
-                content=dec["updated_content"],
-                memory_type=raw.memory_type,
-                confidence=raw.confidence,
-                entity_refs=raw.entity_refs,
-                valid_from=raw.valid_from,
-                valid_until=raw.valid_until,
-                extraction_context=raw.extraction_context,
-                evidence_quote=raw.evidence_quote,
-                evidence_resolved_from_block=raw.evidence_resolved_from_block,
-                evidence_range_start=raw.evidence_range_start,
-                evidence_range_end=raw.evidence_range_end,
-                evidence_anchor=raw.evidence_anchor,
-                source_observation_id=raw.source_observation_id,
-                required_source_observation_ids=list(raw.required_source_observation_ids),
-            )
-            ops.append(
-                ReconcileOperation(
-                    action=action,
-                    memory_id=memory_id,
-                    memory=updated_raw,
-                    reason=reason,
-                    flag_for_review=bool(dec.get("flag_for_review")),
-                )
-            )
-        elif action in (ReconcileAction.SUPERSEDE, ReconcileAction.DELETE) and memory_id:
-            ops.append(
-                ReconcileOperation(
-                    action=action,
-                    memory_id=memory_id,
-                    memory=raw,
-                    reason=reason,
-                    flag_for_review=bool(dec.get("flag_for_review")),
-                )
-            )
-        elif action == ReconcileAction.NOOP:
-            ops.append(
-                ReconcileOperation(
-                    action=action,
-                    memory_id=memory_id,
-                    memory=raw,
-                    reason=reason,
-                    flag_for_review=bool(dec.get("flag_for_review")),
-                )
-            )
-        else:
-            # ADD or fallback
-            ops.append(
-                ReconcileOperation(
-                    action=ReconcileAction.ADD,
-                    memory=raw,
-                    reason=reason,
-                    flag_for_review=bool(dec.get("flag_for_review")),
-                )
-            )
-
-    # Any new extractions not covered by decisions → ADD
-    for i, raw in enumerate(new_extractions):
-        if add_uncovered and i not in seen_indices:
-            ops.append(
-                ReconcileOperation(
-                    action=ReconcileAction.ADD,
-                    memory=raw,
-                    reason="Not covered by reconciliation",
-                )
-            )
-
-    return ops
-
-
-def _validate_complete_reconciliation_batch(
-    decisions: list[dict],
-    incumbents: list[Memory],
-    *,
-    expected_indices: set[int],
-    require_incumbent_coverage: bool,
-    allow_unindexed_incumbents: bool,
-    incumbent_audit: bool = False,
-) -> None:
-    indices = [
-        decision.get("index")
-        for decision in decisions
-        if isinstance(decision.get("index"), int)
-        and int(decision["index"]) in expected_indices
-    ]
-    unexpected_indices = sorted(
-        {
-            int(decision["index"])
-            for decision in decisions
-            if isinstance(decision.get("index"), int)
-            and int(decision["index"]) not in expected_indices
-        }
-    )
-    if unexpected_indices:
-        raise ValueError(f"unexpected new extraction decisions: {unexpected_indices}")
-    duplicate_indices = sorted({index for index in indices if indices.count(index) > 1})
-    if duplicate_indices:
-        raise ValueError(f"duplicate new extraction decisions: {duplicate_indices}")
-    missing_indices = sorted(expected_indices.difference(indices))
-    if missing_indices:
-        raise ValueError(f"missing new extraction decisions: {missing_indices}")
-
-    expected = {memory.id for memory in incumbents}
-    unknown_incumbents = sorted(
-        {
-            str(decision["memory_id"])
-            for decision in decisions
-            if decision.get("memory_id") is not None
-            and decision.get("memory_id") not in expected
-        }
-    )
-    if unknown_incumbents:
-        raise ValueError(f"unexpected incumbent decisions: {unknown_incumbents}")
-    if not allow_unindexed_incumbents:
-        unindexed = [
-            str(decision.get("memory_id"))
-            for decision in decisions
-            if not isinstance(decision.get("index"), int)
-        ]
-        if unindexed:
-            raise ValueError(
-                f"candidate relation batch emitted unindexed incumbent decisions: {unindexed}"
-            )
-        deleted_candidates = sorted(
-            int(decision["index"])
-            for decision in decisions
-            if str(decision.get("action", "")).upper() == "DELETE"
-            and isinstance(decision.get("index"), int)
-        )
-        if deleted_candidates:
-            raise ValueError(
-                f"candidate relation batch emitted DELETE decisions: {deleted_candidates}"
-            )
-    seen = {
-        str(decision["memory_id"])
-        for decision in decisions
-        if decision.get("memory_id") in expected
-    }
-    missing = sorted(expected.difference(seen)) if require_incumbent_coverage else []
-    if missing:
-        raise ValueError(f"missing incumbent decisions: {missing}")
-
-    if incumbent_audit:
-        invalid_actions = sorted(
-            {
-                str(decision.get("action", "")).upper()
-                for decision in decisions
-                if str(decision.get("action", "")).upper() not in {"NOOP", "DELETE"}
-            }
-        )
-        if invalid_actions:
-            raise ValueError(
-                f"incumbent support audit emitted invalid actions: {invalid_actions}"
-            )
-
-    for memory_id in sorted(expected):
-        group = [item for item in decisions if item.get("memory_id") == memory_id]
-        if not group:
-            continue
-        dispositions = {_incumbent_disposition(item) for item in group}
-        if None in dispositions:
-            raise ValueError(f"invalid incumbent decision for {memory_id}")
-        if len(dispositions) > 1:
-            raise ValueError(f"conflicting incumbent decisions for {memory_id}")
-        replacements = [
-            item
-            for item in group
-            if isinstance(item.get("index"), int)
-            and str(item.get("action", "")).upper() in {"UPDATE", "SUPERSEDE"}
-        ]
-        if "replace" in dispositions and not replacements:
-            raise ValueError(
-                f"replacement decision for incumbent {memory_id} requires a new extraction index"
-            )
-        if len(replacements) > 1:
-            raise ValueError(f"multiple replacement candidates for incumbent {memory_id}")
-
-
-def _incumbent_disposition(decision: dict) -> str | None:
-    action = str(decision.get("action", "")).upper()
-    if action == "NOOP":
-        return "keep"
-    if action in {"UPDATE", "SUPERSEDE"}:
-        return "replace"
-    if action == "DELETE":
-        return "remove"
-    return None
-
-
-def _merge_complete_batch_decisions(
-    decisions: list[dict],
-    new_extractions: list[RawMemory],
-    existing_memories: list[Memory],
-) -> list[ReconcileOperation]:
-    """Merge bounded incumbent batches into one unambiguous operation ledger."""
-
-    existing_ids = {memory.id for memory in existing_memories}
-    review_conflicts = _classify_composed_incumbent_conflicts(
-        decisions,
-        existing_ids=existing_ids,
-    )
-    by_index: dict[int, list[dict]] = {index: [] for index in range(len(new_extractions))}
-    by_incumbent: dict[str, list[dict]] = {memory_id: [] for memory_id in existing_ids}
-    for decision in decisions:
-        memory_id = decision.get("memory_id")
-        if memory_id in existing_ids:
-            by_incumbent[str(memory_id)].append(decision)
-        index = decision.get("index")
-        if isinstance(index, int) and index in by_index:
-            by_index[index].append(decision)
-
-    operations: list[ReconcileOperation] = []
-    consumed_incumbents: set[str] = set()
-    for index, raw in enumerate(new_extractions):
-        candidates = by_index[index]
-        destructive = [
-            item
-            for item in candidates
-            if str(item.get("action", "")).upper() in {"UPDATE", "SUPERSEDE", "DELETE"}
-            and item.get("memory_id") in existing_ids
-        ]
-        destructive_targets = {str(item["memory_id"]) for item in destructive}
-        if len(destructive_targets) > 1:
-            raise ValueError(
-                f"new extraction {index} matches multiple destructive incumbents: "
-                f"{sorted(destructive_targets)}"
-            )
-        if destructive:
-            chosen = destructive[0]
-        else:
-            noop = [
-                item
-                for item in candidates
-                if str(item.get("action", "")).upper() == "NOOP"
-                and item.get("memory_id") in existing_ids
-            ]
-            chosen = (
-                sorted(noop, key=lambda item: str(item.get("memory_id")))[0]
-                if noop
-                else next(
-                    (
-                        item
-                        for item in candidates
-                        if str(item.get("action", "")).upper() in {"ADD", "NOOP"}
-                    ),
-                    {"index": index, "action": "ADD", "reason": "new claim"},
-                )
-            )
-        chosen = dict(chosen)
-        chosen_memory_id = chosen.get("memory_id")
-        review_conflict = review_conflicts.get(str(chosen_memory_id))
-        if review_conflict is not None:
-            relation_disposition, audit_disposition = review_conflict
-            if relation_disposition == "replace":
-                chosen["flag_for_review"] = True
-                chosen["reason"] = _conflicting_judgment_review_reason(
-                    relation_disposition,
-                    audit_disposition,
-                )
-            else:
-                # The candidate is an explicit semantic duplicate, while the
-                # independent audit proposes removing the incumbent's support.
-                # The incumbent-only DELETE below owns the Review; this
-                # candidate must not create a second lifecycle operation.
-                chosen["memory_id"] = None
-        if chosen_memory_id in consumed_incumbents:
-            if str(chosen.get("action", "")).upper() != "NOOP":
-                raise ValueError(
-                    f"incumbent {chosen_memory_id} matches multiple destructive new extractions"
-                )
-            # The candidate is explicitly a duplicate, but the incumbent's one
-            # lifecycle KEEP was already recorded by an earlier candidate.
-            chosen["memory_id"] = None
-        parsed = _parse_decisions(
-            [chosen],
-            new_extractions,
-            existing_memories,
-            add_uncovered=False,
-        )
-        if len(parsed) != 1:
-            raise ValueError(f"new extraction {index} did not produce exactly one decision")
-        operations.extend(parsed)
-        if chosen.get("memory_id") in existing_ids:
-            consumed_incumbents.add(str(chosen["memory_id"]))
-
-    for memory in existing_memories:
-        if memory.id in consumed_incumbents:
-            continue
-        group = by_incumbent[memory.id]
-        unindexed = [item for item in group if not isinstance(item.get("index"), int)]
-        decision = dict(unindexed[0] if unindexed else group[0])
-        review_conflict = review_conflicts.get(memory.id)
-        if review_conflict is not None:
-            relation_disposition, audit_disposition = review_conflict
-            decision["flag_for_review"] = True
-            decision["reason"] = _conflicting_judgment_review_reason(
-                relation_disposition,
-                audit_disposition,
-            )
-        # Indexed NOOP rows are also explicit incumbent KEEP decisions. If the
-        # candidate chose another compatible match, normalize this row to the
-        # one incumbent-only operation required by the Lifecycle Planner.
-        decision["index"] = None
-        decision["memory_id"] = memory.id
-        parsed = _parse_decisions(
-            [decision],
-            new_extractions,
-            existing_memories,
-            add_uncovered=False,
-        )
-        if len(parsed) != 1:
-            raise ValueError(f"incumbent {memory.id} did not produce exactly one decision")
-        operations.extend(parsed)
-
-    return operations
-
-
-def _classify_composed_incumbent_conflicts(
-    decisions: list[dict],
-    *,
-    existing_ids: set[str],
-) -> dict[str, tuple[str, str]]:
-    """Return complete semantic disagreements that require Lifecycle Review."""
-
-    conflicts: dict[str, tuple[str, str]] = {}
-    for memory_id in sorted(existing_ids):
-        related = [
-            decision
-            for decision in decisions
-            if decision.get("memory_id") == memory_id and isinstance(decision.get("index"), int)
-        ]
-        audits = [
-            decision
-            for decision in decisions
-            if decision.get("memory_id") == memory_id and not isinstance(decision.get("index"), int)
-        ]
-        if len(audits) != 1:
-            raise ValueError(f"incumbent {memory_id} requires exactly one independent support audit")
-        relation_dispositions = {
-            _incumbent_disposition(decision) for decision in related if _incumbent_disposition(decision) is not None
-        }
-        if len(relation_dispositions) > 1:
-            raise ValueError(f"conflicting candidate relations for incumbent {memory_id}")
-        if not relation_dispositions:
-            continue
-        relation_disposition = next(iter(relation_dispositions))
-        audit_disposition = _incumbent_disposition(audits[0])
-        if audit_disposition is None:
-            raise ValueError(f"invalid incumbent support audit for {memory_id}")
-        compatible = (relation_disposition == "keep" and audit_disposition == "keep") or (
-            relation_disposition == "replace" and audit_disposition == "remove"
-        )
-        if not compatible:
-            conflicts[memory_id] = (relation_disposition, audit_disposition)
-    return conflicts
-
-
-def _conflicting_judgment_review_reason(
-    relation_disposition: str,
-    audit_disposition: str,
-) -> str:
-    return (
-        "candidate relation and incumbent support audit disagree "
-        f"(relation={relation_disposition}, audit={audit_disposition})"
-    )
-
-
-def _fallback_add_all(new_extractions: list[RawMemory]) -> list[ReconcileOperation]:
-    """Treat candidates as ADD only when no incumbent lifecycle is at risk."""
-    return [ReconcileOperation(action=ReconcileAction.ADD, memory=raw) for raw in new_extractions]

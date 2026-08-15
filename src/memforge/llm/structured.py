@@ -322,34 +322,13 @@ class CandidateLedgerResponse(StructuredResponseModel):
     decisions: list[CandidateLedgerDecision]
 
 
-class CandidateRelationDecision(StructuredResponseModel):
-    """One candidate disposition inside a bounded incumbent relation cell."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    action: Literal["ADD", "UPDATE", "SUPERSEDE", "NOOP"]
-    incumbent_slot: int | None = Field(default=None, ge=0, le=29)
-    updated_content: str | None = None
-    reason: str | None = None
-    flag_for_review: bool = False
-
-
-class CandidateRelationResponse(StructuredResponseModel):
-    """Ordered candidate side of a composed reconciliation ledger."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    decisions: list[CandidateRelationDecision]
-
-
 class IncumbentSupportAuditDecision(StructuredResponseModel):
-    """One incumbent's support disposition independent of candidate matching."""
+    """One factual Source Unit support judgment, without lifecycle semantics."""
 
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["DELETE", "NOOP"]
-    reason: str | None = None
-    flag_for_review: bool = False
+    supported: bool
+    reason: str = Field(default="", max_length=1000)
 
 
 class IncumbentSupportAuditResponse(StructuredResponseModel):
@@ -358,6 +337,27 @@ class IncumbentSupportAuditResponse(StructuredResponseModel):
     model_config = ConfigDict(extra="forbid")
 
     decisions: list[IncumbentSupportAuditDecision]
+
+
+class RevisionCompositionDecision(StructuredResponseModel):
+    """One transient proof that a REFINES pair is eligible for revision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pair_index: int = Field(ge=0)
+    same_memory_identity: bool
+    preserves_incumbent_truth: bool
+    candidate_is_canonical_composite: bool
+    current_evidence_entails_candidate: bool
+    reason: str = Field(default="", max_length=1000)
+
+
+class RevisionCompositionResponse(StructuredResponseModel):
+    """Ordered revision proofs for exact REFINES pairs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[RevisionCompositionDecision]
 
 
 class MemoryRelationDecision(StructuredResponseModel):
@@ -775,15 +775,6 @@ class SourceSupportStructuredClient(Protocol):
     ) -> CandidateLedgerResponse:
         """Return one bounded candidate-admission ledger batch."""
 
-    async def reconcile_candidate_relations(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 4096,
-        model: str | None = None,
-    ) -> CandidateRelationResponse:
-        """Return candidate-only decisions for one relation-matrix cell."""
-
     async def audit_incumbent_support(
         self,
         prompt: str,
@@ -792,6 +783,15 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> IncumbentSupportAuditResponse:
         """Return one support disposition for every incumbent in an audit batch."""
+
+    async def prove_revision_compositions(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 4096,
+        model: str | None = None,
+    ) -> RevisionCompositionResponse:
+        """Return transient revision-eligibility proofs for REFINES pairs."""
 
     async def classify_memory_relations(
         self,
@@ -1414,20 +1414,6 @@ class LiteLlmStructuredClient:
             model=model,
         )
 
-    async def reconcile_candidate_relations(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 4096,
-        model: str | None = None,
-    ) -> CandidateRelationResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=CandidateRelationResponse,
-            max_tokens=max_tokens,
-            model=model,
-        )
-
     async def audit_incumbent_support(
         self,
         prompt: str,
@@ -1438,6 +1424,20 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=IncumbentSupportAuditResponse,
+            max_tokens=max_tokens,
+            model=model,
+        )
+
+    async def prove_revision_compositions(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 4096,
+        model: str | None = None,
+    ) -> RevisionCompositionResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=RevisionCompositionResponse,
             max_tokens=max_tokens,
             model=model,
         )
