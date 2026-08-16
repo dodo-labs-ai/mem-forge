@@ -83,6 +83,7 @@ from memforge.source_derivation import (
     source_derivation_manifest,
 )
 from memforge.config import AgentEvaluationConfig, AppConfig, SyncConfig
+from memforge.evals.agent_evaluation import runtime_session_id
 from memforge.storage.database import Database
 from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -10417,6 +10418,15 @@ async def test_failed_diff_guided_derivation_falls_back_to_durable_structural_wo
     )
     extractor = FailingDiffThenStructuralExtractor(raise_error=raise_error)
     memory_engine = RecordingMemoryEngine()
+
+    class RecordingRuntimeEventTraceSink:
+        def __init__(self) -> None:
+            self.batches = []
+
+        def publish(self, events) -> None:
+            self.batches.append(events)
+
+    trace_sink = RecordingRuntimeEventTraceSink()
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=doc_store,
@@ -10424,6 +10434,7 @@ async def test_failed_diff_guided_derivation_falls_back_to_durable_structural_wo
         memory_engine=memory_engine,
         memory_store=_audited_memory_store(db),
         max_concurrent=1,
+        runtime_event_trace_sink=trace_sink,
     )
 
     state = await orchestrator.sync_gene(
@@ -10446,6 +10457,11 @@ async def test_failed_diff_guided_derivation_falls_back_to_durable_structural_wo
         "superseded",
         "applied",
     ]
+    runtime_events = [event for batch in trace_sink.batches for event in batch]
+    assert len({event.projection_run_id for event in runtime_events}) == 1
+    assert len({event.derivation_id for event in runtime_events}) == 2
+    assert len({event.trace_id for event in runtime_events}) == 2
+    assert len({runtime_session_id(event.projection_run_id) for event in runtime_events}) == 1
     assert len(memory_engine.projected_lifecycle_calls) == 1
     assert memory_engine.projected_lifecycle_calls[0]["update_mode"] == "diff_guided"
 

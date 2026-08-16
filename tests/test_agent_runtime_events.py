@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -19,6 +20,8 @@ from memforge.evals.agent_evaluation import (
     runtime_event_otel_attributes,
     publish_runtime_events,
     runtime_event_trace_sink_from_env,
+    runtime_session_id,
+    runtime_trace_id,
     summarize_agent_runtime_events,
 )
 from memforge.storage.database import Database
@@ -42,7 +45,13 @@ async def db(tmp_path):
     await database.close()
 
 
-def _events(*signals: QualitySignal):
+def _events(
+    *signals: QualitySignal,
+    projection_run_id: str = "spr-current",
+    derivation_id: str = "sda-current",
+    batch_id: str = "batch-1",
+    batch_attempt: int = 1,
+):
     return bind_quality_signals(
         tuple(signals),
         source_id="src-teams",
@@ -50,10 +59,10 @@ def _events(*signals: QualitySignal):
         doc_id="doc-window",
         source_unit_id="unit-window",
         target_unit_revision_id="sur-current",
-        projection_run_id="spr-current",
-        derivation_id="sda-current",
-        batch_id="batch-1",
-        batch_attempt=1,
+        projection_run_id=projection_run_id,
+        derivation_id=derivation_id,
+        batch_id=batch_id,
+        batch_attempt=batch_attempt,
         extraction_contract_version="projection-extraction-v8",
         occurred_at=NOW,
     )
@@ -377,6 +386,20 @@ class _FakeLangfuseClient:
         self.calls.append(("shutdown", {}))
 
 
+def _langfuse_sink(
+    client: _FakeLangfuseClient,
+    attribute_scopes: list[dict[str, object]] | None = None,
+) -> LangfuseRuntimeEventTraceSink:
+    scopes = attribute_scopes if attribute_scopes is not None else []
+
+    @contextmanager
+    def attribute_scope(**kwargs):
+        scopes.append(kwargs)
+        yield
+
+    return LangfuseRuntimeEventTraceSink(client, attribute_scope)
+
+
 @pytest.fixture(autouse=True)
 def _reset_runtime_trace_sink_cache():
     runtime_event_trace_sink_from_env.cache_clear()
@@ -397,7 +420,7 @@ def test_langfuse_sink_projects_allowlisted_metadata_and_event_id() -> None:
     )
     client = _FakeLangfuseClient()
 
-    LangfuseRuntimeEventTraceSink(client).publish((event,))
+    _langfuse_sink(client).publish((event,))
 
     projected_event = next(payload for kind, payload in client.calls if kind == "event")
     assert projected_event["metadata"]["event_id"] == event.event_id
@@ -437,7 +460,7 @@ def test_langfuse_sink_omits_durable_only_structured_attempt_identifiers() -> No
     )
     client = _FakeLangfuseClient()
 
-    LangfuseRuntimeEventTraceSink(client).publish((event,))
+    _langfuse_sink(client).publish((event,))
 
     projected_event = next(payload for kind, payload in client.calls if kind == "event")
     assert projected_event["metadata"]["attempt_index"] == 1
@@ -455,6 +478,66 @@ def test_runtime_trace_sink_failure_is_best_effort(caplog) -> None:
     publish_runtime_events(FailingSink(), _events(QualitySignal("batch", "failed", "provider_error")))
     NoOpRuntimeEventTraceSink().publish(())
     assert "trace projection failed" in caplog.text
+    assert "session_id=mfs1-83cf15f58a5beafef62844440de30fbc" in caplog.text
+    assert f"trace_id={_events(QualitySignal('batch', 'failed', 'provider_error'))[0].trace_id}" in caplog.text
+    assert "event_count=1" in caplog.text
+
+
+def test_langfuse_sink_groups_fallback_derivations_in_one_projection_session() -> None:
+    [diff_event] = _events(
+        QualitySignal("extraction_batch_outcome", "failed", "diff_guided_extraction_error"),
+        derivation_id="sdrv-diff",
+        batch_id="dbatch-diff",
+    )
+    [structural_event] = _events(
+        QualitySignal("extraction_batch_outcome", "expected", "candidates_extracted"),
+        derivation_id="sdrv-structural",
+        batch_id="sbatch-structural",
+    )
+    client = _FakeLangfuseClient()
+    attribute_scopes: list[dict[str, object]] = []
+    sink = _langfuse_sink(client, attribute_scopes)
+
+    sink.publish((diff_event,))
+    sink.publish((structural_event,))
+
+    assert [scope["session_id"] for scope in attribute_scopes] == [
+        "mfs1-83cf15f58a5beafef62844440de30fbc",
+        "mfs1-83cf15f58a5beafef62844440de30fbc",
+    ]
+    assert all(scope["trace_name"] == "memforge.agent.extraction_batch" for scope in attribute_scopes)
+    assert all(scope["version"] == "projection-extraction-v8" for scope in attribute_scopes)
+    assert all(
+        scope["tags"] == ["memforge-agent-eval", "memory-extraction", "source-type:teams"] for scope in attribute_scopes
+    )
+    root_trace_ids = [payload["trace_context"]["trace_id"] for kind, payload in client.calls if kind == "root"]
+    assert root_trace_ids == [diff_event.trace_id, structural_event.trace_id]
+    assert diff_event.trace_id != structural_event.trace_id
+
+
+def test_runtime_session_id_is_bounded_versioned_and_projection_specific() -> None:
+    assert runtime_session_id("spr-current") == "mfs1-83cf15f58a5beafef62844440de30fbc"
+    assert runtime_session_id("spr-next") == "mfs1-d3f07dda65d93f39803da948c533759b"
+
+
+def test_runtime_trace_id_guards_w3c_all_zero_value(monkeypatch) -> None:
+    class ZeroDigest:
+        def hexdigest(self) -> str:
+            return "0" * 64
+
+    monkeypatch.setattr(
+        "memforge.evals.agent_evaluation.hashlib.sha256",
+        lambda _value: ZeroDigest(),
+    )
+
+    assert (
+        runtime_trace_id(
+            derivation_id="sdrv-zero",
+            batch_id="batch-zero",
+            batch_attempt=1,
+        )
+        == "0" * 31 + "1"
+    )
 
 
 def test_runtime_trace_sink_is_disabled_without_importing_langfuse(monkeypatch) -> None:
@@ -480,6 +563,7 @@ def test_runtime_trace_sink_uses_langfuse_only_when_enabled(monkeypatch) -> None
     def fake_import(name: str):
         if name == "langfuse":
             return SimpleNamespace(
+                propagate_attributes=lambda **_kwargs: nullcontext(),
                 Langfuse=lambda **kwargs: (
                     client
                     if kwargs
