@@ -557,29 +557,87 @@ def test_unsupported_equivalent_does_not_drop_sibling_refinement() -> None:
     assert operations[1].flag_for_review is True
 
 
-def test_equivalent_candidate_with_multiple_incumbents_fails_closed() -> None:
+def test_equivalent_candidate_rebinds_each_supported_incumbent() -> None:
     first = _memory("mem-first", "Retries use exponential backoff.")
     second = _memory("mem-second", "Retry delays increase exponentially.")
     candidate = RawMemory(content="Retries back off exponentially.", memory_type="fact")
 
-    with pytest.raises(ValueError, match="multiple incumbents"):
-        reduce_relation_ledger(
-            new_extractions=[candidate],
-            existing_memories=[first, second],
-            relations=[
-                RelationLedgerEntry(
-                    candidate_index=0,
-                    incumbent_id=memory.id,
-                    relation_type=MemoryRelationType.EQUIVALENT,
-                    direction=RelationDirection.SYMMETRIC,
-                )
-                for memory in (first, second)
-            ],
-            support_audits=[
-                SupportAuditEntry(incumbent_id=memory.id, supported=True)
-                for memory in (first, second)
-            ],
-        )
+    operations = reduce_relation_ledger(
+        new_extractions=[candidate],
+        existing_memories=[first, second],
+        relations=[
+            RelationLedgerEntry(
+                candidate_index=0,
+                incumbent_id=memory.id,
+                relation_type=MemoryRelationType.EQUIVALENT,
+                direction=RelationDirection.SYMMETRIC,
+            )
+            for memory in (first, second)
+        ],
+        support_audits=[SupportAuditEntry(incumbent_id=memory.id, supported=True) for memory in (first, second)],
+    )
+
+    assert [operation.action for operation in operations] == [
+        ReconcileAction.NOOP,
+        ReconcileAction.NOOP,
+    ]
+    assert [operation.memory_id for operation in operations] == [first.id, second.id]
+    assert all(operation.memory is candidate for operation in operations)
+
+
+def test_runbook_candidate_with_multiple_incumbents_falls_back_to_keep_and_add() -> None:
+    incumbents = [
+        _memory(
+            "mem-http-404",
+            "For HTTP 404, check service health, retrigger, then open a DwC issue if it persists.",
+        ),
+        _memory(
+            "mem-http-502-503",
+            "For HTTP 502 or 503, wait for service recovery and then retrigger the process.",
+        ),
+        _memory(
+            "mem-other-errors",
+            "For other invalid process map errors, create a design-time Jira defect.",
+        ),
+    ]
+    current_procedure = RawMemory(
+        content=(
+            "Diagnose an invalid process map from its actual HTTP error, then follow the status-specific recovery path."
+        ),
+        memory_type="procedure",
+    )
+
+    operations = reduce_relation_ledger(
+        new_extractions=[current_procedure],
+        existing_memories=incumbents,
+        relations=[
+            RelationLedgerEntry(
+                candidate_index=0,
+                incumbent_id=incumbent.id,
+                relation_type=MemoryRelationType.REFINES,
+                direction=RelationDirection.CHALLENGER_TO_CANDIDATE,
+                reason="The current procedure is related but does not prove lossless replacement.",
+            )
+            for incumbent in incumbents
+        ],
+        support_audits=[
+            SupportAuditEntry(
+                incumbent_id=incumbent.id,
+                supported=True,
+                reason="The branch remains supported in the current runbook.",
+            )
+            for incumbent in incumbents
+        ],
+    )
+
+    assert [operation.action for operation in operations] == [
+        ReconcileAction.ADD,
+        ReconcileAction.NOOP,
+        ReconcileAction.NOOP,
+        ReconcileAction.NOOP,
+    ]
+    assert operations[0].memory is current_procedure
+    assert [operation.memory_id for operation in operations[1:]] == [incumbent.id for incumbent in incumbents]
 
 
 @pytest.mark.asyncio
