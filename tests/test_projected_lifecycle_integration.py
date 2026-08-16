@@ -22,6 +22,7 @@ from memforge.llm.structured import (
     StructuredLlmError,
 )
 from memforge.evals.agent_evaluation import (
+    AgentAssessmentQuery,
     AgentRuntimeEventQuery,
     QualitySignal,
     bind_quality_signals,
@@ -1905,6 +1906,18 @@ async def test_source_deriver_binds_provider_neutral_quality_events_to_current_l
     assert event.model == "anthropic/claude-sonnet"
     assert len(event.trace_id or "") == 32
     assert not hasattr(event, "memory_content")
+    assessments = await db.list_agent_assessments(
+        AgentAssessmentQuery(
+            occurred_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            occurred_to=datetime(2027, 1, 1, tzinfo=timezone.utc),
+            requesting_user_id="user-1",
+            include_private=True,
+            source_id=projection.source_id,
+        )
+    )
+    assert [(assessment.target_event_id, assessment.criterion, assessment.label) for assessment in assessments] == [
+        (event.event_id, "evidence_reference_validity", "fail")
+    ]
 
 
 @pytest.mark.asyncio

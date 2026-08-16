@@ -266,6 +266,38 @@ export interface Source {
   sync_schedule?: SourceSyncSchedule | null;
 }
 
+export interface AgentAssessmentSummary {
+  total_assessments: number;
+  runtime_event_count: number;
+  eligible_assessment_count: number;
+  missing_assessment_count: number;
+  label_counts: Record<string, number>;
+  criterion_counts: Record<string, number>;
+  status_counts: Record<string, number>;
+  truncated: boolean;
+}
+
+export interface AgentAssessmentView {
+  assessment_id: string;
+  target_event_id: string;
+  criterion: string;
+  status: "completed" | "failed";
+  label: "pass" | "fail" | "needs_review" | null;
+  reason_code: string;
+  annotator_kind: "code" | "llm" | "human";
+  evaluator_name: string;
+  evaluator_version: string;
+  created_at: string;
+  occurrence_count: number;
+}
+
+export interface SourceAgentEvaluationResponse {
+  source_id: string;
+  window: { from: string; to: string; days: number };
+  summary: AgentAssessmentSummary;
+  assessments: AgentAssessmentView[];
+}
+
 export interface SourceProject {
   project: string;
   document_count: number;

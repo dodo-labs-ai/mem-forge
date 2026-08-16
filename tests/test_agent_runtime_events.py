@@ -8,20 +8,24 @@ from types import SimpleNamespace
 import pytest
 
 from memforge.evals.agent_evaluation import (
+    AgentAssessmentQuery,
     AgentRuntimeEventQuery,
     QualitySignal,
     QualitySignalCollector,
     RuntimeTraceContext,
     LangfuseRuntimeEventTraceSink,
     NoOpRuntimeEventTraceSink,
+    assessment_sink_for_runtime_sink,
     bind_quality_signals,
     current_deployment_revision,
+    evaluate_runtime_events,
     event_public_payload,
     runtime_event_otel_attributes,
     publish_runtime_events,
     runtime_event_trace_sink_from_env,
     runtime_session_id,
     runtime_trace_id,
+    summarize_agent_assessments,
     summarize_agent_runtime_events,
 )
 from memforge.storage.database import Database
@@ -382,6 +386,9 @@ class _FakeLangfuseClient:
     def create_event(self, **kwargs):
         self.calls.append(("event", kwargs))
 
+    def create_score(self, **kwargs):
+        self.calls.append(("score", kwargs))
+
     def shutdown(self) -> None:
         self.calls.append(("shutdown", {}))
 
@@ -438,6 +445,97 @@ def test_langfuse_sink_projects_allowlisted_metadata_and_event_id() -> None:
         "quote_hash",
         "observation_id",
     }.intersection(projected_event["metadata"])
+
+
+def test_deterministic_evaluator_only_judges_supported_runtime_contracts() -> None:
+    events = _events(
+        QualitySignal("structured_output_outcome", "expected", "schema_conformant"),
+        QualitySignal("structured_llm_attempt_outcome", "rejected", "schema_validation_failed"),
+        QualitySignal("evidence_admission_outcome", "rejected", "unknown_evidence_block_id"),
+        QualitySignal("evidence_localization_outcome", "degraded", "whole_block_fallback"),
+        QualitySignal("extraction_batch_outcome", "expected", "zero_candidates"),
+    )
+
+    assessments = evaluate_runtime_events(events)
+
+    assert [(item.criterion, item.label, item.reason_code) for item in assessments] == [
+        ("structured_output_contract", "pass", "schema_conformant"),
+        ("evidence_reference_validity", "fail", "unknown_evidence_block_id"),
+        ("evidence_localization", "needs_review", "whole_block_fallback"),
+    ]
+    assert evaluate_runtime_events(events) == assessments
+
+
+def test_assessment_summary_preserves_coalesced_occurrence_denominator() -> None:
+    [event] = _events(
+        QualitySignal(
+            "evidence_admission_outcome",
+            "rejected",
+            "unknown_evidence_block_id",
+            occurrence_count=4,
+        )
+    )
+    assessments = evaluate_runtime_events((event,))
+
+    assert assessments[0].occurrence_count == 4
+    assert summarize_agent_assessments(assessments) == {
+        "total_assessments": 4,
+        "label_counts": {"fail": 4},
+        "criterion_counts": {"evidence_reference_validity": 4},
+        "status_counts": {"completed": 4},
+    }
+
+
+def test_langfuse_assessment_sink_projects_categorical_score_to_event_trace() -> None:
+    [event] = _events(
+        QualitySignal("evidence_admission_outcome", "rejected", "unknown_evidence_block_id")
+    )
+    [assessment] = evaluate_runtime_events((event,))
+    client = _FakeLangfuseClient()
+    sink = _langfuse_sink(client)
+
+    assessment_sink_for_runtime_sink(sink).publish((assessment,), (event,))
+
+    score = next(payload for kind, payload in client.calls if kind == "score")
+    assert score["score_id"] == assessment.assessment_id
+    assert score["trace_id"] == event.trace_id
+    assert score["name"] == "memforge.evidence_reference_validity"
+    assert score["value"] == "fail"
+    assert score["data_type"] == "CATEGORICAL"
+    assert score["metadata"]["target_event_id"] == event.event_id
+
+
+@pytest.mark.asyncio
+async def test_sqlite_assessments_are_idempotent_visible_and_cascade_with_events(db) -> None:
+    [event] = _events(
+        QualitySignal("evidence_admission_outcome", "rejected", "unknown_evidence_block_id")
+    )
+    assessments = evaluate_runtime_events((event,))
+    await db.record_agent_runtime_events((event,))
+    await db.record_agent_assessments(assessments)
+    await db.record_agent_assessments(assessments)
+
+    query = AgentAssessmentQuery(
+        occurred_from=NOW - timedelta(seconds=1),
+        occurred_to=NOW + timedelta(seconds=1),
+        requesting_user_id="user-1",
+        include_private=True,
+        source_id="src-teams",
+        label="fail",
+    )
+    assert await db.list_agent_assessments(query) == list(assessments)
+    assert await db.list_agent_assessments(
+        AgentAssessmentQuery(
+            occurred_from=query.occurred_from,
+            occurred_to=query.occurred_to,
+        )
+    ) == []
+
+    assert await db.purge_agent_runtime_events(
+        occurred_before=NOW + timedelta(seconds=1),
+        limit=10,
+    ) == 1
+    assert await db.list_agent_assessments(query) == []
 
 
 def test_langfuse_sink_omits_durable_only_structured_attempt_identifiers() -> None:
@@ -652,3 +750,5 @@ def test_cohort_report_uses_event_name_denominators() -> None:
         "degraded": 0.5,
         "expected": 0.5,
     }
+    assessment_sink_for_runtime_sink,
+    evaluate_runtime_events,

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { AlertCircle, Info, Loader2, Lock, Pause, Pin, Play, RefreshCw, SlidersHorizontal } from "lucide-react";
+import { AlertCircle, Info, Loader2, Lock, Pause, Pin, Play, RefreshCw, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import type { Source, SourceCapabilities, SyncStatus } from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SourceSyncStatusCard } from "@/components/admin/SourceSyncStatusCard";
@@ -65,6 +65,7 @@ export function SourceRow({
   onSync,
   onResume,
   onShowDetails,
+  onShowEvaluation,
   onSubscriptionChange,
   actionsMenu,
   highlighted = false,
@@ -89,6 +90,7 @@ export function SourceRow({
   onSync: () => void;
   onResume?: () => void;
   onShowDetails: () => void;
+  onShowEvaluation: () => void;
   onSubscriptionChange: (enabled: boolean) => void;
   actionsMenu: ReactNode;
   highlighted?: boolean;
@@ -173,6 +175,15 @@ export function SourceRow({
                   ? activityPolicy?.activeRowLabel
                   : durableSyncLabel ?? <LastSyncDetails source={source} itemLabel={itemLabel} />}
               </span>
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 rounded-sm text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                onClick={onShowEvaluation}
+                aria-label={`Show online evaluation for ${source.name}`}
+              >
+                <ShieldCheck className="size-3.5 opacity-65" aria-hidden="true" />
+                Online evaluation
+              </button>
               {source.sync_schedule?.enabled && (
                 <span>
                   Auto sync: {formatScheduleInterval(source.sync_schedule.interval_minutes)}

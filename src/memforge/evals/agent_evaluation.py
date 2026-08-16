@@ -24,7 +24,11 @@ from typing import Callable, ContextManager, Iterator, Literal, Mapping, Protoco
 
 
 AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v2"
+AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v1"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
+AgentAssessmentStatus = Literal["completed", "failed"]
+AgentAssessmentLabel = Literal["pass", "fail", "needs_review"]
+AgentAssessmentAnnotatorKind = Literal["code", "llm", "human"]
 logger = logging.getLogger(__name__)
 
 
@@ -220,6 +224,7 @@ class AgentRuntimeEventQuery:
     provider: str | None = None
     deployment_revision: str | None = None
     extraction_contract_version: str | None = None
+    newest_first: bool = False
     limit: int = 100
     offset: int = 0
 
@@ -230,6 +235,71 @@ class AgentRuntimeEventQuery:
             raise ValueError("evaluation cohort limit must be between 1 and 1000")
         if self.offset < 0:
             raise ValueError("evaluation cohort offset must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentAssessment:
+    """One versioned judgment over a durable runtime event."""
+
+    assessment_id: str
+    target_event_id: str
+    criterion: str
+    status: AgentAssessmentStatus
+    label: AgentAssessmentLabel | None
+    reason_code: str
+    annotator_kind: AgentAssessmentAnnotatorKind
+    evaluator_name: str
+    evaluator_version: str
+    created_at: datetime
+    occurrence_count: int = 1
+    schema_version: str = AGENT_ASSESSMENT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        for name in (
+            "assessment_id",
+            "target_event_id",
+            "criterion",
+            "reason_code",
+            "evaluator_name",
+            "evaluator_version",
+        ):
+            _require_safe_identifier(name, getattr(self, name))
+        if self.status == "completed" and self.label is None:
+            raise ValueError("completed assessment requires a label")
+        if self.status == "failed" and self.label is not None:
+            raise ValueError("failed assessment cannot carry a label")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("assessment timestamp requires a timezone")
+        if self.occurrence_count < 1:
+            raise ValueError("assessment occurrence_count must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentAssessmentQuery:
+    """Bounded assessment filters with runtime-event visibility semantics."""
+
+    occurred_from: datetime
+    occurred_to: datetime
+    requesting_user_id: str | None = None
+    include_private: bool = False
+    assessment_id: str | None = None
+    target_event_id: str | None = None
+    source_id: str | None = None
+    criterion: str | None = None
+    status: AgentAssessmentStatus | None = None
+    label: AgentAssessmentLabel | None = None
+    evaluator_name: str | None = None
+    newest_first: bool = False
+    limit: int = 100
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        if self.occurred_to <= self.occurred_from:
+            raise ValueError("assessment cohort requires a non-empty half-open time range")
+        if not 1 <= self.limit <= 1000:
+            raise ValueError("assessment cohort limit must be between 1 and 1000")
+        if self.offset < 0:
+            raise ValueError("assessment cohort offset must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,10 +344,32 @@ class AgentRuntimeEventStore(Protocol):
     ) -> int: ...
 
 
+class AgentAssessmentStore(Protocol):
+    async def record_agent_assessments(
+        self,
+        assessments: tuple[AgentAssessment, ...],
+    ) -> None: ...
+
+    async def list_agent_assessments(
+        self,
+        query: AgentAssessmentQuery,
+    ) -> list[AgentAssessment]: ...
+
+
 class RuntimeEventTraceSink(Protocol):
     """Best-effort post-commit projection seam for one durable event batch."""
 
     def publish(self, events: tuple[AgentRuntimeEvent, ...]) -> None: ...
+
+
+class AgentAssessmentSink(Protocol):
+    """Best-effort post-commit projection seam for durable assessments."""
+
+    def publish(
+        self,
+        assessments: tuple[AgentAssessment, ...],
+        events: tuple[AgentRuntimeEvent, ...],
+    ) -> None: ...
 
 
 class LangfuseObservation(Protocol):
@@ -292,12 +384,55 @@ class LangfuseClient(Protocol):
 
     def create_event(self, **kwargs: object) -> object: ...
 
+    def create_score(self, **kwargs: object) -> None: ...
+
     def shutdown(self) -> None: ...
 
 
 class NoOpRuntimeEventTraceSink:
     def publish(self, events: tuple[AgentRuntimeEvent, ...]) -> None:
         del events
+
+
+class NoOpAgentAssessmentSink:
+    def publish(
+        self,
+        assessments: tuple[AgentAssessment, ...],
+        events: tuple[AgentRuntimeEvent, ...],
+    ) -> None:
+        del assessments, events
+
+
+class LangfuseAgentAssessmentSink:
+    """Project DB-authoritative assessments as trace-level Langfuse Scores."""
+
+    def __init__(self, client: LangfuseClient) -> None:
+        self._client = client
+
+    def publish(
+        self,
+        assessments: tuple[AgentAssessment, ...],
+        events: tuple[AgentRuntimeEvent, ...],
+    ) -> None:
+        event_by_id = {event.event_id: event for event in events}
+        for assessment in assessments:
+            event = event_by_id.get(assessment.target_event_id)
+            if event is None or assessment.status != "completed" or assessment.label is None:
+                continue
+            trace_id = event.trace_id or runtime_trace_id(
+                derivation_id=event.derivation_id,
+                batch_id=event.batch_id,
+                batch_attempt=event.batch_attempt,
+            )
+            self._client.create_score(
+                score_id=assessment.assessment_id,
+                name=f"memforge.{assessment.criterion}",
+                value=assessment.label,
+                data_type="CATEGORICAL",
+                trace_id=trace_id,
+                metadata=_langfuse_assessment_metadata(assessment),
+                timestamp=assessment.created_at,
+            )
 
 
 class LangfuseRuntimeEventTraceSink:
@@ -310,6 +445,9 @@ class LangfuseRuntimeEventTraceSink:
     ) -> None:
         self._client = client
         self._attribute_scope = attribute_scope
+
+    def assessment_sink(self) -> AgentAssessmentSink:
+        return LangfuseAgentAssessmentSink(self._client)
 
     def publish(self, events: tuple[AgentRuntimeEvent, ...]) -> None:
         if not events:
@@ -413,6 +551,36 @@ def publish_runtime_events(
             session_id,
             trace_id,
             len(events),
+            type(exc).__name__,
+        )
+
+
+def assessment_sink_for_runtime_sink(
+    sink: RuntimeEventTraceSink,
+) -> AgentAssessmentSink:
+    """Reuse the configured Langfuse client without coupling the core to it."""
+
+    factory = getattr(sink, "assessment_sink", None)
+    if callable(factory):
+        return factory()
+    return NoOpAgentAssessmentSink()
+
+
+def publish_agent_assessments(
+    sink: AgentAssessmentSink,
+    assessments: tuple[AgentAssessment, ...],
+    events: tuple[AgentRuntimeEvent, ...],
+) -> None:
+    """Publish after commit; projection failure never changes extraction."""
+
+    try:
+        sink.publish(assessments, events)
+    except Exception as exc:
+        first = events[0] if events else None
+        logger.warning(
+            "Agent assessment projection failed session_id=%s assessment_count=%d error_type=%s",
+            runtime_session_id(first.projection_run_id) if first is not None else "none",
+            len(assessments),
             type(exc).__name__,
         )
 
@@ -557,6 +725,63 @@ def bind_quality_signals(
     return tuple(events)
 
 
+def evaluate_runtime_events(
+    events: tuple[AgentRuntimeEvent, ...],
+) -> tuple[AgentAssessment, ...]:
+    """Apply the small, explicit deterministic online-evaluation contract."""
+
+    assessments: list[AgentAssessment] = []
+    for event in events:
+        decision = _deterministic_assessment_decision(event)
+        if decision is None:
+            continue
+        criterion, label = decision
+        identity = (
+            f"{AGENT_ASSESSMENT_SCHEMA_VERSION}:{event.event_id}:{criterion}:"
+            "memforge.deterministic.runtime_contract:1"
+        )
+        assessment_id = "aas-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        assessments.append(
+            AgentAssessment(
+                assessment_id=assessment_id,
+                target_event_id=event.event_id,
+                criterion=criterion,
+                status="completed",
+                label=label,
+                reason_code=event.reason_code,
+                annotator_kind="code",
+                evaluator_name="memforge.deterministic.runtime_contract",
+                evaluator_version="1",
+                created_at=event.occurred_at,
+                occurrence_count=event.occurrence_count,
+            )
+        )
+    return tuple(assessments)
+
+
+def _deterministic_assessment_decision(
+    event: AgentRuntimeEvent,
+) -> tuple[str, AgentAssessmentLabel] | None:
+    if event.event_name == "structured_output_outcome":
+        return (
+            "structured_output_contract",
+            "pass" if event.outcome in {"expected", "degraded"} else "fail",
+        )
+    if event.event_name == "evidence_admission_outcome":
+        return "evidence_reference_validity", "fail"
+    if event.event_name == "evidence_localization_outcome":
+        return (
+            "evidence_localization",
+            "needs_review" if event.reason_code == "whole_block_fallback" else "pass",
+        )
+    if event.event_name == "extraction_batch_outcome":
+        if event.outcome == "failed":
+            return "extraction_completion", "fail"
+        if event.reason_code == "candidates_extracted":
+            return "extraction_completion", "pass"
+    return None
+
+
 def runtime_trace_id(
     *,
     derivation_id: str,
@@ -641,6 +866,37 @@ def event_public_payload(event: AgentRuntimeEvent) -> Mapping[str, object]:
     return payload
 
 
+def assessment_public_payload(
+    assessment: AgentAssessment,
+) -> Mapping[str, object]:
+    """Return the fixed, content-free assessment payload."""
+
+    payload = asdict(assessment)
+    payload["created_at"] = assessment.created_at.isoformat()
+    return payload
+
+
+def summarize_agent_assessments(
+    assessments: tuple[AgentAssessment, ...] | list[AgentAssessment],
+) -> dict[str, object]:
+    """Return bounded counts for an authorized assessment cohort."""
+
+    label_counts: Counter[str] = Counter()
+    criterion_counts: Counter[str] = Counter()
+    status_counts: Counter[str] = Counter()
+    for assessment in assessments:
+        if assessment.label is not None:
+            label_counts[assessment.label] += assessment.occurrence_count
+        criterion_counts[assessment.criterion] += assessment.occurrence_count
+        status_counts[assessment.status] += assessment.occurrence_count
+    return {
+        "total_assessments": sum(item.occurrence_count for item in assessments),
+        "label_counts": dict(sorted(label_counts.items())),
+        "criterion_counts": dict(sorted(criterion_counts.items())),
+        "status_counts": dict(sorted(status_counts.items())),
+    }
+
+
 def _langfuse_batch_metadata(
     event: AgentRuntimeEvent,
     event_count: int,
@@ -708,6 +964,23 @@ def _langfuse_event_metadata(event: AgentRuntimeEvent) -> dict[str, object]:
         "occurrence_count": event.occurrence_count,
     }
     return {name: value for name, value in values.items() if value is not None}
+
+
+def _langfuse_assessment_metadata(
+    assessment: AgentAssessment,
+) -> dict[str, object]:
+    """Return the bounded, content-free Langfuse Score metadata."""
+
+    return {
+        "assessment_id": assessment.assessment_id,
+        "target_event_id": assessment.target_event_id,
+        "schema_version": assessment.schema_version,
+        "reason_code": assessment.reason_code,
+        "annotator_kind": assessment.annotator_kind,
+        "evaluator_name": assessment.evaluator_name,
+        "evaluator_version": assessment.evaluator_version,
+        "occurrence_count": assessment.occurrence_count,
+    }
 
 
 def _langfuse_level(outcome: AgentRuntimeOutcome) -> str:
