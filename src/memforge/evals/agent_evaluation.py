@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 from threading import Lock
-from typing import Iterator, Literal, Mapping, Protocol
+from typing import Callable, ContextManager, Iterator, Literal, Mapping, Protocol
 
 
 AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v2"
@@ -303,8 +303,13 @@ class NoOpRuntimeEventTraceSink:
 class LangfuseRuntimeEventTraceSink:
     """Metadata-only Langfuse projection isolated from product correctness."""
 
-    def __init__(self, client: LangfuseClient) -> None:
+    def __init__(
+        self,
+        client: LangfuseClient,
+        attribute_scope: Callable[..., ContextManager[object]],
+    ) -> None:
         self._client = client
+        self._attribute_scope = attribute_scope
 
     def publish(self, events: tuple[AgentRuntimeEvent, ...]) -> None:
         if not events:
@@ -315,26 +320,32 @@ class LangfuseRuntimeEventTraceSink:
             batch_id=first.batch_id,
             batch_attempt=first.batch_attempt,
         )
-        root = self._client.start_observation(
-            name="memforge.agent.extraction_batch",
-            as_type="span",
-            trace_context={"trace_id": trace_id},
-            metadata=_langfuse_batch_metadata(first, len(events)),
-        )
-        try:
-            for event in events:
-                self._client.create_event(
-                    name=event.event_name,
-                    trace_context={
-                        "trace_id": trace_id,
-                        "parent_span_id": root.id,
-                    },
-                    metadata=_langfuse_event_metadata(event),
-                    level=_langfuse_level(event.outcome),
-                    status_message=event.reason_code,
-                )
-        finally:
-            root.end()
+        with self._attribute_scope(
+            session_id=runtime_session_id(first.projection_run_id),
+            trace_name="memforge.agent.extraction_batch",
+            version=first.extraction_contract_version,
+            tags=_langfuse_tags(first),
+        ):
+            root = self._client.start_observation(
+                name="memforge.agent.extraction_batch",
+                as_type="span",
+                trace_context={"trace_id": trace_id},
+                metadata=_langfuse_batch_metadata(first, len(events)),
+            )
+            try:
+                for event in events:
+                    self._client.create_event(
+                        name=event.event_name,
+                        trace_context={
+                            "trace_id": trace_id,
+                            "parent_span_id": root.id,
+                        },
+                        metadata=_langfuse_event_metadata(event),
+                        level=_langfuse_level(event.outcome),
+                        status_message=event.reason_code,
+                    )
+            finally:
+                root.end()
 
 
 @lru_cache(maxsize=1)
@@ -365,6 +376,7 @@ def runtime_event_trace_sink_from_env() -> RuntimeEventTraceSink:
             should_export_span=span_filter_module.is_langfuse_span,
             release=current_deployment_revision(),
         )
+        attribute_scope = langfuse_module.propagate_attributes
     except Exception as exc:
         logger.warning(
             "Langfuse tracing is enabled but client initialization failed error_type=%s",
@@ -372,7 +384,7 @@ def runtime_event_trace_sink_from_env() -> RuntimeEventTraceSink:
         )
         return NoOpRuntimeEventTraceSink()
     atexit.register(client.shutdown)
-    return LangfuseRuntimeEventTraceSink(client)
+    return LangfuseRuntimeEventTraceSink(client, attribute_scope)
 
 
 def publish_runtime_events(
@@ -384,8 +396,23 @@ def publish_runtime_events(
     try:
         sink.publish(events)
     except Exception as exc:
+        first = events[0] if events else None
+        session_id = runtime_session_id(first.projection_run_id) if first is not None else "none"
+        trace_id = (
+            first.trace_id
+            or runtime_trace_id(
+                derivation_id=first.derivation_id,
+                batch_id=first.batch_id,
+                batch_attempt=first.batch_attempt,
+            )
+            if first is not None
+            else "none"
+        )
         logger.warning(
-            "Agent runtime trace projection failed error_type=%s",
+            "Agent runtime trace projection failed session_id=%s trace_id=%s event_count=%d error_type=%s",
+            session_id,
+            trace_id,
+            len(events),
             type(exc).__name__,
         )
 
@@ -539,7 +566,15 @@ def runtime_trace_id(
     """Return the stable W3C-compatible trace correlation for one attempt."""
 
     seed = f"memforge-agent-runtime-trace-v1:{derivation_id}:{batch_id}:{batch_attempt}"
-    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+    trace_id = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+    return trace_id if trace_id != "0" * 32 else "0" * 31 + "1"
+
+
+def runtime_session_id(projection_run_id: str) -> str:
+    """Return the bounded Langfuse Session correlation for one Projection."""
+
+    seed = f"memforge-agent-runtime-session-v1:{projection_run_id}"
+    return "mfs1-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
 
 
 def current_deployment_revision() -> str | None:
@@ -621,6 +656,16 @@ def _langfuse_batch_metadata(
         "event_count": event_count,
     }
     return {name: value for name, value in values.items() if value is not None}
+
+
+def _langfuse_tags(event: AgentRuntimeEvent) -> list[str]:
+    tags = ["memforge-agent-eval", "memory-extraction"]
+    if event.source_type and len(event.source_type) <= 128 and all(
+        ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
+        for ch in event.source_type
+    ):
+        tags.append(f"source-type:{event.source_type}")
+    return tags
 
 
 def _langfuse_event_metadata(event: AgentRuntimeEvent) -> dict[str, object]:
