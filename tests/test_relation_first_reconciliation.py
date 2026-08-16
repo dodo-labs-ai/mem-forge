@@ -490,6 +490,47 @@ def test_relation_support_matrix(
     assert incumbent_operation.flag_for_review is review
 
 
+@pytest.mark.parametrize(
+    ("supported", "expected_incumbent_action"),
+    [
+        (True, ReconcileAction.NOOP),
+        (False, ReconcileAction.DELETE),
+    ],
+)
+def test_multiple_contradiction_candidates_remain_independent_without_guessing_a_successor(
+    supported: bool,
+    expected_incumbent_action: ReconcileAction,
+) -> None:
+    incumbent = _memory("mem-current", "The service uses one legacy database configuration.")
+    candidates = [
+        RawMemory(content="The primary database uses PostgreSQL 16.", memory_type="fact"),
+        RawMemory(content="The analytics database uses ClickHouse.", memory_type="fact"),
+    ]
+
+    operations = reduce_relation_ledger(
+        new_extractions=candidates,
+        existing_memories=[incumbent],
+        relations=[
+            RelationLedgerEntry(
+                candidate_index=index,
+                incumbent_id=incumbent.id,
+                relation_type=MemoryRelationType.CONTRADICTS,
+                direction=RelationDirection.SYMMETRIC,
+            )
+            for index in range(len(candidates))
+        ],
+        support_audits=[SupportAuditEntry(incumbent_id=incumbent.id, supported=supported)],
+    )
+
+    assert [operation.action for operation in operations] == [
+        ReconcileAction.ADD,
+        ReconcileAction.ADD,
+        expected_incumbent_action,
+    ]
+    assert [operation.memory for operation in operations[:2]] == candidates
+    assert operations[-1].memory_id == incumbent.id
+
+
 def test_partial_projection_keep_does_not_drop_replacement_candidate() -> None:
     candidate = RawMemory(content="The service uses PostgreSQL 16.", memory_type="fact")
 
