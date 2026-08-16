@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
+from memforge.evals.agent_evaluation import QualitySignal, bind_quality_signals, evaluate_runtime_events
 from memforge.memory.lifecycle_plan import (
     CutoverFindingReason,
     CutoverFindingStatus,
@@ -663,6 +664,78 @@ def test_source_projects_route_uses_storage_neutral_admin_reader(tmp_path):
             }
         ],
     }
+
+
+def test_source_agent_evaluation_route_is_bounded_and_storage_neutral(tmp_path):
+    now = datetime.now(timezone.utc)
+    [event] = bind_quality_signals(
+        (QualitySignal("evidence_admission_outcome", "rejected", "unknown_evidence_block_id"),),
+        source_id="src-neutral",
+        source_type="confluence",
+        doc_id="doc-1",
+        source_unit_id="unit-1",
+        target_unit_revision_id="revision-1",
+        projection_run_id="projection-1",
+        derivation_id="derivation-1",
+        batch_id="batch-1",
+        batch_attempt=1,
+        extraction_contract_version="projection-extraction-v8",
+        occurred_at=now,
+    )
+    assessments = list(evaluate_runtime_events((event,)))
+
+    class FakeSourceReader:
+        async def get_schedule_config(self) -> dict:
+            return {"enabled": False}
+
+        async def claim_due_scheduled_sources(self, **_kwargs) -> list[dict]:
+            return []
+
+        async def get_source(self, source_id: str) -> dict | None:
+            assert source_id == "src-neutral"
+            return {
+                "id": source_id,
+                "type": "confluence",
+                "name": "Neutral Source",
+                "access_policy": "private",
+                "access_state": "active",
+                "owner_user_id": "dev",
+            }
+
+        async def list_agent_runtime_events(self, query):
+            assert query.source_id == "src-neutral"
+            assert query.requesting_user_id == "dev"
+            assert query.include_private is True
+            assert query.newest_first is True
+            assert query.limit == 1000
+            return [event]
+
+        async def list_agent_assessments(self, query):
+            assert query.source_id == "src-neutral"
+            assert query.requesting_user_id == "dev"
+            assert query.include_private is True
+            assert query.newest_first is True
+            assert query.limit == 1000
+            return assessments
+
+    app = create_admin_app(db=FakeSourceReader(), config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/sources/src-neutral/agent-evaluation?days=30")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["summary"] == {
+        "total_assessments": 1,
+        "label_counts": {"fail": 1},
+        "criterion_counts": {"evidence_reference_validity": 1},
+        "status_counts": {"completed": 1},
+        "runtime_event_count": 1,
+        "eligible_assessment_count": 1,
+        "missing_assessment_count": 0,
+        "truncated": False,
+    }
+    assert payload["assessments"][0]["target_event_id"] == event.event_id
 
 
 def test_source_schedule_routes_use_storage_neutral_store(tmp_path):

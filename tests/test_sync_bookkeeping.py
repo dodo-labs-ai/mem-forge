@@ -10422,9 +10422,19 @@ async def test_failed_diff_guided_derivation_falls_back_to_durable_structural_wo
     class RecordingRuntimeEventTraceSink:
         def __init__(self) -> None:
             self.batches = []
+            self.assessment_batches = []
 
         def publish(self, events) -> None:
             self.batches.append(events)
+
+        def assessment_sink(self):
+            owner = self
+
+            class RecordingAssessmentSink:
+                def publish(self, assessments, events) -> None:
+                    owner.assessment_batches.append((assessments, events))
+
+            return RecordingAssessmentSink()
 
     trace_sink = RecordingRuntimeEventTraceSink()
     orchestrator = GeneSyncOrchestrator(
@@ -10462,6 +10472,13 @@ async def test_failed_diff_guided_derivation_falls_back_to_durable_structural_wo
     assert len({event.derivation_id for event in runtime_events}) == 2
     assert len({event.trace_id for event in runtime_events}) == 2
     assert len({runtime_session_id(event.projection_run_id) for event in runtime_events}) == 1
+    assert len(trace_sink.assessment_batches) == len(trace_sink.batches)
+    assert any(assessments for assessments, _events in trace_sink.assessment_batches)
+    assert all(
+        {assessment.target_event_id for assessment in assessments}
+        <= {event.event_id for event in events}
+        for assessments, events in trace_sink.assessment_batches
+    )
     assert len(memory_engine.projected_lifecycle_calls) == 1
     assert memory_engine.projected_lifecycle_calls[0]["update_mode"] == "diff_guided"
 

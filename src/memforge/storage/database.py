@@ -141,6 +141,8 @@ from memforge.memory.relation_discovery_contract import (
 )
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.evals.agent_evaluation import (
+    AgentAssessment,
+    AgentAssessmentQuery,
     AgentRuntimeEvent,
     AgentRuntimeEventQuery,
 )
@@ -1707,6 +1709,25 @@ CREATE INDEX IF NOT EXISTS idx_agent_runtime_source_time
     ON agent_runtime_events(source_id, occurred_at, event_id);
 CREATE INDEX IF NOT EXISTS idx_agent_runtime_type_reason
     ON agent_runtime_events(event_name, reason_code, occurred_at);
+
+CREATE TABLE IF NOT EXISTS agent_assessments (
+    assessment_id      TEXT PRIMARY KEY,
+    schema_version     TEXT NOT NULL,
+    target_event_id    TEXT NOT NULL REFERENCES agent_runtime_events(event_id) ON DELETE CASCADE,
+    criterion          TEXT NOT NULL,
+    status             TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+    label              TEXT CHECK (label IN ('pass', 'fail', 'needs_review')),
+    reason_code        TEXT NOT NULL,
+    annotator_kind     TEXT NOT NULL CHECK (annotator_kind IN ('code', 'llm', 'human')),
+    evaluator_name     TEXT NOT NULL,
+    evaluator_version  TEXT NOT NULL,
+    created_at         TEXT NOT NULL,
+    occurrence_count   INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_agent_assessment_event
+    ON agent_assessments(target_event_id, assessment_id);
+CREATE INDEX IF NOT EXISTS idx_agent_assessment_criterion
+    ON agent_assessments(criterion, label, created_at);
 """
 
 # ---------------------------------------------------------------------------
@@ -3406,6 +3427,30 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE agent_runtime_events ADD COLUMN json_error_column INTEGER",
         ],
     ),
+    (
+        78,
+        "Add versioned agent assessments",
+        [
+            """CREATE TABLE IF NOT EXISTS agent_assessments (
+                assessment_id      TEXT PRIMARY KEY,
+                schema_version     TEXT NOT NULL,
+                target_event_id    TEXT NOT NULL REFERENCES agent_runtime_events(event_id) ON DELETE CASCADE,
+                criterion          TEXT NOT NULL,
+                status             TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+                label              TEXT CHECK (label IN ('pass', 'fail', 'needs_review')),
+                reason_code        TEXT NOT NULL,
+                annotator_kind     TEXT NOT NULL CHECK (annotator_kind IN ('code', 'llm', 'human')),
+                evaluator_name     TEXT NOT NULL,
+                evaluator_version  TEXT NOT NULL,
+                created_at         TEXT NOT NULL,
+                occurrence_count   INTEGER NOT NULL DEFAULT 1
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_assessment_event
+               ON agent_assessments(target_event_id, assessment_id)""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_assessment_criterion
+               ON agent_assessments(criterion, label, created_at)""",
+        ],
+    ),
 ]
 
 
@@ -4911,6 +4956,7 @@ class Database:
         batch_id: str,
         result: MemoryExtractionResult,
         runtime_events: tuple[AgentRuntimeEvent, ...] = (),
+        agent_assessments: tuple[AgentAssessment, ...] = (),
     ) -> SourceDerivationAttempt:
         """Atomically persist one batch outcome and its runtime facts."""
 
@@ -5014,6 +5060,7 @@ class Database:
                     ),
                 )
                 await self._insert_agent_runtime_events_unlocked(runtime_events)
+                await self._insert_agent_assessments_unlocked(agent_assessments)
                 await self.db.commit()
                 return await self._source_derivation_attempt_unlocked(derivation_id)
             except Exception:
@@ -17732,7 +17779,9 @@ class Database:
             "SELECT E.* FROM agent_runtime_events E "
             "JOIN sources S ON S.id = E.source_id WHERE "
             + " AND ".join(clauses)
-            + " ORDER BY occurred_at ASC, event_id ASC LIMIT ? OFFSET ?"
+            + " ORDER BY occurred_at "
+            + ("DESC, event_id DESC" if query.newest_first else "ASC, event_id ASC")
+            + " LIMIT ? OFFSET ?"
         )
         rows = await self.db.execute_fetchall(sql, tuple(params))
         return [self._row_to_agent_runtime_event(row) for row in rows]
@@ -17832,6 +17881,123 @@ class Database:
             trace_id=row["trace_id"],  # type: ignore[arg-type]
             span_id=row["span_id"],  # type: ignore[arg-type]
             trace_flags=row["trace_flags"],  # type: ignore[arg-type]
+        )
+
+    # ==================================================================
+    # Agent assessments
+    # ==================================================================
+
+    async def record_agent_assessments(
+        self,
+        assessments: tuple[AgentAssessment, ...],
+    ) -> None:
+        """Append versioned judgments; deterministic IDs make replay idempotent."""
+
+        if not assessments:
+            return
+        async with self._write_lock:
+            await self._insert_agent_assessments_unlocked(assessments)
+            await self.db.commit()
+
+    async def _insert_agent_assessments_unlocked(
+        self,
+        assessments: tuple[AgentAssessment, ...],
+    ) -> None:
+        if not assessments:
+            return
+        await self.db.executemany(
+            """INSERT OR IGNORE INTO agent_assessments (
+                   assessment_id, schema_version, target_event_id, criterion,
+                   status, label, reason_code, annotator_kind, evaluator_name,
+                   evaluator_version, created_at, occurrence_count
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    assessment.assessment_id,
+                    assessment.schema_version,
+                    assessment.target_event_id,
+                    assessment.criterion,
+                    assessment.status,
+                    assessment.label,
+                    assessment.reason_code,
+                    assessment.annotator_kind,
+                    assessment.evaluator_name,
+                    assessment.evaluator_version,
+                    _utc_iso(assessment.created_at),
+                    assessment.occurrence_count,
+                )
+                for assessment in assessments
+            ],
+        )
+
+    async def list_agent_assessments(
+        self,
+        query: AgentAssessmentQuery,
+    ) -> list[AgentAssessment]:
+        """Return assessments whose target events are visible to the caller."""
+
+        clauses = ["E.occurred_at >= ?", "E.occurred_at < ?"]
+        params: list[object] = [
+            _utc_iso(query.occurred_from),
+            _utc_iso(query.occurred_to),
+        ]
+        clauses.append(
+            "((S.access_state = 'active' AND (S.access_policy = 'workspace' OR "
+            "(? = 1 AND S.access_policy = 'private' AND S.owner_user_id = ?))) OR "
+            "(S.access_state = 'changing' AND ? = 1 AND S.owner_user_id = ?))"
+        )
+        params.extend(
+            (
+                int(query.include_private),
+                query.requesting_user_id,
+                int(query.include_private),
+                query.requesting_user_id,
+            )
+        )
+        for expression, value in (
+            ("A.assessment_id", query.assessment_id),
+            ("A.target_event_id", query.target_event_id),
+            ("E.source_id", query.source_id),
+            ("A.criterion", query.criterion),
+            ("A.status", query.status),
+            ("A.label", query.label),
+            ("A.evaluator_name", query.evaluator_name),
+        ):
+            if value is not None:
+                clauses.append(f"{expression} = ?")
+                params.append(value)
+        params.extend((query.limit, query.offset))
+        rows = await self.db.execute_fetchall(
+            "SELECT A.* FROM agent_assessments A "
+            "JOIN agent_runtime_events E ON E.event_id = A.target_event_id "
+            "JOIN sources S ON S.id = E.source_id WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY E.occurred_at "
+            + (
+                "DESC, A.assessment_id DESC"
+                if query.newest_first
+                else "ASC, A.assessment_id ASC"
+            )
+            + " LIMIT ? OFFSET ?",
+            tuple(params),
+        )
+        return [self._row_to_agent_assessment(row) for row in rows]
+
+    @staticmethod
+    def _row_to_agent_assessment(row: Mapping[str, object]) -> AgentAssessment:
+        return AgentAssessment(
+            assessment_id=str(row["assessment_id"]),
+            schema_version=str(row["schema_version"]),
+            target_event_id=str(row["target_event_id"]),
+            criterion=str(row["criterion"]),
+            status=str(row["status"]),  # type: ignore[arg-type]
+            label=row["label"],  # type: ignore[arg-type]
+            reason_code=str(row["reason_code"]),
+            annotator_kind=str(row["annotator_kind"]),  # type: ignore[arg-type]
+            evaluator_name=str(row["evaluator_name"]),
+            evaluator_version=str(row["evaluator_version"]),
+            created_at=datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00")),
+            occurrence_count=int(row["occurrence_count"]),
         )
 
     # ==================================================================

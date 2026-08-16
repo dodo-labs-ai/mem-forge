@@ -13,13 +13,18 @@ from typing import Any, Literal, Protocol
 
 from memforge.models import DocumentRecord, MemoryExtractionResult, RawMemory
 from memforge.evals.agent_evaluation import (
+    AgentAssessment,
+    AgentAssessmentSink,
     AgentRuntimeEvent,
+    NoOpRuntimeEventTraceSink,
     QualitySignal,
     QualitySignalCollector,
     RuntimeEventTraceSink,
+    assessment_sink_for_runtime_sink,
     bind_quality_signals,
     current_deployment_revision,
-    NoOpRuntimeEventTraceSink,
+    evaluate_runtime_events,
+    publish_agent_assessments,
     publish_runtime_events,
     quality_signal_scope,
 )
@@ -185,6 +190,7 @@ class SourceDerivationStore(Protocol):
         batch_id: str,
         result: MemoryExtractionResult,
         runtime_events: tuple[AgentRuntimeEvent, ...] = (),
+        agent_assessments: tuple[AgentAssessment, ...] = (),
     ) -> SourceDerivationAttempt: ...
 
     async def supersede_source_derivation(
@@ -224,10 +230,14 @@ class SourceUnitDeriver:
         ]
         | None = None,
         runtime_event_trace_sink: RuntimeEventTraceSink | None = None,
+        agent_assessment_sink: AgentAssessmentSink | None = None,
     ) -> None:
         self._store = store
         self._plan_work = plan_work or plan_source_derivation_work
         self._runtime_event_trace_sink = runtime_event_trace_sink or NoOpRuntimeEventTraceSink()
+        self._agent_assessment_sink = agent_assessment_sink or assessment_sink_for_runtime_sink(
+            self._runtime_event_trace_sink
+        )
 
     async def derive(
         self,
@@ -318,13 +328,20 @@ class SourceUnitDeriver:
                 deployment_revision=current_deployment_revision(),
                 observation_revision_ids=revision_by_observation,
             )
+            assessments = evaluate_runtime_events(events)
             await self._store.record_source_derivation_batch_result(
                 derivation_id=derivation.id,
                 batch_id=batch.id,
                 result=result,
                 runtime_events=events,
+                agent_assessments=assessments,
             )
             publish_runtime_events(self._runtime_event_trace_sink, events)
+            publish_agent_assessments(
+                self._agent_assessment_sink,
+                assessments,
+                events,
+            )
             return result
 
         pending_results = await collect_bounded(

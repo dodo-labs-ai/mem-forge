@@ -4468,6 +4468,85 @@ def create_admin_app(
         """List search-eligible sources for MCP/source-id discovery."""
         return {"data": await _searchable_source_rows(request, db, sync_service=sync_service)}
 
+    @source_router.get("/{source_id}/agent-evaluation")
+    async def get_source_agent_evaluation(
+        source_id: str,
+        request: Request,
+        days: int = 30,
+        db: Database = Depends(get_db),
+    ):
+        """Return a bounded, authorized online-assessment view for one Source."""
+
+        from memforge.evals.agent_evaluation import (
+            AgentAssessmentQuery,
+            AgentRuntimeEventQuery,
+            assessment_public_payload,
+            evaluate_runtime_events,
+            summarize_agent_assessments,
+        )
+
+        if not 1 <= days <= 90:
+            raise HTTPException(status_code=400, detail="days must be between 1 and 90")
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
+        occurred_to = datetime.now(timezone.utc)
+        occurred_from = occurred_to - timedelta(days=days)
+        principal = resolve_request_principal(request)
+        events = await db.list_agent_runtime_events(
+            AgentRuntimeEventQuery(
+                occurred_from=occurred_from,
+                occurred_to=occurred_to,
+                requesting_user_id=principal,
+                include_private=True,
+                source_id=source_id,
+                newest_first=True,
+                limit=1000,
+            )
+        )
+        assessments = await db.list_agent_assessments(
+            AgentAssessmentQuery(
+                occurred_from=occurred_from,
+                occurred_to=occurred_to,
+                requesting_user_id=principal,
+                include_private=True,
+                source_id=source_id,
+                newest_first=True,
+                limit=1000,
+            )
+        )
+        eligible = evaluate_runtime_events(tuple(events))
+        assessed_ids = {assessment.assessment_id for assessment in assessments}
+        summary = summarize_agent_assessments(assessments)
+        summary.update(
+            {
+                "runtime_event_count": sum(event.occurrence_count for event in events),
+                "eligible_assessment_count": sum(
+                    assessment.occurrence_count for assessment in eligible
+                ),
+                "missing_assessment_count": sum(
+                    assessment.occurrence_count
+                    for assessment in eligible
+                    if assessment.assessment_id not in assessed_ids
+                ),
+                "truncated": len(events) == 1000 or len(assessments) == 1000,
+            }
+        )
+        return {
+            "source_id": source_id,
+            "window": {
+                "from": occurred_from.isoformat(),
+                "to": occurred_to.isoformat(),
+                "days": days,
+            },
+            "summary": summary,
+            "assessments": [
+                assessment_public_payload(assessment)
+                for assessment in assessments[:50]
+            ],
+        }
+
     @source_router.get("/{source_id}/memory-lifecycle")
     async def get_source_memory_lifecycle(
         source_id: str,
