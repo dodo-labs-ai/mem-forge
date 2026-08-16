@@ -358,9 +358,7 @@ def reduce_relation_ledger(
         ]
         related = [entry for entry in entries if entry.relation_type is not MemoryRelationType.UNRELATED]
 
-        if contradictions:
-            if len(contradictions) != 1 or len(related) != 1:
-                raise ValueError(f"incumbent {incumbent.id} has no unique contradiction proposal")
+        if len(contradictions) == 1 and len(related) == 1:
             challenger = contradictions[0]
             consumed_candidates.add(challenger.candidate_index)
             incumbent_operations.append(
