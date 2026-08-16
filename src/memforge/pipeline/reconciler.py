@@ -340,23 +340,8 @@ def reduce_relation_ledger(
         raise ValueError("duplicate revision composition proof")
 
     by_incumbent: dict[str, list[RelationLedgerEntry]] = {memory_id: [] for memory_id in incumbent_ids}
-    identity_targets: dict[int, list[RelationLedgerEntry]] = {
-        index: [] for index in range(len(new_extractions))
-    }
     for entry in relations:
         by_incumbent[entry.incumbent_id].append(entry)
-        if entry.relation_type in {MemoryRelationType.EQUIVALENT, MemoryRelationType.CONTRADICTS} or (
-            entry.relation_type is MemoryRelationType.REFINES
-            and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
-        ):
-            identity_targets[entry.candidate_index].append(entry)
-    ambiguous = {
-        index: {entry.incumbent_id for entry in entries}
-        for index, entries in identity_targets.items()
-        if len(entries) > 1
-    }
-    if ambiguous:
-        raise ValueError(f"candidate relates materially to multiple incumbents: {ambiguous}")
 
     consumed_candidates: set[int] = set()
     incumbent_operations: list[ReconcileOperation] = []

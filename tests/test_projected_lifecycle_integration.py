@@ -456,6 +456,68 @@ class _AdditiveRevisionClient:
         )
 
 
+class _RunbookComponentFallbackClient:
+    async def classify_memory_relations(self, prompt: str, **kwargs):
+        del kwargs
+        groups_json = prompt.split("<memory_pair_groups>\n", 1)[1].split(
+            "\n</memory_pair_groups>",
+            1,
+        )[0]
+        pair_indices = [item["pair_index"] for group in json.loads(groups_json) for item in group["candidates"]]
+        return MemoryRelationResponse(
+            decisions=[
+                MemoryRelationDecision(
+                    pair_index=pair_index,
+                    classification="refines",
+                    direction="challenger_to_candidate",
+                    same_subject_and_scope=True,
+                    incompatible_assertions="",
+                    reason="The procedure is related but not a lossless revision of this branch.",
+                )
+                for pair_index in pair_indices
+            ]
+        )
+
+    async def audit_incumbent_support(self, prompt: str, **kwargs):
+        del kwargs
+        incumbents_json = prompt.split("<incumbents>", 1)[1].split("</incumbents>", 1)[0]
+        return _audit_response(
+            *(
+                IncumbentSupportAuditDecision(
+                    supported=True,
+                    reason="The branch remains supported in the current runbook.",
+                )
+                for _ in json.loads(incumbents_json)
+            )
+        )
+
+    async def prove_revision_compositions(self, prompt: str, **kwargs):
+        del prompt, kwargs
+        raise StructuredLlmError("The current procedure does not losslessly replace each branch.")
+
+
+class _RunbookComponentRevisionClient(_RunbookComponentFallbackClient):
+    async def prove_revision_compositions(self, prompt: str, **kwargs):
+        del kwargs
+        pairs_json = prompt.split("<refinement_pairs>", 1)[1].split(
+            "</refinement_pairs>",
+            1,
+        )[0]
+        return RevisionCompositionResponse(
+            decisions=[
+                RevisionCompositionDecision(
+                    pair_index=item["pair_index"],
+                    same_memory_identity=True,
+                    preserves_incumbent_truth=True,
+                    candidate_is_canonical_composite=True,
+                    current_evidence_entails_candidate=True,
+                    reason="The canonical procedure preserves this branch verbatim.",
+                )
+                for item in json.loads(pairs_json)
+            ]
+        )
+
+
 class _NoopClient:
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
@@ -658,6 +720,204 @@ async def test_additive_refinement_commits_revision_with_candidate_local_evidenc
     assert support[0].excerpt == second_text
     assert stats["updated"] == 1
     assert stats["superseded"] == 0
+
+
+@pytest.mark.asyncio
+async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branches(
+    db: Database,
+) -> None:
+    branch_claims = [
+        "For HTTP 404, check service health, retrigger, then open a DwC issue if it persists.",
+        "For HTTP 502 or 503, wait for service recovery and then retrigger the process.",
+        "For other invalid process map errors, create a design-time Jira defect.",
+    ]
+    first_text = "\n\n".join(branch_claims)
+    first = _projection(run_id="projection-runbook-component-1", body=first_text)
+    adapters = build_sqlite_adapters(db, object())
+    initial_engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_AuditedOutboxDrainer(db),
+        structured_llm_client=_CandidateLedgerClient(
+            _candidate_ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in branch_claims))
+        ),
+    )
+    await initial_engine.apply_projected_lifecycle(
+        projection=first,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content=claim,
+                memory_type="procedure",
+                evidence_quote=claim,
+                evidence_anchor="projection_batch",
+                source_observation_id=first.observations[0].id,
+            )
+            for claim in branch_claims
+        ],
+        doc_type="runbook",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=first_text,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    incumbents = await db.list_memories()
+    await db.enable_lifecycle_gate("src-1")
+
+    current_procedure = (
+        "Diagnose an invalid process map from its actual HTTP error, then follow the status-specific recovery path."
+    )
+    second_text = f"{first_text}\n\n{current_procedure}"
+    second = _projection(
+        run_id="projection-runbook-component-2",
+        body=second_text,
+        prior=first.source_unit_revisions[0],
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
+    )
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_RunbookComponentFallbackClient(),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content=current_procedure,
+                memory_type="procedure",
+                evidence_quote=current_procedure,
+                evidence_anchor="projection_batch",
+                evidence_resolved_from_block=True,
+                source_observation_id=second.observations[0].id,
+            )
+        ],
+        doc_type="runbook",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=second_text,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    memories = await db.list_memories()
+    current_by_id = {memory.id: memory for memory in memories}
+    assert stats["added"] == 1
+    assert stats["noop"] == 3
+    assert stats["pending_review"] == 0
+    assert sorted(memory.content for memory in memories if memory.status == "active") == sorted(
+        [*branch_claims, current_procedure]
+    )
+    assert all(current_by_id[memory.id].status == "active" for memory in incumbents)
+    assert (
+        second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id
+    )
+
+
+@pytest.mark.asyncio
+async def test_runbook_component_revision_creates_one_replacement_for_all_branches(
+    db: Database,
+) -> None:
+    branch_claims = [
+        "For HTTP 404, check service health, retrigger, then open a DwC issue if it persists.",
+        "For HTTP 502 or 503, wait for service recovery and then retrigger the process.",
+        "For other invalid process map errors, create a design-time Jira defect.",
+    ]
+    first_text = "\n\n".join(branch_claims)
+    first = _projection(run_id="projection-runbook-revision-1", body=first_text)
+    adapters = build_sqlite_adapters(db, object())
+    initial_engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_AuditedOutboxDrainer(db),
+        structured_llm_client=_CandidateLedgerClient(
+            _candidate_ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in branch_claims))
+        ),
+    )
+    await initial_engine.apply_projected_lifecycle(
+        projection=first,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content=claim,
+                memory_type="procedure",
+                evidence_quote=claim,
+                evidence_anchor="projection_batch",
+                source_observation_id=first.observations[0].id,
+            )
+            for claim in branch_claims
+        ],
+        doc_type="runbook",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=first_text,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    incumbents = await db.list_memories()
+    await db.enable_lifecycle_gate("src-1")
+
+    canonical_procedure = (
+        "Diagnose an invalid process map from its actual HTTP error, then follow exactly one "
+        "status-specific recovery path:\n- " + "\n- ".join(branch_claims)
+    )
+    second = _projection(
+        run_id="projection-runbook-revision-2",
+        body=canonical_procedure,
+        prior=first.source_unit_revisions[0],
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
+    )
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_RunbookComponentRevisionClient(),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[
+            RawMemory(
+                content=canonical_procedure,
+                memory_type="procedure",
+                evidence_quote=canonical_procedure,
+                evidence_anchor="projection_batch",
+                evidence_resolved_from_block=True,
+                source_observation_id=second.observations[0].id,
+            )
+        ],
+        doc_type="runbook",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=canonical_procedure,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    memories = await db.list_memories()
+    old_memories = [memory for memory in memories if memory.id in {item.id for item in incumbents}]
+    replacement_ids = {memory.superseded_by for memory in old_memories}
+    active = [memory for memory in memories if memory.status == "active"]
+    assert stats["added"] == 1
+    assert stats["updated"] == 3
+    assert stats["pending_review"] == 0
+    assert len(replacement_ids) == 1
+    assert all(memory.status == "superseded" for memory in old_memories)
+    assert len(active) == 1
+    assert active[0].id in replacement_ids
+    assert active[0].content == canonical_procedure
 
 
 @pytest.mark.asyncio
