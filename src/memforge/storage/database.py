@@ -151,6 +151,7 @@ from memforge.evals.offline_evaluation import (
     AcceptedGroundTruthRevision,
     AgentEvaluationCase,
     AgentEvaluationCohort,
+    AgentEvaluationContentPolicy,
     AgentEvaluationResult,
     AgentEvaluationRun,
     AgentEvaluationRunStatus,
@@ -160,6 +161,8 @@ from memforge.evals.offline_evaluation import (
     agent_evaluation_case_to_payload,
     agent_evaluation_cohort_from_payload,
     agent_evaluation_cohort_to_payload,
+    agent_evaluation_content_policy_from_payload,
+    agent_evaluation_content_policy_to_payload,
     agent_evaluation_result_from_payload,
     agent_evaluation_result_to_payload,
     agent_evaluation_run_from_payload,
@@ -1758,6 +1761,18 @@ CREATE TABLE IF NOT EXISTS agent_evaluation_cases (
 CREATE INDEX IF NOT EXISTS idx_agent_evaluation_case_source
     ON agent_evaluation_cases(source_id, created_at, case_id);
 
+CREATE TABLE IF NOT EXISTS agent_evaluation_content_policies (
+    content_policy_id TEXT PRIMARY KEY,
+    source_id         TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    profile           TEXT NOT NULL,
+    policy_version    TEXT NOT NULL,
+    approved_at       TEXT NOT NULL,
+    payload_json      TEXT NOT NULL,
+    UNIQUE (source_id, profile, policy_version)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_evaluation_content_policy_source
+    ON agent_evaluation_content_policies(source_id, profile, policy_version);
+
 CREATE TABLE IF NOT EXISTS accepted_ground_truth_revisions (
     ground_truth_revision_id TEXT PRIMARY KEY,
     case_id                   TEXT NOT NULL REFERENCES agent_evaluation_cases(case_id) ON DELETE CASCADE,
@@ -1815,6 +1830,8 @@ CREATE TABLE IF NOT EXISTS agent_assessments (
     annotator_kind     TEXT NOT NULL CHECK (annotator_kind IN ('code', 'llm', 'human')),
     evaluator_name     TEXT NOT NULL,
     evaluator_version  TEXT NOT NULL,
+    annotator_id       TEXT,
+    content_policy_id  TEXT REFERENCES agent_evaluation_content_policies(content_policy_id),
     created_at         TEXT NOT NULL,
     occurrence_count   INTEGER NOT NULL DEFAULT 1,
     CHECK ((target_event_id IS NOT NULL) != (target_result_id IS NOT NULL))
@@ -3643,6 +3660,26 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                ON agent_assessments(criterion, label, created_at)""",
         ],
     ),
+    (
+        81,
+        "Add human calibration and evaluator content policy provenance",
+        [
+            """CREATE TABLE IF NOT EXISTS agent_evaluation_content_policies (
+                content_policy_id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                profile TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                approved_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                UNIQUE (source_id, profile, policy_version)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_evaluation_content_policy_source
+               ON agent_evaluation_content_policies(source_id, profile, policy_version)""",
+            "ALTER TABLE agent_assessments ADD COLUMN annotator_id TEXT",
+            """ALTER TABLE agent_assessments ADD COLUMN content_policy_id TEXT
+               REFERENCES agent_evaluation_content_policies(content_policy_id)""",
+        ],
+    ),
 ]
 
 
@@ -3791,19 +3828,29 @@ class Database:
                 reason_code TEXT NOT NULL, annotator_kind TEXT NOT NULL
                     CHECK (annotator_kind IN ('code', 'llm', 'human')),
                 evaluator_name TEXT NOT NULL, evaluator_version TEXT NOT NULL,
+                annotator_id TEXT,
+                content_policy_id TEXT
+                    REFERENCES agent_evaluation_content_policies(content_policy_id),
                 created_at TEXT NOT NULL, occurrence_count INTEGER NOT NULL DEFAULT 1,
                 CHECK ((target_event_id IS NOT NULL) != (target_result_id IS NOT NULL))
             )"""
         )
+        supports_human_provenance = {
+            "annotator_id",
+            "content_policy_id",
+        }.issubset(assessment_columns)
         await self.db.execute(
             """INSERT INTO agent_assessments_v3 (
                     assessment_id, schema_version, target_event_id, target_result_id,
                     criterion, status, label, reason_code, annotator_kind,
-                    evaluator_name, evaluator_version, created_at, occurrence_count
+                    evaluator_name, evaluator_version, annotator_id, content_policy_id,
+                    created_at, occurrence_count
                 ) SELECT assessment_id, schema_version, target_event_id, """
             + ("target_result_id" if supports_offline else "NULL")
             + """, criterion, status, label, reason_code, annotator_kind,
-                    evaluator_name, evaluator_version, created_at, occurrence_count
+                    evaluator_name, evaluator_version, """
+            + ("annotator_id, content_policy_id" if supports_human_provenance else "NULL, NULL")
+            + """, created_at, occurrence_count
                 FROM agent_assessments"""
         )
         await self.db.execute("DROP TABLE agent_assessments")
@@ -18319,6 +18366,49 @@ class Database:
         )
         return agent_evaluation_case_from_payload(json.loads(row[0]["payload_json"])) if row else None
 
+    async def record_agent_evaluation_content_policy(
+        self,
+        policy: AgentEvaluationContentPolicy,
+    ) -> None:
+        payload = _canonical_json(agent_evaluation_content_policy_to_payload(policy))
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT OR IGNORE INTO agent_evaluation_content_policies (
+                       content_policy_id, source_id, profile, policy_version,
+                       approved_at, payload_json
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    policy.content_policy_id,
+                    policy.source_id,
+                    policy.profile.value,
+                    policy.policy_version,
+                    policy.approved_at,
+                    payload,
+                ),
+            )
+            await self._assert_immutable_payload(
+                "agent_evaluation_content_policies",
+                "content_policy_id",
+                policy.content_policy_id,
+                payload,
+            )
+            await self.db.commit()
+
+    async def get_agent_evaluation_content_policy(
+        self,
+        content_policy_id: str,
+    ) -> AgentEvaluationContentPolicy | None:
+        row = await self.db.execute_fetchall(
+            """SELECT payload_json FROM agent_evaluation_content_policies
+               WHERE content_policy_id = ?""",
+            (content_policy_id,),
+        )
+        return (
+            agent_evaluation_content_policy_from_payload(json.loads(row[0]["payload_json"]))
+            if row
+            else None
+        )
+
     async def record_accepted_ground_truth_revision(
         self,
         revision: AcceptedGroundTruthRevision,
@@ -18521,6 +18611,7 @@ class Database:
     ) -> None:
         allowed = {
             ("agent_evaluation_cases", "case_id"),
+            ("agent_evaluation_content_policies", "content_policy_id"),
             ("accepted_ground_truth_revisions", "ground_truth_revision_id"),
             ("agent_evaluation_cohorts", "cohort_id"),
             ("agent_evaluation_results", "result_id"),
@@ -18560,8 +18651,9 @@ class Database:
             """INSERT OR IGNORE INTO agent_assessments (
                    assessment_id, schema_version, target_event_id, target_result_id, criterion,
                    status, label, reason_code, annotator_kind, evaluator_name,
-                   evaluator_version, created_at, occurrence_count
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   evaluator_version, annotator_id, content_policy_id, created_at,
+                   occurrence_count
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     assessment.assessment_id,
@@ -18575,12 +18667,42 @@ class Database:
                     assessment.annotator_kind,
                     assessment.evaluator_name,
                     assessment.evaluator_version,
+                    assessment.annotator_id,
+                    assessment.content_policy_id,
                     _utc_iso(assessment.created_at),
                     assessment.occurrence_count,
                 )
                 for assessment in assessments
             ],
         )
+        for assessment in assessments:
+            existing = await self.get_agent_assessment(assessment.assessment_id)
+            if existing != assessment:
+                raise ValueError(
+                    "conflicting immutable agent assessment "
+                    f"assessment_id={assessment.assessment_id}"
+                )
+
+    async def get_agent_assessment(
+        self,
+        assessment_id: str,
+    ) -> AgentAssessment | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM agent_assessments WHERE assessment_id = ?",
+            (assessment_id,),
+        )
+        return self._row_to_agent_assessment(rows[0]) if rows else None
+
+    async def list_agent_assessments_for_result(
+        self,
+        result_id: str,
+    ) -> list[AgentAssessment]:
+        rows = await self.db.execute_fetchall(
+            """SELECT * FROM agent_assessments
+               WHERE target_result_id = ? ORDER BY created_at, assessment_id""",
+            (result_id,),
+        )
+        return [self._row_to_agent_assessment(row) for row in rows]
 
     async def list_agent_assessments(
         self,
@@ -18654,6 +18776,14 @@ class Database:
             annotator_kind=str(row["annotator_kind"]),  # type: ignore[arg-type]
             evaluator_name=str(row["evaluator_name"]),
             evaluator_version=str(row["evaluator_version"]),
+            annotator_id=(
+                str(row["annotator_id"]) if row["annotator_id"] is not None else None
+            ),
+            content_policy_id=(
+                str(row["content_policy_id"])
+                if row["content_policy_id"] is not None
+                else None
+            ),
             created_at=datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00")),
             occurrence_count=int(row["occurrence_count"]),
         )

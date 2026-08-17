@@ -24,7 +24,7 @@ from typing import Callable, ContextManager, Iterator, Literal, Mapping, Protoco
 
 
 AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v3"
-AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v2"
+AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v3"
 SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION = "source-unit-lifecycle-v1"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
 AgentAssessmentStatus = Literal["completed", "failed"]
@@ -270,6 +270,8 @@ class AgentAssessment:
     evaluator_version: str
     created_at: datetime
     target_result_id: str | None = None
+    annotator_id: str | None = None
+    content_policy_id: str | None = None
     occurrence_count: int = 1
     schema_version: str = AGENT_ASSESSMENT_SCHEMA_VERSION
 
@@ -288,6 +290,22 @@ class AgentAssessment:
             _require_safe_identifier("target_event_id", self.target_event_id)
         if self.target_result_id is not None:
             _require_safe_identifier("target_result_id", self.target_result_id)
+        if self.annotator_id is not None:
+            _require_bounded_principal_id("annotator_id", self.annotator_id)
+        if self.content_policy_id is not None:
+            _require_safe_identifier("content_policy_id", self.content_policy_id)
+        if (
+            self.annotator_kind == "human"
+            and self.schema_version == AGENT_ASSESSMENT_SCHEMA_VERSION
+            and (self.annotator_id is None or self.content_policy_id is None)
+        ):
+            raise ValueError(
+                "human assessment requires annotator and content-policy provenance"
+            )
+        if self.annotator_kind != "human" and (
+            self.annotator_id is not None or self.content_policy_id is not None
+        ):
+            raise ValueError("only human assessments carry human-review provenance")
         if self.status == "completed" and self.label is None:
             raise ValueError("completed assessment requires a label")
         if self.status == "failed" and self.label is not None:
@@ -1349,6 +1367,13 @@ def _require_safe_identifier(name: str, value: str | None) -> None:
         for ch in value
     ):
         raise ValueError(f"{name} must be a bounded machine-readable identifier")
+
+
+def _require_bounded_principal_id(name: str, value: str | None) -> None:
+    if value is None:
+        return
+    if not value or len(value) > 255 or any(ord(ch) < 33 or ord(ch) == 127 for ch in value):
+        raise ValueError(f"{name} must be a bounded principal identifier")
 
 
 def _require_safe_diagnostic_path(name: str, value: str | None) -> None:
