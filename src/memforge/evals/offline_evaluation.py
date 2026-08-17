@@ -173,6 +173,7 @@ class AgentEvaluationRunReport:
     completed_result_count: int
     error_result_count: int
     check_counts: Mapping[str, int]
+    population_summaries: Mapping[str, Mapping[str, int]]
 
 
 class OfflineEvaluationStore(Protocol):
@@ -625,6 +626,34 @@ class OfflineAgentEvaluation:
                 else assessment.label
             )
             counts[key] += 1
+        item_by_case_id = {item.case_id: item for item in cohort.items}
+        result_by_id = {result.result_id: result for result in results}
+        population_summaries = {
+            population.value: {
+                "completed": 0,
+                "error": 0,
+                "artifact_unavailable": 0,
+                "pass": 0,
+                "fail": 0,
+                "unknown": 0,
+            }
+            for population in AgentEvaluationPopulation
+        }
+        for result in results:
+            population = item_by_case_id[result.case_id].population.value
+            population_summaries[population][result.status.value] += 1
+        for assessment in assessments:
+            result = result_by_id.get(assessment.target_result_id or "")
+            if result is None:
+                continue
+            population = item_by_case_id[result.case_id].population.value
+            label = (
+                DeterministicCheckLabel.UNKNOWN.value
+                if assessment.label in {None, "needs_review"}
+                else assessment.label
+            )
+            if label in population_summaries[population]:
+                population_summaries[population][label] += 1
         return AgentEvaluationRunReport(
             run=run,
             results=results,
@@ -636,6 +665,7 @@ class OfflineAgentEvaluation:
                 result.status is not AgentEvaluationResultStatus.COMPLETED for result in results
             ),
             check_counts=counts,
+            population_summaries=population_summaries,
         )
 
     async def _require_case(self, case_id: str) -> AgentEvaluationCase:

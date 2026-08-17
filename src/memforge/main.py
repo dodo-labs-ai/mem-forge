@@ -864,6 +864,10 @@ async def _run_offline_evaluation_report(
             "completed_result_count": report.completed_result_count,
             "error_result_count": report.error_result_count,
             "check_counts": dict(report.check_counts),
+            "population_summaries": {
+                population: dict(summary)
+                for population, summary in report.population_summaries.items()
+            },
         },
         "results": [agent_evaluation_result_to_payload(result) for result in report.results],
         "assessments": [
