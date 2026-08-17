@@ -4481,6 +4481,7 @@ def create_admin_app(
             AgentAssessmentQuery,
             AgentRuntimeEventQuery,
             assessment_public_payload,
+            event_public_payload,
             evaluate_runtime_events,
             summarize_agent_assessments,
         )
@@ -4541,6 +4542,10 @@ def create_admin_app(
                 "days": days,
             },
             "summary": summary,
+            "runtime_events": [
+                event_public_payload(event)
+                for event in events[:50]
+            ],
             "assessments": [
                 assessment_public_payload(assessment)
                 for assessment in assessments[:50]
