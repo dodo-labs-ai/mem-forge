@@ -23,8 +23,9 @@ from threading import Lock
 from typing import Callable, ContextManager, Iterator, Literal, Mapping, Protocol
 
 
-AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v2"
+AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v3"
 AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v1"
+SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION = "source-unit-lifecycle-v1"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
 AgentAssessmentStatus = Literal["completed", "failed"]
 AgentAssessmentLabel = Literal["pass", "fail", "needs_review"]
@@ -157,11 +158,25 @@ class AgentRuntimeEvent:
     source_unit_id: str
     target_unit_revision_id: str
     projection_run_id: str
-    derivation_id: str
-    batch_id: str
-    batch_attempt: int
-    extraction_contract_version: str
     schema_version: str = AGENT_RUNTIME_EVENT_SCHEMA_VERSION
+    operation_id: str | None = None
+    execution_id: str | None = None
+    contract_version: str | None = None
+    payload_hash: str | None = None
+    operation_input_hash: str | None = None
+    execution_owner_id: str | None = None
+    base_unit_revision_id: str | None = None
+    duration_ms: int | None = None
+    recovered: bool | None = None
+    incumbent_count: int | None = None
+    relation_pair_count: int | None = None
+    mutation_count: int | None = None
+    review_count: int | None = None
+    model_call_count: int | None = None
+    derivation_id: str | None = None
+    batch_id: str | None = None
+    batch_attempt: int | None = None
+    extraction_contract_version: str | None = None
     deployment_revision: str | None = None
     trace_id: str | None = None
     span_id: str | None = None
@@ -214,6 +229,8 @@ class AgentRuntimeEventQuery:
     requesting_user_id: str | None = None
     include_private: bool = False
     event_id: str | None = None
+    operation_id: str | None = None
+    execution_id: str | None = None
     source_id: str | None = None
     source_type: str | None = None
     event_name: str | None = None
@@ -224,6 +241,7 @@ class AgentRuntimeEventQuery:
     provider: str | None = None
     deployment_revision: str | None = None
     extraction_contract_version: str | None = None
+    contract_version: str | None = None
     newest_first: bool = False
     limit: int = 100
     offset: int = 0
@@ -272,6 +290,31 @@ class AgentAssessment:
             raise ValueError("assessment timestamp requires a timezone")
         if self.occurrence_count < 1:
             raise ValueError("assessment occurrence_count must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRuntimeBundle:
+    """One terminal fact and its deterministic assessment as an atomic unit."""
+
+    events: tuple[AgentRuntimeEvent, ...]
+    assessments: tuple[AgentAssessment, ...]
+
+    def __post_init__(self) -> None:
+        event_ids = {event.event_id for event in self.events}
+        if any(item.target_event_id not in event_ids for item in self.assessments):
+            raise ValueError("agent assessment target must belong to the runtime bundle")
+
+    @property
+    def event(self) -> AgentRuntimeEvent:
+        if len(self.events) != 1:
+            raise ValueError("runtime bundle does not contain exactly one event")
+        return self.events[0]
+
+    @property
+    def assessment(self) -> AgentAssessment:
+        if len(self.assessments) != 1:
+            raise ValueError("runtime bundle does not contain exactly one assessment")
+        return self.assessments[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,11 +462,7 @@ class LangfuseAgentAssessmentSink:
             event = event_by_id.get(assessment.target_event_id)
             if event is None or assessment.status != "completed" or assessment.label is None:
                 continue
-            trace_id = event.trace_id or runtime_trace_id(
-                derivation_id=event.derivation_id,
-                batch_id=event.batch_id,
-                batch_attempt=event.batch_attempt,
-            )
+            trace_id = _event_trace_id(event)
             self._client.create_score(
                 score_id=assessment.assessment_id,
                 name=f"memforge.{assessment.criterion}",
@@ -453,19 +492,18 @@ class LangfuseRuntimeEventTraceSink:
         if not events:
             return
         first = events[0]
-        trace_id = first.trace_id or runtime_trace_id(
-            derivation_id=first.derivation_id,
-            batch_id=first.batch_id,
-            batch_attempt=first.batch_attempt,
-        )
+        trace_id = first.trace_id or _event_trace_id(first)
+        session_id, trace_name, version = _runtime_projection_profile(first)
+        if any(_event_trace_id(event) != trace_id for event in events):
+            raise ValueError("runtime event projection requires one execution per publish")
         with self._attribute_scope(
-            session_id=runtime_session_id(first.projection_run_id),
-            trace_name="memforge.agent.extraction_batch",
-            version=first.extraction_contract_version,
+            session_id=session_id,
+            trace_name=trace_name,
+            version=version,
             tags=_langfuse_tags(first),
         ):
             root = self._client.start_observation(
-                name="memforge.agent.extraction_batch",
+                name=trace_name,
                 as_type="span",
                 trace_context={"trace_id": trace_id},
                 metadata=_langfuse_batch_metadata(first, len(events)),
@@ -535,14 +573,11 @@ def publish_runtime_events(
         sink.publish(events)
     except Exception as exc:
         first = events[0] if events else None
-        session_id = runtime_session_id(first.projection_run_id) if first is not None else "none"
+        session_id = (
+            _runtime_projection_profile(first)[0] if first is not None else "none"
+        )
         trace_id = (
-            first.trace_id
-            or runtime_trace_id(
-                derivation_id=first.derivation_id,
-                batch_id=first.batch_id,
-                batch_attempt=first.batch_attempt,
-            )
+            _event_trace_id(first)
             if first is not None
             else "none"
         )
@@ -579,7 +614,7 @@ def publish_agent_assessments(
         first = events[0] if events else None
         logger.warning(
             "Agent assessment projection failed session_id=%s assessment_count=%d error_type=%s",
-            runtime_session_id(first.projection_run_id) if first is not None else "none",
+            _runtime_projection_profile(first)[0] if first is not None else "none",
             len(assessments),
             type(exc).__name__,
         )
@@ -676,6 +711,34 @@ def bind_quality_signals(
         span_id="0" * 16,
         trace_flags=None,
     )
+    operation_input_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "source_id": source_id,
+                "source_unit_id": source_unit_id,
+                "target_unit_revision_id": target_unit_revision_id,
+                "projection_run_id": projection_run_id,
+                "derivation_id": derivation_id,
+                "batch_id": batch_id,
+                "contract_version": extraction_contract_version,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    operation_id = _runtime_identity(
+        "source-derivation-batch-operation-v1",
+        derivation_id,
+        batch_id,
+        operation_input_hash,
+        prefix="aop",
+    )
+    execution_id = _runtime_identity(
+        "source-derivation-batch-execution-v1",
+        operation_id,
+        str(batch_attempt),
+        prefix="aex",
+    )
     events = []
     for index, signal in enumerate(signals):
         if (
@@ -697,9 +760,32 @@ def bind_quality_signals(
         digest = hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()[:24]
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "identity": identity,
+                    "source_id": source_id,
+                    "source_type": source_type,
+                    "doc_id": doc_id,
+                    "source_unit_id": source_unit_id,
+                    "target_unit_revision_id": target_unit_revision_id,
+                    "projection_run_id": projection_run_id,
+                    "contract_version": extraction_contract_version,
+                    "deployment_revision": deployment_revision,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         events.append(
             AgentRuntimeEvent(
                 event_id=f"are-{digest}",
+                operation_id=operation_id,
+                execution_id=execution_id,
+                contract_version=extraction_contract_version,
+                payload_hash=payload_hash,
+                operation_input_hash=operation_input_hash,
+                execution_owner_id=f"{derivation_id}:{batch_id}:{batch_attempt}",
                 occurred_at=timestamp,
                 source_id=source_id,
                 source_type=source_type,
@@ -723,6 +809,137 @@ def bind_quality_signals(
             )
         )
     return tuple(events)
+
+
+def bind_source_lifecycle_outcome(
+    *,
+    source_id: str,
+    source_type: str,
+    doc_id: str,
+    source_unit_id: str,
+    base_unit_revision_id: str | None,
+    target_unit_revision_id: str,
+    projection_run_id: str,
+    operation_input_hash: str,
+    execution_owner_id: str,
+    outcome: AgentRuntimeOutcome,
+    reason_code: str,
+    attempt_count: int,
+    duration_ms: int,
+    incumbent_count: int,
+    relation_pair_count: int,
+    mutation_count: int,
+    review_count: int,
+    model_call_count: int,
+    occurred_at: datetime | None = None,
+    deployment_revision: str | None = None,
+) -> AgentRuntimeBundle:
+    """Bind one durable Source Unit lifecycle terminal result and assessment."""
+
+    _require_hash("operation_input_hash", operation_input_hash)
+    if attempt_count < 1:
+        raise ValueError("attempt_count must be positive")
+    for name, value in (
+        ("duration_ms", duration_ms),
+        ("incumbent_count", incumbent_count),
+        ("relation_pair_count", relation_pair_count),
+        ("mutation_count", mutation_count),
+        ("review_count", review_count),
+        ("model_call_count", model_call_count),
+    ):
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+    timestamp = occurred_at or datetime.now(timezone.utc)
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("agent runtime event timestamp requires a timezone")
+    timestamp = timestamp.astimezone(timezone.utc)
+    operation_id = _runtime_identity(
+        "source-unit-lifecycle-operation-v1",
+        source_id,
+        source_unit_id,
+        base_unit_revision_id or "none",
+        target_unit_revision_id,
+        operation_input_hash,
+        SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION,
+        prefix="aop",
+    )
+    execution_id = _runtime_identity(
+        "source-unit-lifecycle-execution-v1",
+        operation_id,
+        execution_owner_id,
+        prefix="aex",
+    )
+    event_id = _runtime_identity(
+        AGENT_RUNTIME_EVENT_SCHEMA_VERSION,
+        execution_id,
+        "source_unit_lifecycle_outcome",
+        prefix="are",
+    )
+    payload = {
+        "schema_version": AGENT_RUNTIME_EVENT_SCHEMA_VERSION,
+        "event_id": event_id,
+        "event_name": "source_unit_lifecycle_outcome",
+        "operation_id": operation_id,
+        "execution_id": execution_id,
+        "contract_version": SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION,
+        "operation_input_hash": operation_input_hash,
+        "execution_owner_id": execution_owner_id,
+        "outcome": outcome,
+        "reason_code": reason_code,
+        "source_id": source_id,
+        "source_type": source_type,
+        "doc_id": doc_id,
+        "source_unit_id": source_unit_id,
+        "base_unit_revision_id": base_unit_revision_id,
+        "target_unit_revision_id": target_unit_revision_id,
+        "projection_run_id": projection_run_id,
+        "deployment_revision": deployment_revision,
+        "attempt_count": attempt_count,
+        "duration_ms": duration_ms,
+        "recovered": attempt_count > 1 and outcome != "failed",
+        "incumbent_count": incumbent_count,
+        "relation_pair_count": relation_pair_count,
+        "mutation_count": mutation_count,
+        "review_count": review_count,
+        "model_call_count": model_call_count,
+    }
+    payload_hash = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    trace_id = runtime_execution_trace_id(execution_id)
+    event = AgentRuntimeEvent(
+        **payload,
+        occurred_at=timestamp,
+        payload_hash=payload_hash,
+        trace_id=trace_id,
+        operation="source_unit_lifecycle_reconciliation",
+    )
+    label: AgentAssessmentLabel = "fail" if outcome == "failed" else "pass"
+    assessment_id = _runtime_identity(
+        AGENT_ASSESSMENT_SCHEMA_VERSION,
+        event_id,
+        "source_unit_lifecycle_completion",
+        "memforge.deterministic.runtime_contract:1",
+        prefix="aas",
+    )
+    assessment = AgentAssessment(
+        assessment_id=assessment_id,
+        target_event_id=event_id,
+        criterion="source_unit_lifecycle_completion",
+        status="completed",
+        label=label,
+        reason_code=reason_code,
+        annotator_kind="code",
+        evaluator_name="memforge.deterministic.runtime_contract",
+        evaluator_version="1",
+        created_at=timestamp,
+    )
+    return AgentRuntimeBundle(events=(event,), assessments=(assessment,))
+
+
+def _runtime_identity(seed_version: str, *parts: str, prefix: str) -> str:
+    seed = ":".join((seed_version, *parts))
+    return f"{prefix}-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
 
 
 def evaluate_runtime_events(
@@ -795,6 +1012,52 @@ def runtime_trace_id(
     return trace_id if trace_id != "0" * 32 else "0" * 31 + "1"
 
 
+def runtime_execution_trace_id(execution_id: str) -> str:
+    """Return the W3C-compatible trace projection for one durable execution."""
+
+    trace_id = hashlib.sha256(
+        f"memforge-agent-execution-trace-v1:{execution_id}".encode("utf-8")
+    ).hexdigest()[:32]
+    return trace_id if trace_id != "0" * 32 else "0" * 31 + "1"
+
+
+def runtime_operation_session_id(operation_id: str) -> str:
+    """Return the bounded Langfuse Session projection for one operation."""
+
+    seed = f"memforge-agent-operation-session-v1:{operation_id}"
+    return "mfo1-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
+def _event_trace_id(event: AgentRuntimeEvent) -> str:
+    if event.trace_id is not None:
+        return event.trace_id
+    if event.execution_id is not None:
+        return runtime_execution_trace_id(event.execution_id)
+    if event.derivation_id is None or event.batch_id is None or event.batch_attempt is None:
+        raise ValueError("runtime event has no traceable execution identity")
+    return runtime_trace_id(
+        derivation_id=event.derivation_id,
+        batch_id=event.batch_id,
+        batch_attempt=event.batch_attempt,
+    )
+
+
+def _runtime_projection_profile(event: AgentRuntimeEvent) -> tuple[str, str, str | None]:
+    if event.event_name == "source_unit_lifecycle_outcome":
+        if event.operation_id is None:
+            raise ValueError("lifecycle runtime event requires operation_id")
+        return (
+            runtime_operation_session_id(event.operation_id),
+            "memforge.agent.reconcile_source_unit",
+            event.contract_version,
+        )
+    return (
+        runtime_session_id(event.projection_run_id),
+        "memforge.agent.extraction_batch",
+        event.extraction_contract_version,
+    )
+
+
 def runtime_session_id(projection_run_id: str) -> str:
     """Return the bounded Langfuse Session correlation for one Projection."""
 
@@ -830,6 +1093,9 @@ def runtime_event_otel_attributes(event: AgentRuntimeEvent) -> Mapping[str, obje
     values: dict[str, object | None] = {
         "memforge.agent.event_id": event.event_id,
         "memforge.agent.schema_version": event.schema_version,
+        "memforge.agent.operation_id": event.operation_id,
+        "memforge.agent.execution_id": event.execution_id,
+        "memforge.agent.contract.version": event.contract_version,
         "memforge.agent.outcome": event.outcome,
         "memforge.agent.reason_code": event.reason_code,
         "memforge.source.type": event.source_type,
@@ -839,6 +1105,14 @@ def runtime_event_otel_attributes(event: AgentRuntimeEvent) -> Mapping[str, obje
         "gen_ai.provider.name": event.provider,
         "gen_ai.request.model": event.model,
         "memforge.batch.attempt": event.batch_attempt,
+        "memforge.agent.attempt_count": event.attempt_count,
+        "memforge.agent.duration_ms": event.duration_ms,
+        "memforge.agent.recovered": event.recovered,
+        "memforge.agent.incumbent_count": event.incumbent_count,
+        "memforge.agent.relation_pair_count": event.relation_pair_count,
+        "memforge.agent.mutation_count": event.mutation_count,
+        "memforge.agent.review_count": event.review_count,
+        "memforge.agent.model_call_count": event.model_call_count,
         "gen_ai.request.max_tokens": event.requested_max_tokens,
         "gen_ai.response.finish_reasons": (
             [event.finish_reason] if event.finish_reason is not None else None
@@ -903,19 +1177,32 @@ def _langfuse_batch_metadata(
 ) -> dict[str, object]:
     values: dict[str, object | None] = {
         "schema_version": event.schema_version,
+        "operation_id": event.operation_id,
+        "execution_id": event.execution_id,
+        "contract_version": event.contract_version,
         "source_type": event.source_type,
         "extraction_contract_version": event.extraction_contract_version,
         "deployment_revision": event.deployment_revision,
         "provider": event.provider,
         "model": event.model,
         "batch_attempt": event.batch_attempt,
+        "attempt_count": event.attempt_count,
+        "duration_ms": event.duration_ms,
+        "recovered": event.recovered,
         "event_count": event_count,
     }
     return {name: value for name, value in values.items() if value is not None}
 
 
 def _langfuse_tags(event: AgentRuntimeEvent) -> list[str]:
-    tags = ["memforge-agent-eval", "memory-extraction"]
+    tags = [
+        "memforge-agent-eval",
+        (
+            "source-unit-lifecycle"
+            if event.event_name == "source_unit_lifecycle_outcome"
+            else "memory-extraction"
+        ),
+    ]
     if event.source_type and len(event.source_type) <= 128 and all(
         ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
         for ch in event.source_type
@@ -930,6 +1217,9 @@ def _langfuse_event_metadata(event: AgentRuntimeEvent) -> dict[str, object]:
     values: dict[str, object | None] = {
         "event_id": event.event_id,
         "schema_version": event.schema_version,
+        "operation_id": event.operation_id,
+        "execution_id": event.execution_id,
+        "contract_version": event.contract_version,
         "outcome": event.outcome,
         "reason_code": event.reason_code,
         "source_type": event.source_type,
@@ -941,6 +1231,13 @@ def _langfuse_event_metadata(event: AgentRuntimeEvent) -> dict[str, object]:
         "batch_attempt": event.batch_attempt,
         "localization_mode": event.localization_mode,
         "attempt_count": event.attempt_count,
+        "duration_ms": event.duration_ms,
+        "recovered": event.recovered,
+        "incumbent_count": event.incumbent_count,
+        "relation_pair_count": event.relation_pair_count,
+        "mutation_count": event.mutation_count,
+        "review_count": event.review_count,
+        "model_call_count": event.model_call_count,
         "retry_count": event.retry_count,
         "fallback_count": event.fallback_count,
         "attempt_index": event.attempt_index,

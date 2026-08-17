@@ -26,10 +26,11 @@ from memforge.evals.agent_evaluation import (
     AgentRuntimeEventQuery,
     QualitySignal,
     bind_quality_signals,
+    bind_source_lifecycle_outcome,
     record_quality_signal,
 )
 from memforge.memory.audit import MemoryAuditLogger
-from memforge.memory.engine import MemoryEngine
+from memforge.memory.engine import MemoryEngine, SourceUnitLifecycleExecutionError
 from memforge.memory.evidence import (
     AuthorityCase,
     CandidateMemory,
@@ -551,6 +552,64 @@ class _UnexpectedReconciliationClient:
         del prompt, kwargs
         raise AssertionError("proven-disjoint incumbent must not require LLM reconciliation")
 
+
+class _CapturingRuntimeSink:
+    def __init__(self) -> None:
+        self.published = []
+
+    def publish(self, events) -> None:
+        self.published.append(events)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_commit_rejection_returns_failure_bundle_without_success_row(
+    db: Database,
+) -> None:
+    projection = _projection(
+        run_id="projection-stale-lifecycle-event",
+        body="Service uses PostgreSQL 15.",
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+    )
+
+    with pytest.raises(SourceUnitLifecycleExecutionError) as failure:
+        await engine.apply_projected_lifecycle(
+            projection=projection,
+            doc_id="confluence-123",
+            raw_memories=[
+                RawMemory(
+                    content="Service uses PostgreSQL 15.",
+                    memory_type="fact",
+                )
+            ],
+            doc_type="design-doc",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content="Service uses PostgreSQL 15.",
+            update_mode="full_document",
+            changed_hunks=None,
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+            expected_source_activity_epoch=999,
+            lifecycle_execution_owner_id="sync-run-stale:lease-1",
+        )
+
+    assert failure.value.runtime_bundle.event.reason_code == "lifecycle_commit_failed"
+    assert await db.list_memories() == []
+    assert await db.list_agent_runtime_events(
+        AgentRuntimeEventQuery(
+            occurred_from=datetime(2026, 8, 16, tzinfo=timezone.utc),
+            occurred_to=datetime(2026, 8, 18, tzinfo=timezone.utc),
+            source_id="src-1",
+            event_name="source_unit_lifecycle_outcome",
+            limit=10,
+        )
+    ) == []
+
     async def audit_incumbent_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         raise AssertionError("proven-disjoint incumbent must not require LLM reconciliation")
@@ -565,10 +624,12 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
         body="Service uses PostgreSQL 15.",
     )
     adapters = build_sqlite_adapters(db, object())
+    runtime_sink = _CapturingRuntimeSink()
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
+        runtime_event_trace_sink=runtime_sink,
     )
     await engine.apply_projected_lifecycle(
         projection=first,
@@ -587,6 +648,8 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
         changed_hunks=None,
         update_plan_stats=None,
         source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        lifecycle_execution_owner_id="sync-run-review:lease-1",
+        lifecycle_attempt_count=2,
     )
     [incumbent] = await db.list_memories()
     previous_support = await db.get_active_memory_support_reference_ids(incumbent.id)
@@ -636,6 +699,19 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
     assert (
         second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id
     )
+    runtime_events = await db.list_agent_runtime_events(
+        AgentRuntimeEventQuery(
+            occurred_from=datetime(2026, 8, 16, tzinfo=timezone.utc),
+            occurred_to=datetime(2026, 8, 18, tzinfo=timezone.utc),
+            source_id="src-1",
+            event_name="source_unit_lifecycle_outcome",
+            limit=10,
+        )
+    )
+    assert len(runtime_events) == 1
+    assert runtime_events[0].outcome == "expected"
+    assert runtime_events[0].recovered is True
+    assert runtime_sink.published == [(runtime_events[0],)]
 
 
 @pytest.mark.asyncio
@@ -2003,6 +2079,29 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
         document=staged_document,
         derivation_id=attempt.id,
         derivation_context_identity_hash=(attempt.context_identity_hash),
+        runtime_bundle=(
+            runtime_bundle := bind_source_lifecycle_outcome(
+                source_id="src-1",
+                source_type="confluence",
+                doc_id="confluence-123",
+                source_unit_id=delta.source_unit_id,
+                base_unit_revision_id=delta.previous_unit_revision_id,
+                target_unit_revision_id=delta.current_unit_revision_id,
+                projection_run_id=second.run_id,
+                operation_input_hash="a" * 64,
+                execution_owner_id="sync-run-atomic:lease-1",
+                outcome="expected",
+                reason_code="lifecycle_plan_applied",
+                attempt_count=1,
+                duration_ms=25,
+                incumbent_count=0,
+                relation_pair_count=0,
+                mutation_count=0,
+                review_count=0,
+                model_call_count=0,
+                occurred_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
+            )
+        ),
     )
 
     committed_document = await db.get_document("confluence-123")
@@ -2013,6 +2112,24 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
     assert current_unit is not None
     assert current_unit.id == second.source_unit_revisions[0].id
     assert committed_attempt.status == "applied"
+    events = await db.list_agent_runtime_events(
+        AgentRuntimeEventQuery(
+            occurred_from=datetime(2026, 8, 16, tzinfo=timezone.utc),
+            occurred_to=datetime(2026, 8, 18, tzinfo=timezone.utc),
+            event_id=runtime_bundle.event.event_id,
+            limit=10,
+        )
+    )
+    assessments = await db.list_agent_assessments(
+        AgentAssessmentQuery(
+            occurred_from=datetime(2026, 8, 16, tzinfo=timezone.utc),
+            occurred_to=datetime(2026, 8, 18, tzinfo=timezone.utc),
+            target_event_id=runtime_bundle.event.event_id,
+            limit=10,
+        )
+    )
+    assert events == [runtime_bundle.event]
+    assert assessments == [runtime_bundle.assessment]
 
 
 @pytest.mark.asyncio
@@ -3465,9 +3582,9 @@ async def test_persistent_incomplete_incumbent_audit_fails_closed_without_mutati
     )
 
     with pytest.raises(
-        RuntimeError,
+        SourceUnitLifecycleExecutionError,
         match="incumbent support response count 0 does not match expected count 1",
-    ):
+    ) as failure:
         await engine.apply_projected_lifecycle(
             projection=second,
             doc_id="confluence-123",
@@ -3480,12 +3597,18 @@ async def test_persistent_incomplete_incumbent_audit_fails_closed_without_mutati
             changed_hunks="removed -> retained",
             update_plan_stats=None,
             source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+            lifecycle_execution_owner_id="sync-run-incomplete:lease-1",
+            lifecycle_attempt_count=3,
         )
 
     assert client.calls == 2
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
     assert await db.get_active_memory_support_reference_ids(incumbent.id)
+    assert failure.value.runtime_bundle.event.outcome == "failed"
+    assert failure.value.runtime_bundle.event.reason_code == "support_response_incomplete"
+    assert failure.value.runtime_bundle.event.attempt_count == 3
+    assert failure.value.runtime_bundle.assessment.label == "fail"
     reviews = await db.list_lifecycle_reviews("src-1")
     assert reviews == []
 
