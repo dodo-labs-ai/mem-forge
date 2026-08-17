@@ -24,7 +24,7 @@ from typing import Callable, ContextManager, Iterator, Literal, Mapping, Protoco
 
 
 AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v3"
-AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v1"
+AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v2"
 SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION = "source-unit-lifecycle-v1"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
 AgentAssessmentStatus = Literal["completed", "failed"]
@@ -257,10 +257,10 @@ class AgentRuntimeEventQuery:
 
 @dataclass(frozen=True, slots=True)
 class AgentAssessment:
-    """One versioned judgment over a durable runtime event."""
+    """One versioned judgment over one online event or offline result."""
 
     assessment_id: str
-    target_event_id: str
+    target_event_id: str | None
     criterion: str
     status: AgentAssessmentStatus
     label: AgentAssessmentLabel | None
@@ -269,19 +269,25 @@ class AgentAssessment:
     evaluator_name: str
     evaluator_version: str
     created_at: datetime
+    target_result_id: str | None = None
     occurrence_count: int = 1
     schema_version: str = AGENT_ASSESSMENT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         for name in (
             "assessment_id",
-            "target_event_id",
             "criterion",
             "reason_code",
             "evaluator_name",
             "evaluator_version",
         ):
             _require_safe_identifier(name, getattr(self, name))
+        if (self.target_event_id is None) == (self.target_result_id is None):
+            raise ValueError("assessment requires exactly one event or result target")
+        if self.target_event_id is not None:
+            _require_safe_identifier("target_event_id", self.target_event_id)
+        if self.target_result_id is not None:
+            _require_safe_identifier("target_result_id", self.target_result_id)
         if self.status == "completed" and self.label is None:
             raise ValueError("completed assessment requires a label")
         if self.status == "failed" and self.label is not None:
@@ -301,7 +307,10 @@ class AgentRuntimeBundle:
 
     def __post_init__(self) -> None:
         event_ids = {event.event_id for event in self.events}
-        if any(item.target_event_id not in event_ids for item in self.assessments):
+        if any(
+            item.target_result_id is not None or item.target_event_id not in event_ids
+            for item in self.assessments
+        ):
             raise ValueError("agent assessment target must belong to the runtime bundle")
 
     @property
@@ -327,6 +336,7 @@ class AgentAssessmentQuery:
     include_private: bool = False
     assessment_id: str | None = None
     target_event_id: str | None = None
+    target_result_id: str | None = None
     source_id: str | None = None
     criterion: str | None = None
     status: AgentAssessmentStatus | None = None
@@ -1271,6 +1281,7 @@ def _langfuse_assessment_metadata(
     return {
         "assessment_id": assessment.assessment_id,
         "target_event_id": assessment.target_event_id,
+        "target_result_id": assessment.target_result_id,
         "schema_version": assessment.schema_version,
         "reason_code": assessment.reason_code,
         "annotator_kind": assessment.annotator_kind,

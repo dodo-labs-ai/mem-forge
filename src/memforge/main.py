@@ -815,6 +815,67 @@ async def _run_online_evaluation_report(
     }
 
 
+@eval_group.command("offline-report")
+@click.option("--run-id", required=True)
+@click.option("--user-id", "requesting_user_id", required=True)
+@click.pass_context
+def eval_offline_report(
+    ctx: click.Context,
+    run_id: str,
+    requesting_user_id: str,
+) -> None:
+    """Read one authorized immutable offline evaluation report."""
+
+    config: AppConfig = ctx.obj["config"]
+    payload = asyncio.run(
+        _run_offline_evaluation_report(
+            config=config,
+            run_id=run_id,
+            requesting_user_id=requesting_user_id,
+        )
+    )
+    click.echo(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+
+
+async def _run_offline_evaluation_report(
+    *,
+    config: AppConfig,
+    run_id: str,
+    requesting_user_id: str,
+) -> dict[str, object]:
+    from memforge.evals.agent_evaluation import assessment_public_payload
+    from memforge.evals.offline_evaluation import (
+        OfflineAgentEvaluation,
+        agent_evaluation_result_to_payload,
+        agent_evaluation_run_to_payload,
+    )
+
+    db = await _get_db(config)
+    try:
+        report = await OfflineAgentEvaluation(db, executors={}).read_report(
+            run_id,
+            requesting_user_id=requesting_user_id,
+        )
+    finally:
+        await db.close()
+    return {
+        "run": agent_evaluation_run_to_payload(report.run),
+        "summary": {
+            "completed_result_count": report.completed_result_count,
+            "error_result_count": report.error_result_count,
+            "check_counts": dict(report.check_counts),
+            "population_summaries": {
+                population: dict(summary)
+                for population, summary in report.population_summaries.items()
+            },
+        },
+        "results": [agent_evaluation_result_to_payload(result) for result in report.results],
+        "assessments": [
+            dict(assessment_public_payload(assessment)) for assessment in report.assessments
+        ],
+    }
+
+
 @eval_group.command("purge-runtime-events")
 @click.option("--before", "occurred_before", help="Exclusive RFC 3339 cutoff; defaults to configured retention.")
 @click.option("--limit", type=click.IntRange(1, 10_000), help="Bounded delete count.")
