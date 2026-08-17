@@ -83,7 +83,12 @@ from memforge.source_derivation import (
     source_derivation_manifest,
 )
 from memforge.config import AgentEvaluationConfig, AppConfig, SyncConfig
-from memforge.evals.agent_evaluation import runtime_session_id
+from memforge.evals.agent_evaluation import (
+    AgentAssessmentQuery,
+    AgentRuntimeEventQuery,
+    bind_source_lifecycle_outcome,
+    runtime_session_id,
+)
 from memforge.storage.database import Database
 from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -1588,6 +1593,121 @@ async def test_fail_source_sync_run_requeues_retryable_failure_after_backoff(db:
     assert retried is not None
     assert retried.run_id == enqueued.run_id
     assert retried.lease_attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_durable_recovery_records_one_terminal_lifecycle_failure_per_execution(
+    db: Database,
+) -> None:
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    source_id = "src-lifecycle-terminal-events"
+    await db.upsert_source(
+        id=source_id,
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+    first_lease = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert first_lease is not None
+
+    def failure_bundle(lease_attempt_count: int):
+        return bind_source_lifecycle_outcome(
+            source_id=source_id,
+            source_type="github_repo",
+            doc_id="README.md",
+            source_unit_id="unit-readme",
+            base_unit_revision_id="sur-before",
+            target_unit_revision_id="sur-current",
+            projection_run_id="spr-readme",
+            operation_input_hash="a" * 64,
+            execution_owner_id=(
+                f"{enqueued.run_id}:attempt:{lease_attempt_count}"
+            ),
+            outcome="failed",
+            reason_code="relation_ledger_incomplete",
+            attempt_count=3,
+            duration_ms=50,
+            incumbent_count=2,
+            relation_pair_count=4,
+            mutation_count=0,
+            review_count=0,
+            model_call_count=2,
+            occurred_at=now + timedelta(seconds=lease_attempt_count),
+        )
+
+    first_bundle = failure_bundle(first_lease.lease_attempt_count)
+    assert await db.fail_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=first_lease.lease_attempt_count,
+        error_message="first execution failed",
+        final_state=SyncState(
+            source=source_id,
+            last_sync_status="failed",
+            error_message="first execution failed",
+            runtime_bundles=(first_bundle,),
+        ),
+        retryable=True,
+        failed_at=now + timedelta(seconds=5),
+        next_attempt_at=now + timedelta(seconds=65),
+    )
+    second_lease = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=65),
+    )
+    assert second_lease is not None
+    second_bundle = failure_bundle(second_lease.lease_attempt_count)
+    assert await db.fail_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-b",
+        lease_attempt_count=second_lease.lease_attempt_count,
+        error_message="recovery execution failed",
+        final_state=SyncState(
+            source=source_id,
+            last_sync_status="failed",
+            error_message="recovery execution failed",
+            runtime_bundles=(second_bundle,),
+        ),
+        retryable=False,
+        failed_at=now + timedelta(seconds=70),
+    )
+
+    events = await db.list_agent_runtime_events(
+        AgentRuntimeEventQuery(
+            occurred_from=now,
+            occurred_to=now + timedelta(minutes=2),
+            source_id=source_id,
+            event_name="source_unit_lifecycle_outcome",
+            limit=10,
+        )
+    )
+    assessments = await db.list_agent_assessments(
+        AgentAssessmentQuery(
+            occurred_from=now,
+            occurred_to=now + timedelta(minutes=2),
+            source_id=source_id,
+            criterion="source_unit_lifecycle_completion",
+            limit=10,
+        )
+    )
+    assert events == [first_bundle.event, second_bundle.event]
+    assert events[0].operation_id == events[1].operation_id
+    assert events[0].execution_id != events[1].execution_id
+    assert [item.label for item in assessments] == ["fail", "fail"]
 
 
 @pytest.mark.asyncio
@@ -3144,9 +3264,15 @@ class RecordingMemoryEngine(NoopMemoryEngine):
 class FailingProjectedMemoryEngine(NoopMemoryEngine):
     def __init__(self) -> None:
         self.calls = 0
+        self.lifecycle_attempt_counts: list[int] = []
+        self.lifecycle_execution_owner_ids: list[str | None] = []
 
     async def apply_projected_lifecycle(self, **kwargs):
         self.calls += 1
+        self.lifecycle_attempt_counts.append(kwargs.get("lifecycle_attempt_count"))
+        self.lifecycle_execution_owner_ids.append(
+            kwargs.get("lifecycle_execution_owner_id")
+        )
         raise RuntimeError("lifecycle apply failed")
 
 
@@ -5088,6 +5214,51 @@ async def test_successful_zero_change_sync_advances_last_sync_and_keeps_doc_coun
     assert state.last_sync_at > previous_sync
     assert source["last_sync"] == state.last_sync_at.isoformat()
     assert source["doc_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_type",
+    ["confluence", "jira", "github_repo", "github_pages", "local_markdown", "teams"],
+)
+async def test_supported_configured_sources_reach_shared_lifecycle_execution_seam(
+    db: Database,
+    source_type: str,
+) -> None:
+    source_id = f"src-runtime-seam-{source_type}"
+    await db.upsert_source(
+        id=source_id,
+        type=source_type,
+        name=f"Runtime seam {source_type}",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    class SourceTypeGene(UpdatingDocumentGene):
+        @classmethod
+        def metadata(cls):
+            return replace(UpdatingDocumentGene.metadata(), name=source_type)
+
+    gene_type = UpdatingTicketGene if source_type == "jira" else SourceTypeGene
+    engine = RecordingMemoryEngine()
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+    ).sync_gene(
+        gene=gene_type("# Decision\n\nUse the shared lifecycle seam."),
+        source_name=f"Runtime seam {source_type}",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    [call] = engine.projected_lifecycle_calls
+    assert call["projection"].source_type == source_type
+    assert call["lifecycle_execution_owner_id"]
+    assert call["lifecycle_attempt_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -11208,6 +11379,9 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
 
     assert failed_state.last_sync_status == "failed"
     assert failing_engine.calls == 3
+    assert failing_engine.lifecycle_attempt_counts == [1, 2, 3]
+    assert len(set(failing_engine.lifecycle_execution_owner_ids)) == 1
+    assert failing_engine.lifecycle_execution_owner_ids[0]
     assert (await db.get_current_source_unit_revision(source_unit.id)).id == prior_revision.id  # type: ignore[union-attr]
     assert (await db.get_document("doc-1")).content_hash == prior_document.content_hash  # type: ignore[union-attr]
 
@@ -11228,6 +11402,11 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
 
     assert retry_state.last_sync_status == "success"
     assert len(retry_engine.projected_lifecycle_calls) == 1
+    assert retry_engine.projected_lifecycle_calls[0]["lifecycle_attempt_count"] == 1
+    assert (
+        retry_engine.projected_lifecycle_calls[0]["lifecycle_execution_owner_id"]
+        != failing_engine.lifecycle_execution_owner_ids[0]
+    )
     current_revision = await db.get_current_source_unit_revision(source_unit.id)
     assert current_revision is not None and current_revision.id != prior_revision.id
 

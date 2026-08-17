@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence
 
 import aiosqlite
 
+from memforge.evals.agent_evaluation import AgentRuntimeBundle
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
@@ -1022,6 +1023,7 @@ class SqliteRelationalStore:
         derivation_id: str | None = None,
         derivation_context_identity_hash: str | None = None,
         expected_source_activity_epoch: int | None = None,
+        runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None:
         await self._db.apply_source_projection_lifecycle(
             projection,
@@ -1030,6 +1032,7 @@ class SqliteRelationalStore:
             derivation_id=derivation_id,
             derivation_context_identity_hash=(derivation_context_identity_hash),
             expected_source_activity_epoch=expected_source_activity_epoch,
+            runtime_bundle=runtime_bundle,
         )
 
     async def apply_agent_claim_source_projection_lifecycle(

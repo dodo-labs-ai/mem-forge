@@ -100,7 +100,16 @@ class ReconciliationFailure:
     """Failure metadata for a reconciliation that produced no safe ledger."""
 
     error_type: str
+    reason_code: str
     error: str
+
+
+class ReconciliationContractError(ValueError):
+    """A bounded fail-closed reconciliation invariant violation."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,7 +275,10 @@ async def reconcile_memories(
             relation_pair_count += len(conditional_pairs)
             relation_prompt_chars += conditional.prompt_chars
             if any(decision.relation_type is MemoryRelationType.CONTRADICTS for decision in conditional.decisions):
-                raise ValueError("multiple refinement candidates contain incompatible current assertions")
+                raise ReconciliationContractError(
+                    "non_unique_refinement_conflict",
+                    "multiple refinement candidates contain incompatible current assertions",
+                )
 
         proof_requests = [
             (indices[0], incumbent_id)
@@ -294,11 +306,27 @@ async def reconcile_memories(
             revision_proofs=proofs,
         )
         return _return_result(operations, metrics=metrics(), include_metadata=include_metadata)
+    except ReconciliationContractError as error:
+        logger.warning("Relation-first reconciliation failed closed: %s", error)
+        return _return_result(
+            [],
+            failure=ReconciliationFailure(
+                error_type="relation_first_error",
+                reason_code=error.reason_code,
+                error=str(error),
+            ),
+            metrics=metrics(),
+            include_metadata=include_metadata,
+        )
     except (StructuredLlmError, MemoryPairClassificationError, KeyError, ValueError) as error:
         logger.warning("Relation-first reconciliation failed closed: %s", error)
         return _return_result(
             [],
-            failure=ReconciliationFailure(error_type="relation_first_error", error=str(error)),
+            failure=ReconciliationFailure(
+                error_type="relation_first_error",
+                reason_code="relation_first_failed",
+                error=str(error),
+            ),
             metrics=metrics(),
             include_metadata=include_metadata,
         )
@@ -306,7 +334,11 @@ async def reconcile_memories(
         logger.exception("Unexpected relation-first reconciliation failure")
         return _return_result(
             [],
-            failure=ReconciliationFailure(error_type="unexpected_error", error=str(error)),
+            failure=ReconciliationFailure(
+                error_type="unexpected_error",
+                reason_code="unexpected_reconciliation_failure",
+                error=str(error),
+            ),
             metrics=metrics(),
             include_metadata=include_metadata,
         )
@@ -330,14 +362,23 @@ def reduce_relation_ledger(
     }
     actual_pairs = {(entry.candidate_index, entry.incumbent_id) for entry in relations}
     if len(actual_pairs) != len(relations) or actual_pairs != expected_pairs:
-        raise ValueError("relation ledger does not cover every exact candidate/incumbent pair once")
+        raise ReconciliationContractError(
+            "relation_ledger_incomplete",
+            "relation ledger does not cover every exact candidate/incumbent pair once",
+        )
     audits_by_id = {entry.incumbent_id: entry for entry in support_audits}
     if len(audits_by_id) != len(support_audits) or set(audits_by_id) != incumbent_ids:
-        raise ValueError("support audit does not cover every incumbent exactly once")
+        raise ReconciliationContractError(
+            "support_ledger_incomplete",
+            "support audit does not cover every incumbent exactly once",
+        )
     proofs = revision_proofs or []
     proofs_by_pair = {(proof.candidate_index, proof.incumbent_id): proof for proof in proofs}
     if len(proofs_by_pair) != len(proofs):
-        raise ValueError("duplicate revision composition proof")
+        raise ReconciliationContractError(
+            "duplicate_revision_proof",
+            "duplicate revision composition proof",
+        )
 
     by_incumbent: dict[str, list[RelationLedgerEntry]] = {memory_id: [] for memory_id in incumbent_ids}
     for entry in relations:
@@ -456,10 +497,16 @@ def _bind_relation_entries(
     for decision in decisions:
         challenger_id = decision.pair.challenger.id
         if not challenger_id.startswith("candidate:"):
-            raise ValueError("relation classifier returned an unknown challenger")
+            raise ReconciliationContractError(
+                "relation_response_unknown_challenger",
+                "relation classifier returned an unknown challenger",
+            )
         candidate_index = int(challenger_id.split(":", 1)[1])
         if not 0 <= candidate_index < candidate_count or decision.pair.candidate.id not in incumbent_ids:
-            raise ValueError("relation classifier returned an out-of-scope pair")
+            raise ReconciliationContractError(
+                "relation_response_out_of_scope",
+                "relation classifier returned an out-of-scope pair",
+            )
         entries.append(
             RelationLedgerEntry(
                 candidate_index=candidate_index,
@@ -516,7 +563,8 @@ async def _audit_incumbent_support(
             if len(response.decisions) == len(batch):
                 break
             if attempt + 1 == RECONCILIATION_BATCH_VALIDATION_ATTEMPTS:
-                raise ValueError(
+                raise ReconciliationContractError(
+                    "support_response_incomplete",
                     f"incumbent support response count {len(response.decisions)} "
                     f"does not match expected count {len(batch)}"
                 )

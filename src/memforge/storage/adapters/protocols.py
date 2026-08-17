@@ -13,6 +13,7 @@ import hashlib
 import json
 from typing import Any, Mapping, Protocol, Sequence, TypedDict, runtime_checkable
 
+from memforge.evals.agent_evaluation import AgentRuntimeBundle
 from memforge.models import (
     DocumentRecord,
     Entity,
@@ -611,6 +612,7 @@ class RelationalStore(Protocol):
         derivation_id: str | None = None,
         derivation_context_identity_hash: str | None = None,
         expected_source_activity_epoch: int | None = None,
+        runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None: ...
     async def apply_agent_claim_source_projection_lifecycle(
         self,

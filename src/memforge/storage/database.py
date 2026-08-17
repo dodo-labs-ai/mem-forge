@@ -143,6 +143,7 @@ from memforge.memory.audit import MemoryAuditEvent
 from memforge.evals.agent_evaluation import (
     AgentAssessment,
     AgentAssessmentQuery,
+    AgentRuntimeBundle,
     AgentRuntimeEvent,
     AgentRuntimeEventQuery,
 )
@@ -1647,6 +1648,12 @@ CREATE INDEX IF NOT EXISTS idx_memory_audit_type ON memory_audit_events(event_ty
 CREATE TABLE IF NOT EXISTS agent_runtime_events (
     event_id                    TEXT PRIMARY KEY,
     schema_version              TEXT NOT NULL,
+    operation_id                TEXT,
+    execution_id                TEXT,
+    contract_version            TEXT,
+    payload_hash                TEXT,
+    operation_input_hash        TEXT,
+    execution_owner_id          TEXT,
     event_name                  TEXT NOT NULL,
     outcome                     TEXT NOT NULL,
     reason_code                 TEXT NOT NULL,
@@ -1656,12 +1663,13 @@ CREATE TABLE IF NOT EXISTS agent_runtime_events (
     source_type                 TEXT NOT NULL,
     doc_id                      TEXT NOT NULL,
     source_unit_id              TEXT NOT NULL,
+    base_unit_revision_id       TEXT,
     target_unit_revision_id     TEXT NOT NULL,
     projection_run_id           TEXT NOT NULL,
-    derivation_id               TEXT NOT NULL,
-    batch_id                    TEXT NOT NULL,
-    batch_attempt               INTEGER NOT NULL,
-    extraction_contract_version TEXT NOT NULL,
+    derivation_id               TEXT,
+    batch_id                    TEXT,
+    batch_attempt               INTEGER,
+    extraction_contract_version TEXT,
     operation                   TEXT,
     provider                    TEXT,
     model                       TEXT,
@@ -1676,6 +1684,13 @@ CREATE TABLE IF NOT EXISTS agent_runtime_events (
     quote_chars                 INTEGER,
     localization_mode           TEXT,
     attempt_count               INTEGER,
+    duration_ms                 INTEGER,
+    recovered                   INTEGER,
+    incumbent_count             INTEGER,
+    relation_pair_count         INTEGER,
+    mutation_count              INTEGER,
+    review_count                INTEGER,
+    model_call_count            INTEGER,
     retry_count                 INTEGER,
     fallback_count              INTEGER,
     attempt_index               INTEGER,
@@ -3451,6 +3466,11 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                ON agent_assessments(criterion, label, created_at)""",
         ],
     ),
+    (
+        79,
+        "Separate agent operation, execution, and terminal event identity",
+        [],
+    ),
 ]
 
 
@@ -3517,6 +3537,108 @@ class Database:
         await self._assert_memory_source_ids_resolved()
         await self._db.commit()
 
+    async def _migrate_agent_runtime_event_v3_unlocked(self) -> None:
+        """Relax extraction-only lineage and preserve v2 events and assessments."""
+
+        async with self.db.execute("PRAGMA table_info(agent_runtime_events)") as cursor:
+            columns = {str(row[1]) async for row in cursor}
+        if "operation_id" in columns:
+            return
+        await self.db.execute(
+            """CREATE TABLE agent_runtime_events_v3 (
+                event_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL,
+                operation_id TEXT, execution_id TEXT, contract_version TEXT,
+                payload_hash TEXT, operation_input_hash TEXT, execution_owner_id TEXT,
+                event_name TEXT NOT NULL, outcome TEXT NOT NULL, reason_code TEXT NOT NULL,
+                occurred_at TEXT NOT NULL, deployment_revision TEXT,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                source_type TEXT NOT NULL, doc_id TEXT NOT NULL,
+                source_unit_id TEXT NOT NULL, base_unit_revision_id TEXT,
+                target_unit_revision_id TEXT NOT NULL, projection_run_id TEXT NOT NULL,
+                derivation_id TEXT, batch_id TEXT, batch_attempt INTEGER,
+                extraction_contract_version TEXT, operation TEXT, provider TEXT, model TEXT,
+                prompt_hash TEXT, candidate_hash TEXT, observation_id TEXT,
+                observation_revision_id TEXT, range_start INTEGER, range_end INTEGER,
+                block_hash TEXT, quote_hash TEXT, quote_chars INTEGER,
+                localization_mode TEXT, attempt_count INTEGER, duration_ms INTEGER,
+                recovered INTEGER, incumbent_count INTEGER, relation_pair_count INTEGER,
+                mutation_count INTEGER, review_count INTEGER, model_call_count INTEGER,
+                retry_count INTEGER, fallback_count INTEGER, attempt_index INTEGER,
+                structured_mode TEXT, schema_transport TEXT, requested_max_tokens INTEGER,
+                terminal_category TEXT, error_code TEXT, finish_reason TEXT, stop_reason TEXT,
+                provider_request_id TEXT, prompt_tokens INTEGER, completion_tokens INTEGER,
+                total_tokens INTEGER, response_chars INTEGER, response_hash TEXT,
+                validation_location TEXT, validation_rule TEXT, json_error_line INTEGER,
+                json_error_column INTEGER, candidate_count INTEGER, rejected_count INTEGER,
+                occurrence_count INTEGER NOT NULL DEFAULT 1, trace_id TEXT,
+                span_id TEXT, trace_flags INTEGER
+            )"""
+        )
+        await self.db.execute(
+            """INSERT INTO agent_runtime_events_v3 (
+                event_id, schema_version, event_name, outcome, reason_code, occurred_at,
+                deployment_revision, source_id, source_type, doc_id, source_unit_id,
+                target_unit_revision_id, projection_run_id, derivation_id, batch_id,
+                batch_attempt, extraction_contract_version, operation, provider, model,
+                prompt_hash, candidate_hash, observation_id, observation_revision_id,
+                range_start, range_end, block_hash, quote_hash, quote_chars,
+                localization_mode, attempt_count, retry_count, fallback_count,
+                attempt_index, structured_mode, schema_transport, requested_max_tokens,
+                terminal_category, error_code, finish_reason, stop_reason,
+                provider_request_id, prompt_tokens, completion_tokens, total_tokens,
+                response_chars, response_hash, validation_location, validation_rule,
+                json_error_line, json_error_column, candidate_count, rejected_count,
+                occurrence_count, trace_id, span_id, trace_flags
+            ) SELECT
+                event_id, schema_version, event_name, outcome, reason_code, occurred_at,
+                deployment_revision, source_id, source_type, doc_id, source_unit_id,
+                target_unit_revision_id, projection_run_id, derivation_id, batch_id,
+                batch_attempt, extraction_contract_version, operation, provider, model,
+                prompt_hash, candidate_hash, observation_id, observation_revision_id,
+                range_start, range_end, block_hash, quote_hash, quote_chars,
+                localization_mode, attempt_count, retry_count, fallback_count,
+                attempt_index, structured_mode, schema_transport, requested_max_tokens,
+                terminal_category, error_code, finish_reason, stop_reason,
+                provider_request_id, prompt_tokens, completion_tokens, total_tokens,
+                response_chars, response_hash, validation_location, validation_rule,
+                json_error_line, json_error_column, candidate_count, rejected_count,
+                occurrence_count, trace_id, span_id, trace_flags
+            FROM agent_runtime_events"""
+        )
+        await self.db.execute(
+            """CREATE TABLE agent_assessments_v3 (
+                assessment_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL,
+                target_event_id TEXT NOT NULL
+                    REFERENCES agent_runtime_events_v3(event_id) ON DELETE CASCADE,
+                criterion TEXT NOT NULL, status TEXT NOT NULL
+                    CHECK (status IN ('completed', 'failed')),
+                label TEXT CHECK (label IN ('pass', 'fail', 'needs_review')),
+                reason_code TEXT NOT NULL, annotator_kind TEXT NOT NULL
+                    CHECK (annotator_kind IN ('code', 'llm', 'human')),
+                evaluator_name TEXT NOT NULL, evaluator_version TEXT NOT NULL,
+                created_at TEXT NOT NULL, occurrence_count INTEGER NOT NULL DEFAULT 1
+            )"""
+        )
+        await self.db.execute(
+            """INSERT INTO agent_assessments_v3 SELECT * FROM agent_assessments"""
+        )
+        await self.db.execute("DROP TABLE agent_assessments")
+        await self.db.execute("DROP TABLE agent_runtime_events")
+        await self.db.execute(
+            "ALTER TABLE agent_runtime_events_v3 RENAME TO agent_runtime_events"
+        )
+        await self.db.execute(
+            "ALTER TABLE agent_assessments_v3 RENAME TO agent_assessments"
+        )
+        for sql in (
+            "CREATE INDEX idx_agent_runtime_time ON agent_runtime_events(occurred_at, event_id)",
+            "CREATE INDEX idx_agent_runtime_source_time ON agent_runtime_events(source_id, occurred_at, event_id)",
+            "CREATE INDEX idx_agent_runtime_type_reason ON agent_runtime_events(event_name, reason_code, occurred_at)",
+            "CREATE INDEX idx_agent_assessment_event ON agent_assessments(target_event_id, assessment_id)",
+            "CREATE INDEX idx_agent_assessment_criterion ON agent_assessments(criterion, label, created_at)",
+        ):
+            await self.db.execute(sql)
+
     async def _run_migrations(self) -> None:
         """Apply pending schema migrations tracked in schema_migrations."""
         applied: set[int] = set()
@@ -3537,6 +3659,8 @@ class Database:
                         consolidated_memory_ids = [str(row[0]) async for row in cursor]
                     for memory_id in consolidated_memory_ids:
                         await self.purge_memory(memory_id)
+            if version == 79:
+                await self._migrate_agent_runtime_event_v3_unlocked()
             for sql in statements:
                 try:
                     await self.db.execute(sql)
@@ -7515,6 +7639,7 @@ class Database:
         derivation_id: str | None = None,
         derivation_context_identity_hash: str | None = None,
         expected_source_activity_epoch: int | None = None,
+        runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None:
         """Advance Source Projection and Memory lifecycle in one transaction."""
 
@@ -7530,6 +7655,16 @@ class Database:
             or delta.current_unit_revision_id != plan.scope.target_unit_revision_id
         ):
             raise ValueError("projection and lifecycle plan target different Source Unit revisions")
+        if runtime_bundle is not None:
+            event = runtime_bundle.event
+            if (
+                event.outcome == "failed"
+                or event.source_id != projection.source_id
+                or event.source_unit_id != delta.source_unit_id
+                or event.target_unit_revision_id != delta.current_unit_revision_id
+                or event.projection_run_id != projection.run_id
+            ):
+                raise ValueError("runtime bundle and projected lifecycle outcome do not match")
         async with self._write_lock:
             try:
                 if derivation_id is not None:
@@ -7599,6 +7734,9 @@ class Database:
                            WHERE id = ?""",
                         (now, now, derivation_id),
                     )
+                if runtime_bundle is not None:
+                    await self._insert_agent_runtime_events_unlocked(runtime_bundle.events)
+                    await self._insert_agent_assessments_unlocked(runtime_bundle.assessments)
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -16710,6 +16848,9 @@ class Database:
             try:
                 if final_state is not None:
                     await self._upsert_sync_state_unlocked(final_state)
+                    for bundle in final_state.runtime_bundles:
+                        await self._insert_agent_runtime_events_unlocked(bundle.events)
+                        await self._insert_agent_assessments_unlocked(bundle.assessments)
                 if not retryable:
                     terminal_state = final_state or SyncState(
                         source=str(leased_run["source_id"]),
@@ -17450,6 +17591,9 @@ class Database:
                     started_at=_utc_iso(started_at),
                     finished_at=_utc_iso(finished_at),
                 )
+                for bundle in state.runtime_bundles:
+                    await self._insert_agent_runtime_events_unlocked(bundle.events)
+                    await self._insert_agent_assessments_unlocked(bundle.assessments)
                 await self.db.commit()
             except BaseException:
                 await self.db.rollback()
@@ -17640,8 +17784,12 @@ class Database:
         if not events:
             return
         async with self._write_lock:
-            await self._insert_agent_runtime_events_unlocked(events)
-            await self.db.commit()
+            try:
+                await self._insert_agent_runtime_events_unlocked(events)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def _insert_agent_runtime_events_unlocked(
         self,
@@ -17649,16 +17797,20 @@ class Database:
     ) -> None:
         if not events:
             return
-        await self.db.executemany(
-            """INSERT OR IGNORE INTO agent_runtime_events (
-                    event_id, schema_version, event_name, outcome, reason_code,
+        statement = (
+            """INSERT INTO agent_runtime_events (
+                    event_id, schema_version, operation_id, execution_id,
+                    contract_version, payload_hash, operation_input_hash,
+                    execution_owner_id, event_name, outcome, reason_code,
                     occurred_at, deployment_revision, source_id, source_type,
-                    doc_id, source_unit_id, target_unit_revision_id,
+                    doc_id, source_unit_id, base_unit_revision_id, target_unit_revision_id,
                     projection_run_id, derivation_id, batch_id, batch_attempt,
                     extraction_contract_version, operation, provider, model, prompt_hash,
                     candidate_hash, observation_id, observation_revision_id,
                     range_start, range_end, block_hash, quote_hash, quote_chars,
-                    localization_mode, attempt_count, retry_count, fallback_count,
+                    localization_mode, attempt_count, duration_ms, recovered,
+                    incumbent_count, relation_pair_count, mutation_count,
+                    review_count, model_call_count, retry_count, fallback_count,
                     attempt_index, structured_mode, schema_transport,
                     requested_max_tokens, terminal_category, error_code,
                     finish_reason, stop_reason, provider_request_id,
@@ -17668,12 +17820,21 @@ class Database:
                     candidate_count, rejected_count, occurrence_count,
                     trace_id, span_id, trace_flags
                 ) VALUES ("""
-            + ", ".join("?" for _ in range(57))
-            + ")",
-            [
+            + ", ".join("?" for _ in range(71))
+            + ") ON CONFLICT(event_id) DO NOTHING"
+        )
+        for event in events:
+            cursor = await self.db.execute(
+                statement,
                 (
                         event.event_id,
                         event.schema_version,
+                        event.operation_id,
+                        event.execution_id,
+                        event.contract_version,
+                        event.payload_hash,
+                        event.operation_input_hash,
+                        event.execution_owner_id,
                         event.event_name,
                         event.outcome,
                         event.reason_code,
@@ -17683,6 +17844,7 @@ class Database:
                         event.source_type,
                         event.doc_id,
                         event.source_unit_id,
+                        event.base_unit_revision_id,
                         event.target_unit_revision_id,
                         event.projection_run_id,
                         event.derivation_id,
@@ -17703,6 +17865,13 @@ class Database:
                         event.quote_chars,
                         event.localization_mode,
                         event.attempt_count,
+                        event.duration_ms,
+                        int(event.recovered) if event.recovered is not None else None,
+                        event.incumbent_count,
+                        event.relation_pair_count,
+                        event.mutation_count,
+                        event.review_count,
+                        event.model_call_count,
                         event.retry_count,
                         event.fallback_count,
                         event.attempt_index,
@@ -17729,10 +17898,21 @@ class Database:
                         event.trace_id,
                         event.span_id,
                         event.trace_flags,
+                ),
+            )
+            if cursor.rowcount:
+                continue
+            existing = await self.db.execute(
+                "SELECT payload_hash FROM agent_runtime_events WHERE event_id = ?",
+                (event.event_id,),
+            )
+            row = await existing.fetchone()
+            stored_hash = row["payload_hash"] if row is not None else None
+            if stored_hash != event.payload_hash:
+                raise ValueError(
+                    "conflicting agent runtime event payload "
+                    f"event_id={event.event_id}"
                 )
-                for event in events
-            ],
-        )
 
     async def list_agent_runtime_events(
         self,
@@ -17760,6 +17940,8 @@ class Database:
         )
         for column, value in (
             ("event_id", query.event_id),
+            ("operation_id", query.operation_id),
+            ("execution_id", query.execution_id),
             ("source_id", query.source_id),
             ("source_type", query.source_type),
             ("event_name", query.event_name),
@@ -17770,6 +17952,7 @@ class Database:
             ("provider", query.provider),
             ("deployment_revision", query.deployment_revision),
             ("extraction_contract_version", query.extraction_contract_version),
+            ("contract_version", query.contract_version),
         ):
             if value is not None:
                 clauses.append(f"E.{column} = ?")
@@ -17826,6 +18009,12 @@ class Database:
         return AgentRuntimeEvent(
             event_id=str(row["event_id"]),
             schema_version=str(row["schema_version"]),
+            operation_id=row["operation_id"],  # type: ignore[arg-type]
+            execution_id=row["execution_id"],  # type: ignore[arg-type]
+            contract_version=row["contract_version"],  # type: ignore[arg-type]
+            payload_hash=row["payload_hash"],  # type: ignore[arg-type]
+            operation_input_hash=row["operation_input_hash"],  # type: ignore[arg-type]
+            execution_owner_id=row["execution_owner_id"],  # type: ignore[arg-type]
             event_name=str(row["event_name"]),
             outcome=str(row["outcome"]),  # type: ignore[arg-type]
             reason_code=str(row["reason_code"]),
@@ -17835,12 +18024,13 @@ class Database:
             source_type=str(row["source_type"]),
             doc_id=str(row["doc_id"]),
             source_unit_id=str(row["source_unit_id"]),
+            base_unit_revision_id=row["base_unit_revision_id"],  # type: ignore[arg-type]
             target_unit_revision_id=str(row["target_unit_revision_id"]),
             projection_run_id=str(row["projection_run_id"]),
-            derivation_id=str(row["derivation_id"]),
-            batch_id=str(row["batch_id"]),
-            batch_attempt=int(row["batch_attempt"]),
-            extraction_contract_version=str(row["extraction_contract_version"]),
+            derivation_id=row["derivation_id"],  # type: ignore[arg-type]
+            batch_id=row["batch_id"],  # type: ignore[arg-type]
+            batch_attempt=row["batch_attempt"],  # type: ignore[arg-type]
+            extraction_contract_version=row["extraction_contract_version"],  # type: ignore[arg-type]
             operation=row["operation"],  # type: ignore[arg-type]
             provider=row["provider"],  # type: ignore[arg-type]
             model=row["model"],  # type: ignore[arg-type]
@@ -17855,6 +18045,15 @@ class Database:
             quote_chars=row["quote_chars"],  # type: ignore[arg-type]
             localization_mode=row["localization_mode"],  # type: ignore[arg-type]
             attempt_count=row["attempt_count"],  # type: ignore[arg-type]
+            duration_ms=row["duration_ms"],  # type: ignore[arg-type]
+            recovered=(
+                bool(row["recovered"]) if row["recovered"] is not None else None
+            ),
+            incumbent_count=row["incumbent_count"],  # type: ignore[arg-type]
+            relation_pair_count=row["relation_pair_count"],  # type: ignore[arg-type]
+            mutation_count=row["mutation_count"],  # type: ignore[arg-type]
+            review_count=row["review_count"],  # type: ignore[arg-type]
+            model_call_count=row["model_call_count"],  # type: ignore[arg-type]
             retry_count=row["retry_count"],  # type: ignore[arg-type]
             fallback_count=row["fallback_count"],  # type: ignore[arg-type]
             attempt_index=row["attempt_index"],  # type: ignore[arg-type]

@@ -30,6 +30,11 @@ from typing import TYPE_CHECKING, Any
 
 import tiktoken
 
+from memforge.evals.agent_evaluation import (
+    assessment_sink_for_runtime_sink,
+    publish_agent_assessments,
+    publish_runtime_events,
+)
 from memforge.genes.base import SourceConfigurationError
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
@@ -732,6 +737,7 @@ class GeneSyncOrchestrator:
         memories_extracted = 0
         memories_corroborated = 0
         failed_docs: list[FailedDoc] = []
+        runtime_bundles = []
         error_message: str | None = None
         crawled_doc_ids: set[str] = set()
         existing_state = await self.db.get_sync_state(source_id)
@@ -764,6 +770,7 @@ class GeneSyncOrchestrator:
                     source_id=source_id,
                     source_activity_epoch=source_activity_epoch,
                     run_id=run_id,
+                    lifecycle_execution_owner_id=durable_cycle_id,
                     progress_callback=progress_callback,
                 )
                 docs_updated += recovered["updated"]
@@ -942,6 +949,7 @@ class GeneSyncOrchestrator:
                     "preflight_source_unit_id": None,
                     "preflight_observation_ids": (),
                     "projection_scope_attestation": None,
+                    "runtime_bundle": None,
                 }
                 document_completed = False
 
@@ -997,6 +1005,8 @@ class GeneSyncOrchestrator:
                                 authoritative_snapshot=authoritative_snapshot,
                                 execution_mode=execution_mode,
                                 expected_source_activity_epoch=source_activity_epoch,
+                                lifecycle_execution_owner_id=durable_cycle_id,
+                                lifecycle_attempt_count=attempt,
                             )
                             stats["processed"] = True
                             stats["updated"] = item_stats.get("updated", False)
@@ -1017,11 +1027,13 @@ class GeneSyncOrchestrator:
                             last_error = None
                         except Exception as exc:
                             attempt_error = _retained_document_error(exc)
+                            stats["runtime_bundle"] = getattr(exc, "runtime_bundle", None)
                             retry_document = not isinstance(
                                 exc,
                                 MemoryExtractionFailure,
                             )
                         if attempt_error is None:
+                            stats["runtime_bundle"] = None
                             break
                         last_error = attempt_error
                         if not retry_document:
@@ -1114,6 +1126,8 @@ class GeneSyncOrchestrator:
                     docs_failed += 1
                 memories_extracted += r["memories_extracted"]
                 memories_corroborated += r["memories_corroborated"]
+                if r.get("runtime_bundle") is not None:
+                    runtime_bundles.append(r["runtime_bundle"])
 
             if rebaseline_preflight and docs_failed == 0:
                 current_units = await self.db.list_current_source_unit_observation_ids(source_id)
@@ -1246,6 +1260,8 @@ class GeneSyncOrchestrator:
             status = "failed"
             error_message = str(e)
             failure_retryable = not isinstance(e, SourceConfigurationError)
+            if (runtime_bundle := getattr(e, "runtime_bundle", None)) is not None:
+                runtime_bundles.append(runtime_bundle)
             if scope_transition is not None and transition_started:
                 try:
                     await self.db.fail_projection_scope_transition(
@@ -1301,6 +1317,7 @@ class GeneSyncOrchestrator:
             error_message=error_message,
             failed_docs=failed_docs,
             failure_retryable=failure_retryable,
+            runtime_bundles=tuple(runtime_bundles),
         )
 
         if record_terminal_result and not non_mutating_run:
@@ -1310,6 +1327,17 @@ class GeneSyncOrchestrator:
                 finished_at=finished_at,
                 run_id=run_id,
             )
+            if self.runtime_event_trace_sink is not None:
+                assessment_sink = assessment_sink_for_runtime_sink(
+                    self.runtime_event_trace_sink
+                )
+                for bundle in sync_state.runtime_bundles:
+                    publish_runtime_events(self.runtime_event_trace_sink, bundle.events)
+                    publish_agent_assessments(
+                        assessment_sink,
+                        bundle.assessments,
+                        bundle.events,
+                    )
 
         if progress_callback:
             progress_callback(
@@ -1359,6 +1387,7 @@ class GeneSyncOrchestrator:
         source_id: str,
         source_activity_epoch: int | None,
         run_id: str,
+        lifecycle_execution_owner_id: str | None = None,
         progress_callback: Callable[[dict], None] | None = None,
     ) -> dict[str, int]:
         """Resume durable Source Unit work before reading the provider."""
@@ -1442,6 +1471,7 @@ class GeneSyncOrchestrator:
                         attempt=attempt,
                         source_id=source_id,
                         source_activity_epoch=source_activity_epoch,
+                        lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                     )
                 except Exception as exc:
                     recovery_error = exc
@@ -1478,6 +1508,7 @@ class GeneSyncOrchestrator:
         attempt: SourceDerivationAttempt,
         source_id: str,
         source_activity_epoch: int | None,
+        lifecycle_execution_owner_id: str | None,
     ) -> dict | None:
         """Resume one derivation inside the process document admission."""
 
@@ -1551,6 +1582,8 @@ class GeneSyncOrchestrator:
                 context.reprocess_all_current_observations
             ),
             expected_source_activity_epoch=source_activity_epoch,
+            lifecycle_execution_owner_id=lifecycle_execution_owner_id,
+            lifecycle_attempt_count=1,
         )
 
     # ==================================================================
@@ -1572,6 +1605,8 @@ class GeneSyncOrchestrator:
         authoritative_snapshot: bool = False,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         expected_source_activity_epoch: int | None = None,
+        lifecycle_execution_owner_id: str | None = None,
+        lifecycle_attempt_count: int = 1,
     ) -> dict:
         doc_id = item.item_id
         self._memory_sample("document_wait_start", source_id=source_id, run_id=run_id, doc_id=doc_id)
@@ -1614,6 +1649,8 @@ class GeneSyncOrchestrator:
                         authoritative_snapshot=authoritative_snapshot,
                         execution_mode=execution_mode,
                         expected_source_activity_epoch=expected_source_activity_epoch,
+                        lifecycle_execution_owner_id=lifecycle_execution_owner_id,
+                        lifecycle_attempt_count=lifecycle_attempt_count,
                         source_unit_id_callback=bind_source_unit,
                     )
                 lifecycle_ok = True
@@ -1677,6 +1714,8 @@ class GeneSyncOrchestrator:
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         expected_source_activity_epoch: int | None = None,
         source_unit_id_callback: Callable[[str], None] | None = None,
+        lifecycle_execution_owner_id: str | None = None,
+        lifecycle_attempt_count: int = 1,
     ) -> dict:
         """Process a single content item through the full pipeline.
 
@@ -2234,6 +2273,8 @@ class GeneSyncOrchestrator:
                 ),
                 document=doc_record,
                 expected_source_activity_epoch=expected_source_activity_epoch,
+                lifecycle_execution_owner_id=lifecycle_execution_owner_id,
+                lifecycle_attempt_count=lifecycle_attempt_count,
             )
             stats["memories_extracted"] = memory_stats.get("added", 0)
             stats["memories_corroborated"] = memory_stats.get("updated", 0)
@@ -2369,6 +2410,8 @@ class GeneSyncOrchestrator:
                 derivation_context.reprocess_all_current_observations
             ),
             expected_source_activity_epoch=expected_source_activity_epoch,
+            lifecycle_execution_owner_id=lifecycle_execution_owner_id,
+            lifecycle_attempt_count=lifecycle_attempt_count,
         )
         stats["memories_extracted"] = memory_stats.get("added", 0)
         stats["memories_corroborated"] = memory_stats.get("updated", 0)

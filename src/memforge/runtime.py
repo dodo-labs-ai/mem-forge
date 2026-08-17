@@ -13,6 +13,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from memforge.config import AppConfig
+from memforge.evals.agent_evaluation import (
+    assessment_sink_for_runtime_sink,
+    publish_agent_assessments,
+    publish_runtime_events,
+)
 from memforge.auth import browser_session
 from memforge.genes import GENE_REGISTRY, create_gene, source_type_supports_sync
 from memforge.llm.providers import is_litellm_provider_model
@@ -179,6 +184,23 @@ class SyncRuntime:
             memory_observer=self.memory_observer,
             structured_llm_client=self.structured_llm_client,
             runtime_event_trace_sink=self.runtime_event_trace_sink,
+        )
+
+
+def _publish_terminal_runtime_bundles(
+    runtime: SyncRuntime,
+    state: SyncState,
+) -> None:
+    sink = runtime.runtime_event_trace_sink
+    if sink is None:
+        return
+    assessment_sink = assessment_sink_for_runtime_sink(sink)
+    for bundle in state.runtime_bundles:
+        publish_runtime_events(sink, bundle.events)
+        publish_agent_assessments(
+            assessment_sink,
+            bundle.assessments,
+            bundle.events,
         )
 
 
@@ -612,6 +634,7 @@ def _build_default_sync_runtime(
 ) -> SyncRuntime:
     from memforge.evals.agent_evaluation import runtime_event_trace_sink_from_env
     doc_store = LocalDocumentStore(config.storage.docs_path)
+    runtime_event_trace_sink = runtime_event_trace_sink_from_env()
 
     memory_extractor = MemoryExtractor(
         model=llm.enrichment_model,
@@ -654,6 +677,7 @@ def _build_default_sync_runtime(
         embed_cfg=embed_cfg,
         structured_llm_client=structured_llm_client,
         llm_model=llm.enrichment_model,
+        runtime_event_trace_sink=runtime_event_trace_sink,
     )
     relation_discovery = None
     if memory_engine.pair_classifier is not None:
@@ -684,7 +708,7 @@ def _build_default_sync_runtime(
         extraction_pool=extraction_pool,
         document_lifecycle_admission=document_lifecycle_admission,
         memory_observer=SyncMemoryObserver(),
-        runtime_event_trace_sink=runtime_event_trace_sink_from_env(),
+        runtime_event_trace_sink=runtime_event_trace_sink,
     )
 
 
@@ -1240,6 +1264,7 @@ class SourceSyncWorker:
                 )
                 if not failed:
                     raise SourceSyncLeaseLost(f"source sync lease lost before failure update for run {run.run_id}")
+                _publish_terminal_runtime_bundles(runtime, final_state)
                 return run
             completed = await self.db.complete_source_sync_run(
                 run.run_id,
