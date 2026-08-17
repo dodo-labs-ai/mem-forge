@@ -687,6 +687,31 @@ async def test_sqlite_assessments_are_idempotent_visible_and_cascade_with_events
     assert await db.list_agent_assessments(query) == []
 
 
+@pytest.mark.asyncio
+async def test_sqlite_assessment_batch_rolls_back_on_immutable_collision(db) -> None:
+    [event] = _events(
+        QualitySignal("evidence_admission_outcome", "rejected", "unknown_evidence_block_id")
+    )
+    [existing] = evaluate_runtime_events((event,))
+    await db.record_agent_runtime_events((event,))
+    await db.record_agent_assessments((existing,))
+
+    new_assessment = replace(
+        existing,
+        assessment_id="aas-new-before-conflict",
+    )
+    conflicting = replace(
+        existing,
+        label="pass",
+        reason_code="conflicting_immutable_payload",
+    )
+
+    with pytest.raises(ValueError, match="conflicting immutable agent assessment"):
+        await db.record_agent_assessments((new_assessment, conflicting))
+
+    assert await db.get_agent_assessment(new_assessment.assessment_id) is None
+
+
 def test_langfuse_sink_omits_durable_only_structured_attempt_identifiers() -> None:
     [event] = _events(
         QualitySignal(

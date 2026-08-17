@@ -322,6 +322,16 @@ async def test_human_calibration_is_policy_gated_and_adjudication_preserves_labe
         rubric_version="semantic-rubric-v1",
         reviewer_id="reviewer-1",
     )
+    metadata_report = await evaluation.read_report(
+        report.run.run_id,
+        requesting_user_id="reviewer-2",
+    )
+    assert metadata_report.results[0].output is None
+    assert metadata_report.results[0].output_hash == result.output_hash
+    assert all(item.annotator_kind == "code" for item in metadata_report.assessments)
+    assert first.assessment_id not in {
+        item.assessment_id for item in metadata_report.assessments
+    }
     repeated = await evaluation.record_human_annotation(
         result_id=result.result_id,
         content_policy_id=policy.content_policy_id,
