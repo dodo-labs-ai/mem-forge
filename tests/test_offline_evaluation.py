@@ -150,6 +150,24 @@ async def test_offline_evaluation_records_frozen_lineage_and_result_assessments(
     assert report.completed_result_count == 1
     assert report.error_result_count == 0
     assert report.check_counts == {"pass": 3, "fail": 0, "unknown": 0}
+    assert report.population_summaries == {
+        "failure_regression": {
+            "completed": 1,
+            "error": 0,
+            "artifact_unavailable": 0,
+            "pass": 3,
+            "fail": 0,
+            "unknown": 0,
+        },
+        "representative_control": {
+            "completed": 0,
+            "error": 0,
+            "artifact_unavailable": 0,
+            "pass": 0,
+            "fail": 0,
+            "unknown": 0,
+        },
+    }
     assert {assessment.target_result_id for assessment in report.assessments} == {
         report.results[0].result_id
     }
