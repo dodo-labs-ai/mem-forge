@@ -7029,6 +7029,24 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
         owner_user_id="dev",
     )
 
+    class RecordingAssessmentSink:
+        def __init__(self) -> None:
+            self.batches = []
+
+        def publish(self, assessments, events) -> None:
+            self.batches.append((assessments, events))
+
+    class RecordingRuntimeEventTraceSink:
+        def __init__(self) -> None:
+            self.batches = []
+            self.assessments = RecordingAssessmentSink()
+
+        def publish(self, events) -> None:
+            self.batches.append(events)
+
+        def assessment_sink(self):
+            return self.assessments
+
     class CapturingRuntimeProvider:
         def __init__(self) -> None:
             self.force_full_sync_values: list[bool] = []
@@ -7036,6 +7054,7 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
             self.lifecycle_cycle_ids: list[str] = []
             self.vector_delivery_source_ids: list[str] = []
             self.memory_store = self
+            self.runtime_event_trace_sink = RecordingRuntimeEventTraceSink()
 
         async def build_sync_runtime(
             self,
@@ -7060,12 +7079,33 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
             self.force_full_sync_values.append(bool(kwargs["force_full_sync"]))
             self.lifecycle_cycle_ids.append(str(kwargs["lifecycle_cycle_id"]))
             await self.attempt_lifecycle_vector_delivery(source_id=source_id)
+            terminal_bundle = bind_source_lifecycle_outcome(
+                source_id=source_id,
+                source_type="jira",
+                doc_id="PAY-1",
+                source_unit_id="unit-pay-1",
+                base_unit_revision_id="sur-before",
+                target_unit_revision_id="sur-current",
+                projection_run_id="spr-pay-1",
+                operation_input_hash="a" * 64,
+                execution_owner_id=str(kwargs["lifecycle_cycle_id"]),
+                outcome="expected",
+                reason_code="lifecycle_plan_applied",
+                attempt_count=1,
+                duration_ms=12,
+                incumbent_count=1,
+                relation_pair_count=1,
+                mutation_count=1,
+                review_count=0,
+                model_call_count=1,
+            )
             return SyncState(
                 source=source_id,
                 last_sync_at=datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc),
                 last_sync_status="success",
                 docs_processed=1,
                 docs_updated=1,
+                runtime_bundles=(terminal_bundle,),
             )
 
     provider = CapturingRuntimeProvider()
@@ -7101,6 +7141,16 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
     assert provider.extraction_pools == [worker._extraction_pool]
     assert provider.lifecycle_cycle_ids == [f"{enqueued.run_id}:attempt:1"]
     assert provider.vector_delivery_source_ids == [source_id]
+    assert len(provider.runtime_event_trace_sink.batches) == 1
+    assert provider.runtime_event_trace_sink.batches[0][0].event_name == (
+        "source_unit_lifecycle_outcome"
+    )
+    assert len(provider.runtime_event_trace_sink.assessments.batches) == 1
+    projected_assessments, projected_events = (
+        provider.runtime_event_trace_sink.assessments.batches[0]
+    )
+    assert projected_assessments[0].criterion == "source_unit_lifecycle_completion"
+    assert projected_events == provider.runtime_event_trace_sink.batches[0]
 
 
 @pytest.mark.asyncio
