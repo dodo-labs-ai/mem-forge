@@ -9,14 +9,25 @@ scope, access context, staged evidence, lifecycle plan, and outbox work from one
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 from memforge.llm.structured import StructuredLlmError
+from memforge.evals.agent_evaluation import (
+    AgentRuntimeBundle,
+    NoOpRuntimeEventTraceSink,
+    RuntimeEventTraceSink,
+    assessment_sink_for_runtime_sink,
+    bind_source_lifecycle_outcome,
+    current_deployment_revision,
+    publish_agent_assessments,
+    publish_runtime_events,
+)
 from memforge.memory.candidate_ledger import (
     CandidateLedgerError,
     CandidateLedgerResult,
@@ -33,6 +44,7 @@ from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
     build_lifecycle_plan,
     lifecycle_access_context_hash,
+    lifecycle_memory_version,
     lifecycle_plan_id,
 )
 from memforge.memory.quality import classify_memory_candidate
@@ -50,6 +62,7 @@ from memforge.source_projection import ImpactResult, ProjectionCoverage, resolve
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
     source_derivation_context_identity_hash,
+    source_derivation_projection_identity_hash,
 )
 from memforge.storage.adapters.protocols import EntityResolutionScope
 from memforge.models import (
@@ -70,7 +83,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MemoryEngine"]
+__all__ = ["MemoryEngine", "SourceUnitLifecycleExecutionError"]
 
 
 MEMORY_SUPPORT_VALIDATION_PROMPT = """Determine whether the current evidence still supports the exact Memory claim.
@@ -85,6 +98,24 @@ that directly supports the claim. Never paraphrase evidence_quote.
 {case_json}
 </case_json>
 """
+
+
+class SourceUnitLifecycleExecutionError(RuntimeError):
+    """A failed lifecycle execution carrying its content-free terminal bundle."""
+
+    def __init__(self, message: str, runtime_bundle: AgentRuntimeBundle) -> None:
+        super().__init__(message)
+        self.runtime_bundle = runtime_bundle
+
+
+@dataclass(slots=True)
+class _LifecycleExecutionContext:
+    started_at: float
+    stage: str = "preparation"
+    operation_input_hash: str | None = None
+    incumbent_count: int = 0
+    relation_pair_count: int = 0
+    model_call_count: int = 0
 
 
 class MemoryEngine:
@@ -104,12 +135,17 @@ class MemoryEngine:
         embed_cfg: dict | None = None,
         structured_llm_client: Any = None,
         llm_model: str = "claude-sonnet-4-20250514",
+        runtime_event_trace_sink: RuntimeEventTraceSink | None = None,
     ) -> None:
         self.cross_document_candidates = cross_document_candidates
         self.db = db
         self.memory_store = memory_store
         self.structured_llm_client = structured_llm_client
         self.llm_model = llm_model
+        self.runtime_event_trace_sink = runtime_event_trace_sink or NoOpRuntimeEventTraceSink()
+        self.agent_assessment_sink = assessment_sink_for_runtime_sink(
+            self.runtime_event_trace_sink
+        )
         self.pair_classifier = (
             StructuredMemoryPairClassifier(
                 client=structured_llm_client,
@@ -467,6 +503,104 @@ class MemoryEngine:
         derivation_reprocess_all_current_observations: bool = False,
         expected_source_activity_epoch: int | None = None,
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
+        lifecycle_execution_owner_id: str | None = None,
+        lifecycle_attempt_count: int = 1,
+    ) -> dict[str, int]:
+        """Observe one complete Source Unit lifecycle execution."""
+
+        runtime_context = _LifecycleExecutionContext(started_at=perf_counter())
+        try:
+            return await self._apply_projected_lifecycle_once(
+                projection=projection,
+                doc_id=doc_id,
+                raw_memories=raw_memories,
+                doc_type=doc_type,
+                project_key=project_key,
+                repo_identifier=repo_identifier,
+                document_content=document_content,
+                update_mode=update_mode,
+                changed_hunks=changed_hunks,
+                update_plan_stats=update_plan_stats,
+                source_updated_at=source_updated_at,
+                user_id=user_id,
+                protected_source_observation_ids=protected_source_observation_ids,
+                document=document,
+                derivation_id=derivation_id,
+                derivation_reprocess_all_current_observations=(
+                    derivation_reprocess_all_current_observations
+                ),
+                expected_source_activity_epoch=expected_source_activity_epoch,
+                current_changed_ranges=current_changed_ranges,
+                lifecycle_execution_owner_id=lifecycle_execution_owner_id,
+                lifecycle_attempt_count=lifecycle_attempt_count,
+                _runtime_context=runtime_context,
+            )
+        except SourceUnitLifecycleExecutionError:
+            raise
+        except Exception as exc:
+            if (
+                lifecycle_execution_owner_id is None
+                or runtime_context.operation_input_hash is None
+                or len(projection.deltas) != 1
+            ):
+                raise
+            delta = projection.deltas[0]
+            reason_code = {
+                "candidate_admission": "candidate_admission_failed",
+                "reconciliation": "reconciliation_failed",
+                "plan_construction": "lifecycle_plan_construction_failed",
+                "lifecycle_commit": "lifecycle_commit_failed",
+            }.get(runtime_context.stage, "lifecycle_execution_failed")
+            bundle = bind_source_lifecycle_outcome(
+                source_id=projection.source_id,
+                source_type=projection.source_type,
+                doc_id=doc_id,
+                source_unit_id=delta.source_unit_id,
+                base_unit_revision_id=delta.previous_unit_revision_id,
+                target_unit_revision_id=delta.current_unit_revision_id,
+                projection_run_id=projection.run_id,
+                operation_input_hash=runtime_context.operation_input_hash,
+                execution_owner_id=lifecycle_execution_owner_id,
+                outcome="failed",
+                reason_code=reason_code,
+                attempt_count=lifecycle_attempt_count,
+                duration_ms=max(
+                    0,
+                    round((perf_counter() - runtime_context.started_at) * 1000),
+                ),
+                incumbent_count=runtime_context.incumbent_count,
+                relation_pair_count=runtime_context.relation_pair_count,
+                mutation_count=0,
+                review_count=0,
+                model_call_count=runtime_context.model_call_count,
+                deployment_revision=current_deployment_revision(),
+            )
+            raise SourceUnitLifecycleExecutionError(str(exc), bundle) from exc
+
+    async def _apply_projected_lifecycle_once(
+        self,
+        *,
+        projection: SourceProjection,
+        doc_id: str,
+        raw_memories: list[RawMemory],
+        doc_type: str,
+        project_key: str | None,
+        repo_identifier: str | None,
+        document_content: str,
+        update_mode: str,
+        changed_hunks: str | None,
+        update_plan_stats: dict[str, Any] | None,
+        source_updated_at: datetime | None,
+        user_id: str | None = None,
+        protected_source_observation_ids: tuple[str, ...] = (),
+        document: DocumentRecord | None = None,
+        derivation_id: str | None = None,
+        derivation_reprocess_all_current_observations: bool = False,
+        expected_source_activity_epoch: int | None = None,
+        current_changed_ranges: tuple[tuple[int, int], ...] = (),
+        lifecycle_execution_owner_id: str | None = None,
+        lifecycle_attempt_count: int = 1,
+        _runtime_context: _LifecycleExecutionContext,
     ) -> dict[str, int]:
         """Reconcile a complete Source Unit ledger and atomically apply one plan."""
 
@@ -476,6 +610,9 @@ class MemoryEngine:
         )
         from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 
+        lifecycle_started = _runtime_context.started_at
+        if lifecycle_attempt_count < 1:
+            raise ValueError("lifecycle_attempt_count must be positive")
         if len(projection.deltas) != 1:
             raise ValueError("projected lifecycle requires exactly one Revision Delta")
         delta = projection.deltas[0]
@@ -514,6 +651,36 @@ class MemoryEngine:
             ):
                 filtered_memories.append(raw)
         quality_candidate_count = len(filtered_memories)
+        incumbents, unit_support = await self._active_projected_incumbents(
+            doc_id=doc_id,
+            source_unit_id=scope.source_unit_id,
+        )
+        gate = await self.db.get_lifecycle_gate(scope.source_id)
+        incumbent_support_states = await self.db.get_active_memory_support_states(
+            tuple(memory.id for memory in incumbents)
+        )
+        all_support = {
+            memory_id: state.reference_ids
+            for memory_id, state in incumbent_support_states.items()
+        }
+        support_hashes = {
+            memory_id: state.support_set_hash
+            for memory_id, state in incumbent_support_states.items()
+        }
+        operation_input_hash = _source_lifecycle_operation_input_hash(
+            projection=projection,
+            candidates=filtered_memories,
+            incumbents=incumbents,
+            support_hashes=support_hashes,
+            gate_state=gate.state.value,
+            update_mode=update_mode,
+            changed_hunks=changed_hunks,
+            update_plan_stats=update_plan_stats,
+            llm_model=self.llm_model,
+        )
+        _runtime_context.operation_input_hash = operation_input_hash
+        _runtime_context.incumbent_count = len(incumbents)
+        _runtime_context.stage = "candidate_admission"
         candidate_ledger = await self._select_projected_candidates(
             projection=projection,
             doc_id=doc_id,
@@ -536,11 +703,9 @@ class MemoryEngine:
             }
         )
         stats["skipped"] += quality_candidate_count - len(filtered_memories)
+        _runtime_context.model_call_count += candidate_ledger.structured_llm_calls
+        _runtime_context.stage = "reconciliation"
         reconciliation_started = perf_counter()
-        incumbents, unit_support = await self._active_projected_incumbents(
-            doc_id=doc_id,
-            source_unit_id=scope.source_unit_id,
-        )
         derivation_protected_ids = await self._derivation_protected_incumbents(
             source_id=projection.source_id,
             incumbent_ids=frozenset(memory.id for memory in incumbents),
@@ -612,6 +777,8 @@ class MemoryEngine:
             structured_llm_call_count = reconciliation_metrics.structured_llm_calls
             structured_llm_elapsed_ms = reconciliation_metrics.structured_llm_elapsed_ms
             bounded_reconciliation_elapsed_ms = reconciliation_metrics.reconciliation_elapsed_ms
+            _runtime_context.relation_pair_count = reconciliation_metrics.relation_pair_count
+            _runtime_context.model_call_count += reconciliation_metrics.structured_llm_calls
             stats.update(
                 {
                     "reconciliation_relation_pair_count": reconciliation_metrics.relation_pair_count,
@@ -623,9 +790,37 @@ class MemoryEngine:
                 }
             )
             if result.failure is not None:
-                raise RuntimeError(
-                    f"complete lifecycle reconciliation failed: {result.failure.error_type}: {result.failure.error}"
+                message = (
+                    "complete lifecycle reconciliation failed: "
+                    f"{result.failure.error_type}: {result.failure.error}"
                 )
+                if lifecycle_execution_owner_id is None:
+                    raise RuntimeError(message)
+                failure_bundle = bind_source_lifecycle_outcome(
+                    source_id=projection.source_id,
+                    source_type=source_type,
+                    doc_id=doc_id,
+                    source_unit_id=scope.source_unit_id,
+                    base_unit_revision_id=scope.base_unit_revision_id,
+                    target_unit_revision_id=scope.target_unit_revision_id,
+                    projection_run_id=projection.run_id,
+                    operation_input_hash=operation_input_hash,
+                    execution_owner_id=lifecycle_execution_owner_id,
+                    outcome="failed",
+                    reason_code=result.failure.reason_code,
+                    attempt_count=lifecycle_attempt_count,
+                    duration_ms=max(0, round((perf_counter() - lifecycle_started) * 1000)),
+                    incumbent_count=len(incumbents),
+                    relation_pair_count=result.metrics.relation_pair_count,
+                    mutation_count=0,
+                    review_count=0,
+                    model_call_count=(
+                        candidate_ledger.structured_llm_calls
+                        + result.metrics.structured_llm_calls
+                    ),
+                    deployment_revision=current_deployment_revision(),
+                )
+                raise SourceUnitLifecycleExecutionError(message, failure_bundle)
             operations = tuple(result.operations) + tuple(
                 ReconcileOperation(
                     action=ReconcileAction.NOOP,
@@ -643,6 +838,7 @@ class MemoryEngine:
                 )
                 for memory_id in sorted(derivation_protected_ids)
             )
+        _runtime_context.stage = "plan_construction"
         protected_memory_ids = self._partial_projection_protected_incumbents(
             projection=projection,
             incumbent_impacts=incumbent_impacts,
@@ -711,10 +907,6 @@ class MemoryEngine:
             projection=projection,
             protected_memory_ids=derivation_protected_ids,
         )
-        gate = await self.db.get_lifecycle_gate(scope.source_id)
-        incumbent_support_states = await self.db.get_active_memory_support_states(tuple(incumbents_by_id))
-        all_support = {memory_id: state.reference_ids for memory_id, state in incumbent_support_states.items()}
-        support_hashes = {memory_id: state.support_set_hash for memory_id, state in incumbent_support_states.items()}
         visibility, owner_user_id = await memory_visibility_for_source_id(
             self.db,
             source_id=projection.source_id,
@@ -904,6 +1096,38 @@ class MemoryEngine:
             evidence_units=projected_evidence.units,
             evidence_references=projected_evidence.references,
         )
+        runtime_bundle = None
+        if lifecycle_execution_owner_id is not None:
+            runtime_bundle = bind_source_lifecycle_outcome(
+                source_id=projection.source_id,
+                source_type=source_type,
+                doc_id=doc_id,
+                source_unit_id=scope.source_unit_id,
+                base_unit_revision_id=scope.base_unit_revision_id,
+                target_unit_revision_id=scope.target_unit_revision_id,
+                projection_run_id=projection.run_id,
+                operation_input_hash=operation_input_hash,
+                execution_owner_id=lifecycle_execution_owner_id,
+                outcome="expected",
+                reason_code="lifecycle_plan_applied",
+                attempt_count=lifecycle_attempt_count,
+                duration_ms=max(0, round((perf_counter() - lifecycle_started) * 1000)),
+                incumbent_count=len(incumbents),
+                relation_pair_count=int(stats.get("reconciliation_relation_pair_count", 0)),
+                mutation_count=len(plan.mutations),
+                review_count=sum(
+                    mutation.mutation_type.value == "create_review"
+                    for mutation in plan.mutations
+                ),
+                model_call_count=(
+                    candidate_ledger.structured_llm_calls
+                    + structured_llm_call_count
+                    + entity_resolution.metrics.structured_llm_calls
+                    + identity_resolution.metrics.llm_calls
+                ),
+                deployment_revision=current_deployment_revision(),
+            )
+        _runtime_context.stage = "lifecycle_commit"
         await self.db.apply_source_projection_lifecycle(
             projection,
             plan,
@@ -933,7 +1157,15 @@ class MemoryEngine:
                 else None
             ),
             expected_source_activity_epoch=expected_source_activity_epoch,
+            runtime_bundle=runtime_bundle,
         )
+        if runtime_bundle is not None:
+            publish_runtime_events(self.runtime_event_trace_sink, runtime_bundle.events)
+            publish_agent_assessments(
+                self.agent_assessment_sink,
+                runtime_bundle.assessments,
+                runtime_bundle.events,
+            )
         delivery = await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
         stats["vector_delivery_pending"] = int(delivery.pending)
 
@@ -1282,3 +1514,54 @@ def _candidate_fingerprints(
         }
         for candidate in candidates[:limit]
     ]
+
+
+def _source_lifecycle_operation_input_hash(
+    *,
+    projection: SourceProjection,
+    candidates: Sequence[RawMemory],
+    incumbents: Sequence[Memory],
+    support_hashes: Mapping[str, str],
+    gate_state: str,
+    update_mode: str,
+    changed_hunks: str | None,
+    update_plan_stats: Mapping[str, Any] | None,
+    llm_model: str,
+) -> str:
+    """Digest the exact reconciliation manifest without persisting source content."""
+
+    manifest = {
+        "projection_identity_hash": source_derivation_projection_identity_hash(projection),
+        "candidates": [
+            {
+                "content_hash": content_hash(candidate.content.strip()),
+                "memory_type": candidate.memory_type,
+                "confidence": candidate.confidence,
+                "source_observation_id": candidate.source_observation_id,
+                "required_source_observation_ids": sorted(
+                    candidate.required_source_observation_ids
+                ),
+            }
+            for candidate in candidates
+        ],
+        "incumbents": [
+            {
+                "memory_id": incumbent.id,
+                "memory_version": lifecycle_memory_version(incumbent),
+                "support_set_hash": support_hashes.get(incumbent.id),
+            }
+            for incumbent in sorted(incumbents, key=lambda item: item.id)
+        ],
+        "gate_state": gate_state,
+        "update_mode": update_mode,
+        "changed_hunks_hash": (
+            hashlib.sha256(changed_hunks.encode("utf-8")).hexdigest()
+            if changed_hunks is not None
+            else None
+        ),
+        "update_plan_stats": dict(update_plan_stats or {}),
+        "llm_model": llm_model,
+    }
+    return hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()

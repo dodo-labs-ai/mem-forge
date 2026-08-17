@@ -14,6 +14,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal
 
+from memforge.evals.agent_evaluation import AgentRuntimeBundle
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactSummary
 
 # ---------------------------------------------------------------------------
@@ -493,6 +494,11 @@ class SyncState:
     error_message: str | None = None
     failed_docs: list[FailedDoc] = field(default_factory=list)
     failure_retryable: bool = True
+    runtime_bundles: tuple[AgentRuntimeBundle, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -16,6 +16,7 @@ from memforge.evals.agent_evaluation import (
     LangfuseRuntimeEventTraceSink,
     NoOpRuntimeEventTraceSink,
     assessment_sink_for_runtime_sink,
+    bind_source_lifecycle_outcome,
     bind_quality_signals,
     current_deployment_revision,
     evaluate_runtime_events,
@@ -28,7 +29,7 @@ from memforge.evals.agent_evaluation import (
     summarize_agent_assessments,
     summarize_agent_runtime_events,
 )
-from memforge.storage.database import Database
+from memforge.storage.database import Database, MIGRATIONS
 
 
 NOW = datetime(2026, 8, 13, 6, 0, tzinfo=timezone.utc)
@@ -72,6 +73,51 @@ def _events(
     )
 
 
+def _lifecycle_bundle(
+    *,
+    execution_owner_id: str = "sync-run-7:lease-1",
+    outcome: str = "expected",
+    reason_code: str = "lifecycle_plan_applied",
+):
+    return bind_source_lifecycle_outcome(
+        source_id="src-teams",
+        source_type="teams",
+        doc_id="doc-window",
+        source_unit_id="unit-window",
+        base_unit_revision_id="sur-before",
+        target_unit_revision_id="sur-current",
+        projection_run_id="spr-current",
+        operation_input_hash="a" * 64,
+        execution_owner_id=execution_owner_id,
+        outcome=outcome,
+        reason_code=reason_code,
+        attempt_count=3,
+        duration_ms=250,
+        incumbent_count=2,
+        relation_pair_count=4,
+        mutation_count=2,
+        review_count=0,
+        model_call_count=2,
+        occurred_at=NOW,
+        deployment_revision="cloud-pr-258",
+    )
+
+
+def test_source_lifecycle_terminal_identity_separates_operation_execution_and_event() -> None:
+    first = _lifecycle_bundle()
+    replayed = _lifecycle_bundle()
+    recovered = _lifecycle_bundle(execution_owner_id="sync-run-7:lease-2")
+
+    assert replayed == first
+    assert recovered.event.operation_id == first.event.operation_id
+    assert recovered.event.execution_id != first.event.execution_id
+    assert recovered.event.event_id != first.event.event_id
+    assert first.event.event_name == "source_unit_lifecycle_outcome"
+    assert first.event.payload_hash
+    assert first.assessment.criterion == "source_unit_lifecycle_completion"
+    assert first.assessment.label == "pass"
+
+
 def test_bind_quality_signal_is_replay_stable_without_memory_id() -> None:
     signal = QualitySignal(
         event_name="structured_output_outcome",
@@ -93,6 +139,10 @@ def test_bind_quality_signal_is_replay_stable_without_memory_id() -> None:
     assert first.source_id == "src-teams"
     assert first.derivation_id == "sda-current"
     assert first.batch_id == "batch-1"
+    assert first.operation_id
+    assert first.execution_id
+    assert first.contract_version == "projection-extraction-v8"
+    assert first.payload_hash
     assert not hasattr(first, "memory_content")
     assert len(first.trace_id or "") == 32
 
@@ -248,6 +298,21 @@ async def test_sqlite_event_store_is_idempotent_and_supports_bounded_cohorts(db)
 
 
 @pytest.mark.asyncio
+async def test_sqlite_event_store_rejects_conflicting_terminal_payload(db) -> None:
+    bundle = _lifecycle_bundle()
+    await db.record_agent_runtime_events(bundle.events)
+    conflicting = replace(
+        bundle.event,
+        outcome="failed",
+        reason_code="lifecycle_commit_failed",
+        payload_hash="b" * 64,
+    )
+
+    with pytest.raises(ValueError, match="conflicting agent runtime event payload"):
+        await db.record_agent_runtime_events((conflicting,))
+
+
+@pytest.mark.asyncio
 async def test_sqlite_structured_attempt_diagnostics_round_trip(db) -> None:
     [event] = _events(
         QualitySignal(
@@ -290,6 +355,90 @@ async def test_sqlite_structured_attempt_diagnostics_round_trip(db) -> None:
     )
 
     assert rows == [event]
+
+
+@pytest.mark.asyncio
+async def test_sqlite_v3_migration_preserves_v2_event_and_assessment(db) -> None:
+    await db.db.execute("DROP TABLE agent_assessments")
+    await db.db.execute("DROP TABLE agent_runtime_events")
+    for version, _description, statements in MIGRATIONS:
+        if version not in {76, 78}:
+            continue
+        for statement in statements:
+            await db.db.execute(statement)
+    await db.db.execute(
+        """INSERT INTO agent_runtime_events (
+               event_id, schema_version, event_name, outcome, reason_code,
+               occurred_at, source_id, source_type, doc_id, source_unit_id,
+               target_unit_revision_id, projection_run_id, derivation_id,
+               batch_id, batch_attempt, extraction_contract_version
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "are-legacy",
+            "agent-runtime-event-v2",
+            "extraction_batch_outcome",
+            "expected",
+            "zero_candidates",
+            NOW.isoformat(),
+            "src-teams",
+            "teams",
+            "doc-window",
+            "unit-window",
+            "sur-current",
+            "spr-current",
+            "sda-legacy",
+            "batch-legacy",
+            1,
+            "projection-extraction-v8",
+        ),
+    )
+    await db.db.execute(
+        """INSERT INTO agent_assessments (
+               assessment_id, schema_version, target_event_id, criterion,
+               status, label, reason_code, annotator_kind, evaluator_name,
+               evaluator_version, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "aas-legacy",
+            "agent-assessment-v1",
+            "are-legacy",
+            "extraction_completion",
+            "completed",
+            "pass",
+            "zero_candidates",
+            "code",
+            "memforge.deterministic.runtime_contract",
+            "1",
+            NOW.isoformat(),
+        ),
+    )
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 79")
+    await db.db.commit()
+
+    await db._run_migrations()
+
+    [event] = await db.list_agent_runtime_events(
+        AgentRuntimeEventQuery(
+            occurred_from=NOW - timedelta(seconds=1),
+            occurred_to=NOW + timedelta(seconds=1),
+            requesting_user_id="user-1",
+            include_private=True,
+            event_id="are-legacy",
+        )
+    )
+    [assessment] = await db.list_agent_assessments(
+        AgentAssessmentQuery(
+            occurred_from=NOW - timedelta(seconds=1),
+            occurred_to=NOW + timedelta(seconds=1),
+            requesting_user_id="user-1",
+            include_private=True,
+            assessment_id="aas-legacy",
+        )
+    )
+    assert event.schema_version == "agent-runtime-event-v2"
+    assert event.operation_id is None
+    assert event.derivation_id == "sda-legacy"
+    assert assessment.target_event_id == event.event_id
 
 
 @pytest.mark.asyncio
@@ -611,6 +760,27 @@ def test_langfuse_sink_groups_fallback_derivations_in_one_projection_session() -
     root_trace_ids = [payload["trace_context"]["trace_id"] for kind, payload in client.calls if kind == "root"]
     assert root_trace_ids == [diff_event.trace_id, structural_event.trace_id]
     assert diff_event.trace_id != structural_event.trace_id
+
+
+def test_langfuse_sink_groups_lifecycle_execution_under_operation() -> None:
+    bundle = _lifecycle_bundle()
+    client = _FakeLangfuseClient()
+    attribute_scopes: list[dict[str, object]] = []
+
+    _langfuse_sink(client, attribute_scopes).publish(bundle.events)
+
+    [scope] = attribute_scopes
+    assert scope["session_id"].startswith("mfo1-")
+    assert scope["trace_name"] == "memforge.agent.reconcile_source_unit"
+    assert scope["version"] == "source-unit-lifecycle-v1"
+    assert scope["tags"] == [
+        "memforge-agent-eval",
+        "source-unit-lifecycle",
+        "source-type:teams",
+    ]
+    root = next(payload for kind, payload in client.calls if kind == "root")
+    assert root["name"] == "memforge.agent.reconcile_source_unit"
+    assert root["trace_context"]["trace_id"] == bundle.event.trace_id
 
 
 def test_runtime_session_id_is_bounded_versioned_and_projection_specific() -> None:
