@@ -203,6 +203,8 @@ class AgentEvaluationResult:
 
 @dataclass(frozen=True, slots=True)
 class AgentEvaluationRunReport:
+    """Metadata-only run view; protected outputs and human labels are omitted."""
+
     run: AgentEvaluationRun
     results: tuple[AgentEvaluationResult, ...]
     assessments: tuple[AgentAssessment, ...]
@@ -874,12 +876,15 @@ class OfflineAgentEvaluation:
                 case.source_id,
                 requesting_user_id,
             )
-        results = tuple(await self._store.list_agent_evaluation_results(run_id))
-        assessments = tuple(await self._store.list_agent_assessments_for_run(run_id))
+        stored_results = tuple(await self._store.list_agent_evaluation_results(run_id))
+        results = tuple(replace(result, output=None) for result in stored_results)
+        assessments = tuple(
+            assessment
+            for assessment in await self._store.list_agent_assessments_for_run(run_id)
+            if assessment.annotator_kind == "code"
+        )
         counts = {label.value: 0 for label in DeterministicCheckLabel}
         for assessment in assessments:
-            if assessment.annotator_kind != "code":
-                continue
             key = (
                 DeterministicCheckLabel.UNKNOWN.value
                 if assessment.label in {None, "needs_review"}
@@ -903,8 +908,6 @@ class OfflineAgentEvaluation:
             population = item_by_case_id[result.case_id].population.value
             population_summaries[population][result.status.value] += 1
         for assessment in assessments:
-            if assessment.annotator_kind != "code":
-                continue
             result = result_by_id.get(assessment.target_result_id or "")
             if result is None:
                 continue
