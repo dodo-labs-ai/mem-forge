@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from memforge.evals.agent_evaluation import AgentAssessment
 from memforge.evals.offline_evaluation import (
     AgentEvaluationCase,
     AgentEvaluationCaseKind,
@@ -176,6 +177,17 @@ async def test_offline_evaluation_records_frozen_lineage_and_result_assessments(
         "incumbent_coverage",
         "reconciliation_terminal_state",
     }
+    content_policy = await evaluation.approve_human_calibration_content(
+        source_id=case.source_id,
+        policy_version="workspace-human-review-v1",
+        approved_by="reviewer-2",
+    )
+    with pytest.raises(ValueError, match="calibration-role"):
+        await evaluation.prepare_human_annotation(
+            result_id=report.results[0].result_id,
+            content_policy_id=content_policy.content_policy_id,
+            reviewer_id="reviewer-2",
+        )
 
     replayed = await evaluation.execute_run(
         cohort_id=cohort.cohort_id,
@@ -218,6 +230,172 @@ async def test_offline_evaluation_records_frozen_lineage_and_result_assessments(
     assert case_count[0]["total"] == 0
     assert result_count[0]["total"] == 0
     assert assessment_count[0]["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_human_calibration_is_policy_gated_and_adjudication_preserves_labels(db) -> None:
+    executor = _FixedExecutor()
+    evaluation = OfflineAgentEvaluation(
+        db,
+        executors={AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION: executor},
+    )
+    case = await evaluation.curate_case(
+        case_kind=AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION,
+        source_id="src-teams",
+        doc_id="doc-calibration",
+        source_unit_id="teams-channel:calibration",
+        manifest={
+            "new_extractions": [],
+            "incumbents": [
+                {
+                    "id": "mem-calibration",
+                    "content": "Tracing starts with traceId.",
+                    "memory_type": "procedure",
+                }
+            ],
+            "updated_document": "Tracing starts with traceId.",
+        },
+        promotion_policy_version="manual-v1",
+        created_by="reviewer-1",
+    )
+    seed_reference = await evaluation.accept_ground_truth(
+        case_id=case.case_id,
+        rubric={"required_deterministic_criteria": ["incumbent_coverage"]},
+        accepted_by="reviewer-1",
+    )
+    cohort = await evaluation.freeze_cohort(
+        items=(
+            AgentEvaluationCohortItem(
+                case_id=case.case_id,
+                ground_truth_revision_id=seed_reference.ground_truth_revision_id,
+                population=AgentEvaluationPopulation.FAILURE_REGRESSION,
+                role=AgentEvaluationRole.CALIBRATION,
+                group_key="teams-channel:calibration",
+            ),
+        ),
+        selection_policy_version="calibration-v1",
+        created_by="reviewer-1",
+    )
+    report = await evaluation.execute_run(
+        cohort_id=cohort.cohort_id,
+        candidate_manifest={
+            "code_revision": "abc123",
+            "prompt_hash": "a" * 64,
+            "schema_version": "schema-v1",
+            "contract_version": "reconciliation-v1",
+            "model": "fixed",
+            "replay_harness_version": "1",
+        },
+        evaluator_suite="deterministic-contracts",
+        evaluator_version="1",
+        created_by="reviewer-1",
+    )
+    result = report.results[0]
+
+    with pytest.raises(PermissionError, match="approved policy"):
+        await evaluation.prepare_human_annotation(
+            result_id=result.result_id,
+            content_policy_id="aep-missing",
+            reviewer_id="reviewer-1",
+        )
+
+    policy = await evaluation.approve_human_calibration_content(
+        source_id=case.source_id,
+        policy_version="workspace-human-review-v1",
+        approved_by="reviewer-1",
+    )
+    task = await evaluation.prepare_human_annotation(
+        result_id=result.result_id,
+        content_policy_id=policy.content_policy_id,
+        reviewer_id="reviewer-1",
+    )
+    assert task.case_manifest["updated_document"] == "Tracing starts with traceId."
+    assert task.candidate_output["operations"][0]["memory_id"] == "mem-calibration"
+    assert not hasattr(task, "ground_truth")
+
+    first = await evaluation.record_human_annotation(
+        result_id=result.result_id,
+        content_policy_id=policy.content_policy_id,
+        criterion="semantic_intent",
+        label="fail",
+        reason_code="required_claim_missing",
+        rubric_version="semantic-rubric-v1",
+        reviewer_id="reviewer-1",
+    )
+    repeated = await evaluation.record_human_annotation(
+        result_id=result.result_id,
+        content_policy_id=policy.content_policy_id,
+        criterion="semantic_intent",
+        label="fail",
+        reason_code="required_claim_missing",
+        rubric_version="semantic-rubric-v1",
+        reviewer_id="reviewer-1",
+    )
+    assert repeated == first
+    second = await evaluation.record_human_annotation(
+        result_id=result.result_id,
+        content_policy_id=policy.content_policy_id,
+        criterion="semantic_intent",
+        label="pass",
+        reason_code="required_claim_present",
+        rubric_version="semantic-rubric-v1",
+        reviewer_id="reviewer-2",
+    )
+
+    with pytest.raises(ValueError, match="exactly two"):
+        await evaluation.adjudicate_ground_truth(
+            case_id=case.case_id,
+            supporting_assessment_ids=(first.assessment_id, first.assessment_id),
+            rubric={"required_claims": ["traceId starts the diagnostic workflow"]},
+            acceptance_policy_version="two-reviewer-v1",
+            adjudication_note="The required claim is present in the authority.",
+            accepted_by="adjudicator-1",
+        )
+
+    adjudicated = await evaluation.adjudicate_ground_truth(
+        case_id=case.case_id,
+        supporting_assessment_ids=(first.assessment_id, second.assessment_id),
+        rubric={"required_claims": ["traceId starts the diagnostic workflow"]},
+        acceptance_policy_version="two-reviewer-v1",
+        adjudication_note="The accepted reference keeps the durable tracing workflow.",
+        accepted_by="adjudicator-1",
+    )
+    assert adjudicated.supporting_assessment_ids == tuple(
+        sorted((first.assessment_id, second.assessment_id))
+    )
+    assert adjudicated.ground_truth_revision_id != seed_reference.ground_truth_revision_id
+    preserved = await db.list_agent_assessments_for_result(result.result_id)
+    assert {item.assessment_id for item in preserved} >= {
+        first.assessment_id,
+        second.assessment_id,
+    }
+    assert {item.annotator_id for item in preserved if item.annotator_kind == "human"} == {
+        "reviewer-1",
+        "reviewer-2",
+    }
+    calibrated_report = await evaluation.read_report(
+        report.run.run_id,
+        requesting_user_id="reviewer-1",
+    )
+    assert calibrated_report.check_counts == {"pass": 3, "fail": 0, "unknown": 0}
+
+
+def test_non_human_assessment_rejects_human_review_provenance() -> None:
+    with pytest.raises(ValueError, match="human-review provenance"):
+        AgentAssessment(
+            assessment_id="aas-code-with-policy",
+            target_event_id=None,
+            target_result_id="aeres-result",
+            criterion="typed_output",
+            status="completed",
+            label="pass",
+            reason_code="typed_output_valid",
+            annotator_kind="code",
+            evaluator_name="memforge.deterministic.offline_contract",
+            evaluator_version="1",
+            content_policy_id="aep-policy",
+            created_at=datetime.now(timezone.utc),
+        )
 
 
 @pytest.mark.asyncio

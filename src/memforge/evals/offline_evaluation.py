@@ -16,7 +16,7 @@ from enum import Enum
 from time import perf_counter
 from typing import Protocol
 
-from memforge.evals.agent_evaluation import AgentAssessment
+from memforge.evals.agent_evaluation import AgentAssessment, AgentAssessmentLabel
 from memforge.models import Memory, MemoryExtractionResult, RawMemory, ReconcileOperation
 from memforge.pipeline.reconciler import ReconciliationResult, reconcile_memories
 from memforge.source_derivation import (
@@ -30,6 +30,8 @@ from memforge.source_projection import source_projection_from_payload
 
 
 OFFLINE_EVALUATION_SCHEMA_VERSION = "1"
+OFFLINE_CONTENT_POLICY_SCHEMA_VERSION = "1"
+ACCEPTED_GROUND_TRUTH_SCHEMA_VERSION = "2"
 OFFLINE_DETERMINISTIC_EVALUATOR_VERSION = "1"
 
 
@@ -62,6 +64,12 @@ class AgentEvaluationResultStatus(str, Enum):
     ARTIFACT_UNAVAILABLE = "artifact_unavailable"
 
 
+class AgentEvaluationContentProfile(str, Enum):
+    """Fixed disclosure profiles; profiles expand only through a new version."""
+
+    HUMAN_CALIBRATION = "human_calibration_v1"
+
+
 class DeterministicCheckLabel(str, Enum):
     PASS = "pass"
     FAIL = "fail"
@@ -86,6 +94,31 @@ class AgentEvaluationCase:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentEvaluationContentPolicy:
+    """One immutable approval to disclose protected evaluation content."""
+
+    content_policy_id: str
+    source_id: str
+    profile: AgentEvaluationContentProfile
+    policy_version: str
+    approved_by: str
+    approved_at: str
+    schema_version: str = OFFLINE_CONTENT_POLICY_SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class AgentEvaluationAnnotationTask:
+    """Blinded case and candidate content presented to one authorized reviewer."""
+
+    result_id: str
+    case_id: str
+    case_kind: AgentEvaluationCaseKind
+    content_policy_id: str
+    case_manifest: Mapping[str, object]
+    candidate_output: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
 class AcceptedGroundTruthRevision:
     ground_truth_revision_id: str
     case_id: str
@@ -93,7 +126,10 @@ class AcceptedGroundTruthRevision:
     rubric_hash: str
     accepted_by: str
     accepted_at: str
-    schema_version: str = OFFLINE_EVALUATION_SCHEMA_VERSION
+    supporting_assessment_ids: tuple[str, ...] = ()
+    acceptance_policy_version: str | None = None
+    adjudication_note: str | None = None
+    schema_version: str = ACCEPTED_GROUND_TRUTH_SCHEMA_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +221,12 @@ class OfflineEvaluationStore(Protocol):
 
     async def record_agent_evaluation_case(self, case: AgentEvaluationCase) -> None: ...
     async def get_agent_evaluation_case(self, case_id: str) -> AgentEvaluationCase | None: ...
+    async def record_agent_evaluation_content_policy(
+        self, policy: AgentEvaluationContentPolicy
+    ) -> None: ...
+    async def get_agent_evaluation_content_policy(
+        self, content_policy_id: str
+    ) -> AgentEvaluationContentPolicy | None: ...
     async def record_accepted_ground_truth_revision(
         self, revision: AcceptedGroundTruthRevision
     ) -> None: ...
@@ -213,6 +255,13 @@ class OfflineEvaluationStore(Protocol):
         self, run_id: str
     ) -> list[AgentEvaluationResult]: ...
     async def list_agent_assessments_for_run(self, run_id: str) -> list[AgentAssessment]: ...
+    async def record_agent_assessments(
+        self, assessments: tuple[AgentAssessment, ...]
+    ) -> None: ...
+    async def get_agent_assessment(self, assessment_id: str) -> AgentAssessment | None: ...
+    async def list_agent_assessments_for_result(
+        self, result_id: str
+    ) -> list[AgentAssessment]: ...
 
 
 class OfflineCaseExecutor(Protocol):
@@ -385,6 +434,215 @@ class OfflineAgentEvaluation:
         )
         await self._store.record_agent_evaluation_case(case)
         return case
+
+    async def approve_human_calibration_content(
+        self,
+        *,
+        source_id: str,
+        policy_version: str,
+        approved_by: str,
+        approved_at: str | None = None,
+    ) -> AgentEvaluationContentPolicy:
+        """Approve the one bounded Slice-B protected-content profile."""
+
+        await self._store.authorize_agent_evaluation_source(source_id, approved_by)
+        version = _required("policy_version", policy_version)
+        content_policy_id = _id(
+            "aep",
+            source_id,
+            AgentEvaluationContentProfile.HUMAN_CALIBRATION.value,
+            version,
+        )
+        existing = await self._store.get_agent_evaluation_content_policy(content_policy_id)
+        if existing is not None:
+            return existing
+        policy = AgentEvaluationContentPolicy(
+            content_policy_id=content_policy_id,
+            source_id=_required("source_id", source_id),
+            profile=AgentEvaluationContentProfile.HUMAN_CALIBRATION,
+            policy_version=version,
+            approved_by=_required("approved_by", approved_by),
+            approved_at=approved_at or _now(),
+        )
+        await self._store.record_agent_evaluation_content_policy(policy)
+        return policy
+
+    async def prepare_human_annotation(
+        self,
+        *,
+        result_id: str,
+        content_policy_id: str,
+        reviewer_id: str,
+    ) -> AgentEvaluationAnnotationTask:
+        """Return protected content only after source and policy authorization."""
+
+        result, case, policy = await self._human_annotation_context(
+            result_id=result_id,
+            content_policy_id=content_policy_id,
+            reviewer_id=reviewer_id,
+        )
+        if result.output is None:
+            raise ValueError("human annotation requires a completed candidate output")
+        return AgentEvaluationAnnotationTask(
+            result_id=result.result_id,
+            case_id=case.case_id,
+            case_kind=case.case_kind,
+            content_policy_id=policy.content_policy_id,
+            case_manifest=_canonical_mapping(case.manifest),
+            candidate_output=_canonical_mapping(result.output),
+        )
+
+    async def record_human_annotation(
+        self,
+        *,
+        result_id: str,
+        content_policy_id: str,
+        criterion: str,
+        label: AgentAssessmentLabel,
+        reason_code: str,
+        rubric_version: str,
+        reviewer_id: str,
+        created_at: str | None = None,
+    ) -> AgentAssessment:
+        """Append one immutable human judgment without exposing peer labels."""
+
+        result, _case, policy = await self._human_annotation_context(
+            result_id=result_id,
+            content_policy_id=content_policy_id,
+            reviewer_id=reviewer_id,
+        )
+        criterion = _required("criterion", criterion)
+        reason_code = _required("reason_code", reason_code)
+        rubric_version = _required("rubric_version", rubric_version)
+        reviewer_id = _required("reviewer_id", reviewer_id)
+        if label not in {"pass", "fail", "needs_review"}:
+            raise ValueError("human annotation label must be pass, fail, or needs_review")
+        assessment = AgentAssessment(
+            assessment_id=_id(
+                "aas",
+                result.result_id,
+                criterion,
+                "human",
+                reviewer_id,
+                rubric_version,
+                label,
+                reason_code,
+                policy.content_policy_id,
+            ),
+            target_event_id=None,
+            target_result_id=result.result_id,
+            criterion=criterion,
+            status="completed",
+            label=label,
+            reason_code=reason_code,
+            annotator_kind="human",
+            evaluator_name="memforge.human.calibration",
+            evaluator_version=rubric_version,
+            annotator_id=reviewer_id,
+            content_policy_id=policy.content_policy_id,
+            created_at=datetime.fromisoformat(created_at or _now()),
+        )
+        existing = await self._store.get_agent_assessment(assessment.assessment_id)
+        if existing is not None:
+            return existing
+        await self._store.record_agent_assessments((assessment,))
+        return assessment
+
+    async def adjudicate_ground_truth(
+        self,
+        *,
+        case_id: str,
+        supporting_assessment_ids: Sequence[str],
+        rubric: Mapping[str, object],
+        acceptance_policy_version: str,
+        adjudication_note: str,
+        accepted_by: str,
+        accepted_at: str | None = None,
+    ) -> AcceptedGroundTruthRevision:
+        """Accept a reference while preserving two independent human labels."""
+
+        case = await self._require_case(case_id)
+        await self._store.authorize_agent_evaluation_source(case.source_id, accepted_by)
+        assessment_ids = tuple(sorted(set(supporting_assessment_ids)))
+        if len(assessment_ids) != 2:
+            raise ValueError("ground-truth adjudication requires exactly two annotations")
+        assessments = []
+        for assessment_id in assessment_ids:
+            assessment = await self._store.get_agent_assessment(assessment_id)
+            if assessment is None:
+                raise KeyError(f"unknown human annotation: {assessment_id}")
+            assessments.append(assessment)
+        if any(
+            assessment.annotator_kind != "human"
+            or assessment.status != "completed"
+            or assessment.target_result_id is None
+            or assessment.annotator_id is None
+            or assessment.content_policy_id is None
+            for assessment in assessments
+        ):
+            raise ValueError("adjudication accepts only completed human annotations")
+        if len({assessment.annotator_id for assessment in assessments}) != 2:
+            raise ValueError("adjudication requires two independent reviewers")
+        content_policy_ids = {
+            assessment.content_policy_id
+            for assessment in assessments
+            if assessment.content_policy_id is not None
+        }
+        if len(content_policy_ids) != 1:
+            raise ValueError("adjudication annotations must use the same content policy")
+        if len({assessment.target_result_id for assessment in assessments}) != 1:
+            raise ValueError("adjudication annotations must target the same result")
+        if len({assessment.criterion for assessment in assessments}) != 1:
+            raise ValueError("adjudication annotations must use the same criterion")
+        if len({assessment.evaluator_version for assessment in assessments}) != 1:
+            raise ValueError("adjudication annotations must use the same rubric version")
+        [target_result_id] = {
+            assessment.target_result_id for assessment in assessments if assessment.target_result_id
+        }
+        [content_policy_id] = content_policy_ids
+        _target_result, target_case, _content_policy = await self._human_annotation_context(
+            result_id=target_result_id,
+            content_policy_id=content_policy_id,
+            reviewer_id=accepted_by,
+        )
+        if target_case.case_id != case.case_id:
+            raise ValueError("adjudication annotations do not belong to the requested case")
+        note = adjudication_note.strip()
+        if not note:
+            raise ValueError("adjudication_note is required")
+        if len(note) > 2000:
+            raise ValueError("adjudication_note must not exceed 2000 characters")
+        _validate_rubric(case.case_kind, rubric)
+        rubric_payload = _canonical_mapping(rubric)
+        rubric_hash = _hash(rubric_payload)
+        acceptance_policy_version = _required(
+            "acceptance_policy_version", acceptance_policy_version
+        )
+        revision = AcceptedGroundTruthRevision(
+            ground_truth_revision_id=_id(
+                "aeg",
+                case.case_id,
+                rubric_hash,
+                *assessment_ids,
+                acceptance_policy_version,
+                _hash_text(note),
+            ),
+            case_id=case.case_id,
+            rubric=rubric_payload,
+            rubric_hash=rubric_hash,
+            accepted_by=_required("accepted_by", accepted_by),
+            accepted_at=accepted_at or _now(),
+            supporting_assessment_ids=assessment_ids,
+            acceptance_policy_version=acceptance_policy_version,
+            adjudication_note=note,
+        )
+        existing = await self._store.get_accepted_ground_truth_revision(
+            revision.ground_truth_revision_id
+        )
+        if existing is not None:
+            return existing
+        await self._store.record_accepted_ground_truth_revision(revision)
+        return revision
 
     async def accept_ground_truth(
         self,
@@ -620,6 +878,8 @@ class OfflineAgentEvaluation:
         assessments = tuple(await self._store.list_agent_assessments_for_run(run_id))
         counts = {label.value: 0 for label in DeterministicCheckLabel}
         for assessment in assessments:
+            if assessment.annotator_kind != "code":
+                continue
             key = (
                 DeterministicCheckLabel.UNKNOWN.value
                 if assessment.label in {None, "needs_review"}
@@ -643,6 +903,8 @@ class OfflineAgentEvaluation:
             population = item_by_case_id[result.case_id].population.value
             population_summaries[population][result.status.value] += 1
         for assessment in assessments:
+            if assessment.annotator_kind != "code":
+                continue
             result = result_by_id.get(assessment.target_result_id or "")
             if result is None:
                 continue
@@ -667,6 +929,43 @@ class OfflineAgentEvaluation:
             check_counts=counts,
             population_summaries=population_summaries,
         )
+
+    async def _human_annotation_context(
+        self,
+        *,
+        result_id: str,
+        content_policy_id: str,
+        reviewer_id: str,
+    ) -> tuple[
+        AgentEvaluationResult,
+        AgentEvaluationCase,
+        AgentEvaluationContentPolicy,
+    ]:
+        result = await self._store.get_agent_evaluation_result(result_id)
+        if result is None:
+            raise KeyError(f"unknown evaluation result: {result_id}")
+        if result.status is not AgentEvaluationResultStatus.COMPLETED:
+            raise ValueError("human annotation requires a completed evaluation result")
+        case = await self._require_case(result.case_id)
+        await self._store.authorize_agent_evaluation_source(case.source_id, reviewer_id)
+        policy = await self._store.get_agent_evaluation_content_policy(content_policy_id)
+        if policy is None:
+            raise PermissionError("protected evaluation content requires an approved policy")
+        if (
+            policy.source_id != case.source_id
+            or policy.profile is not AgentEvaluationContentProfile.HUMAN_CALIBRATION
+        ):
+            raise PermissionError("content policy does not authorize this evaluation result")
+        run = await self._store.get_agent_evaluation_run(result.run_id)
+        if run is None:
+            raise RuntimeError("evaluation result run is unavailable")
+        cohort = await self._store.get_agent_evaluation_cohort(run.cohort_id)
+        if cohort is None:
+            raise RuntimeError("evaluation result cohort is unavailable")
+        item = next((item for item in cohort.items if item.case_id == case.case_id), None)
+        if item is None or item.role is not AgentEvaluationRole.CALIBRATION:
+            raise ValueError("human calibration accepts only calibration-role results")
+        return result, case, policy
 
     async def _require_case(self, case_id: str) -> AgentEvaluationCase:
         case = await self._store.get_agent_evaluation_case(case_id)
@@ -982,6 +1281,36 @@ def agent_evaluation_case_from_payload(payload: Mapping[str, object]) -> AgentEv
     )
 
 
+def agent_evaluation_content_policy_to_payload(
+    policy: AgentEvaluationContentPolicy,
+) -> dict[str, object]:
+    return {
+        "content_policy_id": policy.content_policy_id,
+        "source_id": policy.source_id,
+        "profile": policy.profile.value,
+        "policy_version": policy.policy_version,
+        "approved_by": policy.approved_by,
+        "approved_at": policy.approved_at,
+        "schema_version": policy.schema_version,
+    }
+
+
+def agent_evaluation_content_policy_from_payload(
+    payload: Mapping[str, object],
+) -> AgentEvaluationContentPolicy:
+    return AgentEvaluationContentPolicy(
+        content_policy_id=str(payload["content_policy_id"]),
+        source_id=str(payload["source_id"]),
+        profile=AgentEvaluationContentProfile(str(payload["profile"])),
+        policy_version=str(payload["policy_version"]),
+        approved_by=str(payload["approved_by"]),
+        approved_at=str(payload["approved_at"]),
+        schema_version=str(
+            payload.get("schema_version") or OFFLINE_CONTENT_POLICY_SCHEMA_VERSION
+        ),
+    )
+
+
 def accepted_ground_truth_to_payload(
     revision: AcceptedGroundTruthRevision,
 ) -> dict[str, object]:
@@ -992,6 +1321,9 @@ def accepted_ground_truth_to_payload(
         "rubric_hash": revision.rubric_hash,
         "accepted_by": revision.accepted_by,
         "accepted_at": revision.accepted_at,
+        "supporting_assessment_ids": list(revision.supporting_assessment_ids),
+        "acceptance_policy_version": revision.acceptance_policy_version,
+        "adjudication_note": revision.adjudication_note,
         "schema_version": revision.schema_version,
     }
 
@@ -1006,6 +1338,11 @@ def accepted_ground_truth_from_payload(
         rubric_hash=str(payload["rubric_hash"]),
         accepted_by=str(payload["accepted_by"]),
         accepted_at=str(payload["accepted_at"]),
+        supporting_assessment_ids=tuple(
+            str(value) for value in payload.get("supporting_assessment_ids", [])
+        ),
+        acceptance_policy_version=_optional_str(payload.get("acceptance_policy_version")),
+        adjudication_note=_optional_str(payload.get("adjudication_note")),
         schema_version=str(payload.get("schema_version") or OFFLINE_EVALUATION_SCHEMA_VERSION),
     )
 
