@@ -302,8 +302,10 @@ class AgentAssessment:
             raise ValueError(
                 "human assessment requires annotator and content-policy provenance"
             )
-        if self.annotator_kind != "human" and self.annotator_id is not None:
-            raise ValueError("only human assessments carry annotator identity")
+        if self.annotator_kind != "human" and (
+            self.annotator_id is not None or self.content_policy_id is not None
+        ):
+            raise ValueError("only human assessments carry human-review provenance")
         if self.status == "completed" and self.label is None:
             raise ValueError("completed assessment requires a label")
         if self.status == "failed" and self.label is not None:

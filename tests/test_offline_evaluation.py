@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from memforge.evals.agent_evaluation import AgentAssessment
 from memforge.evals.offline_evaluation import (
     AgentEvaluationCase,
     AgentEvaluationCaseKind,
@@ -377,6 +378,24 @@ async def test_human_calibration_is_policy_gated_and_adjudication_preserves_labe
         requesting_user_id="reviewer-1",
     )
     assert calibrated_report.check_counts == {"pass": 3, "fail": 0, "unknown": 0}
+
+
+def test_non_human_assessment_rejects_human_review_provenance() -> None:
+    with pytest.raises(ValueError, match="human-review provenance"):
+        AgentAssessment(
+            assessment_id="aas-code-with-policy",
+            target_event_id=None,
+            target_result_id="aeres-result",
+            criterion="typed_output",
+            status="completed",
+            label="pass",
+            reason_code="typed_output_valid",
+            annotator_kind="code",
+            evaluator_name="memforge.deterministic.offline_contract",
+            evaluator_version="1",
+            content_policy_id="aep-policy",
+            created_at=datetime.now(timezone.utc),
+        )
 
 
 @pytest.mark.asyncio

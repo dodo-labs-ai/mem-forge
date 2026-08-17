@@ -599,19 +599,14 @@ class OfflineAgentEvaluation:
         [target_result_id] = {
             assessment.target_result_id for assessment in assessments if assessment.target_result_id
         }
-        target_result = await self._store.get_agent_evaluation_result(target_result_id)
-        if target_result is None or target_result.case_id != case.case_id:
-            raise ValueError("adjudication annotations do not belong to the requested case")
         [content_policy_id] = content_policy_ids
-        content_policy = await self._store.get_agent_evaluation_content_policy(
-            content_policy_id
+        _target_result, target_case, _content_policy = await self._human_annotation_context(
+            result_id=target_result_id,
+            content_policy_id=content_policy_id,
+            reviewer_id=accepted_by,
         )
-        if (
-            content_policy is None
-            or content_policy.source_id != case.source_id
-            or content_policy.profile is not AgentEvaluationContentProfile.HUMAN_CALIBRATION
-        ):
-            raise ValueError("adjudication annotations lack valid content-policy provenance")
+        if target_case.case_id != case.case_id:
+            raise ValueError("adjudication annotations do not belong to the requested case")
         note = adjudication_note.strip()
         if not note:
             raise ValueError("adjudication_note is required")
