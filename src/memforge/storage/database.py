@@ -18638,8 +18638,12 @@ class Database:
         if not assessments:
             return
         async with self._write_lock:
-            await self._insert_agent_assessments_unlocked(assessments)
-            await self.db.commit()
+            try:
+                await self._insert_agent_assessments_unlocked(assessments)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def _insert_agent_assessments_unlocked(
         self,
