@@ -147,6 +147,24 @@ from memforge.evals.agent_evaluation import (
     AgentRuntimeEvent,
     AgentRuntimeEventQuery,
 )
+from memforge.evals.offline_evaluation import (
+    AcceptedGroundTruthRevision,
+    AgentEvaluationCase,
+    AgentEvaluationCohort,
+    AgentEvaluationResult,
+    AgentEvaluationRun,
+    AgentEvaluationRunStatus,
+    accepted_ground_truth_from_payload,
+    accepted_ground_truth_to_payload,
+    agent_evaluation_case_from_payload,
+    agent_evaluation_case_to_payload,
+    agent_evaluation_cohort_from_payload,
+    agent_evaluation_cohort_to_payload,
+    agent_evaluation_result_from_payload,
+    agent_evaluation_result_to_payload,
+    agent_evaluation_run_from_payload,
+    agent_evaluation_run_to_payload,
+)
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
 from memforge.memory.review_decision import ReviewVectorTask
 from memforge.memory.review_contract import (
@@ -209,6 +227,10 @@ from memforge.storage.admin_source import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 async def _drain_task_despite_cancellation(task: asyncio.Future[Any]) -> Any:
@@ -1725,10 +1747,67 @@ CREATE INDEX IF NOT EXISTS idx_agent_runtime_source_time
 CREATE INDEX IF NOT EXISTS idx_agent_runtime_type_reason
     ON agent_runtime_events(event_name, reason_code, occurred_at);
 
+CREATE TABLE IF NOT EXISTS agent_evaluation_cases (
+    case_id              TEXT PRIMARY KEY,
+    source_id            TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    case_kind            TEXT NOT NULL,
+    manifest_hash        TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    payload_json         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_evaluation_case_source
+    ON agent_evaluation_cases(source_id, created_at, case_id);
+
+CREATE TABLE IF NOT EXISTS accepted_ground_truth_revisions (
+    ground_truth_revision_id TEXT PRIMARY KEY,
+    case_id                   TEXT NOT NULL REFERENCES agent_evaluation_cases(case_id) ON DELETE CASCADE,
+    rubric_hash               TEXT NOT NULL,
+    accepted_at               TEXT NOT NULL,
+    payload_json              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ground_truth_case
+    ON accepted_ground_truth_revisions(case_id, accepted_at, ground_truth_revision_id);
+
+CREATE TABLE IF NOT EXISTS agent_evaluation_cohorts (
+    cohort_id             TEXT PRIMARY KEY,
+    manifest_hash         TEXT NOT NULL,
+    created_at            TEXT NOT NULL,
+    payload_json          TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_evaluation_runs (
+    run_id                TEXT PRIMARY KEY,
+    cohort_id             TEXT NOT NULL REFERENCES agent_evaluation_cohorts(cohort_id),
+    status                TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+    candidate_manifest_hash TEXT NOT NULL,
+    created_at            TEXT NOT NULL,
+    completed_at          TEXT,
+    payload_json          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_evaluation_run_cohort
+    ON agent_evaluation_runs(cohort_id, created_at, run_id);
+
+CREATE TABLE IF NOT EXISTS agent_evaluation_results (
+    result_id             TEXT PRIMARY KEY,
+    run_id                TEXT NOT NULL REFERENCES agent_evaluation_runs(run_id) ON DELETE CASCADE,
+    case_id               TEXT NOT NULL REFERENCES agent_evaluation_cases(case_id) ON DELETE CASCADE,
+    ground_truth_revision_id TEXT NOT NULL REFERENCES accepted_ground_truth_revisions(ground_truth_revision_id) ON DELETE CASCADE,
+    candidate_output_key  TEXT NOT NULL,
+    status                TEXT NOT NULL CHECK (status IN ('completed', 'error', 'artifact_unavailable')),
+    created_at            TEXT NOT NULL,
+    payload_json          TEXT NOT NULL,
+    UNIQUE (run_id, case_id, candidate_output_key)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_evaluation_result_run
+    ON agent_evaluation_results(run_id, case_id, result_id);
+CREATE INDEX IF NOT EXISTS idx_agent_evaluation_result_output_key
+    ON agent_evaluation_results(candidate_output_key, status, created_at, result_id);
+
 CREATE TABLE IF NOT EXISTS agent_assessments (
     assessment_id      TEXT PRIMARY KEY,
     schema_version     TEXT NOT NULL,
-    target_event_id    TEXT NOT NULL REFERENCES agent_runtime_events(event_id) ON DELETE CASCADE,
+    target_event_id    TEXT REFERENCES agent_runtime_events(event_id) ON DELETE CASCADE,
+    target_result_id   TEXT REFERENCES agent_evaluation_results(result_id) ON DELETE CASCADE,
     criterion          TEXT NOT NULL,
     status             TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
     label              TEXT CHECK (label IN ('pass', 'fail', 'needs_review')),
@@ -1737,10 +1816,13 @@ CREATE TABLE IF NOT EXISTS agent_assessments (
     evaluator_name     TEXT NOT NULL,
     evaluator_version  TEXT NOT NULL,
     created_at         TEXT NOT NULL,
-    occurrence_count   INTEGER NOT NULL DEFAULT 1
+    occurrence_count   INTEGER NOT NULL DEFAULT 1,
+    CHECK ((target_event_id IS NOT NULL) != (target_result_id IS NOT NULL))
 );
 CREATE INDEX IF NOT EXISTS idx_agent_assessment_event
     ON agent_assessments(target_event_id, assessment_id);
+CREATE INDEX IF NOT EXISTS idx_agent_assessment_result
+    ON agent_assessments(target_result_id, assessment_id);
 CREATE INDEX IF NOT EXISTS idx_agent_assessment_criterion
     ON agent_assessments(criterion, label, created_at);
 """
@@ -3471,6 +3553,96 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "Separate agent operation, execution, and terminal event identity",
         [],
     ),
+    (
+        80,
+        "Add immutable offline agent evaluation records",
+        [
+            """CREATE TABLE IF NOT EXISTS agent_evaluation_cases (
+                case_id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                case_kind TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_evaluation_case_source
+               ON agent_evaluation_cases(source_id, created_at, case_id)""",
+            """CREATE TABLE IF NOT EXISTS accepted_ground_truth_revisions (
+                ground_truth_revision_id TEXT PRIMARY KEY,
+                case_id TEXT NOT NULL REFERENCES agent_evaluation_cases(case_id) ON DELETE CASCADE,
+                rubric_hash TEXT NOT NULL,
+                accepted_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_ground_truth_case
+               ON accepted_ground_truth_revisions(case_id, accepted_at, ground_truth_revision_id)""",
+            """CREATE TABLE IF NOT EXISTS agent_evaluation_cohorts (
+                cohort_id TEXT PRIMARY KEY,
+                manifest_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS agent_evaluation_runs (
+                run_id TEXT PRIMARY KEY,
+                cohort_id TEXT NOT NULL REFERENCES agent_evaluation_cohorts(cohort_id),
+                status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+                candidate_manifest_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                payload_json TEXT NOT NULL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_evaluation_run_cohort
+               ON agent_evaluation_runs(cohort_id, created_at, run_id)""",
+            """CREATE TABLE IF NOT EXISTS agent_evaluation_results (
+                result_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES agent_evaluation_runs(run_id) ON DELETE CASCADE,
+                case_id TEXT NOT NULL REFERENCES agent_evaluation_cases(case_id) ON DELETE CASCADE,
+                ground_truth_revision_id TEXT NOT NULL
+                    REFERENCES accepted_ground_truth_revisions(ground_truth_revision_id) ON DELETE CASCADE,
+                candidate_output_key TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('completed', 'error', 'artifact_unavailable')),
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                UNIQUE (run_id, case_id, candidate_output_key)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_evaluation_result_run
+               ON agent_evaluation_results(run_id, case_id, result_id)""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_evaluation_result_output_key
+               ON agent_evaluation_results(candidate_output_key, status, created_at, result_id)""",
+            """CREATE TABLE agent_assessments_v4 (
+                assessment_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                target_event_id TEXT REFERENCES agent_runtime_events(event_id) ON DELETE CASCADE,
+                target_result_id TEXT REFERENCES agent_evaluation_results(result_id) ON DELETE CASCADE,
+                criterion TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+                label TEXT CHECK (label IN ('pass', 'fail', 'needs_review')),
+                reason_code TEXT NOT NULL,
+                annotator_kind TEXT NOT NULL CHECK (annotator_kind IN ('code', 'llm', 'human')),
+                evaluator_name TEXT NOT NULL,
+                evaluator_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                CHECK ((target_event_id IS NOT NULL) != (target_result_id IS NOT NULL))
+            )""",
+            """INSERT INTO agent_assessments_v4 (
+                    assessment_id, schema_version, target_event_id, target_result_id,
+                    criterion, status, label, reason_code, annotator_kind,
+                    evaluator_name, evaluator_version, created_at, occurrence_count
+                ) SELECT assessment_id, schema_version, target_event_id, NULL,
+                    criterion, status, label, reason_code, annotator_kind,
+                    evaluator_name, evaluator_version, created_at, occurrence_count
+                FROM agent_assessments""",
+            "DROP TABLE agent_assessments",
+            "ALTER TABLE agent_assessments_v4 RENAME TO agent_assessments",
+            """CREATE INDEX idx_agent_assessment_event
+               ON agent_assessments(target_event_id, assessment_id)""",
+            """CREATE INDEX idx_agent_assessment_result
+               ON agent_assessments(target_result_id, assessment_id)""",
+            """CREATE INDEX idx_agent_assessment_criterion
+               ON agent_assessments(criterion, label, created_at)""",
+        ],
+    ),
 ]
 
 
@@ -3605,22 +3777,34 @@ class Database:
                 occurrence_count, trace_id, span_id, trace_flags
             FROM agent_runtime_events"""
         )
+        async with self.db.execute("PRAGMA table_info(agent_assessments)") as cursor:
+            assessment_columns = {str(row[1]) async for row in cursor}
+        supports_offline = "target_result_id" in assessment_columns
         await self.db.execute(
             """CREATE TABLE agent_assessments_v3 (
                 assessment_id TEXT PRIMARY KEY, schema_version TEXT NOT NULL,
-                target_event_id TEXT NOT NULL
-                    REFERENCES agent_runtime_events_v3(event_id) ON DELETE CASCADE,
+                target_event_id TEXT REFERENCES agent_runtime_events_v3(event_id) ON DELETE CASCADE,
+                target_result_id TEXT REFERENCES agent_evaluation_results(result_id) ON DELETE CASCADE,
                 criterion TEXT NOT NULL, status TEXT NOT NULL
                     CHECK (status IN ('completed', 'failed')),
                 label TEXT CHECK (label IN ('pass', 'fail', 'needs_review')),
                 reason_code TEXT NOT NULL, annotator_kind TEXT NOT NULL
                     CHECK (annotator_kind IN ('code', 'llm', 'human')),
                 evaluator_name TEXT NOT NULL, evaluator_version TEXT NOT NULL,
-                created_at TEXT NOT NULL, occurrence_count INTEGER NOT NULL DEFAULT 1
+                created_at TEXT NOT NULL, occurrence_count INTEGER NOT NULL DEFAULT 1,
+                CHECK ((target_event_id IS NOT NULL) != (target_result_id IS NOT NULL))
             )"""
         )
         await self.db.execute(
-            """INSERT INTO agent_assessments_v3 SELECT * FROM agent_assessments"""
+            """INSERT INTO agent_assessments_v3 (
+                    assessment_id, schema_version, target_event_id, target_result_id,
+                    criterion, status, label, reason_code, annotator_kind,
+                    evaluator_name, evaluator_version, created_at, occurrence_count
+                ) SELECT assessment_id, schema_version, target_event_id, """
+            + ("target_result_id" if supports_offline else "NULL")
+            + """, criterion, status, label, reason_code, annotator_kind,
+                    evaluator_name, evaluator_version, created_at, occurrence_count
+                FROM agent_assessments"""
         )
         await self.db.execute("DROP TABLE agent_assessments")
         await self.db.execute("DROP TABLE agent_runtime_events")
@@ -3635,6 +3819,7 @@ class Database:
             "CREATE INDEX idx_agent_runtime_source_time ON agent_runtime_events(source_id, occurred_at, event_id)",
             "CREATE INDEX idx_agent_runtime_type_reason ON agent_runtime_events(event_name, reason_code, occurred_at)",
             "CREATE INDEX idx_agent_assessment_event ON agent_assessments(target_event_id, assessment_id)",
+            "CREATE INDEX idx_agent_assessment_result ON agent_assessments(target_result_id, assessment_id)",
             "CREATE INDEX idx_agent_assessment_criterion ON agent_assessments(criterion, label, created_at)",
         ):
             await self.db.execute(sql)
@@ -18083,6 +18268,273 @@ class Database:
         )
 
     # ==================================================================
+    # Offline agent evaluation
+    # ==================================================================
+
+    async def authorize_agent_evaluation_source(
+        self,
+        source_id: str,
+        actor_user_id: str,
+    ) -> None:
+        if not actor_user_id:
+            raise PermissionError("offline evaluation requires an authenticated actor")
+        rows = await self.db.execute_fetchall(
+            """SELECT access_policy, access_state, owner_user_id FROM sources
+               WHERE id = ?""",
+            (source_id,),
+        )
+        if not rows:
+            raise KeyError(f"unknown evaluation source: {source_id}")
+        source = rows[0]
+        if source["access_state"] != "active":
+            raise PermissionError("source access transition blocks offline evaluation")
+        if source["access_policy"] == "private" and source["owner_user_id"] != actor_user_id:
+            raise PermissionError("private evaluation source requires its owner")
+
+    async def record_agent_evaluation_case(self, case: AgentEvaluationCase) -> None:
+        payload = _canonical_json(agent_evaluation_case_to_payload(case))
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT OR IGNORE INTO agent_evaluation_cases (
+                       case_id, source_id, case_kind, manifest_hash, created_at, payload_json
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    case.case_id,
+                    case.source_id,
+                    case.case_kind.value,
+                    case.manifest_hash,
+                    case.created_at,
+                    payload,
+                ),
+            )
+            await self._assert_immutable_payload(
+                "agent_evaluation_cases", "case_id", case.case_id, payload
+            )
+            await self.db.commit()
+
+    async def get_agent_evaluation_case(self, case_id: str) -> AgentEvaluationCase | None:
+        row = await self.db.execute_fetchall(
+            "SELECT payload_json FROM agent_evaluation_cases WHERE case_id = ?",
+            (case_id,),
+        )
+        return agent_evaluation_case_from_payload(json.loads(row[0]["payload_json"])) if row else None
+
+    async def record_accepted_ground_truth_revision(
+        self,
+        revision: AcceptedGroundTruthRevision,
+    ) -> None:
+        payload = _canonical_json(accepted_ground_truth_to_payload(revision))
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT OR IGNORE INTO accepted_ground_truth_revisions (
+                       ground_truth_revision_id, case_id, rubric_hash, accepted_at, payload_json
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    revision.ground_truth_revision_id,
+                    revision.case_id,
+                    revision.rubric_hash,
+                    revision.accepted_at,
+                    payload,
+                ),
+            )
+            await self._assert_immutable_payload(
+                "accepted_ground_truth_revisions",
+                "ground_truth_revision_id",
+                revision.ground_truth_revision_id,
+                payload,
+            )
+            await self.db.commit()
+
+    async def get_accepted_ground_truth_revision(
+        self,
+        revision_id: str,
+    ) -> AcceptedGroundTruthRevision | None:
+        row = await self.db.execute_fetchall(
+            """SELECT payload_json FROM accepted_ground_truth_revisions
+               WHERE ground_truth_revision_id = ?""",
+            (revision_id,),
+        )
+        return accepted_ground_truth_from_payload(json.loads(row[0]["payload_json"])) if row else None
+
+    async def record_agent_evaluation_cohort(self, cohort: AgentEvaluationCohort) -> None:
+        payload = _canonical_json(agent_evaluation_cohort_to_payload(cohort))
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT OR IGNORE INTO agent_evaluation_cohorts (
+                       cohort_id, manifest_hash, created_at, payload_json
+                   ) VALUES (?, ?, ?, ?)""",
+                (cohort.cohort_id, cohort.manifest_hash, cohort.created_at, payload),
+            )
+            await self._assert_immutable_payload(
+                "agent_evaluation_cohorts", "cohort_id", cohort.cohort_id, payload
+            )
+            await self.db.commit()
+
+    async def get_agent_evaluation_cohort(
+        self,
+        cohort_id: str,
+    ) -> AgentEvaluationCohort | None:
+        row = await self.db.execute_fetchall(
+            "SELECT payload_json FROM agent_evaluation_cohorts WHERE cohort_id = ?",
+            (cohort_id,),
+        )
+        return agent_evaluation_cohort_from_payload(json.loads(row[0]["payload_json"])) if row else None
+
+    async def record_agent_evaluation_run(self, run: AgentEvaluationRun) -> None:
+        payload = _canonical_json(agent_evaluation_run_to_payload(run))
+        async with self._write_lock:
+            existing_rows = await self.db.execute_fetchall(
+                "SELECT payload_json FROM agent_evaluation_runs WHERE run_id = ?",
+                (run.run_id,),
+            )
+            if existing_rows:
+                existing = agent_evaluation_run_from_payload(
+                    json.loads(existing_rows[0]["payload_json"])
+                )
+                if (
+                    existing.cohort_id != run.cohort_id
+                    or existing.candidate_manifest_hash != run.candidate_manifest_hash
+                    or existing.evaluator_suite != run.evaluator_suite
+                    or existing.evaluator_version != run.evaluator_version
+                    or existing.replicate_count != run.replicate_count
+                ):
+                    raise ValueError(f"conflicting evaluation run payload run_id={run.run_id}")
+                if existing.status is not run.status and existing.status is not AgentEvaluationRunStatus.RUNNING:
+                    raise ValueError("terminal evaluation run cannot transition state")
+                await self.db.execute(
+                    """UPDATE agent_evaluation_runs SET
+                           status = ?, completed_at = ?, payload_json = ?
+                       WHERE run_id = ?""",
+                    (run.status.value, run.completed_at, payload, run.run_id),
+                )
+            else:
+                await self.db.execute(
+                    """INSERT INTO agent_evaluation_runs (
+                           run_id, cohort_id, status, candidate_manifest_hash,
+                           created_at, completed_at, payload_json
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        run.run_id,
+                        run.cohort_id,
+                        run.status.value,
+                        run.candidate_manifest_hash,
+                        run.created_at,
+                        run.completed_at,
+                        payload,
+                    ),
+                )
+            await self.db.commit()
+
+    async def get_agent_evaluation_run(self, run_id: str) -> AgentEvaluationRun | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT payload_json FROM agent_evaluation_runs WHERE run_id = ?",
+            (run_id,),
+        )
+        return agent_evaluation_run_from_payload(json.loads(rows[0]["payload_json"])) if rows else None
+
+    async def record_agent_evaluation_result(
+        self,
+        result: AgentEvaluationResult,
+        assessments: tuple[AgentAssessment, ...] = (),
+    ) -> None:
+        if any(assessment.target_result_id != result.result_id for assessment in assessments):
+            raise ValueError("offline assessment target must match evaluation result")
+        payload = _canonical_json(agent_evaluation_result_to_payload(result))
+        async with self._write_lock:
+            try:
+                await self.db.execute(
+                    """INSERT OR IGNORE INTO agent_evaluation_results (
+                           result_id, run_id, case_id, ground_truth_revision_id,
+                           candidate_output_key, status, created_at, payload_json
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        result.result_id,
+                        result.run_id,
+                        result.case_id,
+                        result.ground_truth_revision_id,
+                        result.candidate_output_key,
+                        result.status.value,
+                        result.created_at,
+                        payload,
+                    ),
+                )
+                await self._assert_immutable_payload(
+                    "agent_evaluation_results", "result_id", result.result_id, payload
+                )
+                await self._insert_agent_assessments_unlocked(assessments)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def get_agent_evaluation_result(
+        self,
+        result_id: str,
+    ) -> AgentEvaluationResult | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT payload_json FROM agent_evaluation_results WHERE result_id = ?",
+            (result_id,),
+        )
+        return agent_evaluation_result_from_payload(json.loads(rows[0]["payload_json"])) if rows else None
+
+    async def get_cached_agent_evaluation_output(
+        self,
+        candidate_output_key: str,
+    ) -> AgentEvaluationResult | None:
+        rows = await self.db.execute_fetchall(
+            """SELECT payload_json FROM agent_evaluation_results
+               WHERE candidate_output_key = ? AND status = 'completed'
+               ORDER BY created_at, result_id LIMIT 1""",
+            (candidate_output_key,),
+        )
+        return agent_evaluation_result_from_payload(json.loads(rows[0]["payload_json"])) if rows else None
+
+    async def list_agent_evaluation_results(
+        self,
+        run_id: str,
+    ) -> list[AgentEvaluationResult]:
+        rows = await self.db.execute_fetchall(
+            """SELECT payload_json FROM agent_evaluation_results
+               WHERE run_id = ? ORDER BY case_id, result_id""",
+            (run_id,),
+        )
+        return [agent_evaluation_result_from_payload(json.loads(row["payload_json"])) for row in rows]
+
+    async def list_agent_assessments_for_run(
+        self,
+        run_id: str,
+    ) -> list[AgentAssessment]:
+        rows = await self.db.execute_fetchall(
+            """SELECT A.* FROM agent_assessments A
+               JOIN agent_evaluation_results R ON R.result_id = A.target_result_id
+               WHERE R.run_id = ? ORDER BY R.case_id, A.assessment_id""",
+            (run_id,),
+        )
+        return [self._row_to_agent_assessment(row) for row in rows]
+
+    async def _assert_immutable_payload(
+        self,
+        table: str,
+        id_column: str,
+        record_id: str,
+        expected_payload: str,
+    ) -> None:
+        allowed = {
+            ("agent_evaluation_cases", "case_id"),
+            ("accepted_ground_truth_revisions", "ground_truth_revision_id"),
+            ("agent_evaluation_cohorts", "cohort_id"),
+            ("agent_evaluation_results", "result_id"),
+        }
+        if (table, id_column) not in allowed:
+            raise ValueError("unsupported immutable evaluation record")
+        rows = await self.db.execute_fetchall(
+            f"SELECT payload_json FROM {table} WHERE {id_column} = ?",
+            (record_id,),
+        )
+        if not rows or rows[0]["payload_json"] != expected_payload:
+            raise ValueError(f"conflicting immutable evaluation payload id={record_id}")
+
+    # ==================================================================
     # Agent assessments
     # ==================================================================
 
@@ -18106,15 +18558,16 @@ class Database:
             return
         await self.db.executemany(
             """INSERT OR IGNORE INTO agent_assessments (
-                   assessment_id, schema_version, target_event_id, criterion,
+                   assessment_id, schema_version, target_event_id, target_result_id, criterion,
                    status, label, reason_code, annotator_kind, evaluator_name,
                    evaluator_version, created_at, occurrence_count
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     assessment.assessment_id,
                     assessment.schema_version,
                     assessment.target_event_id,
+                    assessment.target_result_id,
                     assessment.criterion,
                     assessment.status,
                     assessment.label,
@@ -18133,7 +18586,10 @@ class Database:
         self,
         query: AgentAssessmentQuery,
     ) -> list[AgentAssessment]:
-        """Return assessments whose target events are visible to the caller."""
+        """Return visible online or explicitly targeted offline assessments."""
+
+        if query.target_result_id is not None:
+            return await self._list_offline_agent_assessments(query)
 
         clauses = ["E.occurred_at >= ?", "E.occurred_at < ?"]
         params: list[object] = [
@@ -18187,7 +18643,10 @@ class Database:
         return AgentAssessment(
             assessment_id=str(row["assessment_id"]),
             schema_version=str(row["schema_version"]),
-            target_event_id=str(row["target_event_id"]),
+            target_event_id=(str(row["target_event_id"]) if row["target_event_id"] is not None else None),
+            target_result_id=(
+                str(row["target_result_id"]) if row["target_result_id"] is not None else None
+            ),
             criterion=str(row["criterion"]),
             status=str(row["status"]),  # type: ignore[arg-type]
             label=row["label"],  # type: ignore[arg-type]
@@ -18198,6 +18657,54 @@ class Database:
             created_at=datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00")),
             occurrence_count=int(row["occurrence_count"]),
         )
+
+    async def _list_offline_agent_assessments(
+        self,
+        query: AgentAssessmentQuery,
+    ) -> list[AgentAssessment]:
+        clauses = ["A.target_result_id = ?", "A.created_at >= ?", "A.created_at < ?"]
+        params: list[object] = [
+            query.target_result_id,
+            _utc_iso(query.occurred_from),
+            _utc_iso(query.occurred_to),
+        ]
+        clauses.append(
+            "((S.access_state = 'active' AND (S.access_policy = 'workspace' OR "
+            "(? = 1 AND S.access_policy = 'private' AND S.owner_user_id = ?))) OR "
+            "(S.access_state = 'changing' AND ? = 1 AND S.owner_user_id = ?))"
+        )
+        params.extend(
+            (
+                int(query.include_private),
+                query.requesting_user_id,
+                int(query.include_private),
+                query.requesting_user_id,
+            )
+        )
+        for expression, value in (
+            ("A.assessment_id", query.assessment_id),
+            ("C.source_id", query.source_id),
+            ("A.criterion", query.criterion),
+            ("A.status", query.status),
+            ("A.label", query.label),
+            ("A.evaluator_name", query.evaluator_name),
+        ):
+            if value is not None:
+                clauses.append(f"{expression} = ?")
+                params.append(value)
+        params.extend((query.limit, query.offset))
+        rows = await self.db.execute_fetchall(
+            "SELECT A.* FROM agent_assessments A "
+            "JOIN agent_evaluation_results R ON R.result_id = A.target_result_id "
+            "JOIN agent_evaluation_cases C ON C.case_id = R.case_id "
+            "JOIN sources S ON S.id = C.source_id WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY A.created_at "
+            + ("DESC, A.assessment_id DESC" if query.newest_first else "ASC, A.assessment_id ASC")
+            + " LIMIT ? OFFSET ?",
+            tuple(params),
+        )
+        return [self._row_to_agent_assessment(row) for row in rows]
 
     # ==================================================================
     # Config - schedule

@@ -361,7 +361,7 @@ class SourceUnitDeriver:
         ordered_results = tuple(
             completed_results.get(batch.id) or new_results_by_batch_id[batch.id] for batch in batches
         )
-        extraction = _assemble_derivation_results(
+        extraction = assemble_source_derivation_results(
             projection=request.projection,
             results=ordered_results,
         )
@@ -416,6 +416,69 @@ class SourceUnitDeriver:
             reused_batch_count=len(completed_results),
             executed_batch_count=len(pending_batches),
         )
+
+
+async def replay_source_unit_derivation(
+    request: SourceUnitDerivationRequest,
+) -> MemoryExtractionResult:
+    """Execute one derivation manifest without durable product-side effects.
+
+    Offline evaluation deliberately reuses the production work planner and
+    extraction callback, but it does not stage a Source Derivation, emit runtime
+    events, or write Source/Memory lifecycle state.
+    """
+
+    batches = plan_source_derivation_work(request.projection, request.context)
+    results = await collect_bounded(
+        batches,
+        request.extract_batch,
+        max_concurrent=request.max_concurrent,
+    )
+    extraction = assemble_source_derivation_results(
+        projection=request.projection,
+        results=tuple(results),
+    )
+    extraction.metadata = {
+        **extraction.metadata,
+        "derivation_work_kinds": sorted({_derivation_batch_kind(batch) for batch in batches}),
+        "reused_derivation_batch_count": 0,
+        "executed_derivation_batch_count": len(batches),
+        "offline_replay": True,
+    }
+    if (
+        request.context.work_strategy == "auto"
+        and len(batches) == 1
+        and isinstance(batches[0], DiffGuidedExtractionBatch)
+        and extraction.error_type
+    ):
+        fallback = await replay_source_unit_derivation(
+            replace(
+                request,
+                context=replace(request.context, work_strategy="structural"),
+            )
+        )
+        fallback.metadata = {
+            **fallback.metadata,
+            "diff_guided_fallback": True,
+            "failed_diff_derivation_count": 1,
+        }
+        return fallback
+    structural_batches = tuple(
+        batch for batch in batches if isinstance(batch, StructuralExtractionBatch)
+    )
+    if structural_batches:
+        units = tuple(batch.context.unit for batch in structural_batches)
+        extraction.metadata.update(
+            {
+                "unitized": True,
+                "unit_count": len(units),
+                "failed_unit_count": extraction.metadata.get("failed_batch_count", 0),
+                "segmentation_version": units[0].segmentation_version,
+                "partition_strategy": "recursive_fit_first",
+                "max_unit_input_tokens": UnitizationPolicy().max_unit_input_tokens,
+            }
+        )
+    return extraction
 
 
 def _safe_diagnostic_label(value: object) -> str | None:
@@ -1026,7 +1089,7 @@ def _derivation_context_identity_payload(
     }
 
 
-def _assemble_derivation_results(
+def assemble_source_derivation_results(
     *,
     projection: SourceProjection,
     results: tuple[MemoryExtractionResult, ...],
