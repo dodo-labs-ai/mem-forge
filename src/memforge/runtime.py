@@ -1274,6 +1274,7 @@ class SourceSyncWorker:
             )
             if not completed:
                 raise SourceSyncLeaseLost(f"source sync lease lost before completion for run {run.run_id}")
+            _publish_terminal_runtime_bundles(runtime, final_state)
             return run
         except asyncio.CancelledError:
             raise
