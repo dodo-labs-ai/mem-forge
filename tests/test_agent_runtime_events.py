@@ -412,7 +412,7 @@ async def test_sqlite_v3_migration_preserves_v2_event_and_assessment(db) -> None
             NOW.isoformat(),
         ),
     )
-    await db.db.execute("DELETE FROM schema_migrations WHERE version = 79")
+    await db.db.execute("DELETE FROM schema_migrations WHERE version IN (79, 82)")
     await db.db.commit()
 
     await db._run_migrations()

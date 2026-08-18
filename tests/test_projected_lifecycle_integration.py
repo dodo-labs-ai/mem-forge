@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -667,6 +667,7 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
         structured_llm_client=_ConflictingReplacementClient(),
     )
 
+    event_window_start = datetime.now(timezone.utc) - timedelta(seconds=1)
     stats = await reviewing_engine.apply_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
@@ -685,6 +686,7 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
         update_plan_stats=None,
         source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
     )
+    event_window_end = datetime.now(timezone.utc) + timedelta(seconds=1)
 
     assert stats["pending_review"] == 1
     current = await db.get_memory(incumbent.id)
@@ -701,8 +703,8 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
     )
     runtime_events = await db.list_agent_runtime_events(
         AgentRuntimeEventQuery(
-            occurred_from=datetime(2026, 8, 16, tzinfo=timezone.utc),
-            occurred_to=datetime(2026, 8, 18, tzinfo=timezone.utc),
+            occurred_from=event_window_start,
+            occurred_to=event_window_end,
             source_id="src-1",
             event_name="source_unit_lifecycle_outcome",
             limit=10,

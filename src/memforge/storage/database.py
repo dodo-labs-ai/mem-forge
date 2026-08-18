@@ -1832,6 +1832,9 @@ CREATE TABLE IF NOT EXISTS agent_assessments (
     evaluator_version  TEXT NOT NULL,
     annotator_id       TEXT,
     content_policy_id  TEXT REFERENCES agent_evaluation_content_policies(content_policy_id),
+    input_fingerprint  TEXT,
+    confidence         TEXT CHECK (confidence IS NULL OR confidence IN ('low', 'medium', 'high')),
+    reused_from_assessment_id TEXT,
     created_at         TEXT NOT NULL,
     occurrence_count   INTEGER NOT NULL DEFAULT 1,
     CHECK ((target_event_id IS NOT NULL) != (target_result_id IS NOT NULL))
@@ -1842,6 +1845,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_assessment_result
     ON agent_assessments(target_result_id, assessment_id);
 CREATE INDEX IF NOT EXISTS idx_agent_assessment_criterion
     ON agent_assessments(criterion, label, created_at);
+CREATE INDEX IF NOT EXISTS idx_agent_assessment_input_fingerprint
+    ON agent_assessments(input_fingerprint, status, created_at, assessment_id);
 """
 
 # ---------------------------------------------------------------------------
@@ -3678,6 +3683,17 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE agent_assessments ADD COLUMN annotator_id TEXT",
             """ALTER TABLE agent_assessments ADD COLUMN content_policy_id TEXT
                REFERENCES agent_evaluation_content_policies(content_policy_id)""",
+        ],
+    ),
+    (
+        82,
+        "Add exact semantic assessment reuse metadata",
+        [
+            "ALTER TABLE agent_assessments ADD COLUMN input_fingerprint TEXT",
+            "ALTER TABLE agent_assessments ADD COLUMN confidence TEXT",
+            "ALTER TABLE agent_assessments ADD COLUMN reused_from_assessment_id TEXT",
+            """CREATE INDEX IF NOT EXISTS idx_agent_assessment_input_fingerprint
+               ON agent_assessments(input_fingerprint, status, created_at, assessment_id)""",
         ],
     ),
 ]
@@ -18602,6 +18618,19 @@ class Database:
         )
         return [self._row_to_agent_assessment(row) for row in rows]
 
+    async def get_cached_agent_assessment(
+        self,
+        input_fingerprint: str,
+    ) -> AgentAssessment | None:
+        rows = await self.db.execute_fetchall(
+            """SELECT * FROM agent_assessments
+               WHERE input_fingerprint = ? AND annotator_kind = 'llm'
+                 AND status = 'completed'
+               ORDER BY created_at, assessment_id LIMIT 1""",
+            (input_fingerprint,),
+        )
+        return self._row_to_agent_assessment(rows[0]) if rows else None
+
     async def _assert_immutable_payload(
         self,
         table: str,
@@ -18655,9 +18684,9 @@ class Database:
             """INSERT OR IGNORE INTO agent_assessments (
                    assessment_id, schema_version, target_event_id, target_result_id, criterion,
                    status, label, reason_code, annotator_kind, evaluator_name,
-                   evaluator_version, annotator_id, content_policy_id, created_at,
-                   occurrence_count
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   evaluator_version, annotator_id, content_policy_id, input_fingerprint,
+                   confidence, reused_from_assessment_id, created_at, occurrence_count
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     assessment.assessment_id,
@@ -18673,6 +18702,9 @@ class Database:
                     assessment.evaluator_version,
                     assessment.annotator_id,
                     assessment.content_policy_id,
+                    assessment.input_fingerprint,
+                    assessment.confidence,
+                    assessment.reused_from_assessment_id,
                     _utc_iso(assessment.created_at),
                     assessment.occurrence_count,
                 )
@@ -18786,6 +18818,17 @@ class Database:
             content_policy_id=(
                 str(row["content_policy_id"])
                 if row["content_policy_id"] is not None
+                else None
+            ),
+            input_fingerprint=(
+                str(row["input_fingerprint"])
+                if row["input_fingerprint"] is not None
+                else None
+            ),
+            confidence=row["confidence"],  # type: ignore[arg-type]
+            reused_from_assessment_id=(
+                str(row["reused_from_assessment_id"])
+                if row["reused_from_assessment_id"] is not None
                 else None
             ),
             created_at=datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00")),
