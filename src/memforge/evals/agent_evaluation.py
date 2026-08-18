@@ -24,12 +24,13 @@ from typing import Callable, ContextManager, Iterator, Literal, Mapping, Protoco
 
 
 AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v3"
-AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v3"
+AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v4"
 SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION = "source-unit-lifecycle-v1"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
 AgentAssessmentStatus = Literal["completed", "failed"]
 AgentAssessmentLabel = Literal["pass", "fail", "needs_review"]
 AgentAssessmentAnnotatorKind = Literal["code", "llm", "human"]
+AgentAssessmentConfidence = Literal["low", "medium", "high"]
 logger = logging.getLogger(__name__)
 
 
@@ -272,6 +273,9 @@ class AgentAssessment:
     target_result_id: str | None = None
     annotator_id: str | None = None
     content_policy_id: str | None = None
+    input_fingerprint: str | None = None
+    confidence: AgentAssessmentConfidence | None = None
+    reused_from_assessment_id: str | None = None
     occurrence_count: int = 1
     schema_version: str = AGENT_ASSESSMENT_SCHEMA_VERSION
 
@@ -294,6 +298,10 @@ class AgentAssessment:
             _require_bounded_principal_id("annotator_id", self.annotator_id)
         if self.content_policy_id is not None:
             _require_safe_identifier("content_policy_id", self.content_policy_id)
+        _require_hash("input_fingerprint", self.input_fingerprint)
+        _require_safe_identifier(
+            "reused_from_assessment_id", self.reused_from_assessment_id
+        )
         if (
             self.annotator_kind == "human"
             and self.schema_version == AGENT_ASSESSMENT_SCHEMA_VERSION
@@ -302,10 +310,34 @@ class AgentAssessment:
             raise ValueError(
                 "human assessment requires annotator and content-policy provenance"
             )
-        if self.annotator_kind != "human" and (
-            self.annotator_id is not None or self.content_policy_id is not None
+        if self.annotator_kind != "human" and self.annotator_id is not None:
+            raise ValueError("only human assessments carry reviewer provenance")
+        if self.annotator_kind == "code" and self.content_policy_id is not None:
+            raise ValueError("code assessments cannot carry human-review provenance")
+        if (
+            self.annotator_kind == "llm"
+            and self.target_result_id is not None
+            and self.schema_version == AGENT_ASSESSMENT_SCHEMA_VERSION
+            and (self.content_policy_id is None or self.input_fingerprint is None)
         ):
-            raise ValueError("only human assessments carry human-review provenance")
+            raise ValueError(
+                "offline LLM assessment requires content-policy and input provenance"
+            )
+        if self.confidence is not None and self.annotator_kind != "llm":
+            raise ValueError("only LLM assessments carry model confidence")
+        if self.input_fingerprint is not None and self.annotator_kind != "llm":
+            raise ValueError("only LLM assessments carry semantic input fingerprints")
+        if self.confidence not in {None, "low", "medium", "high"}:
+            raise ValueError("assessment confidence must be low, medium, or high")
+        if self.status == "failed" and self.confidence is not None:
+            raise ValueError("failed assessment cannot carry confidence")
+        if (
+            self.reused_from_assessment_id is not None
+            and self.annotator_kind != "llm"
+        ):
+            raise ValueError("only LLM assessments can reuse an assessment decision")
+        if self.reused_from_assessment_id == self.assessment_id:
+            raise ValueError("assessment cannot reuse itself")
         if self.status == "completed" and self.label is None:
             raise ValueError("completed assessment requires a label")
         if self.status == "failed" and self.label is not None:

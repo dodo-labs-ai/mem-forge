@@ -455,6 +455,19 @@ class RerankResponse(StructuredResponseModel):
     ranking: list[int] = Field(default_factory=list)
 
 
+class OfflineSemanticJudgeResponse(StructuredResponseModel):
+    """One bounded, content-free decision for an offline semantic criterion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: Literal[
+        "criterion_satisfied",
+        "criterion_not_satisfied",
+        "insufficient_evidence",
+    ]
+    confidence: Literal["low", "medium", "high"]
+
+
 @dataclass(frozen=True)
 class StructuredLlmConfig:
     model: str
@@ -1522,6 +1535,20 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=RerankResponse,
+            max_tokens=max_tokens,
+            model=model,
+        )
+
+    async def judge_offline_semantics(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 512,
+        model: str | None = None,
+    ) -> OfflineSemanticJudgeResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=OfflineSemanticJudgeResponse,
             max_tokens=max_tokens,
             model=model,
         )
