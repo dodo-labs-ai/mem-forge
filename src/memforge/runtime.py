@@ -954,6 +954,13 @@ class SourceSyncWorker:
             logger.exception("Relation discovery worker slice failed")
             return False
 
+    async def process_bounded_maintenance_once(self) -> None:
+        """Interleave one bounded slice of each non-source lifecycle queue."""
+
+        await self.process_lifecycle_vector_delivery_once()
+        await self.process_review_vector_delivery_once()
+        await self._process_relation_discovery_once()
+
     async def _heartbeat_until_stopped(
         self,
         run: SourceSyncRun,
@@ -1093,9 +1100,7 @@ class SourceSyncWorker:
             lease_seconds=self.lease_seconds,
         )
         if run is None:
-            await self.process_lifecycle_vector_delivery_once()
-            await self.process_review_vector_delivery_once()
-            await self._process_relation_discovery_once()
+            await self.process_bounded_maintenance_once()
             return None
 
         if run.lease_attempt_count > self.config.sync.worker_max_attempts:
@@ -1319,9 +1324,7 @@ class SourceSyncWorker:
             if run is not None:
                 # Fairly interleave one bounded non-destructive slice even while
                 # source-sync work remains continuously available.
-                await self.process_lifecycle_vector_delivery_once()
-                await self.process_review_vector_delivery_once()
-                await self._process_relation_discovery_once()
+                await self.process_bounded_maintenance_once()
             await asyncio.sleep(0 if run is not None else interval)
 
 

@@ -152,8 +152,10 @@ from memforge.evals.offline_evaluation import (
     AgentEvaluationCase,
     AgentEvaluationCohort,
     AgentEvaluationContentPolicy,
+    AgentEvaluationExecutionState,
     AgentEvaluationResult,
     AgentEvaluationRun,
+    AgentEvaluationRunExecution,
     AgentEvaluationRunStatus,
     accepted_ground_truth_from_payload,
     accepted_ground_truth_to_payload,
@@ -165,6 +167,8 @@ from memforge.evals.offline_evaluation import (
     agent_evaluation_content_policy_to_payload,
     agent_evaluation_result_from_payload,
     agent_evaluation_result_to_payload,
+    agent_evaluation_run_execution_from_payload,
+    agent_evaluation_run_execution_to_payload,
     agent_evaluation_run_from_payload,
     agent_evaluation_run_to_payload,
 )
@@ -1801,6 +1805,20 @@ CREATE TABLE IF NOT EXISTS agent_evaluation_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_evaluation_run_cohort
     ON agent_evaluation_runs(cohort_id, created_at, run_id);
+
+CREATE TABLE IF NOT EXISTS agent_evaluation_run_executions (
+    run_id           TEXT PRIMARY KEY REFERENCES agent_evaluation_runs(run_id) ON DELETE CASCADE,
+    state            TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'completed', 'failed')),
+    worker_id        TEXT,
+    lease_token      TEXT,
+    lease_expires_at TEXT,
+    attempt_count    INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    payload_json     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_evaluation_execution_claim
+    ON agent_evaluation_run_executions(state, lease_expires_at, created_at, run_id);
 
 CREATE TABLE IF NOT EXISTS agent_evaluation_results (
     result_id             TEXT PRIMARY KEY,
@@ -3694,6 +3712,29 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE agent_assessments ADD COLUMN reused_from_assessment_id TEXT",
             """CREATE INDEX IF NOT EXISTS idx_agent_assessment_input_fingerprint
                ON agent_assessments(input_fingerprint, status, created_at, assessment_id)""",
+        ],
+    ),
+    (
+        83,
+        "Add durable offline evaluation run execution leases",
+        [
+            """CREATE TABLE IF NOT EXISTS agent_evaluation_run_executions (
+                run_id TEXT PRIMARY KEY
+                    REFERENCES agent_evaluation_runs(run_id) ON DELETE CASCADE,
+                state TEXT NOT NULL
+                    CHECK (state IN ('queued', 'leased', 'completed', 'failed')),
+                worker_id TEXT,
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_evaluation_execution_claim
+               ON agent_evaluation_run_executions(
+                   state, lease_expires_at, created_at, run_id
+               )""",
         ],
     ),
 ]
@@ -18487,49 +18528,55 @@ class Database:
         return agent_evaluation_cohort_from_payload(json.loads(row[0]["payload_json"])) if row else None
 
     async def record_agent_evaluation_run(self, run: AgentEvaluationRun) -> None:
-        payload = _canonical_json(agent_evaluation_run_to_payload(run))
         async with self._write_lock:
-            existing_rows = await self.db.execute_fetchall(
-                "SELECT payload_json FROM agent_evaluation_runs WHERE run_id = ?",
-                (run.run_id,),
-            )
-            if existing_rows:
-                existing = agent_evaluation_run_from_payload(
-                    json.loads(existing_rows[0]["payload_json"])
-                )
-                if (
-                    existing.cohort_id != run.cohort_id
-                    or existing.candidate_manifest_hash != run.candidate_manifest_hash
-                    or existing.evaluator_suite != run.evaluator_suite
-                    or existing.evaluator_version != run.evaluator_version
-                    or existing.replicate_count != run.replicate_count
-                ):
-                    raise ValueError(f"conflicting evaluation run payload run_id={run.run_id}")
-                if existing.status is not run.status and existing.status is not AgentEvaluationRunStatus.RUNNING:
-                    raise ValueError("terminal evaluation run cannot transition state")
-                await self.db.execute(
-                    """UPDATE agent_evaluation_runs SET
-                           status = ?, completed_at = ?, payload_json = ?
-                       WHERE run_id = ?""",
-                    (run.status.value, run.completed_at, payload, run.run_id),
-                )
-            else:
-                await self.db.execute(
-                    """INSERT INTO agent_evaluation_runs (
-                           run_id, cohort_id, status, candidate_manifest_hash,
-                           created_at, completed_at, payload_json
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        run.run_id,
-                        run.cohort_id,
-                        run.status.value,
-                        run.candidate_manifest_hash,
-                        run.created_at,
-                        run.completed_at,
-                        payload,
-                    ),
-                )
+            await self._record_agent_evaluation_run_locked(run)
             await self.db.commit()
+
+    async def _record_agent_evaluation_run_locked(self, run: AgentEvaluationRun) -> None:
+        payload = _canonical_json(agent_evaluation_run_to_payload(run))
+        existing_rows = await self.db.execute_fetchall(
+            "SELECT payload_json FROM agent_evaluation_runs WHERE run_id = ?",
+            (run.run_id,),
+        )
+        if existing_rows:
+            existing = agent_evaluation_run_from_payload(
+                json.loads(existing_rows[0]["payload_json"])
+            )
+            if (
+                existing.cohort_id != run.cohort_id
+                or existing.candidate_manifest_hash != run.candidate_manifest_hash
+                or existing.evaluator_suite != run.evaluator_suite
+                or existing.evaluator_version != run.evaluator_version
+                or existing.replicate_count != run.replicate_count
+            ):
+                raise ValueError(f"conflicting evaluation run payload run_id={run.run_id}")
+            if (
+                existing.status is not run.status
+                and existing.status is not AgentEvaluationRunStatus.RUNNING
+            ):
+                raise ValueError("terminal evaluation run cannot transition state")
+            await self.db.execute(
+                """UPDATE agent_evaluation_runs SET
+                       status = ?, completed_at = ?, payload_json = ?
+                   WHERE run_id = ?""",
+                (run.status.value, run.completed_at, payload, run.run_id),
+            )
+            return
+        await self.db.execute(
+            """INSERT INTO agent_evaluation_runs (
+                   run_id, cohort_id, status, candidate_manifest_hash,
+                   created_at, completed_at, payload_json
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                run.run_id,
+                run.cohort_id,
+                run.status.value,
+                run.candidate_manifest_hash,
+                run.created_at,
+                run.completed_at,
+                payload,
+            ),
+        )
 
     async def get_agent_evaluation_run(self, run_id: str) -> AgentEvaluationRun | None:
         rows = await self.db.execute_fetchall(
@@ -18537,6 +18584,246 @@ class Database:
             (run_id,),
         )
         return agent_evaluation_run_from_payload(json.loads(rows[0]["payload_json"])) if rows else None
+
+    async def admit_agent_evaluation_run(
+        self,
+        run: AgentEvaluationRun,
+        execution: AgentEvaluationRunExecution,
+    ) -> None:
+        if run.run_id != execution.run_id:
+            raise ValueError("evaluation run admission identity mismatch")
+        if execution.state is not AgentEvaluationExecutionState.QUEUED:
+            raise ValueError("new evaluation run admission must be queued")
+        payload = _canonical_json(agent_evaluation_run_execution_to_payload(execution))
+        async with self._write_lock:
+            try:
+                await self._record_agent_evaluation_run_locked(run)
+                existing = await self.db.execute_fetchall(
+                    """SELECT payload_json FROM agent_evaluation_run_executions
+                       WHERE run_id = ?""",
+                    (run.run_id,),
+                )
+                if not existing:
+                    await self.db.execute(
+                        """INSERT INTO agent_evaluation_run_executions (
+                               run_id, state, worker_id, lease_token,
+                               lease_expires_at, attempt_count, created_at,
+                               updated_at, payload_json
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            execution.run_id,
+                            execution.state.value,
+                            execution.worker_id,
+                            execution.lease_token,
+                            execution.lease_expires_at,
+                            execution.attempt_count,
+                            execution.created_at,
+                            execution.updated_at,
+                            payload,
+                        ),
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def get_agent_evaluation_run_execution(
+        self,
+        run_id: str,
+    ) -> AgentEvaluationRunExecution | None:
+        rows = await self.db.execute_fetchall(
+            """SELECT payload_json FROM agent_evaluation_run_executions
+               WHERE run_id = ?""",
+            (run_id,),
+        )
+        if not rows:
+            return None
+        return agent_evaluation_run_execution_from_payload(
+            json.loads(rows[0]["payload_json"])
+        )
+
+    async def claim_agent_evaluation_run(
+        self,
+        *,
+        worker_id: str,
+        now: str,
+        lease_expires_at: str,
+    ) -> AgentEvaluationRunExecution | None:
+        if not worker_id or lease_expires_at <= now:
+            raise ValueError("evaluation run claim requires a worker and future lease")
+        async with self._write_lock:
+            try:
+                rows = await self.db.execute_fetchall(
+                    """SELECT payload_json FROM agent_evaluation_run_executions
+                       WHERE state = 'queued'
+                          OR (state = 'leased' AND lease_expires_at <= ?)
+                       ORDER BY created_at ASC, run_id ASC
+                       LIMIT 1""",
+                    (now,),
+                )
+                if not rows:
+                    await self.db.commit()
+                    return None
+                current = agent_evaluation_run_execution_from_payload(
+                    json.loads(rows[0]["payload_json"])
+                )
+                claimed = replace(
+                    current,
+                    state=AgentEvaluationExecutionState.LEASED,
+                    worker_id=worker_id,
+                    lease_token=uuid.uuid4().hex,
+                    lease_expires_at=lease_expires_at,
+                    attempt_count=current.attempt_count + 1,
+                    updated_at=now,
+                )
+                payload = _canonical_json(
+                    agent_evaluation_run_execution_to_payload(claimed)
+                )
+                cursor = await self.db.execute(
+                    """UPDATE agent_evaluation_run_executions SET
+                           state = ?, worker_id = ?, lease_token = ?,
+                           lease_expires_at = ?, attempt_count = ?,
+                           updated_at = ?, payload_json = ?
+                       WHERE run_id = ?
+                         AND (
+                           state = 'queued'
+                           OR (state = 'leased' AND lease_expires_at <= ?)
+                         )""",
+                    (
+                        claimed.state.value,
+                        claimed.worker_id,
+                        claimed.lease_token,
+                        claimed.lease_expires_at,
+                        claimed.attempt_count,
+                        claimed.updated_at,
+                        payload,
+                        claimed.run_id,
+                        now,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    await self.db.rollback()
+                    return None
+                await self.db.commit()
+                return claimed
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def heartbeat_agent_evaluation_run(
+        self,
+        *,
+        run_id: str,
+        lease_token: str,
+        now: str,
+        lease_expires_at: str,
+    ) -> bool:
+        if lease_expires_at <= now:
+            raise ValueError("evaluation heartbeat requires a future lease")
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                """SELECT payload_json FROM agent_evaluation_run_executions
+                   WHERE run_id = ?""",
+                (run_id,),
+            )
+            if not rows:
+                return False
+            current = agent_evaluation_run_execution_from_payload(
+                json.loads(rows[0]["payload_json"])
+            )
+            if (
+                current.state is not AgentEvaluationExecutionState.LEASED
+                or current.lease_token != lease_token
+                or not current.lease_expires_at
+                or current.lease_expires_at <= now
+            ):
+                return False
+            renewed = replace(
+                current,
+                lease_expires_at=lease_expires_at,
+                updated_at=now,
+            )
+            cursor = await self.db.execute(
+                """UPDATE agent_evaluation_run_executions SET
+                       lease_expires_at = ?, updated_at = ?, payload_json = ?
+                   WHERE run_id = ? AND state = 'leased'
+                     AND lease_token = ? AND lease_expires_at > ?""",
+                (
+                    renewed.lease_expires_at,
+                    renewed.updated_at,
+                    _canonical_json(
+                        agent_evaluation_run_execution_to_payload(renewed)
+                    ),
+                    run_id,
+                    lease_token,
+                    now,
+                ),
+            )
+            await self.db.commit()
+            return cursor.rowcount == 1
+
+    async def finish_agent_evaluation_run(
+        self,
+        run: AgentEvaluationRun,
+        *,
+        lease_token: str,
+        finished_at: str,
+    ) -> bool:
+        if run.status not in {
+            AgentEvaluationRunStatus.COMPLETED,
+            AgentEvaluationRunStatus.FAILED,
+        }:
+            raise ValueError("evaluation execution can finish only with a terminal run")
+        terminal_state = (
+            AgentEvaluationExecutionState.COMPLETED
+            if run.status is AgentEvaluationRunStatus.COMPLETED
+            else AgentEvaluationExecutionState.FAILED
+        )
+        async with self._write_lock:
+            try:
+                rows = await self.db.execute_fetchall(
+                    """SELECT payload_json FROM agent_evaluation_run_executions
+                       WHERE run_id = ?""",
+                    (run.run_id,),
+                )
+                if not rows:
+                    return False
+                current = agent_evaluation_run_execution_from_payload(
+                    json.loads(rows[0]["payload_json"])
+                )
+                if (
+                    current.state is not AgentEvaluationExecutionState.LEASED
+                    or current.lease_token != lease_token
+                ):
+                    return False
+                finished = replace(
+                    current,
+                    state=terminal_state,
+                    worker_id=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                    updated_at=finished_at,
+                )
+                await self._record_agent_evaluation_run_locked(run)
+                await self.db.execute(
+                    """UPDATE agent_evaluation_run_executions SET
+                           state = ?, worker_id = NULL, lease_token = NULL,
+                           lease_expires_at = NULL, updated_at = ?, payload_json = ?
+                       WHERE run_id = ?""",
+                    (
+                        finished.state.value,
+                        finished.updated_at,
+                        _canonical_json(
+                            agent_evaluation_run_execution_to_payload(finished)
+                        ),
+                        finished.run_id,
+                    ),
+                )
+                await self.db.commit()
+                return True
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def record_agent_evaluation_result(
         self,

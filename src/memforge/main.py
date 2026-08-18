@@ -817,63 +817,34 @@ async def _run_online_evaluation_report(
 
 @eval_group.command("offline-report")
 @click.option("--run-id", required=True)
-@click.option("--user-id", "requesting_user_id", required=True)
 @click.pass_context
 def eval_offline_report(
     ctx: click.Context,
     run_id: str,
-    requesting_user_id: str,
 ) -> None:
-    """Read one authorized immutable offline evaluation report."""
+    """Read one authorized immutable offline evaluation report via the service."""
 
-    config: AppConfig = ctx.obj["config"]
-    payload = asyncio.run(
-        _run_offline_evaluation_report(
-            config=config,
-            run_id=run_id,
-            requesting_user_id=requesting_user_id,
-        )
-    )
-    click.echo(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    _emit_tool_payload(ctx, _tool_client(ctx).get_agent_evaluation_run(run_id))
 
 
-async def _run_offline_evaluation_report(
-    *,
-    config: AppConfig,
-    run_id: str,
-    requesting_user_id: str,
-) -> dict[str, object]:
-    from memforge.evals.agent_evaluation import assessment_public_payload
-    from memforge.evals.offline_evaluation import (
-        OfflineAgentEvaluation,
-        agent_evaluation_result_to_payload,
-        agent_evaluation_run_to_payload,
-    )
+@eval_group.command("offline-submit")
+@click.option(
+    "--spec",
+    "spec_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.pass_context
+def eval_offline_submit(ctx: click.Context, spec_path: Path) -> None:
+    """Submit one pinned offline evaluation JSON spec via the service."""
 
-    db = await _get_db(config)
     try:
-        report = await OfflineAgentEvaluation(db, executors={}).read_report(
-            run_id,
-            requesting_user_id=requesting_user_id,
-        )
-    finally:
-        await db.close()
-    return {
-        "run": agent_evaluation_run_to_payload(report.run),
-        "summary": {
-            "completed_result_count": report.completed_result_count,
-            "error_result_count": report.error_result_count,
-            "check_counts": dict(report.check_counts),
-            "population_summaries": {
-                population: dict(summary)
-                for population, summary in report.population_summaries.items()
-            },
-        },
-        "results": [agent_evaluation_result_to_payload(result) for result in report.results],
-        "assessments": [
-            dict(assessment_public_payload(assessment)) for assessment in report.assessments
-        ],
-    }
+        payload = json.loads(spec_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise click.ClickException(f"Cannot read evaluation spec: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise click.ClickException("Evaluation spec must be a JSON object")
+    _emit_tool_payload(ctx, _tool_client(ctx).admit_agent_evaluation_run(payload))
 
 
 @eval_group.command("purge-runtime-events")

@@ -67,6 +67,24 @@ def test_list_sources_gets_sources_collection():
     assert client.calls == [("GET", "/api/v1/sources", None)]
 
 
+def test_agent_evaluation_run_methods_use_service_execution_routes():
+    spec = {
+        "cohort_id": "aecoh-1",
+        "candidate_manifest": {"model": "candidate-model"},
+        "evaluator_suite": "contracts",
+        "evaluator_version": "1",
+    }
+    client = _RecordingClient({"run": {"run_id": "aer-1"}})
+
+    client.admit_agent_evaluation_run(spec)
+    client.get_agent_evaluation_run("aer-1")
+
+    assert client.calls == [
+        ("POST", "/api/v1/agent-evaluations/runs", spec),
+        ("GET", "/api/v1/agent-evaluations/runs/aer-1", None),
+    ]
+
+
 def test_get_source_schedule_uses_source_schedule_endpoint():
     client = _RecordingClient({"enabled": True, "interval_minutes": 60})
 
