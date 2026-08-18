@@ -307,6 +307,27 @@ def resolve_request_workspace_role(request: Request) -> str:
     return normalize_workspace_role(resolver(request))
 
 
+async def _run_embedded_service_workers(
+    sync_worker: SourceSyncWorker,
+    evaluation_worker: object | None,
+    *,
+    poll_seconds: float,
+) -> None:
+    """Prioritize source lifecycle work, then claim at most one offline run."""
+
+    interval = max(0.1, poll_seconds)
+    while True:
+        source_run = await sync_worker.run_once()
+        if source_run is not None:
+            await sync_worker.process_bounded_maintenance_once()
+            await asyncio.sleep(0)
+            continue
+        execution = None
+        if evaluation_worker is not None:
+            execution = await evaluation_worker.run_once()
+        await asyncio.sleep(0 if execution is not None else interval)
+
+
 def _source_management_forbidden() -> HTTPException:
     return HTTPException(
         status_code=403,
@@ -1619,6 +1640,20 @@ class MemoryReviewDecisionRequest(BaseModel):
 
     expected_fingerprint: str = Field(min_length=1)
     note: str | None = None
+
+
+class AgentEvaluationRunCreateRequest(BaseModel):
+    """Pinned inputs for admitting one durable offline evaluation run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cohort_id: str = Field(min_length=1)
+    candidate_manifest: dict[str, object]
+    evaluator_suite: str = Field(min_length=1)
+    evaluator_version: str = Field(min_length=1)
+    replicate_count: int = Field(default=1, ge=1)
+    baseline_run_id: str | None = None
+    semantic_judge: dict[str, object] | None = None
 
 
 class MemoryReviewRefreshRequest(BaseModel):
@@ -3091,6 +3126,7 @@ def create_admin_app(
             app.state.sync_scheduler = SyncScheduler(app.state.db, app.state.sync_service)
             await app.state.sync_scheduler.start()
         app.state.sync_worker = None
+        app.state.evaluation_worker = None
         app.state.sync_worker_task = None
         if config.sync.worker_enabled:
             app.state.sync_worker = SourceSyncWorker(
@@ -3100,8 +3136,35 @@ def create_admin_app(
                 worker_id="embedded-admin-worker",
                 workspace_id=workspace_id,
             )
+            if config.agent_evaluation.worker_enabled:
+                from memforge.evals.offline_runtime import (
+                    build_offline_evaluation_for_run,
+                )
+                from memforge.evals.offline_worker import OfflineEvaluationWorker
+
+                async def evaluation_factory(run):
+                    return await build_offline_evaluation_for_run(
+                        app.state.db,
+                        config,
+                        runtime_provider,
+                        run,
+                    )
+
+                app.state.evaluation_worker = OfflineEvaluationWorker(
+                    app.state.db,
+                    evaluation_factory=evaluation_factory,
+                    worker_id="embedded-admin-evaluation-worker",
+                    lease_seconds=config.agent_evaluation.worker_lease_seconds,
+                )
             app.state.sync_worker_task = asyncio.create_task(
-                app.state.sync_worker.run_forever(poll_seconds=config.sync.worker_poll_seconds)
+                _run_embedded_service_workers(
+                    app.state.sync_worker,
+                    app.state.evaluation_worker,
+                    poll_seconds=min(
+                        config.sync.worker_poll_seconds,
+                        config.agent_evaluation.worker_poll_seconds,
+                    ),
+                )
             )
 
         try:
@@ -3136,6 +3199,7 @@ def create_admin_app(
         )
         app.state.sync_scheduler = SyncScheduler(db, app.state.sync_service) if config.sync.scheduler_enabled else None
         app.state.sync_worker = None
+        app.state.evaluation_worker = None
         app.state.sync_worker_task = None
     app.state.config = config
     app.state.workspace_id = workspace_id
@@ -3341,6 +3405,10 @@ def create_admin_app(
     entity_router = APIRouter(prefix="/api/v1/entities", tags=["entities"])
     gene_router = APIRouter(prefix="/api/v1/genes", tags=["genes"])
     source_router = APIRouter(prefix="/api/v1/sources", tags=["sources"])
+    evaluation_router = APIRouter(
+        prefix="/api/v1/agent-evaluations",
+        tags=["agent-evaluations"],
+    )
     source_list_router = APIRouter(prefix="/api/v1/source-list", tags=["sources"])
     agent_session_router = APIRouter(prefix="/api/v1/agent-sessions", tags=["agent-sessions"])
     hook_router = APIRouter(prefix="/api/v1/hooks", tags=["hooks"])
@@ -4551,6 +4619,78 @@ def create_admin_app(
                 for assessment in assessments[:50]
             ],
         }
+
+    @evaluation_router.post("/runs", status_code=202)
+    async def admit_agent_evaluation_run(
+        body: AgentEvaluationRunCreateRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Admit one idempotent run; execution remains worker-owned."""
+
+        from memforge.evals.offline_evaluation import (
+            OfflineAgentEvaluation,
+            SemanticJudgeSpec,
+            agent_evaluation_run_execution_to_payload,
+            agent_evaluation_run_to_payload,
+        )
+
+        try:
+            semantic_judge = (
+                SemanticJudgeSpec.from_manifest(body.semantic_judge)
+                if body.semantic_judge is not None
+                else None
+            )
+            run, execution = await OfflineAgentEvaluation(db, executors={}).admit_run(
+                cohort_id=body.cohort_id,
+                candidate_manifest=body.candidate_manifest,
+                evaluator_suite=body.evaluator_suite,
+                evaluator_version=body.evaluator_version,
+                created_by=resolve_request_principal(request),
+                semantic_judge_spec=semantic_judge,
+                replicate_count=body.replicate_count,
+                baseline_run_id=body.baseline_run_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "run": agent_evaluation_run_to_payload(run),
+            "execution": (
+                agent_evaluation_run_execution_to_payload(execution)
+                if execution is not None
+                else None
+            ),
+        }
+
+    @evaluation_router.get("/runs/{run_id}")
+    async def get_agent_evaluation_run(
+        run_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Return one authorized, content-free run status and report."""
+
+        from memforge.evals.offline_evaluation import (
+            OfflineAgentEvaluation,
+            agent_evaluation_report_public_payload,
+        )
+
+        evaluation = OfflineAgentEvaluation(db, executors={})
+        try:
+            report = await evaluation.read_report(
+                run_id,
+                requesting_user_id=resolve_request_principal(request),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        execution = await db.get_agent_evaluation_run_execution(run_id)
+        return agent_evaluation_report_public_payload(report, execution)
 
     @source_router.get("/{source_id}/memory-lifecycle")
     async def get_source_memory_lifecycle(
@@ -8311,6 +8451,7 @@ def create_admin_app(
     app.include_router(entity_router)
     app.include_router(gene_router)
     app.include_router(source_router)
+    app.include_router(evaluation_router)
     app.include_router(source_list_router)
     app.include_router(agent_session_router)
     app.include_router(hook_router)

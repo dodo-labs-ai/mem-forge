@@ -517,6 +517,23 @@ class ToolClient:
         """List search-eligible sources for MCP/source-id discovery."""
         return self._resource_json("GET", "/sources/searchable", None)
 
+    def admit_agent_evaluation_run(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Submit one pinned offline evaluation spec to the service."""
+
+        return self._resource_json("POST", "/agent-evaluations/runs", spec)
+
+    def get_agent_evaluation_run(self, run_id: str) -> dict[str, Any]:
+        """Read one authorized content-free evaluation report."""
+
+        run_id = run_id.strip()
+        if not run_id:
+            return {"error": "run_id is required"}
+        return self._resource_json(
+            "GET",
+            f"/agent-evaluations/runs/{quote(run_id, safe='')}",
+            None,
+        )
+
     def get_source_projection_inventory(
         self,
         source_id: str,

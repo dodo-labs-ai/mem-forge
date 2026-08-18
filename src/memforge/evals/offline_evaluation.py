@@ -20,11 +20,16 @@ from memforge.evals.agent_evaluation import (
     AgentAssessment,
     AgentAssessmentConfidence,
     AgentAssessmentLabel,
+    assessment_public_payload,
 )
 from memforge.models import Memory, MemoryExtractionResult, RawMemory, ReconcileOperation
 from memforge.pipeline.reconciler import ReconciliationResult, reconcile_memories
+from memforge.pipeline.memory_extractor import MemoryExtractor
+from memforge.pipeline.projection_context import ProjectionExtractionBatch
 from memforge.source_derivation import (
+    DiffGuidedExtractionBatch,
     SourceDerivationBatch,
+    StructuralExtractionBatch,
     SourceUnitDerivationRequest,
     memory_extraction_output_payload,
     replay_source_unit_derivation,
@@ -77,10 +82,21 @@ class AgentEvaluationRunStatus(str, Enum):
     FAILED = "failed"
 
 
+class AgentEvaluationExecutionState(str, Enum):
+    QUEUED = "queued"
+    LEASED = "leased"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class AgentEvaluationResultStatus(str, Enum):
     COMPLETED = "completed"
     ERROR = "error"
     ARTIFACT_UNAVAILABLE = "artifact_unavailable"
+
+
+class OfflineArtifactUnavailable(RuntimeError):
+    """A revision-pinned input required by replay cannot be resolved."""
 
 
 class AgentEvaluationContentProfile(str, Enum):
@@ -147,6 +163,21 @@ class SemanticJudgeSpec:
             "output_schema_version": self.output_schema_version,
             "content_policy_id": self.content_policy_id,
         }
+
+    @classmethod
+    def from_manifest(cls, manifest: Mapping[str, object]) -> SemanticJudgeSpec:
+        return cls(
+            criterion=str(manifest["criterion"]),
+            evaluator_name=str(manifest["evaluator_name"]),
+            evaluator_version=str(manifest["evaluator_version"]),
+            prompt_hash=str(manifest["prompt_hash"]),
+            provider=str(manifest["provider"]),
+            model=str(manifest["model"]),
+            model_parameters=_mapping(manifest, "model_parameters"),
+            input_mapping_version=str(manifest["input_mapping_version"]),
+            output_schema_version=str(manifest["output_schema_version"]),
+            content_policy_id=str(manifest["content_policy_id"]),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +320,21 @@ class AgentEvaluationRun:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentEvaluationRunExecution:
+    """Durable worker ownership metadata for one Agent Evaluation Run."""
+
+    run_id: str
+    state: AgentEvaluationExecutionState
+    created_at: str
+    updated_at: str
+    worker_id: str | None = None
+    lease_token: str | None = None
+    lease_expires_at: str | None = None
+    attempt_count: int = 0
+    schema_version: str = OFFLINE_EVALUATION_SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
 class DeterministicCheck:
     criterion: str
     label: DeterministicCheckLabel
@@ -368,6 +414,37 @@ class OfflineEvaluationStore(Protocol):
     ) -> AgentEvaluationCohort | None: ...
     async def record_agent_evaluation_run(self, run: AgentEvaluationRun) -> None: ...
     async def get_agent_evaluation_run(self, run_id: str) -> AgentEvaluationRun | None: ...
+    async def admit_agent_evaluation_run(
+        self,
+        run: AgentEvaluationRun,
+        execution: AgentEvaluationRunExecution,
+    ) -> None: ...
+    async def get_agent_evaluation_run_execution(
+        self,
+        run_id: str,
+    ) -> AgentEvaluationRunExecution | None: ...
+    async def claim_agent_evaluation_run(
+        self,
+        *,
+        worker_id: str,
+        now: str,
+        lease_expires_at: str,
+    ) -> AgentEvaluationRunExecution | None: ...
+    async def heartbeat_agent_evaluation_run(
+        self,
+        *,
+        run_id: str,
+        lease_token: str,
+        now: str,
+        lease_expires_at: str,
+    ) -> bool: ...
+    async def finish_agent_evaluation_run(
+        self,
+        run: AgentEvaluationRun,
+        *,
+        lease_token: str,
+        finished_at: str,
+    ) -> bool: ...
     async def record_agent_evaluation_result(
         self,
         result: AgentEvaluationResult,
@@ -493,6 +570,61 @@ class SourceUnitDerivationReplayExecutor:
             "extraction": memory_extraction_output_payload(result),
             "error_type": result.error_type,
         }
+
+
+class ProductionSourceUnitDerivationReplayExecutor:
+    """Run the production extraction prompts against one immutable case."""
+
+    def __init__(self, structured_llm_client: object) -> None:
+        self._structured_llm_client = structured_llm_client
+
+    async def execute(
+        self,
+        case: AgentEvaluationCase,
+        candidate_manifest: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        projection = source_projection_from_payload(_mapping(case.manifest, "projection"))
+        context = source_unit_derivation_context_from_payload(
+            _mapping(case.manifest, "context")
+        )
+        extractor = MemoryExtractor(
+            model=str(candidate_manifest["model"]),
+            structured_llm_client=self._structured_llm_client,
+        )
+
+        async def extract(
+            batch: SourceDerivationBatch,
+            _candidate_manifest: Mapping[str, object],
+        ) -> MemoryExtractionResult:
+            if isinstance(batch, DiffGuidedExtractionBatch):
+                return await extractor.extract_memory_changes(
+                    changed_hunks=batch.changed_hunks,
+                    updated_document=batch.updated_document,
+                    current_changed_ranges=context.current_changed_ranges,
+                    source_type=projection.source_type,
+                    doc_type=context.doc_type,
+                )
+            if isinstance(batch, StructuralExtractionBatch):
+                return await extractor.extract_unit_memories(
+                    batch.context,
+                    doc_type=context.doc_type,
+                )
+            if isinstance(batch, ProjectionExtractionBatch):
+                if batch.primary_image_bytes:
+                    raise OfflineArtifactUnavailable(
+                        "offline derivation requires pinned binary artifacts"
+                    )
+                return await extractor.extract_projection_batch_memories(
+                    batch,
+                    source_type=projection.source_type,
+                    doc_type=context.doc_type,
+                )
+            raise TypeError(f"unsupported derivation batch: {type(batch).__name__}")
+
+        return await SourceUnitDerivationReplayExecutor(extract).execute(
+            case,
+            candidate_manifest,
+        )
 
 
 class SourceUnitReconciliationReplayExecutor:
@@ -956,57 +1088,32 @@ class OfflineAgentEvaluation:
         replicate_count: int = 1,
         baseline_run_id: str | None = None,
         created_at: str | None = None,
+        execution_lease_token: str | None = None,
     ) -> AgentEvaluationRunReport:
+        cohort, run = await self._prepare_run(
+            cohort_id=cohort_id,
+            candidate_manifest=candidate_manifest,
+            evaluator_suite=evaluator_suite,
+            evaluator_version=evaluator_version,
+            created_by=created_by,
+            semantic_judge_spec=semantic_judge_spec,
+            replicate_count=replicate_count,
+            baseline_run_id=baseline_run_id,
+            created_at=created_at,
+            require_semantic_adapter=True,
+        )
+        existing = await self._store.get_agent_evaluation_run(run.run_id)
+        if existing is not None and existing.status is not AgentEvaluationRunStatus.RUNNING:
+            return await self.read_report(run.run_id, requesting_user_id=created_by)
+        execution = await self._store.get_agent_evaluation_run_execution(run.run_id)
+        if execution is not None and execution_lease_token is None:
+            raise RuntimeError("durably admitted evaluation run requires its worker lease")
+        await self._store.record_agent_evaluation_run(run)
+        candidate = run.candidate_manifest
+        candidate_hash = run.candidate_manifest_hash
+        run_id = run.run_id
         if replicate_count < 1:
             raise ValueError("replicate_count must be positive")
-        _validate_candidate_manifest(candidate_manifest)
-        cohort = await self._store.get_agent_evaluation_cohort(cohort_id)
-        if cohort is None:
-            raise KeyError(f"unknown evaluation cohort: {cohort_id}")
-        semantic_judge_manifest = None
-        if semantic_judge_spec is not None:
-            if self._semantic_judge is None:
-                raise ValueError("semantic judge spec requires an evaluator adapter")
-            if semantic_judge_spec.evaluator_version != evaluator_version:
-                raise ValueError("run and semantic judge evaluator versions must match")
-            await self._authorize_semantic_judge(
-                cohort=cohort,
-                spec=semantic_judge_spec,
-                actor_user_id=created_by,
-            )
-            semantic_judge_manifest = semantic_judge_spec.to_manifest()
-        candidate = _canonical_mapping(candidate_manifest)
-        candidate_hash = _hash(candidate)
-        run_id = _id(
-            "aer",
-            cohort.manifest_hash,
-            candidate_hash,
-            evaluator_suite,
-            evaluator_version,
-            _hash(semantic_judge_manifest) if semantic_judge_manifest is not None else "",
-            replicate_count,
-            baseline_run_id or "",
-        )
-        existing = await self._store.get_agent_evaluation_run(run_id)
-        if existing is not None and existing.status is not AgentEvaluationRunStatus.RUNNING:
-            return await self.read_report(run_id, requesting_user_id=created_by)
-        run = AgentEvaluationRun(
-            run_id=run_id,
-            cohort_id=cohort.cohort_id,
-            candidate_manifest=candidate,
-            candidate_manifest_hash=candidate_hash,
-            evaluator_suite=_required("evaluator_suite", evaluator_suite),
-            evaluator_version=_required("evaluator_version", evaluator_version),
-            replicate_count=replicate_count,
-            status=AgentEvaluationRunStatus.RUNNING,
-            created_by=_required("created_by", created_by),
-            created_at=(existing.created_at if existing is not None else created_at or _now()),
-            baseline_run_id=baseline_run_id,
-            semantic_judge_manifest=semantic_judge_manifest,
-        )
-        if existing is not None:
-            run = replace(run, created_by=existing.created_by)
-        await self._store.record_agent_evaluation_run(run)
         any_error = False
         for item in cohort.items:
             case = await self._require_case(item.case_id)
@@ -1067,6 +1174,29 @@ class OfflineAgentEvaluation:
                             reusable.result_id if reusable is not None else None
                         ),
                     )
+                except OfflineArtifactUnavailable as exc:
+                    any_error = True
+                    result = AgentEvaluationResult(
+                        result_id=result_id,
+                        run_id=run_id,
+                        case_id=case.case_id,
+                        ground_truth_revision_id=ground_truth.ground_truth_revision_id,
+                        replicate_ordinal=replicate_ordinal,
+                        candidate_output_key=candidate_output_key,
+                        status=AgentEvaluationResultStatus.ARTIFACT_UNAVAILABLE,
+                        output=None,
+                        output_hash=None,
+                        duration_ms=max(0, round((perf_counter() - started) * 1000)),
+                        created_at=_now(),
+                        error_code=type(exc).__name__,
+                    )
+                    checks = (
+                        DeterministicCheck(
+                            criterion="candidate_execution",
+                            label=DeterministicCheckLabel.UNKNOWN,
+                            reason_code="candidate_artifact_unavailable",
+                        ),
+                    )
                 except Exception as exc:  # evaluator boundary records unknown/error
                     any_error = True
                     result = AgentEvaluationResult(
@@ -1110,8 +1240,149 @@ class OfflineAgentEvaluation:
             ),
             completed_at=_now(),
         )
-        await self._store.record_agent_evaluation_run(completed)
+        if execution_lease_token is None:
+            await self._store.record_agent_evaluation_run(completed)
+        else:
+            finished = await self._store.finish_agent_evaluation_run(
+                completed,
+                lease_token=execution_lease_token,
+                finished_at=completed.completed_at or _now(),
+            )
+            if not finished:
+                raise RuntimeError("offline evaluation worker lease was lost")
         return await self.read_report(completed.run_id, requesting_user_id=created_by)
+
+    async def admit_run(
+        self,
+        *,
+        cohort_id: str,
+        candidate_manifest: Mapping[str, object],
+        evaluator_suite: str,
+        evaluator_version: str,
+        created_by: str,
+        semantic_judge_spec: SemanticJudgeSpec | None = None,
+        replicate_count: int = 1,
+        baseline_run_id: str | None = None,
+        created_at: str | None = None,
+    ) -> tuple[AgentEvaluationRun, AgentEvaluationRunExecution | None]:
+        _, run = await self._prepare_run(
+            cohort_id=cohort_id,
+            candidate_manifest=candidate_manifest,
+            evaluator_suite=evaluator_suite,
+            evaluator_version=evaluator_version,
+            created_by=created_by,
+            semantic_judge_spec=semantic_judge_spec,
+            replicate_count=replicate_count,
+            baseline_run_id=baseline_run_id,
+            created_at=created_at,
+            require_semantic_adapter=False,
+        )
+        existing_run = await self._store.get_agent_evaluation_run(run.run_id)
+        existing_execution = await self._store.get_agent_evaluation_run_execution(
+            run.run_id
+        )
+        if existing_run is not None:
+            if existing_execution is None and existing_run.status is AgentEvaluationRunStatus.RUNNING:
+                raise RuntimeError("evaluation run is already executing outside durable admission")
+            return existing_run, existing_execution
+        execution = AgentEvaluationRunExecution(
+            run_id=run.run_id,
+            state=AgentEvaluationExecutionState.QUEUED,
+            created_at=run.created_at,
+            updated_at=run.created_at,
+        )
+        await self._store.admit_agent_evaluation_run(run, execution)
+        return run, execution
+
+    async def execute_admitted_run(
+        self,
+        run_id: str,
+        *,
+        lease_token: str,
+    ) -> AgentEvaluationRunReport:
+        run = await self._store.get_agent_evaluation_run(run_id)
+        if run is None:
+            raise KeyError(f"unknown evaluation run: {run_id}")
+        semantic_judge_spec = (
+            SemanticJudgeSpec.from_manifest(run.semantic_judge_manifest)
+            if run.semantic_judge_manifest is not None
+            else None
+        )
+        return await self.execute_run(
+            cohort_id=run.cohort_id,
+            candidate_manifest=run.candidate_manifest,
+            evaluator_suite=run.evaluator_suite,
+            evaluator_version=run.evaluator_version,
+            created_by=run.created_by,
+            semantic_judge_spec=semantic_judge_spec,
+            replicate_count=run.replicate_count,
+            baseline_run_id=run.baseline_run_id,
+            created_at=run.created_at,
+            execution_lease_token=lease_token,
+        )
+
+    async def _prepare_run(
+        self,
+        *,
+        cohort_id: str,
+        candidate_manifest: Mapping[str, object],
+        evaluator_suite: str,
+        evaluator_version: str,
+        created_by: str,
+        semantic_judge_spec: SemanticJudgeSpec | None,
+        replicate_count: int,
+        baseline_run_id: str | None,
+        created_at: str | None,
+        require_semantic_adapter: bool,
+    ) -> tuple[AgentEvaluationCohort, AgentEvaluationRun]:
+        if replicate_count < 1:
+            raise ValueError("replicate_count must be positive")
+        _validate_candidate_manifest(candidate_manifest)
+        cohort = await self._store.get_agent_evaluation_cohort(cohort_id)
+        if cohort is None:
+            raise KeyError(f"unknown evaluation cohort: {cohort_id}")
+        semantic_judge_manifest = None
+        if semantic_judge_spec is not None:
+            if require_semantic_adapter and self._semantic_judge is None:
+                raise ValueError("semantic judge spec requires an evaluator adapter")
+            if semantic_judge_spec.evaluator_version != evaluator_version:
+                raise ValueError("run and semantic judge evaluator versions must match")
+            await self._authorize_semantic_judge(
+                cohort=cohort,
+                spec=semantic_judge_spec,
+                actor_user_id=created_by,
+            )
+            semantic_judge_manifest = semantic_judge_spec.to_manifest()
+        candidate = _canonical_mapping(candidate_manifest)
+        candidate_hash = _hash(candidate)
+        run_id = _id(
+            "aer",
+            cohort.manifest_hash,
+            candidate_hash,
+            evaluator_suite,
+            evaluator_version,
+            _hash(semantic_judge_manifest) if semantic_judge_manifest is not None else "",
+            replicate_count,
+            baseline_run_id or "",
+        )
+        existing = await self._store.get_agent_evaluation_run(run_id)
+        run = AgentEvaluationRun(
+            run_id=run_id,
+            cohort_id=cohort.cohort_id,
+            candidate_manifest=candidate,
+            candidate_manifest_hash=candidate_hash,
+            evaluator_suite=_required("evaluator_suite", evaluator_suite),
+            evaluator_version=_required("evaluator_version", evaluator_version),
+            replicate_count=replicate_count,
+            status=AgentEvaluationRunStatus.RUNNING,
+            created_by=_required("created_by", created_by),
+            created_at=(existing.created_at if existing is not None else created_at or _now()),
+            baseline_run_id=baseline_run_id,
+            semantic_judge_manifest=semantic_judge_manifest,
+        )
+        if existing is not None:
+            run = replace(run, created_by=existing.created_by, status=existing.status)
+        return cohort, run
 
     async def read_report(
         self,
@@ -1946,6 +2217,38 @@ def agent_evaluation_run_from_payload(payload: Mapping[str, object]) -> AgentEva
     )
 
 
+def agent_evaluation_run_execution_to_payload(
+    execution: AgentEvaluationRunExecution,
+) -> dict[str, object]:
+    return {
+        "run_id": execution.run_id,
+        "state": execution.state.value,
+        "created_at": execution.created_at,
+        "updated_at": execution.updated_at,
+        "worker_id": execution.worker_id,
+        "lease_token": execution.lease_token,
+        "lease_expires_at": execution.lease_expires_at,
+        "attempt_count": execution.attempt_count,
+        "schema_version": execution.schema_version,
+    }
+
+
+def agent_evaluation_run_execution_from_payload(
+    payload: Mapping[str, object],
+) -> AgentEvaluationRunExecution:
+    return AgentEvaluationRunExecution(
+        run_id=str(payload["run_id"]),
+        state=AgentEvaluationExecutionState(str(payload["state"])),
+        created_at=str(payload["created_at"]),
+        updated_at=str(payload["updated_at"]),
+        worker_id=_optional_str(payload.get("worker_id")),
+        lease_token=_optional_str(payload.get("lease_token")),
+        lease_expires_at=_optional_str(payload.get("lease_expires_at")),
+        attempt_count=int(payload.get("attempt_count") or 0),
+        schema_version=str(payload.get("schema_version") or OFFLINE_EVALUATION_SCHEMA_VERSION),
+    )
+
+
 def agent_evaluation_result_to_payload(
     result: AgentEvaluationResult,
 ) -> dict[str, object]:
@@ -1964,6 +2267,36 @@ def agent_evaluation_result_to_payload(
         "error_code": result.error_code,
         "reused_from_result_id": result.reused_from_result_id,
         "schema_version": result.schema_version,
+    }
+
+
+def agent_evaluation_report_public_payload(
+    report: AgentEvaluationRunReport,
+    execution: AgentEvaluationRunExecution | None,
+) -> dict[str, object]:
+    """Serialize one authorized report without protected case or output content."""
+
+    return {
+        "run": agent_evaluation_run_to_payload(report.run),
+        "execution": (
+            agent_evaluation_run_execution_to_payload(execution)
+            if execution is not None
+            else None
+        ),
+        "summary": {
+            "completed_result_count": report.completed_result_count,
+            "error_result_count": report.error_result_count,
+            "check_counts": dict(report.check_counts),
+            "population_summaries": {
+                population: dict(summary)
+                for population, summary in report.population_summaries.items()
+            },
+        },
+        "results": [agent_evaluation_result_to_payload(result) for result in report.results],
+        "assessments": [
+            dict(assessment_public_payload(assessment))
+            for assessment in report.assessments
+        ],
     }
 
 

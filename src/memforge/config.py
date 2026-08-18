@@ -110,6 +110,9 @@ class SyncConfig:
 class AgentEvaluationConfig:
     runtime_event_retention_days: int = 90
     runtime_event_purge_batch_size: int = 1000
+    worker_enabled: bool = True
+    worker_poll_seconds: float = 5.0
+    worker_lease_seconds: float = 120.0
 
 
 @dataclass
@@ -260,6 +263,27 @@ class AppConfig:
                     os.environ.get("MEMFORGE_AGENT_RUNTIME_EVENT_PURGE_BATCH_SIZE")
                     or self.agent_evaluation.runtime_event_purge_batch_size
                 ),
+            ),
+        )
+        if os.environ.get("MEMFORGE_AGENT_EVALUATION_WORKER_ENABLED") is not None:
+            self.agent_evaluation.worker_enabled = (
+                os.environ["MEMFORGE_AGENT_EVALUATION_WORKER_ENABLED"]
+                .strip()
+                .lower()
+                in {"1", "true", "yes", "on"}
+            )
+        self.agent_evaluation.worker_poll_seconds = max(
+            0.1,
+            float(
+                os.environ.get("MEMFORGE_AGENT_EVALUATION_WORKER_POLL_SECONDS")
+                or self.agent_evaluation.worker_poll_seconds
+            ),
+        )
+        self.agent_evaluation.worker_lease_seconds = max(
+            1.0,
+            float(
+                os.environ.get("MEMFORGE_AGENT_EVALUATION_WORKER_LEASE_SECONDS")
+                or self.agent_evaluation.worker_lease_seconds
             ),
         )
         self.server.jwt_secret = (
