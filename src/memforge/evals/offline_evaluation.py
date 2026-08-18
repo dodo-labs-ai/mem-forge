@@ -1197,7 +1197,6 @@ class OfflineAgentEvaluation:
         self,
         run_id: str,
         *,
-        content_policy_id: str,
         requesting_user_id: str,
     ) -> SemanticJudgeCalibrationReport:
         """Compare shadow decisions with accepted calibration labels in aggregate."""
@@ -1208,8 +1207,7 @@ class OfflineAgentEvaluation:
         manifest = run.semantic_judge_manifest
         if manifest is None:
             raise ValueError("evaluation run has no semantic judge")
-        if manifest.get("content_policy_id") != content_policy_id:
-            raise PermissionError("semantic calibration policy does not match the run")
+        content_policy_id = str(manifest["content_policy_id"])
         policy = await self._store.get_agent_evaluation_content_policy(content_policy_id)
         if (
             policy is None

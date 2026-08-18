@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -462,7 +463,6 @@ async def test_human_calibration_is_policy_gated_and_adjudication_preserves_labe
     )
     comparison = await evaluation.read_semantic_calibration_report(
         semantic_run.run.run_id,
-        content_policy_id=semantic_policy.content_policy_id,
         requesting_user_id="adjudicator-1",
     )
     assert comparison.comparison_count == 2
@@ -551,6 +551,16 @@ async def test_semantic_judge_is_shadowed_and_exact_assessment_is_reused(db) -> 
         "model": "fixed",
         "replay_harness_version": "1",
     }
+
+    with pytest.raises(PermissionError, match="recipient"):
+        await evaluation.execute_run(
+            cohort_id=cohort.cohort_id,
+            candidate_manifest=candidate_manifest,
+            evaluator_suite="semantic-shadow-wrong-recipient",
+            evaluator_version=judge_spec.evaluator_version,
+            semantic_judge_spec=replace(judge_spec, model="unapproved-model"),
+            created_by="reviewer-1",
+        )
 
     first = await evaluation.execute_run(
         cohort_id=cohort.cohort_id,
