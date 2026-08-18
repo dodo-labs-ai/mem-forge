@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -16,6 +17,10 @@ from memforge.evals.offline_evaluation import (
     AgentEvaluationRunStatus,
     OfflineAgentEvaluation,
     OfflineArtifactUnavailable,
+)
+from memforge.evals.external_annotation import (
+    ImportedAnnotation,
+    LangfuseAnnotationBinding,
 )
 from memforge.evals.offline_worker import OfflineEvaluationWorker
 from memforge.server.admin_api import create_admin_app
@@ -50,6 +55,44 @@ class _UnavailableExecutor:
         raise OfflineArtifactUnavailable("pinned artifact is unavailable")
 
 
+class _AnnotationAdapter:
+    def validate_binding(self, *, queue_id, reviewer_id, score_config_id):
+        return LangfuseAnnotationBinding(
+            project_ref="project-1",
+            queue_id=queue_id,
+            reviewer_id=reviewer_id,
+            score_config_id=score_config_id,
+            score_config_fingerprint="b" * 64,
+        )
+
+    def start_subject(self, task, protected):
+        assert protected.result_id == task.result_id
+        return SimpleNamespace(id="observation-1")
+
+    def finish_subject(self, subject):
+        assert subject.id == "observation-1"
+
+    def subject_exists(self, task):
+        return task.observation_id == "observation-1"
+
+    def find_queue_items(self, task):
+        del task
+        return []
+
+    def create_queue_item(self, task):
+        assert task.observation_id == "observation-1"
+        return SimpleNamespace(id="queue-item-1")
+
+    def read_completed_annotation(self, task):
+        assert task.queue_item_id == "queue-item-1"
+        return ImportedAnnotation(
+            score_id="score-1",
+            score_updated_at="2026-08-18T12:00:00+00:00",
+            score_fingerprint="c" * 64,
+            label="pass",
+        )
+
+
 @pytest.fixture
 async def db(tmp_path):
     database = Database(str(tmp_path / "offline-worker.db"))
@@ -66,7 +109,12 @@ async def db(tmp_path):
     await database.close()
 
 
-async def _admit_run(database, executor):
+async def _admit_run(
+    database,
+    executor,
+    *,
+    role: AgentEvaluationRole = AgentEvaluationRole.SENTINEL,
+):
     evaluation = OfflineAgentEvaluation(
         database,
         executors={AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION: executor},
@@ -101,7 +149,7 @@ async def _admit_run(database, executor):
                 case_id=case.case_id,
                 ground_truth_revision_id=truth.ground_truth_revision_id,
                 population=AgentEvaluationPopulation.FAILURE_REGRESSION,
-                role=AgentEvaluationRole.SENTINEL,
+                role=role,
                 group_key="unit-1",
             ),
         ),
@@ -261,3 +309,77 @@ async def test_run_api_is_idempotent_and_returns_content_free_status(db, tmp_pat
     assert payload["execution"]["state"] == "completed"
     assert payload["summary"]["completed_result_count"] == 1
     assert payload["results"][0]["output"] is None
+
+
+@pytest.mark.asyncio
+async def test_langfuse_annotation_api_round_trip_is_content_free(db, tmp_path) -> None:
+    evaluation, run, _ = await _admit_run(
+        db,
+        _Executor(),
+        role=AgentEvaluationRole.CALIBRATION,
+    )
+
+    async def factory(_run):
+        return evaluation
+
+    await OfflineEvaluationWorker(
+        db,
+        evaluation_factory=factory,
+        worker_id="worker-1",
+    ).run_once()
+    [result] = await db.list_agent_evaluation_results(run.run_id)
+    config = AppConfig(base_dir=tmp_path / "annotation-api")
+    config.sync.worker_enabled = False
+    app = create_admin_app(
+        db=db,
+        config=config,
+        principal_resolver=lambda _request: "owner-1",
+        workspace_role_resolver=lambda _request: "workspace_admin",
+        langfuse_annotation_adapter=_AnnotationAdapter(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        policy_response = await client.post(
+            "/api/v1/agent-evaluations/annotation-policies/langfuse",
+            json={
+                "source_id": "src-teams",
+                "policy_version": "reviewer-1-v1",
+                "queue_id": "queue-1",
+            },
+        )
+        assert policy_response.status_code == 200, policy_response.text
+        policy = policy_response.json()
+        exported_response = await client.post(
+            "/api/v1/agent-evaluations/annotations/langfuse/export",
+            json={
+                "result_id": result.result_id,
+                "content_policy_id": policy["content_policy_id"],
+                "criterion": "semantic_intent",
+                "rubric_version": "rubric-v1",
+                "provider_reviewer_id": "langfuse-user-1",
+                "queue_id": "queue-1",
+                "score_config_id": "score-config-1",
+            },
+        )
+        assert exported_response.status_code == 200, exported_response.text
+        exported = exported_response.json()
+        assert exported["state"] == "queued"
+        assert "case_manifest" not in exported
+        assert "candidate_output" not in exported
+
+        status = await client.get(
+            f"/api/v1/agent-evaluations/annotations/langfuse/{exported['task_id']}"
+        )
+        assert status.status_code == 200, status.text
+        assert status.json()["protected_payload_hash"] == exported["protected_payload_hash"]
+
+        imported_response = await client.post(
+            f"/api/v1/agent-evaluations/annotations/langfuse/{exported['task_id']}/import"
+        )
+        assert imported_response.status_code == 200, imported_response.text
+
+    imported = imported_response.json()
+    assert imported["state"] == "imported"
+    assessment = await db.get_agent_assessment(imported["assessment_id"])
+    assert assessment is not None
+    assert assessment.annotator_id == "langfuse:project-1:langfuse-user-1"

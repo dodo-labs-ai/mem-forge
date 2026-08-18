@@ -157,6 +157,8 @@ from memforge.evals.offline_evaluation import (
     AgentEvaluationRun,
     AgentEvaluationRunExecution,
     AgentEvaluationRunStatus,
+    ExternalAnnotationTask,
+    ExternalAnnotationTaskState,
     accepted_ground_truth_from_payload,
     accepted_ground_truth_to_payload,
     agent_evaluation_case_from_payload,
@@ -171,6 +173,10 @@ from memforge.evals.offline_evaluation import (
     agent_evaluation_run_execution_to_payload,
     agent_evaluation_run_from_payload,
     agent_evaluation_run_to_payload,
+    external_annotation_task_from_payload,
+    external_annotation_task_identity,
+    external_annotation_task_to_payload,
+    validate_external_annotation_task_transition,
 )
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
 from memforge.memory.review_decision import ReviewVectorTask
@@ -1819,6 +1825,30 @@ CREATE TABLE IF NOT EXISTS agent_evaluation_run_executions (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_evaluation_execution_claim
     ON agent_evaluation_run_executions(state, lease_expires_at, created_at, run_id);
+
+CREATE TABLE IF NOT EXISTS external_annotation_tasks (
+    task_id                    TEXT PRIMARY KEY,
+    result_id                  TEXT NOT NULL REFERENCES agent_evaluation_results(result_id) ON DELETE CASCADE,
+    content_policy_id          TEXT NOT NULL REFERENCES agent_evaluation_content_policies(content_policy_id),
+    provider                   TEXT NOT NULL,
+    provider_project_ref       TEXT NOT NULL,
+    queue_id                   TEXT NOT NULL,
+    observation_id             TEXT,
+    queue_item_id              TEXT,
+    provider_score_id          TEXT,
+    state                      TEXT NOT NULL CHECK (state IN (
+        'prepared', 'subject_prepared', 'subject_ready', 'queued', 'imported', 'conflict'
+    )),
+    lease_token                TEXT,
+    lease_expires_at           TEXT,
+    created_at                 TEXT NOT NULL,
+    updated_at                 TEXT NOT NULL,
+    payload_json               TEXT NOT NULL,
+    UNIQUE (provider, provider_project_ref, queue_id, observation_id),
+    UNIQUE (provider, provider_project_ref, provider_score_id)
+);
+CREATE INDEX IF NOT EXISTS idx_external_annotation_task_lease
+    ON external_annotation_tasks(state, lease_expires_at, created_at, task_id);
 
 CREATE TABLE IF NOT EXISTS agent_evaluation_results (
     result_id             TEXT PRIMARY KEY,
@@ -3734,6 +3764,40 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             """CREATE INDEX IF NOT EXISTS idx_agent_evaluation_execution_claim
                ON agent_evaluation_run_executions(
                    state, lease_expires_at, created_at, run_id
+               )""",
+        ],
+    ),
+    (
+        84,
+        "Add durable external human-annotation bridge",
+        [
+            """CREATE TABLE IF NOT EXISTS external_annotation_tasks (
+                task_id TEXT PRIMARY KEY,
+                result_id TEXT NOT NULL
+                    REFERENCES agent_evaluation_results(result_id) ON DELETE CASCADE,
+                content_policy_id TEXT NOT NULL
+                    REFERENCES agent_evaluation_content_policies(content_policy_id),
+                provider TEXT NOT NULL,
+                provider_project_ref TEXT NOT NULL,
+                queue_id TEXT NOT NULL,
+                observation_id TEXT,
+                queue_item_id TEXT,
+                provider_score_id TEXT,
+                state TEXT NOT NULL CHECK (state IN (
+                    'prepared', 'subject_prepared', 'subject_ready',
+                    'queued', 'imported', 'conflict'
+                )),
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                UNIQUE (provider, provider_project_ref, queue_id, observation_id),
+                UNIQUE (provider, provider_project_ref, provider_score_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_external_annotation_task_lease
+               ON external_annotation_tasks(
+                   state, lease_expires_at, created_at, task_id
                )""",
         ],
     ),
@@ -18464,6 +18528,213 @@ class Database:
             agent_evaluation_content_policy_from_payload(json.loads(row[0]["payload_json"]))
             if row
             else None
+        )
+
+    async def admit_external_annotation_task(
+        self,
+        task: ExternalAnnotationTask,
+    ) -> ExternalAnnotationTask:
+        payload = _canonical_json(external_annotation_task_to_payload(task))
+        async with self._write_lock:
+            try:
+                await self.db.execute(
+                    """INSERT OR IGNORE INTO external_annotation_tasks (
+                           task_id, result_id, content_policy_id, provider,
+                           provider_project_ref, queue_id, observation_id,
+                           queue_item_id, provider_score_id, state, lease_token,
+                           lease_expires_at, created_at, updated_at, payload_json
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    self._external_annotation_task_values(task, payload),
+                )
+                existing = await self._get_external_annotation_task_unlocked(task.task_id)
+                if existing is None:
+                    raise RuntimeError("external annotation task admission failed")
+                if external_annotation_task_identity(existing) != (
+                    external_annotation_task_identity(task)
+                ):
+                    raise ValueError("conflicting external annotation task identity")
+                await self.db.commit()
+                return existing
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def get_external_annotation_task(
+        self,
+        task_id: str,
+    ) -> ExternalAnnotationTask | None:
+        return await self._get_external_annotation_task_unlocked(task_id)
+
+    async def _get_external_annotation_task_unlocked(
+        self,
+        task_id: str,
+    ) -> ExternalAnnotationTask | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT payload_json FROM external_annotation_tasks WHERE task_id = ?",
+            (task_id,),
+        )
+        return (
+            external_annotation_task_from_payload(json.loads(rows[0]["payload_json"]))
+            if rows
+            else None
+        )
+
+    async def claim_external_annotation_task(
+        self,
+        *,
+        task_id: str,
+        lease_owner: str,
+        now: str,
+        lease_expires_at: str,
+    ) -> ExternalAnnotationTask | None:
+        if not lease_owner or lease_expires_at <= now:
+            raise ValueError("external annotation claim requires a future lease")
+        async with self._write_lock:
+            try:
+                current = await self._get_external_annotation_task_unlocked(task_id)
+                if current is None or current.state in {
+                    ExternalAnnotationTaskState.IMPORTED,
+                    ExternalAnnotationTaskState.CONFLICT,
+                }:
+                    await self.db.commit()
+                    return current
+                if current.lease_expires_at is not None and current.lease_expires_at > now:
+                    await self.db.commit()
+                    return None
+                claimed = replace(
+                    current,
+                    lease_owner=lease_owner,
+                    lease_token=uuid.uuid4().hex,
+                    lease_expires_at=lease_expires_at,
+                    updated_at=now,
+                )
+                changed = await self._update_external_annotation_task_unlocked(
+                    claimed,
+                    expected_lease_token=current.lease_token,
+                    expected_lease_expires_at=current.lease_expires_at,
+                )
+                if not changed:
+                    await self.db.rollback()
+                    return None
+                await self.db.commit()
+                return claimed
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def update_external_annotation_task(
+        self,
+        task: ExternalAnnotationTask,
+        *,
+        expected_lease_token: str,
+    ) -> bool:
+        async with self._write_lock:
+            try:
+                changed = await self._update_external_annotation_task_unlocked(
+                    task,
+                    expected_lease_token=expected_lease_token,
+                )
+                await self.db.commit()
+                return changed
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def record_external_annotation_import(
+        self,
+        task: ExternalAnnotationTask,
+        assessment: AgentAssessment,
+        *,
+        expected_lease_token: str,
+    ) -> bool:
+        if task.state is not ExternalAnnotationTaskState.IMPORTED:
+            raise ValueError("external annotation import requires imported task state")
+        if task.assessment_id != assessment.assessment_id:
+            raise ValueError("external annotation import assessment identity mismatch")
+        async with self._write_lock:
+            try:
+                current = await self._get_external_annotation_task_unlocked(task.task_id)
+                if current is not None and current.state is ExternalAnnotationTaskState.IMPORTED:
+                    await self.db.commit()
+                    return current.assessment_id == assessment.assessment_id
+                await self._insert_agent_assessments_unlocked((assessment,))
+                changed = await self._update_external_annotation_task_unlocked(
+                    task,
+                    expected_lease_token=expected_lease_token,
+                )
+                if not changed:
+                    raise ValueError("external annotation import lease is stale")
+                await self.db.commit()
+                return True
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def _update_external_annotation_task_unlocked(
+        self,
+        task: ExternalAnnotationTask,
+        *,
+        expected_lease_token: str | None,
+        expected_lease_expires_at: str | None = None,
+    ) -> bool:
+        current = await self._get_external_annotation_task_unlocked(task.task_id)
+        if current is None:
+            return False
+        if external_annotation_task_identity(current) != (
+            external_annotation_task_identity(task)
+        ):
+            raise ValueError("external annotation task identity is immutable")
+        validate_external_annotation_task_transition(current.state, task.state)
+        if current.lease_token != expected_lease_token:
+            return False
+        if (
+            expected_lease_expires_at is not None
+            and current.lease_expires_at != expected_lease_expires_at
+        ):
+            return False
+        payload = _canonical_json(external_annotation_task_to_payload(task))
+        cursor = await self.db.execute(
+            """UPDATE external_annotation_tasks SET
+                   observation_id = ?, queue_item_id = ?, provider_score_id = ?,
+                   state = ?, lease_token = ?, lease_expires_at = ?,
+                   updated_at = ?, payload_json = ?
+               WHERE task_id = ? AND lease_token IS ?""",
+            (
+                task.observation_id,
+                task.queue_item_id,
+                task.provider_score_id,
+                task.state.value,
+                task.lease_token,
+                task.lease_expires_at,
+                task.updated_at,
+                payload,
+                task.task_id,
+                expected_lease_token,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    @staticmethod
+    def _external_annotation_task_values(
+        task: ExternalAnnotationTask,
+        payload: str,
+    ) -> tuple[object, ...]:
+        return (
+            task.task_id,
+            task.result_id,
+            task.content_policy_id,
+            task.provider,
+            task.provider_project_ref,
+            task.queue_id,
+            task.observation_id,
+            task.queue_item_id,
+            task.provider_score_id,
+            task.state.value,
+            task.lease_token,
+            task.lease_expires_at,
+            task.created_at,
+            task.updated_at,
+            payload,
         )
 
     async def record_accepted_ground_truth_revision(

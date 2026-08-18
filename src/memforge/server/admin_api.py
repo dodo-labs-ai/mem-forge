@@ -1656,6 +1656,30 @@ class AgentEvaluationRunCreateRequest(BaseModel):
     semantic_judge: dict[str, object] | None = None
 
 
+class AgentEvaluationLangfusePolicyRequest(BaseModel):
+    """Authorize one Source for one preconfigured reviewer queue."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: str = Field(min_length=1)
+    policy_version: str = Field(min_length=1)
+    queue_id: str = Field(min_length=1)
+
+
+class AgentEvaluationLangfuseExportRequest(BaseModel):
+    """Create one blinded reviewer task in an approved Langfuse queue."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    result_id: str = Field(min_length=1)
+    content_policy_id: str = Field(min_length=1)
+    criterion: str = Field(min_length=1)
+    rubric_version: str = Field(min_length=1)
+    provider_reviewer_id: str = Field(min_length=1)
+    queue_id: str = Field(min_length=1)
+    score_config_id: str = Field(min_length=1)
+
+
 class MemoryReviewRefreshRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -3074,6 +3098,7 @@ def create_admin_app(
     document_store: DocumentArtifactStore | None = None,
     local_agent_lease_validator: Callable[[Request, str, str, int, str], Awaitable[bool]] | None = None,
     local_agent_job_enqueuer: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
+    langfuse_annotation_adapter: object | None = None,
     workspace_id: str = "local",
 ) -> FastAPI:
     """Create and configure the MemForge Admin API FastAPI application.
@@ -3115,6 +3140,7 @@ def create_admin_app(
         app.state.workspace_role_resolver = workspace_role_resolver
         app.state.local_agent_lease_validator = local_agent_lease_validator
         app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
+        app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
         app.state.sync_service = SyncService(
             app.state.db,
             config,
@@ -3180,6 +3206,13 @@ def create_admin_app(
             if app.state.sync_scheduler is not None:
                 await app.state.sync_scheduler.shutdown()
             await app.state.sync_service.shutdown()
+            annotation_adapter = getattr(
+                app.state,
+                "langfuse_annotation_adapter",
+                None,
+            )
+            if annotation_adapter is not None and hasattr(annotation_adapter, "shutdown"):
+                await asyncio.to_thread(annotation_adapter.shutdown)
             if owned_db is not None:
                 await owned_db.close()
 
@@ -3209,6 +3242,7 @@ def create_admin_app(
     app.state.workspace_role_resolver = workspace_role_resolver
     app.state.local_agent_lease_validator = local_agent_lease_validator
     app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
+    app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
 
     @app.middleware("http")
     async def resolve_workspace_context(request: Request, call_next):
@@ -4619,6 +4653,158 @@ def create_admin_app(
                 for assessment in assessments[:50]
             ],
         }
+
+    async def _require_evaluation_result_management(
+        result_id: str,
+        request: Request,
+        db: Database,
+    ) -> None:
+        result = await db.get_agent_evaluation_result(result_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Evaluation result not found")
+        case = await db.get_agent_evaluation_case(result.case_id)
+        if case is None:
+            raise HTTPException(status_code=404, detail="Evaluation case not found")
+        source = await db.get_source(case.source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+
+    def _langfuse_annotation_exchange(
+        request: Request,
+        db: Database,
+    ):
+        from memforge.evals.external_annotation import (
+            ExternalAnnotationExchange,
+            LangfuseAnnotationAdapter,
+        )
+        from memforge.evals.offline_evaluation import OfflineAgentEvaluation
+
+        adapter = getattr(request.app.state, "langfuse_annotation_adapter", None)
+        if adapter is None:
+            adapter = LangfuseAnnotationAdapter.from_env()
+            request.app.state.langfuse_annotation_adapter = adapter
+        return ExternalAnnotationExchange(
+            db,
+            OfflineAgentEvaluation(db, executors={}),
+            adapter,
+        )
+
+    @evaluation_router.post("/annotation-policies/langfuse")
+    async def approve_langfuse_annotation_policy(
+        body: AgentEvaluationLangfusePolicyRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Approve one exact Source-to-queue protected-content disclosure."""
+
+        from memforge.evals.offline_evaluation import (
+            OfflineAgentEvaluation,
+            agent_evaluation_content_policy_to_payload,
+        )
+
+        source = await db.get_source(body.source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        try:
+            policy = await OfflineAgentEvaluation(db, executors={}).approve_langfuse_human_calibration_content(
+                source_id=body.source_id,
+                policy_version=body.policy_version,
+                queue_id=body.queue_id,
+                approved_by=resolve_request_principal(request),
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return agent_evaluation_content_policy_to_payload(policy)
+
+    @evaluation_router.post("/annotations/langfuse/export")
+    async def export_langfuse_annotation(
+        body: AgentEvaluationLangfuseExportRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Export one blinded task while retaining content-free durable state."""
+
+        from memforge.evals.offline_evaluation import external_annotation_task_to_payload
+
+        await _require_evaluation_result_management(body.result_id, request, db)
+        principal = resolve_request_principal(request)
+        try:
+            task = await _langfuse_annotation_exchange(request, db).export(
+                result_id=body.result_id,
+                content_policy_id=body.content_policy_id,
+                criterion=body.criterion,
+                rubric_version=body.rubric_version,
+                actor_user_id=principal,
+                provider_reviewer_id=body.provider_reviewer_id,
+                queue_id=body.queue_id,
+                score_config_id=body.score_config_id,
+                lease_owner=f"api:{uuid.uuid4().hex}",
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            status = 409 if "leased" in str(exc) or "ambiguous" in str(exc) else 503
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Langfuse annotation export failed")
+            raise HTTPException(status_code=502, detail="Langfuse annotation export failed") from exc
+        return external_annotation_task_to_payload(task)
+
+    @evaluation_router.get("/annotations/langfuse/{task_id}")
+    async def get_langfuse_annotation_task(
+        task_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Return one authorized content-free annotation bridge record."""
+
+        from memforge.evals.offline_evaluation import external_annotation_task_to_payload
+
+        task = await db.get_external_annotation_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Annotation task not found")
+        await _require_evaluation_result_management(task.result_id, request, db)
+        return external_annotation_task_to_payload(task)
+
+    @evaluation_router.post("/annotations/langfuse/{task_id}/import")
+    async def import_langfuse_annotation(
+        task_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Import one completed reviewer Score as an immutable assessment."""
+
+        from memforge.evals.offline_evaluation import external_annotation_task_to_payload
+
+        task = await db.get_external_annotation_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Annotation task not found")
+        await _require_evaluation_result_management(task.result_id, request, db)
+        try:
+            imported = await _langfuse_annotation_exchange(request, db).import_completed(
+                task_id=task_id,
+                submitted_by=resolve_request_principal(request),
+                lease_owner=f"api:{uuid.uuid4().hex}",
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            status = 409 if "leased" in str(exc) else 503
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Langfuse annotation import failed")
+            raise HTTPException(status_code=502, detail="Langfuse annotation import failed") from exc
+        return external_annotation_task_to_payload(imported)
 
     @evaluation_router.post("/runs", status_code=202)
     async def admit_agent_evaluation_run(
