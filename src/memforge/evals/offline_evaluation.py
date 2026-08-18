@@ -1265,6 +1265,7 @@ class OfflineAgentEvaluation:
             if ground_truth is None:
                 unknown_count += 1
                 continue
+            comparable_label_found = False
             for assessment_id in ground_truth.supporting_assessment_ids:
                 human = await self._store.get_agent_assessment(assessment_id)
                 if (
@@ -1286,6 +1287,10 @@ class OfflineAgentEvaluation:
                     or labeled_result.output_hash != result.output_hash
                 ):
                     continue
+                comparable_label_found = True
+                if human.label == "needs_review":
+                    unknown_count += 1
+                    continue
                 comparison_count += 1
                 if human.label == judge.label:
                     agreement_count += 1
@@ -1293,6 +1298,8 @@ class OfflineAgentEvaluation:
                     disagreement_count += 1
                 key = f"human_{human.label}__judge_{judge.label}"
                 confusion_counts[key] = confusion_counts.get(key, 0) + 1
+            if not comparable_label_found:
+                unknown_count += 1
         return SemanticJudgeCalibrationReport(
             run_id=run.run_id,
             criterion=criterion,
