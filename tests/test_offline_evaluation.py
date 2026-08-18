@@ -582,6 +582,12 @@ async def test_semantic_judge_is_shadowed_and_exact_assessment_is_reused(db) -> 
     assert first_llm.reused_from_assessment_id is None
     assert first.check_counts == {"pass": 3, "fail": 0, "unknown": 0}
     assert judge.calls == 1
+    uncalibrated = await evaluation.read_semantic_calibration_report(
+        first.run.run_id,
+        requesting_user_id="reviewer-1",
+    )
+    assert uncalibrated.comparison_count == 0
+    assert uncalibrated.unknown_count == 1
 
     second = await evaluation.execute_run(
         cohort_id=cohort.cohort_id,
