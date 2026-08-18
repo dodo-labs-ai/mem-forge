@@ -534,6 +534,51 @@ class ToolClient:
             None,
         )
 
+    def approve_langfuse_annotation_policy(
+        self,
+        spec: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Approve one Source-to-queue annotation content policy."""
+
+        return self._resource_json(
+            "POST",
+            "/agent-evaluations/annotation-policies/langfuse",
+            spec,
+        )
+
+    def export_langfuse_annotation(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Create or resume one reviewer-specific Langfuse task."""
+
+        return self._resource_json(
+            "POST",
+            "/agent-evaluations/annotations/langfuse/export",
+            spec,
+        )
+
+    def get_langfuse_annotation_task(self, task_id: str) -> dict[str, Any]:
+        """Read one content-free external annotation task."""
+
+        task_id = task_id.strip()
+        if not task_id:
+            return {"error": "task_id is required"}
+        return self._resource_json(
+            "GET",
+            f"/agent-evaluations/annotations/langfuse/{quote(task_id, safe='')}",
+            None,
+        )
+
+    def import_langfuse_annotation(self, task_id: str) -> dict[str, Any]:
+        """Import one completed Langfuse human annotation."""
+
+        task_id = task_id.strip()
+        if not task_id:
+            return {"error": "task_id is required"}
+        return self._resource_json(
+            "POST",
+            f"/agent-evaluations/annotations/langfuse/{quote(task_id, safe='')}/import",
+            {},
+        )
+
     def get_source_projection_inventory(
         self,
         source_id: str,

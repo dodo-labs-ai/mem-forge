@@ -39,7 +39,7 @@ from memforge.source_projection import source_projection_from_payload
 
 
 OFFLINE_EVALUATION_SCHEMA_VERSION = "1"
-OFFLINE_CONTENT_POLICY_SCHEMA_VERSION = "1"
+OFFLINE_CONTENT_POLICY_SCHEMA_VERSION = "2"
 ACCEPTED_GROUND_TRUTH_SCHEMA_VERSION = "2"
 OFFLINE_DETERMINISTIC_EVALUATOR_VERSION = "1"
 SEMANTIC_JUDGE_INPUT_MAPPING_VERSION = "1"
@@ -95,6 +95,15 @@ class AgentEvaluationResultStatus(str, Enum):
     ARTIFACT_UNAVAILABLE = "artifact_unavailable"
 
 
+class ExternalAnnotationTaskState(str, Enum):
+    PREPARED = "prepared"
+    SUBJECT_PREPARED = "subject_prepared"
+    SUBJECT_READY = "subject_ready"
+    QUEUED = "queued"
+    IMPORTED = "imported"
+    CONFLICT = "conflict"
+
+
 class OfflineArtifactUnavailable(RuntimeError):
     """A revision-pinned input required by replay cannot be resolved."""
 
@@ -103,6 +112,7 @@ class AgentEvaluationContentProfile(str, Enum):
     """Fixed disclosure profiles; profiles expand only through a new version."""
 
     HUMAN_CALIBRATION = "human_calibration_v1"
+    LANGFUSE_HUMAN_CALIBRATION = "langfuse_human_calibration_v1"
     SEMANTIC_JUDGE_SHADOW = "semantic_judge_shadow_v1"
 
 
@@ -237,13 +247,34 @@ class AgentEvaluationContentPolicy:
     approved_at: str
     recipient_provider: str | None = None
     recipient_model: str | None = None
+    recipient_queue_id: str | None = None
     schema_version: str = OFFLINE_CONTENT_POLICY_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        recipients = (self.recipient_provider, self.recipient_model)
+        recipients = (
+            self.recipient_provider,
+            self.recipient_model,
+            self.recipient_queue_id,
+        )
         if self.profile is AgentEvaluationContentProfile.SEMANTIC_JUDGE_SHADOW:
-            if any(value is None or not value.strip() for value in recipients):
+            if (
+                self.recipient_provider is None
+                or not self.recipient_provider.strip()
+                or self.recipient_model is None
+                or not self.recipient_model.strip()
+                or self.recipient_queue_id is not None
+            ):
                 raise ValueError("semantic judge policy requires provider and model recipients")
+        elif self.profile is AgentEvaluationContentProfile.LANGFUSE_HUMAN_CALIBRATION:
+            if (
+                self.recipient_provider != "langfuse"
+                or self.recipient_model is not None
+                or self.recipient_queue_id is None
+                or not self.recipient_queue_id.strip()
+            ):
+                raise ValueError(
+                    "Langfuse calibration policy requires its provider and queue recipient"
+                )
         elif any(value is not None for value in recipients):
             raise ValueError("human calibration policy cannot name a model recipient")
 
@@ -258,6 +289,147 @@ class AgentEvaluationAnnotationTask:
     content_policy_id: str
     case_manifest: Mapping[str, object]
     candidate_output: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalAnnotationTask:
+    """Content-free durable bridge to one external human-review task."""
+
+    task_id: str
+    result_id: str
+    content_policy_id: str
+    criterion: str
+    rubric_version: str
+    reviewer_id: str
+    provider: str
+    provider_project_ref: str
+    provider_reviewer_id: str
+    queue_id: str
+    score_config_id: str
+    score_config_fingerprint: str
+    trace_id: str
+    protected_payload_hash: str
+    state: ExternalAnnotationTaskState
+    created_at: str
+    updated_at: str
+    observation_id: str | None = None
+    queue_item_id: str | None = None
+    lease_owner: str | None = None
+    lease_token: str | None = None
+    lease_expires_at: str | None = None
+    error_code: str | None = None
+    provider_score_id: str | None = None
+    provider_score_updated_at: str | None = None
+    provider_score_fingerprint: str | None = None
+    assessment_id: str | None = None
+    schema_version: str = "1"
+
+    def __post_init__(self) -> None:
+        for name in (
+            "task_id",
+            "result_id",
+            "content_policy_id",
+            "criterion",
+            "rubric_version",
+            "reviewer_id",
+            "provider",
+            "provider_project_ref",
+            "provider_reviewer_id",
+            "queue_id",
+            "score_config_id",
+        ):
+            _required(name, str(getattr(self, name)))
+        _require_hex_digest("score_config_fingerprint", self.score_config_fingerprint)
+        _require_hex_digest("protected_payload_hash", self.protected_payload_hash)
+        if len(self.trace_id) != 32 or any(
+            char not in "0123456789abcdef" for char in self.trace_id
+        ):
+            raise ValueError("trace_id must be 32 lowercase hexadecimal characters")
+        lease = (self.lease_owner, self.lease_token, self.lease_expires_at)
+        if any(value is None for value in lease) and any(value is not None for value in lease):
+            raise ValueError("external annotation lease fields must be set together")
+        if self.state is ExternalAnnotationTaskState.PREPARED:
+            if self.observation_id is not None or self.queue_item_id is not None:
+                raise ValueError("prepared annotation task cannot have provider objects")
+        elif self.observation_id is None:
+            raise ValueError("delivered annotation task requires an observation")
+        if self.state in {
+            ExternalAnnotationTaskState.QUEUED,
+            ExternalAnnotationTaskState.IMPORTED,
+        } and self.queue_item_id is None:
+            raise ValueError("queued annotation task requires a queue item")
+        if self.state is ExternalAnnotationTaskState.IMPORTED:
+            if any(
+                value is None
+                for value in (
+                    self.provider_score_id,
+                    self.provider_score_updated_at,
+                    self.provider_score_fingerprint,
+                    self.assessment_id,
+                )
+            ):
+                raise ValueError("imported annotation task requires score provenance")
+            if any(value is not None for value in lease):
+                raise ValueError("imported annotation task cannot remain leased")
+            _require_hex_digest(
+                "provider_score_fingerprint",
+                str(self.provider_score_fingerprint),
+            )
+        if self.state is ExternalAnnotationTaskState.CONFLICT:
+            if self.error_code is None or any(value is not None for value in lease):
+                raise ValueError("conflicted annotation task requires an error and no lease")
+
+
+def external_annotation_task_identity(
+    task: ExternalAnnotationTask,
+) -> tuple[object, ...]:
+    """Return the immutable identity shared by every storage adapter."""
+
+    return (
+        task.task_id,
+        task.result_id,
+        task.content_policy_id,
+        task.criterion,
+        task.rubric_version,
+        task.reviewer_id,
+        task.provider,
+        task.provider_project_ref,
+        task.provider_reviewer_id,
+        task.queue_id,
+        task.score_config_id,
+        task.score_config_fingerprint,
+        task.trace_id,
+        task.protected_payload_hash,
+    )
+
+
+def validate_external_annotation_task_transition(
+    current: ExternalAnnotationTaskState,
+    target: ExternalAnnotationTaskState,
+) -> None:
+    """Enforce the provider-neutral delivery state machine."""
+
+    allowed = {
+        ExternalAnnotationTaskState.PREPARED: {
+            ExternalAnnotationTaskState.SUBJECT_PREPARED,
+        },
+        ExternalAnnotationTaskState.SUBJECT_PREPARED: {
+            ExternalAnnotationTaskState.SUBJECT_READY,
+        },
+        ExternalAnnotationTaskState.SUBJECT_READY: {
+            ExternalAnnotationTaskState.QUEUED,
+            ExternalAnnotationTaskState.CONFLICT,
+        },
+        ExternalAnnotationTaskState.QUEUED: {
+            ExternalAnnotationTaskState.IMPORTED,
+        },
+        ExternalAnnotationTaskState.IMPORTED: set(),
+        ExternalAnnotationTaskState.CONFLICT: set(),
+    }
+    if target is not current and target not in allowed[current]:
+        raise ValueError(
+            f"invalid external annotation transition: {current.value} -> {target.value}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +574,33 @@ class OfflineEvaluationStore(Protocol):
     async def get_agent_evaluation_content_policy(
         self, content_policy_id: str
     ) -> AgentEvaluationContentPolicy | None: ...
+    async def admit_external_annotation_task(
+        self, task: ExternalAnnotationTask
+    ) -> ExternalAnnotationTask: ...
+    async def get_external_annotation_task(
+        self, task_id: str
+    ) -> ExternalAnnotationTask | None: ...
+    async def claim_external_annotation_task(
+        self,
+        *,
+        task_id: str,
+        lease_owner: str,
+        now: str,
+        lease_expires_at: str,
+    ) -> ExternalAnnotationTask | None: ...
+    async def update_external_annotation_task(
+        self,
+        task: ExternalAnnotationTask,
+        *,
+        expected_lease_token: str,
+    ) -> bool: ...
+    async def record_external_annotation_import(
+        self,
+        task: ExternalAnnotationTask,
+        assessment: AgentAssessment,
+        *,
+        expected_lease_token: str,
+    ) -> bool: ...
     async def record_accepted_ground_truth_revision(
         self, revision: AcceptedGroundTruthRevision
     ) -> None: ...
@@ -824,6 +1023,43 @@ class OfflineAgentEvaluation:
         await self._store.record_agent_evaluation_content_policy(policy)
         return policy
 
+    async def approve_langfuse_human_calibration_content(
+        self,
+        *,
+        source_id: str,
+        policy_version: str,
+        queue_id: str,
+        approved_by: str,
+        approved_at: str | None = None,
+    ) -> AgentEvaluationContentPolicy:
+        """Approve one Source for one exact Langfuse Annotation Queue."""
+
+        await self._store.authorize_agent_evaluation_source(source_id, approved_by)
+        version = _required("policy_version", policy_version)
+        queue_id = _required("queue_id", queue_id)
+        content_policy_id = _id(
+            "aep",
+            source_id,
+            AgentEvaluationContentProfile.LANGFUSE_HUMAN_CALIBRATION.value,
+            version,
+            queue_id,
+        )
+        existing = await self._store.get_agent_evaluation_content_policy(content_policy_id)
+        if existing is not None:
+            return existing
+        policy = AgentEvaluationContentPolicy(
+            content_policy_id=content_policy_id,
+            source_id=_required("source_id", source_id),
+            profile=AgentEvaluationContentProfile.LANGFUSE_HUMAN_CALIBRATION,
+            policy_version=version,
+            approved_by=_required("approved_by", approved_by),
+            approved_at=approved_at or _now(),
+            recipient_provider="langfuse",
+            recipient_queue_id=queue_id,
+        )
+        await self._store.record_agent_evaluation_content_policy(policy)
+        return policy
+
     async def prepare_human_annotation(
         self,
         *,
@@ -837,6 +1073,7 @@ class OfflineAgentEvaluation:
             result_id=result_id,
             content_policy_id=content_policy_id,
             reviewer_id=reviewer_id,
+            allowed_profiles=frozenset({AgentEvaluationContentProfile.HUMAN_CALIBRATION}),
         )
         if result.output is None:
             raise ValueError("human annotation requires a completed candidate output")
@@ -849,6 +1086,84 @@ class OfflineAgentEvaluation:
             candidate_output=_canonical_mapping(result.output),
         )
 
+    async def prepare_langfuse_annotation_task(
+        self,
+        *,
+        result_id: str,
+        content_policy_id: str,
+        criterion: str,
+        rubric_version: str,
+        reviewer_id: str,
+        actor_user_id: str,
+        provider_project_ref: str,
+        provider_reviewer_id: str,
+        queue_id: str,
+        score_config_id: str,
+        score_config_fingerprint: str,
+        prepared_at: str | None = None,
+    ) -> tuple[ExternalAnnotationTask, AgentEvaluationAnnotationTask]:
+        """Admit one reviewer-specific external task without exporting content."""
+
+        result, case, policy = await self._human_annotation_context(
+            result_id=result_id,
+            content_policy_id=content_policy_id,
+            reviewer_id=actor_user_id,
+            allowed_profiles=frozenset(
+                {AgentEvaluationContentProfile.LANGFUSE_HUMAN_CALIBRATION}
+            ),
+        )
+        if policy.recipient_queue_id != queue_id:
+            raise PermissionError("content policy does not authorize this annotation queue")
+        if result.output is None:
+            raise ValueError("human annotation requires a completed candidate output")
+        task_payload = {
+            "case_manifest": _canonical_mapping(case.manifest),
+            "candidate_output": _canonical_mapping(result.output),
+        }
+        task_id = _id(
+            "aet",
+            result.result_id,
+            policy.content_policy_id,
+            _required("criterion", criterion),
+            _required("rubric_version", rubric_version),
+            _required("reviewer_id", reviewer_id),
+        )
+        now = prepared_at or _now()
+        task = ExternalAnnotationTask(
+            task_id=task_id,
+            result_id=result.result_id,
+            content_policy_id=policy.content_policy_id,
+            criterion=criterion,
+            rubric_version=rubric_version,
+            reviewer_id=reviewer_id,
+            provider="langfuse",
+            provider_project_ref=_required(
+                "provider_project_ref", provider_project_ref
+            ),
+            provider_reviewer_id=_required(
+                "provider_reviewer_id", provider_reviewer_id
+            ),
+            queue_id=_required("queue_id", queue_id),
+            score_config_id=_required("score_config_id", score_config_id),
+            score_config_fingerprint=_required(
+                "score_config_fingerprint", score_config_fingerprint
+            ),
+            trace_id=_hash_text(f"memforge-external-annotation-v1:{task_id}")[:32],
+            protected_payload_hash=_hash(task_payload),
+            state=ExternalAnnotationTaskState.PREPARED,
+            created_at=now,
+            updated_at=now,
+        )
+        admitted = await self._store.admit_external_annotation_task(task)
+        return admitted, AgentEvaluationAnnotationTask(
+            result_id=result.result_id,
+            case_id=case.case_id,
+            case_kind=case.case_kind,
+            content_policy_id=policy.content_policy_id,
+            case_manifest=task_payload["case_manifest"],
+            candidate_output=task_payload["candidate_output"],
+        )
+
     async def record_human_annotation(
         self,
         *,
@@ -859,22 +1174,78 @@ class OfflineAgentEvaluation:
         reason_code: str,
         rubric_version: str,
         reviewer_id: str,
+        submitted_by: str | None = None,
+        external_provider: str | None = None,
+        external_annotation_id: str | None = None,
         created_at: str | None = None,
     ) -> AgentAssessment:
         """Append one immutable human judgment without exposing peer labels."""
 
+        assessment = await self.build_human_annotation(
+            result_id=result_id,
+            content_policy_id=content_policy_id,
+            criterion=criterion,
+            label=label,
+            reason_code=reason_code,
+            rubric_version=rubric_version,
+            reviewer_id=reviewer_id,
+            submitted_by=submitted_by,
+            external_provider=external_provider,
+            external_annotation_id=external_annotation_id,
+            created_at=created_at,
+        )
+        existing = await self._store.get_agent_assessment(assessment.assessment_id)
+        if existing is not None:
+            if existing != replace(assessment, created_at=existing.created_at):
+                raise ValueError("immutable human annotation collision")
+            return existing
+        await self._store.record_agent_assessments((assessment,))
+        return assessment
+
+    async def build_human_annotation(
+        self,
+        *,
+        result_id: str,
+        content_policy_id: str,
+        criterion: str,
+        label: AgentAssessmentLabel,
+        reason_code: str,
+        rubric_version: str,
+        reviewer_id: str,
+        submitted_by: str | None = None,
+        external_provider: str | None = None,
+        external_annotation_id: str | None = None,
+        created_at: str | None = None,
+    ) -> AgentAssessment:
+        """Validate and build one immutable human judgment without persisting it."""
+
         result, _case, policy = await self._human_annotation_context(
             result_id=result_id,
             content_policy_id=content_policy_id,
-            reviewer_id=reviewer_id,
+            reviewer_id=submitted_by or reviewer_id,
+            allowed_profiles=frozenset(
+                {
+                    AgentEvaluationContentProfile.HUMAN_CALIBRATION,
+                    AgentEvaluationContentProfile.LANGFUSE_HUMAN_CALIBRATION,
+                }
+            ),
         )
         criterion = _required("criterion", criterion)
         reason_code = _required("reason_code", reason_code)
         rubric_version = _required("rubric_version", rubric_version)
         reviewer_id = _required("reviewer_id", reviewer_id)
+        if (external_provider is None) != (external_annotation_id is None):
+            raise ValueError(
+                "external annotation provider and identifier must be supplied together"
+            )
+        if external_provider is not None:
+            external_provider = _required("external_provider", external_provider)
+            external_annotation_id = _required(
+                "external_annotation_id", external_annotation_id or ""
+            )
         if label not in {"pass", "fail", "needs_review"}:
             raise ValueError("human annotation label must be pass, fail, or needs_review")
-        assessment = AgentAssessment(
+        return AgentAssessment(
             assessment_id=_id(
                 "aas",
                 result.result_id,
@@ -882,8 +1253,8 @@ class OfflineAgentEvaluation:
                 "human",
                 reviewer_id,
                 rubric_version,
-                label,
-                reason_code,
+                external_provider or label,
+                external_annotation_id or reason_code,
                 policy.content_policy_id,
             ),
             target_event_id=None,
@@ -899,11 +1270,6 @@ class OfflineAgentEvaluation:
             content_policy_id=policy.content_policy_id,
             created_at=datetime.fromisoformat(created_at or _now()),
         )
-        existing = await self._store.get_agent_assessment(assessment.assessment_id)
-        if existing is not None:
-            return existing
-        await self._store.record_agent_assessments((assessment,))
-        return assessment
 
     async def adjudicate_ground_truth(
         self,
@@ -961,6 +1327,12 @@ class OfflineAgentEvaluation:
             result_id=target_result_id,
             content_policy_id=content_policy_id,
             reviewer_id=accepted_by,
+            allowed_profiles=frozenset(
+                {
+                    AgentEvaluationContentProfile.HUMAN_CALIBRATION,
+                    AgentEvaluationContentProfile.LANGFUSE_HUMAN_CALIBRATION,
+                }
+            ),
         )
         if target_case.case_id != case.case_id:
             raise ValueError("adjudication annotations do not belong to the requested case")
@@ -1718,6 +2090,7 @@ class OfflineAgentEvaluation:
         result_id: str,
         content_policy_id: str,
         reviewer_id: str,
+        allowed_profiles: frozenset[AgentEvaluationContentProfile],
     ) -> tuple[
         AgentEvaluationResult,
         AgentEvaluationCase,
@@ -1735,7 +2108,7 @@ class OfflineAgentEvaluation:
             raise PermissionError("protected evaluation content requires an approved policy")
         if (
             policy.source_id != case.source_id
-            or policy.profile is not AgentEvaluationContentProfile.HUMAN_CALIBRATION
+            or policy.profile not in allowed_profiles
         ):
             raise PermissionError("content policy does not authorize this evaluation result")
         run = await self._store.get_agent_evaluation_run(result.run_id)
@@ -2075,6 +2448,7 @@ def agent_evaluation_content_policy_to_payload(
         "approved_at": policy.approved_at,
         "recipient_provider": policy.recipient_provider,
         "recipient_model": policy.recipient_model,
+        "recipient_queue_id": policy.recipient_queue_id,
         "schema_version": policy.schema_version,
     }
 
@@ -2091,9 +2465,57 @@ def agent_evaluation_content_policy_from_payload(
         approved_at=str(payload["approved_at"]),
         recipient_provider=_optional_str(payload.get("recipient_provider")),
         recipient_model=_optional_str(payload.get("recipient_model")),
+        recipient_queue_id=_optional_str(payload.get("recipient_queue_id")),
         schema_version=str(
             payload.get("schema_version") or OFFLINE_CONTENT_POLICY_SCHEMA_VERSION
         ),
+    )
+
+
+def external_annotation_task_to_payload(
+    task: ExternalAnnotationTask,
+) -> dict[str, object]:
+    payload = {name: getattr(task, name) for name in task.__dataclass_fields__}
+    payload["state"] = task.state.value
+    return payload
+
+
+def external_annotation_task_from_payload(
+    payload: Mapping[str, object],
+) -> ExternalAnnotationTask:
+    return ExternalAnnotationTask(
+        task_id=str(payload["task_id"]),
+        result_id=str(payload["result_id"]),
+        content_policy_id=str(payload["content_policy_id"]),
+        criterion=str(payload["criterion"]),
+        rubric_version=str(payload["rubric_version"]),
+        reviewer_id=str(payload["reviewer_id"]),
+        provider=str(payload["provider"]),
+        provider_project_ref=str(payload["provider_project_ref"]),
+        provider_reviewer_id=str(payload["provider_reviewer_id"]),
+        queue_id=str(payload["queue_id"]),
+        score_config_id=str(payload["score_config_id"]),
+        score_config_fingerprint=str(payload["score_config_fingerprint"]),
+        trace_id=str(payload["trace_id"]),
+        protected_payload_hash=str(payload["protected_payload_hash"]),
+        state=ExternalAnnotationTaskState(str(payload["state"])),
+        created_at=str(payload["created_at"]),
+        updated_at=str(payload["updated_at"]),
+        observation_id=_optional_str(payload.get("observation_id")),
+        queue_item_id=_optional_str(payload.get("queue_item_id")),
+        lease_owner=_optional_str(payload.get("lease_owner")),
+        lease_token=_optional_str(payload.get("lease_token")),
+        lease_expires_at=_optional_str(payload.get("lease_expires_at")),
+        error_code=_optional_str(payload.get("error_code")),
+        provider_score_id=_optional_str(payload.get("provider_score_id")),
+        provider_score_updated_at=_optional_str(
+            payload.get("provider_score_updated_at")
+        ),
+        provider_score_fingerprint=_optional_str(
+            payload.get("provider_score_fingerprint")
+        ),
+        assessment_id=_optional_str(payload.get("assessment_id")),
+        schema_version=str(payload.get("schema_version") or "1"),
     )
 
 
@@ -2360,6 +2782,11 @@ def _required(name: str, value: str) -> str:
     if not value:
         raise ValueError(f"{name} is required")
     return value
+
+
+def _require_hex_digest(name: str, value: str) -> None:
+    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
 
 
 def _now() -> str:

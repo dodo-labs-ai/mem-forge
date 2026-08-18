@@ -847,6 +847,86 @@ def eval_offline_submit(ctx: click.Context, spec_path: Path) -> None:
     _emit_tool_payload(ctx, _tool_client(ctx).admit_agent_evaluation_run(payload))
 
 
+@eval_group.command("langfuse-policy-approve")
+@click.option("--source-id", required=True)
+@click.option("--policy-version", required=True)
+@click.option("--queue-id", required=True)
+@click.pass_context
+def eval_langfuse_policy_approve(
+    ctx: click.Context,
+    source_id: str,
+    policy_version: str,
+    queue_id: str,
+) -> None:
+    """Approve one Source for one preconfigured Langfuse reviewer queue."""
+
+    _emit_tool_payload(
+        ctx,
+        _tool_client(ctx).approve_langfuse_annotation_policy(
+            {
+                "source_id": source_id,
+                "policy_version": policy_version,
+                "queue_id": queue_id,
+            }
+        ),
+    )
+
+
+@eval_group.command("langfuse-annotation-export")
+@click.option("--result-id", required=True)
+@click.option("--content-policy-id", required=True)
+@click.option("--criterion", required=True)
+@click.option("--rubric-version", required=True)
+@click.option("--reviewer-id", "provider_reviewer_id", required=True)
+@click.option("--queue-id", required=True)
+@click.option("--score-config-id", required=True)
+@click.pass_context
+def eval_langfuse_annotation_export(
+    ctx: click.Context,
+    result_id: str,
+    content_policy_id: str,
+    criterion: str,
+    rubric_version: str,
+    provider_reviewer_id: str,
+    queue_id: str,
+    score_config_id: str,
+) -> None:
+    """Create or resume one blinded Langfuse reviewer task."""
+
+    _emit_tool_payload(
+        ctx,
+        _tool_client(ctx).export_langfuse_annotation(
+            {
+                "result_id": result_id,
+                "content_policy_id": content_policy_id,
+                "criterion": criterion,
+                "rubric_version": rubric_version,
+                "provider_reviewer_id": provider_reviewer_id,
+                "queue_id": queue_id,
+                "score_config_id": score_config_id,
+            }
+        ),
+    )
+
+
+@eval_group.command("langfuse-annotation-status")
+@click.option("--task-id", required=True)
+@click.pass_context
+def eval_langfuse_annotation_status(ctx: click.Context, task_id: str) -> None:
+    """Read one content-free Langfuse annotation task status."""
+
+    _emit_tool_payload(ctx, _tool_client(ctx).get_langfuse_annotation_task(task_id))
+
+
+@eval_group.command("langfuse-annotation-import")
+@click.option("--task-id", required=True)
+@click.pass_context
+def eval_langfuse_annotation_import(ctx: click.Context, task_id: str) -> None:
+    """Import one completed Langfuse annotation Score."""
+
+    _emit_tool_payload(ctx, _tool_client(ctx).import_langfuse_annotation(task_id))
+
+
 @eval_group.command("purge-runtime-events")
 @click.option("--before", "occurred_before", help="Exclusive RFC 3339 cutoff; defaults to configured retention.")
 @click.option("--limit", type=click.IntRange(1, 10_000), help="Bounded delete count.")

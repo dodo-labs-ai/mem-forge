@@ -85,6 +85,52 @@ def test_agent_evaluation_run_methods_use_service_execution_routes():
     ]
 
 
+def test_langfuse_annotation_methods_use_control_plane_routes():
+    client = _RecordingClient({"task_id": "aet-1"})
+    policy = {
+        "source_id": "src-1",
+        "policy_version": "review-v1",
+        "queue_id": "queue-1",
+    }
+    export = {
+        "result_id": "aeres-1",
+        "content_policy_id": "aep-1",
+        "criterion": "semantic_intent",
+        "rubric_version": "rubric-v1",
+        "provider_reviewer_id": "user-1",
+        "queue_id": "queue-1",
+        "score_config_id": "config-1",
+    }
+
+    client.approve_langfuse_annotation_policy(policy)
+    client.export_langfuse_annotation(export)
+    client.get_langfuse_annotation_task("aet-1")
+    client.import_langfuse_annotation("aet-1")
+
+    assert client.calls == [
+        (
+            "POST",
+            "/api/v1/agent-evaluations/annotation-policies/langfuse",
+            policy,
+        ),
+        (
+            "POST",
+            "/api/v1/agent-evaluations/annotations/langfuse/export",
+            export,
+        ),
+        (
+            "GET",
+            "/api/v1/agent-evaluations/annotations/langfuse/aet-1",
+            None,
+        ),
+        (
+            "POST",
+            "/api/v1/agent-evaluations/annotations/langfuse/aet-1/import",
+            {},
+        ),
+    ]
+
+
 def test_get_source_schedule_uses_source_schedule_endpoint():
     client = _RecordingClient({"enabled": True, "interval_minutes": 60})
 

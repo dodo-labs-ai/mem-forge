@@ -2,16 +2,23 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from memforge.evals.agent_evaluation import AgentAssessment
+from memforge.evals.external_annotation import (
+    ExternalAnnotationExchange,
+    ImportedAnnotation,
+    LangfuseAnnotationBinding,
+)
 from memforge.evals.offline_evaluation import (
     AgentEvaluationCase,
     AgentEvaluationCaseKind,
     AgentEvaluationCohortItem,
     AgentEvaluationPopulation,
     AgentEvaluationRole,
+    ExternalAnnotationTaskState,
     OfflineAgentEvaluation,
     SEMANTIC_JUDGE_PROMPT_HASH,
     SemanticJudgeDecision,
@@ -74,6 +81,48 @@ class _FixedSemanticJudge:
             label="pass",
             reason_code="criterion_satisfied",
             confidence="high",
+        )
+
+
+class _FixedAnnotationAdapter:
+    def __init__(self) -> None:
+        self.created_items = 0
+
+    def validate_binding(self, *, queue_id, reviewer_id, score_config_id):
+        return LangfuseAnnotationBinding(
+            project_ref="project-1",
+            queue_id=queue_id,
+            reviewer_id=reviewer_id,
+            score_config_id=score_config_id,
+            score_config_fingerprint="b" * 64,
+        )
+
+    def start_subject(self, task, protected):
+        assert protected.result_id == task.result_id
+        return SimpleNamespace(id="0123456789abcdef")
+
+    def finish_subject(self, subject):
+        assert subject.id == "0123456789abcdef"
+
+    def subject_exists(self, task):
+        return task.observation_id == "0123456789abcdef"
+
+    def find_queue_items(self, task):
+        del task
+        return []
+
+    def create_queue_item(self, task):
+        assert task.observation_id == "0123456789abcdef"
+        self.created_items += 1
+        return SimpleNamespace(id="queue-item-1")
+
+    def read_completed_annotation(self, task):
+        assert task.queue_item_id == "queue-item-1"
+        return ImportedAnnotation(
+            score_id="score-1",
+            score_updated_at="2026-08-18T10:03:00+00:00",
+            score_fingerprint="c" * 64,
+            label="pass",
         )
 
 
@@ -338,6 +387,104 @@ async def test_human_calibration_is_policy_gated_and_adjudication_preserves_labe
     assert task.candidate_output["operations"][0]["memory_id"] == "mem-calibration"
     assert not hasattr(task, "ground_truth")
 
+    langfuse_policy = await evaluation.approve_langfuse_human_calibration_content(
+        source_id=case.source_id,
+        policy_version="langfuse-reviewer-1-v1",
+        queue_id="queue-reviewer-1",
+        approved_by="reviewer-1",
+    )
+    external, protected = await evaluation.prepare_langfuse_annotation_task(
+        result_id=result.result_id,
+        content_policy_id=langfuse_policy.content_policy_id,
+        criterion="semantic_intent",
+        rubric_version="semantic-rubric-v1",
+        reviewer_id="reviewer-1",
+        actor_user_id="reviewer-1",
+        provider_project_ref="project-1",
+        provider_reviewer_id="langfuse-user-1",
+        queue_id="queue-reviewer-1",
+        score_config_id="config-1",
+        score_config_fingerprint="b" * 64,
+        prepared_at="2026-08-18T10:00:00+00:00",
+    )
+    assert external.state is ExternalAnnotationTaskState.PREPARED
+    assert protected.candidate_output == task.candidate_output
+    repeated_external, _ = await evaluation.prepare_langfuse_annotation_task(
+        result_id=result.result_id,
+        content_policy_id=langfuse_policy.content_policy_id,
+        criterion="semantic_intent",
+        rubric_version="semantic-rubric-v1",
+        reviewer_id="reviewer-1",
+        actor_user_id="reviewer-1",
+        provider_project_ref="project-1",
+        provider_reviewer_id="langfuse-user-1",
+        queue_id="queue-reviewer-1",
+        score_config_id="config-1",
+        score_config_fingerprint="b" * 64,
+        prepared_at="2026-08-18T10:00:00+00:00",
+    )
+    assert repeated_external == external
+    claimed = await db.claim_external_annotation_task(
+        task_id=external.task_id,
+        lease_owner="web-1",
+        now="2026-08-18T10:01:00+00:00",
+        lease_expires_at="2026-08-18T10:02:00+00:00",
+    )
+    assert claimed is not None and claimed.lease_token is not None
+    assert (
+        await db.claim_external_annotation_task(
+            task_id=external.task_id,
+            lease_owner="web-2",
+            now="2026-08-18T10:01:30+00:00",
+            lease_expires_at="2026-08-18T10:02:30+00:00",
+        )
+        is None
+    )
+    released = replace(
+        claimed,
+        lease_owner=None,
+        lease_token=None,
+        lease_expires_at=None,
+        updated_at="2026-08-18T10:01:10+00:00",
+    )
+    assert await db.update_external_annotation_task(
+        released,
+        expected_lease_token=claimed.lease_token,
+    )
+    adapter = _FixedAnnotationAdapter()
+    exchange = ExternalAnnotationExchange(db, evaluation, adapter)
+    queued = await exchange.export(
+        result_id=result.result_id,
+        content_policy_id=langfuse_policy.content_policy_id,
+        criterion="semantic_intent",
+        rubric_version="semantic-rubric-v1",
+        actor_user_id="reviewer-1",
+        provider_reviewer_id="langfuse-user-1",
+        queue_id="queue-reviewer-1",
+        score_config_id="config-1",
+        lease_owner="web-2",
+    )
+    assert queued.state is ExternalAnnotationTaskState.QUEUED
+    assert adapter.created_items == 1
+    imported = await exchange.import_completed(
+        task_id=queued.task_id,
+        submitted_by="reviewer-1",
+        lease_owner="web-3",
+    )
+    assert imported.state is ExternalAnnotationTaskState.IMPORTED
+    assert imported.assessment_id is not None
+    stored_assessment = await db.get_agent_assessment(imported.assessment_id)
+    assert stored_assessment is not None
+    assert stored_assessment.label == "pass"
+    assert stored_assessment.annotator_id == "langfuse:project-1:langfuse-user-1"
+    assert stored_assessment.reason_code == "langfuse_score:score-1"
+    repeated_import = await exchange.import_completed(
+        task_id=queued.task_id,
+        submitted_by="reviewer-1",
+        lease_owner="web-4",
+    )
+    assert repeated_import == imported
+
     first = await evaluation.record_human_annotation(
         result_id=result.result_id,
         content_policy_id=policy.content_policy_id,
@@ -405,6 +552,7 @@ async def test_human_calibration_is_policy_gated_and_adjudication_preserves_labe
         second.assessment_id,
     }
     assert {item.annotator_id for item in preserved if item.annotator_kind == "human"} == {
+        "langfuse:project-1:langfuse-user-1",
         "reviewer-1",
         "reviewer-2",
     }
