@@ -87,7 +87,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.55"
+SERVER_VERSION = "0.1.56"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Local project context is optional. MemForge uses negotiated request-scoped host context when "
@@ -269,6 +269,7 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {},
             "additionalProperties": False,
         },
+        "annotations": {"readOnlyHint": True},
     },
     {
         "name": "search",
@@ -617,17 +618,21 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "replace_memory",
+        "name": "propose_memory_correction",
         "description": (
-            "Replace a memory when conversation context shows a claim should be corrected, "
-            "narrowed, broadened, or superseded. Users need not name this tool. First fetch "
+            "Propose a correction when conversation context shows a Memory should be corrected, "
+            "narrowed, broadened, or superseded. The server applies the correction immediately "
+            "when the current principal owns the Memory or can manage its complete active Source "
+            "Support Set; otherwise it creates a Review for an authorized Source manager. Users "
+            "need not name this tool. First fetch "
             "the memory for hash/provenance, show a readable preview with old claim, new "
-            "claim, provenance/evidence, scope, and replacement reason, then get explicit "
+            "claim, provenance/evidence, effective scope, direct-apply-or-Review consequence, "
+            "and correction reason, then get explicit "
             "confirmation via request_user_input if available, else a concise text question. "
             "Generate replacement_content from the confirmed preview without unapproved semantic "
             "changes. Keep provenance, confirmation details, test/deploy notes, and "
             "why-the-tool-was-called out of replacement_content; put source details in "
-            "provenance. Never replace silently."
+            "provenance. Never propose or apply a correction silently."
         ),
         "inputSchema": {
             "type": "object",
@@ -670,6 +675,10 @@ TOOLS: list[dict[str, Any]] = [
             },
             "required": ["memory_id", "replacement_content", "provenance", "reason", "expected_content_hash"],
             "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": True,
         },
     },
     {
@@ -1050,7 +1059,7 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             target=call_context.target,
             workspace_id=workspace_id,
         )
-    if name == "replace_memory":
+    if name == "propose_memory_correction":
         try:
             memory_id = _required_string_arg(args, "memory_id")
             replacement_kind = str(args.get("replacement_kind") or "supersession").strip()
@@ -1067,7 +1076,7 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             return {"error": str(exc)}
         return _http_json(
             "POST",
-            f"/memories/{quote(memory_id, safe='')}/replace",
+            f"/memories/{quote(memory_id, safe='')}/corrections/propose",
             body,
             target=call_context.target,
             workspace_id=workspace_id,

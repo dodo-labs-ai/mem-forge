@@ -177,7 +177,7 @@ class ToolClient:
             },
         )
 
-    def replace_memory(
+    def propose_memory_correction(
         self,
         memory_id: str,
         *,
@@ -199,7 +199,7 @@ class ToolClient:
         }
         return self._resource_json(
             "POST",
-            f"/memories/{quote(memory_id, safe='')}/replace",
+            f"/memories/{quote(memory_id, safe='')}/corrections/propose",
             body,
         )
 

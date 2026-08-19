@@ -45,7 +45,12 @@ class ReviewPresentation:
         return asdict(self)
 
 
-def present_memory_review(*, kind: str, reason: str | None) -> ReviewPresentation:
+def present_memory_review(
+    *,
+    kind: str,
+    reason: str | None,
+    source_backed_correction: bool = False,
+) -> ReviewPresentation:
     """Present a workbench Review without exposing its internal action names."""
 
     if kind == "cross_source_conflict":
@@ -84,15 +89,29 @@ def present_memory_review(*, kind: str, reason: str | None) -> ReviewPresentatio
         )
     return _presentation(
         decision_label="Updated",
-        summary="Use the proposed memory or keep the current one?",
+        summary=(
+            "Apply the proposed correction or keep the current source-backed memory?"
+            if source_backed_correction
+            else "Use the proposed memory or keep the current one?"
+        ),
         why_human=(
-            "The update would change active memory state, so MemForge needs your "
-            "decision before applying it."
+            "The correction would replace a Memory that still has active Source Support. "
+            "An authorized Source manager must decide whether that Support should stop "
+            "being current."
+            if source_backed_correction
+            else (
+                "The update would change active memory state, so MemForge needs your "
+                "decision before applying it."
+            )
         ),
         current_label="Current memory",
         proposed_label="Proposed memory",
         proposed_empty_text="The proposed memory snapshot is unavailable.",
-        use_latest_consequence=("Use the proposed state going forward and keep the previous state in audit history."),
+        use_latest_consequence=(
+            "Apply the correction, supersede the current Memory, and preserve its Source evidence in audit history."
+            if source_backed_correction
+            else "Use the proposed state going forward and keep the previous state in audit history."
+        ),
         technical_reason=reason,
     )
 

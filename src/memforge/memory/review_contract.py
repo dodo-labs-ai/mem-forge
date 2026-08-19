@@ -71,6 +71,7 @@ def validate_pending_review_retry(
         requested.reviewer,
         _normalized_review_time(requested.expected_incumbent_updated_at),
         _normalized_review_time(requested.expected_challenger_updated_at),
+        requested.expected_support_set_hash,
         requested.replacement_kind,
         _normalized_review_time(requested.resolved_at),
     )
@@ -84,6 +85,7 @@ def validate_pending_review_retry(
         existing.reviewer,
         _normalized_review_time(existing.expected_incumbent_updated_at),
         _normalized_review_time(existing.expected_challenger_updated_at),
+        existing.expected_support_set_hash,
         existing.replacement_kind,
         _normalized_review_time(existing.resolved_at),
     )

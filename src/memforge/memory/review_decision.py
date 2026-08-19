@@ -42,6 +42,7 @@ def memory_review_decision_fingerprint(
             "challenger_memory_id": review.challenger_memory_id,
             "expected_incumbent_updated_at": review.expected_incumbent_updated_at,
             "expected_challenger_updated_at": review.expected_challenger_updated_at,
+            "expected_support_set_hash": review.expected_support_set_hash,
             "replacement_kind": review.replacement_kind,
             "created_at": review.created_at.isoformat() if review.created_at else None,
             "related_challengers": [

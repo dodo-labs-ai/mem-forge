@@ -917,7 +917,7 @@ def test_packaged_plugin_version_is_consistent():
     import tomllib
 
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.55"
+    version = "0.1.56"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
@@ -2696,7 +2696,8 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "suggest_memory_replacement" not in tools
     assert "create_memory" in tools
     assert "retire_memory" in tools
-    assert "replace_memory" in tools
+    assert "propose_memory_correction" in tools
+    assert "replace_memory" not in tools
     assert "list_memory_reviews" in tools
     assert "get_memory_review" in tools
     assert "refresh_memory_review" not in tools
@@ -2812,23 +2813,27 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert retire_schema["required"] == ["memory_id", "reason", "expected_content_hash"]
     assert "status" not in retire_schema["properties"]
 
-    replace_schema = tools["replace_memory"]["inputSchema"]
-    assert replace_schema["required"] == [
+    correction_schema = tools["propose_memory_correction"]["inputSchema"]
+    assert correction_schema["required"] == [
         "memory_id",
         "replacement_content",
         "provenance",
         "reason",
         "expected_content_hash",
     ]
-    assert "provenance" in replace_schema["properties"]
-    assert "Do not put confirmation details" in replace_schema["properties"]["replacement_content"]["description"]
-    assert "provenance" in tools["replace_memory"]["description"]
+    assert "provenance" in correction_schema["properties"]
     assert (
-        "old claim, new claim, provenance/evidence, scope, and replacement reason"
-        in tools["replace_memory"]["description"]
+        "Do not put confirmation details"
+        in correction_schema["properties"]["replacement_content"]["description"]
     )
-    assert replace_schema["properties"]["replacement_kind"]["enum"] == ["revision", "supersession"]
-    assert "status" not in replace_schema["properties"]
+    assert "provenance" in tools["propose_memory_correction"]["description"]
+    assert "direct-apply-or-Review consequence" in tools["propose_memory_correction"]["description"]
+    assert tools["propose_memory_correction"]["annotations"] == {
+        "readOnlyHint": False,
+        "destructiveHint": True,
+    }
+    assert correction_schema["properties"]["replacement_kind"]["enum"] == ["revision", "supersession"]
+    assert "status" not in correction_schema["properties"]
 
     resolve_schema = tools["resolve_memory_review"]["inputSchema"]
     assert resolve_schema["properties"]["decision"]["enum"] == ["approve", "reject"]
@@ -3457,7 +3462,7 @@ def test_mcp_proxy_rejects_create_memory_without_provenance(monkeypatch):
     assert result == {"error": "provenance is required"}
 
 
-def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
+def test_mcp_proxy_forwards_propose_memory_correction_to_lifecycle_endpoint(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
     captured = {}
 
@@ -3485,7 +3490,7 @@ def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FakeOpener())
 
     result = proxy._call_tool(
-        "replace_memory",
+        "propose_memory_correction",
         {
             "memory_id": "mem-old",
             "replacement_content": "Use the new deployment route.",
@@ -3498,7 +3503,7 @@ def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
 
     assert result["replacement_memory_id"] == "mem-new"
     assert captured["method"] == "POST"
-    assert captured["url"] == "https://self.example/api/v1/memories/mem-old/replace"
+    assert captured["url"] == "https://self.example/api/v1/memories/mem-old/corrections/propose"
     assert json.loads(captured["body"].decode()) == {
         "replacement_content": "Use the new deployment route.",
         "provenance": "User corrected this while reviewing the deployment guide.",
@@ -3508,17 +3513,17 @@ def test_mcp_proxy_forwards_replace_memory_to_lifecycle_endpoint(monkeypatch):
     }
 
 
-def test_mcp_proxy_rejects_replace_memory_without_provenance(monkeypatch):
+def test_mcp_proxy_rejects_propose_memory_correction_without_provenance(monkeypatch):
     proxy = _load_plugin_mcp_proxy()
 
     class FailOpener:
         def open(self, *_args, **_kwargs):
-            raise AssertionError("replace_memory should fail before posting without provenance")
+            raise AssertionError("propose_memory_correction should fail before posting without provenance")
 
     monkeypatch.setattr(proxy, "build_opener", lambda *_handlers: FailOpener())
 
     result = proxy._call_tool(
-        "replace_memory",
+        "propose_memory_correction",
         {
             "memory_id": "mem-old",
             "replacement_content": "Use the new deployment route.",
