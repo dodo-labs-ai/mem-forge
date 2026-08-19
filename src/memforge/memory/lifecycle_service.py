@@ -9,17 +9,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Literal
 
 from memforge.agent_knowledge import AgentKnowledgeBundleService
+from memforge.memory.correction_authority import CorrectionAuthority
+from memforge.memory.review_decision import memory_review_decision_fingerprint
+from memforge.memory.review_service import ReviewService
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     DocumentRecord,
     Memory,
+    MemoryReview,
     MemoryType,
+    ReviewKind,
+    ReviewStatus,
     ReplacementKind,
     UNSORTED_PROJECT_KEY,
     Visibility,
     content_hash,
+    generate_deterministic_review_id,
     generate_memory_id,
 )
 from memforge.storage.database import Database
@@ -44,7 +52,7 @@ class RetireMemoryResult:
 
 
 @dataclass(frozen=True)
-class ReplaceMemoryResult:
+class _ReplaceOwnedMemoryResult:
     memory_id: str
     replacement_memory_id: str
     status: str
@@ -55,6 +63,16 @@ class ReplaceMemoryResult:
 class CreateMemoryResult:
     memory_id: str
     status: str
+
+
+@dataclass(frozen=True)
+class ProposeMemoryCorrectionResult:
+    memory_id: str
+    replacement_memory_id: str
+    outcome: Literal["applied", "review_created"]
+    status: str
+    replacement_kind: ReplacementKind
+    review_id: str
 
 
 class MemoryLifecycleService:
@@ -154,7 +172,7 @@ class MemoryLifecycleService:
             raise
         return RetireMemoryResult(memory_id=memory.id, status="retired")
 
-    async def replace_memory(
+    async def _replace_owned_memory(
         self,
         memory_id: str,
         *,
@@ -163,7 +181,7 @@ class MemoryLifecycleService:
         reason: str,
         expected_content_hash: str,
         replacement_kind: ReplacementKind = "supersession",
-    ) -> ReplaceMemoryResult:
+    ) -> _ReplaceOwnedMemoryResult:
         replacement_kind = self._validate_replacement_kind(replacement_kind)
         replacement_content = replacement_content.strip()
         if not replacement_content:
@@ -242,12 +260,203 @@ class MemoryLifecycleService:
                     ) from exc
                 raise
 
-        return ReplaceMemoryResult(
+        return _ReplaceOwnedMemoryResult(
             memory_id=old.id,
             replacement_memory_id=new_memory.id,
             status="superseded",
             replacement_kind=replacement_kind,
         )
+
+    async def propose_memory_correction(
+        self,
+        memory_id: str,
+        *,
+        replacement_content: str,
+        provenance: str,
+        reason: str,
+        expected_content_hash: str,
+        authority: CorrectionAuthority,
+        replacement_kind: ReplacementKind = "supersession",
+    ) -> ProposeMemoryCorrectionResult:
+        """Apply an authorized correction or stage it for an authorized reviewer.
+
+        Every ordinary correction first becomes a hidden challenger plus a
+        stale-guarded supersede Review.  A caller with authority over the full
+        active Support Set resolves that Review immediately; other visible
+        callers leave the same Review pending for a Source manager.  Managed
+        Capture claims keep using their projection-owned correction path.
+        """
+
+        replacement_kind = self._validate_replacement_kind(replacement_kind)
+        replacement_content = replacement_content.strip()
+        provenance = provenance.strip() if provenance else None
+        reason = reason.strip()
+        actor_user_id = authority.actor_user_id.strip()
+        if not replacement_content:
+            raise MemoryLifecycleConflict("replacement_content_required")
+        if not provenance:
+            raise MemoryLifecycleConflict("provenance_required")
+        if not reason:
+            raise MemoryLifecycleConflict("reason_required")
+        if not actor_user_id:
+            raise MemoryLifecycleConflict("actor_user_id_required")
+
+        old = await self._active_target(memory_id, expected_content_hash=expected_content_hash)
+        claim = await self.db.get_agent_claim_by_memory_id(old.id)
+        if claim is not None:
+            if old.owner_user_id != actor_user_id:
+                raise MemoryLifecycleNotFound("memory_not_found")
+            result = await self._replace_owned_memory(
+                old.id,
+                replacement_content=replacement_content,
+                provenance=provenance,
+                reason=reason,
+                expected_content_hash=expected_content_hash,
+                replacement_kind=replacement_kind,
+            )
+            return ProposeMemoryCorrectionResult(
+                memory_id=result.memory_id,
+                replacement_memory_id=result.replacement_memory_id,
+                outcome="applied",
+                status=result.status,
+                replacement_kind=result.replacement_kind,
+                review_id="",
+            )
+
+        support_evidence = await self.db.get_active_memory_support_evidence(old.id)
+        expected_support_set_hash = (
+            await self.db.get_memory_support_set_hash(old.id)
+            if support_evidence
+            else None
+        )
+        can_apply = await self._can_apply_correction(
+            old,
+            authority=authority,
+            supporting_source_ids=tuple(
+                dict.fromkeys(item.source_id for item in support_evidence)
+            ),
+        )
+        if not can_apply and not support_evidence:
+            raise MemoryLifecycleConflict(
+                "workspace_memory_correction_requires_management_authority"
+            )
+
+        now = datetime.now(timezone.utc)
+        challenger = Memory(
+            id=generate_memory_id(),
+            memory_type=old.memory_type,
+            content=replacement_content,
+            content_hash=content_hash(replacement_content),
+            visibility=old.visibility,
+            owner_user_id=old.owner_user_id,
+            project_key=old.project_key,
+            repo_identifier=old.repo_identifier,
+            confidence=old.confidence,
+            created_at=now,
+            updated_at=now,
+            status="pending_review",
+            extraction_context=provenance,
+        )
+        correction_doc_id = f"correction-{challenger.id}"
+        review = MemoryReview(
+            id=generate_deterministic_review_id(
+                kind=ReviewKind.SUPERSEDE.value,
+                incumbent_memory_id=old.id,
+                challenger_memory_id=challenger.id,
+                review_case="user_correction",
+            ),
+            kind=ReviewKind.SUPERSEDE.value,
+            status=ReviewStatus.PENDING.value,
+            incumbent_memory_id=old.id,
+            challenger_memory_id=challenger.id,
+            reason=reason,
+            expected_incumbent_updated_at=(old.updated_at.isoformat() if old.updated_at else None),
+            expected_challenger_updated_at=now.isoformat(),
+            expected_support_set_hash=expected_support_set_hash,
+            replacement_kind=replacement_kind,
+            created_at=now,
+        )
+        await self._write_correction_document(
+            doc_id=correction_doc_id,
+            old_memory=old,
+            replacement_content=replacement_content,
+            provenance=provenance,
+            reason=reason,
+            replacement_kind=replacement_kind,
+            observed_at=now,
+        )
+        try:
+            await self.memory_store.insert_memory(
+                challenger,
+                correction_doc_id,
+                "user_correction",
+                source_updated_at=now,
+                excerpt=provenance,
+                review=review,
+            )
+        except Exception:
+            await self.db.delete_document(correction_doc_id)
+            raise
+
+        if not can_apply:
+            return ProposeMemoryCorrectionResult(
+                memory_id=old.id,
+                replacement_memory_id=challenger.id,
+                outcome="review_created",
+                status="pending",
+                replacement_kind=replacement_kind,
+                review_id=review.id,
+            )
+
+        resolved = await ReviewService(
+            db=self.db,
+            memory_store=self.memory_store,
+        ).approve(
+            review.id,
+            reviewer=actor_user_id,
+            note=reason,
+            expected_fingerprint=memory_review_decision_fingerprint(review),
+        )
+        if resolved.review is None or resolved.review.status != ReviewStatus.APPROVED.value:
+            raise MemoryLifecycleConflict("memory_correction_not_applied")
+        return ProposeMemoryCorrectionResult(
+            memory_id=old.id,
+            replacement_memory_id=challenger.id,
+            outcome="applied",
+            status="superseded",
+            replacement_kind=replacement_kind,
+            review_id=review.id,
+        )
+
+    async def _can_apply_correction(
+        self,
+        memory: Memory,
+        *,
+        authority: CorrectionAuthority,
+        supporting_source_ids: tuple[str, ...],
+    ) -> bool:
+        if supporting_source_ids:
+            for source_id in supporting_source_ids:
+                source = await self.db.get_source(source_id)
+                if source is None:
+                    raise MemoryLifecycleConflict("source_backed_memory_lineage_incomplete")
+                if not authority.can_manage_source(source):
+                    return False
+            return True
+
+        sources = await self.db.get_memory_sources(memory.id)
+        configured_sources = [
+            source
+            for source in sources
+            if source.source_type not in {"user_memory", "user_correction"}
+        ]
+        if configured_sources:
+            raise MemoryLifecycleConflict("source_backed_memory_lineage_incomplete")
+        if memory.visibility == Visibility.PRIVATE.value:
+            if memory.owner_user_id != authority.actor_user_id:
+                raise MemoryLifecycleNotFound("memory_not_found")
+            return True
+        return authority.can_manage_workspace_memory()
 
     async def _active_target(self, memory_id: str, *, expected_content_hash: str) -> Memory:
         memory = await self.db.get_memory(memory_id)

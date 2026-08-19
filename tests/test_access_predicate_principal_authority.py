@@ -71,7 +71,7 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
             _memory("p-shared", "team meeting notes", visibility=WORKSPACE, owner=None),
         )
 
-        async def fake_build_search_engine(db, config, *, audit_logger=None):
+        async def fake_build_search_engine(_provider, db, config, *, audit_logger=None):
             from memforge.config import RetrievalConfig
             from memforge.retrieval.search import SearchEngine
             from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -99,13 +99,17 @@ async def test_request_body_user_id_is_not_access_authority(tmp_path, monkeypatc
                 vector=adapters.vector,
                 embed_cfg={},
                 config=RetrievalConfig(),
+                embedding_provider=lambda _query: [0.1, 0.1, 0.1],
             )
-            engine._get_or_compute_embedding = lambda query: [0.1, 0.1, 0.1]
             return engine
 
         from memforge import runtime as runtime_module
 
-        monkeypatch.setattr(runtime_module, "build_search_engine", fake_build_search_engine)
+        monkeypatch.setattr(
+            runtime_module.DefaultRuntimeProvider,
+            "build_search_engine",
+            fake_build_search_engine,
+        )
 
         app = create_admin_app(db=database, config=cfg)
         with TestClient(app) as client:

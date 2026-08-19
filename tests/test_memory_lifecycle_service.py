@@ -17,6 +17,8 @@ from memforge.memory.evidence import (
     MemorySupportAssertion,
 )
 from memforge.memory.lifecycle_service import MemoryLifecycleConflict, MemoryLifecycleService
+from memforge.memory.review_decision import memory_review_decision_fingerprint
+from memforge.memory.review_service import ReviewService, ReviewStaleConflict
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     ContentItem,
@@ -29,6 +31,7 @@ from memforge.models import (
 )
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.retrieval.search import SearchEngine
+from memforge.server.source_admin_service import can_manage_source
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -65,6 +68,26 @@ class RecordingCollection:
         if "documents" in include:
             result["documents"] = [self.records[record_id]["document"] for record_id in selected]
         return result
+
+
+class _TestCorrectionAuthority:
+    def __init__(self, actor_user_id: str, workspace_role: str) -> None:
+        self.actor_user_id = actor_user_id
+        self.workspace_role = workspace_role
+
+    def can_manage_source(self, source) -> bool:
+        return can_manage_source(
+            dict(source),
+            viewer_id=self.actor_user_id,
+            viewer_role=self.workspace_role,
+        )
+
+    def can_manage_workspace_memory(self) -> bool:
+        return self.workspace_role in {"owner", "workspace_admin"}
+
+
+def _authority(actor_user_id: str, workspace_role: str) -> _TestCorrectionAuthority:
+    return _TestCorrectionAuthority(actor_user_id, workspace_role)
 
 
 def _api_config(tmp_path) -> AppConfig:
@@ -110,6 +133,135 @@ def _store(db: Database, collection: RecordingCollection) -> MemoryStore:
 
     store._embed = fake_embed  # type: ignore[method-assign]
     return store
+
+
+async def _source_backed_memory(
+    db: Database,
+    *,
+    suffix: str,
+    source_owner: str = "source-owner",
+) -> Memory:
+    source_id = f"src-{suffix}"
+    doc_id = f"doc-{suffix}"
+    old = _memory(f"mem-{suffix}", f"The {suffix} source-backed rule is current.")
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name=f"Managed source {suffix}",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id=source_owner,
+    )
+    observed = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=doc_id,
+            source=source_id,
+            source_url=f"https://example.test/{doc_id}",
+            title=doc_id,
+            space_or_project="ENG",
+            author=None,
+            last_modified=observed,
+            labels=[],
+            version="1",
+            content_hash=f"{suffix}-doc-hash",
+            token_count=8,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=observed,
+        )
+    )
+    await db.insert_memory(old)
+    await db.add_memory_source(
+        old.id,
+        doc_id,
+        "confluence",
+        old.content,
+        source_updated_at=observed,
+    )
+    item = ContentItem(
+        item_id=doc_id,
+        title=doc_id,
+        source_url=f"https://example.test/{doc_id}",
+        last_modified=observed,
+        version="1",
+        extra={"page_id": suffix, "space_key": "ENG"},
+    )
+    projection = project_source_item(
+        source_id=source_id,
+        source_type="confluence",
+        run_id=f"projection-{suffix}",
+        item=item,
+        raw=RawContent(item=item, body=old.content.encode(), content_type="text/html"),
+        normalized=NormalizedContent(item=item, markdown_body=old.content),
+    )
+    await db.record_source_projection(projection)
+    observation = projection.observations[0]
+    observation_revision = projection.observation_revisions[0]
+    unit = EvidenceUnit(
+        id=f"eu-{suffix}",
+        source_id=source_id,
+        doc_id=doc_id,
+        doc_revision_id=projection.source_unit_revisions[0].id,
+        source_type="confluence",
+        source_anchor=observation.id,
+        source_lineage_id=projection.source_units[0].id,
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content=old.content,
+        excerpt=old.content,
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        access_context_hash="workspace-eng",
+    )
+    await db.upsert_evidence_unit(unit)
+    reference_id = f"eref-{suffix}"
+    await db.db.execute(
+        """INSERT INTO evidence_references (
+               id, evidence_unit_id, role, anchor_kind, observation_id,
+               observation_revision_id, fragment_id, range_start, range_end, created_at
+           ) VALUES (?, ?, 'primary', 'whole_observation', ?, ?, NULL, NULL, NULL, ?)""",
+        (
+            reference_id,
+            unit.id,
+            observation.id,
+            observation_revision.id,
+            observed.isoformat(),
+        ),
+    )
+    await db.db.commit()
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id=f"support-{suffix}",
+            memory_id=old.id,
+            evidence_reference_id=reference_id,
+            source_id=source_id,
+            access_context_hash="workspace-eng",
+        )
+    )
+    return old
+
+
+async def _move_source_support(db: Database, *, from_memory: Memory, to_memory: Memory) -> None:
+    sources = await db.get_memory_sources(from_memory.id)
+    for source in sources:
+        await db.add_memory_source(
+            to_memory.id,
+            source.doc_id,
+            source.source_type,
+            source.excerpt,
+            support_kind=source.support_kind,
+            source_updated_at=source.source_updated_at,
+        )
+    await db.db.execute(
+        "UPDATE memory_support_assertions SET memory_id = ? WHERE memory_id = ?",
+        (to_memory.id, from_memory.id),
+    )
+    await db.db.commit()
+    await db.purge_memory(from_memory.id)
 
 
 @pytest.mark.asyncio
@@ -183,88 +335,6 @@ async def test_retire_memory_uses_expected_hash_guard(db: Database):
     assert stored is not None
     assert stored.status == "retired"
     assert stored.retirement_reason == "User says this is stale"
-
-
-@pytest.mark.asyncio
-async def test_replace_document_memory_creates_correction_provenance_without_carrying_old_sources(db: Database):
-    old = _memory("mem-replace-tool-old", "Mount Tai defects use queue A")
-    await db.insert_memory(old)
-    await db.upsert_document(
-        DocumentRecord(
-            doc_id="doc-jira-old",
-            source="jira",
-            source_url="https://jira.example/browse/MT-1",
-            title="MT-1",
-            space_or_project="MT",
-            author=None,
-            last_modified=datetime(2026, 6, 20, tzinfo=timezone.utc),
-            labels=[],
-            version="1",
-            content_hash="doc-hash",
-            token_count=100,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
-            last_synced=datetime(2026, 6, 20, tzinfo=timezone.utc),
-        )
-    )
-    await db.add_memory_source(
-        old.id,
-        "doc-jira-old",
-        "jira",
-        "Original Jira excerpt",
-        source_updated_at=datetime(2026, 6, 20, tzinfo=timezone.utc),
-    )
-    collection = RecordingCollection()
-    store = _store(db, collection)
-    service = MemoryLifecycleService(db=db, memory_store=store)
-
-    result = await service.replace_memory(
-        old.id,
-        replacement_content="Mount Tai defects use queue B",
-        provenance="User corrected this after reviewing the Mount Tai defect triage board.",
-        reason="User corrected the queue.",
-        expected_content_hash=old.content_hash,
-        replacement_kind="revision",
-    )
-
-    stored_old = await db.get_memory(old.id)
-    stored_new = await db.get_memory(result.replacement_memory_id)
-    new_sources = await db.get_memory_sources(result.replacement_memory_id)
-    assert stored_old is not None
-    assert stored_old.status == "superseded"
-    assert stored_old.superseded_by == result.replacement_memory_id
-    assert stored_new is not None
-    assert stored_new.status == "active"
-    assert stored_new.content == "Mount Tai defects use queue B"
-    assert stored_new.extraction_context == "User corrected this after reviewing the Mount Tai defect triage board."
-    assert stored_new.visibility == old.visibility
-    assert stored_new.project_key == "UNSORTED"
-    assert [(source.doc_id, source.source_type) for source in new_sources] == [
-        (f"correction-{result.replacement_memory_id}", "user_correction")
-    ]
-    assert new_sources[0].excerpt == "User corrected this after reviewing the Mount Tai defect triage board."
-    assert new_sources[0].excerpt == stored_new.extraction_context
-
-
-@pytest.mark.asyncio
-async def test_replace_document_memory_without_provenance_fails_closed(db: Database):
-    old = _memory("mem-replace-tool-no-provenance", "Mount Tai defects use queue A")
-    await db.insert_memory(old)
-    collection = RecordingCollection()
-    store = _store(db, collection)
-    service = MemoryLifecycleService(db=db, memory_store=store)
-
-    with pytest.raises(MemoryLifecycleConflict, match="provenance_required"):
-        await service.replace_memory(
-            old.id,
-            replacement_content="Mount Tai defects use queue B",
-            provenance="",
-            reason="User corrected the queue.",
-            expected_content_hash=old.content_hash,
-            replacement_kind="revision",
-        )
 
 
 @pytest.mark.asyncio
@@ -381,20 +451,175 @@ async def test_user_lifecycle_cannot_bypass_active_projected_source_support(db: 
             reason="manual retirement",
             expected_content_hash=old.content_hash,
         )
-    with pytest.raises(
-        MemoryLifecycleConflict,
-        match="source_backed_memory_requires_lifecycle_review",
-    ):
-        await service.replace_memory(
-            old.id,
-            replacement_content="A user-authored replacement.",
-            provenance="Explicit user request.",
-            reason="manual replacement",
-            expected_content_hash=old.content_hash,
-        )
-
     assert (await db.get_memory(old.id)).status == "active"
     assert await db.count_documents("user_correction") == 0
+
+
+@pytest.mark.asyncio
+async def test_propose_memory_correction_applies_for_private_memory_owner(db: Database):
+    store = _store(db, RecordingCollection())
+    service = MemoryLifecycleService(db=db, memory_store=store)
+    created = await service.create_memory(
+        content="The original private claim.",
+        provenance="The user recorded the original claim.",
+        owner_user_id="alice",
+        client="codex",
+    )
+    old = await db.get_memory(created.memory_id)
+    assert old is not None
+
+    result = await service.propose_memory_correction(
+        old.id,
+        replacement_content="The corrected private claim.",
+        provenance="Alice supplied the correction.",
+        reason="Alice corrected her private memory.",
+        expected_content_hash=old.content_hash,
+        authority=_authority("alice", "member"),
+        replacement_kind="revision",
+    )
+
+    stored_old = await db.get_memory(old.id)
+    stored_new = await db.get_memory(result.replacement_memory_id)
+    review = await db.get_memory_review(result.review_id)
+    assert result.outcome == "applied"
+    assert stored_old is not None and stored_old.status == "superseded"
+    assert stored_new is not None and stored_new.status == "active"
+    assert stored_new.visibility == "private"
+    assert stored_new.owner_user_id == "alice"
+    assert review is not None and review.status == "approved"
+    assert review.expected_support_set_hash is None
+
+
+@pytest.mark.asyncio
+async def test_propose_memory_correction_applies_for_complete_source_authority(db: Database):
+    old = await _source_backed_memory(db, suffix="authorized", source_owner="alice")
+    service = MemoryLifecycleService(db=db, memory_store=_store(db, RecordingCollection()))
+    support_hash = await db.get_memory_support_set_hash(old.id)
+
+    result = await service.propose_memory_correction(
+        old.id,
+        replacement_content="The authorized corrected source-backed rule.",
+        provenance="The Source owner supplied the correction.",
+        reason="The Source owner corrected the rule.",
+        expected_content_hash=old.content_hash,
+        authority=_authority("alice", "member"),
+    )
+
+    stored_old = await db.get_memory(old.id)
+    stored_new = await db.get_memory(result.replacement_memory_id)
+    review = await db.get_memory_review(result.review_id)
+    assert result.outcome == "applied"
+    assert stored_old is not None and stored_old.status == "superseded"
+    assert stored_new is not None and stored_new.status == "active"
+    assert stored_new.visibility == "workspace"
+    assert stored_new.owner_user_id is None
+    assert await db.get_active_memory_support_reference_ids(old.id) == ()
+    assert review is not None and review.status == "approved"
+    assert review.expected_support_set_hash == support_hash
+    old_sources = await db.get_memory_sources(old.id)
+    assert any(source.source_type == "confluence" for source in old_sources)
+
+
+@pytest.mark.asyncio
+async def test_propose_memory_correction_creates_review_without_complete_source_authority(db: Database):
+    old = await _source_backed_memory(db, suffix="review", source_owner="source-owner")
+    service = MemoryLifecycleService(db=db, memory_store=_store(db, RecordingCollection()))
+    support_hash = await db.get_memory_support_set_hash(old.id)
+
+    result = await service.propose_memory_correction(
+        old.id,
+        replacement_content="The proposed corrected source-backed rule.",
+        provenance="A workspace member proposed the correction.",
+        reason="A workspace member reported a stale rule.",
+        expected_content_hash=old.content_hash,
+        authority=_authority("workspace-member", "member"),
+    )
+
+    stored_old = await db.get_memory(old.id)
+    stored_new = await db.get_memory(result.replacement_memory_id)
+    review = await db.get_memory_review(result.review_id)
+    assert result.outcome == "review_created"
+    assert result.status == "pending"
+    assert stored_old is not None and stored_old.status == "active"
+    assert stored_new is not None and stored_new.status == "pending_review"
+    assert await db.get_active_memory_support_reference_ids(old.id) == ("eref-review",)
+    assert review is not None and review.status == "pending"
+    assert review.expected_support_set_hash == support_hash
+
+
+@pytest.mark.asyncio
+async def test_propose_memory_correction_requires_authority_over_every_supporting_source(db: Database):
+    old = await _source_backed_memory(db, suffix="multi-a", source_owner="alice")
+    additional = await _source_backed_memory(db, suffix="multi-b", source_owner="bob")
+    await _move_source_support(db, from_memory=additional, to_memory=old)
+    service = MemoryLifecycleService(db=db, memory_store=_store(db, RecordingCollection()))
+
+    result = await service.propose_memory_correction(
+        old.id,
+        replacement_content="The proposed multi-source correction.",
+        provenance="Alice proposed a correction but cannot manage Bob's Source.",
+        reason="One Source owner proposed a multi-source correction.",
+        expected_content_hash=old.content_hash,
+        authority=_authority("alice", "member"),
+    )
+
+    assert result.outcome == "review_created"
+    assert set((await db.get_active_memory_support_states((old.id,)))[old.id].reference_ids) == {
+        "eref-multi-a",
+        "eref-multi-b",
+    }
+
+
+@pytest.mark.asyncio
+async def test_propose_memory_correction_self_hosted_owner_has_complete_workspace_authority(db: Database):
+    old = await _source_backed_memory(db, suffix="self-host-a", source_owner="alice")
+    additional = await _source_backed_memory(db, suffix="self-host-b", source_owner="bob")
+    await _move_source_support(db, from_memory=additional, to_memory=old)
+    service = MemoryLifecycleService(db=db, memory_store=_store(db, RecordingCollection()))
+
+    result = await service.propose_memory_correction(
+        old.id,
+        replacement_content="The self-hosted owner corrected the shared claim.",
+        provenance="The self-hosted owner supplied the correction.",
+        reason="The local owner corrected all local workspace Sources.",
+        expected_content_hash=old.content_hash,
+        authority=_authority("dev", "owner"),
+    )
+
+    assert result.outcome == "applied"
+    assert await db.get_active_memory_support_reference_ids(old.id) == ()
+
+
+@pytest.mark.asyncio
+async def test_correction_review_fails_stale_when_support_set_changes(db: Database):
+    old = await _source_backed_memory(db, suffix="stale-a", source_owner="source-owner")
+    store = _store(db, RecordingCollection())
+    service = MemoryLifecycleService(db=db, memory_store=store)
+    proposed = await service.propose_memory_correction(
+        old.id,
+        replacement_content="The proposed correction must be replanned.",
+        provenance="A member proposed a correction before another Source added Support.",
+        reason="The original proposal used an older Support Set.",
+        expected_content_hash=old.content_hash,
+        authority=_authority("workspace-member", "member"),
+    )
+    review = await db.get_memory_review(proposed.review_id)
+    assert review is not None
+    additional = await _source_backed_memory(db, suffix="stale-b", source_owner="other-owner")
+    await _move_source_support(db, from_memory=additional, to_memory=old)
+
+    with pytest.raises(ReviewStaleConflict):
+        await ReviewService(db=db, memory_store=store).approve(
+            review.id,
+            reviewer="workspace-admin",
+            note="Approve the old proposal",
+            expected_fingerprint=memory_review_decision_fingerprint(review),
+        )
+
+    stored_old = await db.get_memory(old.id)
+    stored_challenger = await db.get_memory(proposed.replacement_memory_id)
+    assert stored_old is not None and stored_old.status == "active"
+    assert stored_challenger is not None and stored_challenger.status == "pending_review"
 
 
 @pytest.mark.asyncio
@@ -443,12 +668,13 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     await db.enable_lifecycle_gate("src-agent-sessions-codex")
     service = MemoryLifecycleService(db=db, memory_store=store)
 
-    result = await service.replace_memory(
+    result = await service.propose_memory_correction(
         old.id,
         replacement_content="Invoke Claude Code with `claude`, not `claude-code`.",
         provenance="User corrected the command while reviewing Claude Code CLI usage.",
         reason="User corrected the command name.",
         expected_content_hash=old.content_hash,
+        authority=_authority("andrew.sun01@sap.com", "member"),
         replacement_kind="revision",
     )
 
@@ -723,7 +949,7 @@ async def test_retire_memory_route_audits_request_principal(db: Database, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_replace_memory_route_audits_request_principal(db: Database, tmp_path, monkeypatch):
+async def test_propose_memory_correction_route_audits_request_principal(db: Database, tmp_path, monkeypatch):
     from memforge.server.admin_api import create_admin_app
 
     async def fake_embed(self, _text: str) -> list[float]:
@@ -741,7 +967,7 @@ async def test_replace_memory_route_audits_request_principal(db: Database, tmp_p
 
     with TestClient(app) as client:
         response = client.post(
-            f"/api/v1/memories/{memory.id}/replace",
+            f"/api/v1/memories/{memory.id}/corrections/propose",
             json={
                 "replacement_content": "Route replacement corrected fact",
                 "provenance": "User supplied the corrected route in chat.",
@@ -750,8 +976,19 @@ async def test_replace_memory_route_audits_request_principal(db: Database, tmp_p
                 "replacement_kind": "supersession",
             },
         )
+        removed = client.post(
+            f"/api/v1/memories/{memory.id}/replace",
+            json={
+                "replacement_content": "Removed legacy route",
+                "provenance": "Legacy route must remain absent.",
+                "reason": "The correction contract is unified.",
+                "expected_content_hash": memory.content_hash,
+            },
+        )
 
     assert response.status_code == 200, response.text
+    assert response.json()["outcome"] == "applied"
+    assert removed.status_code == 404
     audit_rows = await db.list_memory_audit_events(
         memory_id=memory.id,
         event_type="memory_supersede_committed",
@@ -759,3 +996,42 @@ async def test_replace_memory_route_audits_request_principal(db: Database, tmp_p
     assert len(audit_rows) == 1
     assert audit_rows[0].actor_type == "user"
     assert audit_rows[0].actor_id == "andrew.sun01@sap.com"
+
+
+@pytest.mark.asyncio
+async def test_propose_memory_correction_route_creates_review_for_workspace_member(
+    db: Database,
+    tmp_path,
+    monkeypatch,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    async def fake_embed(self, _text: str) -> list[float]:
+        return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr("memforge.memory.store.MemoryStore._embed", fake_embed)
+    old = await _source_backed_memory(db, suffix="route-review", source_owner="source-owner")
+    app = create_admin_app(
+        db=db,
+        config=_api_config(tmp_path),
+        principal_resolver=lambda _request: "workspace-member",
+        workspace_role_resolver=lambda _request: "member",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/memories/{old.id}/corrections/propose",
+            json={
+                "replacement_content": "The route-proposed corrected claim.",
+                "provenance": "A workspace member supplied this correction.",
+                "reason": "The member reported stale source knowledge.",
+                "expected_content_hash": old.content_hash,
+                "replacement_kind": "supersession",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["outcome"] == "review_created"
+    assert response.json()["status"] == "pending"
+    review = await db.get_memory_review(response.json()["review_id"])
+    assert review is not None and review.expected_support_set_hash

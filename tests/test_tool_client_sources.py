@@ -672,10 +672,10 @@ def test_tool_client_retire_memory_posts_lifecycle_guard():
     ]
 
 
-def test_tool_client_replace_memory_posts_lifecycle_guard():
+def test_tool_client_propose_memory_correction_posts_lifecycle_guard():
     client = _RecordingClient({"memory_id": "mem-1", "replacement_memory_id": "mem-2"})
 
-    result = client.replace_memory(
+    result = client.propose_memory_correction(
         "mem-1",
         replacement_content="Corrected memory",
         provenance="User supplied the corrected value in chat.",
@@ -688,7 +688,7 @@ def test_tool_client_replace_memory_posts_lifecycle_guard():
     assert client.calls == [
         (
             "POST",
-            "/api/v1/memories/mem-1/replace",
+            "/api/v1/memories/mem-1/corrections/propose",
             {
                 "replacement_content": "Corrected memory",
                 "provenance": "User supplied the corrected value in chat.",

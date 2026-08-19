@@ -94,7 +94,7 @@ MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.55"
+PLUGIN_VERSION = "0.1.56"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -119,13 +119,13 @@ SESSION_START_USAGE_GUIDANCE = (
     "runtime state, or external systems when facts may have changed.\n"
     "- Proactively detect memory creation, corrections, or retirements (`remember this`, "
     "`not X, actually Y`, `don't use this anymore`). For create, search first "
-    "to avoid duplicates. For replace/retire, locate the memory with "
+    "to avoid duplicates. For correction/retirement, locate the memory with "
     "`search`/`get_memory`. Show a readable preview: new claim or old/new claim, "
     "provenance/evidence, scope, and type.\n"
     "- For `create_memory`, confirmed content must be the durable memory only. Keep "
     "confirmation details, test/deploy notes, and why-the-tool-was-called out "
     "of content; put source evidence/details in `provenance`.\n"
-    "- Never mutate memory silently. Before `create_memory`, `replace_memory`, "
+    "- Never mutate memory silently. Before `create_memory`, `propose_memory_correction`, "
     "`retire_memory`, or `resolve_memory_review`, confirm via `request_user_input` if available; "
     "otherwise ask a concise text question. Do not show raw tool arguments unless needed.\n"
     "- If no relevant memory is found, continue normally and say so only when it "
