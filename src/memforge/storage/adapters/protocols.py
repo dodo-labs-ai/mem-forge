@@ -112,6 +112,7 @@ class ActiveMemorySupportState:
     support_set_hash: str
     current_reference_ids: tuple[str, ...]
     current_support_set_hash: str
+    source_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +157,7 @@ def build_active_memory_support_states(
                 reference_id for reference_id, _source_id, _access_hash in current_grouped[memory_id]
             ),
             current_support_set_hash=active_support_rows_hash(current_grouped[memory_id]),
+            source_ids=tuple(dict.fromkeys(source_id for _reference_id, source_id, _access_hash in state_rows)),
         )
         for memory_id, state_rows in grouped.items()
     }

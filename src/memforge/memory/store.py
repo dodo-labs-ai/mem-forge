@@ -46,6 +46,7 @@ from memforge.memory.lifecycle_plan import (
 )
 from memforge.memory.lifecycle_planner import lifecycle_access_context_hash
 from memforge.models import (
+    DocumentRecord,
     Memory,
     MemoryReview,
     MemoryStatus,
@@ -1188,6 +1189,89 @@ class MemoryStore:
             support_kind="extracted",
             reason="memory inserted without deduplication",
             payload={"content_hash": memory.content_hash, "memory_type": memory.memory_type},
+        )
+
+    async def apply_authorized_memory_correction(
+        self,
+        *,
+        document: DocumentRecord,
+        incumbent: Memory,
+        challenger: Memory,
+        review: MemoryReview,
+        reviewer: str,
+        review_note: str,
+    ) -> None:
+        """Commit an authorized correction and publish its durable vector work."""
+
+        context = self._operation_context(doc_id=document.doc_id)
+        await self.db.apply_authorized_memory_correction(
+            document=document,
+            incumbent=incumbent,
+            challenger=challenger,
+            review=review,
+            reviewer=reviewer,
+            review_note=review_note,
+        )
+        vector_sync = "committed"
+        try:
+            delivery = await self.attempt_review_vector_delivery(review.id)
+            if delivery.pending:
+                vector_sync = "durable_retry_pending"
+                await self.record_review_decision(
+                    "review_vector_sync_failed",
+                    memory_id=challenger.id,
+                    review_id=review.id,
+                    reviewer=reviewer,
+                    reason=review.reason,
+                    context=context,
+                    payload={"memory_ids": [incumbent.id, challenger.id]},
+                    error=(
+                        ", ".join(delivery.error_types)
+                        if delivery.error_types
+                        else "durable Review vector work remains pending"
+                    ),
+                )
+        except Exception as exc:
+            vector_sync = "durable_retry_pending"
+            await self.record_review_decision(
+                "review_vector_sync_failed",
+                memory_id=challenger.id,
+                review_id=review.id,
+                reviewer=reviewer,
+                reason=review.reason,
+                context=context,
+                payload={"memory_ids": [incumbent.id, challenger.id]},
+                error=str(exc),
+            )
+        await self.record_audit_event(
+            "memory_insert_committed",
+            "committed",
+            context=context,
+            memory_id=challenger.id,
+            doc_id=document.doc_id,
+            support_kind="extracted",
+            reason="authorized memory correction inserted",
+            payload={"content_hash": challenger.content_hash, "memory_type": challenger.memory_type},
+        )
+        await self.record_audit_event(
+            "memory_supersede_committed",
+            "committed",
+            context=context,
+            memory_id=incumbent.id,
+            candidate_id=challenger.id,
+            review_id=review.id,
+            actor_id=reviewer,
+            reason=review.reason,
+            payload={"old_memory_id": incumbent.id, "new_memory_id": challenger.id},
+        )
+        await self.record_review_decision(
+            "review_approved",
+            memory_id=challenger.id,
+            review_id=review.id,
+            reviewer=reviewer,
+            reason=review.reason,
+            context=context,
+            payload={"incumbent_memory_id": incumbent.id, "vector_sync": vector_sync},
         )
 
     # -------------------------------------------------------------------

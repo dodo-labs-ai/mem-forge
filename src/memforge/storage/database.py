@@ -20499,6 +20499,132 @@ class Database:
                 await self.db.rollback()
                 raise
 
+    async def apply_authorized_memory_correction(
+        self,
+        *,
+        document: DocumentRecord,
+        incumbent: Memory,
+        challenger: Memory,
+        review: MemoryReview,
+        reviewer: str,
+        review_note: str,
+    ) -> None:
+        """Create and approve one authorized correction in one transaction."""
+
+        if review.kind != "supersede" or review.status != "pending":
+            raise ValueError("authorized correction requires a pending supersede Review")
+        if review.incumbent_memory_id != incumbent.id or review.challenger_memory_id != challenger.id:
+            raise ValueError("authorized correction Review participants changed")
+        if incumbent.updated_at is None or challenger.updated_at is None:
+            raise ValueError("authorized correction participants require persisted versions")
+        if challenger.status != "active":
+            raise ValueError("authorized correction challenger must be active")
+        if document.source != "user_correction":
+            raise ValueError("authorized correction requires user_correction provenance")
+
+        async with self._write_lock:
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                async with self.db.execute(
+                    "SELECT status, updated_at FROM memories WHERE id = ?",
+                    (incumbent.id,),
+                ) as cursor:
+                    stored_incumbent = await cursor.fetchone()
+                if (
+                    stored_incumbent is None
+                    or stored_incumbent["status"] != "active"
+                    or stored_incumbent["updated_at"] != incumbent.updated_at.isoformat()
+                ):
+                    raise ValueError("authorized correction incumbent changed")
+
+                if review.expected_support_set_hash is None:
+                    await self._assert_no_active_source_support_unlocked(incumbent.id)
+                else:
+                    await self._consume_correction_support_set_unlocked(
+                        incumbent.id,
+                        expected_support_set_hash=review.expected_support_set_hash,
+                    )
+
+                now = _now_iso()
+                await self._upsert_document_unlocked(document)
+                await self._upsert_memory_preserving_created_at_unlocked(challenger)
+                await self._add_memory_source_unlocked(
+                    challenger.id,
+                    document.doc_id,
+                    "user_correction",
+                    challenger.extraction_context,
+                    source_updated_at=challenger.updated_at,
+                )
+                update = await self.db.execute(
+                    """UPDATE memories SET
+                           status = 'superseded', superseded_by = ?, superseded_at = ?,
+                           valid_until = ?, replacement_reason = ?, replacement_kind = ?,
+                           updated_at = ?
+                         WHERE id = ? AND status = 'active' AND updated_at = ?""",
+                    (
+                        challenger.id,
+                        now,
+                        _today_iso(),
+                        review.reason,
+                        _validate_replacement_kind(review.replacement_kind),
+                        now,
+                        incumbent.id,
+                        incumbent.updated_at.isoformat(),
+                    ),
+                )
+                if update.rowcount != 1:
+                    raise ValueError("authorized correction incumbent changed")
+
+                await self.db.execute(
+                    "DELETE FROM memories_fts WHERE memory_id IN (?, ?)",
+                    (incumbent.id, challenger.id),
+                )
+                await self._rebuild_memory_fts_unlocked(
+                    challenger.id,
+                    search_visible_statuses=set(allowed_search_statuses()),
+                )
+                await self._stale_pending_reviews_unlocked((incumbent.id,), now=now)
+                created_at = review.created_at.isoformat() if review.created_at else now
+                await self.db.execute(
+                    """INSERT INTO memory_reviews (
+                        id, kind, status, incumbent_memory_id, challenger_memory_id,
+                        reason, review_note, reviewer,
+                        expected_incumbent_updated_at, expected_challenger_updated_at,
+                        expected_support_set_hash, replacement_kind, created_at, resolved_at
+                    ) VALUES (?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        review.id,
+                        review.kind,
+                        review.incumbent_memory_id,
+                        review.challenger_memory_id,
+                        review.reason,
+                        review_note,
+                        reviewer,
+                        review.expected_incumbent_updated_at,
+                        review.expected_challenger_updated_at,
+                        review.expected_support_set_hash,
+                        _validate_replacement_kind(review.replacement_kind),
+                        created_at,
+                        now,
+                    ),
+                )
+                await self._enqueue_review_vector_task_unlocked(
+                    review.id,
+                    incumbent.id,
+                    LifecycleVectorOperation.DELETE,
+                    now=now,
+                )
+                await self._enqueue_review_vector_task_unlocked(
+                    review.id,
+                    challenger.id,
+                    LifecycleVectorOperation.UPSERT,
+                    now=now,
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
     def _row_to_review(self, row) -> MemoryReview:
         d = dict(row)
         return MemoryReview(
