@@ -12,12 +12,28 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping
 
 from memforge.evals.offline_evaluation import (
+    AgentEvaluationCaseKind,
     AgentEvaluationAnnotationTask,
     ExternalAnnotationTask,
     ExternalAnnotationTaskState,
     OfflineAgentEvaluation,
     OfflineEvaluationStore,
 )
+
+
+_ANNOTATION_PRESENTATION_VERSION = "1"
+_ANNOTATION_LABELS = {
+    frozenset({"fail", "needs_review", "pass"}): {
+        "fail": "fail",
+        "needs_review": "needs_review",
+        "pass": "pass",
+    },
+    frozenset({"Correct", "Incorrect", "Unsure"}): {
+        "Correct": "pass",
+        "Incorrect": "fail",
+        "Unsure": "needs_review",
+    },
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +43,11 @@ class LangfuseAnnotationBinding:
     reviewer_id: str
     score_config_id: str
     score_config_fingerprint: str
+    provider_to_canonical_labels: tuple[tuple[str, str], ...] = (
+        ("fail", "fail"),
+        ("needs_review", "needs_review"),
+        ("pass", "pass"),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,17 +101,15 @@ class LangfuseAnnotationAdapter:
             raise ValueError("annotation score config is not attached to the queue")
         config = self._client.api.score_configs.get_by_id(score_config_id)
         categories = sorted(
-            (
-                {"label": item.label, "value": item.value}
-                for item in (config.categories or [])
-            ),
+            ({"label": item.label, "value": item.value} for item in (config.categories or [])),
             key=lambda item: item["label"],
         )
         if str(config.data_type) not in {"CATEGORICAL", "ScoreConfigDataType.CATEGORICAL"}:
             raise ValueError("annotation score config must be categorical")
         if config.is_archived:
             raise ValueError("annotation score config is archived")
-        if [item["label"] for item in categories] != ["fail", "needs_review", "pass"]:
+        labels = frozenset(str(item["label"]) for item in categories)
+        if labels not in _ANNOTATION_LABELS:
             raise ValueError("annotation score config labels do not match the rubric contract")
         fingerprint = _hash(
             {
@@ -108,6 +127,7 @@ class LangfuseAnnotationAdapter:
             reviewer_id=reviewer_id,
             score_config_id=score_config_id,
             score_config_fingerprint=fingerprint,
+            provider_to_canonical_labels=tuple(sorted(_ANNOTATION_LABELS[labels].items())),
         )
 
     def start_subject(
@@ -115,12 +135,13 @@ class LangfuseAnnotationAdapter:
         task: ExternalAnnotationTask,
         protected: AgentEvaluationAnnotationTask,
     ) -> Any:
+        presentation = _annotation_presentation(protected, criterion=task.criterion)
         return self._client.start_observation(
             name="memforge.agent.human_annotation",
             as_type="span",
             trace_context={"trace_id": task.trace_id},
-            input=dict(protected.case_manifest),
-            output=dict(protected.candidate_output),
+            input=presentation["input"],
+            output=presentation["output"],
             metadata={
                 "task_id": task.task_id,
                 "result_id": task.result_id,
@@ -128,6 +149,7 @@ class LangfuseAnnotationAdapter:
                 "criterion": task.criterion,
                 "rubric_version": task.rubric_version,
                 "content_policy_id": task.content_policy_id,
+                "presentation_version": _ANNOTATION_PRESENTATION_VERSION,
             },
             version=task.rubric_version,
         )
@@ -160,8 +182,7 @@ class LangfuseAnnotationAdapter:
             matches.extend(
                 item
                 for item in response.data
-                if str(item.object_type).split(".")[-1] == "OBSERVATION"
-                and item.object_id == task.observation_id
+                if str(item.object_type).split(".")[-1] == "OBSERVATION" and item.object_id == task.observation_id
             )
             if page >= response.meta.total_pages:
                 return matches
@@ -227,13 +248,14 @@ class LangfuseAnnotationAdapter:
             or subject.trace_id != task.trace_id
         ):
             raise ValueError("annotation score provenance does not match the task")
-        label = str(score.value)
-        if label not in {"pass", "fail", "needs_review"}:
+        provider_label = str(score.value)
+        label = dict(binding.provider_to_canonical_labels).get(provider_label)
+        if label is None:
             raise ValueError("annotation score label is outside the rubric contract")
         snapshot = {
             "id": score.id,
             "updated_at": score.updated_at.isoformat(),
-            "value": label,
+            "value": provider_label,
             "author_user_id": score.author_user_id,
             "queue_id": score.queue_id,
             "config_id": score.config_id,
@@ -245,6 +267,128 @@ class LangfuseAnnotationAdapter:
             score_fingerprint=_hash(snapshot),
             label=label,
         )
+
+
+def _annotation_presentation(
+    protected: AgentEvaluationAnnotationTask,
+    *,
+    criterion: str,
+) -> dict[str, dict[str, object]]:
+    if protected.case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION:
+        review, candidate = _reconciliation_presentation(protected)
+    else:
+        review = {
+            "title": "Review candidate Memory extraction",
+            "question": f"Does this candidate satisfy the {criterion.replace('_', ' ')} criterion?",
+            "important": "Submitting this review records a label only. It does not change production Memory.",
+        }
+        candidate = {"summary": "Review the candidate output against the source evidence."}
+    review["how_to_score"] = {
+        "Correct": "The candidate is correct for the source evidence.",
+        "Incorrect": "The candidate contains a material error or unsafe change.",
+        "Unsure": "The available evidence is insufficient to decide.",
+    }
+    return {
+        "input": {
+            "review": review,
+            "debug_details": {"case_manifest": dict(protected.case_manifest)},
+        },
+        "output": {
+            "candidate": candidate,
+            "debug_details": {"candidate_output": dict(protected.candidate_output)},
+        },
+    }
+
+
+def _reconciliation_presentation(
+    protected: AgentEvaluationAnnotationTask,
+) -> tuple[dict[str, object], dict[str, object]]:
+    manifest = protected.case_manifest
+    candidate_output = protected.candidate_output
+    incumbents = {
+        str(item.get("id")): item for item in _mapping_items(manifest.get("incumbents")) if item.get("id") is not None
+    }
+    operations = _mapping_items(candidate_output.get("operations"))
+    proposed_changes = [_operation_presentation(operation, incumbents=incumbents) for operation in operations]
+    updated_document = manifest.get("updated_document")
+    source: dict[str, object] = {
+        "type": str(manifest.get("doc_type") or "source"),
+        "state": (
+            "No current source content is present in this evaluation case."
+            if updated_document is None
+            else "Current source content is present in this evaluation case."
+        ),
+        "existing_memory_count": len(incumbents),
+        "new_extraction_count": len(_mapping_items(manifest.get("new_extractions"))),
+    }
+    if updated_document is not None:
+        source["current_content"] = updated_document
+    action_counts: dict[str, int] = {}
+    for operation in operations:
+        action = str(operation.get("action") or "UNKNOWN")
+        action_counts[action] = action_counts.get(action, 0) + 1
+    summary = (
+        "; ".join(_action_count_summary(action, count) for action, count in sorted(action_counts.items()))
+        or "No Memory changes proposed"
+    )
+    return (
+        {
+            "title": "Review proposed Memory changes",
+            "question": "Are the proposed Memory changes correct for this source evidence?",
+            "source": source,
+            "important": "Submitting this review records a label only. It does not apply these changes to production Memory.",
+        },
+        {
+            "summary": summary,
+            "proposed_changes": proposed_changes,
+        },
+    )
+
+
+def _operation_presentation(
+    operation: Mapping[str, object],
+    *,
+    incumbents: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    action = str(operation.get("action") or "UNKNOWN")
+    memory_id = str(operation.get("memory_id") or "")
+    existing = incumbents.get(memory_id)
+    proposed = operation.get("memory")
+    result: dict[str, object] = {"action": _action_label(action)}
+    if existing is not None and existing.get("content") is not None:
+        result["current_memory"] = existing["content"]
+    if isinstance(proposed, Mapping) and proposed.get("content") is not None:
+        result["proposed_memory"] = proposed["content"]
+    if operation.get("flag_for_review") is True:
+        result["requires_additional_review"] = True
+    return result
+
+
+def _action_label(action: str) -> str:
+    return {
+        "ADD": "Add a new Memory",
+        "UPDATE": "Update an existing Memory",
+        "SUPERSEDE": "Replace an existing Memory",
+        "DELETE": "Delete an existing Memory",
+        "NOOP": "Keep an existing Memory unchanged",
+    }.get(action, "Review an unknown Memory action")
+
+
+def _action_count_summary(action: str, count: int) -> str:
+    memory = "Memory" if count == 1 else "Memories"
+    return {
+        "ADD": f"Add {count} new {memory}",
+        "UPDATE": f"Update {count} existing {memory}",
+        "SUPERSEDE": f"Replace {count} existing {memory}",
+        "DELETE": f"Delete {count} existing {memory}",
+        "NOOP": f"Keep {count} existing {memory} unchanged",
+    }.get(action, f"Review {count} unknown Memory actions")
+
+
+def _mapping_items(value: object) -> list[Mapping[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
 
 
 class ExternalAnnotationExchange:
@@ -473,9 +617,7 @@ class ExternalAnnotationExchange:
 
 
 def _hash(payload: Mapping[str, object]) -> str:
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _status_code(exc: Exception) -> int | None:
