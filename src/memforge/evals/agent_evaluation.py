@@ -26,6 +26,9 @@ from typing import Callable, ContextManager, Iterator, Literal, Mapping, Protoco
 AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v3"
 AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v5"
 SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION = "source-unit-lifecycle-v1"
+DETERMINISTIC_RUNTIME_EVALUATOR_NAME = "memforge.deterministic.runtime_contract"
+DETERMINISTIC_RUNTIME_EVALUATOR_VERSION = "1"
+ONLINE_EVALUATION_COVERAGE_POLICY = "semantic_evaluator_v1"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
 AgentAssessmentStatus = Literal["completed", "failed"]
 AgentAssessmentLabel = Literal["pass", "fail", "needs_review"]
@@ -989,7 +992,7 @@ def bind_source_lifecycle_outcome(
         AGENT_ASSESSMENT_SCHEMA_VERSION,
         event_id,
         "source_unit_lifecycle_completion",
-        "memforge.deterministic.runtime_contract:1",
+        f"{DETERMINISTIC_RUNTIME_EVALUATOR_NAME}:{DETERMINISTIC_RUNTIME_EVALUATOR_VERSION}",
         prefix="aas",
     )
     assessment = AgentAssessment(
@@ -1000,8 +1003,8 @@ def bind_source_lifecycle_outcome(
         label=label,
         reason_code=reason_code,
         annotator_kind="code",
-        evaluator_name="memforge.deterministic.runtime_contract",
-        evaluator_version="1",
+        evaluator_name=DETERMINISTIC_RUNTIME_EVALUATOR_NAME,
+        evaluator_version=DETERMINISTIC_RUNTIME_EVALUATOR_VERSION,
         created_at=timestamp,
     )
     return AgentRuntimeBundle(events=(event,), assessments=(assessment,))
@@ -1025,7 +1028,8 @@ def evaluate_runtime_events(
         criterion, label = decision
         identity = (
             f"{AGENT_ASSESSMENT_SCHEMA_VERSION}:{event.event_id}:{criterion}:"
-            "memforge.deterministic.runtime_contract:1"
+            f"{DETERMINISTIC_RUNTIME_EVALUATOR_NAME}:"
+            f"{DETERMINISTIC_RUNTIME_EVALUATOR_VERSION}"
         )
         assessment_id = "aas-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
         assessments.append(
@@ -1037,8 +1041,8 @@ def evaluate_runtime_events(
                 label=label,
                 reason_code=event.reason_code,
                 annotator_kind="code",
-                evaluator_name="memforge.deterministic.runtime_contract",
-                evaluator_version="1",
+                evaluator_name=DETERMINISTIC_RUNTIME_EVALUATOR_NAME,
+                evaluator_version=DETERMINISTIC_RUNTIME_EVALUATOR_VERSION,
                 created_at=event.occurred_at,
                 occurrence_count=event.occurrence_count,
             )
@@ -1049,6 +1053,11 @@ def evaluate_runtime_events(
 def _deterministic_assessment_decision(
     event: AgentRuntimeEvent,
 ) -> tuple[str, AgentAssessmentLabel] | None:
+    if event.event_name == "source_unit_lifecycle_outcome":
+        return (
+            "source_unit_lifecycle_completion",
+            "fail" if event.outcome == "failed" else "pass",
+        )
     if event.event_name == "structured_output_outcome":
         return (
             "structured_output_contract",
@@ -1238,6 +1247,242 @@ def summarize_agent_assessments(
         "label_counts": dict(sorted(label_counts.items())),
         "criterion_counts": dict(sorted(criterion_counts.items())),
         "status_counts": dict(sorted(status_counts.items())),
+    }
+
+
+def build_source_online_evaluation_view(
+    events: tuple[AgentRuntimeEvent, ...] | list[AgentRuntimeEvent],
+    assessments: tuple[AgentAssessment, ...] | list[AgentAssessment],
+    *,
+    representative_limit: int = 3,
+) -> dict[str, object]:
+    """Return one actionable, content-free Source evaluation presentation.
+
+    Coverage is semantic: a persisted assessment covers the expected check when
+    its event, criterion, evaluator, and evaluator version match. Assessment
+    schema versions and storage IDs remain idempotency details and do not create
+    false user-facing coverage gaps.
+    """
+
+    if not 1 <= representative_limit <= 10:
+        raise ValueError("representative_limit must be between 1 and 10")
+    event_rows = list(events)
+    event_by_id = {event.event_id: event for event in event_rows}
+    expected = list(evaluate_runtime_events(tuple(event_rows)))
+    effective = _effective_event_assessments(
+        assessments,
+        visible_event_ids=frozenset(event_by_id),
+    )
+    effective_by_key = {
+        _event_assessment_semantic_key(assessment): assessment
+        for assessment in effective
+    }
+
+    eligible_occurrences = sum(item.occurrence_count for item in expected)
+    assessed_occurrences = 0
+    pending_occurrences = 0
+    pending_times: list[datetime] = []
+    for item in expected:
+        persisted = effective_by_key.get(_event_assessment_semantic_key(item))
+        if persisted is not None and persisted.status == "completed":
+            assessed_occurrences += item.occurrence_count
+        else:
+            pending_occurrences += item.occurrence_count
+            target = event_by_id.get(item.target_event_id or "")
+            if target is not None:
+                pending_times.append(target.occurred_at)
+
+    evaluator_failure_occurrences = sum(
+        item.occurrence_count for item in effective if item.status == "failed"
+    )
+    issue_groups = _source_online_evaluation_issue_groups(
+        effective,
+        event_by_id=event_by_id,
+        representative_limit=representative_limit,
+    )
+    summary = summarize_agent_assessments(effective)
+    summary.update(
+        {
+            "runtime_event_count": sum(event.occurrence_count for event in event_rows),
+            "eligible_assessment_count": eligible_occurrences,
+            "missing_assessment_count": pending_occurrences,
+            "action_issue_group_count": sum(
+                1 for group in issue_groups if group["label"] == "fail"
+            ),
+            "review_issue_group_count": sum(
+                1 for group in issue_groups if group["label"] == "needs_review"
+            ),
+        }
+    )
+    return {
+        "summary": summary,
+        "coverage": {
+            "policy": ONLINE_EVALUATION_COVERAGE_POLICY,
+            "eligible_occurrences": eligible_occurrences,
+            "assessed_occurrences": assessed_occurrences,
+            "pending_occurrences": pending_occurrences,
+            "coverage_rate": (
+                assessed_occurrences / eligible_occurrences
+                if eligible_occurrences
+                else 1.0
+            ),
+            "oldest_pending_at": (
+                min(pending_times).isoformat() if pending_times else None
+            ),
+            "evaluator_failure_occurrences": evaluator_failure_occurrences,
+        },
+        "issue_groups": issue_groups,
+        "runtime_events": [event_public_payload(event) for event in event_rows[:50]],
+        "assessments": [
+            assessment_public_payload(assessment) for assessment in effective[:50]
+        ],
+    }
+
+
+def _event_assessment_semantic_key(
+    assessment: AgentAssessment,
+) -> tuple[str | None, str, str, str]:
+    return (
+        assessment.target_event_id,
+        assessment.criterion,
+        assessment.evaluator_name,
+        assessment.evaluator_version,
+    )
+
+
+def _effective_event_assessments(
+    assessments: tuple[AgentAssessment, ...] | list[AgentAssessment],
+    *,
+    visible_event_ids: frozenset[str],
+) -> list[AgentAssessment]:
+    by_key: dict[tuple[str | None, str, str, str], AgentAssessment] = {}
+    for assessment in assessments:
+        if assessment.target_event_id not in visible_event_ids:
+            continue
+        key = _event_assessment_semantic_key(assessment)
+        incumbent = by_key.get(key)
+        if incumbent is None or _assessment_preference(assessment) > _assessment_preference(
+            incumbent
+        ):
+            by_key[key] = assessment
+    return sorted(
+        by_key.values(),
+        key=lambda item: (item.created_at, item.assessment_id),
+        reverse=True,
+    )
+
+
+def _assessment_preference(assessment: AgentAssessment) -> tuple[bool, datetime, str]:
+    return (
+        assessment.schema_version == AGENT_ASSESSMENT_SCHEMA_VERSION,
+        assessment.created_at,
+        assessment.assessment_id,
+    )
+
+
+def _source_online_evaluation_issue_groups(
+    assessments: list[AgentAssessment],
+    *,
+    event_by_id: Mapping[str, AgentRuntimeEvent],
+    representative_limit: int,
+) -> list[dict[str, object]]:
+    criterion_occurrences: Counter[str] = Counter()
+    for assessment in assessments:
+        if assessment.status == "completed":
+            criterion_occurrences[assessment.criterion] += assessment.occurrence_count
+    grouped: dict[tuple[str, str, str, str, str], dict[str, object]] = {}
+    for assessment in assessments:
+        if assessment.status != "completed" or assessment.label not in {
+            "fail",
+            "needs_review",
+        }:
+            continue
+        event = event_by_id.get(assessment.target_event_id or "")
+        if event is None:
+            continue
+        key = (
+            assessment.label,
+            assessment.criterion,
+            assessment.reason_code,
+            assessment.evaluator_name,
+            assessment.evaluator_version,
+        )
+        group = grouped.setdefault(
+            key,
+            {
+                "group_id": "aeg-"
+                + hashlib.sha256(":".join(key).encode("utf-8")).hexdigest()[:16],
+                "label": assessment.label,
+                "criterion": assessment.criterion,
+                "reason_code": assessment.reason_code,
+                "evaluator_name": assessment.evaluator_name,
+                "evaluator_version": assessment.evaluator_version,
+                "occurrence_count": 0,
+                "distinct_event_count": 0,
+                "first_seen_at": event.occurred_at,
+                "last_seen_at": event.occurred_at,
+                "representative_cases": [],
+            },
+        )
+        group["occurrence_count"] = int(group["occurrence_count"]) + assessment.occurrence_count
+        group["distinct_event_count"] = int(group["distinct_event_count"]) + 1
+        group["first_seen_at"] = min(group["first_seen_at"], event.occurred_at)
+        group["last_seen_at"] = max(group["last_seen_at"], event.occurred_at)
+        representatives = group["representative_cases"]
+        assert isinstance(representatives, list)
+        if len(representatives) < representative_limit:
+            representatives.append(_source_online_evaluation_case(assessment, event))
+
+    values = list(grouped.values())
+    for group in values:
+        group["first_seen_at"] = group["first_seen_at"].isoformat()
+        group["last_seen_at"] = group["last_seen_at"].isoformat()
+        denominator = criterion_occurrences[str(group["criterion"])]
+        group["criterion_occurrence_count"] = denominator
+        group["criterion_rate"] = (
+            int(group["occurrence_count"]) / denominator if denominator else 0.0
+        )
+    values.sort(
+        key=lambda group: (
+            0 if group["label"] == "fail" else 1,
+            -int(group["occurrence_count"]),
+            str(group["criterion"]),
+            str(group["reason_code"]),
+        )
+    )
+    return values
+
+
+def _source_online_evaluation_case(
+    assessment: AgentAssessment,
+    event: AgentRuntimeEvent,
+) -> dict[str, object]:
+    return {
+        "assessment_id": assessment.assessment_id,
+        "event_id": event.event_id,
+        "label": assessment.label,
+        "criterion": assessment.criterion,
+        "reason_code": assessment.reason_code,
+        "occurred_at": event.occurred_at.isoformat(),
+        "occurrence_count": assessment.occurrence_count,
+        "source_id": event.source_id,
+        "source_type": event.source_type,
+        "doc_id": event.doc_id,
+        "source_unit_id": event.source_unit_id,
+        "target_unit_revision_id": event.target_unit_revision_id,
+        "observation_id": event.observation_id,
+        "observation_revision_id": event.observation_revision_id,
+        "projection_run_id": event.projection_run_id,
+        "operation_id": event.operation_id,
+        "execution_id": event.execution_id,
+        "derivation_id": event.derivation_id,
+        "batch_id": event.batch_id,
+        "trace_id": event.trace_id,
+        "provider": event.provider,
+        "model": event.model,
+        "contract_version": event.contract_version,
+        "extraction_contract_version": event.extraction_contract_version,
+        "deployment_revision": event.deployment_revision,
     }
 
 

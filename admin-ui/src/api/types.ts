@@ -271,6 +271,8 @@ export interface AgentAssessmentSummary {
   runtime_event_count: number;
   eligible_assessment_count: number;
   missing_assessment_count: number;
+  action_issue_group_count: number;
+  review_issue_group_count: number;
   label_counts: Record<string, number>;
   criterion_counts: Record<string, number>;
   status_counts: Record<string, number>;
@@ -291,10 +293,83 @@ export interface AgentAssessmentView {
   occurrence_count: number;
 }
 
+export interface AgentEvaluationCoverage {
+  policy: "semantic_evaluator_v1";
+  eligible_occurrences: number;
+  assessed_occurrences: number;
+  pending_occurrences: number;
+  coverage_rate: number;
+  oldest_pending_at: string | null;
+  evaluator_failure_occurrences: number;
+}
+
+export interface AgentEvaluationRepresentativeCase {
+  assessment_id: string;
+  event_id: string;
+  label: "fail" | "needs_review";
+  criterion: string;
+  reason_code: string;
+  occurred_at: string;
+  occurrence_count: number;
+  source_id: string;
+  source_type: string;
+  doc_id: string;
+  source_unit_id: string;
+  target_unit_revision_id: string;
+  observation_id: string | null;
+  observation_revision_id: string | null;
+  projection_run_id: string;
+  operation_id: string | null;
+  execution_id: string | null;
+  derivation_id: string | null;
+  batch_id: string | null;
+  trace_id: string | null;
+  provider: string | null;
+  model: string | null;
+  contract_version: string | null;
+  extraction_contract_version: string | null;
+  deployment_revision: string | null;
+}
+
+export interface AgentEvaluationIssueGroup {
+  group_id: string;
+  label: "fail" | "needs_review";
+  criterion: string;
+  reason_code: string;
+  evaluator_name: string;
+  evaluator_version: string;
+  occurrence_count: number;
+  distinct_event_count: number;
+  criterion_occurrence_count: number;
+  criterion_rate: number;
+  first_seen_at: string;
+  last_seen_at: string;
+  representative_cases: AgentEvaluationRepresentativeCase[];
+}
+
+export interface AgentRuntimeEventView {
+  event_id: string;
+  event_name: string;
+  outcome: "expected" | "degraded" | "rejected" | "failed";
+  reason_code: string;
+  occurred_at: string;
+  occurrence_count: number;
+  source_id: string;
+  source_type: string;
+  doc_id: string;
+  source_unit_id: string;
+  target_unit_revision_id: string;
+  observation_id?: string | null;
+  trace_id?: string | null;
+}
+
 export interface SourceAgentEvaluationResponse {
   source_id: string;
   window: { from: string; to: string; days: number };
   summary: AgentAssessmentSummary;
+  coverage: AgentEvaluationCoverage;
+  issue_groups: AgentEvaluationIssueGroup[];
+  runtime_events: AgentRuntimeEventView[];
   assessments: AgentAssessmentView[];
 }
 

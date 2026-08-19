@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import timedelta
 
 import pytest
 
@@ -13,6 +14,7 @@ from memforge.local_agent.source_contract import (
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
     local_agent_completion_status,
+    local_agent_retry_delay,
     local_agent_input_sha256,
     local_agent_job_config,
     local_agent_rebaseline_snapshot_is_authoritative,
@@ -101,6 +103,15 @@ def test_local_agent_attempt_identity_and_retry_status_are_deterministic() -> No
         local_agent_collection_attempt_id("jira", "job-1", 2, "spoofed")
     with pytest.raises(ValueError, match="not registered"):
         local_agent_collection_attempt_id("unregistered", "job-1", 2)
+
+
+def test_local_agent_retry_delay_uses_long_bounded_schedule() -> None:
+    assert local_agent_retry_delay("failed", retryable=True, attempt_count=1) == timedelta(hours=1)
+    assert local_agent_retry_delay("failed", retryable=True, attempt_count=2) == timedelta(hours=12)
+    assert local_agent_retry_delay("failed", retryable=True, attempt_count=4) == timedelta(hours=12)
+    assert local_agent_retry_delay("failed", retryable=True, attempt_count=5) is None
+    assert local_agent_retry_delay("failed", retryable=False, attempt_count=1) is None
+    assert local_agent_retry_delay("succeeded", retryable=True, attempt_count=1) is None
 
 
 @pytest.mark.parametrize("source_type", ["github_repo", "jira", "local_markdown"])
