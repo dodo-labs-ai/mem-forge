@@ -7,7 +7,7 @@ sources/genes, schedule, LLM configuration, and system health/stats.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
 import hmac
 import json
@@ -346,6 +346,29 @@ def _require_source_management(request: Request, source: dict[str, Any]) -> None
         viewer_role=resolve_request_workspace_role(request),
     ):
         raise _source_management_forbidden()
+
+
+@dataclass(frozen=True)
+class _RequestCorrectionAuthority:
+    actor_user_id: str
+    workspace_role: str
+
+    def can_manage_source(self, source: Mapping[str, Any]) -> bool:
+        return can_manage_source(
+            dict(source),
+            viewer_id=self.actor_user_id,
+            viewer_role=self.workspace_role,
+        )
+
+    def can_manage_workspace_memory(self) -> bool:
+        return self.workspace_role in {"owner", "workspace_admin"}
+
+
+def _request_correction_authority(request: Request) -> _RequestCorrectionAuthority:
+    return _RequestCorrectionAuthority(
+        actor_user_id=resolve_request_principal(request),
+        workspace_role=resolve_request_workspace_role(request),
+    )
 
 
 def _require_source_discoverability(request: Request, source: dict[str, Any]) -> None:
@@ -744,7 +767,7 @@ class MemoryCreateResponse(BaseModel):
     status: str
 
 
-class MemoryReplaceRequest(BaseModel):
+class MemoryCorrectionProposalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     replacement_content: str = Field(min_length=1)
@@ -754,11 +777,13 @@ class MemoryReplaceRequest(BaseModel):
     replacement_kind: Literal["revision", "supersession"] = "supersession"
 
 
-class MemoryReplaceResponse(BaseModel):
+class MemoryCorrectionProposalResponse(BaseModel):
     memory_id: str
     replacement_memory_id: str
+    outcome: Literal["applied", "review_created"]
     status: str
     replacement_kind: str
+    review_id: str
 
 
 class SourceFacetFilterRequest(BaseModel):
@@ -2662,7 +2687,13 @@ def _review_to_response(
         resolved_at=_dt_iso(review.resolved_at),
         is_stale=_is_review_stale(review, incumbent, challenger),
         decision_fingerprint=memory_review_decision_fingerprint(review, related_challengers),
-        presentation=_presentation_response(present_memory_review(kind=review.kind, reason=review.reason)),
+        presentation=_presentation_response(
+            present_memory_review(
+                kind=review.kind,
+                reason=review.reason,
+                source_backed_correction=review.expected_support_set_hash is not None,
+            )
+        ),
     )
 
 
@@ -4029,16 +4060,23 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail=str(exc))
         return MemoryLifecycleResponse(memory_id=result.memory_id, status=result.status)
 
-    @memory_router.post("/{memory_id}/replace", response_model=MemoryReplaceResponse)
-    async def replace_memory_route(
+    @memory_router.post(
+        "/{memory_id}/corrections/propose",
+        response_model=MemoryCorrectionProposalResponse,
+    )
+    async def propose_memory_correction_route(
         memory_id: str,
-        req: MemoryReplaceRequest,
+        req: MemoryCorrectionProposalRequest,
         request: Request,
         db: Database = Depends(get_db),
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        visible = await _filter_visible_ids(db, [memory_id], _workspace_default_scope(request, include_private=True))
+        visible = await _filter_visible_ids(
+            db,
+            [memory_id],
+            _workspace_default_scope(request, include_private=True),
+        )
         if memory_id not in visible:
             raise HTTPException(status_code=404, detail="Memory not found")
         service = await _build_lifecycle_service(
@@ -4048,23 +4086,26 @@ def create_admin_app(
             audit_context=_request_audit_context(request),
         )
         try:
-            result = await service.replace_memory(
+            result = await service.propose_memory_correction(
                 memory_id,
                 replacement_content=req.replacement_content,
                 provenance=req.provenance,
                 reason=req.reason,
                 expected_content_hash=req.expected_content_hash,
+                authority=_request_correction_authority(request),
                 replacement_kind=req.replacement_kind,
             )
         except MemoryLifecycleNotFound:
             raise HTTPException(status_code=404, detail="Memory not found")
         except MemoryLifecycleConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        return MemoryReplaceResponse(
+        return MemoryCorrectionProposalResponse(
             memory_id=result.memory_id,
             replacement_memory_id=result.replacement_memory_id,
+            outcome=result.outcome,
             status=result.status,
             replacement_kind=result.replacement_kind,
+            review_id=result.review_id,
         )
 
     @memory_router.delete("/{memory_id}")
@@ -8175,6 +8216,18 @@ def create_admin_app(
                         status=memory_review.status,
                         message="Review participants changed after analysis",
                     )
+                if (
+                    memory_review.expected_support_set_hash is not None
+                    and await db.get_memory_support_set_hash(memory_review.incumbent_memory_id)
+                    != memory_review.expected_support_set_hash
+                ):
+                    return MemoryReviewDecisionResult(
+                        review_id=item.review_id,
+                        decision=item.decision,
+                        outcome="stale",
+                        status=memory_review.status,
+                        message="The incumbent Support Set changed after the correction was proposed",
+                    )
                 if any(memory.status != "pending_review" for memory in related_challengers):
                     return MemoryReviewDecisionResult(
                         review_id=item.review_id,
@@ -8186,6 +8239,7 @@ def create_admin_app(
                 presentation = present_memory_review(
                     kind=memory_review.kind,
                     reason=memory_review.reason,
+                    source_backed_correction=memory_review.expected_support_set_hash is not None,
                 )
         except HTTPException as exc:
             if exc.status_code == 403:

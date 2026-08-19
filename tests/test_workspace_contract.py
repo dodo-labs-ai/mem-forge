@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.server.admin_api import create_admin_app
+from memforge.server.principal import resolve_workspace_role
 from memforge.storage.database import Database
 
 
@@ -40,6 +41,10 @@ def test_self_hosted_workspace_directory_exposes_readable_local_workspace(
         }
     finally:
         asyncio.run(database.close())
+
+
+def test_self_hosted_workspace_role_matches_directory_owner() -> None:
+    assert resolve_workspace_role(object()) == "owner"  # type: ignore[arg-type]
 
 
 def test_self_hosted_default_workspace_route_is_absent(

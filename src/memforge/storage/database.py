@@ -1620,6 +1620,7 @@ CREATE TABLE IF NOT EXISTS memory_reviews (
     reviewer                        TEXT,
     expected_incumbent_updated_at   TEXT,
     expected_challenger_updated_at  TEXT,
+    expected_support_set_hash       TEXT,
     replacement_kind                TEXT NOT NULL DEFAULT 'supersession',
     created_at                      TEXT NOT NULL,
     resolved_at                     TEXT
@@ -3938,6 +3939,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                ON agent_assessments(criterion, label, created_at)""",
             """CREATE INDEX idx_agent_assessment_input_fingerprint
                ON agent_assessments(input_fingerprint, status, created_at, assessment_id)""",
+        ],
+    ),
+    (
+        86,
+        "Pin source-backed correction Reviews to the active Support Set",
+        [
+            "ALTER TABLE memory_reviews ADD COLUMN expected_support_set_hash TEXT",
         ],
     ),
 ]
@@ -9723,9 +9731,10 @@ class Database:
                             id, kind, status, incumbent_memory_id,
                             challenger_memory_id, reason, review_note, reviewer,
                             expected_incumbent_updated_at,
-                            expected_challenger_updated_at, replacement_kind,
+                            expected_challenger_updated_at, expected_support_set_hash,
+                            replacement_kind,
                             created_at, resolved_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             review.id,
                             review.kind,
@@ -9737,6 +9746,7 @@ class Database:
                             review.reviewer,
                             review.expected_incumbent_updated_at,
                             review.expected_challenger_updated_at,
+                            review.expected_support_set_hash,
                             _validate_replacement_kind(review.replacement_kind),
                             review.created_at.isoformat() if review.created_at else now,
                             review.resolved_at.isoformat() if review.resolved_at else None,
@@ -11086,8 +11096,8 @@ class Database:
                             id, kind, status, incumbent_memory_id, challenger_memory_id,
                             reason, review_note, reviewer,
                             expected_incumbent_updated_at, expected_challenger_updated_at,
-                            replacement_kind, created_at, resolved_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            expected_support_set_hash, replacement_kind, created_at, resolved_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(id) DO UPDATE SET
                             kind=excluded.kind,
                             status=excluded.status,
@@ -11098,6 +11108,7 @@ class Database:
                             reviewer=excluded.reviewer,
                             expected_incumbent_updated_at=excluded.expected_incumbent_updated_at,
                             expected_challenger_updated_at=excluded.expected_challenger_updated_at,
+                            expected_support_set_hash=excluded.expected_support_set_hash,
                             replacement_kind=excluded.replacement_kind,
                             resolved_at=excluded.resolved_at
                         WHERE memory_reviews.status = 'pending'""",
@@ -11112,6 +11123,7 @@ class Database:
                             review.reviewer,
                             review.expected_incumbent_updated_at,
                             review.expected_challenger_updated_at,
+                            review.expected_support_set_hash,
                             _validate_replacement_kind(review.replacement_kind),
                             created_at,
                             review.resolved_at.isoformat() if review.resolved_at else None,
@@ -12168,6 +12180,21 @@ class Database:
                     "direct terminal Memory transition rejected while active source support remains; "
                     "projected lifecycle required"
                 )
+
+    async def _consume_correction_support_set_unlocked(
+        self,
+        memory_id: str,
+        *,
+        expected_support_set_hash: str,
+    ) -> None:
+        actual_hash = await self._memory_support_set_hash_unlocked(memory_id)
+        if actual_hash != expected_support_set_hash:
+            raise ValueError("memory correction support set changed")
+        await self.db.execute(
+            "UPDATE memory_support_assertions SET active = 0, removed_at = ? "
+            "WHERE memory_id = ? AND active = 1",
+            (_now_iso(), memory_id),
+        )
 
     async def _assert_legacy_source_write_allowed_unlocked(self, doc_id: str) -> None:
         async with self.db.execute(
@@ -19758,8 +19785,8 @@ class Database:
                     id, kind, status, incumbent_memory_id, challenger_memory_id,
                     reason, review_note, reviewer,
                     expected_incumbent_updated_at, expected_challenger_updated_at,
-                    replacement_kind, created_at, resolved_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    expected_support_set_hash, replacement_kind, created_at, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     review.id,
                     review.kind,
@@ -19771,6 +19798,7 @@ class Database:
                     review.reviewer,
                     review.expected_incumbent_updated_at,
                     review.expected_challenger_updated_at,
+                    review.expected_support_set_hash,
                     _validate_replacement_kind(review.replacement_kind),
                     created_at,
                     review.resolved_at.isoformat() if review.resolved_at else None,
@@ -19829,8 +19857,8 @@ class Database:
                         id, kind, status, incumbent_memory_id, challenger_memory_id,
                         reason, review_note, reviewer,
                         expected_incumbent_updated_at, expected_challenger_updated_at,
-                        replacement_kind, created_at, resolved_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        expected_support_set_hash, replacement_kind, created_at, resolved_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         review.id,
                         review.kind,
@@ -19842,6 +19870,7 @@ class Database:
                         review.reviewer,
                         review.expected_incumbent_updated_at,
                         review.expected_challenger_updated_at,
+                        review.expected_support_set_hash,
                         _validate_replacement_kind(review.replacement_kind),
                         review.created_at.isoformat() if review.created_at else now,
                         review.resolved_at.isoformat() if review.resolved_at else None,
@@ -20126,8 +20155,8 @@ class Database:
                             id, kind, status, incumbent_memory_id, challenger_memory_id,
                             reason, review_note, reviewer,
                             expected_incumbent_updated_at, expected_challenger_updated_at,
-                            replacement_kind, created_at, resolved_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            expected_support_set_hash, replacement_kind, created_at, resolved_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(id) DO UPDATE SET
                             kind=excluded.kind,
                             status=excluded.status,
@@ -20138,6 +20167,7 @@ class Database:
                             reviewer=excluded.reviewer,
                             expected_incumbent_updated_at=excluded.expected_incumbent_updated_at,
                             expected_challenger_updated_at=excluded.expected_challenger_updated_at,
+                            expected_support_set_hash=excluded.expected_support_set_hash,
                             replacement_kind=excluded.replacement_kind,
                             resolved_at=excluded.resolved_at
                         WHERE memory_reviews.status = 'pending'""",
@@ -20152,6 +20182,7 @@ class Database:
                             review.reviewer,
                             review.expected_incumbent_updated_at,
                             review.expected_challenger_updated_at,
+                            review.expected_support_set_hash,
                             _validate_replacement_kind(review.replacement_kind),
                             created_at,
                             review.resolved_at.isoformat() if review.resolved_at else None,
@@ -20320,6 +20351,8 @@ class Database:
                     or stored_review["kind"] != review.kind
                     or stored_review["incumbent_memory_id"] != incumbent.id
                     or stored_review["challenger_memory_id"] != challenger.id
+                    or stored_review["expected_support_set_hash"]
+                    != review.expected_support_set_hash
                 ):
                     raise ValueError("memory review is not pending")
 
@@ -20333,9 +20366,18 @@ class Database:
 
                 now = _now_iso()
 
-                terminal_participants = (
-                    (incumbent, *related_challengers) if status == "approved" else (challenger, *related_challengers)
-                )
+                if status == "approved" and review.expected_support_set_hash is not None:
+                    await self._consume_correction_support_set_unlocked(
+                        incumbent.id,
+                        expected_support_set_hash=review.expected_support_set_hash,
+                    )
+                    terminal_participants = related_challengers
+                else:
+                    terminal_participants = (
+                        (incumbent, *related_challengers)
+                        if status == "approved"
+                        else (challenger, *related_challengers)
+                    )
                 for memory in terminal_participants:
                     await self._assert_no_active_source_support_unlocked(memory.id)
 
@@ -20470,6 +20512,7 @@ class Database:
             reviewer=d.get("reviewer"),
             expected_incumbent_updated_at=d.get("expected_incumbent_updated_at"),
             expected_challenger_updated_at=d.get("expected_challenger_updated_at"),
+            expected_support_set_hash=d.get("expected_support_set_hash"),
             replacement_kind=_validate_replacement_kind(d.get("replacement_kind") or "supersession"),
             created_at=_parse_dt(d.get("created_at")),
             resolved_at=_parse_dt(d.get("resolved_at")),

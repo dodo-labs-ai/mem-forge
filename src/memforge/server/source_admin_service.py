@@ -29,13 +29,18 @@ from memforge.storage.admin_source import SourceAdminReader
 WORKSPACE_ADMIN_ROLE = "workspace_admin"
 MEMBER_ROLE = "member"
 VIEWER_ROLE = "viewer"
-LOCAL_WORKSPACE_ROLE = WORKSPACE_ADMIN_ROLE
+SELF_HOSTED_OWNER_ROLE = "owner"
+LOCAL_WORKSPACE_ROLE = SELF_HOSTED_OWNER_ROLE
 MANAGED_SOURCE_TYPES = frozenset({"agent_session"})
 
 
 def normalize_workspace_role(role: str | None) -> str:
     value = str(role or "").strip()
-    return value if value in {WORKSPACE_ADMIN_ROLE, MEMBER_ROLE, VIEWER_ROLE} else MEMBER_ROLE
+    return (
+        value
+        if value in {SELF_HOSTED_OWNER_ROLE, WORKSPACE_ADMIN_ROLE, MEMBER_ROLE, VIEWER_ROLE}
+        else MEMBER_ROLE
+    )
 
 
 def _is_managed_source_type(source_type: str) -> bool:
@@ -47,6 +52,8 @@ def source_viewer_relationship(
 ) -> str:
     if source_owner_user_id(source) == viewer_id:
         return "owner"
+    if viewer_role == SELF_HOSTED_OWNER_ROLE:
+        return SELF_HOSTED_OWNER_ROLE
     if viewer_role == WORKSPACE_ADMIN_ROLE:
         return WORKSPACE_ADMIN_ROLE
     return normalize_workspace_role(viewer_role)
@@ -58,6 +65,8 @@ def can_manage_source(
     if not source_is_discoverable(source, viewer_id=viewer_id):
         return False
     if source_owner_user_id(source) == viewer_id:
+        return True
+    if viewer_role == SELF_HOSTED_OWNER_ROLE:
         return True
     return (
         source_access_policy(source) is SourceAccessPolicy.WORKSPACE
