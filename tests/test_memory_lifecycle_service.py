@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -518,6 +519,108 @@ async def test_propose_memory_correction_applies_for_complete_source_authority(d
     assert review.expected_support_set_hash == support_hash
     old_sources = await db.get_memory_sources(old.id)
     assert any(source.source_type == "confluence" for source in old_sources)
+
+
+@pytest.mark.asyncio
+async def test_authorized_correction_fails_atomically_when_support_changes_after_authority_snapshot(
+    db: Database,
+    monkeypatch,
+):
+    old = await _source_backed_memory(db, suffix="authority-snapshot", source_owner="alice")
+    additional = await _source_backed_memory(db, suffix="late-support", source_owner="bob")
+    store = _store(db, RecordingCollection())
+    service = MemoryLifecycleService(db=db, memory_store=store)
+    original_states = db.get_active_memory_support_states
+    injected = False
+
+    async def inject_after_snapshot(result):
+        nonlocal injected
+        if not injected:
+            injected = True
+            await _move_source_support(db, from_memory=additional, to_memory=old)
+        return result
+
+    async def states_then_change(memory_ids):
+        result = await original_states(memory_ids)
+        return await inject_after_snapshot(result)
+
+    monkeypatch.setattr(db, "get_active_memory_support_states", states_then_change)
+
+    with pytest.raises(MemoryLifecycleConflict, match="memory_correction_support_set_changed"):
+        await service.propose_memory_correction(
+            old.id,
+            replacement_content="A stale-authority correction must not commit.",
+            provenance="Alice proposed this before Bob's Support appeared.",
+            reason="Exercise the authority snapshot stale guard.",
+            expected_content_hash=old.content_hash,
+            authority=_authority("alice", "member"),
+        )
+
+    stored_old = await db.get_memory(old.id)
+    assert stored_old is not None and stored_old.status == "active"
+    assert await db.count_memories() == 1
+    assert await db.count_documents("user_correction") == 0
+    assert await db.count_memory_reviews() == 0
+
+
+@pytest.mark.asyncio
+async def test_authorized_correction_rolls_back_staging_when_atomic_resolution_fails(
+    db: Database,
+    monkeypatch,
+):
+    old = await _source_backed_memory(db, suffix="atomic-rollback", source_owner="alice")
+    service = MemoryLifecycleService(db=db, memory_store=_store(db, RecordingCollection()))
+
+    async def fail_vector_outbox(*_args, **_kwargs):
+        raise RuntimeError("forced atomic resolution failure")
+
+    monkeypatch.setattr(db, "_enqueue_review_vector_task_unlocked", fail_vector_outbox)
+
+    with pytest.raises(RuntimeError, match="forced atomic resolution failure"):
+        await service.propose_memory_correction(
+            old.id,
+            replacement_content="This correction must roll back with its Review.",
+            provenance="Alice supplied the correction.",
+            reason="Exercise atomic staging rollback.",
+            expected_content_hash=old.content_hash,
+            authority=_authority("alice", "member"),
+        )
+
+    stored_old = await db.get_memory(old.id)
+    assert stored_old is not None and stored_old.status == "active"
+    assert await db.count_memories() == 1
+    assert await db.get_active_memory_support_reference_ids(old.id) == ("eref-atomic-rollback",)
+    assert await db.count_documents("user_correction") == 0
+    assert await db.count_memory_reviews() == 0
+
+
+@pytest.mark.asyncio
+async def test_authorized_correction_rejects_non_correction_document_provenance(
+    db: Database,
+    monkeypatch,
+):
+    old = await _source_backed_memory(db, suffix="provenance-guard", source_owner="alice")
+    service = MemoryLifecycleService(db=db, memory_store=_store(db, RecordingCollection()))
+    original_builder = service._build_correction_document
+
+    def build_wrong_source_document(**kwargs):
+        return replace(original_builder(**kwargs), source="jira")
+
+    monkeypatch.setattr(service, "_build_correction_document", build_wrong_source_document)
+
+    with pytest.raises(MemoryLifecycleConflict, match="memory_correction_target_changed"):
+        await service.propose_memory_correction(
+            old.id,
+            replacement_content="This correction has invalid provenance.",
+            provenance="Alice supplied the correction.",
+            reason="Exercise the persistence provenance guard.",
+            expected_content_hash=old.content_hash,
+            authority=_authority("alice", "member"),
+        )
+
+    assert await db.count_memories() == 1
+    assert await db.count_documents("user_correction") == 0
+    assert await db.count_memory_reviews() == 0
 
 
 @pytest.mark.asyncio

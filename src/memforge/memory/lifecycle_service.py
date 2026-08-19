@@ -13,8 +13,6 @@ from typing import Literal
 
 from memforge.agent_knowledge import AgentKnowledgeBundleService
 from memforge.memory.correction_authority import CorrectionAuthority
-from memforge.memory.review_decision import memory_review_decision_fingerprint
-from memforge.memory.review_service import ReviewService
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     DocumentRecord,
@@ -323,20 +321,14 @@ class MemoryLifecycleService:
                 review_id="",
             )
 
-        support_evidence = await self.db.get_active_memory_support_evidence(old.id)
-        expected_support_set_hash = (
-            await self.db.get_memory_support_set_hash(old.id)
-            if support_evidence
-            else None
-        )
+        support_state = (await self.db.get_active_memory_support_states((old.id,)))[old.id]
+        expected_support_set_hash = support_state.support_set_hash if support_state.reference_ids else None
         can_apply = await self._can_apply_correction(
             old,
             authority=authority,
-            supporting_source_ids=tuple(
-                dict.fromkeys(item.source_id for item in support_evidence)
-            ),
+            supporting_source_ids=support_state.source_ids,
         )
-        if not can_apply and not support_evidence:
+        if not can_apply and not support_state.reference_ids:
             raise MemoryLifecycleConflict(
                 "workspace_memory_correction_requires_management_authority"
             )
@@ -354,7 +346,7 @@ class MemoryLifecycleService:
             confidence=old.confidence,
             created_at=now,
             updated_at=now,
-            status="pending_review",
+            status="active" if can_apply else "pending_review",
             extraction_context=provenance,
         )
         correction_doc_id = f"correction-{challenger.id}"
@@ -376,7 +368,7 @@ class MemoryLifecycleService:
             replacement_kind=replacement_kind,
             created_at=now,
         )
-        await self._write_correction_document(
+        correction_document = self._build_correction_document(
             doc_id=correction_doc_id,
             old_memory=old,
             replacement_content=replacement_content,
@@ -385,20 +377,20 @@ class MemoryLifecycleService:
             replacement_kind=replacement_kind,
             observed_at=now,
         )
-        try:
-            await self.memory_store.insert_memory(
-                challenger,
-                correction_doc_id,
-                "user_correction",
-                source_updated_at=now,
-                excerpt=provenance,
-                review=review,
-            )
-        except Exception:
-            await self.db.delete_document(correction_doc_id)
-            raise
-
         if not can_apply:
+            await self.db.upsert_document(correction_document)
+            try:
+                await self.memory_store.insert_memory(
+                    challenger,
+                    correction_doc_id,
+                    "user_correction",
+                    source_updated_at=now,
+                    excerpt=provenance,
+                    review=review,
+                )
+            except Exception:
+                await self.db.delete_document(correction_doc_id)
+                raise
             return ProposeMemoryCorrectionResult(
                 memory_id=old.id,
                 replacement_memory_id=challenger.id,
@@ -408,17 +400,21 @@ class MemoryLifecycleService:
                 review_id=review.id,
             )
 
-        resolved = await ReviewService(
-            db=self.db,
-            memory_store=self.memory_store,
-        ).approve(
-            review.id,
-            reviewer=actor_user_id,
-            note=reason,
-            expected_fingerprint=memory_review_decision_fingerprint(review),
-        )
-        if resolved.review is None or resolved.review.status != ReviewStatus.APPROVED.value:
-            raise MemoryLifecycleConflict("memory_correction_not_applied")
+        try:
+            await self.memory_store.apply_authorized_memory_correction(
+                document=correction_document,
+                incumbent=old,
+                challenger=challenger,
+                review=review,
+                reviewer=actor_user_id,
+                review_note=reason,
+            )
+        except ValueError as exc:
+            if "support set changed" in str(exc):
+                raise MemoryLifecycleConflict("memory_correction_support_set_changed") from exc
+            if "active source support" in str(exc):
+                raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review") from exc
+            raise MemoryLifecycleConflict("memory_correction_target_changed") from exc
         return ProposeMemoryCorrectionResult(
             memory_id=old.id,
             replacement_memory_id=challenger.id,
@@ -468,7 +464,7 @@ class MemoryLifecycleService:
             raise MemoryLifecycleConflict("content_hash_mismatch")
         return memory
 
-    async def _write_correction_document(
+    def _build_correction_document(
         self,
         *,
         doc_id: str,
@@ -478,7 +474,7 @@ class MemoryLifecycleService:
         reason: str,
         replacement_kind: ReplacementKind,
         observed_at: datetime,
-    ) -> None:
+    ) -> DocumentRecord:
         lines = [
             f"Target memory: {old_memory.id}",
             f"Replacement kind: {replacement_kind}",
@@ -487,26 +483,30 @@ class MemoryLifecycleService:
         lines.extend(["", "Provenance:", provenance])
         lines.extend(["", "Replacement content:", replacement_content])
         document_body = "\n".join(lines)
-        await self.db.upsert_document(
-            DocumentRecord(
-                doc_id=doc_id,
-                source="user_correction",
-                source_url=f"memforge://memory-corrections/{doc_id}",
-                title=f"User correction for {old_memory.id}",
-                space_or_project=old_memory.project_key or "UNSORTED",
-                author=None,
-                last_modified=observed_at,
-                labels=["user_correction"],
-                version=content_hash(document_body),
-                content_hash=content_hash(document_body),
-                token_count=len(document_body.split()),
-                raw_content_uri=None,
-                raw_content_type=None,
-                normalized_content_uri=None,
-                pdf_content_uri=None,
-                last_synced=observed_at,
-            )
+        return DocumentRecord(
+            doc_id=doc_id,
+            source="user_correction",
+            source_url=f"memforge://memory-corrections/{doc_id}",
+            title=f"User correction for {old_memory.id}",
+            space_or_project=old_memory.project_key or "UNSORTED",
+            author=None,
+            last_modified=observed_at,
+            labels=["user_correction"],
+            version=content_hash(document_body),
+            content_hash=content_hash(document_body),
+            token_count=len(document_body.split()),
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=observed_at,
         )
+
+    async def _write_correction_document(
+        self,
+        **kwargs,
+    ) -> None:
+        await self.db.upsert_document(self._build_correction_document(**kwargs))
 
     async def _write_user_memory_document(
         self,
