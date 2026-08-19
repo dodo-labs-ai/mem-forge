@@ -143,6 +143,111 @@ async def db(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_real_candidate_can_be_annotated_before_ground_truth_exists(db) -> None:
+    evaluation = OfflineAgentEvaluation(db, executors={})
+    case = await evaluation.curate_case(
+        case_kind=AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION,
+        source_id="src-teams",
+        doc_id="doc-real-candidate",
+        source_unit_id="teams-channel:real-candidate",
+        manifest={
+            "new_extractions": [],
+            "incumbents": [
+                {
+                    "id": "mem-real",
+                    "content": "Tracing starts with traceId.",
+                    "content_hash": "a" * 64,
+                    "memory_type": "procedure",
+                }
+            ],
+            "doc_type": "teams",
+            "updated_document": "Tracing starts with traceId.",
+        },
+        promotion_policy_version="real-runtime-artifact-v1",
+        created_by="reviewer-1",
+    )
+    candidate = await evaluation.record_calibration_candidate(
+        case_id=case.case_id,
+        output={
+            "case_kind": case.case_kind.value,
+            "operations": [
+                {
+                    "action": "noop",
+                    "memory_id": "mem-real",
+                    "memory": None,
+                    "reason_code": "unchanged",
+                    "flag_for_review": False,
+                }
+            ],
+            "failure": None,
+        },
+        provenance={
+            "kind": "source_derivation",
+            "derivation_id": "sdrv-real",
+            "target_unit_revision_id": "unitrev-real",
+        },
+        created_by="reviewer-1",
+    )
+    assert await db.get_accepted_ground_truth_revision("missing") is None
+    policy = await evaluation.approve_langfuse_human_calibration_content(
+        source_id=case.source_id,
+        policy_version="candidate-bootstrap-v1",
+        queue_id="queue-reviewer-1",
+        approved_by="reviewer-1",
+    )
+    adapter = _FixedAnnotationAdapter()
+    exchange = ExternalAnnotationExchange(db, evaluation, adapter)
+
+    queued = await exchange.export(
+        candidate_id=candidate.candidate_id,
+        content_policy_id=policy.content_policy_id,
+        criterion="semantic_intent",
+        rubric_version="semantic-rubric-v1",
+        actor_user_id="reviewer-1",
+        provider_reviewer_id="langfuse-user-1",
+        queue_id="queue-reviewer-1",
+        score_config_id="config-1",
+        lease_owner="web-1",
+    )
+    assert queued.result_id is None
+    assert queued.candidate_id == candidate.candidate_id
+    imported = await exchange.import_completed(
+        task_id=queued.task_id,
+        submitted_by="reviewer-1",
+        lease_owner="web-2",
+    )
+
+    assessment = await db.get_agent_assessment(str(imported.assessment_id))
+    assert assessment is not None
+    assert assessment.target_result_id is None
+    assert assessment.target_candidate_id == candidate.candidate_id
+    assert assessment.label == "pass"
+    assert await db.list_agent_assessments_for_candidate(candidate.candidate_id) == [
+        assessment
+    ]
+    second = await evaluation.record_human_annotation(
+        candidate_id=candidate.candidate_id,
+        content_policy_id=policy.content_policy_id,
+        criterion="semantic_intent",
+        label="pass",
+        reason_code="required_claim_present",
+        rubric_version="semantic-rubric-v1",
+        reviewer_id="reviewer-2",
+    )
+    ground_truth = await evaluation.adjudicate_ground_truth(
+        case_id=case.case_id,
+        supporting_assessment_ids=(assessment.assessment_id, second.assessment_id),
+        rubric={"required_claims": ["traceId starts the diagnostic workflow"]},
+        acceptance_policy_version="two-reviewer-v1",
+        adjudication_note="Both reviewers accepted the real candidate output.",
+        accepted_by="reviewer-1",
+    )
+    assert ground_truth.supporting_assessment_ids == tuple(
+        sorted((assessment.assessment_id, second.assessment_id))
+    )
+
+
+@pytest.mark.asyncio
 async def test_offline_evaluation_records_frozen_lineage_and_result_assessments(db) -> None:
     executor = _FixedExecutor()
     evaluation = OfflineAgentEvaluation(

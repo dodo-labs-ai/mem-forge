@@ -145,6 +145,7 @@ class LangfuseAnnotationAdapter:
             metadata={
                 "task_id": task.task_id,
                 "result_id": task.result_id,
+                "candidate_id": task.candidate_id,
                 "case_id": protected.case_id,
                 "criterion": task.criterion,
                 "rubric_version": task.rubric_version,
@@ -276,6 +277,8 @@ def _annotation_presentation(
 ) -> dict[str, dict[str, object]]:
     if protected.case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION:
         review, candidate = _reconciliation_presentation(protected)
+    elif protected.case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
+        review, candidate = _derivation_presentation(protected)
     else:
         review = {
             "title": "Review candidate Memory extraction",
@@ -298,6 +301,54 @@ def _annotation_presentation(
             "debug_details": {"candidate_output": dict(protected.candidate_output)},
         },
     }
+
+
+def _derivation_presentation(
+    protected: AgentEvaluationAnnotationTask,
+) -> tuple[dict[str, object], dict[str, object]]:
+    context = protected.case_manifest.get("context")
+    context_mapping = context if isinstance(context, Mapping) else {}
+    document = context_mapping.get("document")
+    document_mapping = document if isinstance(document, Mapping) else {}
+    extraction = protected.candidate_output.get("extraction")
+    extraction_mapping = extraction if isinstance(extraction, Mapping) else {}
+    memories = _mapping_items(extraction_mapping.get("memories"))
+    source: dict[str, object] = {
+        "type": str(context_mapping.get("doc_type") or "source"),
+        "title": str(document_mapping.get("title") or "Untitled source item"),
+        "candidate_memory_count": len(memories),
+    }
+    current_content = context_mapping.get("document_content")
+    if current_content is not None:
+        source["current_content"] = current_content
+    proposed = []
+    for memory in memories:
+        item: dict[str, object] = {
+            "type": str(memory.get("memory_type") or "fact"),
+            "content": str(memory.get("content") or ""),
+        }
+        if memory.get("evidence_quote"):
+            item["source_evidence"] = memory["evidence_quote"]
+        proposed.append(item)
+    memory_word = "Memory" if len(memories) == 1 else "Memories"
+    return (
+        {
+            "title": "Review extracted Memories",
+            "question": (
+                "Are these extracted Memories accurate, useful, and supported "
+                "by the source evidence?"
+            ),
+            "source": source,
+            "important": (
+                "Submitting this review records a label only. "
+                "It does not change production Memory."
+            ),
+        },
+        {
+            "summary": f"Extract {len(memories)} {memory_word}",
+            "proposed_memories": proposed,
+        },
+    )
 
 
 def _reconciliation_presentation(
@@ -410,7 +461,8 @@ class ExternalAnnotationExchange:
     async def export(
         self,
         *,
-        result_id: str,
+        result_id: str | None = None,
+        candidate_id: str | None = None,
         content_policy_id: str,
         criterion: str,
         rubric_version: str,
@@ -429,6 +481,7 @@ class ExternalAnnotationExchange:
         reviewer_id = f"langfuse:{binding.project_ref}:{binding.reviewer_id}"
         task, protected = await self._evaluation.prepare_langfuse_annotation_task(
             result_id=result_id,
+            candidate_id=candidate_id,
             content_policy_id=content_policy_id,
             criterion=criterion,
             rubric_version=rubric_version,
@@ -544,6 +597,7 @@ class ExternalAnnotationExchange:
             )
             assessment = await self._evaluation.build_human_annotation(
                 result_id=claimed.result_id,
+                candidate_id=claimed.candidate_id,
                 content_policy_id=claimed.content_policy_id,
                 criterion=claimed.criterion,
                 label=imported.label,  # type: ignore[arg-type]

@@ -280,15 +280,31 @@ class AgentEvaluationContentPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentEvaluationCandidate:
+    """One immutable candidate output awaiting human calibration."""
+
+    candidate_id: str
+    case_id: str
+    output: Mapping[str, object]
+    output_hash: str
+    provenance: Mapping[str, object]
+    provenance_hash: str
+    created_by: str
+    created_at: str
+    schema_version: str = OFFLINE_EVALUATION_SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
 class AgentEvaluationAnnotationTask:
     """Blinded case and candidate content presented to one authorized reviewer."""
 
-    result_id: str
+    result_id: str | None
     case_id: str
     case_kind: AgentEvaluationCaseKind
     content_policy_id: str
     case_manifest: Mapping[str, object]
     candidate_output: Mapping[str, object]
+    candidate_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,7 +312,7 @@ class ExternalAnnotationTask:
     """Content-free durable bridge to one external human-review task."""
 
     task_id: str
-    result_id: str
+    result_id: str | None
     content_policy_id: str
     criterion: str
     rubric_version: str
@@ -322,12 +338,12 @@ class ExternalAnnotationTask:
     provider_score_updated_at: str | None = None
     provider_score_fingerprint: str | None = None
     assessment_id: str | None = None
-    schema_version: str = "1"
+    candidate_id: str | None = None
+    schema_version: str = "2"
 
     def __post_init__(self) -> None:
         for name in (
             "task_id",
-            "result_id",
             "content_policy_id",
             "criterion",
             "rubric_version",
@@ -339,6 +355,14 @@ class ExternalAnnotationTask:
             "score_config_id",
         ):
             _required(name, str(getattr(self, name)))
+        if (self.result_id is None) == (self.candidate_id is None):
+            raise ValueError(
+                "external annotation task requires exactly one result or candidate target"
+            )
+        if self.result_id is not None:
+            _required("result_id", self.result_id)
+        if self.candidate_id is not None:
+            _required("candidate_id", self.candidate_id)
         _require_hex_digest("score_config_fingerprint", self.score_config_fingerprint)
         _require_hex_digest("protected_payload_hash", self.protected_payload_hash)
         if len(self.trace_id) != 32 or any(
@@ -388,6 +412,7 @@ def external_annotation_task_identity(
     return (
         task.task_id,
         task.result_id,
+        task.candidate_id,
         task.content_policy_id,
         task.criterion,
         task.rubric_version,
@@ -574,6 +599,12 @@ class OfflineEvaluationStore(Protocol):
     async def get_agent_evaluation_content_policy(
         self, content_policy_id: str
     ) -> AgentEvaluationContentPolicy | None: ...
+    async def record_agent_evaluation_candidate(
+        self, candidate: AgentEvaluationCandidate
+    ) -> None: ...
+    async def get_agent_evaluation_candidate(
+        self, candidate_id: str
+    ) -> AgentEvaluationCandidate | None: ...
     async def admit_external_annotation_task(
         self, task: ExternalAnnotationTask
     ) -> ExternalAnnotationTask: ...
@@ -669,6 +700,9 @@ class OfflineEvaluationStore(Protocol):
     ) -> AgentAssessment | None: ...
     async def list_agent_assessments_for_result(
         self, result_id: str
+    ) -> list[AgentAssessment]: ...
+    async def list_agent_assessments_for_candidate(
+        self, candidate_id: str
     ) -> list[AgentAssessment]: ...
 
 
@@ -1060,36 +1094,79 @@ class OfflineAgentEvaluation:
         await self._store.record_agent_evaluation_content_policy(policy)
         return policy
 
+    async def record_calibration_candidate(
+        self,
+        *,
+        case_id: str,
+        output: Mapping[str, object],
+        provenance: Mapping[str, object],
+        created_by: str,
+        created_at: str | None = None,
+    ) -> AgentEvaluationCandidate:
+        """Persist one real candidate before any Ground Truth exists."""
+
+        case = await self._require_case(case_id)
+        await self._store.authorize_agent_evaluation_source(case.source_id, created_by)
+        output_payload = _canonical_mapping(output)
+        provenance_payload = _canonical_mapping(provenance)
+        output_hash = _hash(output_payload)
+        provenance_hash = _hash(provenance_payload)
+        candidate = AgentEvaluationCandidate(
+            candidate_id=_id(
+                "aecd",
+                case.case_id,
+                output_hash,
+                provenance_hash,
+            ),
+            case_id=case.case_id,
+            output=output_payload,
+            output_hash=output_hash,
+            provenance=provenance_payload,
+            provenance_hash=provenance_hash,
+            created_by=_required("created_by", created_by),
+            created_at=created_at or _now(),
+        )
+        existing = await self._store.get_agent_evaluation_candidate(
+            candidate.candidate_id
+        )
+        if existing is not None:
+            return existing
+        await self._store.record_agent_evaluation_candidate(candidate)
+        return candidate
+
     async def prepare_human_annotation(
         self,
         *,
-        result_id: str,
+        result_id: str | None = None,
+        candidate_id: str | None = None,
         content_policy_id: str,
         reviewer_id: str,
     ) -> AgentEvaluationAnnotationTask:
         """Return protected content only after source and policy authorization."""
 
-        result, case, policy = await self._human_annotation_context(
+        result, candidate, case, policy = await self._human_annotation_subject_context(
             result_id=result_id,
+            candidate_id=candidate_id,
             content_policy_id=content_policy_id,
             reviewer_id=reviewer_id,
             allowed_profiles=frozenset({AgentEvaluationContentProfile.HUMAN_CALIBRATION}),
         )
-        if result.output is None:
-            raise ValueError("human annotation requires a completed candidate output")
+        output = result.output if result is not None else candidate.output
         return AgentEvaluationAnnotationTask(
-            result_id=result.result_id,
+            result_id=result.result_id if result is not None else None,
+            candidate_id=candidate.candidate_id if candidate is not None else None,
             case_id=case.case_id,
             case_kind=case.case_kind,
             content_policy_id=policy.content_policy_id,
             case_manifest=_canonical_mapping(case.manifest),
-            candidate_output=_canonical_mapping(result.output),
+            candidate_output=_canonical_mapping(output),
         )
 
     async def prepare_langfuse_annotation_task(
         self,
         *,
-        result_id: str,
+        result_id: str | None = None,
+        candidate_id: str | None = None,
         content_policy_id: str,
         criterion: str,
         rubric_version: str,
@@ -1104,8 +1181,9 @@ class OfflineAgentEvaluation:
     ) -> tuple[ExternalAnnotationTask, AgentEvaluationAnnotationTask]:
         """Admit one reviewer-specific external task without exporting content."""
 
-        result, case, policy = await self._human_annotation_context(
+        result, candidate, case, policy = await self._human_annotation_subject_context(
             result_id=result_id,
+            candidate_id=candidate_id,
             content_policy_id=content_policy_id,
             reviewer_id=actor_user_id,
             allowed_profiles=frozenset(
@@ -1114,15 +1192,15 @@ class OfflineAgentEvaluation:
         )
         if policy.recipient_queue_id != queue_id:
             raise PermissionError("content policy does not authorize this annotation queue")
-        if result.output is None:
-            raise ValueError("human annotation requires a completed candidate output")
+        output = result.output if result is not None else candidate.output
+        target_id = result.result_id if result is not None else candidate.candidate_id
         task_payload = {
             "case_manifest": _canonical_mapping(case.manifest),
-            "candidate_output": _canonical_mapping(result.output),
+            "candidate_output": _canonical_mapping(output),
         }
         task_id = _id(
             "aet",
-            result.result_id,
+            target_id,
             policy.content_policy_id,
             _required("criterion", criterion),
             _required("rubric_version", rubric_version),
@@ -1131,7 +1209,8 @@ class OfflineAgentEvaluation:
         now = prepared_at or _now()
         task = ExternalAnnotationTask(
             task_id=task_id,
-            result_id=result.result_id,
+            result_id=result.result_id if result is not None else None,
+            candidate_id=candidate.candidate_id if candidate is not None else None,
             content_policy_id=policy.content_policy_id,
             criterion=criterion,
             rubric_version=rubric_version,
@@ -1156,7 +1235,8 @@ class OfflineAgentEvaluation:
         )
         admitted = await self._store.admit_external_annotation_task(task)
         return admitted, AgentEvaluationAnnotationTask(
-            result_id=result.result_id,
+            result_id=result.result_id if result is not None else None,
+            candidate_id=candidate.candidate_id if candidate is not None else None,
             case_id=case.case_id,
             case_kind=case.case_kind,
             content_policy_id=policy.content_policy_id,
@@ -1167,7 +1247,8 @@ class OfflineAgentEvaluation:
     async def record_human_annotation(
         self,
         *,
-        result_id: str,
+        result_id: str | None = None,
+        candidate_id: str | None = None,
         content_policy_id: str,
         criterion: str,
         label: AgentAssessmentLabel,
@@ -1183,6 +1264,7 @@ class OfflineAgentEvaluation:
 
         assessment = await self.build_human_annotation(
             result_id=result_id,
+            candidate_id=candidate_id,
             content_policy_id=content_policy_id,
             criterion=criterion,
             label=label,
@@ -1205,7 +1287,8 @@ class OfflineAgentEvaluation:
     async def build_human_annotation(
         self,
         *,
-        result_id: str,
+        result_id: str | None = None,
+        candidate_id: str | None = None,
         content_policy_id: str,
         criterion: str,
         label: AgentAssessmentLabel,
@@ -1219,8 +1302,9 @@ class OfflineAgentEvaluation:
     ) -> AgentAssessment:
         """Validate and build one immutable human judgment without persisting it."""
 
-        result, _case, policy = await self._human_annotation_context(
+        result, candidate, _case, policy = await self._human_annotation_subject_context(
             result_id=result_id,
+            candidate_id=candidate_id,
             content_policy_id=content_policy_id,
             reviewer_id=submitted_by or reviewer_id,
             allowed_profiles=frozenset(
@@ -1248,7 +1332,7 @@ class OfflineAgentEvaluation:
         return AgentAssessment(
             assessment_id=_id(
                 "aas",
-                result.result_id,
+                result.result_id if result is not None else candidate.candidate_id,
                 criterion,
                 "human",
                 reviewer_id,
@@ -1258,7 +1342,10 @@ class OfflineAgentEvaluation:
                 policy.content_policy_id,
             ),
             target_event_id=None,
-            target_result_id=result.result_id,
+            target_result_id=result.result_id if result is not None else None,
+            target_candidate_id=(
+                candidate.candidate_id if candidate is not None else None
+            ),
             criterion=criterion,
             status="completed",
             label=label,
@@ -1298,7 +1385,10 @@ class OfflineAgentEvaluation:
         if any(
             assessment.annotator_kind != "human"
             or assessment.status != "completed"
-            or assessment.target_result_id is None
+            or (
+                (assessment.target_result_id is None)
+                == (assessment.target_candidate_id is None)
+            )
             or assessment.annotator_id is None
             or assessment.content_policy_id is None
             for assessment in assessments
@@ -1313,18 +1403,30 @@ class OfflineAgentEvaluation:
         }
         if len(content_policy_ids) != 1:
             raise ValueError("adjudication annotations must use the same content policy")
-        if len({assessment.target_result_id for assessment in assessments}) != 1:
-            raise ValueError("adjudication annotations must target the same result")
+        targets = {
+            (
+                "result",
+                assessment.target_result_id,
+            )
+            if assessment.target_result_id is not None
+            else (
+                "candidate",
+                assessment.target_candidate_id,
+            )
+            for assessment in assessments
+        }
+        if len(targets) != 1:
+            raise ValueError("adjudication annotations must target the same subject")
         if len({assessment.criterion for assessment in assessments}) != 1:
             raise ValueError("adjudication annotations must use the same criterion")
         if len({assessment.evaluator_version for assessment in assessments}) != 1:
             raise ValueError("adjudication annotations must use the same rubric version")
-        [target_result_id] = {
-            assessment.target_result_id for assessment in assessments if assessment.target_result_id
-        }
+        [(target_kind, target_id)] = targets
         [content_policy_id] = content_policy_ids
-        _target_result, target_case, _content_policy = await self._human_annotation_context(
-            result_id=target_result_id,
+        _target_result, _target_candidate, target_case, _content_policy = (
+            await self._human_annotation_subject_context(
+            result_id=str(target_id) if target_kind == "result" else None,
+            candidate_id=str(target_id) if target_kind == "candidate" else None,
             content_policy_id=content_policy_id,
             reviewer_id=accepted_by,
             allowed_profiles=frozenset(
@@ -1333,6 +1435,7 @@ class OfflineAgentEvaluation:
                     AgentEvaluationContentProfile.LANGFUSE_HUMAN_CALIBRATION,
                 }
             ),
+            )
         )
         if target_case.case_id != case.case_id:
             raise ValueError("adjudication annotations do not belong to the requested case")
@@ -2122,6 +2225,54 @@ class OfflineAgentEvaluation:
             raise ValueError("human calibration accepts only calibration-role results")
         return result, case, policy
 
+    async def _human_annotation_subject_context(
+        self,
+        *,
+        result_id: str | None,
+        candidate_id: str | None,
+        content_policy_id: str,
+        reviewer_id: str,
+        allowed_profiles: frozenset[AgentEvaluationContentProfile],
+    ) -> tuple[
+        AgentEvaluationResult | None,
+        AgentEvaluationCandidate | None,
+        AgentEvaluationCase,
+        AgentEvaluationContentPolicy,
+    ]:
+        if (result_id is None) == (candidate_id is None):
+            raise ValueError(
+                "human annotation requires exactly one result or candidate target"
+            )
+        if result_id is not None:
+            result, case, policy = await self._human_annotation_context(
+                result_id=result_id,
+                content_policy_id=content_policy_id,
+                reviewer_id=reviewer_id,
+                allowed_profiles=allowed_profiles,
+            )
+            if result.output is None:
+                raise ValueError("human annotation requires a completed candidate output")
+            return result, None, case, policy
+
+        candidate = await self._store.get_agent_evaluation_candidate(
+            str(candidate_id)
+        )
+        if candidate is None:
+            raise KeyError(f"unknown evaluation candidate: {candidate_id}")
+        case = await self._require_case(candidate.case_id)
+        await self._store.authorize_agent_evaluation_source(case.source_id, reviewer_id)
+        policy = await self._store.get_agent_evaluation_content_policy(content_policy_id)
+        if policy is None:
+            raise PermissionError("protected evaluation content requires an approved policy")
+        if (
+            policy.source_id != case.source_id
+            or policy.profile not in allowed_profiles
+        ):
+            raise PermissionError(
+                "content policy does not authorize this evaluation candidate"
+            )
+        return None, candidate, case, policy
+
     async def _require_case(self, case_id: str) -> AgentEvaluationCase:
         case = await self._store.get_agent_evaluation_case(case_id)
         if case is None:
@@ -2472,6 +2623,30 @@ def agent_evaluation_content_policy_from_payload(
     )
 
 
+def agent_evaluation_candidate_to_payload(
+    candidate: AgentEvaluationCandidate,
+) -> dict[str, object]:
+    return {name: getattr(candidate, name) for name in candidate.__dataclass_fields__}
+
+
+def agent_evaluation_candidate_from_payload(
+    payload: Mapping[str, object],
+) -> AgentEvaluationCandidate:
+    return AgentEvaluationCandidate(
+        candidate_id=str(payload["candidate_id"]),
+        case_id=str(payload["case_id"]),
+        output=_canonical_mapping(_mapping(payload, "output")),
+        output_hash=str(payload["output_hash"]),
+        provenance=_canonical_mapping(_mapping(payload, "provenance")),
+        provenance_hash=str(payload["provenance_hash"]),
+        created_by=str(payload["created_by"]),
+        created_at=str(payload["created_at"]),
+        schema_version=str(
+            payload.get("schema_version") or OFFLINE_EVALUATION_SCHEMA_VERSION
+        ),
+    )
+
+
 def external_annotation_task_to_payload(
     task: ExternalAnnotationTask,
 ) -> dict[str, object]:
@@ -2485,7 +2660,7 @@ def external_annotation_task_from_payload(
 ) -> ExternalAnnotationTask:
     return ExternalAnnotationTask(
         task_id=str(payload["task_id"]),
-        result_id=str(payload["result_id"]),
+        result_id=_optional_str(payload.get("result_id")),
         content_policy_id=str(payload["content_policy_id"]),
         criterion=str(payload["criterion"]),
         rubric_version=str(payload["rubric_version"]),
@@ -2515,6 +2690,7 @@ def external_annotation_task_from_payload(
             payload.get("provider_score_fingerprint")
         ),
         assessment_id=_optional_str(payload.get("assessment_id")),
+        candidate_id=_optional_str(payload.get("candidate_id")),
         schema_version=str(payload.get("schema_version") or "1"),
     )
 

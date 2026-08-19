@@ -191,6 +191,63 @@ def test_annotation_subject_starts_with_business_readable_review() -> None:
     assert payload["metadata"]["presentation_version"] == "1"
 
 
+def test_derivation_annotation_presents_source_and_extracted_memories() -> None:
+    calls = []
+    client = SimpleNamespace(
+        start_observation=lambda **kwargs: calls.append(kwargs)
+        or SimpleNamespace(id="observation-1"),
+    )
+    adapter = LangfuseAnnotationAdapter(client)
+    task = replace(_adapter_and_task()[1], result_id=None, candidate_id="aecd-1")
+    protected = AgentEvaluationAnnotationTask(
+        result_id=None,
+        candidate_id="aecd-1",
+        case_id="aec-1",
+        case_kind=AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION,
+        content_policy_id="aep-1",
+        case_manifest={
+            "context": {
+                "doc_type": "jira",
+                "document_content": "The fix ships in Q1/2027.",
+                "document": {"title": "SFPAY-1 release dependency"},
+            }
+        },
+        candidate_output={
+            "case_kind": "source_unit_derivation_v1",
+            "extraction": {
+                "memories": [
+                    {
+                        "memory_type": "fact",
+                        "content": "The fix ships in Q1/2027.",
+                        "evidence_quote": "ships in Q1/2027",
+                    }
+                ]
+            },
+            "error_type": None,
+        },
+    )
+
+    adapter.start_subject(task, protected)
+
+    payload = calls[0]
+    assert payload["input"]["review"]["question"] == (
+        "Are these extracted Memories accurate, useful, and supported by the source evidence?"
+    )
+    assert payload["input"]["review"]["source"]["title"] == (
+        "SFPAY-1 release dependency"
+    )
+    assert payload["output"]["candidate"] == {
+        "summary": "Extract 1 Memory",
+        "proposed_memories": [
+            {
+                "type": "fact",
+                "content": "The fix ships in Q1/2027.",
+                "source_evidence": "ships in Q1/2027",
+            }
+        ],
+    }
+
+
 def test_completed_annotation_rejects_config_drift() -> None:
     adapter, task, api = _adapter_and_task()
     api.score_configs.description = "Changed rubric."

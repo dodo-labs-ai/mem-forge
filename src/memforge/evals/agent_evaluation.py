@@ -24,7 +24,7 @@ from typing import Callable, ContextManager, Iterator, Literal, Mapping, Protoco
 
 
 AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v3"
-AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v4"
+AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v5"
 SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION = "source-unit-lifecycle-v1"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
 AgentAssessmentStatus = Literal["completed", "failed"]
@@ -258,7 +258,7 @@ class AgentRuntimeEventQuery:
 
 @dataclass(frozen=True, slots=True)
 class AgentAssessment:
-    """One versioned judgment over one online event or offline result."""
+    """One versioned judgment over one online event, offline result, or calibration candidate."""
 
     assessment_id: str
     target_event_id: str | None
@@ -271,6 +271,7 @@ class AgentAssessment:
     evaluator_version: str
     created_at: datetime
     target_result_id: str | None = None
+    target_candidate_id: str | None = None
     annotator_id: str | None = None
     content_policy_id: str | None = None
     input_fingerprint: str | None = None
@@ -288,12 +289,21 @@ class AgentAssessment:
             "evaluator_version",
         ):
             _require_safe_identifier(name, getattr(self, name))
-        if (self.target_event_id is None) == (self.target_result_id is None):
-            raise ValueError("assessment requires exactly one event or result target")
+        targets = (
+            self.target_event_id,
+            self.target_result_id,
+            self.target_candidate_id,
+        )
+        if sum(value is not None for value in targets) != 1:
+            raise ValueError(
+                "assessment requires exactly one event, result, or candidate target"
+            )
         if self.target_event_id is not None:
             _require_safe_identifier("target_event_id", self.target_event_id)
         if self.target_result_id is not None:
             _require_safe_identifier("target_result_id", self.target_result_id)
+        if self.target_candidate_id is not None:
+            _require_safe_identifier("target_candidate_id", self.target_candidate_id)
         if self.annotator_id is not None:
             _require_bounded_principal_id("annotator_id", self.annotator_id)
         if self.content_policy_id is not None:
@@ -1332,6 +1342,7 @@ def _langfuse_assessment_metadata(
         "assessment_id": assessment.assessment_id,
         "target_event_id": assessment.target_event_id,
         "target_result_id": assessment.target_result_id,
+        "target_candidate_id": assessment.target_candidate_id,
         "schema_version": assessment.schema_version,
         "reason_code": assessment.reason_code,
         "annotator_kind": assessment.annotator_kind,

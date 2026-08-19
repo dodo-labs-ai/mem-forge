@@ -150,6 +150,7 @@ from memforge.evals.agent_evaluation import (
 from memforge.evals.offline_evaluation import (
     AcceptedGroundTruthRevision,
     AgentEvaluationCase,
+    AgentEvaluationCandidate,
     AgentEvaluationCohort,
     AgentEvaluationContentPolicy,
     AgentEvaluationExecutionState,
@@ -163,6 +164,8 @@ from memforge.evals.offline_evaluation import (
     accepted_ground_truth_to_payload,
     agent_evaluation_case_from_payload,
     agent_evaluation_case_to_payload,
+    agent_evaluation_candidate_from_payload,
+    agent_evaluation_candidate_to_payload,
     agent_evaluation_cohort_from_payload,
     agent_evaluation_cohort_to_payload,
     agent_evaluation_content_policy_from_payload,
@@ -1771,6 +1774,17 @@ CREATE TABLE IF NOT EXISTS agent_evaluation_cases (
 CREATE INDEX IF NOT EXISTS idx_agent_evaluation_case_source
     ON agent_evaluation_cases(source_id, created_at, case_id);
 
+CREATE TABLE IF NOT EXISTS agent_evaluation_candidates (
+    candidate_id         TEXT PRIMARY KEY,
+    case_id              TEXT NOT NULL REFERENCES agent_evaluation_cases(case_id) ON DELETE CASCADE,
+    output_hash          TEXT NOT NULL,
+    provenance_hash      TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    payload_json         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_evaluation_candidate_case
+    ON agent_evaluation_candidates(case_id, created_at, candidate_id);
+
 CREATE TABLE IF NOT EXISTS agent_evaluation_content_policies (
     content_policy_id TEXT PRIMARY KEY,
     source_id         TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -1828,7 +1842,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_evaluation_execution_claim
 
 CREATE TABLE IF NOT EXISTS external_annotation_tasks (
     task_id                    TEXT PRIMARY KEY,
-    result_id                  TEXT NOT NULL REFERENCES agent_evaluation_results(result_id) ON DELETE CASCADE,
+    result_id                  TEXT REFERENCES agent_evaluation_results(result_id) ON DELETE CASCADE,
+    candidate_id               TEXT REFERENCES agent_evaluation_candidates(candidate_id) ON DELETE CASCADE,
     content_policy_id          TEXT NOT NULL REFERENCES agent_evaluation_content_policies(content_policy_id),
     provider                   TEXT NOT NULL,
     provider_project_ref       TEXT NOT NULL,
@@ -1844,6 +1859,7 @@ CREATE TABLE IF NOT EXISTS external_annotation_tasks (
     created_at                 TEXT NOT NULL,
     updated_at                 TEXT NOT NULL,
     payload_json               TEXT NOT NULL,
+    CHECK ((result_id IS NOT NULL) != (candidate_id IS NOT NULL)),
     UNIQUE (provider, provider_project_ref, queue_id, observation_id),
     UNIQUE (provider, provider_project_ref, provider_score_id)
 );
@@ -1871,6 +1887,7 @@ CREATE TABLE IF NOT EXISTS agent_assessments (
     schema_version     TEXT NOT NULL,
     target_event_id    TEXT REFERENCES agent_runtime_events(event_id) ON DELETE CASCADE,
     target_result_id   TEXT REFERENCES agent_evaluation_results(result_id) ON DELETE CASCADE,
+    target_candidate_id TEXT REFERENCES agent_evaluation_candidates(candidate_id) ON DELETE CASCADE,
     criterion          TEXT NOT NULL,
     status             TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
     label              TEXT CHECK (label IN ('pass', 'fail', 'needs_review')),
@@ -1885,12 +1902,18 @@ CREATE TABLE IF NOT EXISTS agent_assessments (
     reused_from_assessment_id TEXT,
     created_at         TEXT NOT NULL,
     occurrence_count   INTEGER NOT NULL DEFAULT 1,
-    CHECK ((target_event_id IS NOT NULL) != (target_result_id IS NOT NULL))
+    CHECK (
+        (target_event_id IS NOT NULL) +
+        (target_result_id IS NOT NULL) +
+        (target_candidate_id IS NOT NULL) = 1
+    )
 );
 CREATE INDEX IF NOT EXISTS idx_agent_assessment_event
     ON agent_assessments(target_event_id, assessment_id);
 CREATE INDEX IF NOT EXISTS idx_agent_assessment_result
     ON agent_assessments(target_result_id, assessment_id);
+CREATE INDEX IF NOT EXISTS idx_agent_assessment_candidate
+    ON agent_assessments(target_candidate_id, assessment_id);
 CREATE INDEX IF NOT EXISTS idx_agent_assessment_criterion
     ON agent_assessments(criterion, label, created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_assessment_input_fingerprint
@@ -3799,6 +3822,122 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                ON external_annotation_tasks(
                    state, lease_expires_at, created_at, task_id
                )""",
+        ],
+    ),
+    (
+        85,
+        "Allow human calibration before Ground Truth acceptance",
+        [
+            """CREATE TABLE IF NOT EXISTS agent_evaluation_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                case_id TEXT NOT NULL
+                    REFERENCES agent_evaluation_cases(case_id) ON DELETE CASCADE,
+                output_hash TEXT NOT NULL,
+                provenance_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_agent_evaluation_candidate_case
+               ON agent_evaluation_candidates(case_id, created_at, candidate_id)""",
+            """CREATE TABLE external_annotation_tasks_v2 (
+                task_id TEXT PRIMARY KEY,
+                result_id TEXT
+                    REFERENCES agent_evaluation_results(result_id) ON DELETE CASCADE,
+                candidate_id TEXT
+                    REFERENCES agent_evaluation_candidates(candidate_id) ON DELETE CASCADE,
+                content_policy_id TEXT NOT NULL
+                    REFERENCES agent_evaluation_content_policies(content_policy_id),
+                provider TEXT NOT NULL,
+                provider_project_ref TEXT NOT NULL,
+                queue_id TEXT NOT NULL,
+                observation_id TEXT,
+                queue_item_id TEXT,
+                provider_score_id TEXT,
+                state TEXT NOT NULL CHECK (state IN (
+                    'prepared', 'subject_prepared', 'subject_ready',
+                    'queued', 'imported', 'conflict'
+                )),
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                CHECK ((result_id IS NOT NULL) != (candidate_id IS NOT NULL)),
+                UNIQUE (provider, provider_project_ref, queue_id, observation_id),
+                UNIQUE (provider, provider_project_ref, provider_score_id)
+            )""",
+            """INSERT INTO external_annotation_tasks_v2 (
+                    task_id, result_id, candidate_id, content_policy_id, provider,
+                    provider_project_ref, queue_id, observation_id, queue_item_id,
+                    provider_score_id, state, lease_token, lease_expires_at,
+                    created_at, updated_at, payload_json
+                ) SELECT task_id, result_id, NULL, content_policy_id, provider,
+                    provider_project_ref, queue_id, observation_id, queue_item_id,
+                    provider_score_id, state, lease_token, lease_expires_at,
+                    created_at, updated_at, payload_json
+                FROM external_annotation_tasks""",
+            "DROP TABLE external_annotation_tasks",
+            "ALTER TABLE external_annotation_tasks_v2 RENAME TO external_annotation_tasks",
+            """CREATE INDEX idx_external_annotation_task_lease
+               ON external_annotation_tasks(
+                   state, lease_expires_at, created_at, task_id
+               )""",
+            """CREATE TABLE agent_assessments_v5 (
+                assessment_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL,
+                target_event_id TEXT
+                    REFERENCES agent_runtime_events(event_id) ON DELETE CASCADE,
+                target_result_id TEXT
+                    REFERENCES agent_evaluation_results(result_id) ON DELETE CASCADE,
+                target_candidate_id TEXT
+                    REFERENCES agent_evaluation_candidates(candidate_id) ON DELETE CASCADE,
+                criterion TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+                label TEXT CHECK (label IN ('pass', 'fail', 'needs_review')),
+                reason_code TEXT NOT NULL,
+                annotator_kind TEXT NOT NULL
+                    CHECK (annotator_kind IN ('code', 'llm', 'human')),
+                evaluator_name TEXT NOT NULL,
+                evaluator_version TEXT NOT NULL,
+                annotator_id TEXT,
+                content_policy_id TEXT
+                    REFERENCES agent_evaluation_content_policies(content_policy_id),
+                input_fingerprint TEXT,
+                confidence TEXT
+                    CHECK (confidence IS NULL OR confidence IN ('low', 'medium', 'high')),
+                reused_from_assessment_id TEXT,
+                created_at TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                CHECK (
+                    (target_event_id IS NOT NULL) +
+                    (target_result_id IS NOT NULL) +
+                    (target_candidate_id IS NOT NULL) = 1
+                )
+            )""",
+            """INSERT INTO agent_assessments_v5 (
+                    assessment_id, schema_version, target_event_id, target_result_id,
+                    target_candidate_id, criterion, status, label, reason_code,
+                    annotator_kind, evaluator_name, evaluator_version, annotator_id,
+                    content_policy_id, input_fingerprint, confidence,
+                    reused_from_assessment_id, created_at, occurrence_count
+                ) SELECT assessment_id, schema_version, target_event_id, target_result_id,
+                    NULL, criterion, status, label, reason_code, annotator_kind,
+                    evaluator_name, evaluator_version, annotator_id,
+                    content_policy_id, input_fingerprint, confidence,
+                    reused_from_assessment_id, created_at, occurrence_count
+                FROM agent_assessments""",
+            "DROP TABLE agent_assessments",
+            "ALTER TABLE agent_assessments_v5 RENAME TO agent_assessments",
+            """CREATE INDEX idx_agent_assessment_event
+               ON agent_assessments(target_event_id, assessment_id)""",
+            """CREATE INDEX idx_agent_assessment_result
+               ON agent_assessments(target_result_id, assessment_id)""",
+            """CREATE INDEX idx_agent_assessment_candidate
+               ON agent_assessments(target_candidate_id, assessment_id)""",
+            """CREATE INDEX idx_agent_assessment_criterion
+               ON agent_assessments(criterion, label, created_at)""",
+            """CREATE INDEX idx_agent_assessment_input_fingerprint
+               ON agent_assessments(input_fingerprint, status, created_at, assessment_id)""",
         ],
     ),
 ]
@@ -18530,6 +18669,48 @@ class Database:
             else None
         )
 
+    async def record_agent_evaluation_candidate(
+        self,
+        candidate: AgentEvaluationCandidate,
+    ) -> None:
+        payload = _canonical_json(agent_evaluation_candidate_to_payload(candidate))
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT OR IGNORE INTO agent_evaluation_candidates (
+                       candidate_id, case_id, output_hash, provenance_hash,
+                       created_at, payload_json
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    candidate.candidate_id,
+                    candidate.case_id,
+                    candidate.output_hash,
+                    candidate.provenance_hash,
+                    candidate.created_at,
+                    payload,
+                ),
+            )
+            await self._assert_immutable_payload(
+                "agent_evaluation_candidates",
+                "candidate_id",
+                candidate.candidate_id,
+                payload,
+            )
+            await self.db.commit()
+
+    async def get_agent_evaluation_candidate(
+        self,
+        candidate_id: str,
+    ) -> AgentEvaluationCandidate | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT payload_json FROM agent_evaluation_candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        )
+        return (
+            agent_evaluation_candidate_from_payload(json.loads(rows[0]["payload_json"]))
+            if rows
+            else None
+        )
+
     async def admit_external_annotation_task(
         self,
         task: ExternalAnnotationTask,
@@ -18539,11 +18720,11 @@ class Database:
             try:
                 await self.db.execute(
                     """INSERT OR IGNORE INTO external_annotation_tasks (
-                           task_id, result_id, content_policy_id, provider,
+                           task_id, result_id, candidate_id, content_policy_id, provider,
                            provider_project_ref, queue_id, observation_id,
                            queue_item_id, provider_score_id, state, lease_token,
                            lease_expires_at, created_at, updated_at, payload_json
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     self._external_annotation_task_values(task, payload),
                 )
                 existing = await self._get_external_annotation_task_unlocked(task.task_id)
@@ -18722,6 +18903,7 @@ class Database:
         return (
             task.task_id,
             task.result_id,
+            task.candidate_id,
             task.content_policy_id,
             task.provider,
             task.provider_project_ref,
@@ -19199,6 +19381,7 @@ class Database:
         allowed = {
             ("agent_evaluation_cases", "case_id"),
             ("agent_evaluation_content_policies", "content_policy_id"),
+            ("agent_evaluation_candidates", "candidate_id"),
             ("accepted_ground_truth_revisions", "ground_truth_revision_id"),
             ("agent_evaluation_cohorts", "cohort_id"),
             ("agent_evaluation_results", "result_id"),
@@ -19240,17 +19423,19 @@ class Database:
             return
         await self.db.executemany(
             """INSERT OR IGNORE INTO agent_assessments (
-                   assessment_id, schema_version, target_event_id, target_result_id, criterion,
+                   assessment_id, schema_version, target_event_id, target_result_id,
+                   target_candidate_id, criterion,
                    status, label, reason_code, annotator_kind, evaluator_name,
                    evaluator_version, annotator_id, content_policy_id, input_fingerprint,
                    confidence, reused_from_assessment_id, created_at, occurrence_count
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     assessment.assessment_id,
                     assessment.schema_version,
                     assessment.target_event_id,
                     assessment.target_result_id,
+                    assessment.target_candidate_id,
                     assessment.criterion,
                     assessment.status,
                     assessment.label,
@@ -19295,6 +19480,17 @@ class Database:
             """SELECT * FROM agent_assessments
                WHERE target_result_id = ? ORDER BY created_at, assessment_id""",
             (result_id,),
+        )
+        return [self._row_to_agent_assessment(row) for row in rows]
+
+    async def list_agent_assessments_for_candidate(
+        self,
+        candidate_id: str,
+    ) -> list[AgentAssessment]:
+        rows = await self.db.execute_fetchall(
+            """SELECT * FROM agent_assessments
+               WHERE target_candidate_id = ? ORDER BY created_at, assessment_id""",
+            (candidate_id,),
         )
         return [self._row_to_agent_assessment(row) for row in rows]
 
@@ -19362,6 +19558,11 @@ class Database:
             target_event_id=(str(row["target_event_id"]) if row["target_event_id"] is not None else None),
             target_result_id=(
                 str(row["target_result_id"]) if row["target_result_id"] is not None else None
+            ),
+            target_candidate_id=(
+                str(row["target_candidate_id"])
+                if row["target_candidate_id"] is not None
+                else None
             ),
             criterion=str(row["criterion"]),
             status=str(row["status"]),  # type: ignore[arg-type]
