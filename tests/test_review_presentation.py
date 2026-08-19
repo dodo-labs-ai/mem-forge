@@ -55,6 +55,18 @@ def test_legacy_internal_reason_is_only_technical_detail() -> None:
     assert presentation.technical_reason == "deterministic_relation_conflict:v7:v8"
 
 
+def test_source_backed_correction_explains_support_override() -> None:
+    presentation = present_memory_review(
+        kind="supersede",
+        reason="user corrected source-backed knowledge",
+        source_backed_correction=True,
+    )
+
+    assert "source-backed" in presentation.summary
+    assert "active Source Support" in presentation.why_human
+    assert "preserve its Source evidence" in presentation.actions[0].consequence
+
+
 def test_cross_source_conflict_is_presented_as_a_non_destructive_finding() -> None:
     presentation = present_memory_review(
         kind="cross_source_conflict",

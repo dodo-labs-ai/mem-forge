@@ -761,6 +761,29 @@ def test_workspace_admin_can_manage_source_they_do_not_own(tmp_path):
         asyncio.run(database.close())
 
 
+def test_self_hosted_owner_can_manage_workspace_source_they_do_not_own(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/v1/sources",
+                headers={"x-test-user": "source-owner", "x-test-workspace-role": "member"},
+                json=_confluence_payload(),
+            )
+            assert created.status_code == 200, created.text
+
+            updated = client.put(
+                f"/api/v1/sources/{created.json()['id']}",
+                headers={"x-test-user": "local-owner", "x-test-workspace-role": "owner"},
+                json={"name": "Self-hosted Owner Updated"},
+            )
+
+        assert updated.status_code == 200, updated.text
+    finally:
+        asyncio.run(database.close())
+
+
 def test_local_source_creator_becomes_execution_owner_and_client_cannot_override(tmp_path):
     database = _connect_database(tmp_path)
     try:
