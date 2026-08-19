@@ -547,6 +547,63 @@ def test_local_agent_forwards_retryable_handler_failure_to_broker(tmp_path):
     ]
 
 
+def test_local_agent_marks_github_cli_connection_failure_retryable(monkeypatch, tmp_path):
+    completed: list[tuple[str, int, str, dict, str | None]] = []
+
+    def fail_github_api(command, *args, **kwargs):
+        return main.subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr=(
+                "error connecting to github.wdf.sap.corp\n"
+                "check your internet connection or https://githubstatus.com"
+            ),
+        )
+
+    monkeypatch.setattr(main.subprocess, "run", fail_github_api)
+    client = ToolClient(
+        target=build_target(origin="http://127.0.0.1:8765"),
+        api_token=None,
+    )
+    runner = LocalAgentRunner(
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        cloud_job_handler=lambda job: main._run_cloud_local_agent_job(job, client),
+        cloud_jobs_provider=lambda: {
+            "jobs": [
+                {
+                    "job_id": "laj-github-vpn",
+                    "operation": "github_repo_sync",
+                    "source_id": "src-github",
+                    "workspace_id": "ws-test",
+                    "attempt_count": 1,
+                    "payload": {
+                        "repo_url": "https://github.wdf.sap.corp/example/repository",
+                        "ref": "main",
+                    },
+                }
+            ]
+        },
+        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: (
+            completed.append((job_id, attempt_count, status, result, error)) or {"ok": True}
+        ),
+    )
+
+    report = runner.run_once(now=datetime(2026, 8, 18, tzinfo=timezone.utc))
+
+    assert completed == [
+        (
+            "laj-github-vpn",
+            1,
+            "failed",
+            {"retryable": True},
+            "GitHub CLI request failed: error connecting to github.wdf.sap.corp\n"
+            "check your internet connection or https://githubstatus.com",
+        )
+    ]
+    assert report["results"][-1]["error_type"] == "GitHubProviderConnectionError"
+
+
 def test_local_agent_treats_missing_source_run_receipt_as_retryable(tmp_path):
     completed: list[tuple[str, int, str, dict, str | None]] = []
 

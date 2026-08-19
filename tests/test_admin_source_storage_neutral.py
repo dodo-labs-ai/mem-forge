@@ -733,9 +733,114 @@ def test_source_agent_evaluation_route_is_bounded_and_storage_neutral(tmp_path):
         "runtime_event_count": 1,
         "eligible_assessment_count": 1,
         "missing_assessment_count": 0,
+        "action_issue_group_count": 1,
+        "review_issue_group_count": 0,
         "truncated": False,
     }
     assert payload["assessments"][0]["target_event_id"] == event.event_id
+
+
+def test_source_agent_evaluation_route_groups_actionable_cases_and_preserves_semantic_coverage(
+    tmp_path,
+):
+    now = datetime.now(timezone.utc)
+    events = bind_quality_signals(
+        (
+            QualitySignal(
+                "evidence_admission_outcome",
+                "rejected",
+                "legacy_quote_unresolved",
+            ),
+            QualitySignal(
+                "evidence_localization_outcome",
+                "degraded",
+                "whole_block_fallback",
+                observation_id="observation-1",
+                observation_revision_id="observation-revision-1",
+                range_start=0,
+                range_end=12,
+            ),
+        ),
+        source_id="src-neutral",
+        source_type="teams",
+        doc_id="doc-1",
+        source_unit_id="unit-1",
+        target_unit_revision_id="revision-1",
+        projection_run_id="projection-1",
+        derivation_id="derivation-1",
+        batch_id="batch-1",
+        batch_attempt=1,
+        extraction_contract_version="projection-extraction-v8",
+        occurred_at=now,
+    )
+    current_assessments = evaluate_runtime_events(events)
+    prior_schema_assessments = [
+        replace(
+            assessment,
+            assessment_id=f"aas-prior-v3-{index}",
+            schema_version="agent-assessment-v3",
+        )
+        for index, assessment in enumerate(current_assessments)
+    ]
+
+    class FakeSourceReader:
+        async def get_schedule_config(self) -> dict:
+            return {"enabled": False}
+
+        async def claim_due_scheduled_sources(self, **_kwargs) -> list[dict]:
+            return []
+
+        async def get_source(self, source_id: str) -> dict | None:
+            assert source_id == "src-neutral"
+            return {
+                "id": source_id,
+                "type": "teams",
+                "name": "Neutral Source",
+                "access_policy": "private",
+                "access_state": "active",
+                "owner_user_id": "dev",
+            }
+
+        async def list_agent_runtime_events(self, query):
+            assert query.source_id == "src-neutral"
+            return list(events)
+
+        async def list_agent_assessments(self, query):
+            assert query.source_id == "src-neutral"
+            return prior_schema_assessments
+
+    app = create_admin_app(db=FakeSourceReader(), config=_config(tmp_path))
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/sources/src-neutral/agent-evaluation?days=1")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["summary"]["missing_assessment_count"] == 0
+    assert payload["coverage"] == {
+        "policy": "semantic_evaluator_v1",
+        "eligible_occurrences": 2,
+        "assessed_occurrences": 2,
+        "pending_occurrences": 0,
+        "coverage_rate": 1.0,
+        "oldest_pending_at": None,
+        "evaluator_failure_occurrences": 0,
+    }
+    assert [group["label"] for group in payload["issue_groups"]] == [
+        "fail",
+        "needs_review",
+    ]
+    fail_group, review_group = payload["issue_groups"]
+    assert fail_group["criterion"] == "evidence_reference_validity"
+    assert fail_group["reason_code"] == "legacy_quote_unresolved"
+    assert fail_group["occurrence_count"] == 1
+    assert fail_group["criterion_occurrence_count"] == 1
+    assert fail_group["criterion_rate"] == 1.0
+    assert fail_group["representative_cases"][0]["event_id"] == events[0].event_id
+    assert fail_group["representative_cases"][0]["doc_id"] == "doc-1"
+    assert fail_group["representative_cases"][0]["source_unit_id"] == "unit-1"
+    assert review_group["criterion"] == "evidence_localization"
+    assert review_group["representative_cases"][0]["observation_id"] == "observation-1"
 
 
 def test_source_schedule_routes_use_storage_neutral_store(tmp_path):

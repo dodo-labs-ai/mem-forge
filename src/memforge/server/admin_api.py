@@ -4582,10 +4582,7 @@ def create_admin_app(
         from memforge.evals.agent_evaluation import (
             AgentAssessmentQuery,
             AgentRuntimeEventQuery,
-            assessment_public_payload,
-            event_public_payload,
-            evaluate_runtime_events,
-            summarize_agent_assessments,
+            build_source_online_evaluation_view,
         )
 
         if not 1 <= days <= 90:
@@ -4619,23 +4616,9 @@ def create_admin_app(
                 limit=1000,
             )
         )
-        eligible = evaluate_runtime_events(tuple(events))
-        assessed_ids = {assessment.assessment_id for assessment in assessments}
-        summary = summarize_agent_assessments(assessments)
-        summary.update(
-            {
-                "runtime_event_count": sum(event.occurrence_count for event in events),
-                "eligible_assessment_count": sum(
-                    assessment.occurrence_count for assessment in eligible
-                ),
-                "missing_assessment_count": sum(
-                    assessment.occurrence_count
-                    for assessment in eligible
-                    if assessment.assessment_id not in assessed_ids
-                ),
-                "truncated": len(events) == 1000 or len(assessments) == 1000,
-            }
-        )
+        view = build_source_online_evaluation_view(events, assessments)
+        summary = dict(view["summary"])
+        summary["truncated"] = len(events) == 1000 or len(assessments) == 1000
         return {
             "source_id": source_id,
             "window": {
@@ -4644,14 +4627,10 @@ def create_admin_app(
                 "days": days,
             },
             "summary": summary,
-            "runtime_events": [
-                event_public_payload(event)
-                for event in events[:50]
-            ],
-            "assessments": [
-                assessment_public_payload(assessment)
-                for assessment in assessments[:50]
-            ],
+            "coverage": view["coverage"],
+            "issue_groups": view["issue_groups"],
+            "runtime_events": view["runtime_events"],
+            "assessments": view["assessments"],
         }
 
     async def _require_evaluation_result_management(

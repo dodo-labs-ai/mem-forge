@@ -12,7 +12,6 @@ import type {
   Project,
   ResolvedProjectsResponse,
   Source,
-  SourceAgentEvaluationResponse,
   SourceCapabilities,
   SourceProjectsResponse,
 } from "@/api/types";
@@ -35,6 +34,7 @@ import {
 import { timeAgo } from "@/utils/date";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { SourceSetupDialog } from "./SourceSetupDialog";
+import { SourceOnlineEvaluationDialog } from "./SourceOnlineEvaluationDialog";
 import { SourceAccessChangeDialog } from "./SourceAccessChangeDialog";
 import { LocalAgentDaemonStatus } from "./LocalAgentDaemonStatus";
 import { isManagedSourceId, isManagedSourceType, userConfigurableGenes } from "./managedSources";
@@ -938,7 +938,8 @@ export function SourcesPage() {
         }}
       />
 
-      <SourceAgentEvaluationDialog
+      <SourceOnlineEvaluationDialog
+        key={evaluationSource?.id ?? "closed-online-evaluation"}
         source={evaluationSource}
         onOpenChange={(open) => {
           if (!open) setEvaluationSource(null);
@@ -1155,116 +1156,6 @@ function SourceActionsMenu({
       )}
     </div>
   );
-}
-
-function SourceAgentEvaluationDialog({
-  source,
-  onOpenChange,
-}: {
-  source: Source | null;
-  onOpenChange: (open: boolean) => void;
-}) {
-  const open = Boolean(source);
-  const evaluationQuery = useQuery<SourceAgentEvaluationResponse>({
-    queryKey: ["source-agent-evaluation", source?.id],
-    queryFn: () => {
-      if (!source) throw new Error("source is required");
-      return resourceClient
-        .get(`/sources/${source.id}/agent-evaluation`, { params: { days: 30 } })
-        .then((response) => response.data);
-    },
-    enabled: open,
-  });
-
-  if (!source) return null;
-  const summary = evaluationQuery.data?.summary;
-  const labels = summary?.label_counts ?? {};
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-3xl">
-        <DialogHeader>
-          <DialogTitle>Online evaluation</DialogTitle>
-          <DialogDescription>
-            Deterministic checks for {source.name} over the last 30 days. Missing checks are unknown, never pass.
-          </DialogDescription>
-        </DialogHeader>
-
-        {evaluationQuery.isPending ? (
-          <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
-            <Loader2 className="size-4 animate-spin" /> Loading evaluation results...
-          </div>
-        ) : evaluationQuery.isError ? (
-          <div className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
-            Failed to load online evaluation results.
-          </div>
-        ) : (
-          <div className="space-y-4">
-            <div className="grid gap-3 sm:grid-cols-4">
-              <DetailMetric label="Checks" value={formatCount(summary?.total_assessments)} />
-              <DetailMetric label="Pass" value={formatCount(labels.pass)} tone="primary" />
-              <DetailMetric label="Fail" value={formatCount(labels.fail)} />
-              <DetailMetric label="Needs review" value={formatCount(labels.needs_review)} />
-            </div>
-
-            {summary?.missing_assessment_count ? (
-              <p className="rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                {summary.missing_assessment_count} eligible runtime events do not have a durable assessment yet.
-              </p>
-            ) : null}
-            {summary?.truncated ? (
-              <p className="text-xs text-muted-foreground">
-                This view is bounded to the first 1,000 runtime facts. Use the authorized CLI report for a narrower cohort.
-              </p>
-            ) : null}
-
-            <div>
-              <h3 className="text-sm font-medium">Recent checks</h3>
-              <div className="mt-2 overflow-hidden rounded-lg border">
-                {evaluationQuery.data?.assessments.length ? (
-                  <div className="divide-y">
-                    {evaluationQuery.data.assessments.map((assessment) => (
-                      <div
-                        key={assessment.assessment_id}
-                        className="grid gap-1 p-3 text-sm sm:grid-cols-[1fr_auto_auto] sm:items-center sm:gap-4"
-                      >
-                        <div>
-                          <div className="font-medium">{humanizeAssessmentCriterion(assessment.criterion)}</div>
-                          <div className="text-xs text-muted-foreground">
-                            {assessment.reason_code}
-                            {assessment.occurrence_count > 1
-                              ? ` · ${assessment.occurrence_count} occurrences`
-                              : ""}
-                          </div>
-                        </div>
-                        <Badge variant={assessment.label === "fail" ? "destructive" : "outline"}>
-                          {assessment.label?.replace("_", " ") ?? assessment.status}
-                        </Badge>
-                        <span className="text-xs text-muted-foreground">{timeAgo(assessment.created_at)}</span>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="p-4 text-sm text-muted-foreground">
-                    No deterministic checks were produced in this window.
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-        )}
-
-        <DialogFooter showCloseButton />
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function humanizeAssessmentCriterion(value: string): string {
-  return value
-    .split("_")
-    .map((part) => part ? `${part[0].toUpperCase()}${part.slice(1)}` : part)
-    .join(" ");
 }
 
 function AgentSessionDetailsDialog({

@@ -53,6 +53,7 @@ from memforge.local_agent.document_identity import (
     build_teams_doc_id,
 )
 from memforge.local_agent.source_contract import (
+    GitHubProviderConnectionError,
     TEAMS_TOMBSTONE_REASONS,
     local_agent_sync_snapshot_id,
     source_processing_receipt,
@@ -420,6 +421,23 @@ def _gh_api_json(repo: dict[str, str], endpoint: str) -> dict[str, Any]:
         raise click.ClickException("GitHub CLI `gh` is required for local GitHub repository sync.") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "gh api failed").strip()
+        normalized_detail = detail.lower()
+        if any(
+            marker in normalized_detail
+            for marker in (
+                "error connecting to",
+                "check your internet connection",
+                "could not resolve host",
+                "no such host",
+                "temporary failure in name resolution",
+                "network is unreachable",
+                "connection refused",
+                "connection timed out",
+                "i/o timeout",
+                "tls handshake timeout",
+            )
+        ):
+            raise GitHubProviderConnectionError(f"GitHub CLI request failed: {detail}")
         raise click.ClickException(f"GitHub CLI request failed: {detail}")
     try:
         payload = json.loads(result.stdout or "{}")

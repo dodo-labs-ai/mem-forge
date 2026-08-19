@@ -615,6 +615,12 @@ def test_deterministic_evaluator_only_judges_supported_runtime_contracts() -> No
     assert evaluate_runtime_events(events) == assessments
 
 
+def test_deterministic_evaluator_reproduces_persisted_lifecycle_assessment() -> None:
+    bundle = _lifecycle_bundle()
+
+    assert evaluate_runtime_events((bundle.event,)) == bundle.assessments
+
+
 def test_assessment_summary_preserves_coalesced_occurrence_denominator() -> None:
     [event] = _events(
         QualitySignal(

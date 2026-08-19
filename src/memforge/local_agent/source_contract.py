@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
+from datetime import timedelta
 from typing import Any
 
 
@@ -94,6 +95,10 @@ _TEAMS_CONVERSATION_ID_RE = re.compile(r"^19:[^\s@]+@[^\s@]+$")
 
 class SourceSyncRunReceiptError(ValueError):
     """Raised when a successful local sync cannot identify its durable server run."""
+
+
+class GitHubProviderConnectionError(ConnectionError):
+    """Raised when GitHub CLI cannot reach the configured GitHub host."""
 
 
 def source_processing_receipt(sync_result: object) -> dict[str, str]:
@@ -185,6 +190,22 @@ def local_agent_completion_status(
     if status == "failed" and retryable and attempt_count < LOCAL_AGENT_JOB_MAX_ATTEMPTS:
         return "queued"
     return "succeeded" if status == "succeeded" else "failed"
+
+
+def local_agent_retry_delay(
+    status: str,
+    *,
+    retryable: bool,
+    attempt_count: int,
+) -> timedelta | None:
+    """Return the server-controlled delay before another daemon lease."""
+    if local_agent_completion_status(
+        status,
+        retryable=retryable,
+        attempt_count=attempt_count,
+    ) != "queued":
+        return None
+    return timedelta(hours=1 if attempt_count == 1 else 12)
 
 
 def local_agent_sync_snapshot_id(job_id: object, attempt_count: object) -> str:
