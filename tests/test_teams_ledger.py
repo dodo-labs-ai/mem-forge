@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from dataclasses import replace
+
+import pytest
 
 from memforge.local_agent.teams_ledger import (
     TeamsLedgerMessage,
@@ -47,7 +50,7 @@ def test_teams_window_id_is_opaque_and_round_trips_path_hostile_components():
 
 
 def test_group_chat_exact_sixty_minute_gap_stays_in_same_frozen_block():
-    projector = TeamsLedgerProjector(gap_minutes=60)
+    projector = TeamsLedgerProjector()
 
     result = projector.project_unthreaded(
         [
@@ -61,11 +64,12 @@ def test_group_chat_exact_sixty_minute_gap_stays_in_same_frozen_block():
     first, second = result.blocks
     assert first.frozen_anchor_message_id == "m1"
     assert first.member_message_ids == ("m1", "m2")
+    assert first.policy_version == "teams-window-v1"
     assert second.frozen_anchor_message_id == "m3"
 
 
 def test_late_message_before_anchor_expands_bounds_without_changing_window_id():
-    projector = TeamsLedgerProjector(gap_minutes=60)
+    projector = TeamsLedgerProjector()
     initial = projector.project_unthreaded(
         [
             _message("m2", "2026-07-08T10:00:00", "anchor"),
@@ -95,7 +99,7 @@ def test_late_message_before_anchor_expands_bounds_without_changing_window_id():
 
 def test_teams_ledger_state_store_preserves_frozen_block_anchor_across_restart(tmp_path):
     state_path = tmp_path / "teams-ledger.json"
-    projector = TeamsLedgerProjector(gap_minutes=60)
+    projector = TeamsLedgerProjector()
     initial = projector.project_unthreaded(
         [
             _message("m2", "2026-07-08T10:00:00", "anchor"),
@@ -127,6 +131,7 @@ def test_teams_ledger_state_store_preserves_frozen_block_anchor_across_restart(t
     assert updated.blocks[0].window_id == original_block.window_id
     assert updated.blocks[0].frozen_anchor_message_id == "m2"
     assert updated.blocks[0].member_message_ids == ("m1", "m2", "m3")
+    assert updated.blocks[0].policy_version == "teams-window-v1"
 
 
 def test_teams_ledger_state_store_persists_message_receipts_across_restart(tmp_path):
@@ -152,3 +157,39 @@ def test_teams_ledger_state_store_persists_message_receipts_across_restart(tmp_p
 
     assert first == {"new": 2, "updated": 0, "unchanged": 0}
     assert second == {"new": 1, "updated": 1, "unchanged": 1}
+
+
+def test_unknown_window_policy_cannot_silently_reassign_existing_lineage():
+    projector = TeamsLedgerProjector()
+    initial = projector.project_unthreaded([_message("m1", "2026-07-08T09:00:00")])
+    unknown = replace(
+        initial,
+        blocks=(replace(initial.blocks[0], policy_version="teams-window-v2"),),
+    )
+
+    with pytest.raises(ValueError, match="unsupported Teams window policy"):
+        projector.project_unthreaded(
+            [
+                _message("m1", "2026-07-08T09:00:00"),
+                _message("m2", "2026-07-08T09:30:00"),
+            ],
+            previous=unknown,
+        )
+
+
+def test_bounded_history_preserves_unobserved_frozen_blocks_for_future_backfill():
+    projector = TeamsLedgerProjector()
+    initial = projector.project_unthreaded(
+        [
+            _message("old", "2025-01-01T09:00:00"),
+            _message("recent", "2026-07-08T09:00:00"),
+        ]
+    )
+
+    advanced = projector.project_unthreaded(
+        [_message("recent", "2026-07-08T09:00:00")],
+        previous=initial,
+    )
+
+    assert [block.window_id for block in advanced.blocks] == [block.window_id for block in initial.blocks]
+    assert advanced.blocks[0].member_message_ids == ("old",)

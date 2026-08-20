@@ -93,7 +93,8 @@ def _teams_payload(name: str = "PCC Agent Dev") -> dict:
         "config": {
             "region": "emea",
             "conversation_ids": ["19:conversation-a@example.test"],
-            "conversation_gap_minutes": 60,
+            "initial_history_days": 14,
+            "rolling_retention_days": None,
         },
     }
 
@@ -108,6 +109,26 @@ def _github_repo_payload(*, connection_mode: str) -> dict:
             "ref": "main",
             "connection_mode": connection_mode,
         },
+    }
+
+
+def test_public_teams_config_migrates_legacy_history_and_hides_internal_knobs() -> None:
+    from memforge.server.admin_api import _public_source_config
+
+    public = _public_source_config(
+        "teams",
+        {
+            "conversation_ids": ["19:conversation-a@example.test"],
+            "max_age_days": 30,
+            "conversation_gap_minutes": 15,
+            "max_block_messages": 25,
+        },
+    )
+
+    assert public == {
+        "conversation_ids": ["19:conversation-a@example.test"],
+        "initial_history_days": 30,
+        "rolling_retention_days": None,
     }
 
 
@@ -514,11 +535,7 @@ def test_source_list_suppresses_resolved_lifecycle_failure_but_keeps_history(tmp
                     )
                 )
             )
-            asyncio.run(
-                database.start_lifecycle_backfill_job(
-                    "historical-failed-maintenance"
-                )
-            )
+            asyncio.run(database.start_lifecycle_backfill_job("historical-failed-maintenance"))
             asyncio.run(
                 database.fail_lifecycle_backfill_job(
                     "historical-failed-maintenance",
@@ -541,18 +558,12 @@ def test_source_list_suppresses_resolved_lifecycle_failure_but_keeps_history(tmp
             )
 
         assert actionable.status_code == 200, actionable.text
-        assert (
-            actionable.json()["data"][0]["lifecycle_maintenance"]["status"]
-            == "failed"
-        )
+        assert actionable.json()["data"][0]["lifecycle_maintenance"]["status"] == "failed"
         assert listed.status_code == 200, listed.text
         assert listed.json()["data"][0]["lifecycle_maintenance"] is None
         assert lifecycle.status_code == 200, lifecycle.text
         assert lifecycle.json()["jobs"][0]["status"] == "failed"
-        assert (
-            lifecycle.json()["jobs"][0]["error"]
-            == "operator recovered stale lifecycle job"
-        )
+        assert lifecycle.json()["jobs"][0]["error"] == "operator recovered stale lifecycle job"
     finally:
         asyncio.run(database.close())
 
@@ -959,7 +970,8 @@ def test_local_source_sync_enqueues_canonical_owner_job(tmp_path):
         assert job_payload == {
             "region": "emea",
             "conversation_ids": ["19:conversation-a@example.test"],
-            "conversation_gap_minutes": 60,
+            "initial_history_days": 14,
+            "rolling_retention_days": None,
             "source_id": created.json()["id"],
             "source_type": "teams",
             "force_full_sync": True,
@@ -983,8 +995,8 @@ def test_teams_scope_transition_is_attached_to_collection_job(tmp_path):
                     "config": {
                         "region": "emea",
                         "conversation_ids": ["19:conversation-a@example.test"],
-                        "conversation_gap_minutes": 60,
-                        "max_age_days": 30,
+                        "initial_history_days": 30,
+                        "rolling_retention_days": 365,
                     }
                 },
             )
@@ -1000,13 +1012,38 @@ def test_teams_scope_transition_is_attached_to_collection_job(tmp_path):
         transition = leased.json()["jobs"][0]["payload"]["projection_scope_transition"]
         assert transition["previous_scope"] == {
             "conversation_ids": ["19:conversation-a@example.test"],
-            "conversation_gap_minutes": 60,
         }
         assert transition["target_scope"] == {
             "conversation_ids": ["19:conversation-a@example.test"],
-            "conversation_gap_minutes": 60,
-            "max_age_days": 30,
+            "rolling_retention_days": 365,
         }
+    finally:
+        asyncio.run(database.close())
+
+
+def test_teams_initial_history_change_does_not_create_destructive_scope_transition(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
+        with TestClient(app) as client:
+            created = client.post("/api/v1/sources", headers=headers, json=_teams_payload())
+            source_id = created.json()["id"]
+            updated = client.put(
+                f"/api/v1/sources/{source_id}",
+                headers=headers,
+                json={
+                    "config": {
+                        "region": "emea",
+                        "conversation_ids": ["19:conversation-a@example.test"],
+                        "initial_history_days": 30,
+                        "rolling_retention_days": None,
+                    }
+                },
+            )
+
+        assert updated.status_code == 200, updated.text
+        assert asyncio.run(database.get_open_projection_scope_transition(source_id)) is None
     finally:
         asyncio.run(database.close())
 
@@ -1043,10 +1080,18 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                 headers=headers,
                 json={
                     **context,
-                    "sync_snapshot_id": (
-                        f"{leased['job_id']}:attempt:{leased['attempt_count']}"
-                    ),
+                    "sync_snapshot_id": (f"{leased['job_id']}:attempt:{leased['attempt_count']}"),
                     "coverage": "bounded_delta",
+                    "scope_attestations": [
+                        {
+                            "subject_type": "conversation",
+                            "subject_key": "19:conversation-a@example.test",
+                            "collection_attempt_id": f"{leased['job_id']}:attempt:{leased['attempt_count']}",
+                            "target_scope_fingerprint": "scope-fingerprint",
+                            "transition_id": None,
+                            "evidence": {"poll": {"access_probe_status": "ok"}},
+                        }
+                    ],
                     "items": [
                         {
                             "doc_id": build_teams_doc_id(
@@ -1124,9 +1169,20 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
             )
         )
         assert len(retained_inputs) == 1
-        process_run = asyncio.run(
-            database.get_source_sync_run(accepted_process.json()["run_id"])
+        manifest_status = asyncio.run(
+            database.get_source_sync_snapshot_manifest_status(
+                source_id=source_id,
+                workspace_id="default",
+                snapshot_id=expected_attempt_id,
+            )
         )
+        assert manifest_status is not None
+        assert manifest_status["scope_attestations"][0].subject_key == "19:conversation-a@example.test"
+        assert all(
+            unit.unit_type != "teams_scope_attestation"
+            for unit in asyncio.run(database.list_current_source_units(source_id))
+        )
+        process_run = asyncio.run(database.get_source_sync_run(accepted_process.json()["run_id"]))
         assert process_run is not None
         assert process_run.input_snapshot_id == expected_attempt_id
         assert stale.status_code == 409, stale.text

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
-import hashlib
 
 from memforge.pipeline.normalizer_utils import html_to_markdown
 
@@ -21,11 +20,6 @@ MEMORY_MESSAGE_TYPES = frozenset(
 
 class TeamsMessageEvidenceError(ValueError):
     """Raised when a potentially memory-bearing message is ambiguous."""
-
-
-def teams_scope_attestation_window_id(*, source_id: str, conversation_id: str) -> str:
-    identity = hashlib.sha256(f"{source_id}\n{conversation_id}".encode("utf-8")).hexdigest()
-    return f"teams-scope:v1:{identity}"
 
 
 def parse_teams_source_timestamp(value: object) -> datetime | None:
@@ -105,33 +99,6 @@ def validate_teams_window_payload(
     if str(payload.get("window_id") or "").strip() != window_id:
         raise TeamsMessageEvidenceError("Teams payload window identity mismatch")
     messages = payload.get("messages")
-    if payload.get("_scope_attestation") is True:
-        target_conversations = payload.get("target_conversation_ids")
-        poll = payload.get("poll")
-        if (
-            messages != []
-            or not str(payload.get("transition_id") or "").strip()
-            or not str(payload.get("target_scope_fingerprint") or "").strip()
-            or not str(payload.get("collection_attempt_id") or "").strip()
-            or not isinstance(target_conversations, list)
-            or not target_conversations
-            or not all(is_direct_teams_conversation_id(value) for value in target_conversations)
-            or len(set(target_conversations)) != len(target_conversations)
-            or not isinstance(poll, Mapping)
-            or str(poll.get("raw_conversation_id") or "").strip() != conversation_id
-            or (
-                source_id is not None
-                and window_id
-                != teams_scope_attestation_window_id(
-                    source_id=source_id,
-                    conversation_id=conversation_id,
-                )
-            )
-            or str(window_type or "").strip() != "scope_attestation"
-            or bool(str(root_message_id or "").strip())
-        ):
-            raise TeamsMessageEvidenceError("Teams scope attestation is invalid")
-        return "scope_attestation"
     from memforge.local_agent.teams_ledger import (
         build_teams_window_id,
         decode_teams_window_id,

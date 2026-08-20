@@ -375,21 +375,25 @@ class ToolClient:
         sync_snapshot_id: str,
         local_agent_job_id: str,
         local_agent_attempt_count: int,
+        scope_attestations: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Declare covered membership and request only missing content bodies."""
         source_id = source_id.strip()
         if not source_id:
             return {"error": "source_id is required"}
+        body: dict[str, Any] = {
+            "items": items,
+            "coverage": coverage,
+            "sync_snapshot_id": sync_snapshot_id,
+            "local_agent_job_id": local_agent_job_id,
+            "local_agent_attempt_count": local_agent_attempt_count,
+        }
+        if scope_attestations is not None:
+            body["scope_attestations"] = scope_attestations
         return self._resource_json(
             "POST",
             f"/sources/{quote(source_id, safe='')}/adapter/manifest",
-            {
-                "items": items,
-                "coverage": coverage,
-                "sync_snapshot_id": sync_snapshot_id,
-                "local_agent_job_id": local_agent_job_id,
-                "local_agent_attempt_count": local_agent_attempt_count,
-            },
+            body,
         )
 
     def push_jira_package(

@@ -329,10 +329,42 @@ export function TeamsSourceSetup({
           )}
           <details className="border-t pt-3">
             <summary className="cursor-pointer text-sm font-semibold">Advanced settings</summary>
-            <div className="mt-3 grid gap-3 sm:grid-cols-3">
-              <NumberField label="History (days)" value={config.max_age_days} onChange={(value) => setConfig({ ...config, max_age_days: value })} />
-              <NumberField label="Conversation gap (minutes)" value={config.conversation_gap_minutes} onChange={(value) => setConfig({ ...config, conversation_gap_minutes: value })} />
-              <NumberField label="Maximum messages per group" value={config.max_block_messages} onChange={(value) => setConfig({ ...config, max_block_messages: value })} />
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <Field
+                label="Initial history"
+                help="How far back to collect when this source is first connected or its history is expanded. Older supported memories do not expire as time passes."
+              >
+                <select
+                  className="h-10 rounded-md border bg-background px-3 text-sm"
+                  value={config.initial_history_days}
+                  onChange={(event) => setConfig({ ...config, initial_history_days: Number(event.target.value) })}
+                >
+                  {![14, 30, 90, 365].includes(config.initial_history_days) && (
+                    <option value={config.initial_history_days}>{config.initial_history_days} days (existing)</option>
+                  )}
+                  <option value={14}>14 days</option>
+                  <option value={30}>30 days</option>
+                  <option value={90}>90 days</option>
+                  <option value={365}>1 year</option>
+                </select>
+              </Field>
+              <Field
+                label="Rolling retention"
+                help="Forever keeps established support. A finite policy removes old Teams support only after a complete, successful scope check."
+              >
+                <select
+                  className="h-10 rounded-md border bg-background px-3 text-sm"
+                  value={config.rolling_retention_days ?? "forever"}
+                  onChange={(event) => setConfig({
+                    ...config,
+                    rolling_retention_days: event.target.value === "forever" ? null : Number(event.target.value),
+                  })}
+                >
+                  <option value="forever">Forever</option>
+                  <option value={365}>1 year</option>
+                  <option value={1095}>3 years</option>
+                </select>
+              </Field>
             </div>
           </details>
         </div>
@@ -426,10 +458,6 @@ export function TeamsSourceSetup({
 
 function Field({ label, help, children }: { label: string; help?: string; children: React.ReactNode }) {
   return <label className="block space-y-1.5"><span className="text-xs font-medium text-muted-foreground">{label}</span>{children}{help && <span className="block text-xs text-muted-foreground">{help}</span>}</label>;
-}
-
-function NumberField({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {
-  return <Field label={label}><Input type="number" min={1} value={value} onChange={(event) => onChange(Math.max(1, Number(event.target.value) || 1))} /></Field>;
 }
 
 function TeamsTypeIcon({ type, className }: { type: TeamsSelectionItem["type"]; className?: string }) {

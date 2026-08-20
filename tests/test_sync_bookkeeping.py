@@ -53,6 +53,7 @@ from memforge.models import (
 from memforge.pipeline.sync_memory import MemorySample, SyncMemoryObserver
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_projection import (
+    ProjectionScopeAttestation,
     ProjectionScopeTransition,
     ProjectionScopeTransitionStatus,
 )
@@ -2845,76 +2846,30 @@ class SinceRecordingEmptyGene(EmptyGene):
             yield ContentItem(item_id="never", title="never", updated_at=datetime.now(timezone.utc))
 
 
-class TeamsScopeAttestationGene(EmptyGene):
-    def __init__(
-        self,
-        *,
-        transition_id: str,
-        target_scope: dict[str, object],
-        collection_attempt_id: str = "job-scope:attempt:1",
-    ) -> None:
-        super().__init__()
-        self._transition_id = transition_id
-        self._target_scope = target_scope
-        self._collection_attempt_id = collection_attempt_id
-        self._payloads: dict[str, dict[str, object]] = {}
-
-    @classmethod
-    def metadata(cls) -> GeneMetadata:
-        return GeneMetadata(
-            name="teams",
-            display_name="Teams",
-            description="test scope attestation",
-            default_sync_interval_minutes=60,
-            auth_method="none",
-            data_shape="message",
-        )
-
-    async def discover(self, since=None):
-        del since
-        conversations = sorted(str(value) for value in self._target_scope.get("conversation_ids", []))
-        for conversation_id in conversations:
-            item_id = f"scope-{conversation_id}"
-            window_id = f"teams-scope:v1:{conversation_id}"
-            self._payloads[item_id] = {
-                "_scope_attestation": True,
-                "conversation_id": conversation_id,
-                "window_id": window_id,
-                "messages": [],
-                "transition_id": self._transition_id,
-                "target_scope_fingerprint": projection_scope_fingerprint(self._target_scope),
-                "target_conversation_ids": conversations,
-                "collection_attempt_id": self._collection_attempt_id,
+def teams_scope_attestations(
+    transition_id: str,
+    target_scope: dict[str, object],
+) -> tuple[ProjectionScopeAttestation, ...]:
+    conversations = sorted(str(value) for value in target_scope.get("conversation_ids", []))
+    return tuple(
+        ProjectionScopeAttestation(
+            subject_type="conversation",
+            subject_key=conversation_id,
+            collection_attempt_id="job-scope:attempt:1",
+            target_scope_fingerprint=projection_scope_fingerprint(target_scope),
+            transition_id=transition_id,
+            evidence={
+                "target_subject_keys": conversations,
                 "poll": {
                     "raw_conversation_id": conversation_id,
                     "access_probe_status": "ok",
                     "pagination_complete": True,
                     "stop_reason": "no_backward_link",
                 },
-            }
-            yield ContentItem(
-                item_id=item_id,
-                title=f"Scope {conversation_id}",
-                source_url="",
-                last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
-                version=f"scope-{self._transition_id}",
-                extra={
-                    "conversation_id": conversation_id,
-                    "window_id": window_id,
-                },
-            )
-
-    async def fetch(self, item: ContentItem) -> RawContent:
-        return RawContent(
-            item=item,
-            body=json.dumps(self._payloads[item.item_id]).encode(),
-            content_type="application/json",
-            authoritative_empty=True,
-            empty_evidence="teams_current_collection_scope_attestation",
+            },
         )
-
-    async def normalize(self, raw: RawContent) -> NormalizedContent:
-        return NormalizedContent(item=raw.item, markdown_body="")
+        for conversation_id in conversations
+    )
 
 
 class IncrementalNewDocumentGene:
@@ -5623,10 +5578,8 @@ async def test_teams_scope_transition_applies_after_removed_units_are_tombstoned
             target_scope={"conversation_ids": ["19:retained-thread@example.test"]},
         )
     )
-    gene = TeamsScopeAttestationGene(
-        transition_id="scope-transition-reconciled",
-        target_scope={"conversation_ids": ["19:retained-thread@example.test"]},
-    )
+    target_scope = {"conversation_ids": ["19:retained-thread@example.test"]}
+    gene = SinceRecordingEmptyGene()
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
@@ -5639,6 +5592,10 @@ async def test_teams_scope_transition_applies_after_removed_units_are_tombstoned
         gene,
         "Teams",
         source_id,
+        projection_scope_attestations=teams_scope_attestations(
+            "scope-transition-reconciled",
+            target_scope,
+        ),
     )
     transition = (await db.list_projection_scope_transitions(source_id))[0]
 
@@ -5646,19 +5603,17 @@ async def test_teams_scope_transition_applies_after_removed_units_are_tombstoned
     assert transition.status is ProjectionScopeTransitionStatus.APPLIED
     assert transition.coverage.value == "tombstoned_delta"
     assert await db.list_indexed_doc_ids(source_id) == set()
-    assert not any(
-        unit.unit_type == "teams_scope_attestation" for unit in await db.list_current_source_units(source_id)
-    )
+    assert await db.list_current_source_units(source_id) == ()
 
 
 @pytest.mark.asyncio
-async def test_teams_max_age_transition_applies_only_with_target_time_attestation(
+async def test_teams_retention_transition_applies_only_with_target_attestation(
     db: Database,
 ):
     source_id = "src-scope-transition-time"
     target_scope = {
         "conversation_ids": ["19:conversation-a@example.test"],
-        "max_age_days": 30,
+        "rolling_retention_days": 365,
     }
     await db.upsert_source(
         id=source_id,
@@ -5674,7 +5629,7 @@ async def test_teams_max_age_transition_applies_only_with_target_time_attestatio
             source_id=source_id,
             previous_scope={
                 "conversation_ids": ["19:conversation-a@example.test"],
-                "max_age_days": 365,
+                "rolling_retention_days": None,
             },
             target_scope=target_scope,
         )
@@ -5720,10 +5675,7 @@ async def test_teams_max_age_transition_applies_only_with_target_time_attestatio
             scope={"configured_scope": target_scope},
         )
     )
-    gene = TeamsScopeAttestationGene(
-        transition_id="scope-transition-time",
-        target_scope=target_scope,
-    )
+    gene = SinceRecordingEmptyGene()
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
@@ -5736,6 +5688,10 @@ async def test_teams_max_age_transition_applies_only_with_target_time_attestatio
         gene,
         "Teams",
         source_id,
+        projection_scope_attestations=teams_scope_attestations(
+            "scope-transition-time",
+            target_scope,
+        ),
     )
     transition = (await db.list_projection_scope_transitions(source_id))[0]
 

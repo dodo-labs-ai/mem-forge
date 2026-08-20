@@ -177,8 +177,10 @@ def test_local_agent_job_payload_preserves_complete_collection_scope() -> None:
 
     assert jira["query_mode"] == "advanced"
     assert jira["jql_filter"] == "updated >= -90d"
-    assert teams["max_age_days"] == 45
-    assert teams["max_block_messages"] == 250
+    assert teams["initial_history_days"] == 45
+    assert teams["rolling_retention_days"] is None
+    assert "max_age_days" not in teams
+    assert "max_block_messages" not in teams
     assert jira["source_config_revision"] == local_agent_source_config_revision(jira_source)
     assert teams["source_config_revision"] == local_agent_source_config_revision(teams_source)
 
@@ -634,7 +636,8 @@ def test_execution_owner_normalizes_missing_and_blank_values() -> None:
             {
                 "region": "emea",
                 "conversation_ids": ["19:team@example.test"],
-                "conversation_gap_minutes": 60,
+                "initial_history_days": 14,
+                "rolling_retention_days": None,
             },
         ),
     ],
@@ -676,6 +679,8 @@ def test_local_agent_sync_job_payload_uses_saved_config_and_request_controls_onl
     assert payload == {
         "region": "emea",
         "conversation_ids": ["19:canonical@example.test"],
+        "initial_history_days": 14,
+        "rolling_retention_days": None,
         "source_id": "src-teams",
         "source_type": "teams",
         "source_activity_epoch": 0,

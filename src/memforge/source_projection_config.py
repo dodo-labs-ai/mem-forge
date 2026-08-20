@@ -44,16 +44,14 @@ _SCOPE_FIELDS: Mapping[str, tuple[str, ...]] = {
         "exclude_url_patterns",
     ),
     "local_markdown": ("include", "exclude"),
-    # These three Teams settings change frozen-window membership and therefore
-    # belong to projection scope, not operational retry/pacing configuration.
+    # Initial history changes collection breadth but never removes established
+    # lineage. Only an explicit rolling-retention policy changes membership.
     "teams": (
         "conversation_ids",
         "channels",
         "group_chats",
         "individual_chats",
-        "max_age_days",
-        "conversation_gap_minutes",
-        "max_block_messages",
+        "rolling_retention_days",
     ),
 }
 

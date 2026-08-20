@@ -68,7 +68,7 @@ def test_jira_advanced_jql_is_the_projection_scope() -> None:
     }
 
 
-def test_teams_window_shape_settings_are_projection_scope() -> None:
+def test_teams_projection_scope_separates_history_from_explicit_retention() -> None:
     scope = canonical_projection_scope(
         "teams",
         {
@@ -77,15 +77,14 @@ def test_teams_window_shape_settings_are_projection_scope() -> None:
             "max_age_days": 14,
             "conversation_gap_minutes": 60,
             "max_block_messages": 100,
+            "rolling_retention_days": 365,
             "conversation_fetch_timeout_seconds": 300,
         },
     )
 
     assert scope == {
         "conversation_ids": ["19:a", "19:b"],
-        "max_age_days": 14,
-        "conversation_gap_minutes": 60,
-        "max_block_messages": 100,
+        "rolling_retention_days": 365,
     }
 
 

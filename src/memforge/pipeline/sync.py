@@ -77,6 +77,7 @@ from memforge.source_projection import (
     ProjectionEnvelope,
     ProjectionRequest,
     ProjectionRunMode,
+    ProjectionScopeAttestation,
     SourceProjection,
     SourceProjectionAdapter,
     SourceRelationType,
@@ -666,6 +667,7 @@ class GeneSyncOrchestrator:
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
+        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         record_terminal_result: bool = True,
     ) -> SyncState:
         """Run the full sync pipeline for a gene.
@@ -948,7 +950,6 @@ class GeneSyncOrchestrator:
                     "failed": False,
                     "preflight_source_unit_id": None,
                     "preflight_observation_ids": (),
-                    "projection_scope_attestation": None,
                     "runtime_bundle": None,
                 }
                 document_completed = False
@@ -1002,6 +1003,7 @@ class GeneSyncOrchestrator:
                                     else None
                                 ),
                                 projection_access_context=configured_access_context,
+                                projection_scope_attestations=projection_scope_attestations,
                                 authoritative_snapshot=authoritative_snapshot,
                                 execution_mode=execution_mode,
                                 expected_source_activity_epoch=source_activity_epoch,
@@ -1023,7 +1025,6 @@ class GeneSyncOrchestrator:
                                 "preflight_observation_ids",
                                 (),
                             )
-                            stats["projection_scope_attestation"] = item_stats.get("projection_scope_attestation")
                             last_error = None
                         except Exception as exc:
                             attempt_error = _retained_document_error(exc)
@@ -1208,11 +1209,7 @@ class GeneSyncOrchestrator:
                         source_type=configured_source_type,
                         transition=scope_transition,
                         current_units=await self.db.list_current_source_units(source_id),
-                        run_attestations=tuple(
-                            result["projection_scope_attestation"]
-                            for result in results
-                            if result.get("projection_scope_attestation") is not None
-                        ),
+                        run_attestations=projection_scope_attestations,
                     )
                 if (absence_is_authoritative or scoped_reconciliation_coverage is not None) and docs_failed == 0:
                     scope_transition = await self.db.complete_projection_scope_transition(
@@ -1602,6 +1599,7 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None = None,
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
+        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         authoritative_snapshot: bool = False,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         expected_source_activity_epoch: int | None = None,
@@ -1646,6 +1644,7 @@ class GeneSyncOrchestrator:
                         projection_scope=projection_scope,
                         scope_transition=scope_transition,
                         projection_access_context=projection_access_context,
+                        projection_scope_attestations=projection_scope_attestations,
                         authoritative_snapshot=authoritative_snapshot,
                         execution_mode=execution_mode,
                         expected_source_activity_epoch=expected_source_activity_epoch,
@@ -1710,6 +1709,7 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None = None,
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
+        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         authoritative_snapshot: bool = False,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         expected_source_activity_epoch: int | None = None,
@@ -1742,7 +1742,6 @@ class GeneSyncOrchestrator:
             "memory_supports_added": 0,
             "memory_supports_updated": 0,
             "memory_supports_removed": 0,
-            "projection_scope_attestation": None,
         }
 
         # ------------------------------------------------------------------
@@ -1832,6 +1831,7 @@ class GeneSyncOrchestrator:
                             run_mode=ProjectionRunMode.FULL_SNAPSHOT,
                             scope_transition=scope_transition,
                             access_context=dict(projection_access_context or {}),
+                            scope_attestations=projection_scope_attestations,
                         ),
                         item=item,
                         raw=raw,
@@ -1871,6 +1871,7 @@ class GeneSyncOrchestrator:
                     run_mode=ProjectionRunMode.FULL_SNAPSHOT,
                     scope_transition=scope_transition,
                     access_context=dict(projection_access_context or {}),
+                    scope_attestations=projection_scope_attestations,
                 ),
                 item=item,
                 raw=raw,
@@ -1910,6 +1911,7 @@ class GeneSyncOrchestrator:
                             run_mode=ProjectionRunMode.FULL_SNAPSHOT,
                             scope_transition=scope_transition,
                             access_context=dict(projection_access_context or {}),
+                            scope_attestations=projection_scope_attestations,
                         ),
                         item=item,
                         raw=raw,
@@ -1918,23 +1920,6 @@ class GeneSyncOrchestrator:
                 )
                 break
         source_unit = projection_probe.source_units[0]
-
-        if source_unit.unit_type == "teams_scope_attestation":
-            # Scope evidence is valid only for this processing run. Persisting
-            # it as a document/Source Unit would turn historical selectors into
-            # an ever-growing pseudo corpus and make later rebaseline replay
-            # stale control state. Return the validated locator directly to the
-            # reconciliation step without recording durable lineage.
-            stats["projection_scope_attestation"] = dict(source_unit.locator)
-            if progress_callback:
-                progress_callback(
-                    {
-                        "phase": "processing",
-                        "event": "document_processed",
-                        "title": item.title,
-                    }
-                )
-            return stats
 
         # Artifact identity belongs to the immutable Source Unit, not to its
         # current document locator. Jira issue keys and repository paths can
@@ -1965,6 +1950,7 @@ class GeneSyncOrchestrator:
                         run_mode=ProjectionRunMode.FULL_SNAPSHOT,
                         scope_transition=scope_transition,
                         access_context=dict(projection_access_context or {}),
+                        scope_attestations=projection_scope_attestations,
                     ),
                     item=item,
                     raw=raw,
@@ -2005,6 +1991,7 @@ class GeneSyncOrchestrator:
                             ),
                             scope_transition=scope_transition,
                             access_context=dict(projection_access_context or {}),
+                            scope_attestations=projection_scope_attestations,
                         ),
                         item=item,
                         raw=raw,
