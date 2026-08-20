@@ -212,6 +212,7 @@ from memforge.source_derivation import (
 from memforge.source_projection import (
     AnchorKind,
     ProjectionCoverage,
+    ProjectionScopeAttestation,
     ProjectionScopeTransition,
     ProjectionScopeTransitionStatus,
     SourceObservationRevision,
@@ -223,6 +224,8 @@ from memforge.source_projection import (
     SourceUnitRevision,
     source_projection_from_payload,
     source_projection_to_payload,
+    projection_scope_attestation_from_payload,
+    projection_scope_attestation_to_payload,
 )
 from memforge.source_artifacts import (
     SourceArtifactEvidence,
@@ -1459,6 +1462,7 @@ CREATE TABLE IF NOT EXISTS source_sync_snapshot_manifests (
     local_agent_attempt_count INTEGER NOT NULL,
     source_activity_epoch INTEGER NOT NULL,
     source_config_revision TEXT NOT NULL,
+    scope_attestations_json TEXT NOT NULL DEFAULT '[]',
     created_at          TEXT NOT NULL,
     PRIMARY KEY (workspace_id, source_id, snapshot_id)
 );
@@ -3946,6 +3950,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "Pin source-backed correction Reviews to the active Support Set",
         [
             "ALTER TABLE memory_reviews ADD COLUMN expected_support_set_hash TEXT",
+        ],
+    ),
+    (
+        87,
+        "Separate projection-scope attestations from Source Unit content",
+        [
+            "ALTER TABLE source_sync_snapshot_manifests ADD COLUMN scope_attestations_json TEXT NOT NULL DEFAULT '[]'",
         ],
     ),
 ]
@@ -17747,6 +17758,7 @@ class Database:
         local_agent_job_id: str,
         local_agent_attempt_count: int,
         source_config_revision: str,
+        scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         expected_activity_epoch: int | None = None,
     ) -> None:
         """Persist one fenced manifest and attach its reusable immutable inputs."""
@@ -17768,6 +17780,11 @@ class Database:
             raise ValueError("snapshot membership was not declared by the manifest")
         if len(manifest_sha256) != 64:
             raise ValueError("snapshot manifest digest is invalid")
+        scope_attestations_json = json.dumps(
+            [projection_scope_attestation_to_payload(item) for item in scope_attestations],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         now = _now_iso()
         async with self._write_lock:
             try:
@@ -17828,7 +17845,8 @@ class Database:
                 async with self.db.execute(
                     """SELECT coverage, item_count, manifest_sha256,
                               local_agent_job_id, local_agent_attempt_count,
-                              source_activity_epoch, source_config_revision
+                              source_activity_epoch, source_config_revision,
+                              scope_attestations_json
                        FROM source_sync_snapshot_manifests
                        WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
                     (workspace_id, source_id, normalized_snapshot_id),
@@ -17842,6 +17860,7 @@ class Database:
                     local_agent_attempt_count,
                     int(source["activity_epoch"] or 0),
                     source_config_revision,
+                    scope_attestations_json,
                 )
                 if existing_manifest is not None:
                     actual_manifest = (
@@ -17852,6 +17871,7 @@ class Database:
                         int(existing_manifest["local_agent_attempt_count"]),
                         int(existing_manifest["source_activity_epoch"]),
                         str(existing_manifest["source_config_revision"]),
+                        str(existing_manifest["scope_attestations_json"]),
                     )
                     if actual_manifest != expected_manifest:
                         raise SourceActivityConflict("source snapshot manifest changed")
@@ -17881,8 +17901,9 @@ class Database:
                         """INSERT INTO source_sync_snapshot_manifests (
                         workspace_id, source_id, snapshot_id, coverage, item_count, manifest_sha256,
                         local_agent_job_id, local_agent_attempt_count,
-                        source_activity_epoch, source_config_revision, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        source_activity_epoch, source_config_revision,
+                        scope_attestations_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             workspace_id,
                             source_id,
@@ -17894,6 +17915,7 @@ class Database:
                             local_agent_attempt_count,
                             int(source["activity_epoch"] or 0),
                             source_config_revision,
+                            scope_attestations_json,
                             now,
                         ),
                     )
@@ -17948,7 +17970,8 @@ class Database:
         async with self.db.execute(
             """SELECT m.coverage, m.item_count, m.local_agent_job_id,
                       m.local_agent_attempt_count, m.source_activity_epoch,
-                      m.source_config_revision, COUNT(si.doc_id) AS materialized_count
+                      m.source_config_revision, m.scope_attestations_json,
+                      COUNT(si.doc_id) AS materialized_count
                FROM source_sync_snapshot_manifests m
                LEFT JOIN source_sync_snapshot_items si
                  ON si.workspace_id = m.workspace_id
@@ -17957,7 +17980,7 @@ class Database:
                WHERE m.workspace_id = ? AND m.source_id = ? AND m.snapshot_id = ?
                GROUP BY m.coverage, m.item_count, m.local_agent_job_id,
                         m.local_agent_attempt_count, m.source_activity_epoch,
-                        m.source_config_revision""",
+                        m.source_config_revision, m.scope_attestations_json""",
             (workspace_id, source_id, snapshot_id),
         ) as cursor:
             row = await cursor.fetchone()
@@ -17974,6 +17997,10 @@ class Database:
             "local_agent_attempt_count": int(row["local_agent_attempt_count"]),
             "source_activity_epoch": int(row["source_activity_epoch"]),
             "source_config_revision": str(row["source_config_revision"]),
+            "scope_attestations": tuple(
+                projection_scope_attestation_from_payload(item)
+                for item in json.loads(row["scope_attestations_json"] or "[]")
+            ),
         }
 
     async def attest_source_sync_input_artifact(

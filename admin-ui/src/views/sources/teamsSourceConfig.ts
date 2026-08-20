@@ -8,9 +8,8 @@ export interface TeamsSelectionItem {
 export interface TeamsSourceConfig {
   name: string;
   region: string;
-  max_age_days: number;
-  conversation_gap_minutes: number;
-  max_block_messages: number;
+  initial_history_days: number;
+  rolling_retention_days: number | null;
 }
 
 export interface TeamsSourcePayload {
@@ -19,9 +18,8 @@ export interface TeamsSourcePayload {
   config: {
     region: string;
     conversation_ids: string;
-    max_age_days: number;
-    conversation_gap_minutes: number;
-    max_block_messages: number;
+    initial_history_days: number;
+    rolling_retention_days: number | null;
   };
 }
 
@@ -45,9 +43,8 @@ export function buildDefaultTeamsSourceConfig(): TeamsSourceConfig {
   return {
     name: "",
     region: "emea",
-    max_age_days: 14,
-    conversation_gap_minutes: 60,
-    max_block_messages: 100,
+    initial_history_days: 14,
+    rolling_retention_days: null,
   };
 }
 
@@ -64,15 +61,11 @@ export function editableTeamsSourceState(source: EditableTeamsSource): EditableT
     config: {
       name: source.name,
       region: stringConfig(source.config.region, defaults.region),
-      max_age_days: numberConfig(source.config.max_age_days, defaults.max_age_days),
-      conversation_gap_minutes: numberConfig(
-        source.config.conversation_gap_minutes,
-        defaults.conversation_gap_minutes,
+      initial_history_days: numberConfig(
+        source.config.initial_history_days ?? source.config.max_age_days,
+        defaults.initial_history_days,
       ),
-      max_block_messages: numberConfig(
-        source.config.max_block_messages,
-        defaults.max_block_messages,
-      ),
+      rolling_retention_days: retentionConfig(source.config.rolling_retention_days),
     },
     conversationIds: stringListConfig(source.config.conversation_ids),
   };
@@ -91,9 +84,8 @@ export function buildTeamsSourcePayload({
     config: {
       region: config.region,
       conversation_ids: selections.map((item) => item.id).join(", "),
-      max_age_days: config.max_age_days,
-      conversation_gap_minutes: config.conversation_gap_minutes,
-      max_block_messages: config.max_block_messages,
+      initial_history_days: config.initial_history_days,
+      rolling_retention_days: config.rolling_retention_days,
     },
   };
 }
@@ -125,6 +117,11 @@ function stringConfig(value: unknown, fallback: string): string {
 function numberConfig(value: unknown, fallback: number): number {
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function retentionConfig(value: unknown): number | null {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return parsed === 365 || parsed === 1095 ? parsed : null;
 }
 
 function stringListConfig(value: unknown): string[] {

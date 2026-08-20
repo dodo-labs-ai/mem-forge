@@ -20,6 +20,7 @@ from memforge.genes import GENE_REGISTRY
 from memforge.source_projection import (
     DeltaAxis,
     ProjectionCoverage,
+    ProjectionScopeAttestation,
     ProjectionScopeTransition,
     SourceRelationType,
     SourceUnit,
@@ -98,22 +99,25 @@ def _jira_payload(
 
 def _teams_run_attestations(
     transition: ProjectionScopeTransition,
-) -> tuple[dict[str, object], ...]:
+) -> tuple[ProjectionScopeAttestation, ...]:
     conversations = sorted(str(value) for value in transition.target_scope.get("conversation_ids", []))
     return tuple(
-        {
-            "conversation_id": conversation_id,
-            "transition_id": transition.id,
-            "target_scope_fingerprint": projection_scope_fingerprint(transition.target_scope),
-            "target_conversation_ids": conversations,
-            "collection_attempt_id": "job-a:attempt:1",
-            "poll": {
-                "raw_conversation_id": conversation_id,
-                "access_probe_status": "ok",
-                "pagination_complete": True,
-                "stop_reason": "no_backward_link",
+        ProjectionScopeAttestation(
+            subject_type="conversation",
+            subject_key=conversation_id,
+            transition_id=transition.id,
+            target_scope_fingerprint=projection_scope_fingerprint(transition.target_scope),
+            collection_attempt_id="job-a:attempt:1",
+            evidence={
+                "target_subject_keys": conversations,
+                "poll": {
+                    "raw_conversation_id": conversation_id,
+                    "access_probe_status": "ok",
+                    "pagination_complete": True,
+                    "stop_reason": "no_backward_link",
+                },
             },
-        }
+        )
         for conversation_id in conversations
     )
 
@@ -1326,48 +1330,6 @@ def test_teams_window_attestation_proves_only_unit_snapshot_completeness() -> No
     )
 
 
-def test_teams_bounded_time_scope_attestation_is_persisted_on_unit_locator() -> None:
-    configured_scope = {
-        "conversation_ids": ["conv-1"],
-        "max_age_days": 30,
-        "conversation_gap_minutes": 60,
-        "max_block_messages": 100,
-    }
-    item = _item(
-        item_id="window-1",
-        extra={"conversation_id": "conv-1", "window_id": "window-1"},
-    )
-    raw, normalized = _inputs(
-        item,
-        {
-            "_scope_coverage_from": "2026-07-01T00:00:00Z",
-            "_scope_coverage_to": "2026-07-16T00:00:00Z",
-            "messages": [
-                {
-                    "id": "msg-1",
-                    "content": "Answer",
-                    "time": "2026-07-10T09:00:00Z",
-                }
-            ],
-        },
-    )
-
-    projection = project_source_item(
-        source_id="src-teams",
-        source_type="teams",
-        run_id="run-teams-bounded-scope",
-        item=item,
-        raw=raw,
-        normalized=normalized,
-        scope={"configured_scope": configured_scope},
-    )
-
-    locator = projection.source_units[0].locator
-    assert locator["time_scope_fingerprint"] == projection_scope_fingerprint(configured_scope)
-    assert locator["time_scope_coverage_from"] == "2026-07-01T00:00:00+00:00"
-    assert locator["time_scope_coverage_to"] == "2026-07-16T00:00:00+00:00"
-
-
 def test_teams_complete_window_tombstone_removes_every_prior_observation() -> None:
     item = _item(
         item_id="window-1",
@@ -1423,6 +1385,96 @@ def test_teams_complete_window_tombstone_removes_every_prior_observation() -> No
     assert tombstone.observations == ()
     assert set(tombstone.deltas[0].removed_observation_ids) == {observation.id for observation in first.observations}
     assert DeltaAxis.MEMBERSHIP in tombstone.deltas[0].axes
+
+
+def test_teams_rolling_retention_tombstone_requires_same_attempt_scope_attestation() -> None:
+    conversation_id = "19:conv-a@example.test"
+    configured_scope = {
+        "conversation_ids": [conversation_id],
+        "rolling_retention_days": 365,
+    }
+    item = _item(
+        item_id="window-expired",
+        extra={"conversation_id": conversation_id, "window_id": "window-expired"},
+    )
+    first_raw, first_normalized = _inputs(
+        item,
+        {"messages": [{"id": "msg-1", "content": "Old", "time": "2024-01-01T00:00:00Z"}]},
+    )
+    first = project_source_item(
+        source_id="src-teams",
+        source_type="teams",
+        run_id="run-retention-before",
+        item=item,
+        raw=first_raw,
+        normalized=first_normalized,
+    )
+    raw, normalized = _inputs(
+        item,
+        {
+            "_authoritative_snapshot": True,
+            "_tombstone": True,
+            "tombstone_reason": "outside_rolling_retention",
+            "rolling_retention_cutoff": "2025-01-01T00:00:00Z",
+            "prior_observed_to": "2024-01-01T00:00:00Z",
+            "conversation_id": conversation_id,
+            "messages": [],
+        },
+        "",
+    )
+    kwargs = {
+        "source_id": "src-teams",
+        "source_type": "teams",
+        "run_id": "run-retention-tombstone",
+        "item": item,
+        "raw": raw,
+        "normalized": normalized,
+        "scope": {"configured_scope": configured_scope},
+        "prior_unit_revision": first.source_unit_revisions[0],
+        "prior_observation_revisions": {
+            first.observations[0].id: first.observation_revisions[0],
+        },
+    }
+    with pytest.raises(ValueError, match="run-scoped coverage evidence"):
+        project_source_item(**kwargs)
+
+    attestation = ProjectionScopeAttestation(
+        subject_type="conversation",
+        subject_key=conversation_id,
+        collection_attempt_id="job-1:attempt:1",
+        target_scope_fingerprint=projection_scope_fingerprint(configured_scope),
+        evidence={
+            "target_subject_keys": [conversation_id],
+            "rolling_retention_cutoff": "2025-01-01T00:00:00Z",
+            "poll": {
+                "raw_conversation_id": conversation_id,
+                "access_probe_status": "ok",
+                "pagination_complete": False,
+                "stop_reason": "cutoff_reached",
+                "absence_covered_from": "2025-01-01T00:00:00Z",
+                "absence_covered_to": "2026-01-01T00:00:00Z",
+            },
+        },
+    )
+    tombstone = project_source_item(**kwargs, scope_attestations=(attestation,))
+    assert tombstone.deltas[0].removed_observation_ids == (first.observations[0].id,)
+    assert tombstone.source_units[0].locator["observed_to"] == "2024-01-01T00:00:00+00:00"
+    assert tombstone.source_units[0].locator["tombstone_reason"] == "outside_rolling_retention"
+
+    incomplete_scope = {
+        "conversation_ids": [conversation_id, "19:conv-b@example.test"],
+        "rolling_retention_days": 365,
+    }
+    incomplete_attestation = replace(
+        attestation,
+        target_scope_fingerprint=projection_scope_fingerprint(incomplete_scope),
+        evidence={**attestation.evidence, "target_subject_keys": sorted(incomplete_scope["conversation_ids"])},
+    )
+    with pytest.raises(ValueError, match="run-scoped coverage evidence"):
+        project_source_item(
+            **{**kwargs, "scope": {"configured_scope": incomplete_scope}},
+            scope_attestations=(incomplete_attestation,),
+        )
 
 
 def test_teams_selector_scope_transition_closes_after_removed_units_are_tombstoned() -> None:
@@ -1527,22 +1579,21 @@ def test_teams_empty_target_units_require_current_run_attestation() -> None:
     )
 
 
-def test_teams_time_scope_transition_requires_bounded_target_attestation() -> None:
+def test_teams_rolling_retention_transition_requires_target_attestation() -> None:
     adapter = GeneSourceProjectionAdapter()
     target_scope = {
         "conversation_ids": ["19:conv-a@example.test"],
-        "max_age_days": 30,
+        "rolling_retention_days": 365,
     }
     transition = ProjectionScopeTransition(
         id="transition-teams-time",
         source_id="src-teams",
         previous_scope={
             "conversation_ids": ["19:conv-a@example.test"],
-            "max_age_days": 365,
+            "rolling_retention_days": None,
         },
         target_scope=target_scope,
     )
-    fingerprint = projection_scope_fingerprint(target_scope)
     attested = SourceUnit(
         id="unit-a",
         source_id="src-teams",
@@ -1551,10 +1602,6 @@ def test_teams_time_scope_transition_requires_bounded_target_attestation() -> No
         locator={
             "conversation_id": "19:conv-a@example.test",
             "window_id": "window-a",
-            "observed_to": "2026-07-10T09:30:00+00:00",
-            "time_scope_fingerprint": fingerprint,
-            "time_scope_coverage_from": "2026-07-01T00:00:00+00:00",
-            "time_scope_coverage_to": "2026-07-16T00:00:00+00:00",
         },
     )
 
@@ -1571,25 +1618,13 @@ def test_teams_time_scope_transition_requires_bounded_target_attestation() -> No
         adapter.reconciliation_coverage(
             source_type="teams",
             transition=transition,
-            current_units=(
-                SourceUnit(
-                    id="unit-stale",
-                    source_id="src-teams",
-                    unit_type="teams_window",
-                    provider_key="window-stale",
-                    locator={
-                        "conversation_id": "19:conv-a@example.test",
-                        "window_id": "window-stale",
-                    },
-                ),
-            ),
-            run_attestations=_teams_run_attestations(transition),
+            current_units=(attested,),
         )
         is None
     )
 
 
-def test_teams_partition_scope_transition_requires_complete_target_attestation() -> None:
+def test_teams_internal_window_policy_is_not_projection_scope() -> None:
     adapter = GeneSourceProjectionAdapter()
     target_scope = {
         "conversation_ids": ["19:conv-a@example.test"],
@@ -1606,7 +1641,6 @@ def test_teams_partition_scope_transition_requires_complete_target_attestation()
         },
         target_scope=target_scope,
     )
-    fingerprint = projection_scope_fingerprint(target_scope)
     complete = SourceUnit(
         id="unit-a",
         source_id="src-teams",
@@ -1615,7 +1649,6 @@ def test_teams_partition_scope_transition_requires_complete_target_attestation()
         locator={
             "conversation_id": "19:conv-a@example.test",
             "window_id": "window-a",
-            "projection_scope_fingerprint": fingerprint,
         },
     )
 
@@ -1626,31 +1659,11 @@ def test_teams_partition_scope_transition_requires_complete_target_attestation()
             current_units=(complete,),
             run_attestations=_teams_run_attestations(transition),
         )
-        is ProjectionCoverage.TOMBSTONED_DELTA
-    )
-    partial = SourceUnit(
-        id="unit-b",
-        source_id="src-teams",
-        unit_type="teams_window",
-        provider_key="window-b",
-        locator={
-            "conversation_id": "19:conv-a@example.test",
-            "window_id": "window-b",
-            "time_scope_fingerprint": fingerprint,
-        },
-    )
-    assert (
-        adapter.reconciliation_coverage(
-            source_type="teams",
-            transition=transition,
-            current_units=(partial,),
-            run_attestations=_teams_run_attestations(transition),
-        )
         is None
     )
 
 
-def test_teams_mixed_time_and_partition_transition_requires_both_axes() -> None:
+def test_teams_legacy_history_and_partition_fields_cannot_authorize_removal() -> None:
     adapter = GeneSourceProjectionAdapter()
     target_scope = {
         "conversation_ids": ["19:conv-a@example.test"],
@@ -1677,16 +1690,6 @@ def test_teams_mixed_time_and_partition_transition_requires_both_axes() -> None:
         locator={
             "conversation_id": "19:conv-a@example.test",
             "window_id": "window-mixed",
-            "observed_to": "2026-07-10T09:30:00+00:00",
-            "partition_scope_fingerprint": projection_scope_fingerprint(
-                {
-                    "conversation_gap_minutes": 30,
-                    "max_block_messages": 50,
-                }
-            ),
-            "time_scope_fingerprint": projection_scope_fingerprint(target_scope),
-            "time_scope_coverage_from": "2026-07-01T00:00:00+00:00",
-            "time_scope_coverage_to": "2026-07-16T00:00:00+00:00",
         },
     )
 
@@ -1697,7 +1700,7 @@ def test_teams_mixed_time_and_partition_transition_requires_both_axes() -> None:
             current_units=(unit,),
             run_attestations=_teams_run_attestations(transition),
         )
-        is ProjectionCoverage.TOMBSTONED_DELTA
+        is None
     )
 
 

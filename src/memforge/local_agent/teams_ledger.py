@@ -16,6 +16,19 @@ TEAMS_LEDGER_STATE_VERSION = 1
 
 
 @dataclass(frozen=True)
+class TeamsWindowPolicy:
+    version: str
+    conversation_gap_minutes: int
+
+
+TEAMS_WINDOW_POLICY_V1 = TeamsWindowPolicy(
+    version="teams-window-v1",
+    conversation_gap_minutes=60,
+)
+_TEAMS_WINDOW_POLICIES = {TEAMS_WINDOW_POLICY_V1.version: TEAMS_WINDOW_POLICY_V1}
+
+
+@dataclass(frozen=True)
 class TeamsMessageKey:
     source_id: str
     conversation_id: str
@@ -70,6 +83,7 @@ class TeamsBlockProjection:
     member_message_ids: tuple[str, ...]
     block_membership_fingerprint: str
     revision_hash: str
+    policy_version: str = TEAMS_WINDOW_POLICY_V1.version
     assignment_generation: int = 0
     rebuild_generation: int = 0
     bridge_not_merged: bool = False
@@ -83,9 +97,11 @@ class TeamsProjectionResult:
 class TeamsLedgerProjector:
     """Project unthreaded Teams messages into stable 60-minute windows."""
 
-    def __init__(self, *, gap_minutes: int = 60) -> None:
-        self.gap_minutes = gap_minutes
-        self._gap = timedelta(minutes=gap_minutes)
+    def __init__(self, *, policy: TeamsWindowPolicy = TEAMS_WINDOW_POLICY_V1) -> None:
+        if policy.version not in _TEAMS_WINDOW_POLICIES:
+            raise ValueError(f"unsupported Teams window policy: {policy.version}")
+        self.policy = policy
+        self._gap = timedelta(minutes=policy.conversation_gap_minutes)
 
     def project_unthreaded(
         self,
@@ -148,6 +164,9 @@ class TeamsLedgerProjector:
         for block in sorted(previous.blocks, key=lambda item: (item.anchor_created_at, item.window_id)):
             members = sorted(assigned.get(block.window_id, []), key=lambda msg: (msg.created_at, msg.message_id))
             if not members:
+                # A bounded collection horizon proves nothing about older
+                # membership. Preserve its stable identity for later backfill.
+                rebuilt.append(block)
                 continue
             rebuilt.append(self._build_block(members[0], members, previous_block=block))
         return rebuilt
@@ -170,12 +189,12 @@ class TeamsLedgerProjector:
         before = [
             block for block in blocks
             if block.member_max_created_at < message.created_at
-            and message.created_at - block.member_max_created_at <= self._gap
+            and message.created_at - block.member_max_created_at <= _window_policy_gap(block.policy_version)
         ]
         after = [
             block for block in blocks
             if message.created_at < block.member_min_created_at
-            and block.member_min_created_at - message.created_at <= self._gap
+            and block.member_min_created_at - message.created_at <= _window_policy_gap(block.policy_version)
         ]
         if before and after:
             return sorted(before, key=lambda block: (message.created_at - block.member_max_created_at, block.window_id))[0]
@@ -207,6 +226,7 @@ class TeamsLedgerProjector:
             assignment_generation = 0
             rebuild_generation = 0
             bridge_not_merged = False
+            policy_version = self.policy.version
         else:
             frozen_anchor_message_id = previous_block.frozen_anchor_message_id
             anchor_created_at = previous_block.anchor_created_at
@@ -214,6 +234,7 @@ class TeamsLedgerProjector:
             assignment_generation = previous_block.assignment_generation + 1
             rebuild_generation = previous_block.rebuild_generation
             bridge_not_merged = previous_block.bridge_not_merged
+            policy_version = previous_block.policy_version
 
         member_message_ids = tuple(message.message_id for message in members)
         member_min_created_at = min(message.created_at for message in members)
@@ -221,6 +242,7 @@ class TeamsLedgerProjector:
         membership_fingerprint = _block_membership_fingerprint(window_id, members)
         revision_hash = _revision_hash(
             window_id=window_id,
+            policy_version=policy_version,
             rebuild_generation=rebuild_generation,
             block_membership_fingerprint=membership_fingerprint,
             messages=members,
@@ -237,6 +259,7 @@ class TeamsLedgerProjector:
             member_message_ids=member_message_ids,
             block_membership_fingerprint=membership_fingerprint,
             revision_hash=revision_hash,
+            policy_version=policy_version,
             assignment_generation=assignment_generation,
             rebuild_generation=rebuild_generation,
             bridge_not_merged=bridge_not_merged,
@@ -415,6 +438,7 @@ def _block_to_json(block: TeamsBlockProjection) -> dict[str, Any]:
         "member_message_ids": list(block.member_message_ids),
         "block_membership_fingerprint": block.block_membership_fingerprint,
         "revision_hash": block.revision_hash,
+        "policy_version": block.policy_version,
         "assignment_generation": block.assignment_generation,
         "rebuild_generation": block.rebuild_generation,
         "bridge_not_merged": block.bridge_not_merged,
@@ -433,6 +457,7 @@ def _block_from_json(value: dict[str, Any]) -> TeamsBlockProjection:
         member_message_ids=tuple(str(item) for item in value.get("member_message_ids", [])),
         block_membership_fingerprint=str(value["block_membership_fingerprint"]),
         revision_hash=str(value["revision_hash"]),
+        policy_version=str(value.get("policy_version") or TEAMS_WINDOW_POLICY_V1.version),
         assignment_generation=int(value.get("assignment_generation") or 0),
         rebuild_generation=int(value.get("rebuild_generation") or 0),
         bridge_not_merged=bool(value.get("bridge_not_merged")),
@@ -441,6 +466,13 @@ def _block_from_json(value: dict[str, Any]) -> TeamsBlockProjection:
 
 def _conversation_state_key(source_id: str, conversation_id: str) -> str:
     return _sha256_json({"source_id": source_id, "conversation_id": conversation_id})
+
+
+def _window_policy_gap(policy_version: str) -> timedelta:
+    policy = _TEAMS_WINDOW_POLICIES.get(policy_version)
+    if policy is None:
+        raise ValueError(f"unsupported Teams window policy: {policy_version}")
+    return timedelta(minutes=policy.conversation_gap_minutes)
 
 
 def _message_receipt_state_key(
@@ -475,6 +507,7 @@ def _block_membership_fingerprint(window_id: str, messages: list[TeamsLedgerMess
 def _revision_hash(
     *,
     window_id: str,
+    policy_version: str,
     rebuild_generation: int,
     block_membership_fingerprint: str,
     messages: list[TeamsLedgerMessage],
@@ -482,6 +515,7 @@ def _revision_hash(
 ) -> str:
     payload: dict[str, Any] = {
         "window_id": window_id,
+        "policy_version": policy_version,
         "rebuild_generation": rebuild_generation,
         "block_membership_fingerprint": block_membership_fingerprint,
         "bridge_not_merged": bridge_not_merged,

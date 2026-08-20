@@ -29,6 +29,7 @@ from memforge.local_agent.source_contract import (
     source_with_sync_inputs,
 )
 from memforge.source_projection_config import projection_access_fingerprint
+from memforge.source_projection import ProjectionScopeAttestation
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthReport
@@ -726,6 +727,7 @@ async def run_source_sync(
     lifecycle_cycle_id: str | None = None,
     scope_transition_run_id: str | None = None,
     reusable_projection_doc_ids: frozenset[str] = frozenset(),
+    projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
     record_terminal_result: bool = True,
 ) -> SyncState:
     await authorize_source_sync_maintenance(
@@ -785,6 +787,7 @@ async def run_source_sync(
             "lifecycle_cycle_id": lifecycle_cycle_id,
             "scope_transition_run_id": scope_transition_run_id,
             "reusable_projection_doc_ids": reusable_projection_doc_ids,
+            "projection_scope_attestations": projection_scope_attestations,
             "record_terminal_result": record_terminal_result,
         }
         if execution_mode is not SourceSyncMode.NORMAL:
@@ -1185,6 +1188,15 @@ class SourceSyncWorker:
                 workspace_id=run.workspace_id,
                 input_snapshot_id=run.input_snapshot_id,
             )
+            projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = ()
+            if run.input_snapshot_id is not None:
+                manifest_status = await self.db.get_source_sync_snapshot_manifest_status(
+                    source_id=run.source_id,
+                    workspace_id=run.workspace_id,
+                    snapshot_id=run.input_snapshot_id,
+                )
+                if manifest_status is not None:
+                    projection_scope_attestations = tuple(manifest_status.get("scope_attestations") or ())
             local_operation = local_agent_sync_operation(source["type"], source.get("config"))
             if run.input_snapshot_id is None:
                 if local_operation is not None and run.input_generation_watermark is None:
@@ -1236,6 +1248,7 @@ class SourceSyncWorker:
                 lifecycle_cycle_id=(f"{run.run_id}:attempt:{run.lease_attempt_count}"),
                 scope_transition_run_id=run.run_id,
                 reusable_projection_doc_ids=reusable_projection_doc_ids,
+                projection_scope_attestations=projection_scope_attestations,
                 record_terminal_result=False,
             )
             if final_state is None:

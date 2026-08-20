@@ -2980,14 +2980,15 @@ def test_local_agent_cloud_teams_sync_pushes_current_attempt_scope_attestation_f
         _cloud_test_client(),
     )
 
-    push = next(call for call in FakeToolClient.calls if call[0] == "push_teams_window_package")
-    raw_payload = push[1]["raw_payload"]
-    assert raw_payload["_scope_attestation"] is True
-    assert raw_payload["transition_id"] == "transition-empty-scope"
-    assert raw_payload["target_conversation_ids"] == [conversation_id]
-    assert raw_payload["collection_attempt_id"] == "laj-teams-empty-scope:attempt:2"
-    assert raw_payload["poll"]["stop_reason"] == "no_backward_link"
-    assert result["counts"]["pushed"] == 1
+    assert not [call for call in FakeToolClient.calls if call[0] == "push_teams_window_package"]
+    manifest = next(call for call in FakeToolClient.calls if call[0] == "prepare_local_source_snapshot")
+    [attestation] = manifest[1]["scope_attestations"]
+    assert attestation["transition_id"] == "transition-empty-scope"
+    assert attestation["subject_key"] == conversation_id
+    assert attestation["collection_attempt_id"] == "laj-teams-empty-scope:attempt:2"
+    assert attestation["evidence"]["poll"]["stop_reason"] == "no_backward_link"
+    assert manifest[1]["items"] == []
+    assert result["counts"]["pushed"] == 0
     assert result["sync_started"] is True
 
 
@@ -3654,6 +3655,8 @@ def test_server_inventory_emits_window_tombstone_only_after_complete_poll():
         "_authoritative_snapshot": True,
         "_tombstone": True,
         "tombstone_reason": "not_returned_by_complete_conversation_poll",
+        "prior_observed_from": "2026-07-08T09:00:00+00:00",
+        "prior_observed_to": "2026-07-08T09:30:00+00:00",
     }
 
 
@@ -3707,11 +3710,95 @@ def test_server_inventory_uses_bounded_poll_only_for_contained_window():
         destructive_enabled=True,
     )
 
-    assert len(documents) == 2
+    assert len(documents) == 1
     assert documents[0]["root_message_id"] == "recent-deleted"
     assert documents[0]["raw_payload"]["tombstone_reason"] == "not_returned_by_bounded_conversation_poll"
-    assert documents[1]["root_message_id"] == "older-retained"
-    assert documents[1]["raw_payload"]["tombstone_reason"] == "outside_configured_time_scope"
+    assert all(document["root_message_id"] != "older-retained" for document in documents)
+
+
+def test_server_inventory_applies_explicit_rolling_retention_only_after_complete_poll_evidence():
+    from memforge.local_agent.teams_ledger import build_teams_window_id
+
+    conversation_id = "19:conversation@thread.tacv2"
+    window_id = build_teams_window_id(
+        source_id="src-teams",
+        conversation_id=conversation_id,
+        root_or_anchor_message_id="expired",
+        window_type="time_block",
+    )
+    audit = {
+        "raw_conversation_id": conversation_id,
+        "pagination_complete": False,
+        "access_probe_status": "ok",
+        "stop_reason": "cutoff_reached",
+        "absence_covered_from": "2025-08-01T00:00:00+00:00",
+        "absence_covered_to": "2026-08-01T00:00:00+00:00",
+    }
+    documents = main._reconcile_teams_documents_with_server_inventory(
+        documents=[],
+        poll_audits=[audit],
+        inventory_units=[
+            {
+                "provider_key": window_id,
+                "locator": {
+                    "conversation_id": conversation_id,
+                    "window_id": window_id,
+                    "observed_from": "2025-01-01T00:00:00+00:00",
+                    "observed_to": "2025-01-01T01:00:00+00:00",
+                },
+            }
+        ],
+        configured_conversation_ids={conversation_id},
+        destructive_enabled=True,
+        rolling_retention_cutoff="2025-08-01T00:00:00+00:00",
+    )
+
+    assert documents[0]["raw_payload"]["tombstone_reason"] == "outside_rolling_retention"
+    assert documents[0]["raw_payload"]["rolling_retention_cutoff"] == "2025-08-01T00:00:00+00:00"
+
+
+def test_teams_retention_cutoff_is_stable_for_same_collection_attempt():
+    conversation_id = "19:conversation@thread.tacv2"
+    poll = {
+        "raw_conversation_id": conversation_id,
+        "pagination_complete": False,
+        "access_probe_status": "ok",
+        "stop_reason": "cutoff_reached",
+        "absence_covered_from": "2025-08-21T00:00:00+00:00",
+        "absence_covered_to": "2026-08-21T00:00:00+00:00",
+    }
+    kwargs = {
+        "source_id": "src-teams",
+        "poll_audits": [poll],
+        "configured_conversation_ids": {conversation_id},
+        "configured_source": {
+            "conversation_ids": [conversation_id],
+            "rolling_retention_days": 365,
+        },
+        "scope_transition": None,
+    }
+
+    first = main._teams_projection_scope_attestations(
+        job={
+            "job_id": "job-1",
+            "attempt_count": 1,
+            "created_at": "2026-08-21T00:00:00+00:00",
+            "updated_at": "2026-08-21T01:00:00+00:00",
+        },
+        **kwargs,
+    )
+    retry = main._teams_projection_scope_attestations(
+        job={
+            "job_id": "job-1",
+            "attempt_count": 1,
+            "created_at": "2026-08-21T00:00:00+00:00",
+            "updated_at": "2026-08-21T12:00:00+00:00",
+        },
+        **kwargs,
+    )
+
+    assert first == retry
+    assert first[0]["evidence"]["rolling_retention_cutoff"] == "2025-08-21T00:00:00+00:00"
 
 
 def test_server_inventory_never_tombstones_after_invalid_message_page():
@@ -3863,19 +3950,11 @@ def test_bounded_inventory_plan_separates_recent_reconciliation_from_scope_clean
         configured_conversation_ids={conversation_id},
         scope_transition=None,
     )
-    max_age_transition = main._teams_inventory_query_plans(
+    explicit_retention = main._teams_inventory_query_plans(
         poll_audits=[audit],
         configured_conversation_ids={conversation_id},
-        scope_transition={
-            "previous_scope": {
-                "conversation_ids": [conversation_id],
-                "max_age_days": 365,
-            },
-            "target_scope": {
-                "conversation_ids": [conversation_id],
-                "max_age_days": 30,
-            },
-        },
+        scope_transition=None,
+        rolling_retention_cutoff="2025-07-16T00:00:00+00:00",
     )
 
     expected = [
@@ -3886,11 +3965,11 @@ def test_bounded_inventory_plan_separates_recent_reconciliation_from_scope_clean
         },
         {
             "conversation_id": conversation_id,
-            "observed_to_lt": "2026-07-01T00:00:00+00:00",
+            "observed_to_lt": "2025-07-16T00:00:00+00:00",
         },
     ]
-    assert ordinary == expected
-    assert max_age_transition == expected
+    assert ordinary == expected[:1]
+    assert explicit_retention == expected
 
 
 def test_collect_teams_documents_from_cloud_job_maps_cloud_conversation_ids_to_direct_rest_config(monkeypatch):

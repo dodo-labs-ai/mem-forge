@@ -89,9 +89,11 @@ class TestMetadata:
         assert "channels" not in field_keys
         assert "group_chats" not in field_keys
         assert "individual_chats" not in field_keys
-        assert "max_age_days" in field_keys
-        assert "conversation_gap_minutes" in field_keys
-        assert "max_block_messages" in field_keys
+        assert "initial_history_days" in field_keys
+        assert "rolling_retention_days" in field_keys
+        assert "max_age_days" not in field_keys
+        assert "conversation_gap_minutes" not in field_keys
+        assert "max_block_messages" not in field_keys
 
     def test_normalize_config_collapses_legacy_direct_selectors(self):
         config = {
@@ -108,7 +110,9 @@ class TestMetadata:
                 "19:chat@example.test",
                 "19:channel@thread.tacv2",
                 "19:person@example.test",
-            ]
+            ],
+            "initial_history_days": 14,
+            "rolling_retention_days": None,
         }
 
     def test_normalize_config_rejects_display_name_selectors(self):
@@ -117,6 +121,22 @@ class TestMetadata:
             match="teams_sync_requires_direct_conversation_ids",
         ):
             TeamsGene.normalize_config({"channels": ["Team Name/General"]})
+
+    def test_legacy_max_age_migrates_to_initial_history_without_retention(self):
+        config = {
+            "conversation_ids": ["19:chat@example.test"],
+            "max_age_days": 45,
+            "conversation_gap_minutes": 30,
+            "max_block_messages": 50,
+        }
+
+        TeamsGene.normalize_config(config)
+
+        assert config == {
+            "conversation_ids": ["19:chat@example.test"],
+            "initial_history_days": 45,
+            "rolling_retention_days": None,
+        }
 
     @pytest.mark.parametrize("selector", ["Payroll: General", "alice@example.com"])
     def test_normalize_config_rejects_punctuation_that_is_not_provider_identity(
@@ -129,27 +149,24 @@ class TestMetadata:
         ):
             TeamsGene.normalize_config({"conversation_ids": [selector]})
 
-    def test_conversation_gap_defaults_to_one_hour(self):
-        schema = TeamsGene.config_schema()
-        gap = next(f for f in schema.fields if f.key == "conversation_gap_minutes")
-        assert gap.default == "60"
-
+    def test_internal_window_policy_is_versioned(self):
         gene = TeamsGene(
-            config={"channels": "Team/Channel"},
+            config={"conversation_ids": ["19:chat@example.test"]},
             source_id="test",
         )
         assert gene._gap_minutes == 60
+        assert gene._window_policy.version == "teams-window-v1"
 
     def test_initial_history_defaults_to_two_weeks(self):
         schema = TeamsGene.config_schema()
-        max_age = next(f for f in schema.fields if f.key == "max_age_days")
-        assert max_age.default == "14"
+        initial_history = next(f for f in schema.fields if f.key == "initial_history_days")
+        assert initial_history.default == "14"
 
         gene = TeamsGene(
-            config={"channels": "Team/Channel"},
+            config={"conversation_ids": ["19:chat@example.test"]},
             source_id="test",
         )
-        assert gene._max_age_days == 14
+        assert gene._initial_history_days == 14
 
     def test_local_agent_package_mode_does_not_require_remote_selectors(self, tmp_path):
         gene = TeamsGene(
@@ -380,18 +397,18 @@ class TestMetadata:
 
     def test_numeric_fields_use_integer_type(self):
         schema = TeamsGene.config_schema()
-        numeric_fields = {"max_age_days", "conversation_gap_minutes", "max_block_messages"}
+        numeric_fields = {"initial_history_days"}
         for f in schema.fields:
             if f.key in numeric_fields:
                 assert f.field_type == ConfigFieldType.INTEGER, f"Field {f.key} should be INTEGER"
 
     def test_config_validation_rejects_empty_scope(self):
-        with pytest.raises(ValueError, match="At least one"):
+        with pytest.raises(ValueError, match="teams_sync_requires_direct_conversation_ids"):
             TeamsGene(config={"region": "emea"}, source_id="test")
 
     def test_config_accepts_channels_only(self):
         gene = TeamsGene(
-            config={"channels": "Team/Channel"},
+            config={"channels": "19:channel@thread.tacv2"},
             source_id="test",
         )
         assert gene.source_id == "test"
@@ -433,11 +450,11 @@ class TestMetadata:
 
 class TestBlockGrouping:
     def test_empty_messages(self):
-        assert _group_into_blocks([], gap_minutes=180, max_messages=100) == []
+        assert _group_into_blocks([], gap_minutes=180) == []
 
     def test_single_message(self):
         msgs = [_msg("1", "Alice", "Hello", NOW)]
-        blocks = _group_into_blocks(msgs, gap_minutes=180, max_messages=100)
+        blocks = _group_into_blocks(msgs, gap_minutes=180)
         assert len(blocks) == 1
         assert len(blocks[0]) == 1
 
@@ -447,7 +464,7 @@ class TestBlockGrouping:
             _msg("2", "Bob", "Hi there", NOW + timedelta(minutes=5)),
             _msg("3", "Alice", "How are you?", NOW + timedelta(minutes=10)),
         ]
-        blocks = _group_into_blocks(msgs, gap_minutes=180, max_messages=100)
+        blocks = _group_into_blocks(msgs, gap_minutes=180)
         assert len(blocks) == 1
         assert len(blocks[0]) == 3
 
@@ -459,18 +476,16 @@ class TestBlockGrouping:
             _msg("3", "Alice", "Afternoon update", NOW + timedelta(hours=5)),
             _msg("4", "Carol", "Got it", NOW + timedelta(hours=5, minutes=10)),
         ]
-        blocks = _group_into_blocks(msgs, gap_minutes=180, max_messages=100)
+        blocks = _group_into_blocks(msgs, gap_minutes=180)
         assert len(blocks) == 2
         assert len(blocks[0]) == 2
         assert len(blocks[1]) == 2
 
-    def test_max_messages_splits_block(self):
-        # Create 10 messages 1 minute apart, max_messages=4
+    def test_context_budget_does_not_split_durable_window_identity(self):
         msgs = [_msg(str(i), "Alice", f"Message {i}", NOW + timedelta(minutes=i)) for i in range(10)]
-        blocks = _group_into_blocks(msgs, gap_minutes=180, max_messages=4)
-        assert len(blocks) >= 3
-        for block in blocks:
-            assert len(block) <= 4
+        blocks = _group_into_blocks(msgs, gap_minutes=180)
+        assert len(blocks) == 1
+        assert len(blocks[0]) == 10
 
     def test_messages_sorted_by_time(self):
         msgs = [
@@ -478,7 +493,7 @@ class TestBlockGrouping:
             _msg("1", "Alice", "First", NOW),
             _msg("2", "Bob", "Second", NOW + timedelta(minutes=10)),
         ]
-        blocks = _group_into_blocks(msgs, gap_minutes=180, max_messages=100)
+        blocks = _group_into_blocks(msgs, gap_minutes=180)
         assert len(blocks) == 1
         assert blocks[0][0]["id"] == "1"
         assert blocks[0][1]["id"] == "2"
@@ -490,7 +505,7 @@ class TestBlockGrouping:
             _msg("2", "Bob", "Exactly one hour later", NOW + timedelta(minutes=60)),
         ]
 
-        blocks = _group_into_blocks(msgs, gap_minutes=60, max_messages=100)
+        blocks = _group_into_blocks(msgs, gap_minutes=60)
 
         assert [[msg["id"] for msg in block] for block in blocks] == [["1", "2"]]
 
@@ -1074,7 +1089,7 @@ class TestDiscover:
     @pytest.fixture
     def gene(self):
         gene = TeamsGene(
-            config={"channels": "Engineering/architecture"},
+            config={"conversation_ids": ["19:abc@thread.tacv2"]},
             source_id="teams-test",
         )
         gene._client = MagicMock(spec=_TeamsAPIClient)
@@ -1306,7 +1321,7 @@ class TestDiscover:
 class TestFetch:
     @pytest.mark.asyncio
     async def test_fetch_thread_returns_json(self):
-        gene = TeamsGene(config={"channels": "T/C"}, source_id="test")
+        gene = TeamsGene(config={"conversation_ids": ["19:test@thread.tacv2"]}, source_id="test")
         gene._client = MagicMock(spec=_TeamsAPIClient)
 
         thread_msgs = [
@@ -1348,7 +1363,7 @@ class TestFetch:
 class TestNormalize:
     @pytest.mark.asyncio
     async def test_normalize_markdown_format(self):
-        gene = TeamsGene(config={"channels": "T/C"}, source_id="test")
+        gene = TeamsGene(config={"conversation_ids": ["19:test@thread.tacv2"]}, source_id="test")
         gene._client = MagicMock()
 
         from memforge.models import ContentItem, RawContent
@@ -1411,7 +1426,7 @@ class TestNormalize:
 
     @pytest.mark.asyncio
     async def test_normalize_source_semantics(self):
-        gene = TeamsGene(config={"channels": "T/C"}, source_id="test")
+        gene = TeamsGene(config={"conversation_ids": ["19:test@thread.tacv2"]}, source_id="test")
         gene._client = MagicMock()
 
         from memforge.models import ContentItem, RawContent
@@ -1453,7 +1468,7 @@ class TestNormalize:
 
     @pytest.mark.asyncio
     async def test_normalize_tolerates_loose_teams_rest_shapes(self):
-        gene = TeamsGene(config={"channels": "T/C"}, source_id="test")
+        gene = TeamsGene(config={"conversation_ids": ["19:test@thread.tacv2"]}, source_id="test")
         gene._client = MagicMock()
 
         from memforge.genes.teams_gene import LOCAL_AGENT_TEAMS_PACKAGE_KIND
@@ -1508,7 +1523,7 @@ class TestNormalize:
 class TestContentHash:
     @pytest.mark.asyncio
     async def test_same_messages_produce_same_markdown(self):
-        gene = TeamsGene(config={"channels": "T/C"}, source_id="test")
+        gene = TeamsGene(config={"conversation_ids": ["19:test@thread.tacv2"]}, source_id="test")
         gene._client = MagicMock()
 
         from memforge.models import ContentItem, RawContent

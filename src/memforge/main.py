@@ -2606,6 +2606,7 @@ def _required_local_source_doc_ids(
     sync_snapshot_id: str,
     local_agent_job_id: str,
     local_agent_attempt_count: int,
+    scope_attestations: list[dict[str, Any]] | None = None,
 ) -> set[str]:
     """Plan one fenced collection and validate the returned materialization set."""
     plan = client.prepare_local_source_snapshot(
@@ -2615,6 +2616,7 @@ def _required_local_source_doc_ids(
         sync_snapshot_id=sync_snapshot_id,
         local_agent_job_id=local_agent_job_id,
         local_agent_attempt_count=local_agent_attempt_count,
+        scope_attestations=scope_attestations,
     )
     _raise_if_local_agent_lease_not_current(plan)
     if plan.get("error"):
@@ -3136,17 +3138,27 @@ def _run_cloud_teams_sync_job(
     documents, poll_audits = _teams_collection_documents_and_polls(collection)
     inventory_findings: list[dict[str, str]] = []
     try:
-        configured_conversation_ids = set(_teams_direct_rest_config_from_cloud_payload(payload)["conversation_ids"])
-        scope_attestation_documents = _teams_scope_attestation_documents(
+        teams_config = _teams_direct_rest_config_from_cloud_payload(payload)
+        configured_conversation_ids = set(teams_config["conversation_ids"])
+        projection_scope_attestations = _teams_projection_scope_attestations(
             source_id=source_id,
             job=job,
             poll_audits=poll_audits,
             configured_conversation_ids=configured_conversation_ids,
+            configured_source=teams_config,
             scope_transition=(
                 payload.get("projection_scope_transition")
                 if isinstance(payload.get("projection_scope_transition"), dict)
                 else None
             ),
+        )
+        retention_cutoff = next(
+            (
+                str(item.get("evidence", {}).get("rolling_retention_cutoff") or "")
+                for item in projection_scope_attestations
+                if isinstance(item.get("evidence"), dict) and item.get("evidence", {}).get("rolling_retention_cutoff")
+            ),
+            None,
         )
         inventory_documents = (
             _iter_teams_inventory_tombstones(
@@ -3160,6 +3172,7 @@ def _run_cloud_teams_sync_job(
                     if isinstance(payload.get("projection_scope_transition"), dict)
                     else None
                 ),
+                rolling_retention_cutoff=retention_cutoff,
                 findings=inventory_findings,
             )
             if not limit
@@ -3167,7 +3180,7 @@ def _run_cloud_teams_sync_job(
         )
     except (KeyError, TypeError, ValueError) as exc:
         inventory_documents = iter(())
-        scope_attestation_documents = []
+        projection_scope_attestations = []
         inventory_setup_error = str(exc)
     else:
         inventory_setup_error = None
@@ -3189,7 +3202,7 @@ def _run_cloud_teams_sync_job(
     documents_to_push: list[dict[str, Any]] = []
     if inventory_error is None:
         try:
-            candidate_documents = list(chain(inventory_documents, documents, scope_attestation_documents))
+            candidate_documents = list(chain(inventory_documents, documents))
             documents_by_doc_id: dict[str, dict[str, Any]] = {}
             manifest_items: list[dict[str, str]] = []
             for doc in candidate_documents:
@@ -3215,6 +3228,7 @@ def _run_cloud_teams_sync_job(
                 sync_snapshot_id=sync_snapshot_id,
                 local_agent_job_id=str(job["job_id"]),
                 local_agent_attempt_count=int(job["attempt_count"]),
+                scope_attestations=projection_scope_attestations,
             )
             documents_to_push = [
                 doc
@@ -3423,7 +3437,9 @@ def _run_cloud_teams_sync_job(
     )
 
     sync_result = None
-    if selected_count and not failed and inventory_error is None and not lease_lost:
+    if (
+        selected_count or _teams_scope_attestations_have_poll_evidence(projection_scope_attestations)
+    ) and not failed and inventory_error is None and not lease_lost:
         # Teams is incremental by stable window id and revision. Processing the
         # historical input set lets the server collapse each window to its
         # latest revision; document-style authoritative snapshots do not apply.
@@ -3651,29 +3667,30 @@ async def _upload_teams_hosted_content_inputs(
     return inputs_by_window, failures_by_window
 
 
-def _teams_scope_attestation_documents(
+def _teams_projection_scope_attestations(
     *,
     source_id: str,
     job: dict[str, Any],
     poll_audits: list[dict[str, Any]],
     configured_conversation_ids: set[str],
+    configured_source: dict[str, Any],
     scope_transition: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    """Build one current-attempt control unit for every target conversation."""
+    """Build control-plane coverage evidence without creating content units."""
 
-    if scope_transition is None:
-        return []
     from memforge.local_agent.source_contract import (
         canonical_teams_conversation_ids,
         local_agent_sync_snapshot_id,
     )
-    from memforge.local_agent.teams_contract import teams_scope_attestation_window_id
-    from memforge.source_projection_config import projection_scope_fingerprint
+    from memforge.source_projection_config import (
+        canonical_projection_scope,
+        projection_scope_fingerprint,
+    )
 
-    transition_id = str(scope_transition.get("id") or "").strip()
-    target_scope = scope_transition.get("target_scope")
-    if not transition_id or not isinstance(target_scope, dict):
-        raise ValueError("Teams scope transition evidence is invalid")
+    transition_id = str((scope_transition or {}).get("id") or "").strip() or None
+    target_scope = (scope_transition or {}).get("target_scope")
+    if not isinstance(target_scope, dict):
+        target_scope = canonical_projection_scope("teams", configured_source)
     target_conversations = set(canonical_teams_conversation_ids(target_scope, require_nonempty=True))
     if target_conversations != configured_conversation_ids:
         raise ValueError("Teams target scope does not match the leased collection config")
@@ -3682,61 +3699,55 @@ def _teams_scope_attestation_documents(
         job.get("attempt_count"),
     )
     target_scope_fingerprint = projection_scope_fingerprint(target_scope)
+    retention_days = target_scope.get("rolling_retention_days")
+    retention_cutoff = None
+    if retention_days not in (None, ""):
+        collection_reference_time = _parse_teams_coverage_time(job.get("created_at"))
+        if collection_reference_time is None:
+            raise ValueError("Teams rolling retention requires a stable collection creation time")
+        retention_cutoff = (collection_reference_time - timedelta(days=int(retention_days))).isoformat()
     audits = {
         str(audit.get("raw_conversation_id") or "").strip(): audit
         for audit in poll_audits
         if str(audit.get("raw_conversation_id") or "").strip()
     }
     documents: list[dict[str, Any]] = []
-    now = datetime.now(timezone.utc).isoformat()
     for conversation_id in sorted(target_conversations):
-        window_id = teams_scope_attestation_window_id(
-            source_id=source_id,
-            conversation_id=conversation_id,
-        )
-        audit = audits.get(conversation_id) or {
-            "raw_conversation_id": conversation_id,
-            "access_probe_status": "missing",
-            "pagination_complete": False,
-            "stop_reason": "missing_provider_poll_audit",
-        }
-        raw_payload = {
-            "_scope_attestation": True,
-            "conversation_id": conversation_id,
-            "window_id": window_id,
-            "messages": [],
-            "transition_id": transition_id,
-            "target_scope_fingerprint": target_scope_fingerprint,
-            "target_conversation_ids": sorted(target_conversations),
-            "collection_attempt_id": collection_attempt_id,
+        audit = audits.get(conversation_id)
+        evidence = {
+            "target_subject_keys": sorted(target_conversations),
             "poll": audit,
         }
-        raw_hash = hashlib.sha256(
-            json.dumps(
-                raw_payload,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        if retention_cutoff is not None:
+            evidence["rolling_retention_cutoff"] = retention_cutoff
         documents.append(
             {
-                "conversation_id": conversation_id,
-                "root_message_id": "",
-                "window_id": window_id,
-                "window_type": "scope_attestation",
-                "revision_hash": raw_hash,
-                "title": f"Teams scope attestation: {conversation_id}",
-                "source_url": "",
-                "last_modified": now,
-                "date_from": now,
-                "date_to": now,
-                "raw_payload": raw_payload,
-                "raw_hash": raw_hash,
-                "message_count": 0,
+                "subject_type": "conversation",
+                "subject_key": conversation_id,
+                "transition_id": transition_id,
+                "collection_attempt_id": collection_attempt_id,
+                "target_scope_fingerprint": target_scope_fingerprint,
+                "evidence": evidence,
             }
         )
     return documents
+
+
+def _teams_scope_attestations_have_poll_evidence(attestations: list[dict[str, Any]]) -> bool:
+    """Return whether every target subject produced evidence for adapter validation."""
+
+    if not attestations:
+        return False
+    expected_subjects = sorted(str(item.get("subject_key") or "") for item in attestations)
+    attempt_ids = {str(item.get("collection_attempt_id") or "") for item in attestations}
+    if not all(expected_subjects) or len(set(expected_subjects)) != len(expected_subjects) or len(attempt_ids) != 1:
+        return False
+    for attestation in attestations:
+        evidence = attestation.get("evidence")
+        poll = evidence.get("poll") if isinstance(evidence, dict) else None
+        if not isinstance(poll, dict) or evidence.get("target_subject_keys") != expected_subjects:
+            return False
+    return True
 
 
 def _iter_teams_inventory_tombstones(
@@ -3747,6 +3758,7 @@ def _iter_teams_inventory_tombstones(
     poll_audits: list[dict[str, Any]],
     configured_conversation_ids: set[str],
     scope_transition: dict[str, Any] | None,
+    rolling_retention_cutoff: str | None = None,
     findings: list[dict[str, str]] | None = None,
 ):
     """Page only relevant inventory slices and yield required tombstones."""
@@ -3756,6 +3768,7 @@ def _iter_teams_inventory_tombstones(
         poll_audits=poll_audits,
         configured_conversation_ids=configured_conversation_ids,
         scope_transition=scope_transition,
+        rolling_retention_cutoff=rolling_retention_cutoff,
     )
     for plan in plans:
         cursor = None
@@ -3790,6 +3803,7 @@ def _iter_teams_inventory_tombstones(
                 inventory_units=units,
                 configured_conversation_ids=configured_conversation_ids,
                 destructive_enabled=True,
+                rolling_retention_cutoff=rolling_retention_cutoff,
             )
             yield from reconciled[len(current_documents) :]
             next_cursor = str(response.get("next_cursor") or "").strip()
@@ -3806,6 +3820,7 @@ def _teams_inventory_query_plans(
     poll_audits: list[dict[str, Any]],
     configured_conversation_ids: set[str],
     scope_transition: dict[str, Any] | None,
+    rolling_retention_cutoff: str | None = None,
 ) -> list[dict[str, str]]:
     audits = {
         str(audit.get("raw_conversation_id") or "").strip(): audit
@@ -3841,12 +3856,13 @@ def _teams_inventory_query_plans(
                 "observed_to_gte": covered_from.isoformat(),
             }
         )
-        plans.append(
-            {
-                "conversation_id": conversation_id,
-                "observed_to_lt": covered_from.isoformat(),
-            }
-        )
+        if rolling_retention_cutoff:
+            plans.append(
+                {
+                    "conversation_id": conversation_id,
+                    "observed_to_lt": rolling_retention_cutoff,
+                }
+            )
 
     removed_conversations = _teams_scope_selector_values(previous_scope) - (_teams_scope_selector_values(target_scope))
     for conversation_id in sorted(removed_conversations):
@@ -3938,6 +3954,7 @@ def _reconcile_teams_documents_with_server_inventory(
     inventory_units: list[dict[str, Any]],
     configured_conversation_ids: set[str],
     destructive_enabled: bool,
+    rolling_retention_cutoff: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return current documents plus server-inventory-backed window tombstones."""
 
@@ -3971,8 +3988,12 @@ def _reconcile_teams_documents_with_server_inventory(
                 reason = "not_returned_by_complete_conversation_poll"
             elif _teams_poll_proves_bounded_unit_absence(audit, locator):
                 reason = "not_returned_by_bounded_conversation_poll"
-            elif _teams_poll_proves_unit_outside_time_scope(audit, locator):
-                reason = "outside_configured_time_scope"
+            elif _teams_poll_proves_unit_outside_rolling_retention(
+                audit,
+                locator,
+                rolling_retention_cutoff,
+            ):
+                reason = "outside_rolling_retention"
         if reason is not None:
             result.append(
                 _teams_window_tombstone_document(
@@ -3980,6 +4001,7 @@ def _reconcile_teams_documents_with_server_inventory(
                     window_id=window_id,
                     locator=locator,
                     reason=reason,
+                    rolling_retention_cutoff=rolling_retention_cutoff,
                 )
             )
     return result
@@ -4017,9 +4039,10 @@ def _teams_poll_proves_bounded_unit_absence(
     )
 
 
-def _teams_poll_proves_unit_outside_time_scope(
+def _teams_poll_proves_unit_outside_rolling_retention(
     audit: dict[str, Any] | None,
     locator: dict[str, Any],
+    rolling_retention_cutoff: str | None,
 ) -> bool:
     if (
         not audit
@@ -4027,9 +4050,18 @@ def _teams_poll_proves_unit_outside_time_scope(
         or str(audit.get("stop_reason") or "").strip() != "cutoff_reached"
     ):
         return False
-    coverage_from = _parse_teams_coverage_time(audit.get("absence_covered_from"))
+    attested_from = _parse_teams_coverage_time(audit.get("absence_covered_from"))
+    attested_to = _parse_teams_coverage_time(audit.get("absence_covered_to"))
+    coverage_from = _parse_teams_coverage_time(rolling_retention_cutoff)
     observed_to = _parse_teams_coverage_time(locator.get("observed_to"))
-    return bool(coverage_from and observed_to and observed_to < coverage_from)
+    return bool(
+        attested_from
+        and attested_to
+        and attested_from <= attested_to
+        and coverage_from
+        and observed_to
+        and observed_to < coverage_from
+    )
 
 
 def _parse_teams_coverage_time(value: object) -> datetime | None:
@@ -4051,6 +4083,7 @@ def _teams_window_tombstone_document(
     window_id: str,
     locator: dict[str, Any],
     reason: str,
+    rolling_retention_cutoff: str | None = None,
 ) -> dict[str, Any]:
     if reason not in TEAMS_TOMBSTONE_REASONS:
         raise ValueError(f"unsupported Teams tombstone reason: {reason}")
@@ -4064,7 +4097,11 @@ def _teams_window_tombstone_document(
         "_authoritative_snapshot": True,
         "_tombstone": True,
         "tombstone_reason": reason,
+        "prior_observed_from": locator.get("observed_from"),
+        "prior_observed_to": locator.get("observed_to"),
     }
+    if reason == "outside_rolling_retention":
+        raw_payload["rolling_retention_cutoff"] = rolling_retention_cutoff
     canonical_payload = json.dumps(
         raw_payload,
         ensure_ascii=False,

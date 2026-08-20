@@ -1959,6 +1959,7 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             lifecycle_cycle_id=None,
                 scope_transition_run_id=None,
                 reusable_projection_doc_ids=frozenset(),
+                projection_scope_attestations=(),
                 record_terminal_result=True,
             ):
             del (
@@ -1967,6 +1968,7 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
                 source_activity_epoch,
                     scope_transition_run_id,
                     reusable_projection_doc_ids,
+                    projection_scope_attestations,
                     record_terminal_result,
                 )
             self.lifecycle_cycle_id = lifecycle_cycle_id
@@ -2079,6 +2081,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             lifecycle_cycle_id=None,
                 scope_transition_run_id=None,
                 reusable_projection_doc_ids=frozenset(),
+                projection_scope_attestations=(),
                 record_terminal_result=True,
             ):
             del (
@@ -2088,6 +2091,7 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
                 lifecycle_cycle_id,
                     scope_transition_run_id,
                     reusable_projection_doc_ids,
+                    projection_scope_attestations,
                     record_terminal_result,
                 )
             self.gene = gene

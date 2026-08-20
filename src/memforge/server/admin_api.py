@@ -1466,6 +1466,7 @@ class LocalSourceManifestRequest(BaseModel):
     sync_snapshot_id: str
     local_agent_job_id: str
     local_agent_attempt_count: int = Field(ge=1)
+    scope_attestations: list[dict[str, Any]] = Field(default_factory=list, max_length=10_000)
 
 
 class AgentSessionWindowRequest(BaseModel):
@@ -1995,6 +1996,20 @@ def _sync_scope_config(source_type: str, config: dict[str, Any]) -> dict[str, An
     from memforge.source_projection_config import canonical_projection_scope
 
     return canonical_projection_scope(source_type, config)
+
+
+def _public_source_config(source_type: str, config: dict[str, Any]) -> dict[str, Any]:
+    """Expose user intent while keeping connector partition policy internal."""
+
+    if source_type != "teams":
+        return config
+    result = dict(config)
+    result["initial_history_days"] = result.get("initial_history_days", result.get("max_age_days", 14))
+    retention = result.get("rolling_retention_days")
+    result["rolling_retention_days"] = retention if retention in {365, 1095} else None
+    for key in ("max_age_days", "conversation_gap_minutes", "max_block_messages"):
+        result.pop(key, None)
+    return result
 
 
 def _provider_namespace_config(source_type: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -4547,6 +4562,7 @@ def create_admin_app(
                     secret_fields=_source_secret_fields(s["type"]),
                     validate_encryption=True,
                 )
+                s["config"] = _public_source_config(s["type"], s["config"])
             else:
                 s["config"] = {}
             # Surface the originating client for agent-session sources so the UI
@@ -7085,6 +7101,10 @@ def create_admin_app(
             SnapshotManifestItem,
             plan_snapshot_manifest,
         )
+        from memforge.source_projection import (
+            projection_scope_attestation_from_payload,
+            projection_scope_attestation_to_payload,
+        )
 
         source = await db.get_source(source_id)
         if not source:
@@ -7117,6 +7137,23 @@ def create_admin_app(
                 req.sync_snapshot_id,
             )
             manifest_items = [(item.doc_id, item.revision, item.change_kind) for item in req.items]
+            scope_attestations = tuple(
+                sorted(
+                    (projection_scope_attestation_from_payload(item) for item in req.scope_attestations),
+                    key=lambda item: (
+                        item.subject_type,
+                        item.subject_key,
+                        item.transition_id or "",
+                    ),
+                )
+            )
+            if any(item.collection_attempt_id != snapshot_id for item in scope_attestations):
+                raise ValueError("Projection Scope Attestation belongs to another collection attempt")
+            attestation_keys = {
+                (item.subject_type, item.subject_key, item.transition_id) for item in scope_attestations
+            }
+            if len(attestation_keys) != len(scope_attestations):
+                raise ValueError("Projection Scope Attestation subjects must be unique")
             retained_inputs = await db.find_source_sync_input_attestations(
                 source_id=source_id,
                 workspace_id=workspace_id,
@@ -7142,6 +7179,9 @@ def create_admin_app(
                             (item.model_dump() for item in req.items),
                             key=lambda item: item["doc_id"],
                         ),
+                        "scope_attestations": [
+                            projection_scope_attestation_to_payload(item) for item in scope_attestations
+                        ],
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -7159,6 +7199,7 @@ def create_admin_app(
                 local_agent_job_id=req.local_agent_job_id,
                 local_agent_attempt_count=req.local_agent_attempt_count,
                 source_config_revision=str(lease_payload["source_config_revision"]),
+                scope_attestations=scope_attestations,
                 expected_activity_epoch=int(lease_payload["source_activity_epoch"]),
             )
         except ValueError as exc:

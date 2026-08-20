@@ -22,6 +22,7 @@ from memforge.source_projection import (
     DeltaAxis,
     ProjectionCoverage,
     ProjectionEnvelope,
+    ProjectionScopeAttestation,
     RevisionDelta,
     SourceAnchor,
     SourceObservation,
@@ -141,6 +142,7 @@ class GeneSourceProjectionAdapter:
             access_context=request.access_context,
             prior_unit_revision=envelope.prior_unit_revision,
             prior_observation_revisions=envelope.prior_observation_revisions,
+            scope_attestations=request.scope_attestations,
         )
 
     def reconciliation_coverage(
@@ -149,7 +151,7 @@ class GeneSourceProjectionAdapter:
         source_type: str,
         transition: ProjectionScopeTransition,
         current_units: tuple[SourceUnit, ...],
-        run_attestations: tuple[Mapping[str, object], ...] = (),
+        run_attestations: tuple[ProjectionScopeAttestation, ...] = (),
     ) -> ProjectionCoverage | None:
         """Return scoped absence proof after provider tombstones were applied."""
 
@@ -161,12 +163,7 @@ class GeneSourceProjectionAdapter:
             "group_chats",
             "individual_chats",
         }
-        time_scope_fields = {"max_age_days"}
-        membership_partition_fields = {
-            "conversation_gap_minutes",
-            "max_block_messages",
-        }
-        supported_fields = selector_fields | time_scope_fields | membership_partition_fields
+        supported_fields = selector_fields | {"rolling_retention_days"}
         changed_fields = {
             key
             for key in set(transition.previous_scope) | set(transition.target_scope)
@@ -194,7 +191,7 @@ class GeneSourceProjectionAdapter:
         ):
             return None
         current_window_units = tuple(unit for unit in current_units if unit.unit_type == "teams_window")
-        if any(unit.unit_type not in {"teams_window", "teams_scope_attestation"} for unit in current_units):
+        if any(unit.unit_type != "teams_window" for unit in current_units):
             return None
         if (changed_fields & selector_fields or target_conversations) and not all(
             str(unit.locator.get("conversation_id") or "").strip() in target_conversations
@@ -202,18 +199,6 @@ class GeneSourceProjectionAdapter:
         ):
             return None
 
-        target_fingerprint = projection_scope_fingerprint(transition.target_scope)
-        if changed_fields & membership_partition_fields:
-            target_partition_fingerprint = _teams_partition_scope_fingerprint(transition.target_scope)
-            if not all(
-                unit.locator.get("projection_scope_fingerprint") == target_fingerprint
-                or unit.locator.get("partition_scope_fingerprint") == target_partition_fingerprint
-                for unit in current_window_units
-            ):
-                return None
-        if changed_fields & time_scope_fields:
-            if not all(_teams_unit_attests_time_scope(unit, target_fingerprint) for unit in current_window_units):
-                return None
         return ProjectionCoverage.TOMBSTONED_DELTA
 
 
@@ -233,6 +218,7 @@ def project_source_item(
     access_context: Mapping[str, object] | None = None,
     prior_unit_revision: SourceUnitRevision | None = None,
     prior_observation_revisions: Mapping[str, SourceObservationRevision] | None = None,
+    scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
 ) -> SourceProjection:
     """Project one completely fetched Source Unit.
 
@@ -256,14 +242,8 @@ def project_source_item(
         native=native,
         coverage=coverage,
         projected_scope=projected_scope,
+        scope_attestations=scope_attestations,
     )
-    if source_type == "teams":
-        locator = _teams_scope_attested_locator(
-            locator=locator,
-            native=native,
-            coverage=coverage,
-            projected_scope=projected_scope,
-        )
     persisted_unit_id = projected_scope.get("source_unit_id")
     persisted_provider_key = projected_scope.get("source_unit_provider_key")
     incarnation = projected_scope.get("source_unit_incarnation")
@@ -545,46 +525,33 @@ def project_source_unit_tombstone(
     )
 
 
-def _teams_scope_attested_locator(
-    *,
-    locator: Mapping[str, object],
-    native: object,
-    coverage: ProjectionCoverage,
-    projected_scope: Mapping[str, object],
-) -> Mapping[str, object]:
-    configured_scope = projected_scope.get("configured_scope")
-    if not isinstance(configured_scope, Mapping):
-        return locator
-    fingerprint = projection_scope_fingerprint(configured_scope)
-    result = dict(locator)
-    result["partition_scope_fingerprint"] = _teams_partition_scope_fingerprint(configured_scope)
-    if coverage is ProjectionCoverage.COMPLETE_SNAPSHOT:
-        result["projection_scope_fingerprint"] = fingerprint
-        return result
-    if not isinstance(native, Mapping):
-        return result
-    covered_from = _normalized_utc_timestamp(native.get("_scope_coverage_from"))
-    covered_to = _normalized_utc_timestamp(native.get("_scope_coverage_to"))
-    if covered_from and covered_to and covered_from <= covered_to:
-        result.update(
-            {
-                "time_scope_fingerprint": fingerprint,
-                "time_scope_coverage_from": covered_from,
-                "time_scope_coverage_to": covered_to,
-            }
-        )
-    return result
-
-
 def _provider_authoritative_unit_coverage(
     *,
     source_type: str,
     native: object,
     coverage: ProjectionCoverage,
     projected_scope: Mapping[str, object],
+    scope_attestations: tuple[ProjectionScopeAttestation, ...],
 ) -> ProjectionCoverage:
     """Apply run authority only where the provider unit contract supports it."""
 
+    configured_scope = projected_scope.get("configured_scope")
+    teams_native = (
+        native.get("raw_payload")
+        if isinstance(native, Mapping) and isinstance(native.get("raw_payload"), Mapping)
+        else native
+    )
+    if (
+        source_type == "teams"
+        and isinstance(teams_native, Mapping)
+        and teams_native.get("tombstone_reason") == "outside_rolling_retention"
+        and not _teams_retention_attestation_is_valid(
+            native=teams_native,
+            configured_scope=(configured_scope if isinstance(configured_scope, Mapping) else {}),
+            run_attestations=scope_attestations,
+        )
+    ):
+        raise ValueError("Teams rolling-retention tombstone lacks complete run-scoped coverage evidence")
     if coverage.proves_absence or projected_scope.get("authoritative_snapshot") is not True:
         return coverage
     if (
@@ -600,57 +567,48 @@ def _provider_authoritative_unit_coverage(
     return coverage
 
 
-def _teams_partition_scope_fingerprint(scope: Mapping[str, object]) -> str:
-    values: dict[str, object] = {}
-    for field_name, default in (
-        ("conversation_gap_minutes", 60),
-        ("max_block_messages", 100),
-    ):
-        try:
-            values[field_name] = int(scope.get(field_name, default))
-        except (TypeError, ValueError):
-            values[field_name] = default
-    return projection_scope_fingerprint(values)
-
-
 def _teams_run_attests_target_scope(
     *,
     transition: ProjectionScopeTransition,
     target_conversations: set[str],
-    run_attestations: tuple[Mapping[str, object], ...],
+    run_attestations: tuple[ProjectionScopeAttestation, ...],
 ) -> bool:
     """Require one exact, successful, same-attempt poll per target conversation."""
 
-    target_fingerprint = projection_scope_fingerprint(transition.target_scope)
+    return _teams_attestations_cover_target_scope(
+        target_scope=transition.target_scope,
+        target_conversations=target_conversations,
+        expected_transition_id=transition.id,
+        run_attestations=run_attestations,
+    )
+
+
+def _teams_attestations_cover_target_scope(
+    *,
+    target_scope: Mapping[str, object],
+    target_conversations: set[str],
+    expected_transition_id: str | None,
+    run_attestations: tuple[ProjectionScopeAttestation, ...],
+) -> bool:
+    target_fingerprint = projection_scope_fingerprint(target_scope)
     expected_conversations = sorted(target_conversations)
-    by_conversation: dict[str, Mapping[str, object]] = {}
+    by_conversation: dict[str, ProjectionScopeAttestation] = {}
     attempt_ids: set[str] = set()
     for attestation in run_attestations:
-        conversation_id = str(attestation.get("conversation_id") or "").strip()
-        target_values = attestation.get("target_conversation_ids")
-        poll = attestation.get("poll")
-        attempt_id = str(attestation.get("collection_attempt_id") or "").strip()
+        conversation_id = attestation.subject_key.strip()
+        target_values = attestation.evidence.get("target_subject_keys")
+        poll = attestation.evidence.get("poll")
+        attempt_id = attestation.collection_attempt_id.strip()
         if (
-            conversation_id not in target_conversations
-            or str(attestation.get("transition_id") or "").strip() != transition.id
-            or attestation.get("target_scope_fingerprint") != target_fingerprint
+            attestation.subject_type != "conversation"
+            or conversation_id not in target_conversations
+            or attestation.transition_id != expected_transition_id
+            or attestation.target_scope_fingerprint != target_fingerprint
             or target_values != expected_conversations
             or not attempt_id
             or not isinstance(poll, Mapping)
-            or str(poll.get("raw_conversation_id") or "").strip() != conversation_id
-            or str(poll.get("access_probe_status") or "").strip().lower() != "ok"
+            or not _teams_poll_attestation_is_valid(poll, conversation_id)
         ):
-            return False
-        stop_reason = str(poll.get("stop_reason") or "").strip()
-        if stop_reason == "no_backward_link":
-            if poll.get("pagination_complete") is not True:
-                return False
-        elif stop_reason == "cutoff_reached":
-            covered_from = _normalized_utc_timestamp(poll.get("absence_covered_from"))
-            covered_to = _normalized_utc_timestamp(poll.get("absence_covered_to"))
-            if not covered_from or not covered_to or covered_from > covered_to:
-                return False
-        else:
             return False
         if conversation_id in by_conversation:
             return False
@@ -659,19 +617,75 @@ def _teams_run_attests_target_scope(
     return set(by_conversation) == target_conversations and len(attempt_ids) == 1
 
 
-def _teams_unit_attests_time_scope(
-    unit: SourceUnit,
-    target_fingerprint: str,
+def _teams_poll_attestation_is_valid(
+    poll: Mapping[str, object],
+    conversation_id: str,
 ) -> bool:
-    locator = unit.locator
-    if locator.get("projection_scope_fingerprint") == target_fingerprint:
-        return True
-    if locator.get("time_scope_fingerprint") != target_fingerprint:
+    if (
+        str(poll.get("raw_conversation_id") or "").strip() != conversation_id
+        or str(poll.get("access_probe_status") or "").strip().lower() != "ok"
+    ):
         return False
-    covered_from = _normalized_utc_timestamp(locator.get("time_scope_coverage_from"))
-    covered_to = _normalized_utc_timestamp(locator.get("time_scope_coverage_to"))
-    observed_to = _normalized_utc_timestamp(locator.get("observed_to"))
-    return bool(covered_from and covered_to and observed_to and covered_from <= observed_to <= covered_to)
+    stop_reason = str(poll.get("stop_reason") or "").strip()
+    if stop_reason == "no_backward_link":
+        return poll.get("pagination_complete") is True
+    if stop_reason != "cutoff_reached":
+        return False
+    covered_from = _normalized_utc_timestamp(poll.get("absence_covered_from"))
+    covered_to = _normalized_utc_timestamp(poll.get("absence_covered_to"))
+    return bool(covered_from and covered_to and covered_from <= covered_to)
+
+
+def _teams_retention_attestation_is_valid(
+    *,
+    native: Mapping[str, object],
+    configured_scope: Mapping[str, object],
+    run_attestations: tuple[ProjectionScopeAttestation, ...],
+) -> bool:
+    conversation_id = str(native.get("conversation_id") or "").strip()
+    cutoff = _normalized_utc_timestamp(native.get("rolling_retention_cutoff"))
+    observed_to = _normalized_utc_timestamp(native.get("prior_observed_to"))
+    try:
+        retention_days = int(configured_scope.get("rolling_retention_days") or 0)
+    except (TypeError, ValueError):
+        return False
+    if (
+        retention_days not in {365, 1095}
+        or not conversation_id
+        or not cutoff
+        or not observed_to
+        or observed_to >= cutoff
+    ):
+        return False
+    from memforge.local_agent.source_contract import canonical_teams_conversation_ids
+
+    try:
+        target_conversations = set(canonical_teams_conversation_ids(configured_scope, require_nonempty=True))
+    except ValueError:
+        return False
+    transition_ids = {item.transition_id for item in run_attestations}
+    if len(transition_ids) != 1 or not _teams_attestations_cover_target_scope(
+        target_scope=configured_scope,
+        target_conversations=target_conversations,
+        expected_transition_id=next(iter(transition_ids)),
+        run_attestations=run_attestations,
+    ):
+        return False
+    target_fingerprint = projection_scope_fingerprint(configured_scope)
+    matches = [
+        item
+        for item in run_attestations
+        if item.subject_type == "conversation"
+        and item.subject_key == conversation_id
+        and item.target_scope_fingerprint == target_fingerprint
+        and _normalized_utc_timestamp(item.evidence.get("rolling_retention_cutoff")) == cutoff
+    ]
+    if len(matches) != 1:
+        return False
+    return all(
+        _normalized_utc_timestamp(item.evidence.get("rolling_retention_cutoff")) == cutoff
+        for item in run_attestations
+    )
 
 
 def _normalized_utc_timestamp(value: object) -> str | None:
@@ -931,26 +945,6 @@ def _project_native(
         data = native if isinstance(native, dict) else {}
         if data.get("package_kind") and isinstance(data.get("raw_payload"), dict):
             data = data["raw_payload"]
-        if data.get("_scope_attestation") is True:
-            conversation_id = str(data.get("conversation_id") or "").strip()
-            poll = data.get("poll")
-            if not conversation_id or not isinstance(poll, Mapping):
-                raise ValueError("Teams scope attestation is invalid")
-            return (
-                "teams_scope_attestation",
-                conversation_id,
-                (),
-                (),
-                ProjectionCoverage.COMPLETE_SNAPSHOT,
-                {
-                    "conversation_id": conversation_id,
-                    "transition_id": data.get("transition_id"),
-                    "target_scope_fingerprint": data.get("target_scope_fingerprint"),
-                    "target_conversation_ids": data.get("target_conversation_ids"),
-                    "collection_attempt_id": data.get("collection_attempt_id"),
-                    "poll": dict(poll),
-                },
-            )
         window_id = str(item.extra.get("window_id") or data.get("window_id") or item.item_id)
         conversation_id = str(item.extra.get("conversation_id") or data.get("conversation_id") or "")
         messages = data.get("messages") if isinstance(data.get("messages"), list) else []
@@ -998,28 +992,33 @@ def _project_native(
         observed_from = str(
             item.extra.get("block_start")
             or data.get("first_message_time")
+            or data.get("prior_observed_from")
             or (observed_times[0] if observed_times else "")
         ).strip()
         observed_to = str(
             item.extra.get("block_end")
             or data.get("last_message_time")
+            or data.get("prior_observed_to")
             or (observed_times[-1] if observed_times else "")
         ).strip()
         observed_from = _normalized_utc_timestamp(observed_from) or observed_from
         observed_to = _normalized_utc_timestamp(observed_to) or observed_to
+        locator = {
+            "conversation_id": conversation_id,
+            "window_id": window_id,
+            "observed_from": observed_from or None,
+            "observed_to": observed_to or None,
+            "url": item.source_url,
+        }
+        if data.get("_tombstone") is True:
+            locator["tombstone_reason"] = data.get("tombstone_reason")
         return (
             "teams_window",
             window_id,
             tuple(inputs),
             tuple(relations),
             coverage,
-            {
-                "conversation_id": conversation_id,
-                "window_id": window_id,
-                "observed_from": observed_from or None,
-                "observed_to": observed_to or None,
-                "url": item.source_url,
-            },
+            locator,
         )
     if source_type == "agent_session":
         data = native if isinstance(native, dict) else {}

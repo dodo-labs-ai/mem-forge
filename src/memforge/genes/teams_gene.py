@@ -1022,34 +1022,25 @@ class TeamsGene(Gene):
                     order=0,
                 ),
                 ConfigField(
-                    key="max_age_days",
-                    label="Max Age (days)",
+                    key="initial_history_days",
+                    label="Initial History (days)",
                     field_type=ConfigFieldType.INTEGER,
                     required=False,
                     default="14",
-                    help_text="How far back to fetch on initial sync",
+                    help_text="How far back to collect when establishing or expanding history",
                     group="sync",
                     order=0,
                 ),
                 ConfigField(
-                    key="conversation_gap_minutes",
-                    label="Conversation Gap (minutes)",
-                    field_type=ConfigFieldType.INTEGER,
+                    key="rolling_retention_days",
+                    label="Rolling Retention",
+                    field_type=ConfigFieldType.SELECT,
                     required=False,
-                    default="60",
-                    help_text="Minutes of silence that starts a new conversation block",
+                    default="forever",
+                    options=["forever", "365", "1095"],
+                    help_text="Explicitly remove MemForge support older than the selected period",
                     group="sync",
                     order=1,
-                ),
-                ConfigField(
-                    key="max_block_messages",
-                    label="Max Block Messages",
-                    field_type=ConfigFieldType.INTEGER,
-                    required=False,
-                    default="100",
-                    help_text="Maximum messages per conversation block",
-                    group="sync",
-                    order=2,
                 ),
             ],
         )
@@ -1070,17 +1061,52 @@ class TeamsGene(Gene):
         for field in TEAMS_CONVERSATION_SELECTOR_FIELDS:
             config.pop(field, None)
         config["conversation_ids"] = list(conversation_ids)
+        if "initial_history_days" not in config:
+            config["initial_history_days"] = config.get("max_age_days", 14)
+        try:
+            initial_history_days = int(config["initial_history_days"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Teams initial history must be a positive number of days") from exc
+        if initial_history_days < 1:
+            raise ValueError("Teams initial history must be a positive number of days")
+        config["initial_history_days"] = initial_history_days
+        retention = config.get("rolling_retention_days")
+        if retention in (None, "", "forever", "none"):
+            config["rolling_retention_days"] = None
+        else:
+            try:
+                retention_days = int(retention)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Teams rolling retention must be Forever, 1 year, or 3 years") from exc
+            if retention_days not in {365, 1095}:
+                raise ValueError("Teams rolling retention must be Forever, 1 year, or 3 years")
+            config["rolling_retention_days"] = retention_days
+        config.pop("max_age_days", None)
+        config.pop("conversation_gap_minutes", None)
+        config.pop("max_block_messages", None)
 
     # -------------------------------------------------------------------
     # Instance methods
     # -------------------------------------------------------------------
 
     def __init__(self, config: dict, source_id: str) -> None:
+        config = dict(config)
+        if config.get("local_agent_documents_dir") is None and not has_package_manifest(config):
+            self.normalize_config(config)
+        else:
+            config["initial_history_days"] = config.get("initial_history_days", config.get("max_age_days", 14))
+            config.setdefault("rolling_retention_days", None)
+            for key in ("max_age_days", "conversation_gap_minutes", "max_block_messages"):
+                config.pop(key, None)
         super().__init__(config, source_id)
         self._client: _TeamsAPIClient | None = None
-        self._gap_minutes = int(config.get("conversation_gap_minutes", 60))
-        self._max_block = int(config.get("max_block_messages", 100))
-        self._max_age_days = int(config.get("max_age_days", 14))
+        from memforge.local_agent.teams_ledger import TEAMS_WINDOW_POLICY_V1
+
+        self._window_policy = TEAMS_WINDOW_POLICY_V1
+        self._gap_minutes = self._window_policy.conversation_gap_minutes
+        self._initial_history_days = int(config.get("initial_history_days", 14))
+        retention = config.get("rolling_retention_days")
+        self._rolling_retention_days = int(retention) if retention is not None else None
         self._conversation_fetch_timeout_seconds = int(config.get("conversation_fetch_timeout_seconds", 300))
         self._message_cache: dict[str, list[dict]] = {}  # conv_id → messages (per-sync)
         self._thread_message_cache: dict[str, list[dict]] = {}
@@ -1208,17 +1234,12 @@ class TeamsGene(Gene):
             package = json.loads(body.decode("utf-8"))
             raw_payload = package.get("raw_payload")
             tombstone = isinstance(raw_payload, dict) and raw_payload.get("_tombstone") is True
-            scope_attestation = isinstance(raw_payload, dict) and raw_payload.get("_scope_attestation") is True
             return RawContent(
                 item=item,
                 body=body,
                 content_type="application/json",
-                authoritative_empty=tombstone or scope_attestation,
-                empty_evidence=(
-                    "teams_complete_conversation_poll_window_tombstone"
-                    if tombstone
-                    else ("teams_current_collection_scope_attestation" if scope_attestation else None)
-                ),
+                authoritative_empty=tombstone,
+                empty_evidence=("teams_complete_conversation_poll_window_tombstone" if tombstone else None),
                 artifacts=source_artifacts_from_package(package),
             )
 
@@ -1318,19 +1339,6 @@ class TeamsGene(Gene):
                 source_semantics={
                     **package_semantics,
                     "tombstone_reason": data.get("tombstone_reason"),
-                },
-            )
-
-        if data.get("_scope_attestation") is True:
-            return NormalizedContent(
-                item=raw.item,
-                markdown_body="",
-                source_semantics={
-                    **package_semantics,
-                    "scope_attestation": True,
-                    "transition_id": data.get("transition_id"),
-                    "target_scope_fingerprint": data.get("target_scope_fingerprint"),
-                    "collection_attempt_id": data.get("collection_attempt_id"),
                 },
             )
 
@@ -1590,12 +1598,17 @@ class TeamsGene(Gene):
     ) -> list[dict]:
         """Fetch messages with full conversation block context.
 
-        Initial sync (since=None): all messages within max_age_days.
+        Initial/backfill collection: messages within initial_history_days.
         Incremental sync: backward from newest until a gap > gap_minutes,
         ensuring the full active conversation block is captured.
         """
         if since is None:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=self._max_age_days)
+            horizon_days = (
+                min(self._initial_history_days, self._rolling_retention_days)
+                if self._rolling_retention_days is not None
+                else self._initial_history_days
+            )
+            cutoff = datetime.now(timezone.utc) - timedelta(days=horizon_days)
             return await self._client.get_messages_until(conv_id, cutoff)
 
         # Incremental: paginate backward, stop at gap boundary
@@ -1713,7 +1726,7 @@ class TeamsGene(Gene):
         ledger_state_path = self._teams_ledger_state_path()
         if ledger_state_path is None:
             items: list[ContentItem] = []
-            for block in _group_into_blocks(block_messages, self._gap_minutes, self._max_block):
+            for block in _group_into_blocks(block_messages, self._gap_minutes):
                 if since and max(m["time"] for m in block) < since:
                     continue
                 items.append(
@@ -1749,7 +1762,7 @@ class TeamsGene(Gene):
         ]
         store = TeamsLedgerStateStore(ledger_state_path)
         previous = store.load_projection(source_id=self.source_id, conversation_id=conv_id)
-        projection = TeamsLedgerProjector(gap_minutes=self._gap_minutes).project_unthreaded(
+        projection = TeamsLedgerProjector(policy=self._window_policy).project_unthreaded(
             ledger_messages,
             previous=previous,
         )
@@ -2127,12 +2140,11 @@ def _teams_attachment_names(value: object) -> list[str]:
 def _group_into_blocks(
     messages: list[dict],
     gap_minutes: int,
-    max_messages: int,
 ) -> list[list[dict]]:
     """Split unthreaded messages into conversation blocks by time gaps.
 
     A gap of >gap_minutes between consecutive messages starts a new block.
-    Blocks exceeding max_messages are split at the largest internal gap.
+    Context-budget batching happens after stable window identity is established.
     """
     if not messages:
         return []
@@ -2153,28 +2165,4 @@ def _group_into_blocks(
     if current_block:
         blocks.append(current_block)
 
-    # Split oversized blocks at largest internal gap
-    final_blocks: list[list[dict]] = []
-    for block in blocks:
-        if len(block) <= max_messages:
-            final_blocks.append(block)
-            continue
-
-        # Find largest gap and split there
-        while len(block) > max_messages:
-            max_gap = 0.0
-            split_idx = len(block) // 2  # fallback: split in half
-
-            for i in range(1, len(block)):
-                gap = (block[i]["time"] - block[i - 1]["time"]).total_seconds()
-                if gap > max_gap:
-                    max_gap = gap
-                    split_idx = i
-
-            final_blocks.append(block[:split_idx])
-            block = block[split_idx:]
-
-        if block:
-            final_blocks.append(block)
-
-    return final_blocks
+    return blocks
