@@ -6,13 +6,15 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 import logging
+from unittest.mock import create_autospec
 
 import pytest
 from rich.logging import RichHandler
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.models import Memory, Visibility, content_hash
+from memforge.models import Memory, SyncState, Visibility, content_hash
+from memforge.source_projection import ProjectionScopeAttestation
 from memforge.storage.database import Database
 
 TEST_SOURCE_KEY = "VV4JjZLLr2BcgRnhV90gCnxzchn43M900VQy3dXJI30="
@@ -31,6 +33,35 @@ class FakeCollection:
 
     def delete(self, **kwargs):
         return None
+
+
+@pytest.mark.asyncio
+async def test_default_runtime_provider_forwards_projection_scope_attestations(monkeypatch):
+    from memforge import runtime
+
+    shared_run_source_sync = create_autospec(
+        runtime.run_source_sync,
+        spec_set=True,
+        return_value=SyncState(source="src-teams", last_sync_status="success"),
+    )
+    monkeypatch.setattr(runtime, "run_source_sync", shared_run_source_sync)
+    attestation = ProjectionScopeAttestation(
+        subject_type="conversation",
+        subject_key="19:conversation@example.test",
+        collection_attempt_id="job-a:attempt:1",
+        target_scope_fingerprint="scope-a",
+        evidence={"poll": {"access_probe_status": "ok"}},
+    )
+
+    state = await runtime.DefaultRuntimeProvider().run_source_sync(
+        object(),
+        AppConfig(),
+        {"id": "src-teams", "type": "teams", "name": "Teams", "config": {}},
+        projection_scope_attestations=(attestation,),
+    )
+
+    assert state.last_sync_status == "success"
+    assert shared_run_source_sync.await_args.kwargs["projection_scope_attestations"] == (attestation,)
 
 
 def _config(tmp_path: Path) -> AppConfig:
