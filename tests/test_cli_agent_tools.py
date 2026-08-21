@@ -3757,7 +3757,18 @@ def test_server_inventory_applies_explicit_rolling_retention_only_after_complete
     assert documents[0]["raw_payload"]["rolling_retention_cutoff"] == "2025-08-01T00:00:00+00:00"
 
 
-def test_teams_retention_cutoff_is_stable_for_same_collection_attempt():
+@pytest.mark.parametrize(
+    ("retention_days", "expected_cutoff"),
+    [
+        (365, "2025-08-21T00:00:00+00:00"),
+        (730, "2024-08-21T00:00:00+00:00"),
+        (1095, "2023-08-22T00:00:00+00:00"),
+    ],
+)
+def test_teams_retention_cutoff_is_stable_for_same_collection_attempt(
+    retention_days: int,
+    expected_cutoff: str,
+):
     conversation_id = "19:conversation@thread.tacv2"
     poll = {
         "raw_conversation_id": conversation_id,
@@ -3773,7 +3784,7 @@ def test_teams_retention_cutoff_is_stable_for_same_collection_attempt():
         "configured_conversation_ids": {conversation_id},
         "configured_source": {
             "conversation_ids": [conversation_id],
-            "rolling_retention_days": 365,
+            "rolling_retention_days": retention_days,
         },
         "scope_transition": None,
     }
@@ -3798,7 +3809,36 @@ def test_teams_retention_cutoff_is_stable_for_same_collection_attempt():
     )
 
     assert first == retry
-    assert first[0]["evidence"]["rolling_retention_cutoff"] == "2025-08-21T00:00:00+00:00"
+    assert first[0]["evidence"]["rolling_retention_cutoff"] == expected_cutoff
+
+
+def test_teams_forever_retention_emits_no_destructive_cutoff():
+    conversation_id = "19:conversation@thread.tacv2"
+    attestations = main._teams_projection_scope_attestations(
+        job={
+            "job_id": "job-forever",
+            "attempt_count": 1,
+            "created_at": "2026-08-21T00:00:00+00:00",
+            "updated_at": "2026-08-21T12:00:00+00:00",
+        },
+        source_id="src-teams",
+        poll_audits=[
+            {
+                "raw_conversation_id": conversation_id,
+                "pagination_complete": True,
+                "access_probe_status": "ok",
+                "stop_reason": "no_backward_link",
+            }
+        ],
+        configured_conversation_ids={conversation_id},
+        configured_source={
+            "conversation_ids": [conversation_id],
+            "rolling_retention_days": None,
+        },
+        scope_transition=None,
+    )
+
+    assert "rolling_retention_cutoff" not in attestations[0]["evidence"]
 
 
 def test_server_inventory_never_tombstones_after_invalid_message_page():

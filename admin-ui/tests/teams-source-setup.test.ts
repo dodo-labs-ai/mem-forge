@@ -7,6 +7,7 @@ import {
   buildTeamsSourceUpdatePayload,
   editableTeamsSourceState,
   existingTeamsSelection,
+  TEAMS_ROLLING_RETENTION_OPTIONS,
   teamsConversationCount,
   teamsSelectionLabel,
   type TeamsSelectionItem,
@@ -41,6 +42,12 @@ assert.equal(
   null,
   "the UI reads only canonical conversation_ids and has no legacy selection fallback",
 );
+assert.deepEqual(TEAMS_ROLLING_RETENTION_OPTIONS, [
+  { value: null, label: "Forever" },
+  { value: 365, label: "1 year" },
+  { value: 730, label: "2 years" },
+  { value: 1095, label: "3 years" },
+]);
 assert.equal(teamsSelectionLabel(selections[0]), "Engineering / Architecture");
 assert.equal(existingTeamsSelection("19:existing@thread.v2").type, "unknown");
 
@@ -52,6 +59,14 @@ const state = editableTeamsSourceState({
 assert.equal(state.config.name, "PCC Agent Dev");
 assert.equal(state.config.initial_history_days, 30);
 assert.deepEqual(state.conversationIds, selections.map((selection) => selection.id));
+assert.equal(
+  editableTeamsSourceState({
+    id: "src-two-year-retention",
+    name: "Two year preset",
+    config: { ...payload.config, rolling_retention_days: 730 },
+  }).config.rolling_retention_days,
+  730,
+);
 
 const setupSource = readFileSync("src/views/sources/TeamsSourceSetup.tsx", "utf8");
 const entrySource = readFileSync("src/views/sources/SourceSetupDialog.tsx", "utf8");

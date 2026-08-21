@@ -1387,11 +1387,14 @@ def test_teams_complete_window_tombstone_removes_every_prior_observation() -> No
     assert DeltaAxis.MEMBERSHIP in tombstone.deltas[0].axes
 
 
-def test_teams_rolling_retention_tombstone_requires_same_attempt_scope_attestation() -> None:
+@pytest.mark.parametrize("retention_days", [365, 730, 1095])
+def test_teams_rolling_retention_tombstone_requires_same_attempt_scope_attestation(
+    retention_days: int,
+) -> None:
     conversation_id = "19:conv-a@example.test"
     configured_scope = {
         "conversation_ids": [conversation_id],
-        "rolling_retention_days": 365,
+        "rolling_retention_days": retention_days,
     }
     item = _item(
         item_id="window-expired",
@@ -1460,6 +1463,25 @@ def test_teams_rolling_retention_tombstone_requires_same_attempt_scope_attestati
     assert tombstone.deltas[0].removed_observation_ids == (first.observations[0].id,)
     assert tombstone.source_units[0].locator["observed_to"] == "2024-01-01T00:00:00+00:00"
     assert tombstone.source_units[0].locator["tombstone_reason"] == "outside_rolling_retention"
+
+    threshold_raw, threshold_normalized = _inputs(
+        item,
+        {
+            "_authoritative_snapshot": True,
+            "_tombstone": True,
+            "tombstone_reason": "outside_rolling_retention",
+            "rolling_retention_cutoff": "2025-01-01T00:00:00Z",
+            "prior_observed_to": "2025-01-01T00:00:00Z",
+            "conversation_id": conversation_id,
+            "messages": [],
+        },
+        "",
+    )
+    with pytest.raises(ValueError, match="run-scoped coverage evidence"):
+        project_source_item(
+            **{**kwargs, "raw": threshold_raw, "normalized": threshold_normalized},
+            scope_attestations=(attestation,),
+        )
 
     incomplete_scope = {
         "conversation_ids": [conversation_id, "19:conv-b@example.test"],

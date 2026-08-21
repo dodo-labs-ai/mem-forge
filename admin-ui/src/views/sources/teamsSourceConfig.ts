@@ -12,6 +12,17 @@ export interface TeamsSourceConfig {
   rolling_retention_days: number | null;
 }
 
+export const TEAMS_ROLLING_RETENTION_OPTIONS = [
+  { value: null, label: "Forever" },
+  { value: 365, label: "1 year" },
+  { value: 730, label: "2 years" },
+  { value: 1095, label: "3 years" },
+] as const;
+
+const TEAMS_ROLLING_RETENTION_DAYS = new Set<number>(
+  TEAMS_ROLLING_RETENTION_OPTIONS.flatMap((option) => option.value === null ? [] : [option.value]),
+);
+
 export interface TeamsSourcePayload {
   type: "teams";
   name: string;
@@ -121,7 +132,7 @@ function numberConfig(value: unknown, fallback: number): number {
 
 function retentionConfig(value: unknown): number | null {
   const parsed = typeof value === "number" ? value : Number(value);
-  return parsed === 365 || parsed === 1095 ? parsed : null;
+  return TEAMS_ROLLING_RETENTION_DAYS.has(parsed) ? parsed : null;
 }
 
 function stringListConfig(value: unknown): string[] {

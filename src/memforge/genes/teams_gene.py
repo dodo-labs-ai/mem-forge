@@ -39,6 +39,7 @@ from memforge.local_agent.teams_contract import (
     parse_teams_source_timestamp,
     validate_teams_provider_message,
 )
+from memforge.local_agent.source_contract import TEAMS_ROLLING_RETENTION_PRESETS
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -1037,7 +1038,7 @@ class TeamsGene(Gene):
                     field_type=ConfigFieldType.SELECT,
                     required=False,
                     default="forever",
-                    options=["forever", "365", "1095"],
+                    options=["forever", *(str(days) for days in TEAMS_ROLLING_RETENTION_PRESETS)],
                     help_text="Explicitly remove MemForge support older than the selected period",
                     group="sync",
                     order=1,
@@ -1077,9 +1078,9 @@ class TeamsGene(Gene):
             try:
                 retention_days = int(retention)
             except (TypeError, ValueError) as exc:
-                raise ValueError("Teams rolling retention must be Forever, 1 year, or 3 years") from exc
-            if retention_days not in {365, 1095}:
-                raise ValueError("Teams rolling retention must be Forever, 1 year, or 3 years")
+                raise ValueError("Teams rolling retention must be Forever, 1 year, 2 years, or 3 years") from exc
+            if retention_days not in TEAMS_ROLLING_RETENTION_PRESETS:
+                raise ValueError("Teams rolling retention must be Forever, 1 year, 2 years, or 3 years")
             config["rolling_retention_days"] = retention_days
         config.pop("max_age_days", None)
         config.pop("conversation_gap_minutes", None)
