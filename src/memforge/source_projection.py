@@ -148,6 +148,15 @@ class FragmentMapping:
 
 @dataclass(frozen=True, slots=True)
 class SourceObservation:
+    """Stable identity for one provider-defined content part of a Source Unit.
+
+    Storage treats ``(source_unit_id, provider_key)`` as the canonical unique
+    key and ``observation_type`` as immutable classification. Adapters must
+    therefore namespace provider keys when native identifiers can overlap
+    across Observation types. Built-in derived ids also include the type so
+    classification drift fails closed instead of rewriting stored identity.
+    """
+
     id: str
     source_id: str
     source_unit_id: str
@@ -158,6 +167,8 @@ class SourceObservation:
 
 @dataclass(frozen=True, slots=True)
 class SourceObservationRevision:
+    """Immutable content revision of one Source Observation."""
+
     id: str
     observation_id: str
     semantic_hash: str
@@ -168,6 +179,15 @@ class SourceObservationRevision:
 
 @dataclass(frozen=True, slots=True)
 class SourceUnit:
+    """Stable identity for one provider item within a configured Source.
+
+    Storage treats ``(source_id, provider_key)`` as the canonical unique key
+    and ``unit_type`` as immutable classification. Adapters must therefore
+    namespace provider keys when native identifiers can overlap across Unit
+    types. Built-in derived ids also include the type so classification drift
+    fails closed instead of rewriting stored identity.
+    """
+
     id: str
     source_id: str
     unit_type: str
@@ -194,6 +214,16 @@ class SourceUnitInventoryPage:
 
 @dataclass(frozen=True, slots=True)
 class SourceUnitRevision:
+    """Append-only aggregate revision representing one Source Unit snapshot.
+
+    This manifest contains no source body. It pins the effective set of
+    :class:`SourceObservationRevision` records for one projected Unit state
+    together with semantic, location, membership, and access fingerprints.
+    The enclosing :class:`SourceProjection` coverage determines whether an
+    omitted Observation proves provider-side removal or whether its prior
+    revision must be carried forward.
+    """
+
     id: str
     source_unit_id: str
     semantic_hash: str
