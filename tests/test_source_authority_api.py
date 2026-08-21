@@ -131,6 +131,11 @@ def test_public_teams_config_migrates_legacy_history_and_hides_internal_knobs() 
         "rolling_retention_days": None,
     }
 
+    assert _public_source_config(
+        "teams",
+        {"conversation_ids": ["19:conversation-a@example.test"], "rolling_retention_days": 730},
+    )["rolling_retention_days"] == 730
+
 
 def _jira_payload(*, sync_mode: str) -> dict:
     return {

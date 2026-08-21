@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Mapping
 
 from memforge.github_repo_utils import build_github_repo_doc_id
+from memforge.local_agent.source_contract import TEAMS_ROLLING_RETENTION_PRESETS
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.source_projection import (
     AnchorKind,
@@ -650,7 +651,7 @@ def _teams_retention_attestation_is_valid(
     except (TypeError, ValueError):
         return False
     if (
-        retention_days not in {365, 1095}
+        retention_days not in TEAMS_ROLLING_RETENTION_PRESETS
         or not conversation_id
         or not cutoff
         or not observed_to

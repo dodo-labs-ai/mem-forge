@@ -94,6 +94,19 @@ class TestMetadata:
         assert "max_age_days" not in field_keys
         assert "conversation_gap_minutes" not in field_keys
         assert "max_block_messages" not in field_keys
+        retention = next(f for f in schema.fields if f.key == "rolling_retention_days")
+        assert retention.options == ["forever", "365", "730", "1095"]
+
+    @pytest.mark.parametrize("retention_days", [365, 730, 1095])
+    def test_normalize_config_accepts_product_retention_presets(self, retention_days: int):
+        config = {
+            "conversation_ids": ["19:chat@example.test"],
+            "rolling_retention_days": retention_days,
+        }
+
+        TeamsGene.normalize_config(config)
+
+        assert config["rolling_retention_days"] == retention_days
 
     def test_normalize_config_collapses_legacy_direct_selectors(self):
         config = {

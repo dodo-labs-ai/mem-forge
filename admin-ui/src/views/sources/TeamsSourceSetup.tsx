@@ -34,6 +34,7 @@ import {
   buildTeamsSourceUpdatePayload,
   editableTeamsSourceState,
   existingTeamsSelection,
+  TEAMS_ROLLING_RETENTION_OPTIONS,
   teamsSelectionLabel,
   type TeamsSelectionItem,
   type TeamsSourceConfig,
@@ -360,9 +361,9 @@ export function TeamsSourceSetup({
                     rolling_retention_days: event.target.value === "forever" ? null : Number(event.target.value),
                   })}
                 >
-                  <option value="forever">Forever</option>
-                  <option value={365}>1 year</option>
-                  <option value={1095}>3 years</option>
+                  {TEAMS_ROLLING_RETENTION_OPTIONS.map((option) => (
+                    <option key={option.label} value={option.value ?? "forever"}>{option.label}</option>
+                  ))}
                 </select>
               </Field>
             </div>

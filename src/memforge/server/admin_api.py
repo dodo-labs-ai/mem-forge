@@ -156,6 +156,7 @@ from memforge.source_access_transition import (
 from memforge.local_agent.readiness import connection_status_from_browser_session
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
+    TEAMS_ROLLING_RETENTION_PRESETS,
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
@@ -2006,7 +2007,9 @@ def _public_source_config(source_type: str, config: dict[str, Any]) -> dict[str,
     result = dict(config)
     result["initial_history_days"] = result.get("initial_history_days", result.get("max_age_days", 14))
     retention = result.get("rolling_retention_days")
-    result["rolling_retention_days"] = retention if retention in {365, 1095} else None
+    result["rolling_retention_days"] = (
+        retention if retention in TEAMS_ROLLING_RETENTION_PRESETS else None
+    )
     for key in ("max_age_days", "conversation_gap_minutes", "max_block_messages"):
         result.pop(key, None)
     return result
