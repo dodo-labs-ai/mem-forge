@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertCircle, Check, Hash, Loader2, MessageSquare, Search, User, X } from "lucide-react";
+import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
+import { AlertCircle, Check, Hash, Info, Loader2, MessageSquare, Search, User, X } from "lucide-react";
 
 import { resourceClient } from "@/api/client";
 import { createLocalAgentJob, getLocalAgentJob } from "@/api/localAgentJobs";
@@ -330,42 +331,50 @@ export function TeamsSourceSetup({
           )}
           <details className="border-t pt-3">
             <summary className="cursor-pointer text-sm font-semibold">Advanced settings</summary>
-            <div className="mt-3 grid gap-3 sm:grid-cols-2">
-              <Field
+            <div className="mt-4 grid gap-5 sm:grid-cols-2 sm:gap-x-8">
+              <SettingsField
                 label="Initial history"
                 help="How far back to collect when this source is first connected or its history is expanded. Older supported memories do not expire as time passes."
               >
-                <select
-                  className="h-10 rounded-md border bg-background px-3 text-sm"
+                <Select<number>
                   value={config.initial_history_days}
-                  onChange={(event) => setConfig({ ...config, initial_history_days: Number(event.target.value) })}
+                  onValueChange={(value) => value !== null && setConfig({ ...config, initial_history_days: value })}
                 >
-                  {![14, 30, 90, 365].includes(config.initial_history_days) && (
-                    <option value={config.initial_history_days}>{config.initial_history_days} days (existing)</option>
-                  )}
-                  <option value={14}>14 days</option>
-                  <option value={30}>30 days</option>
-                  <option value={90}>90 days</option>
-                  <option value={365}>1 year</option>
-                </select>
-              </Field>
-              <Field
+                  <SelectTrigger className="h-10 w-full data-size-default:h-10 sm:w-56" aria-label="Initial history">
+                    <SelectValue>{initialHistoryLabel(config.initial_history_days)}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {![14, 30, 90, 365].includes(config.initial_history_days) && (
+                      <SelectItem value={config.initial_history_days}>{config.initial_history_days} days (existing)</SelectItem>
+                    )}
+                    <SelectItem value={14}>14 days</SelectItem>
+                    <SelectItem value={30}>30 days</SelectItem>
+                    <SelectItem value={90}>90 days</SelectItem>
+                    <SelectItem value={365}>1 year</SelectItem>
+                  </SelectContent>
+                </Select>
+              </SettingsField>
+              <SettingsField
                 label="Rolling retention"
                 help="Forever keeps established support. A finite policy removes old Teams support only after a complete, successful scope check."
               >
-                <select
-                  className="h-10 rounded-md border bg-background px-3 text-sm"
+                <Select<number | "forever">
                   value={config.rolling_retention_days ?? "forever"}
-                  onChange={(event) => setConfig({
+                  onValueChange={(value) => value !== null && setConfig({
                     ...config,
-                    rolling_retention_days: event.target.value === "forever" ? null : Number(event.target.value),
+                    rolling_retention_days: value === "forever" ? null : value,
                   })}
                 >
-                  {TEAMS_ROLLING_RETENTION_OPTIONS.map((option) => (
-                    <option key={option.label} value={option.value ?? "forever"}>{option.label}</option>
-                  ))}
-                </select>
-              </Field>
+                  <SelectTrigger className="h-10 w-full data-size-default:h-10 sm:w-56" aria-label="Rolling retention">
+                    <SelectValue>{rollingRetentionLabel(config.rolling_retention_days)}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {TEAMS_ROLLING_RETENTION_OPTIONS.map((option) => (
+                      <SelectItem key={option.label} value={option.value ?? "forever"}>{option.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </SettingsField>
             </div>
           </details>
         </div>
@@ -459,6 +468,47 @@ export function TeamsSourceSetup({
 
 function Field({ label, help, children }: { label: string; help?: string; children: React.ReactNode }) {
   return <label className="block space-y-1.5"><span className="text-xs font-medium text-muted-foreground">{label}</span>{children}{help && <span className="block text-xs text-muted-foreground">{help}</span>}</label>;
+}
+
+function SettingsField({ label, help, children }: { label: string; help: string; children: React.ReactNode }) {
+  return (
+    <div className="min-w-0 space-y-2">
+      <div className="flex items-center gap-1.5">
+        <span className="text-sm font-medium text-foreground">{label}</span>
+        <PopoverPrimitive.Root>
+          <PopoverPrimitive.Trigger
+            render={
+              <button
+                type="button"
+                className="inline-flex size-6 items-center justify-center rounded-full text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                aria-label={`About ${label}`}
+              />
+            }
+          >
+            <Info className="size-3.5" />
+          </PopoverPrimitive.Trigger>
+          <PopoverPrimitive.Portal>
+            <PopoverPrimitive.Positioner sideOffset={6} align="start" className="z-50">
+              <PopoverPrimitive.Popup className="w-72 rounded-lg border bg-popover p-3 text-sm text-popover-foreground shadow-md outline-none data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0">
+                <div className="font-medium text-foreground">{label}</div>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{help}</p>
+              </PopoverPrimitive.Popup>
+            </PopoverPrimitive.Positioner>
+          </PopoverPrimitive.Portal>
+        </PopoverPrimitive.Root>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function initialHistoryLabel(days: number): string {
+  if (days === 365) return "1 year";
+  return `${days} days`;
+}
+
+function rollingRetentionLabel(days: number | null): string {
+  return TEAMS_ROLLING_RETENTION_OPTIONS.find((option) => option.value === days)?.label ?? `${days} days`;
 }
 
 function TeamsTypeIcon({ type, className }: { type: TeamsSelectionItem["type"]; className?: string }) {
