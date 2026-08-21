@@ -257,6 +257,7 @@ class RuntimeProvider(Protocol):
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
+        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         record_terminal_result: bool = True,
     ) -> SyncState: ...
 
@@ -351,6 +352,7 @@ class DefaultRuntimeProvider:
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
+        projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         record_terminal_result: bool = True,
     ) -> SyncState:
         return await run_source_sync(
@@ -367,6 +369,7 @@ class DefaultRuntimeProvider:
             lifecycle_cycle_id=lifecycle_cycle_id,
             scope_transition_run_id=scope_transition_run_id,
             reusable_projection_doc_ids=reusable_projection_doc_ids,
+            projection_scope_attestations=projection_scope_attestations,
             record_terminal_result=record_terminal_result,
         )
 
