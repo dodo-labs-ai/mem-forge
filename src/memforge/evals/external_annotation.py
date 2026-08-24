@@ -163,13 +163,23 @@ class LangfuseAnnotationAdapter:
         self._client.shutdown()
 
     def subject_exists(self, task: ExternalAnnotationTask) -> bool:
-        try:
-            trace = self._client.api.trace.get(task.trace_id)
-        except Exception as exc:
-            if _status_code(exc) == 404:
+        cursor: str | None = None
+        while True:
+            try:
+                response = self._client.api.observations.get_many(
+                    trace_id=task.trace_id,
+                    limit=1000,
+                    cursor=cursor,
+                )
+            except Exception as exc:
+                if _status_code(exc) == 404:
+                    return False
+                raise
+            if any(item.id == task.observation_id for item in response.data):
+                return True
+            cursor = response.meta.cursor
+            if not cursor:
                 return False
-            raise
-        return any(item.id == task.observation_id for item in trace.observations)
 
     def find_queue_items(self, task: ExternalAnnotationTask) -> list[Any]:
         matches: list[Any] = []
