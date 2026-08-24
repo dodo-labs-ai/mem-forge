@@ -4630,30 +4630,26 @@ def create_admin_app(
         """List search-eligible sources for MCP/source-id discovery."""
         return {"data": await _searchable_source_rows(request, db, sync_service=sync_service)}
 
-    @source_router.get("/{source_id}/agent-evaluation")
-    async def get_source_agent_evaluation(
-        source_id: str,
-        request: Request,
-        days: int = 30,
-        db: Database = Depends(get_db),
-    ):
-        """Return a bounded, authorized online-assessment view for one Source."""
+    def _online_evaluation_window(days: int) -> tuple[datetime, datetime]:
+        if not 1 <= days <= 90:
+            raise HTTPException(status_code=400, detail="days must be between 1 and 90")
+        occurred_to = datetime.now(timezone.utc)
+        return occurred_to - timedelta(days=days), occurred_to
 
+    async def _online_evaluation_rows(
+        db: Database,
+        *,
+        principal: str,
+        occurred_from: datetime,
+        occurred_to: datetime,
+        source_id: str | None = None,
+        source_type: str | None = None,
+    ):
         from memforge.evals.agent_evaluation import (
             AgentAssessmentQuery,
             AgentRuntimeEventQuery,
-            build_source_online_evaluation_view,
         )
 
-        if not 1 <= days <= 90:
-            raise HTTPException(status_code=400, detail="days must be between 1 and 90")
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_discoverability(request, source)
-        occurred_to = datetime.now(timezone.utc)
-        occurred_from = occurred_to - timedelta(days=days)
-        principal = resolve_request_principal(request)
         events = await db.list_agent_runtime_events(
             AgentRuntimeEventQuery(
                 occurred_from=occurred_from,
@@ -4661,6 +4657,7 @@ def create_admin_app(
                 requesting_user_id=principal,
                 include_private=True,
                 source_id=source_id,
+                source_type=source_type,
                 newest_first=True,
                 limit=1000,
             )
@@ -4675,6 +4672,109 @@ def create_admin_app(
                 newest_first=True,
                 limit=1000,
             )
+        )
+        return events, assessments
+
+    @evaluation_router.get("/online-overview")
+    async def get_workspace_agent_evaluation(
+        request: Request,
+        days: int = 1,
+        source_id: str | None = None,
+        source_type: str | None = None,
+        db: Database = Depends(get_db),
+    ):
+        """Return one authorized workspace evaluation overview."""
+
+        from memforge.evals.agent_evaluation import (
+            build_workspace_online_evaluation_view,
+        )
+
+        occurred_from, occurred_to = _online_evaluation_window(days)
+        principal = resolve_request_principal(request)
+        discoverable_sources = [
+            source
+            for source in await db.list_sources()
+            if source_is_discoverable(source, viewer_id=principal)
+        ]
+        available_source_types = sorted(
+            {
+                str(source.get("type") or "unknown")
+                for source in discoverable_sources
+            }
+        )
+        if source_id is not None:
+            selected = [
+                source
+                for source in discoverable_sources
+                if str(source.get("id") or "") == source_id
+            ]
+            if not selected:
+                raise HTTPException(status_code=404, detail="Source not found")
+            discoverable_sources = selected
+        if source_type is not None:
+            discoverable_sources = [
+                source
+                for source in discoverable_sources
+                if str(source.get("type") or "") == source_type
+            ]
+        events, assessments = await _online_evaluation_rows(
+            db,
+            principal=principal,
+            occurred_from=occurred_from,
+            occurred_to=occurred_to,
+            source_id=source_id,
+            source_type=source_type,
+        )
+        view = build_workspace_online_evaluation_view(
+            discoverable_sources,
+            events,
+            assessments,
+        )
+        summary = dict(view["summary"])
+        summary["truncated"] = len(events) == 1000 or len(assessments) == 1000
+        return {
+            "scope": {
+                "kind": "workspace",
+                "source_id": source_id,
+                "source_type": source_type,
+            },
+            "window": {
+                "from": occurred_from.isoformat(),
+                "to": occurred_to.isoformat(),
+                "days": days,
+            },
+            "summary": summary,
+            "coverage": view["coverage"],
+            "issue_groups": view["issue_groups"],
+            "available_source_types": available_source_types,
+            "sources": view["sources"],
+            "runtime_events": view["runtime_events"],
+            "assessments": view["assessments"],
+        }
+
+    @source_router.get("/{source_id}/agent-evaluation")
+    async def get_source_agent_evaluation(
+        source_id: str,
+        request: Request,
+        days: int = 30,
+        db: Database = Depends(get_db),
+    ):
+        """Return a bounded, authorized online-assessment view for one Source."""
+
+        from memforge.evals.agent_evaluation import build_source_online_evaluation_view
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
+        occurred_from, occurred_to = _online_evaluation_window(days)
+        principal = resolve_request_principal(request)
+        events, assessments = await _online_evaluation_rows(
+            db,
+            principal=principal,
+            occurred_from=occurred_from,
+            occurred_to=occurred_to,
+            source_id=source_id,
         )
         view = build_source_online_evaluation_view(events, assessments)
         summary = dict(view["summary"])

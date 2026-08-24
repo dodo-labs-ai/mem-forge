@@ -18,6 +18,7 @@ from memforge.evals.agent_evaluation import (
     assessment_sink_for_runtime_sink,
     bind_source_lifecycle_outcome,
     bind_quality_signals,
+    build_workspace_online_evaluation_view,
     current_deployment_revision,
     evaluate_runtime_events,
     event_public_payload,
@@ -619,6 +620,38 @@ def test_deterministic_evaluator_reproduces_persisted_lifecycle_assessment() -> 
     bundle = _lifecycle_bundle()
 
     assert evaluate_runtime_events((bundle.event,)) == bundle.assessments
+
+
+def test_workspace_evaluation_distinguishes_coverage_gap_from_no_recent_data() -> None:
+    [pending_event] = _events(
+        QualitySignal("structured_output_outcome", "expected", "schema_conformant")
+    )
+
+    view = build_workspace_online_evaluation_view(
+        [
+            {
+                "id": "src-teams",
+                "name": "Teams",
+                "type": "teams",
+                "status": "active",
+            },
+            {
+                "id": "src-empty",
+                "name": "Empty Source",
+                "type": "jira",
+                "status": "active",
+            },
+        ],
+        [pending_event],
+        [],
+    )
+
+    assert [(source["source_id"], source["evaluation_status"]) for source in view["sources"]] == [
+        ("src-teams", "coverage_gap"),
+        ("src-empty", "no_data"),
+    ]
+    assert view["summary"]["affected_source_count"] == 1
+    assert view["coverage"]["pending_occurrences"] == 1
 
 
 def test_assessment_summary_preserves_coalesced_occurrence_denominator() -> None:

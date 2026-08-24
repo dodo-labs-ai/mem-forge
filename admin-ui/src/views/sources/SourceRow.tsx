@@ -1,7 +1,12 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import { AlertCircle, Info, Loader2, Lock, Pause, Pin, Play, RefreshCw, ShieldCheck, SlidersHorizontal } from "lucide-react";
-import type { Source, SourceCapabilities, SyncStatus } from "@/api/types";
+import type {
+  AgentEvaluationSourceHealth,
+  Source,
+  SourceCapabilities,
+  SyncStatus,
+} from "@/api/types";
 import { StatusDot } from "@/components/admin/StatusBadge";
 import { SourceSyncStatusCard } from "@/components/admin/SourceSyncStatusCard";
 import { Badge } from "@/components/ui/badge";
@@ -52,6 +57,7 @@ const DEFAULT_CAPABILITIES: SourceCapabilities = {
 
 export function SourceRow({
   source,
+  evaluationHealth,
   perGroupMemoryCount,
   syncActivity,
   isDeleting,
@@ -77,6 +83,7 @@ export function SourceRow({
   isSigningIn = false,
 }: {
   source: Source;
+  evaluationHealth?: AgentEvaluationSourceHealth;
   perGroupMemoryCount: number;
   syncActivity?: SourceSyncActivity;
   isDeleting: boolean;
@@ -175,15 +182,11 @@ export function SourceRow({
                   ? activityPolicy?.activeRowLabel
                   : durableSyncLabel ?? <LastSyncDetails source={source} itemLabel={itemLabel} />}
               </span>
-              <button
-                type="button"
-                className="inline-flex items-center gap-1 rounded-sm text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              <SourceEvaluationAction
+                sourceName={source.name}
+                health={evaluationHealth}
                 onClick={onShowEvaluation}
-                aria-label={`Show online evaluation for ${source.name}`}
-              >
-                <ShieldCheck className="size-3.5 opacity-65" aria-hidden="true" />
-                Online evaluation
-              </button>
+              />
               {source.sync_schedule?.enabled && (
                 <span>
                   Auto sync: {formatScheduleInterval(source.sync_schedule.interval_minutes)}
@@ -327,6 +330,36 @@ export function SourceRow({
         onRetry={isPaused || !capabilities.can_sync ? undefined : onSync}
       />
     </div>
+  );
+}
+
+function SourceEvaluationAction({
+  sourceName,
+  health,
+  onClick,
+}: {
+  sourceName: string;
+  health?: AgentEvaluationSourceHealth;
+  onClick: () => void;
+}) {
+  if (!health || health.evaluation_status === "healthy" || health.evaluation_status === "no_data") {
+    return null;
+  }
+  const label = health.evaluation_status === "attention"
+    ? `${health.action_issue_group_count} issue${health.action_issue_group_count === 1 ? "" : "s"}`
+    : health.evaluation_status === "coverage_gap"
+      ? `${health.coverage.pending_occurrences} pending evaluations`
+      : `${health.review_issue_group_count} review pattern${health.review_issue_group_count === 1 ? "" : "s"}`;
+  return (
+    <button
+      type="button"
+      className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs font-medium text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+      onClick={onClick}
+      aria-label={`Open evaluation for ${sourceName}: ${label}`}
+    >
+      <ShieldCheck className="size-3.5" aria-hidden="true" />
+      {label}
+    </button>
   );
 }
 

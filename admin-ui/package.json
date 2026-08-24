@@ -33,7 +33,7 @@
     "test:schedules": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/schedules.test.ts && node .tmp-test/schedules.test.js",
     "test:local-agent-daemon-status": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/local-agent-daemon-status.test.ts && node .tmp-test/local-agent-daemon-status.test.js",
     "test:source-readiness": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/source-readiness.test.ts && node .tmp-test/tests/source-readiness.test.js",
-    "test:online-evaluation-dialog-layout": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/online-evaluation-dialog-layout.test.ts && node .tmp-test/online-evaluation-dialog-layout.test.js && vitest run src/views/sources/SourceOnlineEvaluationDialog.test.tsx",
+    "test:online-evaluation-dialog-layout": "rm -rf .tmp-test && tsc --target ES2023 --module NodeNext --moduleResolution NodeNext --types node --strict --esModuleInterop --skipLibCheck --outDir .tmp-test tests/online-evaluation-dialog-layout.test.ts && node .tmp-test/online-evaluation-dialog-layout.test.js && vitest run src/views/sources/SourceOnlineEvaluationDialog.test.tsx src/views/evaluation/OnlineEvaluationPage.test.tsx",
     "preview": "vite preview --port 4174"
   },
   "dependencies": {

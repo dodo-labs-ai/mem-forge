@@ -23,6 +23,12 @@ assert.match(
 
 assert.match(
   sidebarSource,
+  /to: "\/evaluation", label: "Evaluation"/,
+  "workspace Online Evaluation should be a first-class General navigation entry",
+);
+
+assert.match(
+  sidebarSource,
   /getExtensionHiddenReservedNavItems/,
   "sidebar should allow a composed extension to replace a built-in reserved nav item",
 );
@@ -89,6 +95,12 @@ assert.match(
   appSource,
   /getExtensionReservedRouteRedirects/,
   "app routes should allow a composed extension to redirect selected built-in reserved routes",
+);
+
+assert.match(
+  appSource,
+  /path="\/evaluation" element=\{<OnlineEvaluationPage \/>\}/,
+  "the Evaluation navigation entry should resolve to the workspace overview route",
 );
 
 assert.match(

@@ -20,6 +20,7 @@ import { ProjectDetailPage } from "@/views/projects/ProjectDetailPage";
 import { ProjectsPage } from "@/views/projects/ProjectsPage";
 import { ReviewQueuePage } from "@/views/review/ReviewQueuePage";
 import { ReviewDetailPage } from "@/views/review/ReviewDetailPage";
+import { OnlineEvaluationPage } from "@/views/evaluation/OnlineEvaluationPage";
 import { SourcesPage } from "@/views/sources/SourcesPage";
 import { SchedulesPage } from "@/views/schedules/SchedulesPage";
 import { SettingsPage } from "@/views/settings/SettingsPage";
@@ -61,6 +62,7 @@ export default function App() {
               <Route path="/memories/:id" element={<MemoryDetailPage />} />
               <Route path="/review" element={<ReviewQueuePage />} />
               <Route path="/review/:id" element={<ReviewDetailPage />} />
+              <Route path="/evaluation" element={<OnlineEvaluationPage />} />
               <Route path="/entities" element={<EntitiesPage />} />
               <Route path="/entities/:id" element={<EntityDetailPage />} />
               <Route path="/sources" element={<SourcesPage />} />

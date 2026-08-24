@@ -843,6 +843,283 @@ def test_source_agent_evaluation_route_groups_actionable_cases_and_preserves_sem
     assert review_group["representative_cases"][0]["observation_id"] == "observation-1"
 
 
+def test_workspace_agent_evaluation_route_aggregates_only_discoverable_sources(tmp_path):
+    now = datetime.now(timezone.utc)
+
+    def event_for(
+        source_id: str,
+        source_type: str,
+        signal: QualitySignal,
+    ):
+        return bind_quality_signals(
+            (signal,),
+            source_id=source_id,
+            source_type=source_type,
+            doc_id=f"doc-{source_id}",
+            source_unit_id=f"unit-{source_id}",
+            target_unit_revision_id=f"revision-{source_id}",
+            projection_run_id=f"projection-{source_id}",
+            derivation_id=f"derivation-{source_id}",
+            batch_id=f"batch-{source_id}",
+            batch_attempt=1,
+            extraction_contract_version="projection-extraction-v8",
+            occurred_at=now,
+        )[0]
+
+    workspace_failure = event_for(
+        "src-workspace-failure",
+        "teams",
+        QualitySignal(
+            "evidence_admission_outcome",
+            "rejected",
+            "legacy_quote_unresolved",
+        ),
+    )
+    private_review = event_for(
+        "src-private-review",
+        "github_repo",
+        QualitySignal(
+            "evidence_localization_outcome",
+            "degraded",
+            "whole_block_fallback",
+            observation_id="observation-private",
+            observation_revision_id="observation-revision-private",
+            range_start=0,
+            range_end=10,
+        ),
+    )
+    workspace_healthy = event_for(
+        "src-workspace-healthy",
+        "jira",
+        QualitySignal(
+            "structured_output_outcome",
+            "expected",
+            "schema_conformant",
+        ),
+    )
+    hidden_private = event_for(
+        "src-hidden-private",
+        "teams",
+        QualitySignal(
+            "evidence_admission_outcome",
+            "rejected",
+            "missing_evidence_reference",
+        ),
+    )
+    all_events = [
+        workspace_failure,
+        private_review,
+        workspace_healthy,
+        hidden_private,
+    ]
+    all_assessments = list(evaluate_runtime_events(tuple(all_events)))
+    sources = [
+        {
+            "id": "src-workspace-failure",
+            "name": "Workspace Teams",
+            "type": "teams",
+            "status": "active",
+            "owner_user_id": "owner-a",
+            "access_policy": "workspace",
+            "access_state": "active",
+        },
+        {
+            "id": "src-private-review",
+            "name": "My Repository",
+            "type": "github_repo",
+            "status": "active",
+            "owner_user_id": "dev",
+            "access_policy": "private",
+            "access_state": "active",
+        },
+        {
+            "id": "src-workspace-healthy",
+            "name": "Healthy Jira",
+            "type": "jira",
+            "status": "active",
+            "owner_user_id": "owner-a",
+            "access_policy": "workspace",
+            "access_state": "active",
+        },
+        {
+            "id": "src-hidden-private",
+            "name": "Someone Else Private",
+            "type": "teams",
+            "status": "active",
+            "owner_user_id": "someone-else",
+            "access_policy": "private",
+            "access_state": "active",
+        },
+    ]
+
+    class FakeWorkspaceEvaluationReader:
+        async def get_schedule_config(self) -> dict:
+            return {"enabled": False}
+
+        async def claim_due_scheduled_sources(self, **_kwargs) -> list[dict]:
+            return []
+
+        async def list_sources(self):
+            return sources
+
+        async def list_agent_runtime_events(self, query):
+            assert query.source_id is None
+            assert query.requesting_user_id == "dev"
+            assert query.include_private is True
+            assert query.newest_first is True
+            assert query.limit == 1000
+            # Deliberately return a hidden Source event. The route must still
+            # fail closed against the discoverable Source cohort.
+            return all_events
+
+        async def list_agent_assessments(self, query):
+            assert query.source_id is None
+            assert query.requesting_user_id == "dev"
+            assert query.include_private is True
+            assert query.newest_first is True
+            assert query.limit == 1000
+            return all_assessments
+
+    app = create_admin_app(
+        db=FakeWorkspaceEvaluationReader(),
+        config=_config(tmp_path),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/agent-evaluations/online-overview?days=1")
+        hidden_response = client.get(
+            "/api/v1/agent-evaluations/online-overview"
+            "?days=1&source_id=src-hidden-private"
+        )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["scope"] == {
+        "kind": "workspace",
+        "source_id": None,
+        "source_type": None,
+    }
+    assert payload["summary"]["source_count"] == 3
+    assert payload["summary"]["affected_source_count"] == 2
+    assert payload["coverage"]["eligible_occurrences"] == 3
+    assert payload["coverage"]["assessed_occurrences"] == 3
+    assert [source["source_id"] for source in payload["sources"]] == [
+        "src-workspace-failure",
+        "src-private-review",
+        "src-workspace-healthy",
+    ]
+    assert [source["evaluation_status"] for source in payload["sources"]] == [
+        "attention",
+        "review",
+        "healthy",
+    ]
+    assert {group["label"] for group in payload["issue_groups"]} == {
+        "fail",
+        "needs_review",
+    }
+    assert {
+        group["label"]: (
+            group["affected_source_ids"],
+            group["affected_source_count"],
+            group["source_types"],
+        )
+        for group in payload["issue_groups"]
+    } == {
+        "fail": (["src-workspace-failure"], 1, ["teams"]),
+        "needs_review": (["src-private-review"], 1, ["github_repo"]),
+    }
+    assert all(
+        "src-hidden-private" not in group["affected_source_ids"]
+        for group in payload["issue_groups"]
+    )
+    assert hidden_response.status_code == 404
+
+
+def test_workspace_agent_evaluation_route_filters_source_type_without_new_evaluator(
+    tmp_path,
+):
+    now = datetime.now(timezone.utc)
+    teams_event = bind_quality_signals(
+        (QualitySignal("structured_output_outcome", "expected", "schema_conformant"),),
+        source_id="src-teams",
+        source_type="teams",
+        doc_id="doc-teams",
+        source_unit_id="unit-teams",
+        target_unit_revision_id="revision-teams",
+        projection_run_id="projection-teams",
+        derivation_id="derivation-teams",
+        batch_id="batch-teams",
+        batch_attempt=1,
+        extraction_contract_version="projection-extraction-v8",
+        occurred_at=now,
+    )[0]
+    github_event = replace(
+        teams_event,
+        event_id="are-github",
+        source_id="src-github",
+        source_type="github_repo",
+        doc_id="doc-github",
+        source_unit_id="unit-github",
+        target_unit_revision_id="revision-github",
+        projection_run_id="projection-github",
+    )
+    events = [teams_event, github_event]
+    assessments = list(evaluate_runtime_events(tuple(events)))
+
+    class FakeWorkspaceEvaluationReader:
+        async def get_schedule_config(self) -> dict:
+            return {"enabled": False}
+
+        async def claim_due_scheduled_sources(self, **_kwargs) -> list[dict]:
+            return []
+
+        async def list_sources(self):
+            return [
+                {
+                    "id": "src-teams",
+                    "name": "Teams",
+                    "type": "teams",
+                    "status": "active",
+                    "owner_user_id": "dev",
+                    "access_policy": "workspace",
+                    "access_state": "active",
+                },
+                {
+                    "id": "src-github",
+                    "name": "GitHub",
+                    "type": "github_repo",
+                    "status": "active",
+                    "owner_user_id": "dev",
+                    "access_policy": "workspace",
+                    "access_state": "active",
+                },
+            ]
+
+        async def list_agent_runtime_events(self, _query):
+            return events
+
+        async def list_agent_assessments(self, _query):
+            return assessments
+
+    app = create_admin_app(
+        db=FakeWorkspaceEvaluationReader(),
+        config=_config(tmp_path),
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/v1/agent-evaluations/online-overview"
+            "?days=1&source_type=teams"
+        )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["scope"]["source_type"] == "teams"
+    assert payload["available_source_types"] == ["github_repo", "teams"]
+    assert [source["source_id"] for source in payload["sources"]] == ["src-teams"]
+    assert payload["coverage"]["eligible_occurrences"] == 1
+
+
 def test_source_schedule_routes_use_storage_neutral_store(tmp_path):
     class FakeSourceReader:
         def __init__(self) -> None:

@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 from threading import Lock
-from typing import Callable, ContextManager, Iterator, Literal, Mapping, Protocol
+from typing import Callable, ContextManager, Iterator, Literal, Mapping, Protocol, Sequence
 
 
 AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v3"
@@ -1339,6 +1339,144 @@ def build_source_online_evaluation_view(
     }
 
 
+def build_workspace_online_evaluation_view(
+    sources: Sequence[Mapping[str, object]],
+    events: tuple[AgentRuntimeEvent, ...] | list[AgentRuntimeEvent],
+    assessments: tuple[AgentAssessment, ...] | list[AgentAssessment],
+    *,
+    representative_limit: int = 3,
+) -> dict[str, object]:
+    """Return one workspace-scoped presentation over an authorized Source cohort.
+
+    Callers must supply only Sources the principal may discover. Events and
+    assessments are filtered against that explicit cohort again so a drifting
+    adapter cannot leak a hidden Source through aggregate counts.
+    """
+
+    normalized_sources = [_online_evaluation_source(source) for source in sources]
+    source_ids = frozenset(source["source_id"] for source in normalized_sources)
+    event_rows = [event for event in events if event.source_id in source_ids]
+    visible_event_ids = frozenset(event.event_id for event in event_rows)
+    assessment_rows = [
+        assessment
+        for assessment in assessments
+        if assessment.target_event_id in visible_event_ids
+    ]
+    workspace_view = build_source_online_evaluation_view(
+        event_rows,
+        assessment_rows,
+        representative_limit=representative_limit,
+    )
+
+    event_by_source: dict[str, list[AgentRuntimeEvent]] = {
+        source_id: [] for source_id in source_ids
+    }
+    for event in event_rows:
+        event_by_source[event.source_id].append(event)
+    assessment_by_event: dict[str, list[AgentAssessment]] = {}
+    for assessment in assessment_rows:
+        if assessment.target_event_id is None:
+            continue
+        assessment_by_event.setdefault(assessment.target_event_id, []).append(assessment)
+
+    source_health: list[dict[str, object]] = []
+    for source in normalized_sources:
+        source_id = source["source_id"]
+        source_events = event_by_source[source_id]
+        source_event_ids = frozenset(event.event_id for event in source_events)
+        source_assessments = [
+            assessment
+            for event_id in source_event_ids
+            for assessment in assessment_by_event.get(event_id, ())
+        ]
+        view = build_source_online_evaluation_view(
+            source_events,
+            source_assessments,
+            representative_limit=representative_limit,
+        )
+        summary = view["summary"]
+        coverage = view["coverage"]
+        assert isinstance(summary, Mapping)
+        assert isinstance(coverage, Mapping)
+        action_groups = int(summary["action_issue_group_count"])
+        review_groups = int(summary["review_issue_group_count"])
+        pending = int(coverage["pending_occurrences"])
+        evaluator_failures = int(coverage["evaluator_failure_occurrences"])
+        eligible = int(coverage["eligible_occurrences"])
+        if action_groups:
+            evaluation_status = "attention"
+        elif pending or evaluator_failures:
+            evaluation_status = "coverage_gap"
+        elif review_groups:
+            evaluation_status = "review"
+        elif eligible == 0:
+            evaluation_status = "no_data"
+        else:
+            evaluation_status = "healthy"
+        label_counts = summary.get("label_counts")
+        assert isinstance(label_counts, Mapping)
+        source_health.append(
+            {
+                **source,
+                "evaluation_status": evaluation_status,
+                "action_issue_group_count": action_groups,
+                "review_issue_group_count": review_groups,
+                "fail_occurrences": int(label_counts.get("fail") or 0),
+                "review_occurrences": int(label_counts.get("needs_review") or 0),
+                "coverage": dict(coverage),
+                "last_event_at": (
+                    max(event.occurred_at for event in source_events).isoformat()
+                    if source_events
+                    else None
+                ),
+            }
+        )
+
+    status_rank = {
+        "attention": 0,
+        "coverage_gap": 1,
+        "review": 2,
+        "healthy": 3,
+        "no_data": 4,
+    }
+    source_health.sort(
+        key=lambda source: (
+            status_rank[str(source["evaluation_status"])],
+            -int(source["fail_occurrences"]),
+            -int(source["review_occurrences"]),
+            str(source["name"]).casefold(),
+            str(source["source_id"]),
+        )
+    )
+    affected_source_ids = {
+        str(source["source_id"])
+        for source in source_health
+        if source["evaluation_status"] in {"attention", "coverage_gap", "review"}
+    }
+    summary = dict(workspace_view["summary"])
+    summary.update(
+        {
+            "source_count": len(source_health),
+            "affected_source_count": len(affected_source_ids),
+        }
+    )
+    workspace_view["summary"] = summary
+    workspace_view["sources"] = source_health
+    return workspace_view
+
+
+def _online_evaluation_source(source: Mapping[str, object]) -> dict[str, str]:
+    source_id = str(source.get("id") or source.get("source_id") or "").strip()
+    if not source_id:
+        raise ValueError("online evaluation source_id is required")
+    return {
+        "source_id": source_id,
+        "name": str(source.get("name") or source_id),
+        "type": str(source.get("type") or "unknown"),
+        "source_status": str(source.get("status") or "unknown"),
+    }
+
+
 def _event_assessment_semantic_key(
     assessment: AgentAssessment,
 ) -> tuple[str | None, str, str, str]:
@@ -1421,6 +1559,8 @@ def _source_online_evaluation_issue_groups(
                 "distinct_event_count": 0,
                 "first_seen_at": event.occurred_at,
                 "last_seen_at": event.occurred_at,
+                "affected_source_ids": [],
+                "source_types": [],
                 "representative_cases": [],
             },
         )
@@ -1428,6 +1568,14 @@ def _source_online_evaluation_issue_groups(
         group["distinct_event_count"] = int(group["distinct_event_count"]) + 1
         group["first_seen_at"] = min(group["first_seen_at"], event.occurred_at)
         group["last_seen_at"] = max(group["last_seen_at"], event.occurred_at)
+        affected_source_ids = group["affected_source_ids"]
+        source_types = group["source_types"]
+        assert isinstance(affected_source_ids, list)
+        assert isinstance(source_types, list)
+        if event.source_id not in affected_source_ids:
+            affected_source_ids.append(event.source_id)
+        if event.source_type not in source_types:
+            source_types.append(event.source_type)
         representatives = group["representative_cases"]
         assert isinstance(representatives, list)
         if len(representatives) < representative_limit:
@@ -1442,6 +1590,9 @@ def _source_online_evaluation_issue_groups(
         group["criterion_rate"] = (
             int(group["occurrence_count"]) / denominator if denominator else 0.0
         )
+        group["affected_source_ids"] = sorted(group["affected_source_ids"])
+        group["source_types"] = sorted(group["source_types"])
+        group["affected_source_count"] = len(group["affected_source_ids"])
     values.sort(
         key=lambda group: (
             0 if group["label"] == "fail" else 1,

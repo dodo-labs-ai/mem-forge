@@ -1,7 +1,8 @@
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Files, Info, Loader2, LockKeyhole, MoreHorizontal, Pause, Pin, Play, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { Files, Info, Loader2, LockKeyhole, MoreHorizontal, Pause, Pin, Play, Plus, RefreshCw, Search, ShieldCheck, Trash2, X } from "lucide-react";
 import { resourceClient } from "@/api/client";
 import { createLocalAgentJob, getCurrentLocalAgentJobs, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
@@ -14,6 +15,7 @@ import type {
   Source,
   SourceCapabilities,
   SourceProjectsResponse,
+  WorkspaceAgentEvaluationResponse,
 } from "@/api/types";
 import { AsyncBoundary } from "@/components/admin/AsyncBoundary";
 import { DataSurface } from "@/components/admin/DataSurface";
@@ -34,7 +36,6 @@ import {
 import { timeAgo } from "@/utils/date";
 import { SourceIcon } from "@/components/sources/SourceIcon";
 import { SourceSetupDialog } from "./SourceSetupDialog";
-import { SourceOnlineEvaluationDialog } from "./SourceOnlineEvaluationDialog";
 import { SourceAccessChangeDialog } from "./SourceAccessChangeDialog";
 import { LocalAgentDaemonStatus } from "./LocalAgentDaemonStatus";
 import { isManagedSourceId, isManagedSourceType, userConfigurableGenes } from "./managedSources";
@@ -111,6 +112,7 @@ const LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE = "Configure a folder path before syn
 const LOCAL_AGENT_SYNC_FAILED_MESSAGE = "Local daemon could not sync this source.";
 const JIRA_SIGN_IN_FAILED_MESSAGE = "Jira sign-in failed.";
 const LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS = 30_000;
+const SOURCE_EVALUATION_STALE_MS = 60_000;
 
 function safeSourceErrorMessage(error: unknown): string | null {
   if (!(error instanceof Error)) return null;
@@ -218,6 +220,8 @@ function sourceItemLabel(source: Source): string {
 
 export function SourcesPage() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const location = useLocation();
   const [addOpen, setAddOpen] = useState(false);
   const [configDialog, setConfigDialog] = useState<{
     sourceType: string | null;
@@ -225,7 +229,6 @@ export function SourcesPage() {
     initialFocus?: { step: "project" };
   }>({ sourceType: null, source: null });
   const [detailsSource, setDetailsSource] = useState<Source | null>(null);
-  const [evaluationSource, setEvaluationSource] = useState<Source | null>(null);
   const [accessSource, setAccessSource] = useState<Source | null>(null);
   const [openMenuSourceId, setOpenMenuSourceId] = useState<string | null>(null);
   const [sourcePendingDelete, setSourcePendingDelete] = useState<Source | null>(null);
@@ -289,6 +292,14 @@ export function SourcesPage() {
         return Boolean(status && !terminal.has(status));
       }) ? 2000 : false;
     },
+  });
+
+  const evaluationOverviewQuery = useQuery<WorkspaceAgentEvaluationResponse>({
+    queryKey: ["workspace-agent-evaluation", 1, null, null],
+    queryFn: () => resourceClient
+      .get("/agent-evaluations/online-overview", { params: { days: 1 } })
+      .then((response) => response.data),
+    staleTime: SOURCE_EVALUATION_STALE_MS,
   });
 
   const sourceListPreferencesQuery = useQuery<SourceListPreferencesResponse>({
@@ -525,6 +536,18 @@ export function SourcesPage() {
   const totalDocs = sources.reduce((sum, source) => sum + source.doc_count, 0);
   const totalMemories = sources.reduce((sum, source) => sum + (source.memory_count ?? 0), 0);
   const projects = projectsQuery.data ?? [];
+  const evaluationHealthBySource = new Map(
+    (evaluationOverviewQuery.data?.sources ?? []).map((source) => [source.source_id, source]),
+  );
+
+  const openSourceEvaluation = (sourceId: string) => {
+    const params = new URLSearchParams(location.search);
+    params.set("source_id", sourceId);
+    params.delete("source_type");
+    params.delete("criterion");
+    params.delete("label");
+    navigate(`/evaluation?${params.toString()}`);
+  };
 
   // Sources whose project assignment depends on per-document field values
   // need the resolver result to know which groups they appear in. Sources
@@ -792,6 +815,7 @@ export function SourcesPage() {
                       <SourceRow
                         key={`${groupKey}:${source.id}`}
                         source={source}
+                        evaluationHealth={evaluationHealthBySource.get(source.id)}
                         perGroupMemoryCount={memory_count}
                         syncActivity={syncActivity}
                         isDeleting={isDeleting}
@@ -827,7 +851,7 @@ export function SourcesPage() {
                           setSourceStatus.mutate({ sourceId: source.id, status: "active" })
                         }
                         onShowDetails={() => setDetailsSource(source)}
-                        onShowEvaluation={() => setEvaluationSource(source)}
+                        onShowEvaluation={() => openSourceEvaluation(source.id)}
                         onSubscriptionChange={(enabled) => {
                           if (!capabilities.can_subscribe) return;
                           setSubscription.mutate({ sourceId: source.id, enabled });
@@ -858,6 +882,10 @@ export function SourcesPage() {
                               onChangeAccess={() => {
                                 setOpenMenuSourceId(null);
                                 setAccessSource(source);
+                              }}
+                              onShowEvaluation={() => {
+                                setOpenMenuSourceId(null);
+                                openSourceEvaluation(source.id);
                               }}
                               disableMutatingActions={isSourceBusy || isDeleting}
                               disableForceResync={isSourceBusy || isDeleting || source.status === "paused"}
@@ -938,14 +966,6 @@ export function SourcesPage() {
         }}
       />
 
-      <SourceOnlineEvaluationDialog
-        key={evaluationSource?.id ?? "closed-online-evaluation"}
-        source={evaluationSource}
-        onOpenChange={(open) => {
-          if (!open) setEvaluationSource(null);
-        }}
-      />
-
       <DeleteSourceDialog
         source={sourcePendingDelete}
         isDeleting={deleteSource.isPending}
@@ -970,6 +990,7 @@ function SourceActionsMenu({
   onForceResync,
   onToggleStatus,
   onChangeAccess,
+  onShowEvaluation,
   disableMutatingActions,
   disableForceResync,
   disableToggleStatus,
@@ -983,6 +1004,7 @@ function SourceActionsMenu({
   onForceResync: () => void;
   onToggleStatus: () => void;
   onChangeAccess: () => void;
+  onShowEvaluation: () => void;
   disableMutatingActions: boolean;
   disableForceResync: boolean;
   disableToggleStatus: boolean;
@@ -1040,10 +1062,6 @@ function SourceActionsMenu({
     };
   }, [open, onOpenChange]);
 
-  if (!canToggleStatus && !canForceResync && !canChangeAccess && !canDelete) {
-    return null;
-  }
-
   return (
     <div className="relative">
       <Button
@@ -1063,7 +1081,7 @@ function SourceActionsMenu({
               triggerBottom: rect.bottom,
               viewportWidth: window.innerWidth,
               viewportHeight: window.innerHeight,
-              menuHeight: canDelete ? 224 : 160,
+              menuHeight: canDelete ? 288 : 224,
             }));
           }
           onOpenChange(!open);
@@ -1079,6 +1097,21 @@ function SourceActionsMenu({
           className="z-50 rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg"
           style={menuStyle}
         >
+          <button
+            type="button"
+            role="menuitem"
+            className="flex w-full cursor-pointer items-start gap-3 rounded-md px-3 py-2 text-left text-sm hover:bg-muted"
+            onClick={onShowEvaluation}
+          >
+            <ShieldCheck className="mt-0.5 size-4" />
+            <span>
+              <span className="block font-medium text-foreground">Online evaluation</span>
+              <span className="mt-0.5 block text-xs">Open this Source in the workspace Evaluation view.</span>
+            </span>
+          </button>
+          {(canChangeAccess || canToggleStatus || canForceResync || canDelete) && (
+            <div className="my-1 h-px bg-border" />
+          )}
           {canChangeAccess && (
             <button
               type="button"
