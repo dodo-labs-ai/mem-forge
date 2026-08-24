@@ -273,6 +273,8 @@ export interface AgentAssessmentSummary {
   missing_assessment_count: number;
   action_issue_group_count: number;
   review_issue_group_count: number;
+  source_count?: number;
+  affected_source_count?: number;
   label_counts: Record<string, number>;
   criterion_counts: Record<string, number>;
   status_counts: Record<string, number>;
@@ -342,6 +344,9 @@ export interface AgentEvaluationIssueGroup {
   distinct_event_count: number;
   criterion_occurrence_count: number;
   criterion_rate: number;
+  affected_source_ids: string[];
+  affected_source_count: number;
+  source_types: string[];
   first_seen_at: string;
   last_seen_at: string;
   representative_cases: AgentEvaluationRepresentativeCase[];
@@ -369,6 +374,43 @@ export interface SourceAgentEvaluationResponse {
   summary: AgentAssessmentSummary;
   coverage: AgentEvaluationCoverage;
   issue_groups: AgentEvaluationIssueGroup[];
+  runtime_events: AgentRuntimeEventView[];
+  assessments: AgentAssessmentView[];
+}
+
+export type AgentEvaluationSourceStatus =
+  | "attention"
+  | "coverage_gap"
+  | "review"
+  | "healthy"
+  | "no_data";
+
+export interface AgentEvaluationSourceHealth {
+  source_id: string;
+  name: string;
+  type: string;
+  source_status: string;
+  evaluation_status: AgentEvaluationSourceStatus;
+  action_issue_group_count: number;
+  review_issue_group_count: number;
+  fail_occurrences: number;
+  review_occurrences: number;
+  coverage: AgentEvaluationCoverage;
+  last_event_at: string | null;
+}
+
+export interface WorkspaceAgentEvaluationResponse {
+  scope: {
+    kind: "workspace";
+    source_id: string | null;
+    source_type: string | null;
+  };
+  window: { from: string; to: string; days: number };
+  summary: AgentAssessmentSummary;
+  coverage: AgentEvaluationCoverage;
+  issue_groups: AgentEvaluationIssueGroup[];
+  available_source_types: string[];
+  sources: AgentEvaluationSourceHealth[];
   runtime_events: AgentRuntimeEventView[];
   assessments: AgentAssessmentView[];
 }

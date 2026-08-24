@@ -253,6 +253,31 @@ assert.match(
   /empty:hidden[\s\S]*<SourceAccessLabel source=\{source\} \/>[\s\S]*<SourceReadinessAlert/,
   "Source rows should reserve their optional metadata line for private access and readiness alerts",
 );
+assert.match(
+  sourceRowSource,
+  /health\.evaluation_status === "healthy" \|\| health\.evaluation_status === "no_data"/,
+  "healthy evaluation state should not add steady-state noise to Source rows",
+);
+assert.match(
+  sourcesPageSource,
+  /get\("\/agent-evaluations\/online-overview", \{ params: \{ days: 1 \} \}\)/,
+  "Source rows should consume one workspace evaluation overview instead of issuing one query per Source",
+);
+assert.match(
+  sourcesPageSource,
+  /navigate\(`\/evaluation\?\$\{params\.toString\(\)\}`\)/,
+  "Source evaluation actions should deep-link to the shared workspace route",
+);
+assert.doesNotMatch(
+  sourcesPageSource,
+  /<SourceOnlineEvaluationDialog/,
+  "SourcesPage should not maintain a second Online Evaluation presentation",
+);
+assert.match(
+  sourcesPageSource,
+  /role="menuitem"[\s\S]*Online evaluation[\s\S]*workspace Evaluation view/,
+  "healthy Sources should retain a contextual Evaluation deep link in the overflow menu",
+);
 assert.doesNotMatch(
   sourceRowSource,
   /Shared with workspace/,

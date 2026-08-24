@@ -2,6 +2,7 @@ import { NavLink } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import type { ComponentType } from "react";
 import {
+  Activity,
   Brain,
   CalendarClock,
   Database,
@@ -42,6 +43,7 @@ const navGroups: NavGroup[] = [
     items: [
       { to: "/memories", label: "Memories", icon: Brain },
       { to: "/review", label: "Review", icon: ShieldCheck, badgeKey: "pending-reviews" as const },
+      { to: "/evaluation", label: "Evaluation", icon: Activity },
       { to: "/entities", label: "Entities", icon: Database },
       { to: "/sources", label: "Sources", icon: Files },
       { to: "/schedules", label: "Scheduled Syncs", icon: CalendarClock },
