@@ -989,6 +989,125 @@ async def test_litellm_structured_client_repairs_invalid_json_backslash_escapes(
 
 
 @pytest.mark.asyncio
+async def test_litellm_structured_client_repairs_unescaped_quotes_without_changing_values(
+    monkeypatch,
+    caplog,
+):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(
+            '{"memories":[{"content":"Use "规则" for validation.",'
+            '"memory_type":"procedure","confidence":0.9,'
+            '"entity_refs":[],"evidence_quote":"Use "规则" for validation.",'
+            '"evidence_block_id":"EB-1"}],"artifact_summaries":[]}'
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    caplog.set_level(logging.WARNING, logger="memforge.llm.structured")
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+        )
+    )
+
+    response = await client.extract_projection_memories("prompt", max_tokens=8192)
+
+    assert response.memories[0].content == 'Use "规则" for validation.'
+    assert response.memories[0].evidence_quote == 'Use "规则" for validation.'
+    assert len(calls) == 1
+    [recovery_log] = [record for record in caplog.records if "structured_json_recovery" in record.message]
+    assert '"recovery_kind":"unescaped_json_string_quotes"' in recovery_log.message
+    assert '"repaired_pairs":2' in recovery_log.message
+    assert "规则" not in recovery_log.message
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_does_not_repair_missing_json_delimiter(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse('{"supported":true "reason":"still entailed"}')
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+        )
+    )
+
+    with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response"):
+        await client.validate_memory_support("prompt")
+
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_does_not_guess_ambiguous_terminal_quote(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse('{"supported":true,"reason":"Use "rule"}')
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+        )
+    )
+
+    with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response"):
+        await client.validate_memory_support("prompt")
+
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_rejects_quote_repair_when_schema_is_invalid(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return CompletionResponse(
+            '{"memories":[{"content":"Use "规则" for validation.",'
+            '"memory_type":"unsupported","confidence":0.9}],"artifact_summaries":[]}'
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+        )
+    )
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await client.extract_projection_memories("prompt", max_tokens=8192)
+
+    assert raised.value.error_code == "ValidationError"
+    assert ("memories.0.memory_type", "literal_error") in raised.value.validation_fields
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "content",
     [
