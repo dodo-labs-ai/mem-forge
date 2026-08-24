@@ -58,6 +58,23 @@ class _Scores:
         return SimpleNamespace(data=[self.score], meta=SimpleNamespace(cursor=None))
 
 
+class _Observations:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def get_many(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs["cursor"] is None:
+            return SimpleNamespace(
+                data=[SimpleNamespace(id="other-observation")],
+                meta=SimpleNamespace(cursor="next"),
+            )
+        return SimpleNamespace(
+            data=[SimpleNamespace(id="observation-1")],
+            meta=SimpleNamespace(cursor=None),
+        )
+
+
 def _adapter_and_task(*, labels=("pass", "needs_review", "fail"), score_value="pass"):
     subject = SimpleNamespace(
         kind="observation",
@@ -123,6 +140,18 @@ def test_completed_annotation_uses_cursor_and_exact_score_provenance() -> None:
     assert imported.label == "pass"
     assert imported.score_id == "score-1"
     assert api.scores_v3.cursors == [None, "next"]
+
+
+def test_annotation_subject_recovery_uses_v4_observations_api() -> None:
+    adapter, task, api = _adapter_and_task()
+    api.observations = _Observations()
+
+    assert adapter.subject_exists(task) is True
+
+    assert api.observations.calls == [
+        {"trace_id": task.trace_id, "limit": 1000, "cursor": None},
+        {"trace_id": task.trace_id, "limit": 1000, "cursor": "next"},
+    ]
 
 
 def test_completed_annotation_maps_readable_label_to_canonical_value() -> None:
