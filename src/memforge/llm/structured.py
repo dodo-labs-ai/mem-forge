@@ -13,7 +13,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field as dataclass_field
 from threading import Lock
 from time import perf_counter
-from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, get_args, get_origin
+from typing import Annotated, Any, Callable, Iterator, Literal, Mapping, Protocol, get_args, get_origin
 from weakref import WeakKeyDictionary
 
 import litellm
@@ -37,6 +37,10 @@ type StructuredLlmTerminalCategory = Literal[
 type NativeSchemaTransport = Literal[
     "auto",
     "json_schema_response_format",
+]
+type TransientEvidenceBlockId = Annotated[
+    str,
+    Field(min_length=1, pattern=r"^EB-\d{3,}$"),
 ]
 
 
@@ -219,10 +223,25 @@ class MemoryCandidate(StructuredResponseModel):
     valid_until: str | None = None
     extraction_context: str | None = None
     evidence_quote: str | None = None
-    evidence_block_id: str | None = None
+    evidence_block_id: TransientEvidenceBlockId
     evidence_anchor: Literal["unit", "glossary", "preamble", "outline", "document", "unknown"] = "unknown"
-    source_observation_id: str | None = None
     required_source_observation_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_model_owned_observation_authority(cls, value: object):
+        if isinstance(value, Mapping) and "source_observation_id" in value:
+            raise ValueError(
+                "textual candidates must select evidence_block_id; "
+                "source_observation_id is application-owned"
+            )
+        return value
+
+    @property
+    def source_observation_id(self) -> None:
+        """Text authority maps to an Observation only after Block resolution."""
+
+        return None
 
 
 class ArtifactSelectionSummary(StructuredResponseModel):
@@ -270,8 +289,8 @@ class MemoryExtractionResponse(StructuredResponseModel):
     artifact_summaries: list[ArtifactSelectionSummary] = Field(default_factory=list)
 
 
-class ProjectionMemoryCandidate(StructuredResponseModel):
-    """Model judgments for one projection candidate; anchors are derived locally."""
+class _ProjectionMemoryCandidateBase(StructuredResponseModel):
+    """Shared model judgments; evidence authority is selected by a concrete variant."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -281,9 +300,6 @@ class ProjectionMemoryCandidate(StructuredResponseModel):
     entity_refs: list[str] = Field(default_factory=list)
     valid_from: str | None = None
     valid_until: str | None = None
-    evidence_quote: str | None = None
-    evidence_block_id: str | None = None
-    source_observation_id: str | None = None
     required_source_observation_ids: list[str] = Field(default_factory=list)
 
     @property
@@ -293,6 +309,68 @@ class ProjectionMemoryCandidate(StructuredResponseModel):
     @property
     def evidence_anchor(self) -> Literal["unknown"]:
         return "unknown"
+
+
+class ProjectionTextMemoryCandidate(_ProjectionMemoryCandidateBase):
+    """One textual claim bound to an application-owned transient Evidence Block."""
+
+    evidence_quote: str | None = None
+    evidence_block_id: TransientEvidenceBlockId
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_model_owned_observation_authority(cls, value: object):
+        if isinstance(value, Mapping) and "source_observation_id" in value:
+            raise ValueError(
+                "textual candidates must select evidence_block_id; "
+                "source_observation_id is application-owned"
+            )
+        return value
+
+    @property
+    def source_observation_id(self) -> None:
+        """Text authority maps to an Observation only after Block resolution."""
+
+        return None
+
+
+class ProjectionArtifactMemoryCandidate(_ProjectionMemoryCandidateBase):
+    """One visual claim bound to the exact supplied binary Artifact Observation."""
+
+    source_observation_id: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_text_authority(cls, value: object):
+        if isinstance(value, Mapping):
+            forbidden = {
+                field
+                for field in ("evidence_block_id", "evidence_quote")
+                if field in value
+            }
+            if forbidden:
+                raise ValueError(
+                    "Artifact candidates cannot provide textual authority: "
+                    + ", ".join(sorted(forbidden))
+                )
+        return value
+
+    @property
+    def evidence_quote(self) -> None:
+        """Binary Artifact evidence has no textual quote."""
+
+        return None
+
+    @property
+    def evidence_block_id(self) -> None:
+        """Binary Artifact evidence is addressed by its supplied Observation."""
+
+        return None
+
+
+type ProjectionMemoryCandidate = (
+    ProjectionTextMemoryCandidate | ProjectionArtifactMemoryCandidate
+)
 
 
 class ProjectionMemoryExtractionResponse(StructuredResponseModel):

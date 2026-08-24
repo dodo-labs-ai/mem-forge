@@ -140,10 +140,10 @@ class EvidenceCatalog:
         )
 
     def resolve(self, memory: RawMemory) -> EvidenceResolution | None:
-        """Resolve one candidate; quote mismatch lowers precision, never admission."""
+        """Resolve one Block-authorized candidate; quote mismatch lowers precision."""
 
         block_id = (memory.evidence_block_id or "").strip()
-        block = self._by_id.get(block_id) if block_id else self._resolve_legacy_quote(memory)
+        block = self._by_id.get(block_id) if block_id else None
         if block is None:
             return None
         refined = _localize_quote_range(block.text, memory.evidence_quote)
@@ -167,36 +167,6 @@ class EvidenceCatalog:
             block=block,
             refinement=refinement,
         )
-
-    def _resolve_legacy_quote(self, memory: RawMemory) -> EvidenceBlock | None:
-        """Temporarily admit old quote-only responses only when ownership is unique."""
-
-        quote = memory.evidence_quote
-        if not quote or not quote.strip():
-            return None
-        known_observation_ids = {
-            block.observation_id
-            for block in self.blocks
-            if block.observation_id is not None
-        }
-        # A valid current-batch hint may disambiguate repeated legacy quotes.
-        # A stale or out-of-scope hint remains non-authoritative and is ignored.
-        observation_filter = (
-            memory.source_observation_id
-            if memory.source_observation_id in known_observation_ids
-            else None
-        )
-        candidates = tuple(
-            block
-            for block in self.blocks
-            if (
-                observation_filter is None
-                or block.observation_id == observation_filter
-            )
-            and localize_quote(block.text, quote) is not None
-        )
-        return candidates[0] if len(candidates) == 1 else None
-
 
 def _paragraph_ranges(text: str) -> tuple[tuple[int, int], ...]:
     ranges: list[tuple[int, int]] = []

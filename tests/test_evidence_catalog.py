@@ -110,8 +110,8 @@ def test_invalid_block_id_rejects_even_when_quote_appears_elsewhere() -> None:
     )
 
 
-def test_quote_only_compatibility_requires_one_unique_block() -> None:
-    catalog = EvidenceCatalog.from_text("Keep A7.\n\nKeep A7.")
+def test_quote_only_candidate_is_never_admitted() -> None:
+    catalog = EvidenceCatalog.from_text("Keep A7.")
 
     assert catalog.resolve(_memory(block_id=None, quote="Keep A7.")) is None
 
@@ -191,7 +191,7 @@ def test_block_fallback_telemetry_survives_derivation_replay_without_content() -
     }
 
 
-def test_quote_only_compatibility_rebinds_one_unique_block_despite_stale_hint() -> None:
+def test_quote_only_candidate_cannot_rebind_through_a_stale_observation_hint() -> None:
     catalog = EvidenceCatalog.from_spans(
         (
             EvidenceAuthoritySpan("First rule.", observation_id="obs-first"),
@@ -203,5 +203,4 @@ def test_quote_only_compatibility_rebinds_one_unique_block_despite_stale_hint() 
 
     resolved = catalog.resolve(memory)
 
-    assert resolved is not None
-    assert resolved.memory.source_observation_id == "obs-second"
+    assert resolved is None

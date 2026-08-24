@@ -2,16 +2,21 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from memforge.llm.structured import (
     ArtifactSelectionSummary,
+    LiteLlmStructuredClient,
     MemoryCandidate,
     MemoryExtractionResponse,
+    ProjectionMemoryExtractionResponse,
+    StructuredLlmConfig,
     StructuredLlmImage,
 )
 from memforge.models import ContentItem, NormalizedContent, RawContent
+from memforge.pipeline.evidence_catalog import EvidenceAuthoritySpan, EvidenceCatalog
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import plan_projection_extraction_batches
 from memforge.pipeline.source_projection_adapters import project_source_item
@@ -26,6 +31,27 @@ from memforge.source_artifacts import (
     SourceArtifactSummary,
     StoredSourceArtifact,
 )
+
+
+def _evidence_block_id(batch, observation_id: str) -> str:
+    catalog = EvidenceCatalog.from_spans(
+        tuple(
+            EvidenceAuthoritySpan(
+                text=content,
+                observation_id=candidate_observation_id,
+                source_start=source_start,
+            )
+            for candidate_observation_id, source_start, content in batch.primary_authority_spans
+            if content
+        )
+    )
+    matches = [
+        block.id
+        for block in catalog.blocks
+        if block.observation_id == observation_id
+    ]
+    assert len(matches) == 1
+    return matches[0]
 
 
 def _jira_projection(comment_count: int = 3):
@@ -443,6 +469,10 @@ async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context
                         entity_refs=[],
                         extraction_context="Reply 1: retain A7",
                         evidence_quote="Reply 1: retain A7",
+                        evidence_block_id=_evidence_block_id(
+                            batch,
+                            batch.primary_observation_ids[0],
+                        ),
                     ),
                     MemoryCandidate(
                         content="Context-only claim.",
@@ -451,6 +481,7 @@ async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context
                         entity_refs=[],
                         extraction_context="A7 processing context",
                         evidence_quote="A7 processing context",
+                        evidence_block_id="EB-999",
                     ),
                 ],
             )
@@ -484,8 +515,11 @@ async def test_projection_batch_preserves_one_long_canonical_excerpt() -> None:
                         content="Incumbent support remains until approval.",
                         memory_type="decision",
                         evidence_quote=quote,
+                        evidence_block_id=_evidence_block_id(
+                            batch,
+                            batch.primary_observation_ids[0],
+                        ),
                         extraction_context=batch.primary_markdown,
-                        source_observation_id=batch.primary_observation_ids[0],
                     )
                 ]
             )
@@ -511,26 +545,22 @@ async def test_projection_batch_extractor_accepts_only_explicit_visual_evidence(
             nonlocal observed_images
             del prompt
             observed_images = kwargs["images"]
-            return MemoryExtractionResponse(
-                memories=[
-                    MemoryCandidate(
-                        content="The screenshot shows a settled validation result.",
-                        memory_type="fact",
-                        evidence_quote="",
-                        source_observation_id=visual_observation_id,
-                    ),
-                    MemoryCandidate(
-                        content="An unbound visual claim must be rejected.",
-                        memory_type="fact",
-                        evidence_quote="",
-                    ),
-                ],
-                artifact_summaries=[
-                    ArtifactSelectionSummary(
-                        source_observation_id=visual_observation_id,
-                        summary="Validation result screen showing the settled outcome.",
-                    )
-                ],
+            return ProjectionMemoryExtractionResponse.model_validate(
+                {
+                    "memories": [
+                        {
+                            "content": "The screenshot shows a settled validation result.",
+                            "memory_type": "fact",
+                            "source_observation_id": visual_observation_id,
+                        }
+                    ],
+                    "artifact_summaries": [
+                        {
+                            "source_observation_id": visual_observation_id,
+                            "summary": "Validation result screen showing the settled outcome.",
+                        }
+                    ],
+                }
             )
 
     image = StructuredLlmImage(
@@ -562,6 +592,101 @@ async def test_projection_batch_extractor_accepts_only_explicit_visual_evidence(
 
 
 @pytest.mark.asyncio
+async def test_projection_batch_extractor_rejects_unsupplied_artifact_authority() -> None:
+    projection = _jira_projection(1)
+    batch = plan_projection_extraction_batches(projection)[0]
+    supplied_observation_id = batch.primary_observation_ids[-1]
+
+    class Client:
+        async def extract_projection_memories(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return ProjectionMemoryExtractionResponse.model_validate(
+                {
+                    "memories": [
+                        {
+                            "content": "An unsupplied image cannot support this claim.",
+                            "memory_type": "fact",
+                            "source_observation_id": "obs-not-supplied",
+                        }
+                    ]
+                }
+            )
+
+    result = await MemoryExtractor(
+        structured_llm_client=Client()
+    ).extract_projection_batch_memories(
+        batch,
+        source_type="jira",
+        images=(
+            StructuredLlmImage(
+                source_observation_id=supplied_observation_id,
+                media_type="image/png",
+                body=b"\x89PNG",
+            ),
+        ),
+    )
+
+    assert result.memories == []
+    assert result.metadata["invalid_evidence_block_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_projection_missing_block_exhaustion_returns_structured_error(
+    monkeypatch,
+) -> None:
+    projection = _jira_projection(1)
+    batch = plan_projection_extraction_batches(projection)[0]
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            '{"memories":[{"content":"A7 remains enabled.",'
+                            '"memory_type":"decision",'
+                            '"evidence_quote":"retain A7"}]}'
+                        )
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(
+        "memforge.llm.structured.litellm.acompletion",
+        fake_acompletion,
+    )
+    monkeypatch.setattr(
+        "memforge.llm.structured.litellm.supports_response_schema",
+        lambda **_kwargs: True,
+    )
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url="http://localhost:6655/anthropic",
+            api_key="local-key",
+            timeout_s=120.0,
+        )
+    )
+
+    result = await MemoryExtractor(
+        structured_llm_client=client
+    ).extract_projection_batch_memories(
+        batch,
+        source_type="jira",
+    )
+
+    assert len(calls) == 3
+    assert result.memories == []
+    assert result.error_type == "structured_llm_error"
+    assert result.metadata["safe_error_code"] == "ValidationError"
+    assert result.metadata["safe_validation_fields"]
+    assert "A7 remains enabled" not in str(result.metadata)
+
+
+@pytest.mark.asyncio
 async def test_projection_batch_extractor_keeps_memories_when_optional_summaries_are_missing_or_unknown() -> None:
     projection = _jira_projection(1)
     batch = plan_projection_extraction_batches(projection)[0]
@@ -588,16 +713,19 @@ async def test_projection_batch_extractor_keeps_memories_when_optional_summaries
                     )
                 ]
             )
-            return MemoryExtractionResponse(
-                memories=[
-                    MemoryCandidate(
-                        content="The screenshot shows a durable validation result.",
-                        memory_type="fact",
-                        evidence_quote="",
-                        source_observation_id=visual_observation_id,
-                    )
-                ],
-                artifact_summaries=summaries,
+            return ProjectionMemoryExtractionResponse.model_validate(
+                {
+                    "memories": [
+                        {
+                            "content": "The screenshot shows a durable validation result.",
+                            "memory_type": "fact",
+                            "source_observation_id": visual_observation_id,
+                        }
+                    ],
+                    "artifact_summaries": [
+                        summary.model_dump() for summary in summaries
+                    ],
+                }
             )
 
     missing = await MemoryExtractor(
@@ -641,7 +769,7 @@ async def test_projection_batch_extractor_discards_malformed_optional_summaries_
     class Client:
         async def extract_projection_memories(self, prompt: str, **kwargs):
             del prompt, kwargs
-            return MemoryExtractionResponse.model_validate(
+            return ProjectionMemoryExtractionResponse.model_validate(
                 {
                     "memories": [
                         {
@@ -650,7 +778,6 @@ async def test_projection_batch_extractor_discards_malformed_optional_summaries_
                                 "result."
                             ),
                             "memory_type": "fact",
-                            "evidence_quote": "",
                             "source_observation_id": visual_observation_id,
                         }
                     ],
@@ -703,7 +830,10 @@ async def test_projection_batch_extractor_discards_orphan_summaries_without_imag
                         content="The primary text states a durable rule.",
                         memory_type="fact",
                         evidence_quote=evidence_quote,
-                        source_observation_id=source_observation_id,
+                        evidence_block_id=_evidence_block_id(
+                            batch,
+                            source_observation_id,
+                        ),
                     )
                 ],
                 artifact_summaries=[
@@ -854,14 +984,20 @@ async def test_projection_batch_extractor_preserves_declared_required_context() 
                         content="A7 is retained under the issue context.",
                         memory_type="decision",
                         evidence_quote="Reply 1: retain A7",
-                        source_observation_id=batch.primary_observation_ids[0],
+                        evidence_block_id=_evidence_block_id(
+                            batch,
+                            batch.primary_observation_ids[0],
+                        ),
                         required_source_observation_ids=[required_id],
                     ),
                     MemoryCandidate(
                         content="An invented dependency must be rejected.",
                         memory_type="decision",
                         evidence_quote="Reply 1: retain A7",
-                        source_observation_id=batch.primary_observation_ids[0],
+                        evidence_block_id=_evidence_block_id(
+                            batch,
+                            batch.primary_observation_ids[0],
+                        ),
                         required_source_observation_ids=["obs-not-in-context"],
                     ),
                 ]
@@ -912,14 +1048,14 @@ async def test_projection_batch_rejects_context_that_belongs_only_to_another_pri
                         content="The first comment depends on non-adjacent context.",
                         memory_type="decision",
                         evidence_quote="Reply 0: retain A7",
-                        source_observation_id=first_primary_id,
+                        evidence_block_id=_evidence_block_id(batch, first_primary_id),
                         required_source_observation_ids=[context_for_other_primary_id],
                     ),
                     MemoryCandidate(
                         content="The second comment depends on its adjacent context.",
                         memory_type="decision",
                         evidence_quote="Reply 1: retain A7",
-                        source_observation_id=changed[1].id,
+                        evidence_block_id=_evidence_block_id(batch, changed[1].id),
                         required_source_observation_ids=[context_for_other_primary_id],
                     ),
                 ]
@@ -936,7 +1072,7 @@ async def test_projection_batch_rejects_context_that_belongs_only_to_another_pri
 
 
 @pytest.mark.asyncio
-async def test_projection_batch_extractor_uses_explicit_observation_for_duplicate_quote() -> None:
+async def test_projection_batch_extractor_uses_block_for_duplicate_quote() -> None:
     projection = _jira_projection(2)
     batches = plan_projection_extraction_batches(
         projection,
@@ -955,18 +1091,13 @@ async def test_projection_batch_extractor_uses_explicit_observation_for_duplicat
                         content="The second reply retains A7.",
                         memory_type="decision",
                         evidence_quote=duplicate_quote,
-                        source_observation_id=second_id,
+                        evidence_block_id=_evidence_block_id(comment_batch, second_id),
                     ),
                     MemoryCandidate(
                         content="An unanchored duplicate must be skipped.",
                         memory_type="decision",
                         evidence_quote=duplicate_quote,
-                    ),
-                    MemoryCandidate(
-                        content="A mismatched explicit anchor must be skipped.",
-                        memory_type="decision",
-                        evidence_quote="Reply 0: retain A7",
-                        source_observation_id=second_id,
+                        evidence_block_id="EB-999",
                     ),
                 ]
             )
@@ -996,7 +1127,7 @@ async def test_teams_batch_preserves_message_observation_anchor() -> None:
                         content="A7 remains enabled.",
                         memory_type="decision",
                         evidence_quote="keep A7",
-                        source_observation_id=target_id,
+                        evidence_block_id=_evidence_block_id(batch, target_id),
                     )
                 ]
             )
@@ -1051,7 +1182,7 @@ async def test_teams_projection_batch_keeps_language_authority_on_changed_primar
                         content="A7 保持启用。",
                         memory_type="decision",
                         evidence_quote="决定：A7 保持启用。",
-                        source_observation_id=target_id,
+                        evidence_block_id=_evidence_block_id(batch, target_id),
                     )
                 ]
             )
