@@ -203,7 +203,7 @@ The following observations are CONTEXT only. Use them to resolve references and 
 For a PRIMARY `binary_artifact` observation with separately supplied image
 evidence, inspect the image itself. A claim grounded in that image must set
 `source_observation_id` to that exact Artifact Observation, and must leave
-`evidence_quote` empty because binary evidence has no
+`evidence_block_id` and `evidence_quote` empty because binary evidence has no
 text quote. Do not infer image contents from the filename, upload event, parent
 text, or metadata. Do not emit a claim for an Artifact image that was not
 supplied in this request.

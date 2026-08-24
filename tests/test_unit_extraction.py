@@ -63,7 +63,7 @@ def _context() -> ExtractionContext:
 
 
 @pytest.mark.asyncio
-async def test_extract_unit_memories_requires_anchor_and_exact_unit_quote():
+async def test_extract_unit_memories_requires_block_and_exact_unit_quote():
     client = RecordingStructuredMemoryClient(
         MemoryExtractionResponse(
             memories=[
@@ -78,21 +78,14 @@ async def test_extract_unit_memories_requires_anchor_and_exact_unit_quote():
                     evidence_quote=(
                         "Tracking uses [UnifiedContextApi](../uca) for explicit API calls."
                     ),
+                    evidence_block_id="EB-002",
                     evidence_anchor="unit",
-                ),
-                MemoryCandidate(
-                    content="Tracking uses UnifiedContextApi for explicit API calls.",
-                    memory_type="fact",
-                    confidence=0.9,
-                    entity_refs=["UnifiedContextApi"],
-                    extraction_context="Tracking uses UnifiedContextApi for explicit API calls.",
-                    evidence_quote="Tracking uses UnifiedContextApi for explicit API calls.",
-                    evidence_anchor="glossary",
                 ),
                 MemoryCandidate(
                     content="An invented unit claim.",
                     memory_type="fact",
                     evidence_quote="This quote is absent from the owned unit.",
+                    evidence_block_id="EB-999",
                     evidence_anchor="unit",
                 ),
             ]
@@ -193,6 +186,7 @@ async def test_extract_unit_memories_preserves_long_claim_local_quote_without_tr
                     memory_type="decision",
                     extraction_context=context.unit.unit_markdown,
                     evidence_quote=quote,
+                    evidence_block_id="EB-003",
                     evidence_anchor="unit",
                 )
             ]

@@ -54,6 +54,150 @@ def _png_bytes(*, width: int = 1, height: int = 1) -> bytes:
     return output.getvalue()
 
 
+def test_text_memory_schema_requires_transient_evidence_block_authority() -> None:
+    with pytest.raises(ValidationError):
+        MemoryExtractionResponse.model_validate(
+            {
+                "memories": [
+                    {
+                        "content": "A durable claim.",
+                        "memory_type": "fact",
+                        "evidence_quote": "A quote without a Block address.",
+                    }
+                ]
+            }
+        )
+
+    response = MemoryExtractionResponse.model_validate(
+        {
+            "memories": [
+                {
+                    "content": "A durable claim.",
+                    "memory_type": "fact",
+                    "evidence_block_id": "EB-001",
+                }
+            ]
+        }
+    )
+    schema = MemoryExtractionResponse.model_json_schema()["$defs"][
+        "MemoryCandidate"
+    ]
+    assert "source_observation_id" not in schema["properties"]
+    assert "source_observation_id" not in response.memories[0].model_dump()
+    assert response.memories[0].source_observation_id is None
+
+    for forbidden_value in (None, "obs-arbitrary"):
+        with pytest.raises(ValidationError):
+            MemoryExtractionResponse.model_validate(
+                {
+                    "memories": [
+                        {
+                            "content": "A durable claim.",
+                            "memory_type": "fact",
+                            "evidence_block_id": "EB-001",
+                            "source_observation_id": forbidden_value,
+                        }
+                    ]
+                }
+            )
+
+
+def test_projection_memory_schema_rejects_missing_authority() -> None:
+    with pytest.raises(ValidationError):
+        ProjectionMemoryExtractionResponse.model_validate(
+            {
+                "memories": [
+                    {
+                        "content": "A durable textual claim.",
+                        "memory_type": "fact",
+                        "evidence_quote": "A quote without a Block address.",
+                    }
+                ]
+            }
+        )
+
+
+def test_projection_text_schema_exposes_only_block_authority() -> None:
+    text_response = ProjectionMemoryExtractionResponse.model_validate(
+        {
+            "memories": [
+                {
+                    "content": "A durable textual claim.",
+                    "memory_type": "fact",
+                    "evidence_block_id": "EB-001",
+                    "evidence_quote": "A durable textual claim.",
+                }
+            ]
+        }
+    )
+    text_schema = ProjectionMemoryExtractionResponse.model_json_schema()["$defs"][
+        "ProjectionTextMemoryCandidate"
+    ]
+    assert text_response.memories[0].evidence_block_id == "EB-001"
+    assert text_response.memories[0].source_observation_id is None
+    assert "source_observation_id" not in text_schema["properties"]
+    assert "source_observation_id" not in text_response.memories[0].model_dump()
+
+    for forbidden_value in (None, "obs-artifact-1"):
+        with pytest.raises(ValidationError):
+            ProjectionMemoryExtractionResponse.model_validate(
+                {
+                    "memories": [
+                        {
+                            "content": "Ambiguous evidence authority.",
+                            "memory_type": "fact",
+                            "evidence_block_id": "EB-001",
+                            "source_observation_id": forbidden_value,
+                        }
+                    ]
+                }
+            )
+
+
+def test_projection_artifact_schema_exposes_only_observation_authority() -> None:
+    artifact_response = ProjectionMemoryExtractionResponse.model_validate(
+        {
+            "memories": [
+                {
+                    "content": "The supplied diagram records the approved flow.",
+                    "memory_type": "decision",
+                    "source_observation_id": "obs-artifact-1",
+                }
+            ]
+        }
+    )
+    artifact_schema = ProjectionMemoryExtractionResponse.model_json_schema()[
+        "$defs"
+    ]["ProjectionArtifactMemoryCandidate"]
+    assert artifact_response.memories[0].evidence_block_id is None
+    assert artifact_response.memories[0].evidence_quote is None
+    assert artifact_response.memories[0].source_observation_id == "obs-artifact-1"
+    assert "evidence_block_id" not in artifact_schema["properties"]
+    assert "evidence_quote" not in artifact_schema["properties"]
+    assert "evidence_block_id" not in artifact_response.memories[0].model_dump()
+    assert "evidence_quote" not in artifact_response.memories[0].model_dump()
+
+    for forbidden_field, forbidden_value in (
+        ("evidence_block_id", None),
+        ("evidence_block_id", "EB-001"),
+        ("evidence_quote", None),
+        ("evidence_quote", "Invented text"),
+    ):
+        with pytest.raises(ValidationError):
+            ProjectionMemoryExtractionResponse.model_validate(
+                {
+                    "memories": [
+                        {
+                            "content": "Artifact evidence cannot carry text authority.",
+                            "memory_type": "fact",
+                            "source_observation_id": "obs-artifact-1",
+                            forbidden_field: forbidden_value,
+                        }
+                    ]
+                }
+            )
+
+
 class ChoiceMessage:
     def __init__(self, content: str | None) -> None:
         self.content = content
@@ -178,7 +322,10 @@ async def test_structured_llm_metrics_scope_isolates_concurrent_source_units(
     async def fake_acompletion(**kwargs):
         prompt = kwargs["messages"][0]["content"]
         await asyncio.sleep(0)
-        response = CompletionResponse('{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}')
+        response = CompletionResponse(
+            '{"memories":[{"content":"A durable fact.","memory_type":"fact",'
+            '"evidence_block_id":"EB-001"}]}'
+        )
         token_count = 11 if "source-a" in prompt else 23
         response.usage = {
             "prompt_tokens": token_count,
@@ -320,6 +467,7 @@ def test_memory_extraction_response_accepts_memory_list():
                     "valid_from": None,
                     "valid_until": None,
                     "extraction_context": "Service A uses PostgreSQL 16",
+                    "evidence_block_id": "EB-001",
                 }
             ]
         }
@@ -334,6 +482,7 @@ def test_memory_extraction_response_accepts_memory_list():
             valid_from=None,
             valid_until=None,
             extraction_context="Service A uses PostgreSQL 16",
+            evidence_block_id="EB-001",
         )
     ]
     assert response.artifact_summaries == []
@@ -439,7 +588,8 @@ async def test_litellm_structured_client_uses_response_schema_for_memory_extract
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         return CompletionResponse(
-            '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact","confidence":0.9}]}'
+            '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
+            '"confidence":0.9,"evidence_block_id":"EB-001"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -505,7 +655,7 @@ async def test_projection_extraction_schema_excludes_datastore_owned_anchor_fiel
         calls.append(kwargs)
         return CompletionResponse(
             '{"memories":[{"content":"A7 remains enabled.","memory_type":"decision",'
-            '"evidence_quote":"retain A7","source_observation_id":"obs-1",'
+            '"source_observation_id":"obs-1",'
             '"evidence_anchor":"source_artifact","extraction_context":"invented"}]}'
         )
 
@@ -529,14 +679,60 @@ async def test_projection_extraction_schema_excludes_datastore_owned_anchor_fiel
     )
 
     schema = calls[0]["response_format"].model_json_schema()
-    candidate_properties = schema["$defs"]["ProjectionMemoryCandidate"][
-        "properties"
-    ]
+    text_candidate = schema["$defs"]["ProjectionTextMemoryCandidate"]
+    artifact_candidate = schema["$defs"]["ProjectionArtifactMemoryCandidate"]
     assert calls[0]["response_format"] is ProjectionMemoryExtractionResponse
-    assert "evidence_anchor" not in candidate_properties
-    assert "extraction_context" not in candidate_properties
+    assert "evidence_block_id" in text_candidate["required"]
+    assert "source_observation_id" in artifact_candidate["required"]
+    assert "evidence_anchor" not in text_candidate["properties"]
+    assert "extraction_context" not in text_candidate["properties"]
+    assert "evidence_anchor" not in artifact_candidate["properties"]
+    assert "extraction_context" not in artifact_candidate["properties"]
     assert response.memories[0].evidence_anchor == "unknown"
     assert response.memories[0].extraction_context is None
+
+
+@pytest.mark.asyncio
+async def test_projection_missing_block_uses_bounded_schema_recovery(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) < 3:
+            return CompletionResponse(
+                '{"memories":[{"content":"A7 remains enabled.",'
+                '"memory_type":"decision","evidence_quote":"retain A7"}]}'
+            )
+        return CompletionResponse(
+            '{"memories":[{"content":"A7 remains enabled.",'
+            '"memory_type":"decision","evidence_block_id":"EB-001",'
+            '"evidence_quote":"retain A7"}]}'
+        )
+
+    monkeypatch.setattr(
+        "memforge.llm.structured.litellm.acompletion",
+        fake_acompletion,
+    )
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest",
+            base_url="http://localhost:6655/anthropic",
+            api_key="local-key",
+            timeout_s=120.0,
+        )
+    )
+
+    response = await client.extract_projection_memories(
+        "Select one Evidence Block for every textual claim.",
+        max_tokens=8192,
+    )
+
+    assert response.memories[0].evidence_block_id == "EB-001"
+    assert len(calls) == 3
+    assert calls[0]["response_format"] is ProjectionMemoryExtractionResponse
+    assert "response_format" not in calls[1]
+    assert "response_format" not in calls[2]
 
 
 @pytest.mark.asyncio
@@ -766,7 +962,8 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         return CompletionResponse(
-            '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact","confidence":0.9}]}'
+            '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
+            '"confidence":0.9,"evidence_block_id":"EB-001"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -810,7 +1007,8 @@ async def test_litellm_structured_client_supports_prompt_template_transport(
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         return CompletionResponse(
-            '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact","confidence":0.9}]}'
+            '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
+            '"confidence":0.9,"evidence_block_id":"EB-001"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -969,7 +1167,8 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
 async def test_litellm_structured_client_repairs_invalid_json_backslash_escapes(monkeypatch):
     async def fake_acompletion(**kwargs):
         return CompletionResponse(
-            r'{"memories":[{"content":"Use regex \s+ for whitespace.","memory_type":"fact","confidence":0.8}]}'
+            r'{"memories":[{"content":"Use regex \s+ for whitespace.","memory_type":"fact",'
+            r'"confidence":0.8,"evidence_block_id":"EB-001"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1001,7 +1200,7 @@ async def test_litellm_structured_client_repairs_unescaped_quotes_without_changi
             '{"memories":[{"content":"Use "规则" for validation.",'
             '"memory_type":"procedure","confidence":0.9,'
             '"entity_refs":[],"evidence_quote":"Use "规则" for validation.",'
-            '"evidence_block_id":"EB-1"}],"artifact_summaries":[]}'
+            '"evidence_block_id":"EB-001"}],"artifact_summaries":[]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1103,7 +1302,10 @@ async def test_litellm_structured_client_rejects_quote_repair_when_schema_is_inv
         await client.extract_projection_memories("prompt", max_tokens=8192)
 
     assert raised.value.error_code == "ValidationError"
-    assert ("memories.0.memory_type", "literal_error") in raised.value.validation_fields
+    assert any(
+        path.endswith(".memory_type") and error_type == "literal_error"
+        for path, error_type in raised.value.validation_fields
+    )
     assert len(calls) == 3
 
 
@@ -1184,7 +1386,7 @@ async def test_litellm_structured_client_reports_content_free_validation_fields(
         return CompletionResponse(
             '{"memories":[{"content":"secret source text",'
             '"memory_type":"unsupported","confidence":2.0,'
-            '"entity_refs":[]}]}'
+            '"entity_refs":[],"evidence_block_id":"EB-001"}]}'
         )
 
     monkeypatch.setattr(
@@ -1395,7 +1597,8 @@ async def test_litellm_structured_client_falls_back_once_to_json_text(monkeypatc
         if len(calls) == 1:
             raise first_error
         return CompletionResponse(
-            '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact","confidence":0.9}]}'
+            '{"memories":[{"content":"Service A uses PostgreSQL 16.","memory_type":"fact",'
+            '"confidence":0.9,"evidence_block_id":"EB-001"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1528,7 +1731,8 @@ async def test_litellm_structured_client_retries_invalid_json_fallback_once(monk
         if len(calls) < 3:
             return CompletionResponse("{}")
         return CompletionResponse(
-            '{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}'
+            '{"memories":[{"content":"A durable fact.","memory_type":"fact",'
+            '"evidence_block_id":"EB-001"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1668,7 +1872,10 @@ async def test_litellm_structured_client_shares_one_transport_retry_budget_acros
             raise RetryableFailure("temporary")
         if len(calls) == 2:
             return CompletionResponse("{}")
-        return CompletionResponse('{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}')
+        return CompletionResponse(
+            '{"memories":[{"content":"A durable fact.","memory_type":"fact",'
+            '"evidence_block_id":"EB-001"}]}'
+        )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     set_native_schema_support(monkeypatch, True)
@@ -1699,7 +1906,10 @@ async def test_litellm_structured_client_aggregates_available_usage_without_esti
     monkeypatch,
 ):
     telemetry: list[StructuredLlmCallTelemetry] = []
-    response = CompletionResponse('{"memories":[{"content":"A durable fact.","memory_type":"fact"}]}')
+    response = CompletionResponse(
+        '{"memories":[{"content":"A durable fact.","memory_type":"fact",'
+        '"evidence_block_id":"EB-001"}]}'
+    )
     response.usage = {
         "prompt_tokens": 11,
         "completion_tokens": 7,
