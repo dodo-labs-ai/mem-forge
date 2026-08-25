@@ -400,6 +400,7 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
     client = _RecordingClient({"jobs": []})
 
     lease = client.lease_local_agent_jobs(limit=3, lease_seconds=120, wait_seconds=25)
+    status = client.get_local_agent_status()
     heartbeat = client.heartbeat_local_agent_job("laj-1", attempt_count=2, lease_seconds=120)
     complete = client.complete_local_agent_job(
         "laj-1",
@@ -409,6 +410,7 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
     )
 
     assert lease == {"jobs": []}
+    assert status == {"jobs": []}
     assert heartbeat == {"jobs": []}
     assert complete == {"jobs": []}
     assert client.calls == [
@@ -416,6 +418,11 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
             "POST",
             "/api/cloud/local-agent/jobs/lease",
             {"limit": 3, "lease_seconds": 120, "wait_seconds": 25},
+        ),
+        (
+            "GET",
+            "/api/cloud/local-agent/status",
+            None,
         ),
         (
             "POST",

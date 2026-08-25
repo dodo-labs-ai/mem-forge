@@ -8,12 +8,26 @@ lifecycle reconciliation.
 ## Setup
 
 1. Install the host-side CLI with `pipx install memforge-ai`.
-2. Start the local daemon with `memforge adapter daemon run`.
+2. Run `memforge setup` to configure the active API target and install the local
+   daemon as a login user service.
 3. In the Sources UI, add a Local Markdown or GitHub Repository source.
 4. Choose the local folder or repository through the source-specific browser.
 5. Configure include and exclude patterns, then save the source.
 
-When developing MemForge from a checkout, use
+For a hosted target that is not already configured, pass its URL and provide the
+token when prompted:
+
+```bash
+memforge setup --api-url https://api.example.memforge
+```
+
+`memforge setup` registers a macOS LaunchAgent or Linux systemd user service,
+starts it, and waits for the server-observed heartbeat. The API token is stored
+in the operating-system keyring rather than in the launchd property list,
+systemd unit, or MemForge config file. No `sudo`, hand-written service file, or
+user cron entry is required.
+
+When developing MemForge from a checkout, keep using the foreground command
 `uv run memforge adapter daemon run` instead of the installed command.
 
 The daemon authenticates with the user's MemForge API key. Self-hosted OSS and
@@ -78,6 +92,23 @@ remain running and authenticated; no user crontab or daemon-side schedule is
 created.
 
 ## Operations
+
+Manage the installed user service through MemForge rather than calling
+`launchctl` or `systemctl` directly:
+
+```bash
+memforge daemon status
+memforge daemon restart
+memforge daemon logs --follow
+memforge daemon stop
+memforge daemon start
+memforge daemon uninstall
+```
+
+The foreground `memforge adapter daemon run` and one-shot
+`memforge adapter daemon once` commands remain available for development and
+diagnosis. Automatic service installation currently supports macOS launchd and
+Linux systemd.
 
 Rename, pause, rescope, force-resync, schedule, and delete sources in the UI.
 Connection paths and execution ownership remain attached to the saved source,

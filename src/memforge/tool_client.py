@@ -769,6 +769,10 @@ class ToolClient:
             {"limit": limit, "lease_seconds": lease_seconds, "wait_seconds": wait_seconds},
         )
 
+    def get_local_agent_status(self) -> dict[str, Any]:
+        """Return the authenticated user's server-observed daemon heartbeat."""
+        return self._host_json("GET", "/api/cloud/local-agent/status", None)
+
     def heartbeat_local_agent_job(
         self,
         job_id: str,
