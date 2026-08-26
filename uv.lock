@@ -1550,7 +1550,7 @@ wheels = [
 
 [[package]]
 name = "memforge-ai"
-version = "0.1.57"
+version = "0.1.58"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },

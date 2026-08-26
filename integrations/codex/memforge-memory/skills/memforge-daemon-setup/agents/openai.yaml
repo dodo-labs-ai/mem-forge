@@ -1,0 +1,4 @@
+interface:
+  display_name: "MemForge Daemon Setup"
+  short_description: "Install and verify the local MemForge daemon"
+  default_prompt: "Use $memforge-daemon-setup to install and verify my local MemForge daemon."
