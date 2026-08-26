@@ -85,6 +85,33 @@ class FailingLaunchctl(FakeLaunchctl):
         return super().__call__(args, **kwargs)
 
 
+class DelayedBootoutLaunchctl(FakeLaunchctl):
+    def __init__(self) -> None:
+        super().__init__()
+        self.loaded = True
+        self.bootout_pending = False
+        self.removal_checks = 0
+
+    def __call__(self, args, **kwargs) -> subprocess.CompletedProcess[str]:
+        command = list(args)
+        if command[:2] == ["launchctl", "bootout"]:
+            self.commands.append(command)
+            self.bootout_pending = True
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[:2] == ["launchctl", "print"] and self.bootout_pending:
+            self.commands.append(command)
+            self.removal_checks += 1
+            if self.removal_checks >= 2:
+                self.loaded = False
+                self.bootout_pending = False
+                return subprocess.CompletedProcess(command, 113, "", "service not found")
+            return subprocess.CompletedProcess(command, 0, "state = exited\n", "")
+        if command[:2] == ["launchctl", "bootstrap"] and self.loaded:
+            self.commands.append(command)
+            raise subprocess.CalledProcessError(5, command, stderr="Bootstrap failed: 5: Input/output error")
+        return super().__call__(args, **kwargs)
+
+
 class FakeSystemctl:
     def __init__(self) -> None:
         self.active = False
@@ -321,6 +348,19 @@ def test_launchd_adapter_restores_previous_service_when_replacement_fails(tmp_pa
         )
 
     assert adapter.unit_path.read_bytes() == b"previous plist"
+    assert runner.loaded is True
+
+
+def test_launchd_adapter_waits_until_bootout_removes_the_previous_label(tmp_path):
+    runner = DelayedBootoutLaunchctl()
+    paths = DaemonServicePaths.for_home(tmp_path)
+    adapter = LaunchdUserService(home=tmp_path, uid=501, paths=paths, runner=runner)
+    adapter.unit_path.parent.mkdir(parents=True)
+    adapter.unit_path.write_bytes(b"previous plist")
+
+    adapter.apply(DaemonLaunchSpec.for_executable("/Users/test/.local/bin/memforge"))
+
+    assert runner.removal_checks == 2
     assert runner.loaded is True
 
 

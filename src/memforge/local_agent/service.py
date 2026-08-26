@@ -11,6 +11,7 @@ import plistlib
 import re
 import subprocess
 import sys
+import time
 from typing import Any, Callable, Protocol, Sequence
 
 
@@ -25,6 +26,8 @@ DEFAULT_RUNTIME_PATHS = (
     "/usr/sbin",
     "/sbin",
 )
+LAUNCHD_UNLOAD_TIMEOUT_SECONDS = 6.0
+LAUNCHD_STATE_POLL_SECONDS = 0.05
 
 
 class DaemonServiceError(RuntimeError):
@@ -407,6 +410,16 @@ class LaunchdUserService(_CommandAdapter):
     def _loaded(self) -> bool:
         return self._run(["launchctl", "print", self.service_target]).returncode == 0
 
+    def _bootout(self) -> None:
+        self._run(["launchctl", "bootout", self.service_target], check=True)
+        deadline = time.monotonic() + LAUNCHD_UNLOAD_TIMEOUT_SECONDS
+        while self._loaded():
+            if time.monotonic() >= deadline:
+                raise DaemonServiceError(
+                    f"Timed out waiting for launchd to unload {LAUNCHD_LABEL}."
+                )
+            time.sleep(LAUNCHD_STATE_POLL_SECONDS)
+
     def snapshot(self) -> LaunchdServiceSnapshot:
         return LaunchdServiceSnapshot(
             unit=self.unit_path.read_bytes() if self.unit_path.exists() else None,
@@ -430,7 +443,7 @@ class LaunchdUserService(_CommandAdapter):
             "StandardErrorPath": str(self.paths.stderr_log),
         }
         if self._loaded():
-            self._run(["launchctl", "bootout", self.service_target], check=True)
+            self._bootout()
         _atomic_write(self.unit_path, plistlib.dumps(payload, fmt=plistlib.FMT_XML))
         self._run(["launchctl", "bootstrap", self.domain, str(self.unit_path)], check=True)
 
@@ -438,7 +451,7 @@ class LaunchdUserService(_CommandAdapter):
         if snapshot.loaded and snapshot.unit is None:
             raise DaemonServiceError("Cannot restore the loaded LaunchAgent because its previous plist is unavailable.")
         if self._loaded():
-            self._run(["launchctl", "bootout", self.service_target], check=True)
+            self._bootout()
         self.unit_path.unlink(missing_ok=True)
         if snapshot.unit is not None:
             _atomic_write(self.unit_path, snapshot.unit)
@@ -448,7 +461,7 @@ class LaunchdUserService(_CommandAdapter):
 
     def uninstall(self) -> None:
         if self._loaded():
-            self._run(["launchctl", "bootout", self.service_target], check=True)
+            self._bootout()
         self.unit_path.unlink(missing_ok=True)
 
     def start(self) -> None:
@@ -461,7 +474,7 @@ class LaunchdUserService(_CommandAdapter):
 
     def stop(self) -> None:
         if self._loaded():
-            self._run(["launchctl", "bootout", self.service_target], check=True)
+            self._bootout()
 
     def restart(self) -> None:
         if not self.unit_path.exists():
