@@ -82,6 +82,7 @@ def test_mcp_resolves_an_ordinary_directory_binding_when_selector_is_omitted(
         "MEMFORGE_API_URL",
         "https://cloud.example.hana.ondemand.com",
     )
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_BINDINGS_FILE", str(bindings))
     monkeypatch.setattr(proxy, "_http_json", fake_http_json)
 
@@ -130,6 +131,7 @@ def test_explicit_workspace_overrides_local_directory_binding(
         "MEMFORGE_API_URL",
         "https://cloud.example.hana.ondemand.com",
     )
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_BINDINGS_FILE", str(bindings))
     monkeypatch.setattr(proxy, "_http_json", fake_http_json)
 
@@ -175,6 +177,7 @@ def test_hook_default_is_not_an_interactive_tool_fallback(
         "MEMFORGE_API_URL",
         "https://cloud.example.hana.ondemand.com",
     )
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_BINDINGS_FILE", str(bindings))
     monkeypatch.setattr(proxy, "_http_json", fake_http_json)
 
