@@ -32,6 +32,7 @@ from rich.table import Table
 
 from memforge.api_target import Edition, MemForgeTarget, build_target
 from memforge.auth import browser_session
+from memforge.capability_discovery import discover_target
 from memforge.config import DEFAULT_SEARCH_TOP_K, AppConfig, load_config
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSION_LIST,
@@ -161,7 +162,6 @@ def _read_cli_config() -> dict[str, Any]:
 
 def _write_cli_config(data: dict[str, Any]) -> None:
     path = _cli_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     targets = data.get("targets") if isinstance(data.get("targets"), dict) else {}
     lines = [f"active = {_toml_string(str(data.get('active') or ''))}", ""]
     for name, target in sorted(targets.items()):
@@ -169,11 +169,24 @@ def _write_cli_config(data: dict[str, Any]) -> None:
             continue
         lines.append(f"[targets.{_toml_key(str(name))}]")
         lines.append(f"api_url = {_toml_string(str(target.get('api_url') or ''))}")
+        if target.get("edition"):
+            lines.append(f"edition = {_toml_string(str(target['edition']))}")
         if target.get("token_env"):
             lines.append(f"token_env = {_toml_string(str(target['token_env']))}")
         lines.append("")
-    path.write_text("\n".join(lines), encoding="utf-8")
-    path.chmod(0o600)
+    _write_cli_config_bytes(path, "\n".join(lines).encode("utf-8"))
+
+
+def _write_cli_config_bytes(path: Path, payload: bytes) -> None:
+    """Atomically replace the private CLI config, including exact rollback snapshots."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(payload)
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _toml_string(value: str) -> str:
@@ -184,6 +197,20 @@ def _toml_key(value: str) -> str:
     return json.dumps(value)
 
 
+def _daemon_keyring_api_token(api_url: str) -> str | None:
+    """Reuse the daemon credential for ordinary CLI calls to the exact same target."""
+    from memforge.local_agent.service import DaemonCredentialStore, DaemonServiceError, DaemonServicePaths
+
+    store = DaemonCredentialStore(DaemonServicePaths.for_home(Path.home()).config)
+    try:
+        environment = store.environment()
+    except DaemonServiceError:
+        return None
+    if environment.get("MEMFORGE_API_URL", "").rstrip("/") != api_url.rstrip("/"):
+        return None
+    return environment.get("MEMFORGE_API_TOKEN")
+
+
 def _resolve_api_target(
     _config: AppConfig,
 ) -> _ResolvedCliTarget:
@@ -191,10 +218,11 @@ def _resolve_api_target(
     if any(os.getenv(name, "").strip() for name in target_env_names):
         target = _build_cli_target(
             api_url=os.getenv("MEMFORGE_API_URL"),
+            edition=os.getenv("MEMFORGE_EDITION"),
         )
         return _ResolvedCliTarget(
             target=target,
-            api_token=os.getenv("MEMFORGE_API_TOKEN"),
+            api_token=os.getenv("MEMFORGE_API_TOKEN") or _daemon_keyring_api_token(target.origin),
             active_target="",
             token_env="MEMFORGE_API_TOKEN",
         )
@@ -206,11 +234,12 @@ def _resolve_api_target(
     if isinstance(profile, dict):
         target = _build_cli_target(
             api_url=profile.get("api_url"),
+            edition=profile.get("edition"),
         )
         token_env = str(profile.get("token_env") or "")
         return _ResolvedCliTarget(
             target=target,
-            api_token=os.getenv(token_env) if token_env else None,
+            api_token=(os.getenv(token_env) if token_env else None) or _daemon_keyring_api_token(target.origin),
             active_target=active,
             token_env=token_env,
         )
@@ -226,8 +255,17 @@ def _resolve_api_target(
 def _build_cli_target(
     *,
     api_url: object,
+    edition: object | None = None,
 ) -> MemForgeTarget:
-    return build_target(origin=str(api_url) if api_url is not None else None)
+    origin = str(api_url) if api_url is not None else None
+    if origin is None:
+        return build_target(origin=None)
+    if edition is not None and str(edition).strip():
+        return build_target(origin=origin, edition=str(edition).strip())
+    try:
+        return discover_target(origin)
+    except ValueError as exc:
+        raise click.ClickException(f"Could not discover MemForge capabilities: {exc}") from exc
 
 
 def _tool_client(ctx) -> ToolClient:
@@ -1239,27 +1277,34 @@ def target_list(ctx):
 @click.pass_context
 def target_add(ctx, name: str, api_url: str, token_env: str):
     """Add or update an API target and make it active."""
+    payload = _set_cli_target(
+        name=name,
+        target=_build_cli_target(api_url=api_url),
+        token_env=token_env,
+    )
+    _emit_tool_payload(ctx, payload)
+
+
+def _set_cli_target(*, name: str, target: MemForgeTarget, token_env: str) -> dict[str, Any]:
+    """Persist one active CLI target for explicit and guided setup flows."""
     name = name.strip()
     if not name:
         raise click.ClickException("Target name is required.")
-    resolved = _build_cli_target(api_url=api_url)
     data = _read_cli_config()
     targets = data.setdefault("targets", {})
     targets[name] = {
-        "api_url": resolved.origin,
+        "api_url": target.origin,
+        "edition": target.edition.value,
         "token_env": token_env.strip(),
     }
     data["active"] = name
     _write_cli_config(data)
-    _emit_tool_payload(
-        ctx,
-        {
-            "ok": True,
-            "active": name,
-            "edition": resolved.edition.value,
-            "api_url": resolved.origin,
-        },
-    )
+    return {
+        "ok": True,
+        "active": name,
+        "edition": target.edition.value,
+        "api_url": target.origin,
+    }
 
 
 @target.command("use")
@@ -1281,6 +1326,367 @@ def target_use(ctx, name: str):
 def target_check(ctx):
     """Check the active API target health."""
     payload = _tool_client(ctx).health()
+    _emit_tool_payload(ctx, payload)
+
+
+# ---------------------------------------------------------------------------
+# daemon service and guided setup
+# ---------------------------------------------------------------------------
+
+
+def _daemon_service_manager():
+    from memforge.local_agent.service import DaemonServiceManager
+
+    return DaemonServiceManager.current()
+
+
+def _current_cli_executable() -> str:
+    invoked = Path(sys.argv[0]).expanduser()
+    if invoked.is_absolute() and invoked.exists() and os.access(invoked, os.X_OK):
+        return str(invoked)
+    discovered = shutil.which(sys.argv[0]) or shutil.which("memforge")
+    if discovered:
+        return discovered
+    raise click.ClickException("Could not locate the installed `memforge` executable.")
+
+
+def _daemon_service_action(action: str) -> dict[str, Any]:
+    from memforge.local_agent.service import DaemonServiceError
+
+    manager = _daemon_service_manager()
+    try:
+        return getattr(manager, action)()
+    except DaemonServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _require_safe_daemon_service_install(manager) -> None:
+    from memforge.local_agent.service import DaemonServiceError
+
+    try:
+        native_status = manager.status()
+    except DaemonServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    runtime_status = _local_agent_daemon_status(_local_agent_state_store().load())
+    if runtime_status["status"] == "running" and not native_status.get("loaded"):
+        raise click.ClickException(
+            "A foreground or unmanaged MemForge daemon is already running. Stop it before installing the user service."
+        )
+
+
+@cli.group("daemon")
+def daemon_service():
+    """Install and manage the MemForge local daemon user service."""
+
+
+@daemon_service.command("install")
+@click.pass_context
+def daemon_service_install(ctx):
+    """Install and start the daemon as a login user service."""
+    from memforge.local_agent.service import DaemonServiceError
+
+    resolved = _resolve_api_target(ctx.obj["config"])
+    manager = _daemon_service_manager()
+    _require_safe_daemon_service_install(manager)
+    api_token = resolved.api_token
+    if resolved.target.authentication_required and not api_token:
+        token_name = resolved.token_env or "MEMFORGE_API_TOKEN"
+        raise click.ClickException(f"Set {token_name} before installing the daemon service.")
+    try:
+        payload = manager.install(
+            executable=_current_cli_executable(),
+            api_url=resolved.target.origin,
+            api_token=api_token,
+            edition=resolved.target.edition.value,
+        )
+    except DaemonServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _emit_tool_payload(ctx, payload)
+
+
+@daemon_service.command("status")
+@click.option("--verbose", is_flag=True, help="Include the raw local daemon state file.")
+@click.pass_context
+def daemon_service_status(ctx, verbose: bool):
+    """Show native, local runtime, and server-observed connection status."""
+    _emit_tool_payload(ctx, _daemon_health_payload(ctx, verbose=verbose))
+
+
+def _daemon_health_payload(ctx, *, verbose: bool) -> dict[str, Any]:
+    from memforge.local_agent.service import DaemonServiceError
+
+    manager = _daemon_service_manager()
+    try:
+        service = manager.status()
+    except DaemonServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    runtime = _local_agent_status_payload(ctx, verbose=verbose)
+    try:
+        environment = manager.environment()
+        target = _build_cli_target(
+            api_url=environment["MEMFORGE_API_URL"],
+            edition=environment.get("MEMFORGE_EDITION"),
+        )
+        connection = ToolClient(
+            target=target,
+            api_token=environment.get("MEMFORGE_API_TOKEN"),
+        ).get_local_agent_status()
+    except (DaemonServiceError, click.ClickException) as exc:
+        connection = {
+            "status": "unconfigured",
+            "error": str(exc),
+        }
+    healthy = (
+        service.get("running") is True
+        and runtime.get("status") == "running"
+        and connection.get("status") == "online"
+    )
+    return {
+        "status": "healthy" if healthy else "unhealthy",
+        "service": service,
+        "runtime": runtime,
+        "connection": connection,
+    }
+
+
+@daemon_service.command("check")
+@click.pass_context
+def daemon_service_check(ctx):
+    """Exit nonzero unless the native service is running and connected to MemForge."""
+    payload = _daemon_health_payload(ctx, verbose=False)
+    if payload["status"] != "healthy":
+        payload["error"] = "MemForge daemon health check failed."
+    _emit_tool_payload(ctx, payload)
+
+
+@daemon_service.command("start")
+@click.pass_context
+def daemon_service_start(ctx):
+    """Start the installed daemon user service."""
+    _emit_tool_payload(ctx, _daemon_service_action("start"))
+
+
+@daemon_service.command("stop")
+@click.pass_context
+def daemon_service_stop(ctx):
+    """Stop the installed daemon user service until the next start or login."""
+    _emit_tool_payload(ctx, _daemon_service_action("stop"))
+
+
+@daemon_service.command("restart")
+@click.pass_context
+def daemon_service_restart(ctx):
+    """Restart the installed daemon user service."""
+    _emit_tool_payload(ctx, _daemon_service_action("restart"))
+
+
+@daemon_service.command("uninstall")
+@click.option("--yes", is_flag=True, help="Remove the service without prompting.")
+@click.pass_context
+def daemon_service_uninstall(ctx, yes: bool):
+    """Stop the daemon and remove its user-service configuration and credential."""
+    if not yes and not click.confirm("Uninstall the MemForge daemon service?", default=False):
+        _emit_tool_payload(ctx, {"ok": True, "cancelled": True})
+        return
+    _emit_tool_payload(ctx, _daemon_service_action("uninstall"))
+
+
+@daemon_service.command("logs")
+@click.option("--lines", default=100, show_default=True, type=click.IntRange(min=1))
+@click.option("--follow", "follow_logs", is_flag=True, help="Keep streaming new daemon log entries.")
+def daemon_service_logs(lines: int, follow_logs: bool):
+    """Show native daemon-service logs."""
+    from memforge.local_agent.service import DaemonServiceError
+
+    try:
+        exit_code = _daemon_service_manager().logs(lines=lines, follow=follow_logs)
+    except DaemonServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    raise click.exceptions.Exit(exit_code)
+
+
+@daemon_service.command("_run", hidden=True)
+@click.pass_context
+def daemon_service_run(ctx):
+    """Run from the native user-service adapter with its stored credential."""
+    from memforge.local_agent.service import DaemonServiceError
+
+    try:
+        environment = _daemon_service_manager().environment()
+    except DaemonServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    os.environ.update(environment)
+    if "MEMFORGE_API_TOKEN" not in environment:
+        os.environ.pop("MEMFORGE_API_TOKEN", None)
+    _run_local_agent_daemon(ctx, browser=None, poll_interval_seconds=10, cloud_job_wait_seconds=25)
+
+
+def _status_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _wait_for_local_agent_online(
+    client: ToolClient,
+    *,
+    after_last_seen_at: str | None,
+    timeout_seconds: float = 35.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    baseline = _status_timestamp(after_last_seen_at)
+    latest: dict[str, Any] = {"status": "offline"}
+    while True:
+        latest = client.get_local_agent_status()
+        observed = _status_timestamp(latest.get("last_seen_at"))
+        fresh = observed is not None and (baseline is None or observed > baseline)
+        if latest.get("status") == "online" and fresh:
+            return {**latest, "fresh": True}
+        if latest.get("error"):
+            return latest
+        if time.monotonic() >= deadline:
+            return {**latest, "fresh": False}
+        time.sleep(0.5)
+
+
+@cli.command("setup")
+@click.option("--api-url", default=None, help="MemForge API URL. Uses the active target or prompts when absent.")
+@click.option("--target-name", default=None, help="Name used when saving a newly configured target.")
+@click.option(
+    "--token-env", default="MEMFORGE_API_TOKEN", show_default=True, help="Environment variable holding the token."
+)
+@click.pass_context
+def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: str):
+    """Configure a target and install the local daemon user service."""
+    from memforge.api_target import Edition
+    from memforge.local_agent.service import DaemonServiceError
+
+    cli_config_path = _cli_config_path()
+    cli_config_snapshot = cli_config_path.read_bytes() if cli_config_path.exists() else None
+    cli_config = _read_cli_config()
+    active_name = str(cli_config.get("active") or "")
+    targets = cli_config.get("targets") if isinstance(cli_config.get("targets"), dict) else {}
+    has_configured_target = bool(os.getenv("MEMFORGE_API_URL", "").strip()) or active_name in targets
+    candidate_url = api_url
+    if candidate_url is None and not has_configured_target:
+        candidate_url = click.prompt(
+            "MemForge API URL",
+            default="http://127.0.0.1:8765",
+            show_default=True,
+        )
+    if candidate_url:
+        target_value = _build_cli_target(api_url=candidate_url)
+        candidate_name = (target_name or ("cloud" if target_value.edition is Edition.CLOUD else "local")).strip()
+        if not candidate_name:
+            raise click.ClickException("Target name is required.")
+        resolved = _ResolvedCliTarget(
+            target=target_value,
+            api_token=(os.getenv(token_env) if token_env else None) or _daemon_keyring_api_token(target_value.origin),
+            active_target=candidate_name,
+            token_env=token_env.strip(),
+        )
+    else:
+        resolved = _resolve_api_target(ctx.obj["config"])
+    manager = _daemon_service_manager()
+    _require_safe_daemon_service_install(manager)
+    api_token = resolved.api_token
+    if resolved.target.authentication_required and not api_token:
+        api_token = click.prompt("MemForge API token", hide_input=True, confirmation_prompt=True)
+
+    client = ToolClient(target=resolved.target, api_token=api_token)
+    health = client.health()
+    if health.get("error"):
+        _emit_tool_payload(ctx, health)
+        return
+    try:
+        replacement = manager.replace(
+            executable=_current_cli_executable(),
+            api_url=resolved.target.origin,
+            api_token=api_token,
+            edition=resolved.target.edition.value,
+        )
+    except DaemonServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    baseline_status = client.get_local_agent_status()
+    if baseline_status.get("error"):
+        try:
+            replacement.rollback()
+        except DaemonServiceError as rollback_error:
+            raise click.ClickException(
+                f"Daemon status baseline failed and the previous service could not be restored: {rollback_error}"
+            ) from rollback_error
+        _emit_tool_payload(ctx, baseline_status)
+        return
+
+    daemon_status = _wait_for_local_agent_online(
+        client,
+        after_last_seen_at=baseline_status.get("last_seen_at"),
+    )
+    if daemon_status.get("status") != "online" or daemon_status.get("fresh") is not True:
+        try:
+            replacement.rollback()
+        except DaemonServiceError as rollback_error:
+            raise click.ClickException(
+                "Daemon heartbeat verification failed and the previous service could not be restored: "
+                f"{rollback_error}"
+            ) from rollback_error
+        payload = dict(daemon_status)
+        payload["error"] = "Daemon service did not produce a fresh server heartbeat."
+        payload["recommendation"] = "Run `memforge daemon logs` and retry setup."
+        _emit_tool_payload(ctx, payload)
+        return
+    try:
+        _set_cli_target(
+            name=resolved.active_target or ("cloud" if resolved.target.edition is Edition.CLOUD else "local"),
+            target=resolved.target,
+            token_env=resolved.token_env or token_env,
+        )
+    except Exception as config_error:
+        try:
+            replacement.rollback()
+        except DaemonServiceError as rollback_error:
+            raise click.ClickException(
+                f"Could not save the CLI target ({config_error}); service rollback also failed: {rollback_error}"
+            ) from config_error
+        raise click.ClickException(f"Could not save the CLI target: {config_error}") from config_error
+    try:
+        replacement.commit()
+    except DaemonServiceError as commit_error:
+        recovery_errors: list[str] = []
+        try:
+            if cli_config_snapshot is not None:
+                _write_cli_config_bytes(cli_config_path, cli_config_snapshot)
+            else:
+                cli_config_path.unlink(missing_ok=True)
+        except Exception as config_restore_error:
+            recovery_errors.append(f"CLI target restore failed: {config_restore_error}")
+        try:
+            replacement.rollback()
+        except DaemonServiceError as service_restore_error:
+            recovery_errors.append(f"service rollback failed: {service_restore_error}")
+        detail = f"Could not commit daemon setup: {commit_error}"
+        if recovery_errors:
+            detail += "; " + "; ".join(recovery_errors)
+        raise click.ClickException(detail) from commit_error
+    payload: dict[str, Any] = {
+        "ok": True,
+        "target": {
+            "edition": resolved.target.edition.value,
+            "api_url": resolved.target.origin,
+        },
+        "service": manager.status(),
+    }
+    payload["daemon"] = daemon_status
     _emit_tool_payload(ctx, payload)
 
 
@@ -1892,6 +2298,11 @@ def adapter_daemon():
 @click.pass_context
 def adapter_daemon_status(ctx, verbose: bool):
     """Show local agent daemon state."""
+    _emit_tool_payload(ctx, _local_agent_status_payload(ctx, verbose=verbose))
+
+
+def _local_agent_status_payload(ctx, *, verbose: bool) -> dict[str, Any]:
+    """Build the process-level daemon status shared by legacy and service CLI surfaces."""
     state = _local_agent_state_store().load()
     state_tasks = state.get("tasks") if isinstance(state.get("tasks"), dict) else {}
     daemon_status = _local_agent_daemon_status(state)
@@ -1914,10 +2325,7 @@ def adapter_daemon_status(ctx, verbose: bool):
         payload["recommendations"] = recommendations
     if verbose:
         payload["state"] = state
-    _emit_tool_payload(
-        ctx,
-        payload,
-    )
+    return payload
 
 
 def _local_agent_daemon_status(state: dict[str, Any]) -> dict[str, Any]:
@@ -2091,6 +2499,22 @@ def adapter_daemon_run(
     cloud_job_wait_seconds: int,
 ):
     """Run the local agent daemon until interrupted."""
+    _run_local_agent_daemon(
+        ctx,
+        browser=browser,
+        poll_interval_seconds=poll_interval_seconds,
+        cloud_job_wait_seconds=cloud_job_wait_seconds,
+    )
+
+
+def _run_local_agent_daemon(
+    ctx,
+    *,
+    browser: str | None,
+    poll_interval_seconds: int,
+    cloud_job_wait_seconds: int,
+) -> None:
+    """Own the single daemon process loop for foreground and native-service entrypoints."""
     daemon_lock = _acquire_local_agent_daemon_lock()
     if daemon_lock is None:
         _emit_tool_payload(

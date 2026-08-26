@@ -76,6 +76,11 @@ class ToolClient:
     def _host_url(self, path: str) -> str:
         if not path.startswith("/api/"):
             raise ValueError("host_path_must_start_with_api")
+        return self._origin_url(path)
+
+    def _origin_url(self, path: str) -> str:
+        if not path.startswith("/") or path.startswith("//"):
+            raise ValueError("origin_path_must_be_absolute")
         return f"{self.target.origin}{path}"
 
     def search(
@@ -769,6 +774,10 @@ class ToolClient:
             {"limit": limit, "lease_seconds": lease_seconds, "wait_seconds": wait_seconds},
         )
 
+    def get_local_agent_status(self) -> dict[str, Any]:
+        """Return the authenticated user's server-observed daemon heartbeat."""
+        return self._host_json("GET", "/api/cloud/local-agent/status", None)
+
     def heartbeat_local_agent_job(
         self,
         job_id: str,
@@ -835,7 +844,7 @@ class ToolClient:
         return self._resource_json("POST", "/auth/jira-session/expire", {"base_url": base_url, "error": error})
 
     def health(self) -> dict[str, Any]:
-        return self._resource_json("GET", "/health", None)
+        return self._http_json("GET", self._origin_url(self.target.health_path), None)
 
     def get_resource(
         self,

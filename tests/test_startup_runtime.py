@@ -349,6 +349,17 @@ def test_admin_app_lifespan_owns_database_and_sync_service(tmp_path):
         assert app.state.db._db is not None
         assert app.state.sync_service is not None
         assert client.get("/api/v1/health").status_code == 200
+        capabilities = client.get("/.well-known/memforge")
+        assert capabilities.status_code == 200
+        assert capabilities.json() == {
+            "protocol": "memforge",
+            "protocol_version": 1,
+            "edition": "oss",
+            "api_base": "/api/v1",
+            "health_path": "/api/v1/health",
+            "authentication": {"required": False, "scheme": "none"},
+        }
+        assert capabilities.headers["x-content-type-options"] == "nosniff"
 
     assert app.state.db._db is None
 
