@@ -1519,7 +1519,7 @@ def _wait_for_local_agent_online(
     client: ToolClient,
     *,
     after_last_seen_at: str | None,
-    timeout_seconds: float = 20.0,
+    timeout_seconds: float = 35.0,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     baseline = _status_timestamp(after_last_seen_at)
@@ -1586,10 +1586,6 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
     if health.get("error"):
         _emit_tool_payload(ctx, health)
         return
-    baseline_status = client.get_local_agent_status()
-    if baseline_status.get("error"):
-        _emit_tool_payload(ctx, baseline_status)
-        return
     try:
         replacement = manager.replace(
             executable=_current_cli_executable(),
@@ -1598,6 +1594,17 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
         )
     except DaemonServiceError as exc:
         raise click.ClickException(str(exc)) from exc
+
+    baseline_status = client.get_local_agent_status()
+    if baseline_status.get("error"):
+        try:
+            replacement.rollback()
+        except DaemonServiceError as rollback_error:
+            raise click.ClickException(
+                f"Daemon status baseline failed and the previous service could not be restored: {rollback_error}"
+            ) from rollback_error
+        _emit_tool_payload(ctx, baseline_status)
+        return
 
     daemon_status = _wait_for_local_agent_online(
         client,

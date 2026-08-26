@@ -516,6 +516,7 @@ class FakeServiceManager:
         self.fail_commit = False
 
     def replace(self, *, executable: str, api_url: str, api_token: str | None):
+        self.actions.append("replace")
         self.installs.append({"executable": executable, "api_url": api_url, "api_token": api_token})
         replacement = FakeReplacement(fail_commit=self.fail_commit)
         self.replacements.append(replacement)
@@ -705,6 +706,46 @@ def test_setup_configures_target_installs_service_and_verifies_heartbeat(monkeyp
     assert manager.installs[0]["api_token"] == "cloud-token"
     assert manager.installs[0]["api_url"] == "https://cloud.example.hana.ondemand.com"
     assert 'active = "dev"' in config_path.read_text(encoding="utf-8")
+
+
+def test_setup_captures_heartbeat_baseline_after_replacing_old_daemon(monkeypatch, tmp_path):
+    events: list[str] = []
+    manager = FakeServiceManager()
+    original_replace = manager.replace
+
+    def replace(**kwargs):
+        events.append("replace")
+        return original_replace(**kwargs)
+
+    manager.replace = replace
+    monkeypatch.setattr(main, "_daemon_service_manager", lambda: manager)
+    monkeypatch.setattr(main, "_current_cli_executable", lambda: "/opt/memforge/bin/memforge")
+
+    class FakeToolClient:
+        def __init__(self, **kwargs):
+            self.statuses = iter(
+                [
+                    {"status": "online", "last_seen_at": "2026-08-26T00:00:00+00:00"},
+                    {"status": "online", "last_seen_at": "2026-08-26T00:00:25+00:00"},
+                ]
+            )
+
+        def health(self):
+            return {"status": "ok"}
+
+        def get_local_agent_status(self):
+            events.append("heartbeat")
+            return next(self.statuses)
+
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--api-url", "http://127.0.0.1:8765"],
+        env={"MEMFORGE_CLI_CONFIG": str(tmp_path / "cli.toml")},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert events == ["replace", "heartbeat", "heartbeat"]
 
 
 def test_setup_guides_a_new_cloud_user_without_preconfigured_target(monkeypatch, tmp_path):
