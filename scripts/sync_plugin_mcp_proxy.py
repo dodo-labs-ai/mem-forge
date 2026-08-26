@@ -115,6 +115,26 @@ DAEMON_SETUP_OPENAI_GENERATED_COPIES = (
     / "agents"
     / "openai.yaml",
 )
+DAEMON_SETUP_OPERATIONS_CANONICAL = (
+    ROOT
+    / "integrations"
+    / "codex"
+    / "memforge-memory"
+    / "skills"
+    / "memforge-daemon-setup"
+    / "references"
+    / "operations.md"
+)
+DAEMON_SETUP_OPERATIONS_GENERATED_COPIES = (
+    ROOT
+    / "integrations"
+    / "claude-code"
+    / "memforge-memory"
+    / "skills"
+    / "memforge-daemon-setup"
+    / "references"
+    / "operations.md",
+)
 CANONICAL_PLUGIN_CONFIG_TARGET_IMPORT = b"""if __package__:
     from .api_target import MemForgeTarget, build_target
     from .capability_discovery import discover_target
@@ -176,6 +196,7 @@ PLUGIN_RUNTIME_FILES = (
     (SETUP_HELPER_CANONICAL, SETUP_HELPER_GENERATED_COPIES, None),
     (DAEMON_SETUP_SKILL_CANONICAL, DAEMON_SETUP_SKILL_GENERATED_COPIES, None),
     (DAEMON_SETUP_OPENAI_CANONICAL, DAEMON_SETUP_OPENAI_GENERATED_COPIES, None),
+    (DAEMON_SETUP_OPERATIONS_CANONICAL, DAEMON_SETUP_OPERATIONS_GENERATED_COPIES, None),
 )
 
 

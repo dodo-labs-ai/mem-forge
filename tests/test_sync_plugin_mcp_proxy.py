@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
+
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,11 +87,16 @@ def test_repo_plugin_copies_pass_the_check_command():
     assert result.stderr == ""
 
 
-def test_daemon_setup_skill_is_packaged_identically_for_both_clients():
-    codex_skill = ROOT / "integrations" / "codex" / "memforge-memory" / "skills" / "memforge-daemon-setup"
-    claude_skill = ROOT / "integrations" / "claude-code" / "memforge-memory" / "skills" / "memforge-daemon-setup"
+def test_daemon_setup_skill_has_discoverable_metadata_and_packaged_operations():
+    for client in ("codex", "claude-code"):
+        skill = ROOT / "integrations" / client / "memforge-memory" / "skills" / "memforge-daemon-setup"
+        content = (skill / "SKILL.md").read_text()
+        frontmatter_match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+        assert frontmatter_match is not None
+        frontmatter = yaml.safe_load(frontmatter_match.group(1))
+        interface = yaml.safe_load((skill / "agents" / "openai.yaml").read_text())["interface"]
 
-    assert (codex_skill / "SKILL.md").read_bytes() == (claude_skill / "SKILL.md").read_bytes()
-    assert (codex_skill / "agents" / "openai.yaml").read_bytes() == (
-        claude_skill / "agents" / "openai.yaml"
-    ).read_bytes()
+        assert frontmatter["name"] == "memforge-daemon-setup"
+        assert "daemon" in frontmatter["description"].lower()
+        assert "$memforge-daemon-setup" in interface["default_prompt"]
+        assert (skill / "references" / "operations.md").is_file()
