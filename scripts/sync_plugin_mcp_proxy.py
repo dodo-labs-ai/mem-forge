@@ -36,6 +36,11 @@ API_TARGET_GENERATED_COPIES = (
     ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_api_target.py",
     ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_api_target.py",
 )
+CAPABILITY_DISCOVERY_CANONICAL = ROOT / "src" / "memforge" / "capability_discovery.py"
+CAPABILITY_DISCOVERY_GENERATED_COPIES = (
+    ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_capability_discovery.py",
+    ROOT / "integrations" / "claude-code" / "memforge-memory" / "scripts" / "memforge_capability_discovery.py",
+)
 PLUGIN_CONFIG_CANONICAL = ROOT / "src" / "memforge" / "plugin_config.py"
 PLUGIN_CONFIG_GENERATED_COPIES = (
     ROOT / "integrations" / "codex" / "memforge-memory" / "scripts" / "memforge_plugin_config.py",
@@ -74,14 +79,20 @@ SETUP_HELPER_GENERATED_COPIES = (
 )
 CANONICAL_PLUGIN_CONFIG_TARGET_IMPORT = b"""if __package__:
     from .api_target import MemForgeTarget, build_target
+    from .capability_discovery import discover_target
 else:  # pragma: no cover - direct file load used by packaged integrations
     from memforge.api_target import MemForgeTarget, build_target
+    from memforge.capability_discovery import discover_target
 """
 PACKAGED_PLUGIN_CONFIG_TARGET_IMPORT = b"""if __package__:
     from .memforge_api_target import MemForgeTarget, build_target
+    from .memforge_capability_discovery import discover_target
 else:  # pragma: no cover - direct file load used by packaged integrations
     from memforge_api_target import MemForgeTarget, build_target
+    from memforge_capability_discovery import discover_target
 """
+CANONICAL_CAPABILITY_TARGET_IMPORT = b"from memforge.api_target import (\n"
+PACKAGED_CAPABILITY_TARGET_IMPORT = b"from memforge_api_target import (\n"
 
 
 def packaged_plugin_config_content(canonical_content: bytes) -> bytes:
@@ -95,12 +106,28 @@ def packaged_plugin_config_content(canonical_content: bytes) -> bytes:
     )
 
 
+def packaged_capability_discovery_content(canonical_content: bytes) -> bytes:
+    """Rewrite the capability parser import for the standalone plugin layout."""
+    if canonical_content.count(CANONICAL_CAPABILITY_TARGET_IMPORT) != 1:
+        raise ValueError("canonical capability target import is missing or ambiguous")
+    return canonical_content.replace(
+        CANONICAL_CAPABILITY_TARGET_IMPORT,
+        PACKAGED_CAPABILITY_TARGET_IMPORT,
+        1,
+    )
+
+
 PLUGIN_RUNTIME_FILES = (
     (CANONICAL, GENERATED_COPIES, None),
     (HOOK_CANONICAL, HOOK_GENERATED_COPIES, None),
     (REPO_IDENTITY_CANONICAL, REPO_IDENTITY_GENERATED_COPIES, None),
     (REPOSITORY_CONTEXT_CANONICAL, REPOSITORY_CONTEXT_GENERATED_COPIES, None),
     (API_TARGET_CANONICAL, API_TARGET_GENERATED_COPIES, None),
+    (
+        CAPABILITY_DISCOVERY_CANONICAL,
+        CAPABILITY_DISCOVERY_GENERATED_COPIES,
+        packaged_capability_discovery_content,
+    ),
     (
         PLUGIN_CONFIG_CANONICAL,
         PLUGIN_CONFIG_GENERATED_COPIES,

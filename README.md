@@ -159,6 +159,29 @@ memforge --help
 `memforge-ai` is the Python distribution name; the installed command and import
 package remain `memforge`.
 
+Configure the current target and install the local collection daemon as a login
+user service with one guided command:
+
+```bash
+# Guided setup; press Enter to use the local self-hosted target
+memforge setup
+
+# Or configure a hosted target; the token is prompted and saved in the OS keyring
+memforge setup --api-url https://memory.example.com
+```
+
+With no active target, the guided command prompts for the API URL and offers the
+local self-hosted endpoint as its default. MemForge discovers the exact origin's
+edition, authentication requirement, API base, and health path from
+`/.well-known/memforge`; it does not infer service type from the hostname.
+
+The setup command manages launchd on macOS and the systemd user manager on
+Linux. Use `memforge daemon status`, `check`, `restart`, `logs`, `stop`, `start`,
+and `uninstall` for subsequent operations; users do not need to write native
+service files or keep a terminal open. Status and check include the
+server-observed heartbeat, so users can prove connectivity before scheduling or
+triggering a source sync.
+
 You can also exercise the same read path from the CLI:
 
 ```bash

@@ -8,12 +8,32 @@ lifecycle reconciliation.
 ## Setup
 
 1. Install the host-side CLI with `pipx install memforge-ai`.
-2. Start the local daemon with `memforge adapter daemon run`.
+2. Run `memforge setup` to configure the active API target and install the local
+   daemon as a login user service.
 3. In the Sources UI, add a Local Markdown or GitHub Repository source.
 4. Choose the local folder or repository through the source-specific browser.
 5. Configure include and exclude patterns, then save the source.
 
-When developing MemForge from a checkout, use
+When no target is already configured, `memforge setup` prompts for the API URL;
+press Enter to accept the local self-hosted default or enter the hosted URL. The
+same URL can be supplied non-interactively, after which Cloud setup prompts for
+the token:
+
+```bash
+memforge setup --api-url https://memory.example.com
+```
+
+`memforge setup` registers a macOS LaunchAgent or Linux systemd user service,
+starts it, and waits for the server-observed heartbeat. The API token is stored
+in the operating-system keyring rather than in the launchd property list,
+systemd unit, or MemForge config file. No `sudo`, hand-written service file, or
+user cron entry is required.
+
+Setup reads `/.well-known/memforge` from the exact origin to discover whether
+the service is self-hosted or Cloud and which health/authentication contract it
+uses. Custom domains therefore require no client-side DNS allowlist.
+
+When developing MemForge from a checkout, keep using the foreground command
 `uv run memforge adapter daemon run` instead of the installed command.
 
 The daemon authenticates with the user's MemForge API key. Self-hosted OSS and
@@ -78,6 +98,30 @@ remain running and authenticated; no user crontab or daemon-side schedule is
 created.
 
 ## Operations
+
+Manage the installed user service through MemForge rather than calling
+`launchctl` or `systemctl` directly:
+
+```bash
+memforge daemon status
+memforge daemon check
+memforge daemon restart
+memforge daemon logs --follow
+memforge daemon stop
+memforge daemon start
+memforge daemon uninstall
+```
+
+The foreground `memforge adapter daemon run` and one-shot
+`memforge adapter daemon once` commands remain available for development and
+diagnosis. Automatic service installation currently supports macOS launchd and
+Linux systemd.
+
+`memforge daemon status` reports native service state, the local daemon PID and
+lock, and the server-observed heartbeat for the daemon's stored target and
+Keychain credential. `memforge daemon check` exits nonzero unless all three are
+healthy, so installation can be verified without first triggering a source
+sync.
 
 Rename, pause, rescope, force-resync, schedule, and delete sources in the UI.
 Connection paths and execution ownership remain attached to the saved source,
