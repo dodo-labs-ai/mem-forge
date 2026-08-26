@@ -2,7 +2,7 @@
 
 This plugin connects Codex lifecycle hooks to a MemForge API.
 It also registers a thin local MCP proxy for explicit memory tools.
-The packaged runtime and plugin version is `0.1.57`.
+The packaged runtime and plugin version is `0.1.58`.
 
 With no routing variables, the plugin targets local OSS at
 `http://127.0.0.1:8765/api/v1`. Otherwise set the origin in
@@ -22,6 +22,8 @@ to any data tool for a one-request override. It may be omitted when the account
 has exactly one accessible workspace or the project has a user-confirmed local
 binding. Use the `memforge-setup` skill to bind a Git repository or ordinary
 directory and, when desired, configure the client-local hook fallback.
+Use `memforge-daemon-setup` when the agent should securely install, configure,
+verify, troubleshoot, or remove the managed local collection daemon.
 Repository context remains provenance attribution; it never selects or
 authorizes a workspace.
 

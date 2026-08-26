@@ -82,3 +82,13 @@ def test_repo_plugin_copies_pass_the_check_command():
     assert result.returncode == 0
     assert "already in sync" in result.stdout
     assert result.stderr == ""
+
+
+def test_daemon_setup_skill_is_packaged_identically_for_both_clients():
+    codex_skill = ROOT / "integrations" / "codex" / "memforge-memory" / "skills" / "memforge-daemon-setup"
+    claude_skill = ROOT / "integrations" / "claude-code" / "memforge-memory" / "skills" / "memforge-daemon-setup"
+
+    assert (codex_skill / "SKILL.md").read_bytes() == (claude_skill / "SKILL.md").read_bytes()
+    assert (codex_skill / "agents" / "openai.yaml").read_bytes() == (
+        claude_skill / "agents" / "openai.yaml"
+    ).read_bytes()
