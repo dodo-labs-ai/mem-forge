@@ -24,7 +24,8 @@ Run read-only checks before proposing a mutation:
 ```bash
 uname -s
 command -v memforge || true
-memforge --version
+command -v uv >/dev/null && uv tool list || true
+command -v pipx >/dev/null && pipx list || true
 memforge target list
 memforge daemon status
 ```
@@ -124,62 +125,18 @@ Success requires all of the following, without triggering a Source sync:
 
 - `daemon check` exits zero and reports `healthy`;
 - native service is running;
-- local runtime is running and its lock PID matches the native service PID;
+- local runtime is running;
 - server connection is `online`.
 
-Report CLI version, target origin and edition, service manager, and connection
-state. Never report credentials, Keychain account identifiers, or raw local
-state.
+When both native and runtime PIDs are available, matching values are useful
+additional evidence but are not required on platforms that do not expose a
+native PID. Report the installed distribution version when package-manager
+metadata provides it, plus target origin and edition, service manager, and
+connection state. Never report credentials, Keychain account identifiers, or
+raw local state.
 
-## Diagnose a failed setup
+## Conditional operations
 
-Use the supported surfaces:
-
-```bash
-memforge daemon status
-memforge daemon logs --lines 100
-```
-
-Keep health/discovery, authentication, native service, runtime lock, and server
-heartbeat failures distinct. Do not retry blindly, bypass capability discovery,
-write a compatibility target, run launchctl/systemctl directly, or use root. If
-the server lacks `/.well-known/memforge`, update the server before retrying.
-Inspect only bounded relevant logs. Redact credentials, user-specific paths,
-and unrelated Source content before relaying excerpts.
-
-Setup is transactional. When it reports rollback failure, stop and report that
-terminal condition instead of applying another mutation.
-
-## Ongoing lifecycle
-
-Use only these commands:
-
-```bash
-memforge daemon start
-memforge daemon stop
-memforge daemon restart
-memforge daemon logs
-memforge daemon status
-memforge daemon check
-```
-
-Changing the target or token is a new setup operation with the same preview and
-authorization boundary.
-
-## Uninstall boundary
-
-Only uninstall after explicit authorization:
-
-```bash
-memforge daemon uninstall --yes
-```
-
-Verify through the uninstall result and `memforge daemon status` that
-`installed`, `loaded`, `running`, and `configured` are false, runtime is
-stopped, connection is unconfigured, and the prior service PID is no longer
-reported. A successful uninstall means the CLI also removed its daemon keyring
-credential; do not inspect or display raw Keychain records. Explain that
-uninstall intentionally preserves the CLI,
-`~/.memforge/cli.toml`, logs, runtime history, Sources, and other MemForge data.
-Never claim this is a full machine reset and never delete `~/.memforge`
-recursively.
+For setup failure, an unhealthy daemon, lifecycle commands, target/token
+changes, or uninstall requests, read
+[references/operations.md](references/operations.md) before acting.
