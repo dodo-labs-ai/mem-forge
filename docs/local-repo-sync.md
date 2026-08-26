@@ -14,11 +14,13 @@ lifecycle reconciliation.
 4. Choose the local folder or repository through the source-specific browser.
 5. Configure include and exclude patterns, then save the source.
 
-For a hosted target that is not already configured, pass its URL and provide the
-token when prompted:
+When no target is already configured, `memforge setup` prompts for the API URL;
+press Enter to accept the local self-hosted default or enter the hosted URL. The
+same URL can be supplied non-interactively, after which Cloud setup prompts for
+the token:
 
 ```bash
-memforge setup --api-url https://api.example.memforge
+memforge setup --api-url https://memforge.example.hana.ondemand.com
 ```
 
 `memforge setup` registers a macOS LaunchAgent or Linux systemd user service,
@@ -98,6 +100,7 @@ Manage the installed user service through MemForge rather than calling
 
 ```bash
 memforge daemon status
+memforge daemon check
 memforge daemon restart
 memforge daemon logs --follow
 memforge daemon stop
@@ -109,6 +112,12 @@ The foreground `memforge adapter daemon run` and one-shot
 `memforge adapter daemon once` commands remain available for development and
 diagnosis. Automatic service installation currently supports macOS launchd and
 Linux systemd.
+
+`memforge daemon status` reports native service state, the local daemon PID and
+lock, and the server-observed heartbeat for the daemon's stored target and
+Keychain credential. `memforge daemon check` exits nonzero unless all three are
+healthy, so installation can be verified without first triggering a source
+sync.
 
 Rename, pause, rescope, force-resync, schedule, and delete sources in the UI.
 Connection paths and execution ownership remain attached to the saved source,

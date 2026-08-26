@@ -18,6 +18,13 @@ LAUNCHD_LABEL = "com.memforge.local-daemon"
 SYSTEMD_UNIT_NAME = "memforge-local-daemon.service"
 KEYRING_SERVICE = "memforge-local-daemon"
 SERVICE_CONFIG_VERSION = 1
+DEFAULT_RUNTIME_PATHS = (
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+)
 
 
 class DaemonServiceError(RuntimeError):
@@ -41,6 +48,55 @@ class DaemonServicePaths:
             stdout_log=state_dir / "local-agent-daemon.stdout.log",
             stderr_log=state_dir / "local-agent-daemon.stderr.log",
         )
+
+
+def _reject_control_characters(value: str, *, field: str) -> None:
+    if any(character in value for character in ("\x00", "\r", "\n")):
+        raise DaemonServiceError(f"{field} must not contain control characters.")
+
+
+@dataclass(frozen=True)
+class DaemonLaunchSpec:
+    """Complete non-secret process contract translated by native service adapters."""
+
+    executable: str
+    arguments: tuple[str, ...]
+    runtime_path: tuple[str, ...]
+
+    @classmethod
+    def for_executable(
+        cls,
+        executable: str,
+        *,
+        inherited_path: str | None = None,
+    ) -> DaemonLaunchSpec:
+        normalized_executable = str(Path(executable).expanduser())
+        if not Path(normalized_executable).is_absolute():
+            raise DaemonServiceError("The daemon executable path must be absolute.")
+        _reject_control_characters(normalized_executable, field="Daemon executable path")
+        arguments = ("daemon", "_run")
+        inherited_entries = (inherited_path if inherited_path is not None else os.getenv("PATH", "")).split(":")
+        candidates = (str(Path(normalized_executable).parent), *inherited_entries, *DEFAULT_RUNTIME_PATHS)
+        runtime_path: list[str] = []
+        for candidate in candidates:
+            normalized = candidate
+            if not normalized or not Path(normalized).is_absolute() or normalized in runtime_path:
+                continue
+            _reject_control_characters(normalized, field="Daemon runtime PATH entry")
+            runtime_path.append(normalized)
+        return cls(
+            executable=normalized_executable,
+            arguments=arguments,
+            runtime_path=tuple(runtime_path),
+        )
+
+    @property
+    def command(self) -> tuple[str, ...]:
+        return (self.executable, *self.arguments)
+
+    @property
+    def environment(self) -> dict[str, str]:
+        return {"PATH": ":".join(self.runtime_path)}
 
 
 @dataclass(frozen=True)
@@ -115,6 +171,10 @@ class DaemonCredentialStore:
                 raise DaemonServiceError(
                     "Could not read the existing daemon API token from the operating-system keyring."
                 ) from exc
+            if not previous_token:
+                raise DaemonServiceError(
+                    "The existing daemon API token is missing from the operating-system keyring."
+                )
         if account is not None:
             try:
                 self.keyring.set_password(KEYRING_SERVICE, account, api_token)
@@ -133,15 +193,19 @@ class DaemonCredentialStore:
                 json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n",
             )
         except Exception as exc:
+            credential_rollback_error: Exception | None = None
             if account is not None:
                 try:
                     if previous_token is not None:
                         self.keyring.set_password(KEYRING_SERVICE, account, previous_token)
                     elif previous is None or previous.keyring_account != account:
                         self.keyring.delete_password(KEYRING_SERVICE, account)
-                except Exception:
-                    pass
-            raise DaemonServiceError(f"Could not write daemon service config: {self.path}") from exc
+                except Exception as rollback_error:
+                    credential_rollback_error = rollback_error
+            detail = f"Could not write daemon service config: {self.path}"
+            if credential_rollback_error is not None:
+                detail += f"; credential rollback failed: {credential_rollback_error}"
+            raise DaemonServiceError(detail) from exc
         return StoredDaemonTarget(api_url=normalized_url, keyring_account=account)
 
     def load(self) -> StoredDaemonTarget:
@@ -193,7 +257,7 @@ class DaemonCredentialStore:
                 raise DaemonServiceError("The existing daemon API token is missing from the operating-system keyring.")
         return DaemonCredentialSnapshot(target=target, api_token=token)
 
-    def delete_secret(self, target: StoredDaemonTarget, *, strict: bool = False) -> None:
+    def delete_secret(self, target: StoredDaemonTarget, *, strict: bool = True) -> None:
         if not target.keyring_account:
             return
         try:
@@ -209,11 +273,11 @@ class DaemonCredentialStore:
     def restore(self, snapshot: DaemonCredentialSnapshot | None) -> None:
         current = self.load() if self.path.exists() else None
         if snapshot is None:
-            self.delete(strict=False)
+            self.delete(strict=True)
             return
         self.save(api_url=snapshot.target.api_url, api_token=snapshot.api_token)
         if current is not None and current.keyring_account != snapshot.target.keyring_account:
-            self.delete_secret(current)
+            self.delete_secret(current, strict=True)
 
     def delete(self, *, strict: bool = True) -> None:
         try:
@@ -237,7 +301,11 @@ class UserServiceAdapter(Protocol):
     platform: str
     unit_path: Path
 
-    def install(self, command: Sequence[str]) -> None: ...
+    def snapshot(self) -> Any: ...
+
+    def apply(self, launch: DaemonLaunchSpec) -> None: ...
+
+    def restore(self, snapshot: Any) -> None: ...
 
     def uninstall(self) -> None: ...
 
@@ -276,6 +344,26 @@ class _CommandAdapter:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             raise DaemonServiceError(detail or f"Service manager command failed: {' '.join(args)}") from exc
 
+    @staticmethod
+    def _require_success(result: subprocess.CompletedProcess[str], *, operation: str) -> None:
+        if result.returncode == 0:
+            return
+        detail = (result.stderr or result.stdout or "").strip()
+        raise DaemonServiceError(detail or f"{operation} failed with exit code {result.returncode}.")
+
+
+@dataclass(frozen=True)
+class LaunchdServiceSnapshot:
+    unit: bytes | None
+    loaded: bool
+
+
+@dataclass(frozen=True)
+class SystemdServiceSnapshot:
+    unit: bytes | None
+    enabled: bool
+    active: bool
+
 
 class LaunchdUserService(_CommandAdapter):
     """Manage a per-login macOS LaunchAgent."""
@@ -299,16 +387,21 @@ class LaunchdUserService(_CommandAdapter):
     def _loaded(self) -> bool:
         return self._run(["launchctl", "print", self.service_target]).returncode == 0
 
-    def install(self, command: Sequence[str]) -> None:
+    def snapshot(self) -> LaunchdServiceSnapshot:
+        return LaunchdServiceSnapshot(
+            unit=self.unit_path.read_bytes() if self.unit_path.exists() else None,
+            loaded=self._loaded(),
+        )
+
+    def apply(self, launch: DaemonLaunchSpec) -> None:
         self.paths.stdout_log.parent.mkdir(parents=True, exist_ok=True)
         for log_path in (self.paths.stdout_log, self.paths.stderr_log):
             log_path.touch(exist_ok=True)
             log_path.chmod(0o600)
-        previous = self.unit_path.read_bytes() if self.unit_path.exists() else None
-        was_loaded = self._loaded()
         payload = {
             "Label": LAUNCHD_LABEL,
-            "ProgramArguments": list(command),
+            "ProgramArguments": list(launch.command),
+            "EnvironmentVariables": launch.environment,
             "RunAtLoad": True,
             "KeepAlive": True,
             "ProcessType": "Background",
@@ -316,18 +409,22 @@ class LaunchdUserService(_CommandAdapter):
             "StandardOutPath": str(self.paths.stdout_log),
             "StandardErrorPath": str(self.paths.stderr_log),
         }
-        if was_loaded:
+        if self._loaded():
             self._run(["launchctl", "bootout", self.service_target], check=True)
-        try:
-            _atomic_write(self.unit_path, plistlib.dumps(payload, fmt=plistlib.FMT_XML))
-            self._run(["launchctl", "bootstrap", self.domain, str(self.unit_path)], check=True)
-        except Exception:
-            self.unit_path.unlink(missing_ok=True)
-            if previous is not None:
-                _atomic_write(self.unit_path, previous)
-                if was_loaded:
-                    self._run(["launchctl", "bootstrap", self.domain, str(self.unit_path)])
-            raise
+        _atomic_write(self.unit_path, plistlib.dumps(payload, fmt=plistlib.FMT_XML))
+        self._run(["launchctl", "bootstrap", self.domain, str(self.unit_path)], check=True)
+
+    def restore(self, snapshot: LaunchdServiceSnapshot) -> None:
+        if snapshot.loaded and snapshot.unit is None:
+            raise DaemonServiceError("Cannot restore the loaded LaunchAgent because its previous plist is unavailable.")
+        if self._loaded():
+            self._run(["launchctl", "bootout", self.service_target], check=True)
+        self.unit_path.unlink(missing_ok=True)
+        if snapshot.unit is not None:
+            _atomic_write(self.unit_path, snapshot.unit)
+        if snapshot.loaded:
+            result = self._run(["launchctl", "bootstrap", self.domain, str(self.unit_path)])
+            self._require_success(result, operation="launchd rollback bootstrap")
 
     def uninstall(self) -> None:
         if self._loaded():
@@ -395,12 +492,26 @@ class SystemdUserService(_CommandAdapter):
         self.paths = paths
 
     @staticmethod
-    def _unit(command: Sequence[str]) -> str:
-        def quote(argument: str) -> str:
-            escaped = argument.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
-            return f'"{escaped}"'
+    def _exec_quote(argument: str) -> str:
+        _reject_control_characters(argument, field="systemd ExecStart argument")
+        escaped = (
+            argument.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("%", "%%")
+            .replace("$", "$$")
+        )
+        return f'"{escaped}"'
 
-        exec_start = " ".join(quote(part) for part in command)
+    @staticmethod
+    def _environment_quote(assignment: str) -> str:
+        _reject_control_characters(assignment, field="systemd environment assignment")
+        escaped = assignment.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+        return f'"{escaped}"'
+
+    @classmethod
+    def _unit(cls, launch: DaemonLaunchSpec) -> str:
+        exec_start = " ".join(cls._exec_quote(part) for part in launch.command)
+        environment = cls._environment_quote(f"PATH={launch.environment['PATH']}")
         return (
             "[Unit]\n"
             "Description=MemForge local agent daemon\n"
@@ -408,32 +519,41 @@ class SystemdUserService(_CommandAdapter):
             "After=network-online.target\n\n"
             "[Service]\n"
             f"ExecStart={exec_start}\n"
+            f"Environment={environment}\n"
             "Restart=on-failure\n"
             "RestartSec=10\n\n"
             "[Install]\n"
             "WantedBy=default.target\n"
         )
 
-    def install(self, command: Sequence[str]) -> None:
-        previous = self.unit_path.read_bytes() if self.unit_path.exists() else None
-        was_enabled = self._run(["systemctl", "--user", "is-enabled", SYSTEMD_UNIT_NAME]).returncode == 0
+    def snapshot(self) -> SystemdServiceSnapshot:
+        return SystemdServiceSnapshot(
+            unit=self.unit_path.read_bytes() if self.unit_path.exists() else None,
+            enabled=self._run(["systemctl", "--user", "is-enabled", SYSTEMD_UNIT_NAME]).returncode == 0,
+            active=self._run(["systemctl", "--user", "is-active", SYSTEMD_UNIT_NAME]).returncode == 0,
+        )
+
+    def apply(self, launch: DaemonLaunchSpec) -> None:
         was_active = self._run(["systemctl", "--user", "is-active", SYSTEMD_UNIT_NAME]).returncode == 0
-        try:
-            _atomic_write(self.unit_path, self._unit(command).encode("utf-8"))
-            self._run(["systemctl", "--user", "daemon-reload"], check=True)
-            self._run(["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT_NAME], check=True)
-        except Exception:
-            self.unit_path.unlink(missing_ok=True)
-            if previous is not None:
-                _atomic_write(self.unit_path, previous)
-            self._run(["systemctl", "--user", "daemon-reload"])
-            if previous is not None and was_enabled:
-                args = ["systemctl", "--user", "enable"]
-                if was_active:
-                    args.append("--now")
-                args.append(SYSTEMD_UNIT_NAME)
-                self._run(args)
-            raise
+        _atomic_write(self.unit_path, self._unit(launch).encode("utf-8"))
+        self._run(["systemctl", "--user", "daemon-reload"], check=True)
+        self._run(["systemctl", "--user", "enable", SYSTEMD_UNIT_NAME], check=True)
+        action = "restart" if was_active else "start"
+        self._run(["systemctl", "--user", action, SYSTEMD_UNIT_NAME], check=True)
+
+    def restore(self, snapshot: SystemdServiceSnapshot) -> None:
+        if self._run(["systemctl", "--user", "is-active", SYSTEMD_UNIT_NAME]).returncode == 0:
+            self._run(["systemctl", "--user", "stop", SYSTEMD_UNIT_NAME], check=True)
+        if self._run(["systemctl", "--user", "is-enabled", SYSTEMD_UNIT_NAME]).returncode == 0:
+            self._run(["systemctl", "--user", "disable", SYSTEMD_UNIT_NAME], check=True)
+        self.unit_path.unlink(missing_ok=True)
+        if snapshot.unit is not None:
+            _atomic_write(self.unit_path, snapshot.unit)
+        self._run(["systemctl", "--user", "daemon-reload"], check=True)
+        if snapshot.enabled:
+            self._run(["systemctl", "--user", "enable", SYSTEMD_UNIT_NAME], check=True)
+        if snapshot.active:
+            self._run(["systemctl", "--user", "start", SYSTEMD_UNIT_NAME], check=True)
 
     def uninstall(self) -> None:
         self._run(
@@ -503,6 +623,62 @@ def service_adapter(
     )
 
 
+def _replacement_failure(
+    operation: str,
+    original: BaseException,
+    rollback_errors: Sequence[BaseException],
+) -> DaemonServiceError:
+    detail = f"{operation} failed: {original}"
+    if rollback_errors:
+        detail += "; rollback failed: " + "; ".join(str(error) for error in rollback_errors)
+    return DaemonServiceError(detail)
+
+
+class DaemonServiceReplacement:
+    """In-memory replacement transaction retained until setup verification commits."""
+
+    def __init__(
+        self,
+        *,
+        manager: DaemonServiceManager,
+        service_snapshot: Any,
+        credential_snapshot: DaemonCredentialSnapshot | None,
+        current_target: StoredDaemonTarget,
+    ) -> None:
+        self._manager = manager
+        self._service_snapshot = service_snapshot
+        self._credential_snapshot = credential_snapshot
+        self._current_target = current_target
+        self._finalized = False
+
+    def commit(self) -> None:
+        if self._finalized:
+            raise DaemonServiceError("The daemon service replacement is already finalized.")
+        if (
+            self._credential_snapshot is not None
+            and self._credential_snapshot.target.keyring_account != self._current_target.keyring_account
+        ):
+            self._manager.credentials.delete_secret(self._credential_snapshot.target)
+        self._finalized = True
+
+    def rollback(self) -> None:
+        if self._finalized:
+            raise DaemonServiceError("The daemon service replacement is already finalized.")
+        rollback_errors: list[BaseException] = []
+        try:
+            self._manager.credentials.restore(self._credential_snapshot)
+        except Exception as exc:
+            rollback_errors.append(exc)
+        if not rollback_errors:
+            try:
+                self._manager.adapter.restore(self._service_snapshot)
+            except Exception as exc:
+                rollback_errors.append(exc)
+        if rollback_errors:
+            raise _replacement_failure("Daemon service rollback", rollback_errors[0], rollback_errors[1:])
+        self._finalized = True
+
+
 class DaemonServiceManager:
     """Own credentials and native user-service lifecycle behind one interface."""
 
@@ -519,16 +695,43 @@ class DaemonServiceManager:
             credentials=DaemonCredentialStore(paths.config),
         )
 
-    def install(self, *, executable: str, api_url: str, api_token: str | None) -> dict[str, Any]:
-        previous = self.credentials.snapshot()
-        current = self.credentials.save(api_url=api_url, api_token=api_token)
+    def replace(self, *, executable: str, api_url: str, api_token: str | None) -> DaemonServiceReplacement:
+        launch = DaemonLaunchSpec.for_executable(executable)
+        service_snapshot = self.adapter.snapshot()
+        credential_snapshot = self.credentials.snapshot()
+        current_target = self.credentials.save(api_url=api_url, api_token=api_token)
         try:
-            self.adapter.install([executable, "daemon", "_run"])
-        except Exception:
-            self.credentials.restore(previous)
-            raise
-        if previous is not None and previous.target.keyring_account != current.keyring_account:
-            self.credentials.delete_secret(previous.target)
+            self.adapter.apply(launch)
+        except Exception as apply_error:
+            rollback_errors: list[BaseException] = []
+            try:
+                self.credentials.restore(credential_snapshot)
+            except Exception as exc:
+                rollback_errors.append(exc)
+            if not rollback_errors:
+                try:
+                    self.adapter.restore(service_snapshot)
+                except Exception as exc:
+                    rollback_errors.append(exc)
+            raise _replacement_failure("Daemon service replacement", apply_error, rollback_errors) from apply_error
+        return DaemonServiceReplacement(
+            manager=self,
+            service_snapshot=service_snapshot,
+            credential_snapshot=credential_snapshot,
+            current_target=current_target,
+        )
+
+    def install(self, *, executable: str, api_url: str, api_token: str | None) -> dict[str, Any]:
+        replacement = self.replace(executable=executable, api_url=api_url, api_token=api_token)
+        try:
+            replacement.commit()
+        except Exception as commit_error:
+            rollback_errors: list[BaseException] = []
+            try:
+                replacement.rollback()
+            except Exception as exc:
+                rollback_errors.append(exc)
+            raise _replacement_failure("Daemon service commit", commit_error, rollback_errors) from commit_error
         return self.status()
 
     def uninstall(self) -> dict[str, Any]:
