@@ -10,6 +10,7 @@ import pytest
 
 import memforge.main as main
 import memforge.local_agent.service as daemon_service_module
+from memforge.api_target import build_target
 from memforge.local_agent.service import (
     KEYRING_SERVICE,
     DaemonCredentialStore,
@@ -22,6 +23,18 @@ from memforge.local_agent.service import (
     service_adapter,
 )
 from memforge.main import cli
+
+
+@pytest.fixture(autouse=True)
+def _stub_daemon_capability_discovery(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        main,
+        "discover_target",
+        lambda origin: build_target(
+            origin=origin,
+            edition="cloud" if origin.startswith("https://") else "oss",
+        ),
+    )
 
 
 class FakeKeyring:
@@ -113,12 +126,17 @@ def test_daemon_credentials_keep_token_out_of_config(tmp_path):
     config_path = tmp_path / "daemon-service.json"
     store = DaemonCredentialStore(config_path, keyring_store=keyring)
 
-    target = store.save(api_url="https://memforge.example/", api_token="secret-token")
+    target = store.save(
+        api_url="https://memforge.example/",
+        api_token="secret-token",
+        edition="cloud",
+    )
 
     saved = config_path.read_text(encoding="utf-8")
     assert "secret-token" not in saved
     assert json.loads(saved) == {
         "api_url": "https://memforge.example",
+        "edition": "cloud",
         "keyring_account": target.keyring_account,
         "version": 1,
     }
@@ -126,6 +144,7 @@ def test_daemon_credentials_keep_token_out_of_config(tmp_path):
     assert keyring.values[(KEYRING_SERVICE, target.keyring_account)] == "secret-token"
     assert store.environment() == {
         "MEMFORGE_API_URL": "https://memforge.example",
+        "MEMFORGE_EDITION": "cloud",
         "MEMFORGE_API_TOKEN": "secret-token",
     }
 
@@ -513,17 +532,24 @@ class FakeServiceManager:
         self.installs: list[dict[str, str | None]] = []
         self.actions: list[str] = []
         self.replacements: list[FakeReplacement] = []
+        self.editions: list[str | None] = []
         self.fail_commit = False
 
-    def replace(self, *, executable: str, api_url: str, api_token: str | None):
+    def replace(self, *, executable: str, api_url: str, api_token: str | None, edition: str | None = None):
         self.actions.append("replace")
         self.installs.append({"executable": executable, "api_url": api_url, "api_token": api_token})
+        self.editions.append(edition)
         replacement = FakeReplacement(fail_commit=self.fail_commit)
         self.replacements.append(replacement)
         return replacement
 
-    def install(self, *, executable: str, api_url: str, api_token: str | None):
-        replacement = self.replace(executable=executable, api_url=api_url, api_token=api_token)
+    def install(self, *, executable: str, api_url: str, api_token: str | None, edition: str | None = None):
+        replacement = self.replace(
+            executable=executable,
+            api_url=api_url,
+            api_token=api_token,
+            edition=edition,
+        )
         replacement.commit()
         return {"platform": "launchd", "installed": True, "running": True}
 
@@ -548,7 +574,11 @@ class FakeServiceManager:
         return {"installed": False, "running": False}
 
     def environment(self):
-        return {"MEMFORGE_API_URL": "https://stored.example", "MEMFORGE_API_TOKEN": "stored-token"}
+        return {
+            "MEMFORGE_API_URL": "https://stored.example",
+            "MEMFORGE_EDITION": "cloud",
+            "MEMFORGE_API_TOKEN": "stored-token",
+        }
 
     def logs(self, *, lines: int, follow: bool):
         self.actions.append(f"logs:{lines}:{follow}")
@@ -704,6 +734,7 @@ def test_setup_configures_target_installs_service_and_verifies_heartbeat(monkeyp
     assert payload["daemon"]["status"] == "online"
     assert payload["daemon"]["last_seen_at"] == "2026-08-26T00:00:00+00:00"
     assert manager.installs[0]["api_token"] == "cloud-token"
+    assert manager.editions[0] == "cloud"
     assert manager.installs[0]["api_url"] == "https://cloud.example.hana.ondemand.com"
     assert 'active = "dev"' in config_path.read_text(encoding="utf-8")
 
@@ -776,14 +807,17 @@ def test_setup_guides_a_new_cloud_user_without_preconfigured_target(monkeypatch,
     result = CliRunner().invoke(
         cli,
         ["setup"],
-        input="https://cloud.example.hana.ondemand.com\ncloud-token\ncloud-token\n",
+        input="https://memory.example.com\ncloud-token\ncloud-token\n",
         env={"MEMFORGE_CLI_CONFIG": str(config_path)},
     )
 
     assert result.exit_code == 0, result.output
-    assert manager.installs[0]["api_url"] == "https://cloud.example.hana.ondemand.com"
+    assert manager.installs[0]["api_url"] == "https://memory.example.com"
     assert manager.installs[0]["api_token"] == "cloud-token"
-    assert 'api_url = "https://cloud.example.hana.ondemand.com"' in config_path.read_text(encoding="utf-8")
+    assert manager.editions[0] == "cloud"
+    saved_config = config_path.read_text(encoding="utf-8")
+    assert 'api_url = "https://memory.example.com"' in saved_config
+    assert 'edition = "cloud"' in saved_config
 
 
 def test_setup_preserves_previous_target_when_health_validation_fails(monkeypatch, tmp_path):
@@ -962,7 +996,13 @@ def test_daemon_status_uses_the_daemons_stored_target_for_server_connection(monk
 
     class FakeToolClient:
         def __init__(self, *, target, api_token):
-            captured.update({"api_url": target.origin, "api_token": api_token})
+            captured.update(
+                {
+                    "api_url": target.origin,
+                    "edition": target.edition.value,
+                    "api_token": api_token,
+                }
+            )
 
         def get_local_agent_status(self):
             return {
@@ -982,7 +1022,11 @@ def test_daemon_status_uses_the_daemons_stored_target_for_server_connection(monk
     payload = json.loads(result.output)
     assert payload["status"] == "healthy"
     assert payload["connection"]["status"] == "online"
-    assert captured == {"api_url": "https://stored.example", "api_token": "stored-token"}
+    assert captured == {
+        "api_url": "https://stored.example",
+        "edition": "cloud",
+        "api_token": "stored-token",
+    }
 
 
 def test_daemon_check_exits_nonzero_when_server_heartbeat_is_offline(monkeypatch, tmp_path):

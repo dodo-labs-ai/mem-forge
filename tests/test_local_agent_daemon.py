@@ -189,7 +189,7 @@ def test_local_adapter_capability_commands_include_teams():
 
 def test_oss_local_markdown_job_uses_the_unscoped_api_client(monkeypatch):
     client = ToolClient(
-        target=build_target(origin="http://127.0.0.1:8765"),
+        target=build_target(origin="http://127.0.0.1:8765", edition="oss"),
         api_token=None,
     )
     observed: dict[str, object] = {}
@@ -225,7 +225,7 @@ def test_oss_local_markdown_job_uses_the_unscoped_api_client(monkeypatch):
 
 def test_cloud_local_agent_job_requires_and_applies_workspace_scope():
     client = ToolClient(
-        target=build_host_target(origin="https://memforge.example.hana.ondemand.com"),
+        target=build_host_target(origin="https://memforge.example.hana.ondemand.com", edition="cloud"),
         api_token="cloud-token",
     )
     job = {
@@ -324,6 +324,7 @@ def test_teams_sync_job_reauths_when_no_local_session(monkeypatch, tmp_path):
     class FakeClient:
         target = build_target(
             origin="https://memforge.example.hana.ondemand.com",
+            edition="cloud",
         )
 
         def for_workspace(self, workspace_id: str):
@@ -563,7 +564,7 @@ def test_local_agent_marks_github_cli_connection_failure_retryable(monkeypatch, 
 
     monkeypatch.setattr(main.subprocess, "run", fail_github_api)
     client = ToolClient(
-        target=build_target(origin="http://127.0.0.1:8765"),
+        target=build_target(origin="http://127.0.0.1:8765", edition="oss"),
         api_token=None,
     )
     runner = LocalAgentRunner(
@@ -947,12 +948,13 @@ def test_adapter_daemon_status_uses_environment_target_provenance(monkeypatch, t
     monkeypatch.setenv("MEMFORGE_LOCAL_AGENT_LOCK", str(tmp_path / "daemon.lock"))
     monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "cli.toml"))
     monkeypatch.setenv("MEMFORGE_API_URL", "https://environment.hana.ondemand.com")
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "ws-environment")
     monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
     monkeypatch.setenv("SAP_TOKEN", "inactive-profile-token")
     (tmp_path / "cli.toml").write_text(
         'active = "sap"\n\n[targets.sap]\n'
-        'api_url = "https://profile.hana.ondemand.com"\nworkspace_id = "ws-profile"\n'
+        'api_url = "https://profile.hana.ondemand.com"\nedition = "cloud"\nworkspace_id = "ws-profile"\n'
         'token_env = "SAP_TOKEN"\n',
         encoding="utf-8",
     )
@@ -997,6 +999,7 @@ def test_adapter_daemon_status_allows_cloud_target_without_global_workspace(monk
     (tmp_path / "cli.toml").write_text(
         'active = "cloud"\n\n[targets.cloud]\n'
         'api_url = "https://memforge-dev.cfapps.eu12.hana.ondemand.com"\n'
+        'edition = "cloud"\n'
         'token_env = "MEMFORGE_API_TOKEN"\n',
         encoding="utf-8",
     )

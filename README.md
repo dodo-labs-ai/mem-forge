@@ -167,11 +167,13 @@ user service with one guided command:
 memforge setup
 
 # Or configure a hosted target; the token is prompted and saved in the OS keyring
-memforge setup --api-url https://memforge.example.hana.ondemand.com
+memforge setup --api-url https://memory.example.com
 ```
 
 With no active target, the guided command prompts for the API URL and offers the
-local self-hosted endpoint as its default.
+local self-hosted endpoint as its default. MemForge discovers the exact origin's
+edition, authentication requirement, API base, and health path from
+`/.well-known/memforge`; it does not infer service type from the hostname.
 
 The setup command manages launchd on macOS and the systemd user manager on
 Linux. Use `memforge daemon status`, `check`, `restart`, `logs`, `stop`, `start`,

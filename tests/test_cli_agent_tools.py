@@ -17,9 +17,14 @@ from memforge.main import cli
 
 @pytest.fixture(autouse=True)
 def _isolate_cli_target_configuration(monkeypatch, tmp_path: Path):
-    for name in ("MEMFORGE_API_URL", "MEMFORGE_WORKSPACE_ID", "MEMFORGE_API_TOKEN"):
+    for name in ("MEMFORGE_API_URL", "MEMFORGE_EDITION", "MEMFORGE_WORKSPACE_ID", "MEMFORGE_API_TOKEN"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "isolated-cli.toml"))
+    monkeypatch.setattr(
+        main,
+        "discover_target",
+        lambda origin: build_target(origin=origin, edition="cloud"),
+    )
     from memforge.auth.teams_auth import TeamsAuthenticator
 
     monkeypatch.setattr(TeamsAuthenticator, "_load_keychain_token_data", staticmethod(lambda: None))
@@ -207,7 +212,7 @@ class FakeToolClient:
 
     def for_workspace(self, workspace_id: str):
         return type(self)(
-            target=build_target(origin=self.api_url),
+            target=build_target(origin=self.api_url, edition="cloud"),
             api_token=self.api_token,
             workspace_id=workspace_id,
             timeout_seconds=self.timeout_seconds,
@@ -218,6 +223,7 @@ def _cloud_test_client() -> FakeToolClient:
     return FakeToolClient(
         target=build_target(
             origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+            edition="cloud",
         ),
         api_token="tok",
         workspace_id="ws-from-cloud",
@@ -567,7 +573,7 @@ def test_target_profile_sets_default_api_url(monkeypatch, tmp_path: Path):
     assert FakeToolClient.calls == [
         ("health", {"api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "api_token": "secret-token"})
     ]
-    assert "edition = " not in cli_config.read_text(encoding="utf-8")
+    assert 'edition = "cloud"' in cli_config.read_text(encoding="utf-8")
     assert "workspace_id" not in cli_config.read_text(encoding="utf-8")
 
 

@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from memforge.api_target import Edition, MemForgeTarget
+from memforge.api_target import MemForgeTarget
 from memforge.config import DEFAULT_SEARCH_TOP_K
 from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.sync_progress import normalize_sync_progress_snapshot
@@ -844,9 +844,7 @@ class ToolClient:
         return self._resource_json("POST", "/auth/jira-session/expire", {"base_url": base_url, "error": error})
 
     def health(self) -> dict[str, Any]:
-        if self.target.edition is Edition.CLOUD:
-            return self._http_json("GET", self._origin_url("/healthz"), None)
-        return self._resource_json("GET", "/health", None)
+        return self._http_json("GET", self._origin_url(self.target.health_path), None)
 
     def get_resource(
         self,

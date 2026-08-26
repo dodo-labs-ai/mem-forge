@@ -32,6 +32,7 @@ from rich.table import Table
 
 from memforge.api_target import Edition, MemForgeTarget, build_target
 from memforge.auth import browser_session
+from memforge.capability_discovery import discover_target
 from memforge.config import DEFAULT_SEARCH_TOP_K, AppConfig, load_config
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSION_LIST,
@@ -168,6 +169,8 @@ def _write_cli_config(data: dict[str, Any]) -> None:
             continue
         lines.append(f"[targets.{_toml_key(str(name))}]")
         lines.append(f"api_url = {_toml_string(str(target.get('api_url') or ''))}")
+        if target.get("edition"):
+            lines.append(f"edition = {_toml_string(str(target['edition']))}")
         if target.get("token_env"):
             lines.append(f"token_env = {_toml_string(str(target['token_env']))}")
         lines.append("")
@@ -215,6 +218,7 @@ def _resolve_api_target(
     if any(os.getenv(name, "").strip() for name in target_env_names):
         target = _build_cli_target(
             api_url=os.getenv("MEMFORGE_API_URL"),
+            edition=os.getenv("MEMFORGE_EDITION"),
         )
         return _ResolvedCliTarget(
             target=target,
@@ -230,6 +234,7 @@ def _resolve_api_target(
     if isinstance(profile, dict):
         target = _build_cli_target(
             api_url=profile.get("api_url"),
+            edition=profile.get("edition"),
         )
         token_env = str(profile.get("token_env") or "")
         return _ResolvedCliTarget(
@@ -250,8 +255,17 @@ def _resolve_api_target(
 def _build_cli_target(
     *,
     api_url: object,
+    edition: object | None = None,
 ) -> MemForgeTarget:
-    return build_target(origin=str(api_url) if api_url is not None else None)
+    origin = str(api_url) if api_url is not None else None
+    if origin is None:
+        return build_target(origin=None)
+    if edition is not None and str(edition).strip():
+        return build_target(origin=origin, edition=str(edition).strip())
+    try:
+        return discover_target(origin)
+    except ValueError as exc:
+        raise click.ClickException(f"Could not discover MemForge capabilities: {exc}") from exc
 
 
 def _tool_client(ctx) -> ToolClient:
@@ -1263,20 +1277,24 @@ def target_list(ctx):
 @click.pass_context
 def target_add(ctx, name: str, api_url: str, token_env: str):
     """Add or update an API target and make it active."""
-    payload = _set_cli_target(name=name, api_url=api_url, token_env=token_env)
+    payload = _set_cli_target(
+        name=name,
+        target=_build_cli_target(api_url=api_url),
+        token_env=token_env,
+    )
     _emit_tool_payload(ctx, payload)
 
 
-def _set_cli_target(*, name: str, api_url: str, token_env: str) -> dict[str, Any]:
+def _set_cli_target(*, name: str, target: MemForgeTarget, token_env: str) -> dict[str, Any]:
     """Persist one active CLI target for explicit and guided setup flows."""
     name = name.strip()
     if not name:
         raise click.ClickException("Target name is required.")
-    resolved = _build_cli_target(api_url=api_url)
     data = _read_cli_config()
     targets = data.setdefault("targets", {})
     targets[name] = {
-        "api_url": resolved.origin,
+        "api_url": target.origin,
+        "edition": target.edition.value,
         "token_env": token_env.strip(),
     }
     data["active"] = name
@@ -1284,8 +1302,8 @@ def _set_cli_target(*, name: str, api_url: str, token_env: str) -> dict[str, Any
     return {
         "ok": True,
         "active": name,
-        "edition": resolved.edition.value,
-        "api_url": resolved.origin,
+        "edition": target.edition.value,
+        "api_url": target.origin,
     }
 
 
@@ -1365,14 +1383,13 @@ def daemon_service():
 @click.pass_context
 def daemon_service_install(ctx):
     """Install and start the daemon as a login user service."""
-    from memforge.api_target import Edition
     from memforge.local_agent.service import DaemonServiceError
 
     resolved = _resolve_api_target(ctx.obj["config"])
     manager = _daemon_service_manager()
     _require_safe_daemon_service_install(manager)
     api_token = resolved.api_token
-    if resolved.target.edition is Edition.CLOUD and not api_token:
+    if resolved.target.authentication_required and not api_token:
         token_name = resolved.token_env or "MEMFORGE_API_TOKEN"
         raise click.ClickException(f"Set {token_name} before installing the daemon service.")
     try:
@@ -1380,6 +1397,7 @@ def daemon_service_install(ctx):
             executable=_current_cli_executable(),
             api_url=resolved.target.origin,
             api_token=api_token,
+            edition=resolved.target.edition.value,
         )
     except DaemonServiceError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -1405,12 +1423,15 @@ def _daemon_health_payload(ctx, *, verbose: bool) -> dict[str, Any]:
     runtime = _local_agent_status_payload(ctx, verbose=verbose)
     try:
         environment = manager.environment()
-        target = _build_cli_target(api_url=environment["MEMFORGE_API_URL"])
+        target = _build_cli_target(
+            api_url=environment["MEMFORGE_API_URL"],
+            edition=environment.get("MEMFORGE_EDITION"),
+        )
         connection = ToolClient(
             target=target,
             api_token=environment.get("MEMFORGE_API_TOKEN"),
         ).get_local_agent_status()
-    except DaemonServiceError as exc:
+    except (DaemonServiceError, click.ClickException) as exc:
         connection = {
             "status": "unconfigured",
             "error": str(exc),
@@ -1578,7 +1599,7 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
     manager = _daemon_service_manager()
     _require_safe_daemon_service_install(manager)
     api_token = resolved.api_token
-    if resolved.target.edition is Edition.CLOUD and not api_token:
+    if resolved.target.authentication_required and not api_token:
         api_token = click.prompt("MemForge API token", hide_input=True, confirmation_prompt=True)
 
     client = ToolClient(target=resolved.target, api_token=api_token)
@@ -1591,6 +1612,7 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
             executable=_current_cli_executable(),
             api_url=resolved.target.origin,
             api_token=api_token,
+            edition=resolved.target.edition.value,
         )
     except DaemonServiceError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -1626,7 +1648,7 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
     try:
         _set_cli_target(
             name=resolved.active_target or ("cloud" if resolved.target.edition is Edition.CLOUD else "local"),
-            api_url=resolved.target.origin,
+            target=resolved.target,
             token_env=resolved.token_env or token_env,
         )
     except Exception as config_error:

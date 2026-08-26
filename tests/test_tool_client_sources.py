@@ -24,7 +24,10 @@ class _RecordingClient(ToolClient):
 
     def __init__(self, response: dict[str, Any], *, origin: str = "https://self.example.test") -> None:
         super().__init__(
-            target=build_target(origin=origin),
+            target=build_target(
+                origin=origin,
+                edition="cloud" if origin.endswith("hana.ondemand.com") else "oss",
+            ),
             api_token="tok",
         )
         self._response = response
@@ -370,7 +373,7 @@ def test_start_source_processing_posts_snapshot_identity():
 
 def test_start_source_processing_resolves_the_workspace_resource_url(monkeypatch):
     client = ToolClient(
-        target=build_target(origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com"),
+        target=build_target(origin="https://memforge-dev.cfapps.eu12.hana.ondemand.com", edition="cloud"),
         api_token="tok",
         workspace_id="mount_tai",
     )
@@ -498,7 +501,7 @@ def test_local_agent_job_heartbeat_sends_user_progress():
 
 def test_tool_client_uses_target_for_workspace_resource_calls():
     client = ToolClient(
-        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com", edition="cloud"),
         api_token="tok",
         workspace_id="ws-a",
     )
@@ -511,7 +514,7 @@ def test_tool_client_uses_target_for_workspace_resource_calls():
 
 def test_tool_client_can_scope_server_level_client_to_job_workspace():
     server_client = ToolClient(
-        target=build_host_target(origin="https://memforge.example.hana.ondemand.com"),
+        target=build_host_target(origin="https://memforge.example.hana.ondemand.com", edition="cloud"),
         api_token="token",
     )
 
@@ -524,7 +527,7 @@ def test_tool_client_can_scope_server_level_client_to_job_workspace():
 
 def test_control_plane_daemon_jobs_use_host_origin_not_workspace_resource():
     client = ToolClient(
-        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com", edition="cloud"),
         api_token="tok",
         workspace_id="ws-a",
     )
@@ -546,7 +549,7 @@ def test_control_plane_lease_unavailable_reports_attempted_host_url(monkeypatch)
 
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: UnavailableOpener())
     client = ToolClient(
-        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com", edition="cloud"),
         api_token="tok",
         workspace_id="ws-a",
     )
@@ -581,7 +584,7 @@ def test_tool_client_forwards_search_to_hosted_workspace(monkeypatch):
 
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
     client = ToolClient(
-        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com", edition="cloud"),
         api_token="tok",
         workspace_id="mount_tai",
     )
@@ -791,7 +794,7 @@ def test_tool_client_fetches_resource_through_hosted_workspace(monkeypatch):
 
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
     client = ToolClient(
-        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com", edition="cloud"),
         api_token="tok",
         workspace_id="mount_tai",
     )
@@ -835,7 +838,7 @@ def test_tool_client_fetches_source_artifact_through_hosted_workspace(monkeypatc
 
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
     client = ToolClient(
-        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com", edition="cloud"),
         api_token="tok",
         workspace_id="mount_tai",
     )
@@ -906,7 +909,7 @@ def test_tool_client_file_mode_verifies_resource_integrity(
     monkeypatch.setenv("MEMFORGE_ARTIFACT_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FakeOpener())
     client = ToolClient(
-        target=build_target(origin="https://memforge.example.hana.ondemand.com"),
+        target=build_target(origin="https://memforge.example.hana.ondemand.com", edition="cloud"),
         api_token="tok",
         workspace_id="mount_tai",
     )

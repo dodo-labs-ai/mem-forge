@@ -19,6 +19,9 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolate_memforge_plugin_config(monkeypatch, tmp_path):
     monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
+    # Remote endpoint behavior is not under test in this module; keep its
+    # edition explicit so only capability-discovery tests perform I/O.
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.delenv("MEMFORGE_API_TOKEN", raising=False)
     monkeypatch.delenv("MEMFORGE_WORKSPACE_ID", raising=False)
     monkeypatch.delenv("MEMFORGE_WORKSPACE_BINDINGS_FILE", raising=False)
@@ -27,6 +30,7 @@ def _isolate_memforge_plugin_config(monkeypatch, tmp_path):
         from memforge import plugin_config
 
         monkeypatch.setattr(plugin_config, "_CONFIG_CACHE", None)
+        plugin_config._target_for_configuration.cache_clear()
     except Exception:
         pass
 
@@ -38,16 +42,20 @@ def _normalized_plugin_config_ast(source: str) -> str:
             """
 if __package__:
     from .api_target import MemForgeTarget, build_target
+    from .capability_discovery import discover_target
 else:
     from memforge.api_target import MemForgeTarget, build_target
+    from memforge.capability_discovery import discover_target
 """
         ).body[0],
         ast.parse(
             """
 if __package__:
     from .memforge_api_target import MemForgeTarget, build_target
+    from .memforge_capability_discovery import discover_target
 else:
     from memforge_api_target import MemForgeTarget, build_target
+    from memforge_capability_discovery import discover_target
 """
         ).body[0],
     ]
@@ -61,6 +69,9 @@ else:
                 "api_target",
                 "memforge.api_target",
                 "memforge_api_target",
+                "capability_discovery",
+                "memforge.capability_discovery",
+                "memforge_capability_discovery",
             }
             for child in ast.walk(node)
         )
@@ -1081,6 +1092,7 @@ def test_mcp_and_hook_share_cloud_resource_url(monkeypatch):
     from memforge import hook_adapter, plugin_mcp_proxy
 
     monkeypatch.setenv("MEMFORGE_API_URL", "https://cloud.example.hana.ondemand.com")
+    monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "mount_tai")
 
     assert plugin_mcp_proxy._resource_url("/sources") == ("https://cloud.example.hana.ondemand.com/api/v1/sources")
@@ -1103,6 +1115,7 @@ def test_mcp_roots_and_hook_workspace_share_repository_workspace_override(monkey
         """
 [memforge]
 MEMFORGE_API_URL = "https://cloud.example.hana.ondemand.com"
+MEMFORGE_EDITION = "cloud"
 MEMFORGE_WORKSPACE_ID = "user_workspace"
 """,
         encoding="utf-8",
@@ -4502,7 +4515,12 @@ def _load_plugin_mcp_proxy():
 def _load_packaged_mcp_proxy(client: str, monkeypatch):
     root = Path(__file__).resolve().parents[1]
     proxy_path = root / "integrations" / client / "memforge-memory" / "scripts" / "memforge_mcp.py"
-    for name in ("memforge_api_target", "memforge_plugin_config", "memforge_repo_identity"):
+    for name in (
+        "memforge_api_target",
+        "memforge_capability_discovery",
+        "memforge_plugin_config",
+        "memforge_repo_identity",
+    ):
         monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.syspath_prepend(str(proxy_path.parent))
     module_name = f"memforge_mcp_{client.replace('-', '_')}_test"
@@ -4726,6 +4744,7 @@ def test_hook_adapter_uses_codex_plugin_config_when_hook_env_is_absent(monkeypat
         """
 [memforge]
 MEMFORGE_API_URL = "https://memforge.example.hana.ondemand.com"
+MEMFORGE_EDITION = "cloud"
 MEMFORGE_API_TOKEN = "config-token"
 MEMFORGE_WORKSPACE_ID = "mount_tai"
 """,
@@ -4773,6 +4792,7 @@ def test_post_json_uses_codex_plugin_config_for_workspace_and_token(monkeypatch,
         """
 [memforge]
 MEMFORGE_API_URL = "https://memforge.example.hana.ondemand.com"
+MEMFORGE_EDITION = "cloud"
 MEMFORGE_API_TOKEN = "config-token"
 MEMFORGE_WORKSPACE_ID = "mount_tai"
 """,

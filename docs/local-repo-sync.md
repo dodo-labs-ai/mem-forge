@@ -20,7 +20,7 @@ same URL can be supplied non-interactively, after which Cloud setup prompts for
 the token:
 
 ```bash
-memforge setup --api-url https://memforge.example.hana.ondemand.com
+memforge setup --api-url https://memory.example.com
 ```
 
 `memforge setup` registers a macOS LaunchAgent or Linux systemd user service,
@@ -28,6 +28,10 @@ starts it, and waits for the server-observed heartbeat. The API token is stored
 in the operating-system keyring rather than in the launchd property list,
 systemd unit, or MemForge config file. No `sudo`, hand-written service file, or
 user cron entry is required.
+
+Setup reads `/.well-known/memforge` from the exact origin to discover whether
+the service is self-hosted or Cloud and which health/authentication contract it
+uses. Custom domains therefore require no client-side DNS allowlist.
 
 When developing MemForge from a checkout, keep using the foreground command
 `uv run memforge adapter daemon run` instead of the installed command.

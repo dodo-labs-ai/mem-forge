@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 _LOCAL_OSS_ORIGIN = "http://127.0.0.1:8765"
-_CLOUD_HOST_SUFFIX = "hana.ondemand.com"
+CAPABILITY_PATH = "/.well-known/memforge"
+CAPABILITY_PROTOCOL = "memforge"
+CAPABILITY_PROTOCOL_VERSION = 1
 
 
 class Edition(str, Enum):
@@ -26,10 +29,14 @@ class TargetConfigurationError(ValueError):
 class MemForgeTarget:
     edition: Edition
     origin: str
+    api_base_path: str
+    health_path: str
+    authentication_required: bool
+    authentication_scheme: str
 
     @property
     def api_base(self) -> str:
-        return f"{self.origin}/api/v1"
+        return f"{self.origin}{self.api_base_path}"
 
     def resource_url(
         self,
@@ -53,21 +60,123 @@ class MemForgeTarget:
 def build_target(
     *,
     origin: str | None,
+    edition: Edition | str | None = None,
 ) -> MemForgeTarget:
-    """Build one canonical v1 target, deriving edition only from the hostname."""
+    """Build one canonical target from an explicit or local-default edition."""
     origin_value = _normalized_optional(origin)
 
     if origin_value is None:
-        return MemForgeTarget(Edition.OSS, _LOCAL_OSS_ORIGIN)
+        if edition not in {None, Edition.OSS, Edition.OSS.value}:
+            raise TargetConfigurationError("local_target_must_use_oss_edition")
+        return _target_for_edition(_LOCAL_OSS_ORIGIN, Edition.OSS)
 
-    canonical_origin = _canonical_origin(origin_value)
-    target_edition = Edition.CLOUD if _is_cloud_origin(canonical_origin) else Edition.OSS
-    return MemForgeTarget(target_edition, canonical_origin)
+    normalized_origin = canonical_origin(origin_value)
+    if edition is None:
+        raise TargetConfigurationError("memforge_edition_required")
+    try:
+        target_edition = Edition(edition)
+    except ValueError as exc:
+        raise TargetConfigurationError("memforge_edition_invalid") from exc
+    return _target_for_edition(normalized_origin, target_edition)
 
 
-def build_host_target(*, origin: str | None) -> MemForgeTarget:
+def build_host_target(
+    *,
+    origin: str | None,
+    edition: Edition | str | None = None,
+) -> MemForgeTarget:
     """Build a host-level target for APIs that are not workspace-routed."""
-    return build_target(origin=origin)
+    return build_target(origin=origin, edition=edition)
+
+
+def capability_document(edition: Edition) -> dict[str, Any]:
+    """Return the public protocol-v1 capability document for one edition."""
+    target = _target_for_edition("http://capability.invalid", edition)
+    return {
+        "protocol": CAPABILITY_PROTOCOL,
+        "protocol_version": CAPABILITY_PROTOCOL_VERSION,
+        "edition": edition.value,
+        "api_base": target.api_base_path,
+        "health_path": target.health_path,
+        "authentication": {
+            "required": target.authentication_required,
+            "scheme": target.authentication_scheme,
+        },
+    }
+
+
+def target_from_capability_document(
+    *,
+    origin: str,
+    document: Mapping[str, Any],
+) -> MemForgeTarget:
+    """Validate one protocol-v1 discovery document and bind it to its origin."""
+    expected_keys = {
+        "protocol",
+        "protocol_version",
+        "edition",
+        "api_base",
+        "health_path",
+        "authentication",
+    }
+    if set(document) != expected_keys:
+        raise TargetConfigurationError("memforge_capability_schema_invalid")
+    if document.get("protocol") != CAPABILITY_PROTOCOL:
+        raise TargetConfigurationError("memforge_capability_protocol_invalid")
+    version = document.get("protocol_version")
+    if type(version) is not int or version != CAPABILITY_PROTOCOL_VERSION:
+        raise TargetConfigurationError("memforge_capability_version_unsupported")
+    try:
+        edition = Edition(document.get("edition"))
+    except (TypeError, ValueError) as exc:
+        raise TargetConfigurationError("memforge_capability_edition_invalid") from exc
+    authentication = document.get("authentication")
+    if not isinstance(authentication, Mapping) or set(authentication) != {"required", "scheme"}:
+        raise TargetConfigurationError("memforge_capability_auth_invalid")
+    required = authentication.get("required")
+    scheme = authentication.get("scheme")
+    expected_scheme = "bearer" if required is True else "none"
+    if type(required) is not bool or scheme != expected_scheme:
+        raise TargetConfigurationError("memforge_capability_auth_invalid")
+    api_base_path = _capability_path(document.get("api_base"), field="api_base")
+    health_path = _capability_path(document.get("health_path"), field="health_path")
+    expected = _target_for_edition(canonical_origin(origin), edition)
+    if (
+        api_base_path != expected.api_base_path
+        or health_path != expected.health_path
+        or required != expected.authentication_required
+    ):
+        raise TargetConfigurationError("memforge_capability_contract_invalid")
+    return expected
+
+
+def _target_for_edition(origin: str, edition: Edition) -> MemForgeTarget:
+    if edition is Edition.CLOUD:
+        return MemForgeTarget(
+            edition=edition,
+            origin=origin,
+            api_base_path="/api/v1",
+            health_path="/healthz",
+            authentication_required=True,
+            authentication_scheme="bearer",
+        )
+    return MemForgeTarget(
+        edition=edition,
+        origin=origin,
+        api_base_path="/api/v1",
+        health_path="/api/v1/health",
+        authentication_required=False,
+        authentication_scheme="none",
+    )
+
+
+def _capability_path(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.startswith("/") or value.startswith("//"):
+        raise TargetConfigurationError(f"memforge_capability_{field}_invalid")
+    parsed = urlsplit(value)
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        raise TargetConfigurationError(f"memforge_capability_{field}_invalid")
+    return value
 
 
 def _normalized_optional(value: str | None) -> str | None:
@@ -75,7 +184,7 @@ def _normalized_optional(value: str | None) -> str | None:
     return normalized or None
 
 
-def _canonical_origin(origin: str | None) -> str:
+def canonical_origin(origin: str | None) -> str:
     if origin is None:
         raise TargetConfigurationError("memforge_origin_required")
     try:
@@ -95,8 +204,3 @@ def _canonical_origin(origin: str | None) -> str:
     ):
         raise TargetConfigurationError("memforge_origin_required")
     return origin.rstrip("/")
-
-
-def _is_cloud_origin(origin: str) -> bool:
-    hostname = (urlsplit(origin).hostname or "").lower().rstrip(".")
-    return hostname == _CLOUD_HOST_SUFFIX or hostname.endswith(f".{_CLOUD_HOST_SUFFIX}")
