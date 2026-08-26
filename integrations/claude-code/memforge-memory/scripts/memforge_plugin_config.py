@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import os
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Mapping
 
 if __package__:
     from .memforge_api_target import MemForgeTarget, build_target
+    from .memforge_capability_discovery import discover_target
 else:  # pragma: no cover - direct file load used by packaged integrations
     from memforge_api_target import MemForgeTarget, build_target
+    from memforge_capability_discovery import discover_target
 
 
 _CONFIG_CACHE: dict[str, str] | None = None
@@ -26,8 +29,25 @@ _BASIC_TOML_STRING = re.compile(
 
 
 def configured_target() -> MemForgeTarget:
-    origin = _configured_value("MEMFORGE_API_URL", "").strip() or None
-    return build_target(origin=origin)
+    environment_origin = os.getenv("MEMFORGE_API_URL", "").strip()
+    if environment_origin:
+        return _target_for_configuration(
+            environment_origin,
+            os.getenv("MEMFORGE_EDITION", "").strip(),
+        )
+
+    config = _codex_memforge_config()
+    return _target_for_configuration(
+        config.get("MEMFORGE_API_URL", "").strip(),
+        config.get("MEMFORGE_EDITION", "").strip(),
+    )
+
+
+@lru_cache(maxsize=8)
+def _target_for_configuration(origin: str, edition: str) -> MemForgeTarget:
+    if not origin:
+        return build_target(origin=None)
+    return build_target(origin=origin, edition=edition) if edition else discover_target(origin)
 
 
 def configured_api_token() -> str:

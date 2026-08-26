@@ -105,6 +105,7 @@ class StoredDaemonTarget:
 
     api_url: str
     keyring_account: str | None
+    edition: str | None = None
 
 
 @dataclass(frozen=True)
@@ -159,7 +160,13 @@ class DaemonCredentialStore:
     def _account(api_url: str) -> str:
         return hashlib.sha256(api_url.encode("utf-8")).hexdigest()
 
-    def save(self, *, api_url: str, api_token: str | None) -> StoredDaemonTarget:
+    def save(
+        self,
+        *,
+        api_url: str,
+        api_token: str | None,
+        edition: str | None = None,
+    ) -> StoredDaemonTarget:
         normalized_url = api_url.rstrip("/")
         account = self._account(normalized_url) if api_token else None
         previous = self.load() if self.path.exists() else None
@@ -187,6 +194,8 @@ class DaemonCredentialStore:
             "api_url": normalized_url,
             "keyring_account": account,
         }
+        if edition:
+            payload["edition"] = edition
         try:
             _atomic_write(
                 self.path,
@@ -206,7 +215,7 @@ class DaemonCredentialStore:
             if credential_rollback_error is not None:
                 detail += f"; credential rollback failed: {credential_rollback_error}"
             raise DaemonServiceError(detail) from exc
-        return StoredDaemonTarget(api_url=normalized_url, keyring_account=account)
+        return StoredDaemonTarget(api_url=normalized_url, keyring_account=account, edition=edition)
 
     def load(self) -> StoredDaemonTarget:
         try:
@@ -219,13 +228,20 @@ class DaemonCredentialStore:
             raise DaemonServiceError(f"Unsupported daemon service config: {self.path}")
         api_url = str(payload.get("api_url") or "").strip().rstrip("/")
         account = payload.get("keyring_account")
-        if not api_url or (account is not None and not isinstance(account, str)):
+        edition = payload.get("edition")
+        if (
+            not api_url
+            or (account is not None and not isinstance(account, str))
+            or (edition is not None and edition not in {"oss", "cloud"})
+        ):
             raise DaemonServiceError(f"Invalid daemon service config: {self.path}")
-        return StoredDaemonTarget(api_url=api_url, keyring_account=account)
+        return StoredDaemonTarget(api_url=api_url, keyring_account=account, edition=edition)
 
     def environment(self) -> dict[str, str]:
         target = self.load()
         environment = {"MEMFORGE_API_URL": target.api_url}
+        if target.edition:
+            environment["MEMFORGE_EDITION"] = target.edition
         if target.keyring_account:
             try:
                 token = self.keyring.get_password(KEYRING_SERVICE, target.keyring_account)
@@ -275,7 +291,11 @@ class DaemonCredentialStore:
         if snapshot is None:
             self.delete(strict=True)
             return
-        self.save(api_url=snapshot.target.api_url, api_token=snapshot.api_token)
+        self.save(
+            api_url=snapshot.target.api_url,
+            api_token=snapshot.api_token,
+            edition=snapshot.target.edition,
+        )
         if current is not None and current.keyring_account != snapshot.target.keyring_account:
             self.delete_secret(current, strict=True)
 
@@ -695,11 +715,18 @@ class DaemonServiceManager:
             credentials=DaemonCredentialStore(paths.config),
         )
 
-    def replace(self, *, executable: str, api_url: str, api_token: str | None) -> DaemonServiceReplacement:
+    def replace(
+        self,
+        *,
+        executable: str,
+        api_url: str,
+        api_token: str | None,
+        edition: str | None = None,
+    ) -> DaemonServiceReplacement:
         launch = DaemonLaunchSpec.for_executable(executable)
         service_snapshot = self.adapter.snapshot()
         credential_snapshot = self.credentials.snapshot()
-        current_target = self.credentials.save(api_url=api_url, api_token=api_token)
+        current_target = self.credentials.save(api_url=api_url, api_token=api_token, edition=edition)
         try:
             self.adapter.apply(launch)
         except Exception as apply_error:
@@ -721,8 +748,20 @@ class DaemonServiceManager:
             current_target=current_target,
         )
 
-    def install(self, *, executable: str, api_url: str, api_token: str | None) -> dict[str, Any]:
-        replacement = self.replace(executable=executable, api_url=api_url, api_token=api_token)
+    def install(
+        self,
+        *,
+        executable: str,
+        api_url: str,
+        api_token: str | None,
+        edition: str | None = None,
+    ) -> dict[str, Any]:
+        replacement = self.replace(
+            executable=executable,
+            api_url=api_url,
+            api_token=api_token,
+            edition=edition,
+        )
         try:
             replacement.commit()
         except Exception as commit_error:

@@ -57,7 +57,7 @@ def server():
 
 def test_tool_client_jira_session_round_trip(server):
     client = ToolClient(
-        target=build_target(origin=server),
+        target=build_target(origin=server, edition="oss"),
         api_token=None,
     )
     assert client.get_jira_session("https://jira.example.test")["status"] == "active"

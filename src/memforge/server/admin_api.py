@@ -30,6 +30,8 @@ from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from memforge.api_target import CAPABILITY_PATH, Edition, capability_document
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from memforge.config import DEFAULT_SEARCH_TOP_K, AppConfig
@@ -3521,6 +3523,17 @@ def create_admin_app(
     # ===================================================================
     # 1. Health & Stats
     # ===================================================================
+
+    @health_router.get(CAPABILITY_PATH)
+    async def capabilities() -> JSONResponse:
+        """Declare the origin-scoped OSS protocol contract."""
+        return JSONResponse(
+            capability_document(Edition.OSS),
+            headers={
+                "Cache-Control": "public, max-age=300",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @health_router.get("/api/v1/workspaces")
     async def list_workspaces(request: Request) -> dict[str, object]:
