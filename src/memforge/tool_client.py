@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from memforge.api_target import MemForgeTarget
+from memforge.api_target import Edition, MemForgeTarget
 from memforge.config import DEFAULT_SEARCH_TOP_K
 from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.sync_progress import normalize_sync_progress_snapshot
@@ -76,6 +76,11 @@ class ToolClient:
     def _host_url(self, path: str) -> str:
         if not path.startswith("/api/"):
             raise ValueError("host_path_must_start_with_api")
+        return self._origin_url(path)
+
+    def _origin_url(self, path: str) -> str:
+        if not path.startswith("/") or path.startswith("//"):
+            raise ValueError("origin_path_must_be_absolute")
         return f"{self.target.origin}{path}"
 
     def search(
@@ -839,6 +844,8 @@ class ToolClient:
         return self._resource_json("POST", "/auth/jira-session/expire", {"base_url": base_url, "error": error})
 
     def health(self) -> dict[str, Any]:
+        if self.target.edition is Edition.CLOUD:
+            return self._http_json("GET", self._origin_url("/healthz"), None)
         return self._resource_json("GET", "/health", None)
 
     def get_resource(
