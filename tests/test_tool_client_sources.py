@@ -22,9 +22,9 @@ from memforge.tool_client import ToolClient
 class _RecordingClient(ToolClient):
     """ToolClient that captures the _http_json call instead of making a request."""
 
-    def __init__(self, response: dict[str, Any]) -> None:
+    def __init__(self, response: dict[str, Any], *, origin: str = "https://self.example.test") -> None:
         super().__init__(
-            target=build_target(origin="https://self.example.test"),
+            target=build_target(origin=origin),
             api_token="tok",
         )
         self._response = response
@@ -33,6 +33,19 @@ class _RecordingClient(ToolClient):
     def _http_json(self, method, url, body):  # type: ignore[override]
         self.calls.append((method, url.removeprefix(self.target.origin), body))
         return self._response
+
+
+def test_health_uses_edition_owned_host_contract():
+    self_hosted = _RecordingClient({"status": "ok"})
+    cloud = _RecordingClient(
+        {"status": "ok"},
+        origin="https://memforge.example.hana.ondemand.com",
+    )
+
+    assert self_hosted.health() == {"status": "ok"}
+    assert cloud.health() == {"status": "ok"}
+    assert self_hosted.calls == [("GET", "/api/v1/health", None)]
+    assert cloud.calls == [("GET", "/healthz", None)]
 
 
 def test_create_source_posts_type_name_and_config():
