@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from memforge.agent_knowledge_markdown import (
     render_agent_concept_markdown,
@@ -59,6 +59,9 @@ from memforge.models import (
     slugify,
 )
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
+from memforge.pipeline.projection_fragments import (
+    resolve_projected_agent_claim_fragment,
+)
 from memforge.pipeline.source_projection_adapters import project_source_item
 
 
@@ -132,9 +135,61 @@ class AgentKnowledgePatchProposal(BaseModel):
     reason: str = ""
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     citations: list[str] = Field(default_factory=list)
-    primary_evidence_ids: list[str] = Field(default_factory=list)
+    primary_event_id: str | None = None
+    required_event_ids: list[str] = Field(default_factory=list)
     covered_concept_id: str | None = None
     covered_claim_id: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_single_legacy_primary_event(cls, value: object):
+        """Read one legacy primary while refusing arbitrary multi-Primary collapse."""
+
+        if not isinstance(value, Mapping) or "primary_evidence_ids" not in value:
+            return value
+        normalized = dict(value)
+        if normalized.get("primary_event_id") not in {None, ""}:
+            raise ValueError("patch cannot mix primary_event_id with legacy primary_evidence_ids")
+        raw_ids = normalized.pop("primary_evidence_ids")
+        if not isinstance(raw_ids, list):
+            raise ValueError("legacy primary_evidence_ids must be a list")
+        ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        if len(ids) > 1:
+            raise ValueError("legacy patch has multiple independent Primary events")
+        normalized["primary_event_id"] = ids[0] if ids else None
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_fixed_event_support(self):
+        if self.primary_event_id is not None:
+            self.primary_event_id = self.primary_event_id.strip() or None
+        self.required_event_ids = [value.strip() for value in self.required_event_ids]
+        if any(not value for value in self.required_event_ids):
+            raise ValueError("required_event_ids cannot contain blank values")
+        if len(set(self.required_event_ids)) != len(self.required_event_ids):
+            raise ValueError("required_event_ids must be duplicate-free")
+        if self.primary_event_id in self.required_event_ids:
+            raise ValueError("primary_event_id cannot also be Required")
+        if self.action == "no_output":
+            if self.primary_event_id is not None or self.required_event_ids:
+                raise ValueError("no_output cannot select Evidence events")
+        return self
+
+    @property
+    def primary_evidence_ids(self) -> list[str]:
+        """Compatibility read for completed legacy callers; never part of v9 schema."""
+
+        return [self.primary_event_id] if self.primary_event_id is not None else []
+
+
+class AgentKnowledgePatchModelResponse(AgentKnowledgePatchProposal):
+    """Provider response schema; internal application commands stay separately authorized."""
+
+    @model_validator(mode="after")
+    def _require_model_primary_event(self):
+        if self.action != "no_output" and self.primary_event_id is None:
+            raise ValueError("non-no_output patch requires exactly one primary_event_id")
+        return self
 
 
 @dataclass(frozen=True)
@@ -746,6 +801,8 @@ class AgentKnowledgeBundleService:
             incumbent_memory_id=None,
             reconcile_action=ReconcileAction.ADD,
             reconciliation_reason=proposal.reason or "agent claim created",
+            primary_event_id=proposal.primary_event_id,
+            required_event_ids=tuple(proposal.required_event_ids),
         )
         plan, unit = self._bind_relation_evidence_to_plan(
             plan=plan,
@@ -825,6 +882,8 @@ class AgentKnowledgeBundleService:
         reconcile_action: ReconcileAction,
         reconciliation_reason: str,
         memory_extraction_context: str | None = None,
+        primary_event_id: str | None = None,
+        required_event_ids: tuple[str, ...] = (),
     ):
         """Build the provider-neutral projection and complete claim plan.
 
@@ -931,6 +990,22 @@ class AgentKnowledgeBundleService:
             project_key=project_key,
             repo_identifier=repo_identifier,
         )
+        if raw_memory is not None:
+            resolved_selection, event_receipt = resolve_projected_agent_claim_fragment(
+                projection,
+                claim_text=claim_text,
+                access_context_hash=access_hash,
+                primary_event_id=primary_event_id,
+                required_event_ids=required_event_ids,
+            )
+            raw_memory = replace(
+                raw_memory,
+                resolved_evidence_selection=resolved_selection,
+                support_validation={
+                    **raw_memory.support_validation,
+                    "agent_event_source_range_receipt": event_receipt.to_payload(),
+                },
+            )
         source_support = await self.db.get_source_unit_support_reference_ids(
             scope.source_unit_id
         )
@@ -1166,6 +1241,8 @@ class AgentKnowledgeBundleService:
                 else ReconcileAction.SUPERSEDE
             ),
             reconciliation_reason=replacement_reason,
+            primary_event_id=proposal.primary_event_id,
+            required_event_ids=tuple(proposal.required_event_ids),
             memory_extraction_context=memory_extraction_context,
         )
         plan, unit = self._bind_relation_evidence_to_plan(
@@ -1616,7 +1693,8 @@ Decision boundary:
 - If it belongs in an existing concept but is a distinct durable claim, use add_new_claim and copy the exact concept_id when the listed concept is unambiguous.
 - If it is a new durable concept, use create_new_concept with a concise title and concept_type.
 - If nothing durable should be kept, use no_output.
-- Agent-session memory is user-anchored: non-no_output actions require at least one primary_evidence_ids entry from <primary_evidence>.
+- Agent-session memory is user-anchored: non-no_output actions require exactly one primary_event_id copied from <primary_evidence>.
+- required_event_ids is duplicate-free and contains only necessary user-authored dependency events; do not include merely helpful context.
 - Primary evidence is explicit durable user intent: a user-authored preference, approval, design decision, rule, convention, or instruction to remember something for future work.
 - Generic chat control such as "continue", "do it", "retry", or "ok" is supporting context, not durable memory authority.
 - Primary evidence authorizes the durable claim. Supporting evidence can explain, qualify, or provide provenance, but Supporting evidence cannot by itself authorize create_new_concept or add_new_claim.
@@ -1651,7 +1729,7 @@ IDs are optional for update_existing_claim and supersede_existing_claim when the
 </comparison_context>
 
 <primary_evidence>
-Explicit durable user intent that may authorize durable memory. Non-no_output actions must cite one or more IDs from this section in primary_evidence_ids.
+Explicit durable user intent that may authorize durable memory. A non-no_output action must copy exactly one ID from this section into primary_event_id.
 {primary_evidence}
 </primary_evidence>
 

@@ -1083,8 +1083,9 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
     calls: list[dict[str, object]] = []
     payloads = {
         "SourceSupportResponse": '{"decisions":[]}',
-        "MemoryExtractionResponse": '{"memories":[]}',
-        "ProjectionMemoryExtractionResponse": '{"memories":[]}',
+            "MemoryExtractionResponse": '{"memories":[]}',
+            "ProjectionMemoryExtractionResponse": '{"memories":[]}',
+            "ProjectionFragmentMemoryExtractionResponse": '{"memories":[]}',
         "CandidateLedgerResponse": '{"decisions":[]}',
         "IncumbentSupportAuditResponse": '{"decisions":[]}',
         "RevisionCompositionResponse": '{"decisions":[]}',
@@ -1094,7 +1095,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "EntityBatchValidationResponse": '{"decisions":[]}',
         "QueryEntityDetectionResponse": '{"entity_ids":[]}',
         "RerankResponse": '{"ranking":[]}',
-        "AgentKnowledgePatchProposal": '{"action":"no_output"}',
+            "AgentKnowledgePatchModelResponse": '{"action":"no_output"}',
         "AgentSessionAuthorityResponse": '{"decisions":[]}',
         "OfflineSemanticJudgeResponse": (
             '{"verdict":"criterion_satisfied",'
@@ -1121,10 +1122,16 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
     operations = {
         "verify_source_support": lambda: client.verify_source_support("prompt"),
         "extract_memories": lambda: client.extract_memories("prompt", max_tokens=512),
-        "extract_projection_memories": lambda: client.extract_projection_memories(
-            "prompt",
-            max_tokens=512,
-        ),
+            "extract_projection_memories": lambda: client.extract_projection_memories(
+                "prompt",
+                max_tokens=512,
+            ),
+            "extract_projection_fragment_memories": (
+                lambda: client.extract_projection_fragment_memories(
+                    "prompt",
+                    max_tokens=512,
+                )
+            ),
         "select_memory_candidates": lambda: client.select_memory_candidates("prompt"),
         "audit_incumbent_support": lambda: client.audit_incumbent_support("prompt"),
         "prove_revision_compositions": lambda: client.prove_revision_compositions("prompt"),

@@ -42,6 +42,10 @@ type TransientEvidenceBlockId = Annotated[
     str,
     Field(min_length=1, pattern=r"^EB-\d{3,}$"),
 ]
+type TransientEvidenceFragmentRef = Annotated[
+    str,
+    Field(min_length=1, pattern=r"^f\d{6}$"),
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +384,37 @@ class ProjectionMemoryExtractionResponse(StructuredResponseModel):
 
     memories: list[ProjectionMemoryCandidate]
     artifact_summaries: list[ArtifactSelectionSummary] = Field(default_factory=list)
+
+
+class ProjectionFragmentMemoryCandidate(StructuredResponseModel):
+    """v9 model judgment with catalog-local selectors and no authority fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1)
+    memory_type: Literal["fact", "decision", "convention", "procedure"]
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    entity_refs: list[str] = Field(default_factory=list)
+    valid_from: str | None = None
+    valid_until: str | None = None
+    primary_ref: TransientEvidenceFragmentRef
+    required_refs: list[TransientEvidenceFragmentRef] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _require_one_duplicate_free_support_set(self):
+        if self.primary_ref in self.required_refs:
+            raise ValueError("primary_ref cannot also appear in required_refs")
+        if len(set(self.required_refs)) != len(self.required_refs):
+            raise ValueError("required_refs must be duplicate-free")
+        return self
+
+
+class ProjectionFragmentMemoryExtractionResponse(StructuredResponseModel):
+    """projection-extraction-v9 response containing model judgments only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    memories: list[ProjectionFragmentMemoryCandidate]
 
 
 class CandidateLedgerDecision(StructuredResponseModel):
@@ -856,6 +891,16 @@ class SourceSupportStructuredClient(Protocol):
         images: tuple[StructuredLlmImage, ...] = (),
     ) -> ProjectionMemoryExtractionResponse:
         """Return projection judgments without datastore-owned anchor fields."""
+
+    async def extract_projection_fragment_memories(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> ProjectionFragmentMemoryExtractionResponse:
+        """Return v9 projection judgments with transient Fragment selectors."""
 
     async def select_memory_candidates(
         self,
@@ -1600,6 +1645,22 @@ class LiteLlmStructuredClient:
             images=images,
         )
 
+    async def extract_projection_fragment_memories(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> ProjectionFragmentMemoryExtractionResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=ProjectionFragmentMemoryExtractionResponse,
+            max_tokens=max_tokens,
+            model=model,
+            images=images,
+        )
+
     async def select_memory_candidates(
         self,
         prompt: str,
@@ -1747,11 +1808,11 @@ class LiteLlmStructuredClient:
         max_tokens: int = 2048,
         model: str | None = None,
     ):
-        from memforge.agent_knowledge import AgentKnowledgePatchProposal
+        from memforge.agent_knowledge import AgentKnowledgePatchModelResponse
 
         return await self._call_schema(
             prompt=prompt,
-            response_format=AgentKnowledgePatchProposal,
+            response_format=AgentKnowledgePatchModelResponse,
             max_tokens=max_tokens,
             model=model,
         )

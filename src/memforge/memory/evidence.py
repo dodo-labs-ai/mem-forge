@@ -8,7 +8,7 @@ from enum import Enum
 from hashlib import sha256
 from typing import Any, Generic, Mapping, Protocol, TypeVar
 
-from memforge.source_projection import SourceAnchor
+from memforge.source_projection import AnchorKind, SourceAnchor
 
 
 CandidateT = TypeVar("CandidateT")
@@ -74,6 +74,90 @@ class EvidenceRole(str, Enum):
     PRIMARY = "primary"
     REQUIRED = "required"
     CONTEXT = "context"
+
+
+class EvidencePartKind(str, Enum):
+    """Authoritative representation of one resolved Evidence Unit part."""
+
+    TEXT = "text"
+    ARTIFACT = "artifact"
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedEvidencePart:
+    """One exact application-resolved selection, after transient ref lookup."""
+
+    role: EvidenceRole
+    kind: EvidencePartKind
+    anchor: SourceAnchor
+    raw_content_sha256: str
+    presentation_sha256: str
+    excerpt: str | None = None
+    artifact_metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.role not in {EvidenceRole.PRIMARY, EvidenceRole.REQUIRED}:
+            raise ValueError("resolved Evidence parts must be Primary or Required")
+        for name, value in (
+            ("raw_content_sha256", self.raw_content_sha256),
+            ("presentation_sha256", self.presentation_sha256),
+        ):
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+        if self.kind is EvidencePartKind.TEXT:
+            if self.anchor.kind is not AnchorKind.REVISION_RANGE or self.excerpt is None:
+                raise ValueError("text Evidence requires an exact range and excerpt")
+            if self.artifact_metadata:
+                raise ValueError("text Evidence cannot carry Artifact metadata")
+        elif self.anchor.kind is not AnchorKind.WHOLE_OBSERVATION:
+            raise ValueError("Artifact Evidence requires a whole-Observation Anchor")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedEvidenceSelection:
+    """Complete resolved Primary-plus-Required selection for one v9 candidate."""
+
+    source_id: str
+    source_unit_id: str
+    target_unit_revision_id: str
+    access_context_hash: str
+    catalog_digest: str
+    compiler_contract_version: int
+    parts: tuple[ResolvedEvidencePart, ...]
+
+    def __post_init__(self) -> None:
+        if not all(
+            value
+            for value in (
+                self.source_id,
+                self.source_unit_id,
+                self.target_unit_revision_id,
+                self.access_context_hash,
+                self.catalog_digest,
+            )
+        ):
+            raise ValueError("resolved Evidence selection identity is incomplete")
+        if self.compiler_contract_version <= 0:
+            raise ValueError("compiler contract version must be positive")
+        primary_count = sum(part.role is EvidenceRole.PRIMARY for part in self.parts)
+        if primary_count != 1:
+            raise ValueError("resolved Evidence selection requires exactly one Primary")
+        identities: set[tuple[object, ...]] = set()
+        for part in self.parts:
+            anchor = part.anchor
+            identity = (
+                part.role,
+                part.kind,
+                anchor.observation_id,
+                anchor.observation_revision_id,
+                anchor.kind,
+                anchor.range_start,
+                anchor.range_end,
+                part.raw_content_sha256,
+            )
+            if identity in identities:
+                raise ValueError("resolved Evidence selection contains a duplicate part")
+            identities.add(identity)
 
 
 @dataclass(frozen=True, slots=True)
