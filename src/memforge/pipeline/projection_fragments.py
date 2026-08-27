@@ -223,7 +223,7 @@ def compile_projection_fragment_catalog(
     batch: ProjectionExtractionBatch,
     *,
     access_context_hash: str,
-    required_authority_observation_ids: tuple[str, ...] = (),
+    required_authority_observation_ids: tuple[str, ...] | None = None,
     supplied_artifact_observation_ids: tuple[str, ...] = (),
     max_fragments: int = DEFAULT_MAX_FRAGMENTS,
     max_presentation_chars: int = DEFAULT_MAX_PRESENTATION_CHARS,
@@ -248,7 +248,11 @@ def compile_projection_fragment_catalog(
         if revision.id in set(unit_revision.observation_revision_ids)
     }
     observation_ids = {observation.id for observation in projection.observations}
-    required_ids = set(required_authority_observation_ids)
+    required_ids = set(
+        batch.required_authority_observation_ids
+        if required_authority_observation_ids is None
+        else required_authority_observation_ids
+    )
     if not required_ids.issubset(batch.context_observation_ids):
         raise ValueError("Required authority must come from the bounded batch dependency input")
     selectable_ids = set(batch.primary_observation_ids) | required_ids

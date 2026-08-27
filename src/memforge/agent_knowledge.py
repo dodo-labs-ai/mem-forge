@@ -33,6 +33,7 @@ from memforge.memory.evidence import (
     RelationOutcomeBundle,
     RelationRunRecord,
     RelationType,
+    SupportScopeVersion,
     build_candidate_universe,
     build_mandatory_candidate_bucket_results,
     relation_bundle_snapshot_audit,
@@ -1006,8 +1007,13 @@ class AgentKnowledgeBundleService:
                     "agent_event_source_range_receipt": event_receipt.to_payload(),
                 },
             )
-        source_support = await self.db.get_source_unit_support_reference_ids(
-            scope.source_unit_id
+        support_scope_version = await self.db.get_support_scope_version()
+        source_support = (
+            await self.db.get_source_unit_support_unit_ids(scope.source_unit_id)
+            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+            else await self.db.get_source_unit_support_reference_ids(
+                scope.source_unit_id
+            )
         )
         incumbents: dict[str, Memory] = {}
         incumbent_candidates: dict[str, RawMemory] = {}
@@ -1027,6 +1033,22 @@ class AgentKnowledgeBundleService:
                 )
         if incumbent_memory_id is not None and incumbent_memory_id not in incumbents:
             raise ValueError("agent claim replacement lacks current Source Unit support")
+        for memory_id, candidate in tuple(incumbent_candidates.items()):
+            if memory_id == incumbent_memory_id:
+                continue
+            selection, receipt = resolve_projected_agent_claim_fragment(
+                projection,
+                claim_text=candidate.evidence_quote or "",
+                access_context_hash=access_hash,
+            )
+            incumbent_candidates[memory_id] = replace(
+                candidate,
+                resolved_evidence_selection=selection,
+                support_validation={
+                    **candidate.support_validation,
+                    "agent_event_source_range_receipt": receipt.to_payload(),
+                },
+            )
         evidence_candidates = [
             candidate
             for memory_id, candidate in sorted(incumbent_candidates.items())
@@ -1046,6 +1068,7 @@ class AgentKnowledgeBundleService:
             access_context_hash=access_hash,
             extractor_run_id=projection.run_id,
             observed_at=observed_at.isoformat(),
+            support_scope_version=support_scope_version,
         )
         canonical_memories = evidence.canonical_memories_by_claim_hash
         incumbent_candidates = {
@@ -1075,8 +1098,11 @@ class AgentKnowledgeBundleService:
                 reason=reconciliation_reason,
             )
         )
+        active_support_states = await self.db.get_active_memory_support_states(
+            tuple(incumbents)
+        )
         all_active_support = {
-            memory_id: await self.db.get_active_memory_support_reference_ids(memory_id)
+            memory_id: active_support_states[memory_id].support_ids
             for memory_id in incumbents
         }
         support_hashes = {
@@ -1098,6 +1124,18 @@ class AgentKnowledgeBundleService:
             ),
             new_evidence_reference_ids=(),
             evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
+            support_scope_version=support_scope_version,
+            source_support_unit_ids=(
+                source_support
+                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                else None
+            ),
+            all_active_support_unit_ids=(
+                all_active_support
+                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                else None
+            ),
+            evidence_unit_ids_by_claim_hash=evidence.evidence_unit_ids_by_claim_hash,
             defaults=NewMemoryDefaults(
                 visibility=Visibility.PRIVATE.value,
                 owner_user_id=owner_user_id,
@@ -1268,7 +1306,10 @@ class AgentKnowledgeBundleService:
                 submitted_at=submitted_at,
             )
             await self.db.record_relation_outcome_bundle(relation_outcome)
-            if not await self.db.get_active_memory_support_reference_ids(old_memory_id):
+            active_support = await self.db.get_active_memory_support_states(
+                (old_memory_id,)
+            )
+            if not active_support[old_memory_id].support_ids:
                 raise RuntimeError("agent claim replacement retry lacks active Source Projection support")
             current_memory = await self.db.get_memory(old_memory_id)
             if current_memory is None or current_memory.status != "active":

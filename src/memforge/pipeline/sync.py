@@ -70,7 +70,11 @@ from memforge.memory.lifecycle_plan import (
     AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON,
     ReconciliationScope,
 )
-from memforge.memory.lifecycle_planner import lifecycle_plan_id
+from memforge.memory.evidence import SupportScopeVersion
+from memforge.memory.lifecycle_planner import (
+    lifecycle_access_context_hash,
+    lifecycle_plan_id,
+)
 from memforge.memory.project_resolver import resolve_project_key
 from memforge.source_projection import (
     ProjectionCoverage,
@@ -99,6 +103,11 @@ from memforge.source_derivation import (
     SourceUnitDeriver,
     aggregate_extraction_metrics,
 )
+from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_V9
+from memforge.pipeline.projection_fragments import (
+    compile_projection_fragment_catalog,
+)
+from memforge.source_access import memory_visibility_for_source_id
 from memforge.source_projection_config import canonical_projection_scope
 
 if TYPE_CHECKING:
@@ -2728,6 +2737,23 @@ class GeneSyncOrchestrator:
     ) -> MemoryExtractionResult:
         """Execute durable extraction work for one Source Unit revision."""
 
+        support_scope_version = await self.db.get_support_scope_version()
+        extraction_contract_version = (
+            PROJECTION_EXTRACTION_V9
+            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+            else SOURCE_DERIVATION_CONTRACT_VERSION
+        )
+        visibility, owner_user_id = await memory_visibility_for_source_id(
+            self.db,
+            source_id=source_id,
+        )
+        access_context_hash = lifecycle_access_context_hash(
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            project_key=derivation_context.project_key,
+            repo_identifier=derivation_context.repo_identifier,
+        )
+
         async def extract_one(batch):
             if isinstance(batch, DiffGuidedExtractionBatch):
                 async with self._heavy_work_slot(source_id):
@@ -2764,24 +2790,50 @@ class GeneSyncOrchestrator:
                     return result
 
             primary_ids = set(batch.primary_observation_ids)
+            supplied_observation_ids = primary_ids | set(
+                batch.required_authority_observation_ids
+            )
+            input_binary_bytes = (
+                batch.primary_image_bytes + batch.required_image_bytes
+            )
             async with self._heavy_work_slot(
                 source_id,
-                multimodal=batch.primary_image_bytes > 0,
+                multimodal=input_binary_bytes > 0,
             ) as admission:
                 batch_images = self._projection_images(
                     projection=projection,
-                    observation_ids=primary_ids,
+                    observation_ids=supplied_observation_ids,
                 )
-                result = await self.memory_extractor.extract_projection_batch_memories(
-                    batch,
-                    source_type=source_type,
-                    doc_type=doc_type,
-                    images=batch_images,
-                )
+                if (
+                    support_scope_version
+                    is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                ):
+                    catalog = compile_projection_fragment_catalog(
+                        projection,
+                        batch,
+                        access_context_hash=access_context_hash,
+                        supplied_artifact_observation_ids=tuple(
+                            image.source_observation_id for image in batch_images
+                        ),
+                    )
+                    result = await self.memory_extractor.extract_projection_fragment_memories(
+                        catalog,
+                        source_type=source_type,
+                        doc_type=doc_type,
+                        context_markdown=batch.context_markdown,
+                        images=batch_images,
+                    )
+                else:
+                    result = await self.memory_extractor.extract_projection_batch_memories(
+                        batch,
+                        source_type=source_type,
+                        doc_type=doc_type,
+                        images=batch_images,
+                    )
                 result.metadata = {
                     **(result.metadata or {}),
                     "extraction_queue_wait_ms": admission.queue_wait_ms,
-                    "input_binary_bytes": batch.primary_image_bytes,
+                    "input_binary_bytes": input_binary_bytes,
                     "multimodal_calls": int(admission.multimodal),
                     "max_active_multimodal": admission.active_multimodal,
                 }
@@ -2810,6 +2862,7 @@ class GeneSyncOrchestrator:
                 context=derivation_context,
                 extract_batch=extract_one,
                 max_concurrent=self._source_parallelism_limit(),
+                extraction_contract_version=extraction_contract_version,
             )
         )
         result.extraction.derivation_id = result.derivation.id

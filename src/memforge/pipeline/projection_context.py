@@ -31,6 +31,8 @@ class ProjectionExtractionBatch:
     # Exact segment coordinates in immutable Observation revisions. Kept
     # transient so EvidenceCatalog never creates a block across overlap seams.
     primary_authority_spans: tuple[tuple[str, int, str], ...] = ()
+    required_authority_observation_ids: tuple[str, ...] = ()
+    required_image_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +52,7 @@ def plan_projection_extraction_batches(
     max_context_chars: int = 20_000,
     primary_overlap_chars: int = 2_000,
     max_primary_binary_bytes: int = MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
+    extraction_contract_version: str = PROJECTION_EXTRACTION_CONTRACT_VERSION,
 ) -> tuple[ProjectionExtractionBatch, ...]:
     """Build bounded batches using only generic deltas and relations.
 
@@ -192,6 +195,16 @@ def plan_projection_extraction_batches(
             )
         )
         context_set = set(context)
+        relation_dependency_ids = {
+            related_id
+            for primary_id in primary
+            for relation in projection.relations
+            for related_id in (
+                (relation.to_id,) if relation.from_id == primary_id
+                else ((relation.from_id,) if relation.to_id == primary_id else ())
+            )
+            if related_id in context_set
+        }
         context_by_primary = tuple(
             (
                 observation_id,
@@ -217,7 +230,7 @@ def plan_projection_extraction_batches(
         )
         digest = hashlib.sha256(
             (
-                f"{PROJECTION_EXTRACTION_CONTRACT_VERSION}\x1f"
+                f"{extraction_contract_version}\x1f"
                 f"{target_unit_revision_id}\x1f{unit.id}\x1f"
                 f"{index}\x1f{segment_identity}"
             ).encode()
@@ -229,6 +242,10 @@ def plan_projection_extraction_batches(
                 primary_image_bytes=sum(
                     _observation_image_size(revisions[observation_id].metadata)
                     for observation_id in primary
+                ),
+                required_image_bytes=sum(
+                    _observation_image_size(revisions[observation_id].metadata)
+                    for observation_id in relation_dependency_ids
                 ),
                 primary_observation_ids=primary,
                 primary_content_by_observation_id=primary_content_by_observation_id,
@@ -245,6 +262,11 @@ def plan_projection_extraction_batches(
                         ],
                     )
                     for segment in group
+                ),
+                required_authority_observation_ids=tuple(
+                    observation_id
+                    for observation_id in context
+                    if observation_id in relation_dependency_ids
                 ),
             )
         )

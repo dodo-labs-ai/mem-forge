@@ -10,6 +10,8 @@ from typing import Mapping, Protocol, Sequence, runtime_checkable
 from memforge.memory.evidence import (
     EvidenceReference,
     EvidenceUnit,
+    SupportScopeVersion,
+    evidence_part_set_digest,
     validate_evidence_references,
 )
 from memforge.memory.relation_discovery_contract import RelationDiscoveryRequest
@@ -379,6 +381,7 @@ class CoverageProof:
 class StaleGuard:
     observation_revision_ids: tuple[str, ...]
     support_set_hashes: Mapping[str, str]
+    support_scope_version: SupportScopeVersion = SupportScopeVersion.REFERENCE_SET_V1
     memory_versions: Mapping[str, str] = field(default_factory=dict)
 
 
@@ -388,6 +391,7 @@ class LifecycleMutation:
     memory_id: str
     source_id: str
     evidence_reference_ids: tuple[str, ...] = ()
+    evidence_unit_ids: tuple[str, ...] = ()
     replacement_memory_id: str | None = None
     payload: Mapping[str, object] = field(default_factory=dict)
 
@@ -400,9 +404,11 @@ class LifecycleMutation:
                 LifecycleMutationType.ATTACH_SUPPORT,
                 LifecycleMutationType.REMOVE_SUPPORT,
             }
-            and not self.evidence_reference_ids
+            and not (self.evidence_reference_ids or self.evidence_unit_ids)
         ):
-            raise ValueError("support mutation requires evidence_reference_ids")
+            raise ValueError("support mutation requires Evidence identity")
+        if self.evidence_reference_ids and self.evidence_unit_ids:
+            raise ValueError("support mutation cannot mix v1 References and v2 Units")
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,6 +435,15 @@ class LifecyclePlan:
         for item in self.mutations:
             if item.mutation_type in DESTRUCTIVE_MUTATIONS and item.memory_id not in incumbents:
                 raise ValueError("destructive mutation targets memory outside mandatory incumbent ledger")
+            if item.mutation_type in {
+                LifecycleMutationType.ATTACH_SUPPORT,
+                LifecycleMutationType.REMOVE_SUPPORT,
+            }:
+                if self.stale_guard.support_scope_version is SupportScopeVersion.REFERENCE_SET_V1:
+                    if not item.evidence_reference_ids or item.evidence_unit_ids:
+                        raise ValueError("v1 Plan support mutation requires Reference ids")
+                elif not item.evidence_unit_ids or item.evidence_reference_ids:
+                    raise ValueError("v2 Plan support mutation requires Evidence Unit ids")
         unit_ids = {item.id for item in self.evidence_units}
         if len(unit_ids) != len(self.evidence_units):
             raise ValueError("duplicate staged Evidence Unit")
@@ -468,6 +483,11 @@ class LifecyclePlan:
                 references,
                 available_revision_ids=available_revisions,
             )
+            if self.stale_guard.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+                unit = next(item for item in self.evidence_units if item.id == unit_id)
+                digest = evidence_part_set_digest(references)
+                if unit.part_set_digest != digest:
+                    raise ValueError("v2 staged Evidence Unit part digest mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,7 +497,12 @@ class ContestedSupportEdge:
     memory_id: str
     source_id: str
     source_unit_id: str
-    evidence_reference_id: str
+    evidence_reference_id: str | None = None
+    evidence_unit_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.evidence_reference_id is None) == (self.evidence_unit_id is None):
+            raise ValueError("contested Support requires exactly one versioned identity")
 
 
 def contested_supports_from_staged_evidence(
@@ -507,20 +532,25 @@ def contested_supports_from_staged_evidence(
         if raw_mutation.get("memory_id") != incumbent_memory_id or raw_mutation.get("source_id") != source_id:
             raise ValueError("create_review remove_support targets another incumbent")
         reference_ids = raw_mutation.get("evidence_reference_ids")
-        if not isinstance(reference_ids, Sequence) or isinstance(reference_ids, (str, bytes)):
-            raise ValueError("create_review remove_support requires evidence_reference_ids")
-        if not reference_ids or not all(
-            isinstance(reference_id, str) and reference_id for reference_id in reference_ids
+        unit_ids = raw_mutation.get("evidence_unit_ids")
+        if reference_ids and unit_ids:
+            raise ValueError("create_review remove_support cannot mix Support versions")
+        identities = unit_ids or reference_ids
+        if not isinstance(identities, Sequence) or isinstance(identities, (str, bytes)):
+            raise ValueError("create_review remove_support requires versioned Evidence ids")
+        if not identities or not all(
+            isinstance(identity, str) and identity for identity in identities
         ):
-            raise ValueError("create_review remove_support requires stable evidence references")
+            raise ValueError("create_review remove_support requires stable Evidence ids")
         contested.update(
             ContestedSupportEdge(
                 memory_id=incumbent_memory_id,
                 source_id=source_id,
                 source_unit_id=source_unit_id,
-                evidence_reference_id=reference_id,
+                evidence_reference_id=(identity if reference_ids else None),
+                evidence_unit_id=(identity if unit_ids else None),
             )
-            for reference_id in reference_ids
+            for identity in identities
         )
     return frozenset(contested)
 
@@ -584,6 +614,7 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
         "stale_guard": {
             "observation_revision_ids": list(plan.stale_guard.observation_revision_ids),
             "support_set_hashes": dict(plan.stale_guard.support_set_hashes),
+            "support_scope_version": plan.stale_guard.support_scope_version.value,
             "memory_versions": dict(plan.stale_guard.memory_versions),
         },
         "evidence_units": [
@@ -607,6 +638,7 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
                 "observed_at": item.observed_at,
                 "extractor_run_id": item.extractor_run_id,
                 "access_context_hash": item.access_context_hash,
+                "part_set_digest": item.part_set_digest,
             }
             for item in plan.evidence_units
         ],
@@ -615,6 +647,11 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
                 "id": item.id,
                 "evidence_unit_id": item.evidence_unit_id,
                 "role": item.role.value,
+                "kind": item.kind.value if item.kind is not None else None,
+                "raw_content_sha256": item.raw_content_sha256,
+                "presentation_sha256": item.presentation_sha256,
+                "excerpt": item.excerpt,
+                "artifact_metadata": dict(item.artifact_metadata),
                 "anchor": {
                     "kind": item.anchor.kind.value,
                     "observation_id": item.anchor.observation_id,
@@ -649,6 +686,7 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
                 "memory_id": item.memory_id,
                 "source_id": item.source_id,
                 "evidence_reference_ids": list(item.evidence_reference_ids),
+                "evidence_unit_ids": list(item.evidence_unit_ids),
                 "replacement_memory_id": item.replacement_memory_id,
                 "payload": dict(item.payload),
             }

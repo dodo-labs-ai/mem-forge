@@ -34,7 +34,7 @@ from memforge.memory.candidate_ledger import (
     select_unique_memory_candidates,
 )
 from memforge.memory.entity_resolver import EntityResolver
-from memforge.memory.evidence import EvidenceRole
+from memforge.memory.evidence import EvidenceRole, SupportScopeVersion
 from memforge.memory.identity_resolver import (
     IdentityResolutionRequest,
     IdentityResolver,
@@ -180,7 +180,12 @@ class MemoryEngine:
         projected path; same-document extracted support is included only to
         keep pre-cutover rows visible to the conservative lineage gate.
         """
-        unit_support = await self.db.get_source_unit_support_reference_ids(source_unit_id)
+        support_scope_version = await self.db.get_support_scope_version()
+        unit_support = (
+            await self.db.get_source_unit_support_unit_ids(source_unit_id)
+            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+            else await self.db.get_source_unit_support_reference_ids(source_unit_id)
+        )
         incumbents_by_id = {
             memory.id: memory for memory in await self.db.list_active_memories(tuple(sorted(unit_support)))
         }
@@ -213,6 +218,10 @@ class MemoryEngine:
             source_id=projection.source_id,
         )
         resolved: dict[str, ImpactResult] = {}
+        v2 = (
+            await self.db.get_support_scope_version()
+            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+        )
         for memory_id in ordered_incumbent_ids:
             reference_ids = unit_support.get(memory_id)
             if not reference_ids:
@@ -223,7 +232,11 @@ class MemoryEngine:
             impacts = {
                 resolve_anchor_impact(item.anchor, delta)
                 for item in evidence
-                if item.reference_id in scoped_reference_ids
+                if (
+                    item.evidence_unit_id in scoped_reference_ids
+                    if v2
+                    else item.reference_id in scoped_reference_ids
+                )
             }
             if ImpactResult.AFFECTED in impacts:
                 resolved[memory_id] = ImpactResult.AFFECTED
@@ -656,11 +669,12 @@ class MemoryEngine:
             source_unit_id=scope.source_unit_id,
         )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
+        support_scope_version = await self.db.get_support_scope_version()
         incumbent_support_states = await self.db.get_active_memory_support_states(
             tuple(memory.id for memory in incumbents)
         )
         all_support = {
-            memory_id: state.reference_ids
+            memory_id: state.support_ids
             for memory_id, state in incumbent_support_states.items()
         }
         support_hashes = {
@@ -1038,7 +1052,7 @@ class MemoryEngine:
             memory_id: classified_candidate_support[memory_id] for memory_id in attached_target_ids
         }
         for memory_id, state in attached_support_states.items():
-            all_support[memory_id] = state.reference_ids
+            all_support[memory_id] = state.support_ids
             support_hashes[memory_id] = state.support_set_hash
         evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
         projected_evidence = build_projected_claim_evidence(
@@ -1053,6 +1067,7 @@ class MemoryEngine:
             access_context_hash=access_context_hash,
             extractor_run_id=projection.run_id,
             observed_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
+            support_scope_version=support_scope_version,
         )
         operations = tuple(
             replace(
@@ -1078,6 +1093,20 @@ class MemoryEngine:
             observation_revision_ids=observation_revision_ids,
             new_evidence_reference_ids=(),
             evidence_reference_ids_by_claim_hash=(projected_evidence.reference_ids_by_claim_hash),
+            support_scope_version=support_scope_version,
+            source_support_unit_ids=(
+                unit_support
+                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                else None
+            ),
+            all_active_support_unit_ids=(
+                all_support
+                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                else None
+            ),
+            evidence_unit_ids_by_claim_hash=(
+                projected_evidence.evidence_unit_ids_by_claim_hash
+            ),
             corroboration_targets_by_claim_hash=corroboration_targets,
             corroboration_proofs_by_claim_hash=corroboration_proofs,
             defaults=NewMemoryDefaults(
@@ -1340,7 +1369,8 @@ class MemoryEngine:
         )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
         support_states = await self.db.get_active_memory_support_states(tuple(incumbents_by_id))
-        all_support = {memory_id: state.reference_ids for memory_id, state in support_states.items()}
+        support_scope_version = await self.db.get_support_scope_version()
+        all_support = {memory_id: state.support_ids for memory_id, state in support_states.items()}
         support_hashes = {memory_id: state.support_set_hash for memory_id, state in support_states.items()}
         visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
         plan = build_lifecycle_plan(
@@ -1354,6 +1384,17 @@ class MemoryEngine:
             support_set_hashes=support_hashes,
             observation_revision_ids=(),
             new_evidence_reference_ids=(),
+            support_scope_version=support_scope_version,
+            source_support_unit_ids=(
+                unit_support
+                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                else None
+            ),
+            all_active_support_unit_ids=(
+                all_support
+                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                else None
+            ),
             defaults=NewMemoryDefaults(
                 visibility=visibility,
                 owner_user_id=owner_user_id,

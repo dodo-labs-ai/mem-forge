@@ -43,11 +43,13 @@ from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.storage.adapters.protocols import (
     ActiveMemorySupportRow,
     ActiveMemorySupportState,
+    ActiveMemoryUnitSupportRow,
     EntityResolutionScope,
     EntityUpsert,
     STORAGE_BIND_CHUNK_SIZE,
     active_support_rows_hash,
     build_active_memory_support_states,
+    build_active_memory_unit_support_states,
 )
 from memforge.models import (
     AgentHookReceipt,
@@ -86,12 +88,17 @@ from memforge.memory.evidence import (
     CandidateBucket,
     CandidateMemory,
     EvidenceContentProvenance,
+    EvidencePartKind,
     EvidenceReference,
     EvidenceRole,
     EvidenceRelationRecord,
     EvidenceUnit,
     LifecycleAction,
     MemorySupportAssertion,
+    MemoryUnitSupportAssertion,
+    SupportScopeVersion,
+    SupportCutoverFinding,
+    SupportCutoverReport,
     RelationCandidateRecord,
     RelationDirection,
     RelationOutcomeBundle,
@@ -99,8 +106,11 @@ from memforge.memory.evidence import (
     RelationRunRecord,
     RelationType,
     ReviewCase,
+    evidence_context_association_id,
+    evidence_part_set_digest,
     evidence_relation_retry_identity,
     evidence_reference_id_for,
+    memory_unit_support_assertion_id,
     relation_bundle_snapshot_audit,
     relation_candidate_retry_identity,
     validate_persisted_evidence_relation,
@@ -808,6 +818,7 @@ CREATE TABLE IF NOT EXISTS evidence_units (
     content              TEXT NOT NULL,
     excerpt              TEXT,
     evidence_provenance  TEXT NOT NULL,
+    part_set_digest      TEXT,
     created_at           TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
     CHECK (visibility IN ('private','workspace')),
@@ -1203,15 +1214,24 @@ CREATE INDEX IF NOT EXISTS idx_lifecycle_backfill_jobs_source
 
 CREATE TABLE IF NOT EXISTS evidence_references (
     id                          TEXT PRIMARY KEY,
-    evidence_unit_id            TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
+    evidence_unit_id            TEXT REFERENCES evidence_units(id) ON DELETE CASCADE,
     role                        TEXT NOT NULL CHECK (role IN ('primary', 'required', 'context')),
+    part_kind                   TEXT CHECK (part_kind IS NULL OR part_kind IN ('text', 'artifact')),
     anchor_kind                 TEXT NOT NULL,
     observation_id              TEXT NOT NULL REFERENCES source_observations(id) ON DELETE CASCADE,
     observation_revision_id     TEXT NOT NULL REFERENCES source_observation_revisions(id),
     fragment_id                 TEXT,
     range_start                 INTEGER,
     range_end                   INTEGER,
-    created_at                  TEXT NOT NULL
+    raw_content_sha256          TEXT,
+    presentation_sha256         TEXT,
+    excerpt                     TEXT,
+    artifact_metadata_json      TEXT NOT NULL DEFAULT '{}',
+    created_at                  TEXT NOT NULL,
+    CHECK (
+        (role IN ('primary', 'required') AND evidence_unit_id IS NOT NULL)
+        OR (role = 'context' AND evidence_unit_id IS NULL)
+    )
 );
 
 CREATE TABLE IF NOT EXISTS memory_support_assertions (
@@ -1227,6 +1247,83 @@ CREATE TABLE IF NOT EXISTS memory_support_assertions (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_support_assertions_active
     ON memory_support_assertions(memory_id, active);
+
+CREATE TABLE IF NOT EXISTS memory_unit_support_assertions (
+    id                  TEXT PRIMARY KEY,
+    memory_id           TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    evidence_unit_id    TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    access_context_hash TEXT NOT NULL,
+    active              INTEGER NOT NULL DEFAULT 1,
+    created_at          TEXT NOT NULL,
+    removed_at          TEXT,
+    UNIQUE (memory_id, evidence_unit_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_unit_support_assertions_active
+    ON memory_unit_support_assertions(memory_id, active);
+
+CREATE TABLE IF NOT EXISTS evidence_context_associations (
+    id                    TEXT PRIMARY KEY,
+    evidence_unit_id      TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
+    evidence_reference_id TEXT NOT NULL REFERENCES evidence_references(id) ON DELETE CASCADE,
+    active                INTEGER NOT NULL DEFAULT 1,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL,
+    removed_at            TEXT,
+    UNIQUE (evidence_unit_id, evidence_reference_id)
+);
+
+CREATE TABLE IF NOT EXISTS system_contract_markers (
+    marker_key TEXT PRIMARY KEY,
+    marker_value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS support_cutover_reports (
+    id TEXT PRIMARY KEY,
+    support_scope_version TEXT NOT NULL,
+    legacy_group_count INTEGER NOT NULL,
+    eligible_group_count INTEGER NOT NULL,
+    ineligible_group_count INTEGER NOT NULL,
+    active_eligible_group_count INTEGER NOT NULL,
+    inactive_eligible_group_count INTEGER NOT NULL,
+    finding_payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS support_cutover_lease (
+    lease_key TEXT PRIMARY KEY CHECK (lease_key = 'support_scope_cutover'),
+    owner_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO system_contract_markers (
+    marker_key, marker_value, updated_at
+) VALUES ('support_scope_version', 'reference-set-v1', datetime('now'));
+
+CREATE TRIGGER IF NOT EXISTS block_legacy_support_insert_v2
+BEFORE INSERT ON memory_support_assertions
+WHEN (SELECT marker_value FROM system_contract_markers
+      WHERE marker_key = 'support_scope_version') = 'evidence-unit-set-v2'
+BEGIN
+    SELECT RAISE(ABORT, 'reference-scoped Support is immutable under evidence-unit-set-v2');
+END;
+
+CREATE TRIGGER IF NOT EXISTS block_legacy_support_update_v2
+BEFORE UPDATE ON memory_support_assertions
+WHEN (SELECT marker_value FROM system_contract_markers
+      WHERE marker_key = 'support_scope_version') = 'evidence-unit-set-v2'
+BEGIN
+    SELECT RAISE(ABORT, 'reference-scoped Support is immutable under evidence-unit-set-v2');
+END;
+
+CREATE TRIGGER IF NOT EXISTS block_legacy_support_delete_v2
+BEFORE DELETE ON memory_support_assertions
+WHEN (SELECT marker_value FROM system_contract_markers
+      WHERE marker_key = 'support_scope_version') = 'evidence-unit-set-v2'
+BEGIN
+    SELECT RAISE(ABORT, 'reference-scoped Support is immutable under evidence-unit-set-v2');
+END;
 
 CREATE TABLE IF NOT EXISTS lifecycle_plans (
     id                TEXT PRIMARY KEY,
@@ -4064,6 +4161,124 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE source_derivation_attempts ADD COLUMN terminal_reason_code TEXT",
         ],
     ),
+    (
+        90,
+        "Add Evidence Unit scoped Support and Context projection",
+        [
+            "PRAGMA foreign_keys = OFF",
+            "ALTER TABLE evidence_units ADD COLUMN part_set_digest TEXT",
+            """CREATE TABLE evidence_context_migration_map (
+                evidence_unit_id TEXT NOT NULL,
+                evidence_reference_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (evidence_unit_id, evidence_reference_id)
+            )""",
+            """INSERT INTO evidence_context_migration_map (
+                    evidence_unit_id, evidence_reference_id, created_at
+                ) SELECT evidence_unit_id, id, created_at
+                    FROM evidence_references WHERE role = 'context'""",
+            """CREATE TABLE evidence_references_v2 (
+                id TEXT PRIMARY KEY,
+                evidence_unit_id TEXT REFERENCES evidence_units(id) ON DELETE CASCADE,
+                role TEXT NOT NULL CHECK (role IN ('primary', 'required', 'context')),
+                part_kind TEXT CHECK (part_kind IS NULL OR part_kind IN ('text', 'artifact')),
+                anchor_kind TEXT NOT NULL,
+                observation_id TEXT NOT NULL REFERENCES source_observations(id) ON DELETE CASCADE,
+                observation_revision_id TEXT NOT NULL REFERENCES source_observation_revisions(id),
+                fragment_id TEXT,
+                range_start INTEGER,
+                range_end INTEGER,
+                raw_content_sha256 TEXT,
+                presentation_sha256 TEXT,
+                excerpt TEXT,
+                artifact_metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                CHECK (
+                    (role IN ('primary', 'required') AND evidence_unit_id IS NOT NULL)
+                    OR (role = 'context' AND evidence_unit_id IS NULL)
+                )
+            )""",
+            """INSERT INTO evidence_references_v2 (
+                    id, evidence_unit_id, role, anchor_kind, observation_id,
+                    observation_revision_id, fragment_id, range_start, range_end,
+                    created_at
+                ) SELECT id,
+                    CASE WHEN role = 'context' THEN NULL ELSE evidence_unit_id END,
+                    role, anchor_kind, observation_id, observation_revision_id,
+                    fragment_id, range_start, range_end, created_at
+                    FROM evidence_references""",
+            "DROP TABLE evidence_references",
+            "ALTER TABLE evidence_references_v2 RENAME TO evidence_references",
+            """CREATE TABLE IF NOT EXISTS memory_unit_support_assertions (
+                id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                access_context_hash TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                removed_at TEXT,
+                UNIQUE (memory_id, evidence_unit_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_memory_unit_support_assertions_active
+               ON memory_unit_support_assertions(memory_id, active)""",
+            """CREATE TABLE IF NOT EXISTS evidence_context_associations (
+                id TEXT PRIMARY KEY,
+                evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
+                evidence_reference_id TEXT NOT NULL REFERENCES evidence_references(id) ON DELETE CASCADE,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                removed_at TEXT,
+                UNIQUE (evidence_unit_id, evidence_reference_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS system_contract_markers (
+                marker_key TEXT PRIMARY KEY,
+                marker_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+            """INSERT OR IGNORE INTO system_contract_markers (
+                    marker_key, marker_value, updated_at
+                ) VALUES ('support_scope_version', 'reference-set-v1', datetime('now'))""",
+            """CREATE TABLE IF NOT EXISTS support_cutover_reports (
+                id TEXT PRIMARY KEY,
+                support_scope_version TEXT NOT NULL,
+                legacy_group_count INTEGER NOT NULL,
+                eligible_group_count INTEGER NOT NULL,
+                ineligible_group_count INTEGER NOT NULL,
+                active_eligible_group_count INTEGER NOT NULL,
+                inactive_eligible_group_count INTEGER NOT NULL,
+                finding_payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS support_cutover_lease (
+                lease_key TEXT PRIMARY KEY CHECK (lease_key = 'support_scope_cutover'),
+                owner_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL
+            )""",
+            """CREATE TRIGGER IF NOT EXISTS block_legacy_support_insert_v2
+               BEFORE INSERT ON memory_support_assertions
+               WHEN (SELECT marker_value FROM system_contract_markers
+                     WHERE marker_key = 'support_scope_version') = 'evidence-unit-set-v2'
+               BEGIN
+                   SELECT RAISE(ABORT, 'reference-scoped Support is immutable under evidence-unit-set-v2');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS block_legacy_support_update_v2
+               BEFORE UPDATE ON memory_support_assertions
+               WHEN (SELECT marker_value FROM system_contract_markers
+                     WHERE marker_key = 'support_scope_version') = 'evidence-unit-set-v2'
+               BEGIN
+                   SELECT RAISE(ABORT, 'reference-scoped Support is immutable under evidence-unit-set-v2');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS block_legacy_support_delete_v2
+               BEFORE DELETE ON memory_support_assertions
+               WHEN (SELECT marker_value FROM system_contract_markers
+                     WHERE marker_key = 'support_scope_version') = 'evidence-unit-set-v2'
+               BEGIN
+                   SELECT RAISE(ABORT, 'reference-scoped Support is immutable under evidence-unit-set-v2');
+               END""",
+        ],
+    ),
 ]
 
 
@@ -4321,12 +4536,14 @@ class Database:
                         "run the report method for exact revision ids",
                         len(profile_report.unresolved_revision_ids),
                     )
+            if version == 90:
+                await self._backfill_evidence_context_associations_unlocked()
             await self.db.execute(
                 "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, _now_iso()),
             )
             await self.db.commit()
-            if version == 44:
+            if version in {44, 90}:
                 # SQLite ignores attempts to enable foreign keys while a
                 # transaction is active. Migration 44 disables them before a
                 # table rebuild, so restore the connection invariant only
@@ -4338,6 +4555,32 @@ class Database:
                     raise RuntimeError("failed to restore SQLite foreign key enforcement")
             logger.info("Applied migration %d: %s", version, description)
         await self._assert_memory_source_ids_resolved()
+
+    async def _backfill_evidence_context_associations_unlocked(self) -> None:
+        rows = await self.db.execute_fetchall(
+            """SELECT evidence_unit_id, evidence_reference_id, created_at
+               FROM evidence_context_migration_map
+               ORDER BY evidence_unit_id, evidence_reference_id"""
+        )
+        for row in rows:
+            association_id = evidence_context_association_id(
+                str(row["evidence_unit_id"]),
+                str(row["evidence_reference_id"]),
+            )
+            await self.db.execute(
+                """INSERT INTO evidence_context_associations (
+                       id, evidence_unit_id, evidence_reference_id, active,
+                       created_at, updated_at, removed_at
+                   ) VALUES (?, ?, ?, 1, ?, ?, NULL)""",
+                (
+                    association_id,
+                    row["evidence_unit_id"],
+                    row["evidence_reference_id"],
+                    row["created_at"],
+                    row["created_at"],
+                ),
+            )
+        await self.db.execute("DROP TABLE evidence_context_migration_map")
 
     async def backfill_evidence_representation_profiles(self) -> EvidenceProfileBackfillReport:
         """Classify legacy revisions from their adapter-owned stored contract."""
@@ -5465,6 +5708,15 @@ class Database:
                     (doc_id,),
                 ) as cursor:
                     document_row = await cursor.fetchone()
+                if (
+                    document_row is not None
+                    and await self.get_support_scope_version()
+                    is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                ):
+                    raise ValueError(
+                        "direct document deletion is disabled after Support v2 cutover; "
+                        "apply projected lifecycle and delete_projected_document"
+                    )
                 async with self.db.execute(
                     "SELECT 1 FROM memory_support_assertions msa "
                     "JOIN evidence_references er ON er.id = msa.evidence_reference_id "
@@ -6792,34 +7044,74 @@ class Database:
     ) -> tuple[SourceArtifactEvidence, ...]:
         """Return current binary Artifacts in actively supported Evidence bundles."""
 
+        v2 = (
+            await self.get_support_scope_version()
+            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+        )
+        supported_units = (
+            """SELECT msa.memory_id, msa.source_id, msa.access_context_hash,
+                      msa.evidence_unit_id
+                 FROM memory_unit_support_assertions msa
+                 JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+                WHERE msa.memory_id = ? AND msa.active = 1
+                  AND eu.source_id = msa.source_id
+                  AND eu.access_context_hash = msa.access_context_hash
+                  AND NOT EXISTS (
+                      SELECT 1 FROM evidence_references er
+                      JOIN source_observations so ON so.id = er.observation_id
+                      WHERE er.evidence_unit_id = msa.evidence_unit_id
+                        AND er.role IN ('primary', 'required')
+                        AND er.observation_revision_id != so.current_revision_id
+                  )"""
+            if v2
+            else """SELECT DISTINCT msa.memory_id, msa.source_id,
+                      msa.access_context_hash, supported_er.evidence_unit_id
+                 FROM memory_support_assertions msa
+                 JOIN evidence_references supported_er
+                   ON supported_er.id = msa.evidence_reference_id
+                 JOIN evidence_units eu
+                   ON eu.id = supported_er.evidence_unit_id
+                  AND eu.source_id = msa.source_id
+                  AND eu.access_context_hash = msa.access_context_hash
+                 JOIN source_observations supported_so
+                   ON supported_so.id = supported_er.observation_id
+                  AND supported_so.current_revision_id =
+                      supported_er.observation_revision_id
+                WHERE msa.memory_id = ? AND msa.active = 1"""
+        )
         rows = await self.db.execute_fetchall(
-            """SELECT msa.memory_id,
+            f"""WITH supported_units AS (
+                      {supported_units}
+                  ), artifact_refs AS (
+                      SELECT er.id, er.evidence_unit_id, er.role,
+                             er.observation_id, er.observation_revision_id
+                        FROM evidence_references er
+                       WHERE er.evidence_unit_id IS NOT NULL
+                      UNION ALL
+                      SELECT er.id, association.evidence_unit_id, er.role,
+                             er.observation_id, er.observation_revision_id
+                        FROM evidence_context_associations association
+                        JOIN evidence_references er
+                          ON er.id = association.evidence_reference_id
+                       WHERE association.active = 1
+                  )
+               SELECT supported_units.memory_id,
                       artifact_er.id AS evidence_reference_id,
                       artifact_er.evidence_unit_id, artifact_er.role,
                       so.id AS observation_id, so.source_id, so.source_unit_id,
                       sor.id AS observation_revision_id, sor.metadata_json
-               FROM memory_support_assertions msa
-               JOIN evidence_references supported_er
-                 ON supported_er.id = msa.evidence_reference_id
+               FROM supported_units
                JOIN evidence_units eu
-                 ON eu.id = supported_er.evidence_unit_id
-                AND eu.source_id = msa.source_id
-                AND eu.access_context_hash = msa.access_context_hash
-               JOIN source_observations supported_so
-                 ON supported_so.id = supported_er.observation_id
-                AND supported_so.source_id = eu.source_id
-                AND supported_so.current_revision_id =
-                    supported_er.observation_revision_id
-               JOIN evidence_references artifact_er
-                 ON artifact_er.evidence_unit_id = supported_er.evidence_unit_id
+                 ON eu.id = supported_units.evidence_unit_id
+               JOIN artifact_refs artifact_er
+                 ON artifact_er.evidence_unit_id = supported_units.evidence_unit_id
                JOIN source_observations so
                  ON so.id = artifact_er.observation_id
                 AND so.source_id = eu.source_id
                JOIN source_observation_revisions sor
                  ON sor.id = artifact_er.observation_revision_id
                 AND sor.id = so.current_revision_id
-               WHERE msa.memory_id = ? AND msa.active = 1
-                 AND so.observation_type = 'binary_artifact'
+               WHERE so.observation_type = 'binary_artifact'
                ORDER BY artifact_er.id""",
             (memory_id,),
         )
@@ -7035,25 +7327,37 @@ class Database:
     async def count_active_source_memories_without_support(self, source_id: str) -> int:
         """Count active Memories whose same-source support invariant is absent."""
 
+        v2 = (
+            await self.get_support_scope_version()
+            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+        )
+        support_subquery = (
+            """SELECT 1
+               FROM memory_unit_support_assertions msa
+               JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+               WHERE msa.memory_id = ms.memory_id
+                 AND msa.source_id = ms.source_id
+                 AND msa.active = 1
+                 AND eu.source_id = msa.source_id
+                 AND eu.doc_id = ms.doc_id"""
+            if v2
+            else """SELECT 1
+               FROM memory_support_assertions msa
+               JOIN evidence_references er ON er.id = msa.evidence_reference_id
+               JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+               WHERE msa.memory_id = ms.memory_id
+                 AND msa.source_id = ms.source_id
+                 AND msa.active = 1
+                 AND eu.source_id = msa.source_id
+                 AND eu.doc_id = ms.doc_id"""
+        )
         async with self.db.execute(
-            """SELECT COUNT(DISTINCT ms.memory_id) AS count
+            f"""SELECT COUNT(DISTINCT ms.memory_id) AS count
                FROM memory_sources ms
                JOIN memories m ON m.id = ms.memory_id
                WHERE ms.source_id = ?
                  AND m.status = 'active'
-                 AND NOT EXISTS (
-                     SELECT 1
-                     FROM memory_support_assertions msa
-                     JOIN evidence_references er
-                       ON er.id = msa.evidence_reference_id
-                     JOIN evidence_units eu
-                       ON eu.id = er.evidence_unit_id
-                     WHERE msa.memory_id = ms.memory_id
-                       AND msa.source_id = ms.source_id
-                       AND msa.active = 1
-                       AND eu.source_id = msa.source_id
-                       AND eu.doc_id = ms.doc_id
-                 )""",
+                 AND NOT EXISTS ({support_subquery})""",
             (source_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -7065,12 +7369,26 @@ class Database:
     ) -> int:
         """Count active supported Memories missing their same-source provenance projection."""
 
+        v2 = (
+            await self.get_support_scope_version()
+            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+        )
+        support_table = (
+            "memory_unit_support_assertions"
+            if v2
+            else "memory_support_assertions"
+        )
+        evidence_join = (
+            "LEFT JOIN evidence_units eu ON eu.id = msa.evidence_unit_id"
+            if v2
+            else """LEFT JOIN evidence_references er ON er.id = msa.evidence_reference_id
+                    LEFT JOIN evidence_units eu ON eu.id = er.evidence_unit_id"""
+        )
         async with self.db.execute(
-            """SELECT COUNT(DISTINCT msa.memory_id) AS count
-               FROM memory_support_assertions msa
+            f"""SELECT COUNT(DISTINCT msa.memory_id) AS count
+               FROM {support_table} msa
                JOIN memories m ON m.id = msa.memory_id
-               LEFT JOIN evidence_references er ON er.id = msa.evidence_reference_id
-               LEFT JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+               {evidence_join}
                WHERE msa.source_id = ?
                  AND msa.active = 1
                  AND m.status = 'active'
@@ -8180,6 +8498,596 @@ class Database:
         assert resolved is not None
         return resolved
 
+    async def get_support_scope_version(self) -> SupportScopeVersion:
+        async with self.db.execute(
+            """SELECT marker_value FROM system_contract_markers
+               WHERE marker_key = 'support_scope_version'"""
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("support_scope_version marker is missing")
+        try:
+            return SupportScopeVersion(str(row["marker_value"]))
+        except ValueError as exc:
+            raise RuntimeError("support_scope_version marker is unknown") from exc
+
+    async def report_support_scope_cutover(self) -> SupportCutoverReport:
+        """Persist one exact report-only inventory without changing Support."""
+
+        async with self._write_lock:
+            report = await self._support_scope_cutover_report_unlocked()
+            findings_payload = [
+                {
+                    "memory_id": finding.memory_id,
+                    "evidence_unit_id": finding.evidence_unit_id,
+                    "source_id": finding.source_id,
+                    "access_context_hash": finding.access_context_hash,
+                    "reason_codes": list(finding.reason_codes),
+                }
+                for finding in report.findings
+            ]
+            await self.db.execute(
+                """INSERT INTO support_cutover_reports (
+                       id, support_scope_version, legacy_group_count,
+                       eligible_group_count, ineligible_group_count,
+                       active_eligible_group_count, inactive_eligible_group_count,
+                       finding_payload_json, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO NOTHING""",
+                (
+                    report.id,
+                    report.support_scope_version.value,
+                    report.legacy_group_count,
+                    report.eligible_group_count,
+                    report.ineligible_group_count,
+                    report.active_eligible_group_count,
+                    report.inactive_eligible_group_count,
+                    json.dumps(findings_payload, sort_keys=True, separators=(",", ":")),
+                    report.created_at,
+                ),
+            )
+            await self.db.commit()
+            return report
+
+    async def _support_scope_cutover_report_unlocked(self) -> SupportCutoverReport:
+        version = await self.get_support_scope_version()
+        rows = await self._legacy_support_group_rows_unlocked()
+        findings: list[SupportCutoverFinding] = []
+        eligible_count = 0
+        active_eligible_count = 0
+        inactive_eligible_count = 0
+        snapshot_groups: list[Mapping[str, object]] = []
+        for row in rows:
+            unit_id = str(row["evidence_unit_id"] or "")
+            reasons: list[str] = []
+            references = []
+            if not unit_id or row["unit_source_id"] is None:
+                reasons.append("missing_evidence_unit")
+            else:
+                references = await self.db.execute_fetchall(
+                    """SELECT id, role FROM evidence_references
+                       WHERE evidence_unit_id = ? AND role IN ('primary', 'required')
+                       ORDER BY role, id""",
+                    (unit_id,),
+                )
+                primary_count = sum(str(reference["role"]) == "primary" for reference in references)
+                if primary_count != 1:
+                    reasons.append("primary_count_invalid")
+                if len(references) != int(row["support_row_count"]):
+                    reasons.append("support_group_incomplete")
+                for reference in references:
+                    try:
+                        await self._legacy_reference_part_unlocked(str(reference["id"]))
+                    except ValueError:
+                        reasons.append("part_unresolvable")
+                        break
+            if row["unit_source_id"] != row["source_id"]:
+                reasons.append("source_inconsistent")
+            if row["unit_access_context_hash"] != row["access_context_hash"]:
+                reasons.append("access_context_inconsistent")
+            if int(row["active_state_count"] or 0) != 1:
+                reasons.append("active_state_mixed")
+            if int(row["missing_created_count"] or 0):
+                reasons.append("creation_time_missing")
+            if int(row["missing_removed_count"] or 0):
+                reasons.append("removal_time_missing")
+            active = int(row["active_count"] or 0) == int(row["support_row_count"] or 0)
+            snapshot_groups.append(
+                {
+                    "memory_id": str(row["memory_id"]),
+                    "evidence_unit_id": unit_id,
+                    "source_id": str(row["source_id"]),
+                    "access_context_hash": str(row["access_context_hash"]),
+                    "support_row_count": int(row["support_row_count"] or 0),
+                    "active": active,
+                    "earliest_created_at": row["earliest_created_at"],
+                    "latest_removed_at": row["latest_removed_at"],
+                    "reason_codes": sorted(set(reasons)),
+                }
+            )
+            if reasons:
+                findings.append(
+                    SupportCutoverFinding(
+                        memory_id=str(row["memory_id"]),
+                        evidence_unit_id=unit_id,
+                        source_id=str(row["source_id"]),
+                        access_context_hash=str(row["access_context_hash"]),
+                        reason_codes=tuple(sorted(set(reasons))),
+                    )
+                )
+            else:
+                eligible_count += 1
+                if active:
+                    active_eligible_count += 1
+                else:
+                    inactive_eligible_count += 1
+        identity = {
+            "support_scope_version": version.value,
+            "groups": snapshot_groups,
+        }
+        report_id = "support-cutover-" + hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:24]
+        return SupportCutoverReport(
+            id=report_id,
+            support_scope_version=version,
+            legacy_group_count=len(rows),
+            eligible_group_count=eligible_count,
+            ineligible_group_count=len(findings),
+            active_eligible_group_count=active_eligible_count,
+            inactive_eligible_group_count=inactive_eligible_count,
+            findings=tuple(findings),
+            created_at=_now_iso(),
+        )
+
+    async def _legacy_support_group_rows_unlocked(self):
+        return await self.db.execute_fetchall(
+            """SELECT msa.memory_id, er.evidence_unit_id, msa.source_id,
+                      msa.access_context_hash, eu.source_id AS unit_source_id,
+                      eu.access_context_hash AS unit_access_context_hash,
+                      COUNT(*) AS support_row_count,
+                      COUNT(DISTINCT msa.active) AS active_state_count,
+                      SUM(CASE WHEN msa.active = 1 THEN 1 ELSE 0 END) AS active_count,
+                      SUM(CASE WHEN msa.created_at IS NULL OR msa.created_at = '' THEN 1 ELSE 0 END)
+                          AS missing_created_count,
+                      SUM(CASE WHEN msa.active = 0 AND (
+                          msa.removed_at IS NULL OR msa.removed_at = ''
+                      ) THEN 1 ELSE 0 END) AS missing_removed_count,
+                      MIN(msa.created_at) AS earliest_created_at,
+                      MAX(msa.removed_at) AS latest_removed_at
+                 FROM memory_support_assertions msa
+                 LEFT JOIN evidence_references er ON er.id = msa.evidence_reference_id
+                 LEFT JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                GROUP BY msa.memory_id, er.evidence_unit_id, msa.source_id,
+                         msa.access_context_hash, eu.source_id, eu.access_context_hash
+                ORDER BY msa.memory_id, er.evidence_unit_id, msa.source_id,
+                         msa.access_context_hash"""
+        )
+
+    async def _legacy_reference_part_unlocked(
+        self,
+        reference_id: str,
+    ) -> tuple[str, str, str, str | None, Mapping[str, object]]:
+        """Derive exact technical v2 part fields from stored authority only."""
+
+        async with self.db.execute(
+            """SELECT er.*, eu.evidence_provenance, eu.excerpt AS unit_excerpt,
+                      sor.content, sor.metadata_json, sor.profile_name
+                 FROM evidence_references er
+                 JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                 JOIN source_observation_revisions sor
+                   ON sor.id = er.observation_revision_id
+                WHERE er.id = ? AND er.role IN ('primary', 'required')""",
+            (reference_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise ValueError("legacy Support reference is unavailable")
+        metadata = json.loads(row["metadata_json"] or "{}")
+        artifact = metadata.get("source_artifact") if isinstance(metadata, Mapping) else None
+        if row["profile_name"] == "binary-artifact" or row["evidence_provenance"] == "source_artifact":
+            if not isinstance(artifact, Mapping):
+                raise ValueError("legacy Artifact reference lacks authoritative metadata")
+            raw_digest = str(artifact.get("sha256") or "").lower()
+            if len(raw_digest) != 64 or any(character not in "0123456789abcdef" for character in raw_digest):
+                raise ValueError("legacy Artifact reference lacks a valid digest")
+            return (
+                "artifact",
+                raw_digest,
+                hashlib.sha256(b"").hexdigest(),
+                None,
+                dict(artifact),
+            )
+        if row["profile_name"] is None:
+            raise ValueError("legacy text reference has no representation profile")
+        content = str(row["content"])
+        anchor_kind = str(row["anchor_kind"])
+        if anchor_kind == AnchorKind.WHOLE_OBSERVATION.value:
+            raw = content
+        elif anchor_kind == AnchorKind.REVISION_RANGE.value:
+            start = row["range_start"]
+            end = row["range_end"]
+            if not isinstance(start, int) or not isinstance(end, int) or not 0 <= start < end <= len(content):
+                raise ValueError("legacy text reference range is invalid")
+            raw = content[start:end]
+        else:
+            raise ValueError("legacy stable Fragment cannot be deterministically migrated")
+        return (
+            "text",
+            hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            raw,
+            {},
+        )
+
+    async def apply_support_scope_v2_cutover(
+        self,
+        *,
+        expected_report_id: str,
+        owner_id: str,
+    ) -> SupportCutoverReport:
+        """Perform one exact-count, exclusive, forward-only v2 activation."""
+
+        if not expected_report_id or not owner_id:
+            raise ValueError("Support cutover requires report and owner identity")
+        async with self._write_lock:
+            try:
+                await self.db.execute("BEGIN EXCLUSIVE")
+                version = await self.get_support_scope_version()
+                if version is not SupportScopeVersion.REFERENCE_SET_V1:
+                    raise ValueError("Support cutover requires reference-set-v1")
+                now = _now_iso()
+                await self.db.execute(
+                    """INSERT INTO support_cutover_lease (
+                           lease_key, owner_id, acquired_at
+                       ) VALUES ('support_scope_cutover', ?, ?)""",
+                    (owner_id, now),
+                )
+                report = await self._support_scope_cutover_report_unlocked()
+                if report.id != expected_report_id:
+                    raise ValueError("Support cutover report is stale")
+                ineligible_keys = {
+                    (
+                        finding.memory_id,
+                        finding.evidence_unit_id,
+                        finding.source_id,
+                        finding.access_context_hash,
+                    )
+                    for finding in report.findings
+                }
+                for finding in report.findings:
+                    if finding.evidence_unit_id:
+                        await self.db.execute(
+                            """UPDATE evidence_units
+                                  SET evidence_provenance = 'legacy_limited',
+                                      updated_at = ?
+                                WHERE id = ?""",
+                            (now, finding.evidence_unit_id),
+                        )
+                inserted = 0
+                for row in await self._legacy_support_group_rows_unlocked():
+                    key = (
+                        str(row["memory_id"]),
+                        str(row["evidence_unit_id"] or ""),
+                        str(row["source_id"]),
+                        str(row["access_context_hash"]),
+                    )
+                    if key in ineligible_keys:
+                        continue
+                    unit_id = key[1]
+                    reference_rows = await self.db.execute_fetchall(
+                        """SELECT id FROM evidence_references
+                           WHERE evidence_unit_id = ?
+                             AND role IN ('primary', 'required')
+                           ORDER BY role, id""",
+                        (unit_id,),
+                    )
+                    for reference_row in reference_rows:
+                        reference_id = str(reference_row["id"])
+                        kind, raw_digest, presentation_digest, excerpt, artifact_metadata = (
+                            await self._legacy_reference_part_unlocked(reference_id)
+                        )
+                        await self.db.execute(
+                            """UPDATE evidence_references
+                                  SET part_kind = ?, raw_content_sha256 = ?,
+                                      presentation_sha256 = ?, excerpt = ?,
+                                      artifact_metadata_json = ?
+                                WHERE id = ?
+                                  AND evidence_unit_id = ?
+                                  AND role IN ('primary', 'required')""",
+                            (
+                                kind,
+                                raw_digest,
+                                presentation_digest,
+                                excerpt,
+                                json.dumps(
+                                    dict(artifact_metadata),
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                                reference_id,
+                                unit_id,
+                            ),
+                        )
+                    references = await self._v2_unit_references_unlocked(unit_id)
+                    part_digest = evidence_part_set_digest(references)
+                    await self.db.execute(
+                        "UPDATE evidence_units SET part_set_digest = ?, updated_at = ? WHERE id = ?",
+                        (part_digest, now, unit_id),
+                    )
+                    active = int(row["active_count"] or 0) == int(row["support_row_count"] or 0)
+                    assertion = MemoryUnitSupportAssertion(
+                        id=memory_unit_support_assertion_id(
+                            memory_id=key[0],
+                            evidence_unit_id=unit_id,
+                            source_id=key[2],
+                            access_context_hash=key[3],
+                        ),
+                        memory_id=key[0],
+                        evidence_unit_id=unit_id,
+                        source_id=key[2],
+                        access_context_hash=key[3],
+                        active=active,
+                        created_at=str(row["earliest_created_at"]),
+                        removed_at=(
+                            None if active else str(row["latest_removed_at"])
+                        ),
+                    )
+                    await self._insert_memory_unit_support_unlocked(assertion)
+                    inserted += 1
+                if inserted != report.eligible_group_count:
+                    raise ValueError("Support cutover eligible count changed")
+                async with self.db.execute(
+                    "SELECT COUNT(*) AS count FROM memory_unit_support_assertions"
+                ) as cursor:
+                    v2_count = int((await cursor.fetchone())["count"])
+                if v2_count != report.eligible_group_count:
+                    raise ValueError("Support cutover v2 exact-count postcondition failed")
+                await self._rebuild_memory_sources_for_support_v2_unlocked(
+                    report,
+                    now=now,
+                )
+                await self.db.execute(
+                    """UPDATE system_contract_markers
+                          SET marker_value = 'evidence-unit-set-v2', updated_at = ?
+                        WHERE marker_key = 'support_scope_version'
+                          AND marker_value = 'reference-set-v1'""",
+                    (now,),
+                )
+                await self.db.execute(
+                    """UPDATE lifecycle_plans
+                          SET status = 'stale', error = 'support_scope_version_changed'
+                        WHERE status = 'staged'
+                          AND COALESCE(
+                              json_extract(payload_json, '$.stale_guard.support_scope_version'),
+                              'reference-set-v1'
+                          ) = 'reference-set-v1'"""
+                )
+                await self.db.execute(
+                    """UPDATE lifecycle_reviews
+                          SET status = 'stale', resolved_at = ?
+                        WHERE status = 'pending'
+                          AND lifecycle_plan_id IN (
+                              SELECT id FROM lifecycle_plans
+                              WHERE COALESCE(
+                                  json_extract(payload_json, '$.stale_guard.support_scope_version'),
+                                  'reference-set-v1'
+                              ) = 'reference-set-v1'
+                          )""",
+                    (now,),
+                )
+                await self.db.execute(
+                    """UPDATE source_derivation_attempts
+                          SET status = 'superseded',
+                              terminal_reason_code = 'CONTRACT_SUPERSEDED',
+                              updated_at = ?
+                        WHERE extraction_contract_version = 'projection-extraction-v8'
+                          AND status IN ('pending', 'retryable_failure')""",
+                    (now,),
+                )
+                await self.db.execute(
+                    "DELETE FROM support_cutover_lease WHERE lease_key = 'support_scope_cutover'"
+                )
+                await self.db.commit()
+                return replace(
+                    report,
+                    support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
+                )
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def _v2_unit_references_unlocked(
+        self,
+        evidence_unit_id: str,
+    ) -> tuple[EvidenceReference, ...]:
+        rows = await self.db.execute_fetchall(
+            """SELECT * FROM evidence_references
+               WHERE evidence_unit_id = ? AND role IN ('primary', 'required')
+               ORDER BY role, observation_revision_id, range_start, range_end, id""",
+            (evidence_unit_id,),
+        )
+        return tuple(
+            EvidenceReference(
+                id=str(row["id"]),
+                evidence_unit_id=evidence_unit_id,
+                role=EvidenceRole(str(row["role"])),
+                kind=EvidencePartKind(str(row["part_kind"])),
+                anchor=SourceAnchor(
+                    kind=AnchorKind(str(row["anchor_kind"])),
+                    observation_id=str(row["observation_id"]),
+                    observation_revision_id=str(row["observation_revision_id"]),
+                    fragment_id=(
+                        str(row["fragment_id"])
+                        if row["fragment_id"] is not None
+                        else None
+                    ),
+                    range_start=(
+                        int(row["range_start"])
+                        if row["range_start"] is not None
+                        else None
+                    ),
+                    range_end=(
+                        int(row["range_end"])
+                        if row["range_end"] is not None
+                        else None
+                    ),
+                ),
+                raw_content_sha256=str(row["raw_content_sha256"]),
+                presentation_sha256=str(row["presentation_sha256"]),
+                excerpt=(str(row["excerpt"]) if row["excerpt"] is not None else None),
+                artifact_metadata=(
+                    json.loads(row["artifact_metadata_json"] or "{}")
+                ),
+            )
+            for row in rows
+        )
+
+    async def _insert_memory_unit_support_unlocked(
+        self,
+        assertion: MemoryUnitSupportAssertion,
+    ) -> None:
+        async with self.db.execute(
+            """SELECT source_id, source_lineage_id, doc_revision_id,
+                      access_context_hash, part_set_digest
+                 FROM evidence_units WHERE id = ?""",
+            (assertion.evidence_unit_id,),
+        ) as cursor:
+            unit = await cursor.fetchone()
+        if unit is None:
+            raise ValueError("v2 Support references an unknown Evidence Unit")
+        if unit["source_id"] != assertion.source_id:
+            raise ValueError("v2 Support Evidence belongs to another Source")
+        if unit["access_context_hash"] != assertion.access_context_hash:
+            raise ValueError("v2 Support access context does not match Evidence Unit")
+        expected_id = memory_unit_support_assertion_id(
+            memory_id=assertion.memory_id,
+            evidence_unit_id=assertion.evidence_unit_id,
+            source_id=assertion.source_id,
+            access_context_hash=assertion.access_context_hash,
+        )
+        if assertion.id != expected_id:
+            raise ValueError("v2 Support id is not deterministic")
+        references = await self._v2_unit_references_unlocked(assertion.evidence_unit_id)
+        part_digest = evidence_part_set_digest(references)
+        if unit["part_set_digest"] != part_digest:
+            raise ValueError("v2 Support Evidence Unit part digest mismatch")
+        revision_ids = {reference.anchor.observation_revision_id for reference in references}
+        async with self.db.execute(
+            """SELECT observation_revision_ids_json, source_unit_id
+                 FROM source_unit_revisions WHERE id = ?""",
+            (unit["doc_revision_id"],),
+        ) as cursor:
+            unit_revision = await cursor.fetchone()
+        if unit_revision is None or unit_revision["source_unit_id"] != unit["source_lineage_id"]:
+            raise ValueError("v2 Support Unit revision lineage is invalid")
+        if not revision_ids.issubset(
+            {str(value) for value in json.loads(unit_revision["observation_revision_ids_json"])}
+        ):
+            raise ValueError("v2 Support references another Source Unit revision")
+        await self.db.execute(
+            """INSERT INTO memory_unit_support_assertions (
+                   id, memory_id, evidence_unit_id, source_id,
+                   access_context_hash, active, created_at, removed_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(memory_id, evidence_unit_id) DO UPDATE SET
+                   source_id = excluded.source_id,
+                   access_context_hash = excluded.access_context_hash,
+                   active = excluded.active,
+                   removed_at = excluded.removed_at""",
+            (
+                assertion.id,
+                assertion.memory_id,
+                assertion.evidence_unit_id,
+                assertion.source_id,
+                assertion.access_context_hash,
+                int(assertion.active),
+                assertion.created_at or _now_iso(),
+                assertion.removed_at,
+            ),
+        )
+
+    async def upsert_memory_unit_support_assertion(
+        self,
+        assertion: MemoryUnitSupportAssertion,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        async with self._write_lock:
+            try:
+                if await self.get_support_scope_version() is not SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+                    raise ValueError("v2 Support writer is disabled before cutover")
+                await self._assert_source_activity_fence_unlocked(
+                    assertion.source_id,
+                    source_activity,
+                )
+                await self._insert_memory_unit_support_unlocked(assertion)
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def _rebuild_memory_sources_for_support_v2_unlocked(
+        self,
+        report: SupportCutoverReport,
+        *,
+        now: str,
+    ) -> None:
+        await self.db.execute("DROP TABLE IF EXISTS temp.support_cutover_old_memory_sources")
+        await self.db.execute(
+            """CREATE TEMP TABLE support_cutover_old_memory_sources AS
+               SELECT * FROM memory_sources
+               WHERE source_id IN (SELECT id FROM sources)"""
+        )
+        await self.db.execute(
+            "DELETE FROM memory_sources WHERE source_id IN (SELECT id FROM sources)"
+        )
+        await self.db.execute(
+            """INSERT OR IGNORE INTO memory_sources (
+                   memory_id, doc_id, source_id, source_type, excerpt,
+                   support_kind, added_at, source_updated_at
+               ) SELECT msa.memory_id, eu.doc_id, msa.source_id, eu.source_type,
+                        eu.excerpt, COALESCE(old.support_kind, 'corroborated'),
+                        COALESCE(old.added_at, msa.created_at), old.source_updated_at
+                   FROM memory_unit_support_assertions msa
+                   JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+                   JOIN documents d ON d.doc_id = eu.doc_id
+                   LEFT JOIN support_cutover_old_memory_sources old
+                     ON old.memory_id = msa.memory_id
+                    AND old.source_id = msa.source_id
+                    AND old.doc_id = eu.doc_id
+                  WHERE msa.active = 1"""
+        )
+        ineligible_memory_ids = tuple(
+            sorted({finding.memory_id for finding in report.findings})
+        )
+        if ineligible_memory_ids:
+            placeholders = ",".join("?" for _ in ineligible_memory_ids)
+            await self.db.execute(
+                f"""INSERT OR IGNORE INTO memory_sources (
+                       memory_id, doc_id, source_id, source_type, excerpt,
+                       support_kind, added_at, source_updated_at
+                   ) SELECT memory_id, doc_id, source_id, source_type, excerpt,
+                            'legacy_limited', added_at, source_updated_at
+                       FROM support_cutover_old_memory_sources
+                      WHERE memory_id IN ({placeholders})""",
+                ineligible_memory_ids,
+            )
+        missing = await self.db.execute_fetchall(
+            """SELECT msa.id FROM memory_unit_support_assertions msa
+               JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+               WHERE msa.active = 1 AND eu.doc_id IS NOT NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM memory_sources ms
+                      WHERE ms.memory_id = msa.memory_id
+                        AND ms.source_id = msa.source_id
+                        AND ms.doc_id = eu.doc_id
+                 )"""
+        )
+        if missing:
+            raise ValueError("memory_sources v2 rebuild postcondition failed")
+        await self.db.execute("DROP TABLE support_cutover_old_memory_sources")
+
     async def record_evidence_references(
         self,
         evidence_unit_id: str,
@@ -8201,9 +9109,16 @@ class Database:
         persisted = tuple(
             EvidenceReference(
                 id=item.id or evidence_reference_id_for(evidence_unit_id, item),
-                evidence_unit_id=evidence_unit_id,
+                evidence_unit_id=(
+                    None if item.role is EvidenceRole.CONTEXT else evidence_unit_id
+                ),
                 role=item.role,
                 anchor=item.anchor,
+                kind=item.kind,
+                raw_content_sha256=item.raw_content_sha256,
+                presentation_sha256=item.presentation_sha256,
+                excerpt=item.excerpt,
+                artifact_metadata=dict(item.artifact_metadata),
             )
             for item in validated
         )
@@ -8225,22 +9140,56 @@ class Database:
                     anchor = item.anchor
                     await self.db.execute(
                         """INSERT OR IGNORE INTO evidence_references (
-                            id, evidence_unit_id, role, anchor_kind, observation_id,
-                            observation_revision_id, fragment_id, range_start, range_end, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            id, evidence_unit_id, role, part_kind, anchor_kind,
+                            observation_id, observation_revision_id, fragment_id,
+                            range_start, range_end, raw_content_sha256,
+                            presentation_sha256, excerpt, artifact_metadata_json,
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             item.id,
-                            evidence_unit_id,
+                            item.evidence_unit_id,
                             item.role.value,
+                            item.kind.value if item.kind is not None else None,
                             anchor.kind.value,
                             anchor.observation_id,
                             anchor.observation_revision_id,
                             anchor.fragment_id,
                             anchor.range_start,
                             anchor.range_end,
+                            item.raw_content_sha256,
+                            item.presentation_sha256,
+                            item.excerpt,
+                            json.dumps(
+                                dict(item.artifact_metadata),
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
                             _now_iso(),
                         ),
                     )
+                    if item.role is EvidenceRole.CONTEXT:
+                        now = _now_iso()
+                        await self.db.execute(
+                            """INSERT INTO evidence_context_associations (
+                                   id, evidence_unit_id, evidence_reference_id,
+                                   active, created_at, updated_at, removed_at
+                               ) VALUES (?, ?, ?, 1, ?, ?, NULL)
+                               ON CONFLICT(evidence_unit_id, evidence_reference_id)
+                               DO UPDATE SET active = 1,
+                                             updated_at = excluded.updated_at,
+                                             removed_at = NULL""",
+                            (
+                                evidence_context_association_id(
+                                    evidence_unit_id,
+                                    str(item.id),
+                                ),
+                                evidence_unit_id,
+                                item.id,
+                                now,
+                                now,
+                            ),
+                        )
                 await self._assert_source_activity_fence_unlocked(
                     source_id,
                     source_activity,
@@ -8251,6 +9200,131 @@ class Database:
                 raise
         return persisted
 
+    async def replace_evidence_context_associations(
+        self,
+        evidence_unit_id: str,
+        references: Sequence[EvidenceReference],
+    ) -> tuple[EvidenceReference, ...]:
+        """Replace only the mutable current Context projection for one Unit."""
+
+        if any(reference.role is not EvidenceRole.CONTEXT for reference in references):
+            raise ValueError("Context replacement accepts only Context references")
+        persisted = tuple(
+            EvidenceReference(
+                id=reference.id
+                or evidence_reference_id_for(evidence_unit_id, reference),
+                evidence_unit_id=None,
+                role=EvidenceRole.CONTEXT,
+                anchor=reference.anchor,
+                kind=reference.kind,
+                raw_content_sha256=reference.raw_content_sha256,
+                presentation_sha256=reference.presentation_sha256,
+                excerpt=reference.excerpt,
+                artifact_metadata=dict(reference.artifact_metadata),
+            )
+            for reference in references
+        )
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    "SELECT source_id, source_lineage_id FROM evidence_units WHERE id = ?",
+                    (evidence_unit_id,),
+                ) as cursor:
+                    unit = await cursor.fetchone()
+                if unit is None:
+                    raise ValueError("Context association requires an Evidence Unit")
+                now = _now_iso()
+                for reference in persisted:
+                    anchor = reference.anchor
+                    async with self.db.execute(
+                        """SELECT so.source_id, so.source_unit_id,
+                                  so.current_revision_id
+                             FROM source_observations so
+                             JOIN source_observation_revisions sor
+                               ON sor.observation_id = so.id
+                            WHERE so.id = ? AND sor.id = ?""",
+                        (anchor.observation_id, anchor.observation_revision_id),
+                    ) as cursor:
+                        observation = await cursor.fetchone()
+                    if (
+                        observation is None
+                        or observation["source_id"] != unit["source_id"]
+                        or observation["source_unit_id"] != unit["source_lineage_id"]
+                        or observation["current_revision_id"]
+                        != anchor.observation_revision_id
+                    ):
+                        raise ValueError("Context reference is stale or outside the Evidence Unit")
+                    await self.db.execute(
+                        """INSERT OR IGNORE INTO evidence_references (
+                               id, evidence_unit_id, role, part_kind, anchor_kind,
+                               observation_id, observation_revision_id, fragment_id,
+                               range_start, range_end, raw_content_sha256,
+                               presentation_sha256, excerpt, artifact_metadata_json,
+                               created_at
+                           ) VALUES (?, NULL, 'context', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            reference.id,
+                            reference.kind.value if reference.kind is not None else None,
+                            anchor.kind.value,
+                            anchor.observation_id,
+                            anchor.observation_revision_id,
+                            anchor.fragment_id,
+                            anchor.range_start,
+                            anchor.range_end,
+                            reference.raw_content_sha256,
+                            reference.presentation_sha256,
+                            reference.excerpt,
+                            json.dumps(
+                                dict(reference.artifact_metadata),
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            now,
+                        ),
+                    )
+                    await self.db.execute(
+                        """INSERT INTO evidence_context_associations (
+                               id, evidence_unit_id, evidence_reference_id,
+                               active, created_at, updated_at, removed_at
+                           ) VALUES (?, ?, ?, 1, ?, ?, NULL)
+                           ON CONFLICT(evidence_unit_id, evidence_reference_id)
+                           DO UPDATE SET active = 1,
+                                         updated_at = excluded.updated_at,
+                                         removed_at = NULL""",
+                        (
+                            evidence_context_association_id(
+                                evidence_unit_id,
+                                str(reference.id),
+                            ),
+                            evidence_unit_id,
+                            reference.id,
+                            now,
+                            now,
+                        ),
+                    )
+                desired_ids = tuple(str(reference.id) for reference in persisted)
+                if desired_ids:
+                    placeholders = ",".join("?" for _ in desired_ids)
+                    await self.db.execute(
+                        f"""UPDATE evidence_context_associations
+                               SET active = 0, updated_at = ?, removed_at = ?
+                             WHERE evidence_unit_id = ? AND active = 1
+                               AND evidence_reference_id NOT IN ({placeholders})""",
+                        (now, now, evidence_unit_id, *desired_ids),
+                    )
+                else:
+                    await self.db.execute(
+                        """UPDATE evidence_context_associations
+                              SET active = 0, updated_at = ?, removed_at = ?
+                            WHERE evidence_unit_id = ? AND active = 1""",
+                        (now, now, evidence_unit_id),
+                    )
+                await self.db.commit()
+                return persisted
+            except Exception:
+                await self.db.rollback()
+                raise
+
     async def upsert_memory_support_assertion(
         self,
         assertion: MemorySupportAssertion,
@@ -8259,6 +9333,13 @@ class Database:
     ) -> None:
         async with self._write_lock:
             try:
+                if (
+                    await self.get_support_scope_version()
+                    is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                ):
+                    raise ValueError(
+                        "reference-scoped Support writer is disabled after cutover"
+                    )
                 await self._assert_source_activity_fence_unlocked(
                     assertion.source_id,
                     source_activity,
@@ -8315,9 +9396,13 @@ class Database:
                 raise
 
     async def get_memory_support_set_hash(self, memory_id: str) -> str:
+        if await self.get_support_scope_version() is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            return await self._memory_unit_support_set_hash_unlocked(memory_id)
         return await self._memory_support_set_hash_unlocked(memory_id)
 
     async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]:
+        if await self.get_support_scope_version() is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            raise ValueError("reference-scoped Support reads are disabled after cutover")
         rows = await self.db.execute_fetchall(
             """SELECT evidence_reference_id
                FROM memory_support_assertions
@@ -8327,6 +9412,18 @@ class Database:
         )
         return tuple(row["evidence_reference_id"] for row in rows)
 
+    async def get_active_memory_support_unit_ids(self, memory_id: str) -> tuple[str, ...]:
+        if await self.get_support_scope_version() is not SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            raise ValueError("unit-scoped Support reads are disabled before cutover")
+        rows = await self.db.execute_fetchall(
+            """SELECT evidence_unit_id
+               FROM memory_unit_support_assertions
+               WHERE memory_id = ? AND active = 1
+               ORDER BY evidence_unit_id""",
+            (memory_id,),
+        )
+        return tuple(str(row["evidence_unit_id"]) for row in rows)
+
     async def get_active_memory_support_states(
         self,
         memory_ids: Sequence[str],
@@ -8334,6 +9431,45 @@ class Database:
         ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
         if not ids:
             return {}
+        if await self.get_support_scope_version() is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            support_rows_v2: list[ActiveMemoryUnitSupportRow] = []
+            for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
+                chunk = ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+                placeholders = ", ".join("?" for _ in chunk)
+                rows = await self.db.execute_fetchall(
+                    f"""SELECT msa.memory_id, msa.id AS support_id,
+                               msa.evidence_unit_id, msa.source_id,
+                               msa.access_context_hash, eu.part_set_digest,
+                               EXISTS (
+                                   SELECT 1 FROM evidence_references primary_er
+                                   WHERE primary_er.evidence_unit_id = msa.evidence_unit_id
+                                     AND primary_er.role = 'primary'
+                               ) AND NOT EXISTS (
+                                   SELECT 1 FROM evidence_references er
+                                   JOIN source_observations so ON so.id = er.observation_id
+                                   WHERE er.evidence_unit_id = msa.evidence_unit_id
+                                     AND er.role IN ('primary', 'required')
+                                     AND er.observation_revision_id != so.current_revision_id
+                               ) AS is_current
+                        FROM memory_unit_support_assertions msa
+                        JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+                        WHERE msa.active = 1
+                          AND msa.memory_id IN ({placeholders})""",
+                    chunk,
+                )
+                support_rows_v2.extend(
+                    ActiveMemoryUnitSupportRow(
+                        memory_id=str(row["memory_id"]),
+                        support_id=str(row["support_id"]),
+                        evidence_unit_id=str(row["evidence_unit_id"]),
+                        source_id=str(row["source_id"]),
+                        access_context_hash=str(row["access_context_hash"]),
+                        part_set_digest=str(row["part_set_digest"]),
+                        is_current=bool(row["is_current"]),
+                    )
+                    for row in rows
+                )
+            return build_active_memory_unit_support_states(ids, support_rows_v2)
         support_rows: list[ActiveMemorySupportRow] = []
         for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
             chunk = ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
@@ -8382,6 +9518,15 @@ class Database:
         """Return active Support Evidence for each requested Memory in bounded chunks."""
 
         ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
+        if (
+            ids
+            and await self.get_support_scope_version()
+            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+        ):
+            return await self._get_active_memory_unit_support_evidence_many(
+                ids,
+                source_id=source_id,
+            )
         grouped: dict[str, list[ActiveSupportEvidence]] = {memory_id: [] for memory_id in ids}
         for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
             chunk = ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
@@ -8427,6 +9572,76 @@ class Database:
                 )
         return {memory_id: tuple(grouped[memory_id]) for memory_id in ids}
 
+    async def _get_active_memory_unit_support_evidence_many(
+        self,
+        memory_ids: tuple[str, ...],
+        *,
+        source_id: str | None,
+    ) -> Mapping[str, tuple[ActiveSupportEvidence, ...]]:
+        grouped: dict[str, list[ActiveSupportEvidence]] = {
+            memory_id: [] for memory_id in memory_ids
+        }
+        for offset in range(0, len(memory_ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = memory_ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            params: list[object] = list(chunk)
+            source_clause = ""
+            if source_id is not None:
+                source_clause = " AND msa.source_id = ?"
+                params.append(source_id)
+            rows = await self.db.execute_fetchall(
+                f"""SELECT msa.memory_id, msa.source_id, msa.evidence_unit_id,
+                           er.id AS reference_id, er.role, er.anchor_kind,
+                           er.observation_id, er.observation_revision_id,
+                           er.fragment_id, er.range_start, er.range_end,
+                           er.excerpt
+                    FROM memory_unit_support_assertions msa
+                    JOIN evidence_references er
+                      ON er.evidence_unit_id = msa.evidence_unit_id
+                     AND er.role IN ('primary', 'required')
+                    WHERE msa.memory_id IN ({placeholders}) AND msa.active = 1"""
+                + source_clause
+                + " ORDER BY msa.memory_id, msa.source_id, msa.evidence_unit_id, er.role, er.id",
+                tuple(params),
+            )
+            for row in rows:
+                memory_id = str(row["memory_id"])
+                grouped[memory_id].append(
+                    ActiveSupportEvidence(
+                        memory_id=memory_id,
+                        source_id=str(row["source_id"]),
+                        reference_id=str(row["reference_id"]),
+                        evidence_unit_id=str(row["evidence_unit_id"]),
+                        role=EvidenceRole(str(row["role"])),
+                        anchor=SourceAnchor(
+                            kind=AnchorKind(str(row["anchor_kind"])),
+                            observation_id=str(row["observation_id"]),
+                            observation_revision_id=str(row["observation_revision_id"]),
+                            fragment_id=(
+                                str(row["fragment_id"])
+                                if row["fragment_id"] is not None
+                                else None
+                            ),
+                            range_start=(
+                                int(row["range_start"])
+                                if row["range_start"] is not None
+                                else None
+                            ),
+                            range_end=(
+                                int(row["range_end"])
+                                if row["range_end"] is not None
+                                else None
+                            ),
+                        ),
+                        excerpt=(
+                            str(row["excerpt"])
+                            if row["excerpt"] is not None
+                            else None
+                        ),
+                    )
+                )
+        return {memory_id: tuple(grouped[memory_id]) for memory_id in memory_ids}
+
     async def get_active_memory_support_observation_ids_many(
         self,
         memory_ids: Sequence[str],
@@ -8437,22 +9652,39 @@ class Database:
 
         ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
         grouped: dict[str, set[str]] = {memory_id: set() for memory_id in ids}
+        v2 = (
+            await self.get_support_scope_version()
+            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+        )
         for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
             chunk = ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
             placeholders = ", ".join("?" for _ in chunk)
-            rows = await self.db.execute_fetchall(
-                f"""SELECT DISTINCT msa.memory_id,
-                           supported_er.observation_id
-                    FROM memory_support_assertions msa
-                    JOIN evidence_references supported_er
-                      ON supported_er.id = msa.evidence_reference_id
-                    WHERE msa.memory_id IN ({placeholders})
-                      AND msa.active = 1
-                      AND msa.source_id = ?
-                    ORDER BY msa.memory_id,
-                             supported_er.observation_id""",
-                (*chunk, source_id),
-            )
+            if v2:
+                rows = await self.db.execute_fetchall(
+                    f"""SELECT DISTINCT msa.memory_id, er.observation_id
+                        FROM memory_unit_support_assertions msa
+                        JOIN evidence_references er
+                          ON er.evidence_unit_id = msa.evidence_unit_id
+                         AND er.role IN ('primary', 'required')
+                        WHERE msa.memory_id IN ({placeholders})
+                          AND msa.active = 1 AND msa.source_id = ?
+                        ORDER BY msa.memory_id, er.observation_id""",
+                    (*chunk, source_id),
+                )
+            else:
+                rows = await self.db.execute_fetchall(
+                    f"""SELECT DISTINCT msa.memory_id,
+                               supported_er.observation_id
+                        FROM memory_support_assertions msa
+                        JOIN evidence_references supported_er
+                          ON supported_er.id = msa.evidence_reference_id
+                        WHERE msa.memory_id IN ({placeholders})
+                          AND msa.active = 1
+                          AND msa.source_id = ?
+                        ORDER BY msa.memory_id,
+                                 supported_er.observation_id""",
+                    (*chunk, source_id),
+                )
             for row in rows:
                 grouped[str(row["memory_id"])].add(str(row["observation_id"]))
         return {memory_id: tuple(sorted(grouped[memory_id])) for memory_id in ids}
@@ -8461,6 +9693,8 @@ class Database:
         self,
         source_unit_id: str,
     ) -> Mapping[str, tuple[str, ...]]:
+        if await self.get_support_scope_version() is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            raise ValueError("reference-scoped Support reads are disabled after cutover")
         rows = await self.db.execute_fetchall(
             """SELECT msa.memory_id, msa.evidence_reference_id
                FROM memory_support_assertions msa
@@ -8474,6 +9708,25 @@ class Database:
         for row in rows:
             values[row["memory_id"]].append(row["evidence_reference_id"])
         return {memory_id: tuple(reference_ids) for memory_id, reference_ids in values.items()}
+
+    async def get_source_unit_support_unit_ids(
+        self,
+        source_unit_id: str,
+    ) -> Mapping[str, tuple[str, ...]]:
+        if await self.get_support_scope_version() is not SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            raise ValueError("unit-scoped Support reads are disabled before cutover")
+        rows = await self.db.execute_fetchall(
+            """SELECT msa.memory_id, msa.evidence_unit_id
+               FROM memory_unit_support_assertions msa
+               JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+               WHERE eu.source_lineage_id = ? AND msa.active = 1
+               ORDER BY msa.memory_id, msa.evidence_unit_id""",
+            (source_unit_id,),
+        )
+        values: dict[str, list[str]] = defaultdict(list)
+        for row in rows:
+            values[str(row["memory_id"])].append(str(row["evidence_unit_id"]))
+        return {memory_id: tuple(unit_ids) for memory_id, unit_ids in values.items()}
 
     async def _memory_support_set_hash_unlocked(
         self,
@@ -8496,6 +9749,13 @@ class Database:
                     )
                 )
         return active_support_rows_hash(values)
+
+    async def _memory_unit_support_set_hash_unlocked(
+        self,
+        memory_id: str,
+    ) -> str:
+        states = await self.get_active_memory_support_states((memory_id,))
+        return states[memory_id].support_set_hash
 
     async def get_lifecycle_plan_status(self, plan_id: str) -> str | None:
         async with self.db.execute(
@@ -8759,6 +10019,9 @@ class Database:
                 gate_state = LifecycleGateState(gate_row["state"]) if gate_row else LifecycleGateState.GATED
                 if gate_state is not plan.gate_state:
                     raise ValueError("lifecycle plan gate stale guard failed")
+                marker = await self.get_support_scope_version()
+                if marker is not plan.stale_guard.support_scope_version:
+                    raise ValueError("lifecycle plan Support scope version is stale")
                 async with self.db.execute(
                     "SELECT current_revision_id FROM source_units WHERE id = ?",
                     (plan.scope.source_unit_id,),
@@ -8778,7 +10041,11 @@ class Database:
                     if current_count != len(set(plan.stale_guard.observation_revision_ids)):
                         raise ValueError("lifecycle plan observation revision stale guard failed")
                 for memory_id, expected_hash in plan.stale_guard.support_set_hashes.items():
-                    actual_hash = await self._memory_support_set_hash_unlocked(memory_id)
+                    actual_hash = (
+                        await self._memory_unit_support_set_hash_unlocked(memory_id)
+                        if marker is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                        else await self._memory_support_set_hash_unlocked(memory_id)
+                    )
                     if actual_hash != expected_hash:
                         raise ValueError(f"lifecycle plan support stale guard failed: {memory_id}")
                 for memory_id, expected_version in plan.stale_guard.memory_versions.items():
@@ -8817,6 +10084,7 @@ class Database:
                         plan.id,
                         mutation,
                         source_unit_id=plan.scope.source_unit_id,
+                        support_scope_version=marker,
                         now=now,
                     )
                 for request in plan.relation_discovery_requests:
@@ -8899,6 +10167,17 @@ class Database:
         to an Observation current in its own stable Source Unit. A newly
         activated Memory must additionally gain support in the Plan's Unit.
         """
+
+        if (
+            getattr(
+                getattr(plan, "stale_guard", None),
+                "support_scope_version",
+                SupportScopeVersion.REFERENCE_SET_V1,
+            )
+            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+        ):
+            await self._validate_projected_unit_support_invariant_unlocked(plan)
+            return
 
         created_ids = {
             mutation.memory_id
@@ -8998,6 +10277,105 @@ class Database:
             if len(accepted_supports) != len(supports):
                 raise ValueError(f"projected lifecycle left stale or ambiguous source support: {memory_id}")
 
+    async def _validate_projected_unit_support_invariant_unlocked(
+        self,
+        plan: LifecyclePlan,
+    ) -> None:
+        created_ids = {
+            mutation.memory_id
+            for mutation in plan.mutations
+            if mutation.mutation_type
+            in {
+                LifecycleMutationType.CREATE_MEMORY,
+                LifecycleMutationType.REACTIVATE_MEMORY,
+            }
+        }
+        candidate_ids = (
+            set(plan.coverage_proof.mandatory_incumbent_ids)
+            | created_ids
+            | {
+                mutation.memory_id
+                for mutation in plan.mutations
+                if mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
+            }
+        )
+        contested = set(pending_review_contested_supports(plan))
+        contested.update(
+            await self._durable_pending_review_contested_supports_unlocked(
+                source_id=plan.scope.source_id,
+                memory_ids=candidate_ids,
+            )
+        )
+        for memory_id in sorted(candidate_ids):
+            async with self.db.execute(
+                "SELECT status FROM memories WHERE id = ?",
+                (memory_id,),
+            ) as cursor:
+                memory = await cursor.fetchone()
+            if memory is None or memory["status"] != "active":
+                continue
+            supports = await self.db.execute_fetchall(
+                """SELECT msa.evidence_unit_id, eu.source_id AS evidence_source_id,
+                          eu.source_lineage_id, eu.doc_revision_id,
+                          su.source_id AS unit_source_id,
+                          su.current_revision_id AS current_unit_revision_id,
+                          COUNT(er.id) AS supporting_part_count,
+                          SUM(CASE WHEN er.role = 'primary' THEN 1 ELSE 0 END)
+                              AS primary_count,
+                          SUM(CASE WHEN er.observation_revision_id != so.current_revision_id
+                                   THEN 1 ELSE 0 END) AS stale_part_count,
+                          CASE WHEN EXISTS (
+                              SELECT 1 FROM memory_sources ms
+                               WHERE ms.memory_id = msa.memory_id
+                                 AND ms.source_id = msa.source_id
+                                 AND ms.doc_id = eu.doc_id
+                          ) THEN 1 ELSE 0 END AS has_source_provenance
+                   FROM memory_unit_support_assertions msa
+                   JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+                   JOIN source_units su ON su.id = eu.source_lineage_id
+                   LEFT JOIN evidence_references er
+                     ON er.evidence_unit_id = msa.evidence_unit_id
+                    AND er.role IN ('primary', 'required')
+                   LEFT JOIN source_observations so ON so.id = er.observation_id
+                  WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
+                  GROUP BY msa.evidence_unit_id, eu.source_id,
+                           eu.source_lineage_id, eu.doc_revision_id,
+                           su.source_id, su.current_revision_id""",
+                (memory_id, plan.scope.source_id),
+            )
+            accepted = []
+            current_scope_count = 0
+            for support in supports:
+                structurally_valid = (
+                    support["evidence_source_id"] == plan.scope.source_id
+                    and support["unit_source_id"] == plan.scope.source_id
+                    and int(support["primary_count"] or 0) == 1
+                    and int(support["supporting_part_count"] or 0) >= 1
+                    and int(support["has_source_provenance"] or 0) == 1
+                )
+                current = (
+                    structurally_valid
+                    and int(support["stale_part_count"] or 0) == 0
+                )
+                if current and support["source_lineage_id"] == plan.scope.source_unit_id:
+                    current_scope_count += 1
+                contested_edge = ContestedSupportEdge(
+                    memory_id=memory_id,
+                    source_id=plan.scope.source_id,
+                    source_unit_id=str(support["source_lineage_id"]),
+                    evidence_unit_id=str(support["evidence_unit_id"]),
+                )
+                if current or (structurally_valid and contested_edge in contested):
+                    accepted.append(support)
+            if memory_id in created_ids and current_scope_count == 0:
+                raise ValueError(
+                    f"projected lifecycle activated Memory without complete Unit support: {memory_id}"
+                )
+            if len(accepted) != len(supports):
+                raise ValueError(
+                    f"projected lifecycle left stale or incomplete Unit support: {memory_id}"
+                )
+
     async def _durable_pending_review_contested_supports_unlocked(
         self,
         *,
@@ -9056,8 +10434,9 @@ class Database:
                     repo_identifier, source_anchor, source_lineage_id,
                     source_metadata_json, project_key, visibility, owner_user_id,
                     observed_at, extractor_run_id, access_context_hash, content,
-                    excerpt, evidence_provenance, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    excerpt, evidence_provenance, part_set_digest,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     observed_at=excluded.observed_at,
                     extractor_run_id=excluded.extractor_run_id,
@@ -9083,6 +10462,7 @@ class Database:
                     unit.content,
                     unit.excerpt,
                     unit.evidence_provenance.value,
+                    unit.part_set_digest,
                     now,
                     now,
                 ),
@@ -9091,22 +10471,83 @@ class Database:
             anchor = reference.anchor
             await self.db.execute(
                 """INSERT OR IGNORE INTO evidence_references (
-                    id, evidence_unit_id, role, anchor_kind, observation_id,
-                    observation_revision_id, fragment_id, range_start, range_end, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    id, evidence_unit_id, role, part_kind, anchor_kind,
+                    observation_id, observation_revision_id, fragment_id,
+                    range_start, range_end, raw_content_sha256,
+                    presentation_sha256, excerpt, artifact_metadata_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     reference.id,
-                    reference.evidence_unit_id,
+                    (
+                        None
+                        if reference.role is EvidenceRole.CONTEXT
+                        else reference.evidence_unit_id
+                    ),
                     reference.role.value,
+                    reference.kind.value if reference.kind is not None else None,
                     anchor.kind.value,
                     anchor.observation_id,
                     anchor.observation_revision_id,
                     anchor.fragment_id,
                     anchor.range_start,
                     anchor.range_end,
+                    reference.raw_content_sha256,
+                    reference.presentation_sha256,
+                    reference.excerpt,
+                    json.dumps(
+                        dict(reference.artifact_metadata),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                     now,
                 ),
             )
+            if reference.role is EvidenceRole.CONTEXT:
+                assert reference.evidence_unit_id is not None
+                await self.db.execute(
+                    """INSERT INTO evidence_context_associations (
+                           id, evidence_unit_id, evidence_reference_id,
+                           active, created_at, updated_at, removed_at
+                       ) VALUES (?, ?, ?, 1, ?, ?, NULL)
+                       ON CONFLICT(evidence_unit_id, evidence_reference_id)
+                       DO UPDATE SET active = 1,
+                                     updated_at = excluded.updated_at,
+                                     removed_at = NULL""",
+                    (
+                        evidence_context_association_id(
+                            reference.evidence_unit_id,
+                            str(reference.id),
+                        ),
+                        reference.evidence_unit_id,
+                        reference.id,
+                        now,
+                        now,
+                    ),
+                )
+        for unit in plan.evidence_units:
+            desired_context_ids = tuple(
+                str(reference.id)
+                for reference in plan.evidence_references
+                if reference.role is EvidenceRole.CONTEXT
+                and reference.evidence_unit_id == unit.id
+            )
+            if desired_context_ids:
+                placeholders = ", ".join("?" for _ in desired_context_ids)
+                await self.db.execute(
+                    f"""UPDATE evidence_context_associations
+                           SET active = 0, updated_at = ?, removed_at = ?
+                         WHERE evidence_unit_id = ? AND active = 1
+                           AND evidence_reference_id NOT IN ({placeholders})""",
+                    (now, now, unit.id, *desired_context_ids),
+                )
+            else:
+                await self.db.execute(
+                    """UPDATE evidence_context_associations
+                          SET active = 0, updated_at = ?, removed_at = ?
+                        WHERE evidence_unit_id = ? AND active = 1""",
+                    (now, now, unit.id),
+                )
 
     async def _apply_lifecycle_mutation_unlocked(
         self,
@@ -9114,6 +10555,7 @@ class Database:
         mutation,
         *,
         source_unit_id: str,
+        support_scope_version: SupportScopeVersion,
         now: str,
     ) -> None:
         mutation_type = mutation.mutation_type
@@ -9202,6 +10644,40 @@ class Database:
             access_hash = mutation.payload.get("access_context_hash")
             if not isinstance(access_hash, str) or not access_hash:
                 raise ValueError("attach_support mutation requires access_context_hash")
+            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+                for evidence_unit_id in mutation.evidence_unit_ids:
+                    async with self.db.execute(
+                        """SELECT source_id, doc_id, source_type, excerpt, observed_at
+                           FROM evidence_units WHERE id = ?""",
+                        (evidence_unit_id,),
+                    ) as cursor:
+                        unit = await cursor.fetchone()
+                    if unit is None or unit["source_id"] != mutation.source_id:
+                        raise ValueError("attach_support Evidence Unit belongs to another source")
+                    assertion = MemoryUnitSupportAssertion(
+                        id=memory_unit_support_assertion_id(
+                            memory_id=mutation.memory_id,
+                            evidence_unit_id=evidence_unit_id,
+                            source_id=mutation.source_id,
+                            access_context_hash=access_hash,
+                        ),
+                        memory_id=mutation.memory_id,
+                        evidence_unit_id=evidence_unit_id,
+                        source_id=mutation.source_id,
+                        access_context_hash=access_hash,
+                        created_at=now,
+                    )
+                    await self._insert_memory_unit_support_unlocked(assertion)
+                    await self._corroborate_memory_unlocked(
+                        mutation.memory_id,
+                        str(unit["doc_id"]),
+                        str(unit["source_type"]),
+                        unit["excerpt"],
+                        source_id=mutation.source_id,
+                        support_kind="corroborated",
+                        source_updated_at=_parse_dt(mutation.payload.get("source_updated_at")),
+                    )
+                return
             for reference_id in mutation.evidence_reference_ids:
                 async with self.db.execute(
                     """SELECT er.role, eu.source_id, eu.doc_id, eu.source_type,
@@ -9249,6 +10725,60 @@ class Database:
                 )
             return
         if mutation_type is LifecycleMutationType.REMOVE_SUPPORT:
+            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+                placeholders = ", ".join("?" for _ in mutation.evidence_unit_ids)
+                rows = await self.db.execute_fetchall(
+                    f"""SELECT msa.evidence_unit_id, eu.source_lineage_id, eu.doc_id
+                         FROM memory_unit_support_assertions msa
+                         JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+                        WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
+                          AND msa.evidence_unit_id IN ({placeholders})""",
+                    (
+                        mutation.memory_id,
+                        mutation.source_id,
+                        *mutation.evidence_unit_ids,
+                    ),
+                )
+                if len(rows) != len(set(mutation.evidence_unit_ids)):
+                    raise ValueError("remove_support did not match complete active Evidence Units")
+                if any(str(row["source_lineage_id"]) != source_unit_id for row in rows):
+                    raise ValueError("remove_support Evidence Unit belongs to another Source Unit")
+                support_doc_ids = {
+                    str(row["doc_id"]) for row in rows if row["doc_id"]
+                }
+                cursor = await self.db.execute(
+                    f"""UPDATE memory_unit_support_assertions
+                           SET active = 0, removed_at = ?
+                         WHERE memory_id = ? AND source_id = ? AND active = 1
+                           AND evidence_unit_id IN ({placeholders})""",
+                    (
+                        now,
+                        mutation.memory_id,
+                        mutation.source_id,
+                        *mutation.evidence_unit_ids,
+                    ),
+                )
+                if cursor.rowcount != len(set(mutation.evidence_unit_ids)):
+                    raise ValueError("remove_support did not remove complete Evidence Units")
+                for document_id in sorted(support_doc_ids):
+                    await self.db.execute(
+                        """DELETE FROM memory_sources
+                            WHERE memory_id = ? AND doc_id = ? AND source_id = ?
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM memory_unit_support_assertions msa
+                                  JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+                                  WHERE msa.memory_id = memory_sources.memory_id
+                                    AND msa.source_id = memory_sources.source_id
+                                    AND msa.active = 1
+                                    AND eu.doc_id = memory_sources.doc_id
+                              )""",
+                        (mutation.memory_id, document_id, mutation.source_id),
+                    )
+                    await self._refresh_memory_metadata_fts_unlocked(
+                        mutation.memory_id,
+                        document_id,
+                    )
+                return
             placeholders = ", ".join("?" for _ in mutation.evidence_reference_ids)
             rows = await self.db.execute_fetchall(
                 f"""SELECT msa.evidence_reference_id, so.source_unit_id, eu.doc_id
@@ -9299,9 +10829,14 @@ class Database:
             return
         if mutation_type is LifecycleMutationType.SUPERSEDE_MEMORY:
             assert mutation.replacement_memory_id is not None
+            support_table = (
+                "memory_unit_support_assertions"
+                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                else "memory_support_assertions"
+            )
             async with self.db.execute(
-                """SELECT 1 FROM memory_support_assertions
-                   WHERE memory_id = ? AND active = 1 LIMIT 1""",
+                f"""SELECT 1 FROM {support_table}
+                    WHERE memory_id = ? AND active = 1 LIMIT 1""",
                 (mutation.memory_id,),
             ) as cursor:
                 if await cursor.fetchone() is not None:
@@ -9345,9 +10880,14 @@ class Database:
             )
             return
         if mutation_type is LifecycleMutationType.RETIRE_MEMORY:
+            support_table = (
+                "memory_unit_support_assertions"
+                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                else "memory_support_assertions"
+            )
             async with self.db.execute(
-                """SELECT 1 FROM memory_support_assertions
-                   WHERE memory_id = ? AND active = 1 LIMIT 1""",
+                f"""SELECT 1 FROM {support_table}
+                    WHERE memory_id = ? AND active = 1 LIMIT 1""",
                 (mutation.memory_id,),
             ) as cursor:
                 if await cursor.fetchone() is not None:
@@ -10289,26 +11829,13 @@ class Database:
             persisted_unit_row = await cursor.fetchone()
         if persisted_unit_row is None or self._row_to_evidence_unit(persisted_unit_row) != unit:
             raise ValueError("relation discovery evidence snapshot is stale")
-        async with self.db.execute(
-            f"""SELECT 1
-                 FROM memory_support_assertions msa
-                 JOIN evidence_references er
-                   ON er.id = msa.evidence_reference_id
-                 JOIN evidence_units eu ON eu.id = er.evidence_unit_id
-                 JOIN source_observations so ON so.id = er.observation_id
-                WHERE {CURRENT_RELATION_EVIDENCE_PREDICATE_SQL}
-                  AND eu.id = ?
-                LIMIT 1""",
-            (
-                work_row["memory_id"],
-                work_row["source_id"],
-                work_row["source_id"],
-                work_row["source_unit_id"],
-                unit.id,
-            ),
-        ) as cursor:
-            if await cursor.fetchone() is None:
-                raise ValueError("relation discovery evidence is no longer current")
+        current_unit = await self.get_current_relation_evidence_unit(
+            str(work_row["memory_id"]),
+            source_id=str(work_row["source_id"]),
+            source_unit_id=str(work_row["source_unit_id"]),
+        )
+        if current_unit is None or current_unit.id != unit.id:
+            raise ValueError("relation discovery evidence is no longer current")
         candidate_ids = tuple(dict.fromkeys(candidate.memory_id for candidate in outcome.candidates))
         if not candidate_ids:
             return
@@ -10503,8 +12030,9 @@ class Database:
                         repo_identifier, source_anchor, source_lineage_id,
                         source_metadata_json, project_key, visibility, owner_user_id,
                         observed_at, extractor_run_id, access_context_hash, content,
-                        excerpt, evidence_provenance, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        excerpt, evidence_provenance, part_set_digest,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         observed_at=excluded.observed_at,
                         extractor_run_id=excluded.extractor_run_id,
@@ -10530,6 +12058,7 @@ class Database:
                         unit.content,
                         unit.excerpt,
                         provenance,
+                        unit.part_set_digest,
                         now,
                         now,
                     ),
@@ -10575,6 +12104,7 @@ class Database:
             content=row["content"],
             excerpt=row["excerpt"],
             evidence_provenance=EvidenceContentProvenance(row["evidence_provenance"]),
+            part_set_digest=row["part_set_digest"],
         )
 
     async def get_current_relation_evidence_unit(
@@ -10584,17 +12114,36 @@ class Database:
         source_id: str,
         source_unit_id: str,
     ) -> EvidenceUnit | None:
-        rows = await self.db.execute_fetchall(
-            f"""SELECT DISTINCT eu.id
-                 FROM memory_support_assertions msa
-                 JOIN evidence_references er
-                   ON er.id = msa.evidence_reference_id
-                 JOIN evidence_units eu ON eu.id = er.evidence_unit_id
-                 JOIN source_observations so ON so.id = er.observation_id
-                WHERE {CURRENT_RELATION_EVIDENCE_PREDICATE_SQL}
-                ORDER BY eu.id""",
-            (memory_id, source_id, source_id, source_unit_id),
-        )
+        if await self.get_support_scope_version() is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            rows = await self.db.execute_fetchall(
+                """SELECT DISTINCT eu.id
+                   FROM memory_unit_support_assertions msa
+                   JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+                   JOIN source_units su ON su.id = eu.source_lineage_id
+                  WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
+                    AND eu.source_id = ? AND eu.source_lineage_id = ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM evidence_references er
+                        JOIN source_observations so ON so.id = er.observation_id
+                        WHERE er.evidence_unit_id = eu.id
+                          AND er.role IN ('primary', 'required')
+                          AND er.observation_revision_id != so.current_revision_id
+                    )
+                  ORDER BY eu.id""",
+                (memory_id, source_id, source_id, source_unit_id),
+            )
+        else:
+            rows = await self.db.execute_fetchall(
+                f"""SELECT DISTINCT eu.id
+                     FROM memory_support_assertions msa
+                     JOIN evidence_references er
+                       ON er.id = msa.evidence_reference_id
+                     JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                     JOIN source_observations so ON so.id = er.observation_id
+                    WHERE {CURRENT_RELATION_EVIDENCE_PREDICATE_SQL}
+                    ORDER BY eu.id""",
+                (memory_id, source_id, source_id, source_unit_id),
+            )
         if not rows:
             return None
         if len(rows) != 1:
@@ -10790,6 +12339,25 @@ class Database:
         if not unique_unit_ids:
             return
         placeholders = ", ".join("?" for _ in unique_unit_ids)
+        context_rows = await self.db.execute_fetchall(
+            f"""SELECT evidence_reference_id
+                FROM evidence_context_associations
+                WHERE evidence_unit_id IN ({placeholders})""",
+            unique_unit_ids,
+        )
+        context_reference_ids = tuple(
+            str(row["evidence_reference_id"]) for row in context_rows
+        )
+        await self.db.execute(
+            f"DELETE FROM evidence_context_associations WHERE evidence_unit_id IN ({placeholders})",
+            unique_unit_ids,
+        )
+        if context_reference_ids:
+            context_placeholders = ", ".join("?" for _ in context_reference_ids)
+            await self.db.execute(
+                f"DELETE FROM evidence_references WHERE id IN ({context_placeholders})",
+                context_reference_ids,
+            )
         await self.db.execute(
             f"DELETE FROM relation_candidates WHERE evidence_unit_id IN ({placeholders})",
             unique_unit_ids,
@@ -12545,9 +14113,15 @@ class Database:
         )
 
     async def _assert_no_active_source_support_unlocked(self, memory_id: str) -> None:
+        support_table = (
+            "memory_unit_support_assertions"
+            if await self.get_support_scope_version()
+            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+            else "memory_support_assertions"
+        )
         async with self.db.execute(
-            """SELECT 1 FROM memory_support_assertions
-               WHERE memory_id = ? AND active = 1 LIMIT 1""",
+            f"""SELECT 1 FROM {support_table}
+                WHERE memory_id = ? AND active = 1 LIMIT 1""",
             (memory_id,),
         ) as cursor:
             if await cursor.fetchone() is not None:
@@ -12562,11 +14136,21 @@ class Database:
         *,
         expected_support_set_hash: str,
     ) -> None:
-        actual_hash = await self._memory_support_set_hash_unlocked(memory_id)
+        version = await self.get_support_scope_version()
+        actual_hash = (
+            await self._memory_unit_support_set_hash_unlocked(memory_id)
+            if version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+            else await self._memory_support_set_hash_unlocked(memory_id)
+        )
         if actual_hash != expected_support_set_hash:
             raise ValueError("memory correction support set changed")
+        support_table = (
+            "memory_unit_support_assertions"
+            if version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+            else "memory_support_assertions"
+        )
         await self.db.execute(
-            "UPDATE memory_support_assertions SET active = 0, removed_at = ? "
+            f"UPDATE {support_table} SET active = 0, removed_at = ? "
             "WHERE memory_id = ? AND active = 1",
             (_now_iso(), memory_id),
         )
@@ -14067,17 +15651,32 @@ class Database:
                     if await cursor.fetchone() is None:
                         await self.db.commit()
                         return False
-                await self.db.execute(
-                    """DELETE FROM memory_support_assertions
-                   WHERE memory_id = ? AND source_id = ?
-                     AND evidence_reference_id IN (
-                         SELECT er.id
-                           FROM evidence_references er
-                           JOIN evidence_units eu ON eu.id = er.evidence_unit_id
-                          WHERE eu.doc_id = ? AND eu.source_id = ?
-                     )""",
-                    (memory_id, source_id, doc_id, source_id),
-                )
+                if (
+                    await self.get_support_scope_version()
+                    is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                ):
+                    await self.db.execute(
+                        """UPDATE memory_unit_support_assertions
+                              SET active = 0, removed_at = ?
+                            WHERE memory_id = ? AND source_id = ? AND active = 1
+                              AND evidence_unit_id IN (
+                                  SELECT id FROM evidence_units
+                                  WHERE doc_id = ? AND source_id = ?
+                              )""",
+                        (_now_iso(), memory_id, source_id, doc_id, source_id),
+                    )
+                else:
+                    await self.db.execute(
+                        """DELETE FROM memory_support_assertions
+                       WHERE memory_id = ? AND source_id = ?
+                         AND evidence_reference_id IN (
+                             SELECT er.id
+                               FROM evidence_references er
+                               JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                              WHERE eu.doc_id = ? AND eu.source_id = ?
+                         )""",
+                        (memory_id, source_id, doc_id, source_id),
+                    )
                 await self._delete_current_evidence_relation_for_memory_doc_unlocked(
                     memory_id,
                     source_id,
@@ -14157,8 +15756,31 @@ class Database:
         *,
         retire_reason: str,
     ) -> bool:
-        async with self.db.execute(
-            """SELECT
+        version = await self.get_support_scope_version()
+        if version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            query = """SELECT
+                   (SELECT COUNT(*)
+                      FROM memory_sources ms
+                      JOIN documents d ON ms.doc_id = d.doc_id
+                     WHERE ms.memory_id = ?) AS total_count,
+                   (SELECT COUNT(*)
+                      FROM memory_unit_support_assertions msa
+                     WHERE msa.memory_id = ? AND msa.active = 1) AS active_support_count,
+                   (SELECT COUNT(*)
+                      FROM memory_unit_support_assertions msa
+                      LEFT JOIN evidence_units eu
+                        ON eu.id = msa.evidence_unit_id
+                     WHERE msa.memory_id = ? AND msa.active = 1
+                       AND (
+                           eu.id IS NULL OR eu.doc_id IS NULL OR NOT EXISTS (
+                               SELECT 1 FROM memory_sources ms
+                                WHERE ms.memory_id = msa.memory_id
+                                  AND ms.source_id = msa.source_id
+                                  AND ms.doc_id = eu.doc_id
+                           )
+                       )) AS missing_projection_count"""
+        else:
+            query = """SELECT
                    (SELECT COUNT(*)
                       FROM memory_sources ms
                       JOIN documents d ON ms.doc_id = d.doc_id
@@ -14180,7 +15802,9 @@ class Database:
                                   AND ms.source_id = msa.source_id
                                   AND ms.doc_id = eu.doc_id
                            )
-                       )) AS missing_projection_count""",
+                       )) AS missing_projection_count"""
+        async with self.db.execute(
+            query,
             (memory_id, memory_id, memory_id),
         ) as cursor:
             row = await cursor.fetchone()
@@ -16150,6 +17774,10 @@ class Database:
         Returns memory IDs retired because the source removal left them without
         valid support.
         """
+        if await self.get_support_scope_version() is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            raise ValueError(
+                "Support v2 lifecycle history cannot be purged by ordinary Source deletion"
+            )
         async with self._write_lock:
             try:
                 source_lock = await self.db.execute(
@@ -16366,6 +17994,11 @@ class Database:
         retires memories left unsupported; and closes the destructive gate until
         a complete replay succeeds.
         """
+
+        if await self.get_support_scope_version() is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            raise ValueError(
+                "Support v2 recovery is forward-only; reference-scoped rebaseline is disabled"
+            )
 
         async with self._write_lock:
             try:
@@ -20306,8 +21939,22 @@ class Database:
             for row in memory_rows
         )
 
+        v2 = (
+            await self.get_support_scope_version()
+            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+        )
+        support_from = (
+            """memory_unit_support_assertions MSA
+                 JOIN evidence_references ER
+                   ON ER.evidence_unit_id = MSA.evidence_unit_id
+                  AND ER.role IN ('primary', 'required')"""
+            if v2
+            else """memory_support_assertions MSA
+                 JOIN evidence_references ER
+                   ON ER.id = MSA.evidence_reference_id"""
+        )
         async with self.db.execute(
-            """SELECT MSA.memory_id,
+            f"""SELECT MSA.memory_id,
                       MSA.source_id AS assertion_source_id,
                       MSA.access_context_hash AS assertion_access_context_hash,
                       ER.evidence_unit_id,
@@ -20326,9 +21973,7 @@ class Database:
                       SU.source_id AS source_unit_source_id,
                       S.access_policy AS source_access_policy,
                       S.owner_user_id AS source_owner_user_id
-                 FROM memory_support_assertions MSA
-                 JOIN evidence_references ER
-                   ON ER.id = MSA.evidence_reference_id
+                 FROM {support_from}
                  JOIN evidence_units EU
                    ON EU.id = ER.evidence_unit_id
                  JOIN source_observations SO
@@ -20338,7 +21983,7 @@ class Database:
                  JOIN sources S
                    ON S.id = MSA.source_id
                 WHERE MSA.memory_id IN (?, ?) AND MSA.active = 1
-                ORDER BY MSA.memory_id, MSA.id""",
+                ORDER BY MSA.memory_id, MSA.id, ER.id""",
             memory_ids,
         ) as cursor:
             support_rows = await cursor.fetchall()
