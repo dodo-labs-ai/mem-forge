@@ -254,6 +254,38 @@ class ActiveSupportEvidence:
     excerpt: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryEvidenceItemProjection:
+    reference_id: str
+    role: EvidenceRole
+    kind: EvidencePartKind
+    anchor: SourceAnchor
+    excerpt: str | None
+    raw_content_sha256: str
+    presentation_sha256: str
+    current: bool
+    artifact_metadata: Mapping[str, object] = field(default_factory=dict)
+
+    @property
+    def grants_support(self) -> bool:
+        return self.role in {EvidenceRole.PRIMARY, EvidenceRole.REQUIRED}
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryEvidenceUnitProjection:
+    evidence_unit_id: str
+    support_ids: tuple[str, ...]
+    support_scope_version: SupportScopeVersion
+    source_id: str
+    source_type: str
+    source_unit_id: str
+    source_unit_revision_id: str | None
+    doc_id: str | None
+    current: bool
+    legacy_limited: bool
+    items: tuple[MemoryEvidenceItemProjection, ...]
+
+
 def validate_evidence_references(
     references: tuple[EvidenceReference, ...],
     *,

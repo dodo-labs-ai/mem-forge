@@ -45,3 +45,54 @@ def test_memory_detail_compaction_preserves_structured_conflict_context() -> Non
 
     assert result["conflict_contexts"] == [_conflict_context()]
     assert "owner_user_id" not in result
+
+
+def test_memory_detail_compaction_preserves_grouped_role_aware_evidence() -> None:
+    result = _compact_memory_response(
+        {
+            "id": "mem-primary",
+            "content": "Deployment requires approval.",
+            "evidence": [
+                {
+                    "evidence_unit_id": "eu-v2-1",
+                    "support_scope_version": "evidence-unit-set-v2",
+                    "source_type": "github_repo",
+                    "doc_id": "doc-1",
+                    "current": True,
+                    "legacy_limited": False,
+                    "items": [
+                        {
+                            "role": "primary",
+                            "kind": "text",
+                            "support_contribution": True,
+                            "excerpt": "Deployment requires approval.",
+                            "current": True,
+                            "raw_content_sha256": "internal",
+                        },
+                        {
+                            "role": "context",
+                            "kind": "artifact",
+                            "support_contribution": False,
+                            "current": True,
+                            "artifact": {
+                                "summary": "Approval flow diagram",
+                                "evidence_role": "context",
+                                "filename": "flow.png",
+                                "content_type": "image/png",
+                                "size_bytes": 42,
+                                "url": "/api/v1/source-artifacts/rev-1",
+                                "sha256": "internal",
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    [unit] = result["evidence"]
+    assert unit["evidence_unit_id"] == "eu-v2-1"
+    assert [item["role"] for item in unit["items"]] == ["primary", "context"]
+    assert unit["items"][1]["artifact"]["url"].endswith("/rev-1")
+    assert "raw_content_sha256" not in unit["items"][0]
+    assert "sha256" not in unit["items"][1]["artifact"]

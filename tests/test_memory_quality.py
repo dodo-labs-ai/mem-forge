@@ -765,6 +765,20 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     assert artifact["sha256"] == digest
     assert artifact["summary"] == ("Service case review screen showing the investigation areas.")
     assert artifact["url"] == "/api/v1/source-artifacts/obsrev-image"
+    [evidence_unit] = detail.json()["evidence"]
+    assert [item["role"] for item in evidence_unit["items"]] == [
+        "primary",
+        "required",
+        "context",
+    ]
+    assert [item["support_contribution"] for item in evidence_unit["items"]] == [
+        True,
+        True,
+        False,
+    ]
+    assert evidence_unit["items"][-1]["artifact"]["url"] == (
+        "/api/v1/source-artifacts/obsrev-image"
+    )
 
     await db.db.execute(
         "UPDATE source_observations SET current_revision_id = ? WHERE id = ?",
@@ -809,7 +823,9 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     await db.db.commit()
     with TestClient(app) as client:
         unauthorized_replay = client.get("/api/v1/source-artifacts/obsrev-image")
+        unauthorized_detail = client.get(f"/api/v1/memories/{memory.id}")
     assert unauthorized_replay.status_code == 404
+    assert unauthorized_detail.status_code == 404
 
 
 @pytest.mark.parametrize(

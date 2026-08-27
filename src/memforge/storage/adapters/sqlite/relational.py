@@ -24,6 +24,7 @@ from memforge.memory.evidence import (
     EvidenceReference,
     EvidenceUnit,
     MemorySupportAssertion,
+    MemoryEvidenceUnitProjection,
     MemoryUnitSupportAssertion,
     SupportScopeVersion,
     RelationOutcomeBundle,
@@ -716,6 +717,12 @@ class SqliteRelationalStore:
         memory_id: str,
     ) -> tuple[SourceArtifactEvidence, ...]:
         return await self._db.get_memory_source_artifacts(memory_id)
+
+    async def get_memory_evidence_units(
+        self,
+        memory_id: str,
+    ) -> tuple[MemoryEvidenceUnitProjection, ...]:
+        return await self._db.get_memory_evidence_units(memory_id)
 
     async def find_source_unit_by_document_id(
         self,

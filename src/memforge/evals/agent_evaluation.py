@@ -27,7 +27,7 @@ AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v3"
 AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v5"
 SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION = "source-unit-lifecycle-v1"
 DETERMINISTIC_RUNTIME_EVALUATOR_NAME = "memforge.deterministic.runtime_contract"
-DETERMINISTIC_RUNTIME_EVALUATOR_VERSION = "1"
+DETERMINISTIC_RUNTIME_EVALUATOR_VERSION = "2"
 ONLINE_EVALUATION_COVERAGE_POLICY = "semantic_evaluator_v1"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
 AgentAssessmentStatus = Literal["completed", "failed"]
@@ -1064,7 +1064,15 @@ def _deterministic_assessment_decision(
             "pass" if event.outcome in {"expected", "degraded"} else "fail",
         )
     if event.event_name == "evidence_admission_outcome":
-        return "evidence_reference_validity", "fail"
+        bucket = evidence_selection_outcome_bucket(event)
+        return {
+            "accepted": ("evidence_fragment_acceptance", "pass"),
+            "stale": ("evidence_fragment_staleness", "fail"),
+            "unselectable": ("evidence_fragment_selectability", "fail"),
+            "catalog_too_large": ("evidence_catalog_capacity", "fail"),
+            "review": ("evidence_fragment_review", "needs_review"),
+            "rejected": ("evidence_reference_validity", "fail"),
+        }[bucket]
     if event.event_name == "evidence_localization_outcome":
         return (
             "evidence_localization",
@@ -1076,6 +1084,47 @@ def _deterministic_assessment_decision(
         if event.reason_code == "candidates_extracted":
             return "extraction_completion", "pass"
     return None
+
+
+def evidence_selection_outcome_bucket(
+    event: AgentRuntimeEvent,
+) -> Literal[
+    "accepted",
+    "rejected",
+    "stale",
+    "unselectable",
+    "catalog_too_large",
+    "review",
+]:
+    """Classify v9 selection outcomes without rewriting historical v8 events."""
+
+    reason = event.reason_code
+    if event.outcome == "expected" or reason == "fragment_selection_resolved":
+        return "accepted"
+    if reason == "catalog_too_large":
+        return "catalog_too_large"
+    if reason in {
+        "unknown_ref",
+        "stale_ref",
+        "stale_catalog",
+        "contract_superseded",
+    }:
+        return "stale"
+    if reason in {
+        "catalog_unusable",
+        "ineligible_role",
+        "unsupported_profile",
+        "no_selectable_content",
+        "artifact_ineligible",
+    }:
+        return "unselectable"
+    if reason in {
+        "review_required",
+        "legacy_limited",
+        "mandatory_incomplete",
+    }:
+        return "review"
+    return "rejected"
 
 
 def runtime_trace_id(

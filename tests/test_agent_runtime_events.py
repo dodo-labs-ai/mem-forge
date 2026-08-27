@@ -616,6 +616,30 @@ def test_deterministic_evaluator_only_judges_supported_runtime_contracts() -> No
     assert evaluate_runtime_events(events) == assessments
 
 
+def test_v9_evidence_evaluation_distinguishes_selection_outcome_taxonomy() -> None:
+    events = _events(
+        QualitySignal(
+            "evidence_admission_outcome",
+            "expected",
+            "fragment_selection_resolved",
+        ),
+        QualitySignal("evidence_admission_outcome", "rejected", "unknown_ref"),
+        QualitySignal("evidence_admission_outcome", "rejected", "ineligible_role"),
+        QualitySignal("evidence_admission_outcome", "rejected", "catalog_too_large"),
+        QualitySignal("evidence_admission_outcome", "degraded", "review_required"),
+    )
+
+    assessments = evaluate_runtime_events(events)
+
+    assert [(item.criterion, item.label, item.reason_code) for item in assessments] == [
+        ("evidence_fragment_acceptance", "pass", "fragment_selection_resolved"),
+        ("evidence_fragment_staleness", "fail", "unknown_ref"),
+        ("evidence_fragment_selectability", "fail", "ineligible_role"),
+        ("evidence_catalog_capacity", "fail", "catalog_too_large"),
+        ("evidence_fragment_review", "needs_review", "review_required"),
+    ]
+
+
 def test_deterministic_evaluator_reproduces_persisted_lifecycle_assessment() -> None:
     bundle = _lifecycle_bundle()
 

@@ -95,6 +95,8 @@ from memforge.memory.evidence import (
     EvidenceUnit,
     LifecycleAction,
     MemorySupportAssertion,
+    MemoryEvidenceItemProjection,
+    MemoryEvidenceUnitProjection,
     MemoryUnitSupportAssertion,
     SupportScopeVersion,
     SupportCutoverFinding,
@@ -7036,6 +7038,333 @@ class Database:
             source_id=str(row["source_id"]),
             source_unit_id=str(row["source_unit_id"]),
             metadata=json.loads(row["metadata_json"] or "{}"),
+        )
+
+    async def get_memory_evidence_units(
+        self,
+        memory_id: str,
+    ) -> tuple[MemoryEvidenceUnitProjection, ...]:
+        """Return one hash-verified grouped Evidence projection for get_memory."""
+
+        version = await self.get_support_scope_version()
+        if version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            support_rows = await self.db.execute_fetchall(
+                """SELECT msa.id AS support_id, msa.evidence_unit_id,
+                          'evidence-unit-set-v2' AS support_scope_version,
+                          eu.source_id, eu.source_type, eu.source_lineage_id,
+                          eu.doc_revision_id, eu.doc_id,
+                          eu.evidence_provenance
+                     FROM memory_unit_support_assertions msa
+                     JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+                    WHERE msa.memory_id = ? AND msa.active = 1
+                    UNION ALL
+                   SELECT msa.id AS support_id, er.evidence_unit_id,
+                          'reference-set-v1' AS support_scope_version,
+                          eu.source_id, eu.source_type,
+                          COALESCE(eu.source_lineage_id, support_so.source_unit_id)
+                              AS source_lineage_id,
+                          eu.doc_revision_id, eu.doc_id,
+                          'legacy_limited' AS evidence_provenance
+                     FROM memory_support_assertions msa
+                     JOIN evidence_references er ON er.id = msa.evidence_reference_id
+                     JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                     JOIN source_observations support_so
+                       ON support_so.id = er.observation_id
+                    WHERE msa.memory_id = ? AND msa.active = 1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM memory_unit_support_assertions v2
+                           WHERE v2.memory_id = msa.memory_id
+                             AND v2.evidence_unit_id = er.evidence_unit_id
+                             AND v2.active = 1
+                      )
+                    ORDER BY evidence_unit_id, support_id""",
+                (memory_id, memory_id),
+            )
+        else:
+            support_rows = await self.db.execute_fetchall(
+                """SELECT msa.id AS support_id, er.evidence_unit_id,
+                          'reference-set-v1' AS support_scope_version,
+                          eu.source_id, eu.source_type,
+                          COALESCE(eu.source_lineage_id, support_so.source_unit_id)
+                              AS source_lineage_id,
+                          eu.doc_revision_id, eu.doc_id,
+                          eu.evidence_provenance
+                     FROM memory_support_assertions msa
+                     JOIN evidence_references er ON er.id = msa.evidence_reference_id
+                     JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                     JOIN source_observations support_so
+                       ON support_so.id = er.observation_id
+                    WHERE msa.memory_id = ? AND msa.active = 1
+                    ORDER BY er.evidence_unit_id, msa.id""",
+                (memory_id,),
+            )
+        grouped_headers: dict[str, dict[str, object]] = {}
+        for row in support_rows:
+            unit_id = str(row["evidence_unit_id"])
+            header = grouped_headers.setdefault(
+                unit_id,
+                {
+                    "support_ids": [],
+                    "support_scope_version": str(row["support_scope_version"]),
+                    "source_id": str(row["source_id"]),
+                    "source_type": str(row["source_type"]),
+                    "source_unit_id": str(row["source_lineage_id"] or ""),
+                    "source_unit_revision_id": (
+                        str(row["doc_revision_id"])
+                        if row["doc_revision_id"] is not None
+                        else None
+                    ),
+                    "doc_id": (
+                        str(row["doc_id"])
+                        if row["doc_id"] is not None
+                        else None
+                    ),
+                    "legacy_limited": (
+                        str(row["evidence_provenance"]) == "legacy_limited"
+                    ),
+                },
+            )
+            support_ids = header["support_ids"]
+            assert isinstance(support_ids, list)
+            support_ids.append(str(row["support_id"]))
+            if header["support_scope_version"] != str(row["support_scope_version"]):
+                header["legacy_limited"] = True
+
+        projected: list[MemoryEvidenceUnitProjection] = []
+        for unit_id, header in sorted(grouped_headers.items()):
+            scope_version = SupportScopeVersion(
+                str(header["support_scope_version"])
+            )
+            if scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+                supporting_rows = await self.db.execute_fetchall(
+                    """SELECT er.*, eu.excerpt AS unit_excerpt,
+                              so.observation_type, so.current_revision_id,
+                              so.source_id AS observation_source_id,
+                              so.source_unit_id AS observation_source_unit_id,
+                              sor.content, sor.metadata_json, sor.profile_name
+                         FROM evidence_references er
+                         JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                         JOIN source_observations so ON so.id = er.observation_id
+                         JOIN source_observation_revisions sor
+                           ON sor.id = er.observation_revision_id
+                        WHERE er.evidence_unit_id = ?
+                          AND er.role IN ('primary', 'required')
+                        ORDER BY er.role, er.observation_revision_id,
+                                 er.range_start, er.range_end, er.id""",
+                    (unit_id,),
+                )
+            else:
+                supporting_rows = await self.db.execute_fetchall(
+                    """SELECT DISTINCT er.*, eu.excerpt AS unit_excerpt,
+                              so.observation_type, so.current_revision_id,
+                              so.source_id AS observation_source_id,
+                              so.source_unit_id AS observation_source_unit_id,
+                              sor.content, sor.metadata_json, sor.profile_name
+                         FROM memory_support_assertions msa
+                         JOIN evidence_references er
+                           ON er.id = msa.evidence_reference_id
+                         JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                         JOIN source_observations so ON so.id = er.observation_id
+                         JOIN source_observation_revisions sor
+                           ON sor.id = er.observation_revision_id
+                        WHERE msa.memory_id = ? AND msa.active = 1
+                          AND er.evidence_unit_id = ?
+                          AND er.role IN ('primary', 'required')
+                        ORDER BY er.role, er.observation_revision_id,
+                                 er.range_start, er.range_end, er.id""",
+                    (memory_id, unit_id),
+                )
+            context_rows = await self.db.execute_fetchall(
+                """SELECT er.*, NULL AS unit_excerpt,
+                          so.observation_type, so.current_revision_id,
+                          so.source_id AS observation_source_id,
+                          so.source_unit_id AS observation_source_unit_id,
+                          sor.content, sor.metadata_json, sor.profile_name
+                     FROM evidence_context_associations association
+                     JOIN evidence_references er
+                       ON er.id = association.evidence_reference_id
+                     JOIN source_observations so ON so.id = er.observation_id
+                     JOIN source_observation_revisions sor
+                       ON sor.id = er.observation_revision_id
+                    WHERE association.evidence_unit_id = ?
+                      AND association.active = 1
+                      AND er.role = 'context'
+                    ORDER BY er.observation_revision_id,
+                             er.range_start, er.range_end, er.id""",
+                (unit_id,),
+            )
+            supporting_items: list[MemoryEvidenceItemProjection] = []
+            invalid_support = False
+            for row in supporting_rows:
+                if (
+                    row["observation_source_id"] != header["source_id"]
+                    or row["observation_source_unit_id"]
+                    != header["source_unit_id"]
+                ):
+                    invalid_support = True
+                    break
+                try:
+                    supporting_items.append(
+                        self._project_memory_evidence_item(row)
+                    )
+                except ValueError:
+                    invalid_support = True
+                    break
+            if invalid_support or not supporting_items or sum(
+                item.role is EvidenceRole.PRIMARY for item in supporting_items
+            ) != 1:
+                continue
+            context_items: list[MemoryEvidenceItemProjection] = []
+            for row in context_rows:
+                if (
+                    row["observation_source_id"] != header["source_id"]
+                    or row["observation_source_unit_id"]
+                    != header["source_unit_id"]
+                ):
+                    continue
+                try:
+                    context_items.append(self._project_memory_evidence_item(row))
+                except ValueError:
+                    continue
+            items = tuple(
+                sorted(
+                    (*supporting_items, *context_items),
+                    key=lambda item: (
+                        {
+                            EvidenceRole.PRIMARY: 0,
+                            EvidenceRole.REQUIRED: 1,
+                            EvidenceRole.CONTEXT: 2,
+                        }[item.role],
+                        item.anchor.observation_revision_id,
+                        -1
+                        if item.anchor.range_start is None
+                        else item.anchor.range_start,
+                        -1
+                        if item.anchor.range_end is None
+                        else item.anchor.range_end,
+                        item.reference_id,
+                    ),
+                )
+            )
+            support_ids = header["support_ids"]
+            assert isinstance(support_ids, list)
+            projected.append(
+                MemoryEvidenceUnitProjection(
+                    evidence_unit_id=unit_id,
+                    support_ids=tuple(sorted(set(support_ids))),
+                    support_scope_version=scope_version,
+                    source_id=str(header["source_id"]),
+                    source_type=str(header["source_type"]),
+                    source_unit_id=str(header["source_unit_id"]),
+                    source_unit_revision_id=header["source_unit_revision_id"],
+                    doc_id=header["doc_id"],
+                    current=all(
+                        item.current
+                        for item in items
+                        if item.grants_support
+                    ),
+                    legacy_limited=bool(header["legacy_limited"]),
+                    items=items,
+                )
+            )
+        return tuple(projected)
+
+    @staticmethod
+    def _project_memory_evidence_item(row) -> MemoryEvidenceItemProjection:
+        role = EvidenceRole(str(row["role"]))
+        anchor = SourceAnchor(
+            kind=AnchorKind(str(row["anchor_kind"])),
+            observation_id=str(row["observation_id"]),
+            observation_revision_id=str(row["observation_revision_id"]),
+            fragment_id=(
+                str(row["fragment_id"])
+                if row["fragment_id"] is not None
+                else None
+            ),
+            range_start=(
+                int(row["range_start"])
+                if row["range_start"] is not None
+                else None
+            ),
+            range_end=(
+                int(row["range_end"])
+                if row["range_end"] is not None
+                else None
+            ),
+        )
+        metadata = json.loads(row["metadata_json"] or "{}")
+        artifact = (
+            metadata.get("source_artifact")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        is_artifact = (
+            row["part_kind"] == EvidencePartKind.ARTIFACT.value
+            or row["profile_name"] == "binary-artifact"
+            or row["observation_type"] == "binary_artifact"
+        )
+        current = row["current_revision_id"] == row["observation_revision_id"]
+        if is_artifact:
+            if not isinstance(artifact, Mapping):
+                raise ValueError("Artifact Evidence lacks authoritative metadata")
+            raw_digest = str(artifact.get("sha256") or "").lower()
+            if len(raw_digest) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in raw_digest
+            ):
+                raise ValueError("Artifact Evidence digest is invalid")
+            if row["raw_content_sha256"] not in {None, raw_digest}:
+                raise ValueError("Artifact Evidence digest mismatch")
+            presentation_digest = str(
+                row["presentation_sha256"]
+                or hashlib.sha256(b"").hexdigest()
+            )
+            return MemoryEvidenceItemProjection(
+                reference_id=str(row["id"]),
+                role=role,
+                kind=EvidencePartKind.ARTIFACT,
+                anchor=anchor,
+                excerpt=None,
+                raw_content_sha256=raw_digest,
+                presentation_sha256=presentation_digest,
+                current=current,
+                artifact_metadata=dict(artifact),
+            )
+        content = str(row["content"])
+        if anchor.kind is AnchorKind.WHOLE_OBSERVATION:
+            raw = content
+        elif anchor.kind is AnchorKind.REVISION_RANGE:
+            assert anchor.range_start is not None and anchor.range_end is not None
+            if anchor.range_end > len(content):
+                raise ValueError("Evidence range exceeds immutable revision")
+            raw = content[anchor.range_start : anchor.range_end]
+        else:
+            raise ValueError("stable Fragment Evidence cannot be reconstructed")
+        raw_digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        if row["raw_content_sha256"] not in {None, raw_digest}:
+            raise ValueError("text Evidence raw digest mismatch")
+        excerpt = (
+            str(row["excerpt"])
+            if row["excerpt"] is not None
+            else (
+                str(row["unit_excerpt"])
+                if role is EvidenceRole.PRIMARY
+                and row["unit_excerpt"] is not None
+                else raw
+            )
+        )
+        presentation_digest = hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
+        if row["presentation_sha256"] not in {None, presentation_digest}:
+            raise ValueError("text Evidence presentation digest mismatch")
+        return MemoryEvidenceItemProjection(
+            reference_id=str(row["id"]),
+            role=role,
+            kind=EvidencePartKind.TEXT,
+            anchor=anchor,
+            excerpt=excerpt,
+            raw_content_sha256=raw_digest,
+            presentation_sha256=presentation_digest,
+            current=current,
         )
 
     async def get_memory_source_artifacts(

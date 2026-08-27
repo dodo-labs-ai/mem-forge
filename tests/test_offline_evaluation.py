@@ -1150,3 +1150,46 @@ async def test_offline_case_curation_enforces_private_source_owner(db) -> None:
             promotion_policy_version="manual-v1",
             created_by="not-owner",
         )
+
+
+def test_offline_v9_evidence_resolution_verifies_exact_resolved_parts() -> None:
+    import hashlib
+
+    from memforge.evals.offline_evaluation import _derivation_evidence_resolves
+
+    content = "Deployment requires approval."
+    raw_digest = hashlib.sha256(content.encode()).hexdigest()
+    memory = {
+        "resolved_evidence_selection": {
+            "parts": [
+                {
+                    "role": "primary",
+                    "kind": "text",
+                    "anchor": {
+                        "kind": "revision_range",
+                        "observation_id": "obs-1",
+                        "observation_revision_id": "rev-1",
+                        "range_start": 0,
+                        "range_end": len(content),
+                    },
+                    "raw_content_sha256": raw_digest,
+                    "presentation_sha256": raw_digest,
+                    "excerpt": content,
+                }
+            ]
+        }
+    }
+    revisions = {
+        "obs-1": {
+            "id": "rev-1",
+            "observation_id": "obs-1",
+            "content": content,
+            "metadata": {},
+        }
+    }
+
+    assert _derivation_evidence_resolves(memory, revisions)
+    memory["resolved_evidence_selection"]["parts"][0][
+        "raw_content_sha256"
+    ] = "0" * 64
+    assert not _derivation_evidence_resolves(memory, revisions)
