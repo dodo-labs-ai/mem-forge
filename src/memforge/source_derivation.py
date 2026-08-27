@@ -12,6 +12,12 @@ from datetime import datetime
 from typing import Any, Literal, Protocol
 
 from memforge.models import DocumentRecord, MemoryExtractionResult, RawMemory
+from memforge.memory.evidence import (
+    EvidencePartKind,
+    EvidenceRole,
+    ResolvedEvidencePart,
+    ResolvedEvidenceSelection,
+)
 from memforge.evals.agent_evaluation import (
     AgentAssessment,
     AgentAssessmentSink,
@@ -30,6 +36,7 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.pipeline.bounded_work import collect_bounded
 from memforge.pipeline.extraction_contract import (
+    CONTRACT_SUPERSEDED,
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
 )
 from memforge.pipeline.document_units import (
@@ -45,6 +52,8 @@ from memforge.pipeline.projection_context import (
 )
 from memforge.source_artifacts import SourceArtifactSummary
 from memforge.source_projection import (
+    AnchorKind,
+    SourceAnchor,
     SourceProjection,
     source_projection_to_payload,
 )
@@ -121,6 +130,7 @@ class SourceDerivationAttempt:
     context_identity_hash: str
     extraction_contract_version: str
     status: str
+    terminal_reason_code: str | None
     batches: tuple[SourceDerivationBatchRecord, ...]
     created_at: str
     updated_at: str
@@ -196,7 +206,16 @@ class SourceDerivationStore(Protocol):
     async def supersede_source_derivation(
         self,
         derivation_id: str,
+        *,
+        reason_code: str | None = None,
     ) -> None: ...
+
+    async def supersede_incomplete_source_derivations_for_contract(
+        self,
+        *,
+        extraction_contract_version: str,
+        reason_code: str = CONTRACT_SUPERSEDED,
+    ) -> tuple[str, ...]: ...
 
 @dataclass(frozen=True, slots=True)
 class SourceUnitDerivationRequest:
@@ -869,6 +888,9 @@ def memory_extraction_result_from_output_payload(
                 evidence_anchor=_optional_string(value.get("evidence_anchor")),
                 source_observation_id=_optional_string(value.get("source_observation_id")),
                 required_source_observation_ids=_string_list(value.get("required_source_observation_ids")),
+                resolved_evidence_selection=_resolved_evidence_selection_from_payload(
+                    value.get("resolved_evidence_selection")
+                ),
                 support_validation=(
                     dict(value.get("support_validation") or {})
                     if isinstance(value.get("support_validation"), Mapping)
@@ -1006,8 +1028,90 @@ def _raw_memory_payload(memory: RawMemory) -> dict[str, object]:
         "evidence_anchor": memory.evidence_anchor,
         "source_observation_id": memory.source_observation_id,
         "required_source_observation_ids": list(memory.required_source_observation_ids),
+        "resolved_evidence_selection": (
+            _resolved_evidence_selection_payload(memory.resolved_evidence_selection)
+            if memory.resolved_evidence_selection is not None
+            else None
+        ),
         "support_validation": dict(memory.support_validation),
     }
+
+
+def _resolved_evidence_selection_payload(
+    selection: ResolvedEvidenceSelection,
+) -> dict[str, object]:
+    return {
+        "source_id": selection.source_id,
+        "source_unit_id": selection.source_unit_id,
+        "target_unit_revision_id": selection.target_unit_revision_id,
+        "access_context_hash": selection.access_context_hash,
+        "catalog_digest": selection.catalog_digest,
+        "compiler_contract_version": selection.compiler_contract_version,
+        "parts": [
+            {
+                "role": part.role.value,
+                "kind": part.kind.value,
+                "anchor": {
+                    "kind": part.anchor.kind.value,
+                    "observation_id": part.anchor.observation_id,
+                    "observation_revision_id": part.anchor.observation_revision_id,
+                    "fragment_id": part.anchor.fragment_id,
+                    "range_start": part.anchor.range_start,
+                    "range_end": part.anchor.range_end,
+                },
+                "raw_content_sha256": part.raw_content_sha256,
+                "presentation_sha256": part.presentation_sha256,
+                "excerpt": part.excerpt,
+                "artifact_metadata": dict(part.artifact_metadata),
+            }
+            for part in selection.parts
+        ],
+    }
+
+
+def _resolved_evidence_selection_from_payload(
+    value: object,
+) -> ResolvedEvidenceSelection | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or not isinstance(value.get("parts"), list):
+        raise ValueError("resolved Evidence selection payload is invalid")
+    parts: list[ResolvedEvidencePart] = []
+    for raw_part in value["parts"]:
+        if not isinstance(raw_part, Mapping) or not isinstance(raw_part.get("anchor"), Mapping):
+            raise ValueError("resolved Evidence part payload is invalid")
+        raw_anchor = raw_part["anchor"]
+        parts.append(
+            ResolvedEvidencePart(
+                role=EvidenceRole(str(raw_part["role"])),
+                kind=EvidencePartKind(str(raw_part["kind"])),
+                anchor=SourceAnchor(
+                    kind=AnchorKind(str(raw_anchor["kind"])),
+                    observation_id=str(raw_anchor["observation_id"]),
+                    observation_revision_id=str(raw_anchor["observation_revision_id"]),
+                    fragment_id=_optional_string(raw_anchor.get("fragment_id")),
+                    range_start=_optional_int(raw_anchor.get("range_start")),
+                    range_end=_optional_int(raw_anchor.get("range_end")),
+                ),
+                raw_content_sha256=str(raw_part["raw_content_sha256"]),
+                presentation_sha256=str(raw_part["presentation_sha256"]),
+                excerpt=_optional_string(raw_part.get("excerpt")),
+                artifact_metadata=(
+                    dict(raw_part["artifact_metadata"])
+                    if isinstance(raw_part.get("artifact_metadata"), Mapping)
+                    else {}
+                ),
+            )
+        )
+    return ResolvedEvidenceSelection(
+        source_id=str(value["source_id"]),
+        source_unit_id=str(value["source_unit_id"]),
+        target_unit_revision_id=str(value["target_unit_revision_id"]),
+        access_context_hash=str(value["access_context_hash"]),
+        catalog_digest=str(value["catalog_digest"]),
+        compiler_contract_version=int(value["compiler_contract_version"]),
+        parts=tuple(parts),
+    )
 
 
 def _string_list(value: object) -> list[str]:

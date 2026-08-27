@@ -168,6 +168,7 @@ def build_projected_claim_evidence(
                 "projection_run_id": projection.run_id,
                 "source_unit_revision_id": unit_revision.id,
                 "observation_type": observations_by_id[primary_id].observation_type,
+                **_resolved_fragment_audit_metadata(raw),
             },
             observed_at=observed_at or primary_revision.observed_at,
             extractor_run_id=extractor_run_id,
@@ -243,6 +244,22 @@ def build_projected_claim_evidence(
         reference_ids_by_claim_hash=reference_ids_by_claim_hash,
         canonical_memories_by_claim_hash=canonical_memories_by_claim_hash,
     )
+
+
+def _resolved_fragment_audit_metadata(raw: RawMemory) -> dict[str, object]:
+    selection = raw.resolved_evidence_selection
+    if selection is None:
+        return {}
+    metadata: dict[str, object] = {
+        "projection_extraction_v9_shadow_validated": True,
+        "fragment_catalog_digest": selection.catalog_digest,
+        "fragment_compiler_contract_version": selection.compiler_contract_version,
+        "resolved_fragment_part_count": len(selection.parts),
+    }
+    receipt = raw.support_validation.get("agent_event_source_range_receipt")
+    if isinstance(receipt, Mapping):
+        metadata["agent_event_source_range_receipt"] = dict(receipt)
+    return metadata
 
 
 def _primary_evidence_anchor(

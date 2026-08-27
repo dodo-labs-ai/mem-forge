@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from time import perf_counter
@@ -26,6 +27,10 @@ from memforge.pipeline.evidence_catalog import (
 )
 from memforge.pipeline.extraction_contract import DURABLE_MEMORY_QUALITY_RULES
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
+from memforge.pipeline.projection_fragments import (
+    FragmentSelectionError,
+    ProjectionFragmentCatalog,
+)
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_SUMMARY_CHARS,
     SourceArtifactSummary,
@@ -223,6 +228,35 @@ PRIMARY observation. Reconciliation owns historical identity and support.
 Prefer an empty memories array over weak or transient claims. Do not emit records that only say an item was created, updated, uploaded, attached, assigned, labeled, ranked, moved, reprioritized, or passed through a routine workflow status. Do not emit revision history, source metadata, routing fields, questions, or secrets. An attachment-upload event is provenance, not authority about the attachment's contents; only separately supplied attachment-content evidence may support a claim. Preserve durable resolution rationale, settled outcomes, and conditions.
 
 Return ONLY a JSON object with a "memories" array."""
+
+
+PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic knowledge from one authorized Source Unit catalog.
+
+<source_type>{source_type}</source_type>
+<doc_type>{doc_type}</doc_type>
+Only the following application-owned Evidence Fragments may support a Memory:
+<evidence_fragment_catalog digest="{catalog_digest}">
+{fragment_catalog}
+</evidence_fragment_catalog>
+<read_only_context>
+{context_observations}
+</read_only_context>
+
+Each Memory must contain exactly:
+- "content": one self-contained durable claim
+- "memory_type": one of "fact", "decision", "convention", "procedure"
+- "confidence": 0.0-1.0
+- "entity_refs": entity names copied from supporting Fragments
+- "valid_from": YYYY-MM-DD or null
+- "valid_until": YYYY-MM-DD or null
+- "primary_ref": exactly one Fragment ref eligible for Primary that directly states the claim
+- "required_refs": a duplicate-free list of only those Required-eligible refs without which the claim would be invalid or ambiguous
+
+Do not return Evidence text, quotes, Observation or Revision IDs, offsets, hashes, profile names, catalog digests, Context refs, or lifecycle actions. Split a candidate that would otherwise need multiple independently claim-bearing Primary refs.
+
+""" + DURABLE_MEMORY_QUALITY_RULES + """Read-only Context may help interpretation but cannot support a claim unless the application also offered the exact material as a Required-eligible Fragment. Fragment refs are valid only in this catalog. Never invent or transform a ref.
+
+Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memories."""
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +605,172 @@ class MemoryExtractor:
                 ),
                 "invalid_evidence_block_count": (
                     len(result.memories) - len(kept)
+                ),
+            },
+        )
+
+    async def extract_projection_fragment_memories(
+        self,
+        catalog: ProjectionFragmentCatalog,
+        *,
+        source_type: str,
+        doc_type: str = "unknown",
+        context_markdown: str = "",
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> MemoryExtractionResult:
+        """Run the disabled v9 selector path and resolve every ref immediately.
+
+        This method is deliberately not selected by the v1 Support runtime.  It
+        is the tested schema/compiler/resolver seam that the v2 cutover can
+        activate atomically without persisting transient Fragment refs.
+        """
+
+        if not self.structured_llm_client:
+            return MemoryExtractionResult(
+                error_type="llm_client_unavailable",
+                error="No LLM client configured for memory extraction",
+            )
+        if not catalog.usable:
+            return MemoryExtractionResult(
+                error_type="evidence_catalog_unusable",
+                error="Evidence Fragment catalog is not usable",
+                metadata={
+                    "extraction_contract_version": "projection-extraction-v9",
+                    "catalog_digest": catalog.digest,
+                    "catalog_error_codes": sorted({error.code.value for error in catalog.errors}),
+                },
+            )
+        invoke = getattr(
+            self.structured_llm_client,
+            "extract_projection_fragment_memories",
+            None,
+        )
+        if not callable(invoke):
+            return MemoryExtractionResult(
+                error_type="projection_extraction_v9_unavailable",
+                error="Structured client does not implement projection-extraction-v9",
+            )
+
+        prompt = PROJECTION_FRAGMENT_EXTRACTION_PROMPT.format(
+            source_type=source_type,
+            doc_type=doc_type,
+            catalog_digest=catalog.digest,
+            fragment_catalog=json.dumps(
+                catalog.model_payload(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            context_observations=context_markdown[:PROJECTION_CONTEXT_CHAR_CAP],
+        )
+        started = perf_counter()
+        metrics = {
+            "structured_llm_calls": 1,
+            "extraction_model": self.model,
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "prompt_chars": len(prompt),
+            "image_count": len(images),
+            "image_bytes": sum(len(image.body) for image in images),
+            "extraction_contract_version": "projection-extraction-v9",
+            "catalog_digest": catalog.digest,
+            "catalog_fragment_count": len(catalog.fragments),
+        }
+        try:
+            call_kwargs = {
+                "max_tokens": self.max_tokens,
+                "model": self.model,
+            }
+            if images:
+                call_kwargs["images"] = images
+            response = await invoke(prompt, **call_kwargs)
+        except StructuredLlmError as error:
+            return MemoryExtractionResult(
+                error_type="structured_llm_error",
+                error=str(error),
+                metadata={
+                    **metrics,
+                    "safe_error_code": error.error_code,
+                    "safe_validation_fields": [
+                        {"location": location, "type": rule_type}
+                        for location, rule_type in error.validation_fields
+                    ],
+                    "structured_llm_elapsed_ms": max(
+                        0, round((perf_counter() - started) * 1000)
+                    ),
+                },
+            )
+        except Exception as error:
+            logger.error("Unexpected projection Fragment extraction error: %s", error)
+            return MemoryExtractionResult(
+                error_type="unexpected_error",
+                error=str(error),
+                metadata={
+                    **metrics,
+                    "structured_llm_elapsed_ms": max(
+                        0, round((perf_counter() - started) * 1000)
+                    ),
+                },
+            )
+
+        memories: list[RawMemory] = []
+        rejection_counts: dict[str, int] = {}
+        for candidate in response.memories:
+            candidate_hash = hashlib.sha256(candidate.content.encode("utf-8")).hexdigest()
+            try:
+                selection = catalog.resolve_selection(
+                    primary_ref=candidate.primary_ref,
+                    required_refs=candidate.required_refs,
+                )
+            except FragmentSelectionError as error:
+                rejection_counts[error.code.value] = rejection_counts.get(error.code.value, 0) + 1
+                record_quality_signal(
+                    QualitySignal(
+                        event_name="evidence_admission_outcome",
+                        outcome="rejected",
+                        reason_code=error.code.value,
+                        prompt_hash=metrics["prompt_sha256"],
+                        candidate_hash=candidate_hash,
+                    )
+                )
+                continue
+            record_quality_signal(
+                QualitySignal(
+                    event_name="evidence_admission_outcome",
+                    outcome="expected",
+                    reason_code="fragment_selection_resolved",
+                    prompt_hash=metrics["prompt_sha256"],
+                    candidate_hash=candidate_hash,
+                )
+            )
+            memories.append(
+                RawMemory(
+                    content=candidate.content,
+                    memory_type=candidate.memory_type,
+                    confidence=candidate.confidence,
+                    entity_refs=list(candidate.entity_refs),
+                    valid_from=candidate.valid_from,
+                    valid_until=candidate.valid_until,
+                    evidence_anchor="projection_fragment_catalog",
+                    source_observation_id=selection.parts[0].anchor.observation_id,
+                    required_source_observation_ids=[
+                        part.anchor.observation_id
+                        for part in selection.parts
+                        if part.role.value == "required"
+                    ],
+                    resolved_evidence_selection=selection,
+                )
+            )
+        return MemoryExtractionResult(
+            memories=memories,
+            metadata={
+                **metrics,
+                "resolved_fragment_selection_count": len(memories),
+                "rejected_fragment_selection_count": (
+                    len(response.memories) - len(memories)
+                ),
+                "fragment_selection_rejection_counts": rejection_counts,
+                "structured_llm_elapsed_ms": max(
+                    0, round((perf_counter() - started) * 1000)
                 ),
             },
         )

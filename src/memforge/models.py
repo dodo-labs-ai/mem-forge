@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Any, Literal
 
 from memforge.evals.agent_evaluation import AgentRuntimeBundle
+from memforge.memory.evidence import ResolvedEvidenceSelection
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactSummary
 
 # ---------------------------------------------------------------------------
@@ -228,6 +229,9 @@ class RawMemory:
     evidence_anchor: str | None = None
     source_observation_id: str | None = None
     required_source_observation_ids: list[str] = field(default_factory=list)
+    # v9 stores only exact application-resolved parts. Catalog-local refs never
+    # survive the model call or enter derivation/lifecycle identity.
+    resolved_evidence_selection: ResolvedEvidenceSelection | None = None
     support_validation: dict[str, object] = field(default_factory=dict)
 
 

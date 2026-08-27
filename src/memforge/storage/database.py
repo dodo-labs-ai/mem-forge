@@ -1127,6 +1127,7 @@ CREATE TABLE IF NOT EXISTS source_derivation_attempts (
     status                      TEXT NOT NULL CHECK (
         status IN ('pending', 'retryable_failure', 'completed', 'applied', 'superseded')
     ),
+    terminal_reason_code        TEXT,
     created_at                  TEXT NOT NULL,
     updated_at                  TEXT NOT NULL,
     completed_at                TEXT,
@@ -4056,6 +4057,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE source_observation_revisions ADD COLUMN representation_schema_version INTEGER",
         ],
     ),
+    (
+        89,
+        "Record typed Source derivation terminal reasons",
+        [
+            "ALTER TABLE source_derivation_attempts ADD COLUMN terminal_reason_code TEXT",
+        ],
+    ),
 ]
 
 
@@ -5911,19 +5919,58 @@ class Database:
     async def supersede_source_derivation(
         self,
         derivation_id: str,
+        *,
+        reason_code: str | None = None,
     ) -> None:
         now = _now_iso()
         async with self._write_lock:
             await self.db.execute(
                 """UPDATE source_derivation_attempts
-                   SET status = 'superseded', updated_at = ?
+                   SET status = 'superseded', terminal_reason_code = ?, updated_at = ?
                    WHERE id = ?
                      AND status IN (
                          'pending', 'retryable_failure', 'completed'
                      )""",
-                (now, derivation_id),
+                (reason_code, now, derivation_id),
             )
             await self.db.commit()
+
+    async def supersede_incomplete_source_derivations_for_contract(
+        self,
+        *,
+        extraction_contract_version: str,
+        reason_code: str = "CONTRACT_SUPERSEDED",
+    ) -> tuple[str, ...]:
+        """Terminally classify only pending/retryable work for one old contract."""
+
+        if not extraction_contract_version or not reason_code:
+            raise ValueError("derivation contract supersession requires typed identity")
+        now = _now_iso()
+        async with self._write_lock:
+            try:
+                rows = await self.db.execute_fetchall(
+                    """SELECT id FROM source_derivation_attempts
+                       WHERE extraction_contract_version = ?
+                         AND status IN ('pending', 'retryable_failure')
+                       ORDER BY created_at, id""",
+                    (extraction_contract_version,),
+                )
+                derivation_ids = tuple(str(row["id"]) for row in rows)
+                if derivation_ids:
+                    placeholders = ",".join("?" for _ in derivation_ids)
+                    await self.db.execute(
+                        f"""UPDATE source_derivation_attempts
+                            SET status = 'superseded', terminal_reason_code = ?,
+                                updated_at = ?
+                            WHERE id IN ({placeholders})
+                              AND status IN ('pending', 'retryable_failure')""",
+                        (reason_code, now, *derivation_ids),
+                    )
+                await self.db.commit()
+                return derivation_ids
+            except Exception:
+                await self.db.rollback()
+                raise
 
     async def get_completed_source_derivation_batch_results(
         self,
@@ -6041,6 +6088,11 @@ class Database:
             context_identity_hash=str(row["context_identity_hash"]),
             extraction_contract_version=str(row["extraction_contract_version"]),
             status=str(row["status"]),
+            terminal_reason_code=(
+                str(row["terminal_reason_code"])
+                if row["terminal_reason_code"] is not None
+                else None
+            ),
             batches=tuple(batches),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),

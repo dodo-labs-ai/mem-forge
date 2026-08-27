@@ -469,11 +469,22 @@ def _agent_patch_primary_evidence_error(
     if proposal.action == "no_output":
         return None
     primary_ids = _primary_agent_session_evidence_ids(events)
-    cited_primary_ids = {evidence_id.strip() for evidence_id in proposal.primary_evidence_ids if evidence_id.strip()}
-    if not cited_primary_ids:
+    primary_event_id = (proposal.primary_event_id or "").strip()
+    if not primary_event_id:
         return "Agent-session patch has no primary evidence authorization."
-    if not cited_primary_ids <= primary_ids:
+    if primary_event_id not in primary_ids:
         return "Agent-session patch cites non-primary evidence as authorization."
+    user_event_ids = {
+        str(event["evidence_id"])
+        for event in events
+        if event.get("evidence_id")
+        and event.get("kind") == "user_message"
+        and event.get("actor") == "user"
+        and event.get("actor_is_explicit")
+    }
+    required_ids = set(proposal.required_event_ids)
+    if not required_ids <= user_event_ids:
+        return "Agent-session patch cites assistant or tool-only Required evidence."
     return None
 
 
