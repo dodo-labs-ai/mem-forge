@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Mapping
 
@@ -34,6 +34,9 @@ from memforge.source_projection import (
     SourceRelationType,
     SourceUnit,
     SourceUnitRevision,
+)
+from memforge.source_representation import (
+    representation_profile_for_observation_contract,
 )
 from memforge.source_projection_config import (
     projection_access_fingerprint,
@@ -303,6 +306,15 @@ def project_source_item(
     revisions: list[SourceObservationRevision] = []
     carried_revision_ids: list[str] = []
     for value in observations_input:
+        evidence_profile = representation_profile_for_observation_contract(
+            source_type=source_type,
+            observation_type=value.observation_type,
+        )
+        if evidence_profile is None:
+            raise ValueError(
+                "Source Observation contract lacks an Evidence Representation Profile: "
+                f"{source_type}/{value.observation_type}"
+            )
         observation_id = _stable_id("obs", unit_id, value.observation_type, value.provider_key)
         semantic_hash = _observation_semantic_hash(value)
         revision_id = _stable_id("obsrev", observation_id, semantic_hash)
@@ -323,19 +335,25 @@ def project_source_item(
             content=value.content,
             observed_at=value.observed_at,
             metadata={**dict(value.metadata), "provider_key": value.provider_key},
+            evidence_profile=evidence_profile,
         )
         prior_revision = prior_observation_revisions.get(observation_id)
         # Revision identity is semantic. Operational metadata enrichment under
         # an unchanged semantic hash must preserve the exact immutable row.
-        revisions.append(
-            prior_revision
-            if (
-                prior_revision is not None
-                and prior_revision.observation_id == observation_id
-                and prior_revision.semantic_hash == semantic_hash
+        if (
+            prior_revision is not None
+            and prior_revision.observation_id == observation_id
+            and prior_revision.semantic_hash == semantic_hash
+        ):
+            if prior_revision.evidence_profile not in {None, evidence_profile}:
+                raise ValueError("immutable Observation Revision changed representation profile")
+            revisions.append(
+                prior_revision
+                if prior_revision.evidence_profile is not None
+                else replace(prior_revision, evidence_profile=evidence_profile)
             )
-            else projected_revision
-        )
+        else:
+            revisions.append(projected_revision)
     if coverage is ProjectionCoverage.PARTIAL_PROJECTION:
         projected_observation_ids = {item.observation_id for item in revisions}
         for observation_id, revision in prior_observation_revisions.items():

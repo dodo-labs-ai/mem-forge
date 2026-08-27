@@ -211,6 +211,8 @@ from memforge.source_derivation import (
 )
 from memforge.source_projection import (
     AnchorKind,
+    EvidenceCoordinateSpace,
+    EvidenceRepresentationProfile,
     ProjectionCoverage,
     ProjectionScopeAttestation,
     ProjectionScopeTransition,
@@ -226,6 +228,11 @@ from memforge.source_projection import (
     source_projection_to_payload,
     projection_scope_attestation_from_payload,
     projection_scope_attestation_to_payload,
+)
+from memforge.source_representation import (
+    EvidenceProfileBackfillReport,
+    representation_contract_for_profile,
+    representation_profile_for_observation_contract,
 )
 from memforge.source_artifacts import (
     SourceArtifactEvidence,
@@ -246,6 +253,70 @@ from memforge.storage.admin_source import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _evidence_profile_from_storage_row(row: Mapping[str, object]) -> EvidenceRepresentationProfile | None:
+    keys = set(row.keys())
+    required_columns = {"profile_name", "profile_version", "coordinate_space"}
+    if not required_columns.issubset(keys):
+        return None
+    profile_values = tuple(row[key] for key in ("profile_name", "profile_version", "coordinate_space"))
+    if all(value is None for value in profile_values):
+        return None
+    if any(value is None for value in profile_values):
+        raise ValueError("stored Evidence Representation Profile is incomplete")
+    return EvidenceRepresentationProfile(
+        name=str(row["profile_name"]),
+        version=int(row["profile_version"]),
+        coordinate_space=EvidenceCoordinateSpace(str(row["coordinate_space"])),
+        schema_name=(
+            str(row["representation_schema_name"])
+            if "representation_schema_name" in keys and row["representation_schema_name"] is not None
+            else None
+        ),
+        schema_version=(
+            int(row["representation_schema_version"])
+            if "representation_schema_version" in keys and row["representation_schema_version"] is not None
+            else None
+        ),
+    )
+
+
+def _source_observation_revision_from_storage_row(
+    row: Mapping[str, object],
+) -> SourceObservationRevision:
+    return SourceObservationRevision(
+        id=str(row["id"]),
+        observation_id=str(row["observation_id"]),
+        semantic_hash=str(row["semantic_hash"]),
+        content=str(row["content"]),
+        observed_at=(str(row["observed_at"]) if row["observed_at"] is not None else None),
+        metadata=json.loads(str(row["metadata_json"] or "{}")),
+        evidence_profile=_evidence_profile_from_storage_row(row),
+    )
+
+
+def _projection_retry_comparison_json(
+    payload: Mapping[str, object],
+    *,
+    carried_profile_deferred_ids: frozenset[str] = frozenset(),
+) -> str:
+    """Normalize only the additive pre-profile payload shape for retry identity."""
+
+    normalized = dict(payload)
+    raw_revisions = payload.get("observation_revisions", [])
+    if not isinstance(raw_revisions, list):
+        raise ValueError("invalid projection retry payload")
+    revisions: list[object] = []
+    for raw in raw_revisions:
+        if not isinstance(raw, Mapping):
+            raise ValueError("invalid projection retry Observation Revision")
+        revision = dict(raw)
+        if revision.get("evidence_profile") is None or str(revision.get("id")) in carried_profile_deferred_ids:
+            revision.pop("evidence_profile", None)
+        revisions.append(revision)
+    normalized["observation_revisions"] = revisions
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
 
 
 def _canonical_json(value: object) -> str:
@@ -985,13 +1056,28 @@ CREATE TABLE IF NOT EXISTS source_observations (
 );
 
 CREATE TABLE IF NOT EXISTS source_observation_revisions (
-    id              TEXT PRIMARY KEY,
-    observation_id  TEXT NOT NULL REFERENCES source_observations(id) ON DELETE CASCADE,
-    semantic_hash   TEXT NOT NULL,
-    content         TEXT NOT NULL,
-    metadata_json   TEXT NOT NULL DEFAULT '{}',
-    observed_at     TEXT,
-    created_at      TEXT NOT NULL
+    id                            TEXT PRIMARY KEY,
+    observation_id                TEXT NOT NULL REFERENCES source_observations(id) ON DELETE CASCADE,
+    semantic_hash                 TEXT NOT NULL,
+    content                       TEXT NOT NULL,
+    metadata_json                 TEXT NOT NULL DEFAULT '{}',
+    observed_at                   TEXT,
+    profile_name                  TEXT,
+    profile_version               INTEGER CHECK (profile_version IS NULL OR profile_version > 0),
+    coordinate_space              TEXT,
+    representation_schema_name    TEXT,
+    representation_schema_version INTEGER CHECK (
+        representation_schema_version IS NULL OR representation_schema_version > 0
+    ),
+    created_at                    TEXT NOT NULL,
+    CHECK (
+        (profile_name IS NULL AND profile_version IS NULL AND coordinate_space IS NULL)
+        OR
+        (profile_name IS NOT NULL AND profile_version IS NOT NULL AND coordinate_space IS NOT NULL)
+    ),
+    CHECK (
+        (representation_schema_name IS NULL) = (representation_schema_version IS NULL)
+    )
 );
 
 CREATE TABLE IF NOT EXISTS source_unit_revisions (
@@ -3959,6 +4045,17 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE source_sync_snapshot_manifests ADD COLUMN scope_attestations_json TEXT NOT NULL DEFAULT '[]'",
         ],
     ),
+    (
+        88,
+        "Declare Evidence representation profiles on Observation Revisions",
+        [
+            "ALTER TABLE source_observation_revisions ADD COLUMN profile_name TEXT",
+            "ALTER TABLE source_observation_revisions ADD COLUMN profile_version INTEGER",
+            "ALTER TABLE source_observation_revisions ADD COLUMN coordinate_space TEXT",
+            "ALTER TABLE source_observation_revisions ADD COLUMN representation_schema_name TEXT",
+            "ALTER TABLE source_observation_revisions ADD COLUMN representation_schema_version INTEGER",
+        ],
+    ),
 ]
 
 
@@ -4202,6 +4299,20 @@ class Database:
                 await self._partition_legacy_agent_session_sources_unlocked()
             if version == 62:
                 await self._reset_legacy_contradiction_summaries_unlocked()
+            if version == 88:
+                profile_report = await self._backfill_evidence_representation_profiles_unlocked()
+                logger.info(
+                    "Evidence profile backfill scanned=%d backfilled=%d unresolved=%d",
+                    profile_report.scanned_revision_count,
+                    profile_report.backfilled_revision_count,
+                    len(profile_report.unresolved_revision_ids),
+                )
+                if profile_report.unresolved_revision_ids:
+                    logger.warning(
+                        "Evidence profile backfill left %d revisions unselectable; "
+                        "run the report method for exact revision ids",
+                        len(profile_report.unresolved_revision_ids),
+                    )
             await self.db.execute(
                 "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, _now_iso()),
@@ -4219,6 +4330,75 @@ class Database:
                     raise RuntimeError("failed to restore SQLite foreign key enforcement")
             logger.info("Applied migration %d: %s", version, description)
         await self._assert_memory_source_ids_resolved()
+
+    async def backfill_evidence_representation_profiles(self) -> EvidenceProfileBackfillReport:
+        """Classify legacy revisions from their adapter-owned stored contract."""
+
+        async with self._write_lock:
+            report = await self._backfill_evidence_representation_profiles_unlocked()
+            await self.db.commit()
+            return report
+
+    async def _backfill_evidence_representation_profiles_unlocked(
+        self,
+    ) -> EvidenceProfileBackfillReport:
+        from memforge.source_representation import (
+            representation_profile_for_observation_contract,
+        )
+
+        async with self.db.execute(
+            """SELECT sor.id, s.type AS source_type, so.observation_type,
+                      sor.profile_name, sor.profile_version, sor.coordinate_space
+                 FROM source_observation_revisions sor
+                 JOIN source_observations so ON so.id = sor.observation_id
+                 JOIN sources s ON s.id = so.source_id
+                WHERE sor.profile_name IS NULL
+                   OR sor.profile_version IS NULL
+                   OR sor.coordinate_space IS NULL
+                ORDER BY sor.id"""
+        ) as cursor:
+            rows = [dict(row) async for row in cursor]
+
+        backfilled = 0
+        unresolved: list[str] = []
+        for row in rows:
+            if any(row[key] is not None for key in ("profile_name", "profile_version", "coordinate_space")):
+                unresolved.append(str(row["id"]))
+                continue
+            profile = representation_profile_for_observation_contract(
+                source_type=str(row["source_type"]),
+                observation_type=str(row["observation_type"]),
+            )
+            if profile is None:
+                unresolved.append(str(row["id"]))
+                continue
+            update_cursor = await self.db.execute(
+                """UPDATE source_observation_revisions
+                      SET profile_name = ?, profile_version = ?, coordinate_space = ?,
+                          representation_schema_name = ?, representation_schema_version = ?
+                    WHERE id = ?
+                      AND profile_name IS NULL
+                      AND profile_version IS NULL
+                      AND coordinate_space IS NULL""",
+                (
+                    profile.name,
+                    profile.version,
+                    profile.coordinate_space.value,
+                    profile.schema_name,
+                    profile.schema_version,
+                    row["id"],
+                ),
+            )
+            if update_cursor.rowcount == 1:
+                backfilled += 1
+            else:
+                unresolved.append(str(row["id"]))
+
+        return EvidenceProfileBackfillReport(
+            scanned_revision_count=len(rows),
+            backfilled_revision_count=backfilled,
+            unresolved_revision_ids=tuple(unresolved),
+        )
 
     async def _reset_legacy_contradiction_summaries_unlocked(self) -> None:
         """Discard directional summary residue without assuming every legacy cache column exists."""
@@ -5867,6 +6047,95 @@ class Database:
             completed_at=(str(row["completed_at"]) if row["completed_at"] is not None else None),
         )
 
+    def _validate_new_projection_revision_declarations(
+        self,
+        projection: SourceProjection,
+    ) -> None:
+        carried_revision_ids = set(projection.carried_observation_revision_ids)
+        observations = {item.id: item for item in projection.observations}
+        for revision in projection.observation_revisions:
+            if revision.id in carried_revision_ids:
+                continue
+            observation = observations[revision.observation_id]
+            expected_profile = representation_profile_for_observation_contract(
+                source_type=projection.source_type,
+                observation_type=observation.observation_type,
+            )
+            if expected_profile is None:
+                raise ValueError(
+                    "Source Observation contract has no registered representation declaration: "
+                    f"{projection.source_type}/{observation.observation_type}"
+                )
+            if revision.evidence_profile != expected_profile:
+                raise ValueError(
+                    "new Observation Revision does not match its registered representation declaration: "
+                    f"{revision.id}"
+                )
+            if revision.evidence_profile is not None and representation_contract_for_profile(
+                revision.evidence_profile
+            ) is None:
+                raise ValueError(f"new Observation Revision uses an unsupported profile: {revision.id}")
+
+    async def _resolve_carried_projection_revisions_unlocked(
+        self,
+        projection: SourceProjection,
+    ) -> SourceProjection:
+        carried_revision_ids = set(projection.carried_observation_revision_ids)
+        if not carried_revision_ids:
+            return projection
+        expected_unit_by_revision: dict[str, str] = {}
+        for unit_revision in projection.source_unit_revisions:
+            for revision_id in carried_revision_ids.intersection(unit_revision.observation_revision_ids):
+                expected_unit_by_revision[revision_id] = unit_revision.source_unit_id
+
+        placeholders = ", ".join("?" for _ in carried_revision_ids)
+        async with self.db.execute(
+            f"""SELECT sor.*, so.source_id AS observation_source_id,
+                       so.source_unit_id AS observation_source_unit_id,
+                       so.current_revision_id AS observation_current_revision_id
+                  FROM source_observation_revisions sor
+                  JOIN source_observations so ON so.id = sor.observation_id
+                 WHERE sor.id IN ({placeholders})""",
+            tuple(sorted(carried_revision_ids)),
+        ) as cursor:
+            persisted_rows = {str(row["id"]): dict(row) async for row in cursor}
+        if set(persisted_rows) != carried_revision_ids:
+            missing = sorted(carried_revision_ids.difference(persisted_rows))
+            raise ValueError(f"carried Observation Revision does not exist: {', '.join(missing)}")
+
+        effective_by_id: dict[str, SourceObservationRevision] = {}
+        provided_by_id = {item.id: item for item in projection.observation_revisions}
+        for revision_id in sorted(carried_revision_ids):
+            row = persisted_rows[revision_id]
+            expected_unit_id = expected_unit_by_revision[revision_id]
+            if (
+                row["observation_source_id"] != projection.source_id
+                or row["observation_source_unit_id"] != expected_unit_id
+            ):
+                raise ValueError(f"carried Observation Revision belongs to another Source Unit: {revision_id}")
+            if row["observation_current_revision_id"] != revision_id:
+                raise ValueError(f"carried Observation Revision is not current: {revision_id}")
+            persisted = _source_observation_revision_from_storage_row(row)
+            provided = provided_by_id[revision_id]
+            if (
+                provided.observation_id != persisted.observation_id
+                or provided.semantic_hash != persisted.semantic_hash
+                or provided.content != persisted.content
+                or dict(provided.metadata) != dict(persisted.metadata)
+                or provided.observed_at != persisted.observed_at
+            ):
+                raise ValueError(f"carried Observation Revision payload mismatch: {revision_id}")
+            if provided.evidence_profile is not None and provided.evidence_profile != persisted.evidence_profile:
+                raise ValueError(f"carried Observation Revision profile mismatch: {revision_id}")
+            effective_by_id[revision_id] = persisted
+
+        return replace(
+            projection,
+            observation_revisions=tuple(
+                effective_by_id.get(item.id, item) for item in projection.observation_revisions
+            ),
+        )
+
     async def record_source_projection(
         self,
         projection: SourceProjection,
@@ -5881,9 +6150,9 @@ class Database:
         provider identity. Reusing a run id for a different payload is rejected.
         """
 
-        payload = source_projection_to_payload(projection)
-        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        incoming_payload = source_projection_to_payload(projection)
+        incoming_payload_json = json.dumps(incoming_payload, sort_keys=True, separators=(",", ":"))
+        incoming_payload_hash = hashlib.sha256(incoming_payload_json.encode("utf-8")).hexdigest()
         now = _now_iso()
         transaction_lock = self._write_lock if _manage_transaction else nullcontext()
         async with transaction_lock:
@@ -5894,29 +6163,56 @@ class Database:
                     "UPDATE sources SET status = status WHERE id = ?",
                     (projection.source_id,),
                 )
+                async with self.db.execute(
+                    "SELECT type, activity_epoch FROM sources WHERE id = ?",
+                    (projection.source_id,),
+                ) as cursor:
+                    persisted_source = await cursor.fetchone()
+                if persisted_source is None:
+                    raise ValueError("projection Source does not exist")
+                if str(persisted_source["type"]) != projection.source_type:
+                    raise ValueError("projection Source type does not match the persisted Configured Source")
                 if expected_source_activity_epoch is not None:
-                    async with self.db.execute(
-                        "SELECT activity_epoch FROM sources WHERE id = ?",
-                        (projection.source_id,),
-                    ) as cursor:
-                        source_epoch = await cursor.fetchone()
-                    current_epoch = int(source_epoch["activity_epoch"] or 0)
+                    current_epoch = int(persisted_source["activity_epoch"] or 0)
                     if current_epoch != expected_source_activity_epoch:
                         raise SourceActivityConflict(
                             "source activity epoch changed: "
                             f"expected {expected_source_activity_epoch}, current {current_epoch}"
                         )
                 async with self.db.execute(
-                    "SELECT payload_hash FROM source_projection_runs WHERE id = ?",
+                    "SELECT payload_hash, payload_json FROM source_projection_runs WHERE id = ?",
                     (projection.run_id,),
                 ) as cursor:
                     existing_run = await cursor.fetchone()
                 if existing_run is not None:
-                    if existing_run["payload_hash"] != payload_hash:
+                    existing_payload = json.loads(str(existing_run["payload_json"]))
+                    carried_profile_deferred_ids = frozenset(
+                        revision.id
+                        for revision in projection.observation_revisions
+                        if revision.id in projection.carried_observation_revision_ids
+                        and revision.evidence_profile is None
+                    )
+                    if existing_run["payload_hash"] != incoming_payload_hash and (
+                        _projection_retry_comparison_json(
+                            existing_payload,
+                            carried_profile_deferred_ids=carried_profile_deferred_ids,
+                        )
+                        != _projection_retry_comparison_json(
+                            incoming_payload,
+                            carried_profile_deferred_ids=carried_profile_deferred_ids,
+                        )
+                    ):
                         raise ValueError("projection retry payload mismatch")
                     if _manage_transaction:
                         await self.db.commit()
                     return
+
+                projection = await self._resolve_carried_projection_revisions_unlocked(projection)
+                self._validate_new_projection_revision_declarations(projection)
+                carried_revision_ids = set(projection.carried_observation_revision_ids)
+                payload = source_projection_to_payload(projection)
+                payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
 
                 await self.db.execute(
                     """INSERT INTO source_projection_runs (
@@ -6051,12 +6347,17 @@ class Database:
                     )
 
                 for revision in projection.observation_revisions:
+                    if revision.id in carried_revision_ids:
+                        continue
                     metadata_json = json.dumps(dict(revision.metadata), sort_keys=True)
+                    profile = revision.evidence_profile
                     await self.db.execute(
                         """INSERT OR IGNORE INTO source_observation_revisions (
                             id, observation_id, semantic_hash, content, metadata_json,
-                            observed_at, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            observed_at, profile_name, profile_version, coordinate_space,
+                            representation_schema_name, representation_schema_version,
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             revision.id,
                             revision.observation_id,
@@ -6064,6 +6365,11 @@ class Database:
                             revision.content,
                             metadata_json,
                             revision.observed_at,
+                            profile.name if profile is not None else None,
+                            profile.version if profile is not None else None,
+                            profile.coordinate_space.value if profile is not None else None,
+                            profile.schema_name if profile is not None else None,
+                            profile.schema_version if profile is not None else None,
                             now,
                         ),
                     )
@@ -6075,6 +6381,11 @@ class Database:
                             "semantic_hash": revision.semantic_hash,
                             "content": revision.content,
                             "metadata_json": metadata_json,
+                            "profile_name": profile.name if profile is not None else None,
+                            "profile_version": profile.version if profile is not None else None,
+                            "coordinate_space": profile.coordinate_space.value if profile is not None else None,
+                            "representation_schema_name": profile.schema_name if profile is not None else None,
+                            "representation_schema_version": profile.schema_version if profile is not None else None,
                         },
                     )
                     await self.db.execute(
@@ -6394,6 +6705,7 @@ class Database:
                     content=row["content"],
                     observed_at=row["observed_at"],
                     metadata=json.loads(row["metadata_json"] or "{}"),
+                    evidence_profile=_evidence_profile_from_storage_row(row),
                 )
         return revisions
 

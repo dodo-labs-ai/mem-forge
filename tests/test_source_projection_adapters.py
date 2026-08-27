@@ -19,6 +19,7 @@ from memforge.pipeline.source_projection_adapters import (
 from memforge.genes import GENE_REGISTRY
 from memforge.source_projection import (
     DeltaAxis,
+    EvidenceCoordinateSpace,
     ProjectionCoverage,
     ProjectionScopeAttestation,
     ProjectionScopeTransition,
@@ -26,6 +27,10 @@ from memforge.source_projection import (
     SourceUnit,
 )
 from memforge.source_projection_config import projection_scope_fingerprint
+from memforge.source_representation import (
+    representation_contract_for_profile,
+    representation_profile_for_observation_contract,
+)
 from memforge.source_artifacts import StoredSourceArtifact
 from memforge.storage.database import Database
 
@@ -1796,3 +1801,73 @@ def test_unit_tombstone_removes_all_prior_observations_with_explicit_coverage() 
 
 def test_every_builtin_gene_has_an_explicit_projection_contract() -> None:
     assert set(GENE_REGISTRY) == set(BUILTIN_SPECIALIZED_SOURCE_TYPES)
+
+
+@pytest.mark.parametrize(
+    ("source_type", "observation_type", "profile_name", "schema_name", "coordinate_space"),
+    [
+        ("confluence", "page_body", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("jira", "issue_core", "canonical-record", "jira-issue-core", EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("jira", "comment", "canonical-record", "jira-comment", EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("jira", "changelog", "canonical-record", "jira-changelog", EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("github_repo", "file_content", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("github_pages", "page_content", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("local_markdown", "file_content", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("teams", "message", "canonical-record", "teams-message", EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("agent_session", "session_summary", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("agent_session", "agent_concept", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("future_extension", "document_content", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
+        ("jira", "binary_artifact", "binary-artifact", None, EvidenceCoordinateSpace.WHOLE_ARTIFACT),
+    ],
+)
+def test_projection_contract_declares_representation_without_content_inference(
+    source_type: str,
+    observation_type: str,
+    profile_name: str,
+    schema_name: str | None,
+    coordinate_space: EvidenceCoordinateSpace,
+) -> None:
+    profile = representation_profile_for_observation_contract(
+        source_type=source_type,
+        observation_type=observation_type,
+    )
+
+    assert profile is not None
+    assert profile.name == profile_name
+    assert profile.version == 1
+    assert profile.schema_name == schema_name
+    assert profile.coordinate_space is coordinate_space
+    contract = representation_contract_for_profile(profile)
+    assert contract is not None
+    if schema_name is not None:
+        assert contract.canonical_schema is not None
+        assert contract.canonical_schema.name == schema_name
+
+
+def test_unknown_projection_representation_remains_unclassified() -> None:
+    assert (
+        representation_profile_for_observation_contract(
+            source_type="future_extension",
+            observation_type="opaque_record",
+        )
+        is None
+    )
+
+
+def test_projected_revision_carries_the_adapter_declared_profile() -> None:
+    item = _item(item_id="extension-doc")
+    raw, normalized = _inputs(item, b"# Source", markdown="# Normalized")
+
+    projection = project_source_item(
+        source_id="src-extension",
+        source_type="future_extension",
+        run_id="run-extension",
+        item=item,
+        raw=raw,
+        normalized=normalized,
+    )
+
+    profile = projection.observation_revisions[0].evidence_profile
+    assert profile is not None
+    assert profile.name == "markdown-structural"
+    assert profile.version == 1

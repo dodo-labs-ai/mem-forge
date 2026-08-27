@@ -4485,11 +4485,12 @@ async def _insert_document_with_metadata(
     version: str,
     normalized_content_uri: str | None = None,
     projection_source_type: str | None = None,
+    configured_source_type: str | None = None,
 ) -> None:
     await db.upsert_source(
         id=source_id,
-        type=projection_source_type or "jira",
-        name="Jira Board",
+        type=configured_source_type or projection_source_type or "docs",
+        name="Configured Source",
         config_json="{}",
         access_policy="workspace",
         owner_user_id="dev",
@@ -5856,7 +5857,7 @@ async def test_document_last_modified_becomes_memory_source_updated_at(db: Datab
     last_modified = datetime(2026, 6, 10, 8, 30, tzinfo=timezone.utc)
     await db.upsert_source(
         id=source_id,
-        type="confluence",
+        type="docs",
         name="Documents",
         config_json="{}",
         access_policy="workspace",
@@ -5894,7 +5895,7 @@ async def test_explicit_source_updated_at_overrides_document_last_modified(db: D
     explicit_source_updated_at = "2026-06-11T09:45:00+00:00"
     await db.upsert_source(
         id=source_id,
-        type="confluence",
+        type="docs",
         name="Documents",
         config_json="{}",
         access_policy="workspace",
@@ -7371,6 +7372,7 @@ async def test_source_projection_reuse_requires_prior_manifest_and_current_linea
         title="Jira 0",
         markdown=markdown,
         version=revision,
+        configured_source_type="jira",
     )
     item = ContentItem(
         item_id=doc_id,
@@ -10859,6 +10861,7 @@ async def test_structured_source_update_uses_diff_guided_extraction_and_audits_s
         markdown=old_markdown,
         version="1",
         normalized_content_uri=normalized_content_uri,
+        configured_source_type="jira",
     )
     extractor = RecordingMemoryExtractor()
     memory_store = _audited_memory_store(db)
@@ -10955,7 +10958,7 @@ async def test_large_full_document_uses_deterministic_units(db: Database):
     source_id = "src-large-doc-full"
     await db.upsert_source(
         id=source_id,
-        type="github_pages",
+        type="docs",
         name="Documents",
         config_json="{}",
         access_policy="workspace",
@@ -11009,7 +11012,7 @@ async def test_sync_gene_records_source_unit_llm_summary_for_changed_and_noop_ru
     source_id = "src-source-unit-llm-summary"
     await db.upsert_source(
         id=source_id,
-        type="github_pages",
+        type="docs",
         name="Documents",
         config_json="{}",
         access_policy="workspace",
@@ -11339,7 +11342,7 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
     new_markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
     await db.upsert_source(
         id=source_id,
-        type="confluence",
+        type="docs",
         name="Documents",
         config_json="{}",
         access_policy="workspace",
@@ -11464,7 +11467,7 @@ async def test_new_document_lifecycle_retry_reuses_staged_document(
     markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
     await db.upsert_source(
         id=source_id,
-        type="confluence",
+        type="docs",
         name="Documents",
         config_json="{}",
         access_policy="workspace",
@@ -12272,6 +12275,7 @@ async def test_reused_projection_skips_per_document_work_and_drains_outbox_once(
             title=f"Jira {index}",
             markdown=f"# Jira {index}\n\nBody",
             version=str(index),
+            configured_source_type="jira",
         )
     release = asyncio.Event()
     release.set()
@@ -12312,6 +12316,7 @@ async def test_reused_projection_materializes_only_changed_member(
             title=f"Jira {index}",
             markdown=f"# Jira {index}\n\nBody",
             version=str(index),
+            configured_source_type="jira",
         )
     release = asyncio.Event()
     release.set()
@@ -12347,6 +12352,7 @@ async def test_force_sync_ignores_reused_projection_plan(db: Database) -> None:
         title="Jira 0",
         markdown="# Jira 0\n\nBody",
         version="0",
+        configured_source_type="jira",
     )
     release = asyncio.Event()
     release.set()
@@ -12390,6 +12396,7 @@ async def test_reused_projection_remains_complete_snapshot_membership_for_deleti
             title=doc_id,
             markdown=markdown,
             version=version,
+            configured_source_type="jira",
         )
         item = ContentItem(
             item_id=doc_id,

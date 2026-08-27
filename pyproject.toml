@@ -32,6 +32,7 @@ dependencies = [
     "apscheduler>=3.10",
     "pydantic>=2.9",
     "tiktoken>=0.7",
+    "markdown-it-py>=4.0,<5",
     "markdownify>=0.13",
     "beautifulsoup4>=4.12",
     "bcrypt>=4.2",
