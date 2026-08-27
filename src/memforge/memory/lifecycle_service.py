@@ -158,7 +158,10 @@ class MemoryLifecycleService:
                 observed_at=datetime.now(timezone.utc),
             )
             return RetireMemoryResult(memory_id=memory.id, status="retired")
-        if await self.db.get_active_memory_support_reference_ids(memory.id):
+        support_state = (
+            await self.db.get_active_memory_support_states((memory.id,))
+        )[memory.id]
+        if support_state.support_ids:
             raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review")
         try:
             await self.memory_store.retire_memory(memory.id, reason=reason)
@@ -221,7 +224,10 @@ class MemoryLifecycleService:
             )
             new_memory.id = replacement_id
         else:
-            if await self.db.get_active_memory_support_reference_ids(old.id):
+            support_state = (
+                await self.db.get_active_memory_support_states((old.id,))
+            )[old.id]
+            if support_state.support_ids:
                 raise MemoryLifecycleConflict(
                     "source_backed_memory_requires_lifecycle_review"
                 )
@@ -322,13 +328,15 @@ class MemoryLifecycleService:
             )
 
         support_state = (await self.db.get_active_memory_support_states((old.id,)))[old.id]
-        expected_support_set_hash = support_state.support_set_hash if support_state.reference_ids else None
+        expected_support_set_hash = (
+            support_state.support_set_hash if support_state.support_ids else None
+        )
         can_apply = await self._can_apply_correction(
             old,
             authority=authority,
             supporting_source_ids=support_state.source_ids,
         )
-        if not can_apply and not support_state.reference_ids:
+        if not can_apply and not support_state.support_ids:
             raise MemoryLifecycleConflict(
                 "workspace_memory_correction_requires_management_authority"
             )

@@ -38,6 +38,7 @@ from memforge.pipeline.bounded_work import collect_bounded
 from memforge.pipeline.extraction_contract import (
     CONTRACT_SUPERSEDED,
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
+    PROJECTION_EXTRACTION_V9,
 )
 from memforge.pipeline.document_units import (
     ExtractionContext,
@@ -226,6 +227,7 @@ class SourceUnitDerivationRequest:
         Awaitable[MemoryExtractionResult],
     ]
     max_concurrent: int
+    extraction_contract_version: str = PROJECTION_EXTRACTION_CONTRACT_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,11 +264,27 @@ class SourceUnitDeriver:
         self,
         request: SourceUnitDerivationRequest,
     ) -> SourceUnitDerivationResult:
-        batches = self._plan_work(request.projection, request.context)
+        batches = (
+            plan_projection_extraction_batches(
+                request.projection,
+                primary_observation_ids=(
+                    tuple(
+                        observation.id
+                        for observation in request.projection.observations
+                    )
+                    if request.context.reprocess_all_current_observations
+                    else None
+                ),
+                extraction_contract_version=request.extraction_contract_version,
+            )
+            if request.extraction_contract_version == PROJECTION_EXTRACTION_V9
+            else self._plan_work(request.projection, request.context)
+        )
         manifest = source_derivation_manifest(
             request.projection,
             batches,
             context=request.context,
+            extraction_contract_version=request.extraction_contract_version,
         )
         derivation = await self._store.stage_source_derivation(manifest)
         completed_results = await self._store.get_completed_source_derivation_batch_results(
@@ -447,7 +465,21 @@ async def replay_source_unit_derivation(
     events, or write Source/Memory lifecycle state.
     """
 
-    batches = plan_source_derivation_work(request.projection, request.context)
+    batches = (
+        plan_projection_extraction_batches(
+            request.projection,
+            primary_observation_ids=(
+                tuple(
+                    observation.id for observation in request.projection.observations
+                )
+                if request.context.reprocess_all_current_observations
+                else None
+            ),
+            extraction_contract_version=request.extraction_contract_version,
+        )
+        if request.extraction_contract_version == PROJECTION_EXTRACTION_V9
+        else plan_source_derivation_work(request.projection, request.context)
+    )
     results = await collect_bounded(
         batches,
         request.extract_batch,
@@ -998,6 +1030,10 @@ def _batch_input_payload_hash(
         "context_observation_ids": list(batch.context_observation_ids),
         "context_content_sha256": hashlib.sha256(batch.context_markdown.encode("utf-8")).hexdigest(),
         "primary_image_bytes": batch.primary_image_bytes,
+        "required_authority_observation_ids": list(
+            batch.required_authority_observation_ids
+        ),
+        "required_image_bytes": batch.required_image_bytes,
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 

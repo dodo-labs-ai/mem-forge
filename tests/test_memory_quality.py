@@ -717,8 +717,15 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
         """INSERT INTO evidence_references
            (id, evidence_unit_id, role, anchor_kind, observation_id,
             observation_revision_id, created_at)
-           VALUES (?, ?, 'context', 'whole_observation', ?, ?, ?)""",
-        ("eref-image", "evidence-image", "obs-image", "obsrev-image", now),
+           VALUES (?, NULL, 'context', 'whole_observation', ?, ?, ?)""",
+        ("eref-image", "obs-image", "obsrev-image", now),
+    )
+    await db.db.execute(
+        """INSERT INTO evidence_context_associations (
+               id, evidence_unit_id, evidence_reference_id, active,
+               created_at, updated_at
+           ) VALUES ('ectx-image', 'evidence-image', 'eref-image', 1, ?, ?)""",
+        (now, now),
     )
     await db.db.execute(
         """INSERT INTO memory_support_assertions

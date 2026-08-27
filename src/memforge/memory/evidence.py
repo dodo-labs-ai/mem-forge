@@ -76,6 +76,11 @@ class EvidenceRole(str, Enum):
     CONTEXT = "context"
 
 
+class SupportScopeVersion(str, Enum):
+    REFERENCE_SET_V1 = "reference-set-v1"
+    EVIDENCE_UNIT_SET_V2 = "evidence-unit-set-v2"
+
+
 class EvidencePartKind(str, Enum):
     """Authoritative representation of one resolved Evidence Unit part."""
 
@@ -166,6 +171,11 @@ class EvidenceReference:
     anchor: SourceAnchor
     id: str | None = None
     evidence_unit_id: str | None = None
+    kind: EvidencePartKind | None = None
+    raw_content_sha256: str | None = None
+    presentation_sha256: str | None = None
+    excerpt: str | None = None
+    artifact_metadata: Mapping[str, object] = field(default_factory=dict)
 
     @property
     def grants_support(self) -> bool:
@@ -174,6 +184,8 @@ class EvidenceReference:
 
 @dataclass(frozen=True, slots=True)
 class MemorySupportAssertion:
+    """Legacy reference-scoped Support retained as immutable v1 history."""
+
     id: str
     memory_id: str
     evidence_reference_id: str
@@ -182,6 +194,51 @@ class MemorySupportAssertion:
     active: bool = True
     created_at: str | None = None
     removed_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryUnitSupportAssertion:
+    id: str
+    memory_id: str
+    evidence_unit_id: str
+    source_id: str
+    access_context_hash: str
+    active: bool = True
+    created_at: str | None = None
+    removed_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceContextAssociation:
+    id: str
+    evidence_unit_id: str
+    evidence_reference_id: str
+    active: bool = True
+    created_at: str | None = None
+    updated_at: str | None = None
+    removed_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SupportCutoverFinding:
+    memory_id: str
+    evidence_unit_id: str
+    source_id: str
+    access_context_hash: str
+    reason_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SupportCutoverReport:
+    id: str
+    support_scope_version: SupportScopeVersion
+    legacy_group_count: int
+    eligible_group_count: int
+    ineligible_group_count: int
+    active_eligible_group_count: int
+    inactive_eligible_group_count: int
+    findings: tuple[SupportCutoverFinding, ...]
+    created_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +299,110 @@ def evidence_reference_id_for(evidence_unit_id: str, reference: EvidenceReferenc
         ).encode("utf-8")
     ).hexdigest()[:20]
     return f"eref-{digest}"
+
+
+def evidence_part_set_digest(references: tuple[EvidenceReference, ...]) -> str:
+    """Hash only authoritative v2 part identity in canonical order."""
+
+    supporting = tuple(
+        reference
+        for reference in references
+        if reference.role in {EvidenceRole.PRIMARY, EvidenceRole.REQUIRED}
+    )
+    if sum(item.role is EvidenceRole.PRIMARY for item in supporting) != 1:
+        raise ValueError("v2 Evidence part set requires exactly one Primary")
+    parts: list[tuple[object, ...]] = []
+    seen: set[tuple[object, ...]] = set()
+    for reference in supporting:
+        if reference.kind is None or reference.raw_content_sha256 is None:
+            raise ValueError("v2 Evidence part requires kind and raw content digest")
+        if len(reference.raw_content_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in reference.raw_content_sha256
+        ):
+            raise ValueError("v2 Evidence part raw digest must be lowercase SHA-256")
+        anchor = reference.anchor
+        identity = (
+            reference.role.value,
+            reference.kind.value,
+            anchor.observation_id,
+            anchor.observation_revision_id,
+            anchor.kind.value,
+            anchor.range_start,
+            anchor.range_end,
+            reference.raw_content_sha256,
+        )
+        if identity in seen:
+            raise ValueError("v2 Evidence part set contains a duplicate part")
+        seen.add(identity)
+        parts.append(identity)
+    canonical_parts = [list(part) for part in parts]
+    canonical_parts.sort(
+        key=lambda part: json.dumps(part, separators=(",", ":"))
+    )
+    return sha256(
+        json.dumps(canonical_parts, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def evidence_unit_id_v2(
+    *,
+    source_unit_id: str,
+    claim_content: str,
+    part_set_digest: str,
+    access_context_hash: str,
+) -> str:
+    if not all(
+        value
+        for value in (
+            source_unit_id,
+            claim_content.strip(),
+            part_set_digest,
+            access_context_hash,
+        )
+    ):
+        raise ValueError("v2 Evidence Unit identity is incomplete")
+    digest = sha256(
+        "\x1f".join(
+            (
+                SupportScopeVersion.EVIDENCE_UNIT_SET_V2.value,
+                source_unit_id,
+                sha256(claim_content.strip().encode("utf-8")).hexdigest(),
+                part_set_digest,
+                access_context_hash,
+            )
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    return f"eu-v2-{digest}"
+
+
+def memory_unit_support_assertion_id(
+    *,
+    memory_id: str,
+    evidence_unit_id: str,
+    source_id: str,
+    access_context_hash: str,
+) -> str:
+    if not all((memory_id, evidence_unit_id, source_id, access_context_hash)):
+        raise ValueError("v2 Support identity is incomplete")
+    digest = sha256(
+        "\x1f".join(
+            (memory_id, evidence_unit_id, source_id, access_context_hash)
+        ).encode("utf-8")
+    ).hexdigest()[:20]
+    return f"support-v2-{digest}"
+
+
+def evidence_context_association_id(
+    evidence_unit_id: str,
+    evidence_reference_id: str,
+) -> str:
+    if not evidence_unit_id or not evidence_reference_id:
+        raise ValueError("Context association identity is incomplete")
+    digest = sha256(
+        f"{evidence_unit_id}\x1f{evidence_reference_id}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"ectx-{digest}"
 
 
 class LifecycleAction(str, Enum):
@@ -367,6 +528,7 @@ class EvidenceUnit:
     observed_at: str | None = None
     extractor_run_id: str | None = None
     access_context_hash: str | None = None
+    part_set_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -24,6 +24,8 @@ from memforge.memory.evidence import (
     EvidenceReference,
     EvidenceUnit,
     MemorySupportAssertion,
+    MemoryUnitSupportAssertion,
+    SupportScopeVersion,
     RelationOutcomeBundle,
 )
 from memforge.memory.lifecycle_plan import (
@@ -952,6 +954,16 @@ class SqliteRelationalStore:
     async def get_evidence_unit(self, evidence_unit_id: str) -> EvidenceUnit | None:
         return await self._db.get_evidence_unit(evidence_unit_id)
 
+    async def replace_evidence_context_associations(
+        self,
+        evidence_unit_id: str,
+        references: Sequence[EvidenceReference],
+    ) -> tuple[EvidenceReference, ...]:
+        return await self._db.replace_evidence_context_associations(
+            evidence_unit_id,
+            references,
+        )
+
     async def upsert_memory_support_assertion(
         self,
         assertion: MemorySupportAssertion,
@@ -963,11 +975,42 @@ class SqliteRelationalStore:
             source_activity=source_activity,
         )
 
+    async def upsert_memory_unit_support_assertion(
+        self,
+        assertion: MemoryUnitSupportAssertion,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        await self._db.upsert_memory_unit_support_assertion(
+            assertion,
+            source_activity=source_activity,
+        )
+
+    async def get_support_scope_version(self) -> SupportScopeVersion:
+        return await self._db.get_support_scope_version()
+
+    async def report_support_scope_cutover(self):
+        return await self._db.report_support_scope_cutover()
+
+    async def apply_support_scope_v2_cutover(
+        self,
+        *,
+        expected_report_id: str,
+        owner_id: str,
+    ):
+        return await self._db.apply_support_scope_v2_cutover(
+            expected_report_id=expected_report_id,
+            owner_id=owner_id,
+        )
+
     async def get_memory_support_set_hash(self, memory_id: str) -> str:
         return await self._db.get_memory_support_set_hash(memory_id)
 
     async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]:
         return await self._db.get_active_memory_support_reference_ids(memory_id)
+
+    async def get_active_memory_support_unit_ids(self, memory_id: str) -> tuple[str, ...]:
+        return await self._db.get_active_memory_support_unit_ids(memory_id)
 
     async def get_active_memory_support_states(
         self,
@@ -1013,6 +1056,12 @@ class SqliteRelationalStore:
         source_unit_id: str,
     ) -> dict[str, tuple[str, ...]]:
         return dict(await self._db.get_source_unit_support_reference_ids(source_unit_id))
+
+    async def get_source_unit_support_unit_ids(
+        self,
+        source_unit_id: str,
+    ) -> dict[str, tuple[str, ...]]:
+        return dict(await self._db.get_source_unit_support_unit_ids(source_unit_id))
 
     async def apply_source_projection_lifecycle(
         self,

@@ -18,6 +18,7 @@ from memforge.memory.lifecycle_plan import (
     ReconciliationScope,
     StaleGuard,
 )
+from memforge.memory.evidence import SupportScopeVersion
 from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryRequest,
     relation_discovery_request_id,
@@ -114,6 +115,12 @@ def build_lifecycle_review_approval_plan(
             ),
             support_set_hashes={incumbent_id: support_hashes[incumbent_id]},
             memory_versions={incumbent_id: memory_versions[incumbent_id]},
+            support_scope_version=SupportScopeVersion(
+                str(
+                    stale_payload.get("support_scope_version")
+                    or SupportScopeVersion.REFERENCE_SET_V1.value
+                )
+            ),
         ),
         # Resolve first inside the same transaction so terminal mutations stale
         # only other pending review work. Any later failure rolls approval back.
@@ -240,6 +247,12 @@ def build_lifecycle_review_refresh_plan(
             observation_revision_ids=observation_revision_ids,
             support_set_hashes={incumbent_id: current_support_set_hash},
             memory_versions={incumbent_id: current_memory_version},
+            support_scope_version=SupportScopeVersion(
+                str(
+                    stale_payload.get("support_scope_version")
+                    or SupportScopeVersion.REFERENCE_SET_V1.value
+                )
+            ),
         ),
         mutations=(create_review,),
     )
@@ -335,12 +348,16 @@ def _deserialize_mutation(
     memory_id = _text(raw.get("memory_id"), "mutation.memory_id")
     replacement_memory_id = _optional_text(raw.get("replacement_memory_id"))
     evidence_ids = tuple(str(item) for item in _sequence(raw.get("evidence_reference_ids", ())))
+    evidence_unit_ids = tuple(
+        str(item) for item in _sequence(raw.get("evidence_unit_ids", ()))
+    )
     payload = _mapping(raw.get("payload", {}), "mutation.payload")
     mutation = LifecycleMutation(
         mutation_type=mutation_type,
         memory_id=memory_id,
         source_id=mutation_source_id,
         evidence_reference_ids=evidence_ids,
+        evidence_unit_ids=evidence_unit_ids,
         replacement_memory_id=replacement_memory_id,
         payload=dict(payload),
     )
