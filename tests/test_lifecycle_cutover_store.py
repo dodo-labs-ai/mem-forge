@@ -2301,6 +2301,15 @@ async def test_cutover_reconstructs_historical_projection_from_exact_stored_arti
     db: Database,
     tmp_path,
 ) -> None:
+    source_id = "src-teams-historical"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Historical Teams",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
     now = datetime(2026, 7, 15, tzinfo=timezone.utc)
     raw_payload = {
         "conversation_type": "group_chat",
@@ -2316,14 +2325,14 @@ async def test_cutover_reconstructs_historical_projection_from_exact_stored_arti
     }
     store = LocalDocumentStore(str(tmp_path / "artifacts"))
     raw_uri = store.store_raw(
-        "src-1",
+        source_id,
         "doc-legacy",
         "Historical Teams block",
         json.dumps(raw_payload).encode(),
         "application/json",
     )
     normalized_uri = store.store_normalized(
-        "src-1",
+        source_id,
         "doc-legacy",
         "Historical Teams block",
         "# Historical Teams block\n\nLegacy claim",
@@ -2331,7 +2340,7 @@ async def test_cutover_reconstructs_historical_projection_from_exact_stored_arti
     await db.upsert_document(
         DocumentRecord(
             doc_id="teams-historical-window",
-            source="src-1",
+            source=source_id,
             source_url="https://teams.microsoft.com/l/message/conversation-1/message-1",
             title="Historical Teams block",
             space_or_project="PCC",
@@ -2355,7 +2364,7 @@ async def test_cutover_reconstructs_historical_projection_from_exact_stored_arti
         "Legacy claim",
         source_updated_at=None,
     )
-    assert (await run_source_lifecycle_backfill(db, "src-1")).finding_count == 1
+    assert (await run_source_lifecycle_backfill(db, source_id)).finding_count == 1
 
     projections = []
 
@@ -2365,7 +2374,7 @@ async def test_cutover_reconstructs_historical_projection_from_exact_stored_arti
                 await reconstruct_historical_source_projection(
                     db,
                     store,
-                    source_id="src-1",
+                    source_id=source_id,
                     source_type="teams",
                     document_id=document_id,
                 )
@@ -2376,17 +2385,17 @@ async def test_cutover_reconstructs_historical_projection_from_exact_stored_arti
 
     completed = await run_source_lifecycle_recovery_job(
         db,
-        "src-1",
+        source_id,
         job_id="historical-reconstruction",
         reconstruct_documents=reconstruct,
         repair_projections=unexpected_reextract,
     )
 
     assert projections[0].checkpoint["cutover_repair"] is True
-    assert await db.find_source_unit_by_document_id("src-1", "teams-historical-window") is not None
+    assert await db.find_source_unit_by_document_id(source_id, "teams-historical-window") is not None
     assert completed.mapped_memories == 1
     assert completed.finding_count == 0
-    assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
+    assert (await db.get_lifecycle_gate(source_id)).state is LifecycleGateState.ENABLED
 
 
 @pytest.mark.asyncio
@@ -2474,6 +2483,15 @@ async def test_cutover_reconstructs_agent_session_projection_from_canonical_conc
 
 @pytest.mark.asyncio
 async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: Database) -> None:
+    source_id = "src-teams-ambiguous"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Ambiguous Teams",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
     now = datetime(2026, 7, 15, tzinfo=timezone.utc)
     item = ContentItem(
         item_id="teams-window-ambiguous",
@@ -2507,7 +2525,7 @@ async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: D
         content_type="application/json",
     )
     projection = project_source_item(
-        source_id="src-1",
+        source_id=source_id,
         source_type="teams",
         run_id="projection-ambiguous",
         item=item,
@@ -2518,7 +2536,7 @@ async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: D
     await db.upsert_document(
         DocumentRecord(
             doc_id=item.item_id,
-            source="src-1",
+            source=source_id,
             source_url=item.source_url,
             title=item.title,
             space_or_project="PCC",
@@ -2542,28 +2560,28 @@ async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: D
         "Repeated quote…",
         source_updated_at=None,
     )
-    result = await run_source_lifecycle_backfill(db, "src-1")
+    result = await run_source_lifecycle_backfill(db, source_id)
     assert result.finding_count == 1
-    finding = (await db.list_lifecycle_cutover_findings("src-1"))[0]
+    finding = (await db.list_lifecycle_cutover_findings(source_id))[0]
     assert finding.reason is CutoverFindingReason.AMBIGUOUS_OBSERVATION
 
     selected_observation_id = projection.observations[0].id
     with pytest.raises(ValueError, match="requires an exact evidence_quote"):
         await repair_lifecycle_cutover_finding(
             db,
-            source_id="src-1",
+            source_id=source_id,
             finding_id=finding.id,
             observation_id=selected_observation_id,
         )
     repaired = await repair_lifecycle_cutover_finding(
         db,
-        source_id="src-1",
+        source_id=source_id,
         finding_id=finding.id,
         observation_id=selected_observation_id,
         evidence_quote="Repeated quote",
         operator_id="operator-1",
     )
-    final = await run_source_lifecycle_backfill(db, "src-1")
+    final = await run_source_lifecycle_backfill(db, source_id)
 
     assert repaired.status is CutoverFindingStatus.RESOLVED
     assert repaired.observation_id == selected_observation_id
@@ -2571,7 +2589,7 @@ async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: D
     assert final.gate_enabled is True
     async with db.db.execute(
         "SELECT source_metadata_json FROM evidence_units WHERE source_id = ?",
-        ("src-1",),
+        (source_id,),
     ) as cursor:
         metadata = json.loads((await cursor.fetchone())["source_metadata_json"])
     assert metadata["operator_selected_observation"] is True

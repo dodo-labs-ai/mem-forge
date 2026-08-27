@@ -8,6 +8,7 @@ and run-scoped coverage for documents, conversations, and hybrid sources.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Mapping, Protocol, runtime_checkable
@@ -101,6 +102,44 @@ class SourceRelationType(str, Enum):
     REFERENCES = "references"
 
 
+class EvidenceCoordinateSpace(str, Enum):
+    """Coordinates used by one immutable Evidence representation."""
+
+    UNICODE_SCALAR = "unicode-scalar"
+    WHOLE_ARTIFACT = "whole-artifact"
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceRepresentationProfile:
+    """Typed compiler contract declared by the projecting adapter."""
+
+    name: str
+    version: int
+    coordinate_space: EvidenceCoordinateSpace
+    schema_name: str | None = None
+    schema_version: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name.strip() or self.name != self.name.strip():
+            raise ValueError("Evidence Representation Profile requires a name")
+        if re.search(r"-v\d+$", self.name):
+            raise ValueError("Evidence Representation Profile name must not embed its version")
+        if self.version <= 0:
+            raise ValueError("Evidence Representation Profile version must be positive")
+        if (self.schema_name is None) != (self.schema_version is None):
+            raise ValueError("Evidence representation schema name and version must be declared together")
+        if self.schema_name is not None and (
+            not self.schema_name.strip() or self.schema_name != self.schema_name.strip()
+        ):
+            raise ValueError("Evidence representation schema requires a normalized name")
+        if self.schema_version is not None and self.schema_version <= 0:
+            raise ValueError("Evidence representation schema version must be positive")
+        if self.name == "canonical-record" and self.schema_name is None:
+            raise ValueError("canonical-record requires a representation schema")
+        if self.name != "canonical-record" and self.schema_name is not None:
+            raise ValueError("only canonical-record accepts a representation schema")
+
+
 @dataclass(frozen=True, slots=True)
 class SourceAnchor:
     """A controlled, revision-pinned location inside one observation."""
@@ -175,6 +214,7 @@ class SourceObservationRevision:
     content: str
     observed_at: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+    evidence_profile: EvidenceRepresentationProfile | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,6 +624,17 @@ def source_projection_to_payload(projection: SourceProjection) -> dict[str, obje
                 "content": item.content,
                 "observed_at": item.observed_at,
                 "metadata": dict(item.metadata),
+                "evidence_profile": (
+                    {
+                        "name": item.evidence_profile.name,
+                        "version": item.evidence_profile.version,
+                        "coordinate_space": item.evidence_profile.coordinate_space.value,
+                        "schema_name": item.evidence_profile.schema_name,
+                        "schema_version": item.evidence_profile.schema_version,
+                    }
+                    if item.evidence_profile is not None
+                    else None
+                ),
             }
             for item in projection.observation_revisions
         ],
@@ -692,6 +743,7 @@ def source_projection_from_payload(payload: Mapping[str, object]) -> SourceProje
                 content=str(item["content"]),
                 observed_at=_optional_str(item.get("observed_at")),
                 metadata=_mapping(item.get("metadata")),
+                evidence_profile=_evidence_profile_from_payload(item.get("evidence_profile")),
             )
             for item in mappings("observation_revisions")
         ),
@@ -840,3 +892,17 @@ def _optional_int(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("invalid source projection integer")
     return value
+
+
+def _evidence_profile_from_payload(value: object) -> EvidenceRepresentationProfile | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("invalid Evidence Representation Profile payload")
+    return EvidenceRepresentationProfile(
+        name=str(value["name"]),
+        version=int(value["version"]),
+        coordinate_space=EvidenceCoordinateSpace(str(value["coordinate_space"])),
+        schema_name=_optional_str(value.get("schema_name")),
+        schema_version=_optional_int(value.get("schema_version")),
+    )

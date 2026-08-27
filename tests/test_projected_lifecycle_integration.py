@@ -152,6 +152,17 @@ async def db(tmp_path):
         await database.close()
 
 
+async def _set_fixture_source_type(db: Database, source_type: str) -> None:
+    await db.upsert_source(
+        id="src-1",
+        type=source_type,
+        name="Engineering",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+
+
 def _projection(
     *,
     run_id: str,
@@ -3751,6 +3762,7 @@ async def test_partial_jira_projection_skips_llm_for_proven_disjoint_incumbent(
     db: Database,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    await _set_fixture_source_type(db, "jira")
     caplog.set_level("INFO", logger="memforge.memory.engine")
     first = _jira_projection(
         run_id="projection-jira-partial-fence-1",
@@ -3823,6 +3835,7 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    await _set_fixture_source_type(db, "jira")
     caplog.set_level("INFO", logger="memforge.memory.engine")
     first = _jira_projection(
         run_id="projection-jira-new-candidate-1",
@@ -3906,6 +3919,7 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
 async def test_partial_jira_projection_admits_directly_affected_incumbent_delete(
     db: Database,
 ) -> None:
+    await _set_fixture_source_type(db, "jira")
     first = _jira_projection(
         run_id="projection-jira-partial-affected-1",
         description="A7 is retained.",
@@ -3959,6 +3973,7 @@ async def test_partial_jira_projection_admits_directly_affected_incumbent_delete
 
 @pytest.mark.asyncio
 async def test_noop_revalidates_revised_required_jira_description(db: Database) -> None:
+    await _set_fixture_source_type(db, "jira")
     first = _jira_projection(
         run_id="projection-jira-required-1",
         description="A7 applies only to regular payroll.",
@@ -4098,6 +4113,7 @@ async def test_noop_revalidates_revised_required_with_artifact_primary(
 
 @pytest.mark.asyncio
 async def test_noop_with_invalidated_required_evidence_creates_review(db: Database) -> None:
+    await _set_fixture_source_type(db, "jira")
     first = _jira_projection(
         run_id="projection-jira-invalid-required-1",
         description="A7 applies only to regular payroll.",
@@ -5093,6 +5109,7 @@ async def test_stale_parallel_cross_unit_create_fails_closed_before_duplicate_wr
 async def test_projected_memory_support_survives_relation_work_retry_and_empty_completion(
     db: Database,
 ) -> None:
+    await _set_fixture_source_type(db, "jira")
     projection = _jira_projection(
         run_id="projection-jira-new-memory",
         description="A7 applies only to regular payroll.",
@@ -5928,6 +5945,7 @@ async def test_generic_document_delete_rejects_active_projected_support(
 async def test_rebaseline_replay_reuses_memory_with_explicit_observation_support(
     db: Database,
 ) -> None:
+    await _set_fixture_source_type(db, "jira")
     projection = _jira_projection(
         run_id="projection-jira-before-rebaseline",
         description="A7 applies only to regular payroll.",
