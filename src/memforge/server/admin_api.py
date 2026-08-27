@@ -672,6 +672,37 @@ class MemoryEvidenceArtifactDetail(BaseModel):
     url: str
 
 
+class MemoryEvidenceItemDetail(BaseModel):
+    evidence_reference_id: str
+    role: Literal["primary", "required", "context"]
+    kind: Literal["text", "artifact"]
+    support_contribution: bool
+    observation_id: str
+    observation_revision_id: str
+    anchor_kind: str
+    range_start: int | None = None
+    range_end: int | None = None
+    excerpt: str | None = None
+    raw_content_sha256: str
+    presentation_sha256: str
+    current: bool
+    artifact: MemoryEvidenceArtifactDetail | None = None
+
+
+class MemoryEvidenceUnitDetail(BaseModel):
+    evidence_unit_id: str
+    support_ids: list[str]
+    support_scope_version: Literal["reference-set-v1", "evidence-unit-set-v2"]
+    source_id: str
+    source_type: str
+    source_unit_id: str
+    source_unit_revision_id: str | None = None
+    doc_id: str | None = None
+    current: bool
+    legacy_limited: bool
+    items: list[MemoryEvidenceItemDetail]
+
+
 class MemoryConflictContextDetail(BaseModel):
     review_id: str
     counterpart_memory_id: str
@@ -719,6 +750,7 @@ class MemoryDetailResponse(MemoryResponse):
     entity_refs: list[str] = []
     sources: list[MemorySourceDetail] = []
     evidence_artifacts: list[MemoryEvidenceArtifactDetail] = []
+    evidence: list[MemoryEvidenceUnitDetail] = []
     conflict_contexts: list[MemoryConflictContextDetail] = []
 
 
@@ -2616,6 +2648,67 @@ def _memory_source_detail(
     )
 
 
+def _memory_evidence_unit_detail(group) -> MemoryEvidenceUnitDetail:
+    items: list[MemoryEvidenceItemDetail] = []
+    for item in group.items:
+        artifact = None
+        if item.kind.value == "artifact":
+            metadata = dict(item.artifact_metadata)
+            artifact = MemoryEvidenceArtifactDetail(
+                artifact_id=str(metadata.get("artifact_id") or item.anchor.observation_id),
+                observation_id=item.anchor.observation_id,
+                observation_revision_id=item.anchor.observation_revision_id,
+                parent_observation_id=str(metadata.get("parent_observation_id") or ""),
+                evidence_reference_id=item.reference_id,
+                evidence_unit_id=group.evidence_unit_id,
+                evidence_role=item.role.value,
+                filename=str(metadata.get("filename") or "artifact"),
+                content_type=str(metadata.get("media_type") or "application/octet-stream"),
+                size_bytes=int(metadata.get("size_bytes") or 0),
+                sha256=item.raw_content_sha256,
+                summary=(
+                    str(metadata["summary"])
+                    if metadata.get("summary") is not None
+                    else None
+                ),
+                url=(
+                    "/api/v1/source-artifacts/"
+                    + quote(item.anchor.observation_revision_id, safe="")
+                ),
+            )
+        items.append(
+            MemoryEvidenceItemDetail(
+                evidence_reference_id=item.reference_id,
+                role=item.role.value,
+                kind=item.kind.value,
+                support_contribution=item.grants_support,
+                observation_id=item.anchor.observation_id,
+                observation_revision_id=item.anchor.observation_revision_id,
+                anchor_kind=item.anchor.kind.value,
+                range_start=item.anchor.range_start,
+                range_end=item.anchor.range_end,
+                excerpt=item.excerpt,
+                raw_content_sha256=item.raw_content_sha256,
+                presentation_sha256=item.presentation_sha256,
+                current=item.current,
+                artifact=artifact,
+            )
+        )
+    return MemoryEvidenceUnitDetail(
+        evidence_unit_id=group.evidence_unit_id,
+        support_ids=list(group.support_ids),
+        support_scope_version=group.support_scope_version.value,
+        source_id=group.source_id,
+        source_type=group.source_type,
+        source_unit_id=group.source_unit_id,
+        source_unit_revision_id=group.source_unit_revision_id,
+        doc_id=group.doc_id,
+        current=group.current,
+        legacy_limited=group.legacy_limited,
+        items=items,
+    )
+
+
 def _pick_origin_source_type(pairs: list[tuple[str, str | None, str | None]]) -> tuple[str | None, str | None]:
     """Pick a memory's display source and client from its (source_type, support_kind, client) triples,
     ordered oldest-first: the extraction origin if any, else the first source.
@@ -3910,15 +4003,118 @@ def create_admin_app(
         if memory_id not in visible:
             raise HTTPException(status_code=404, detail="Memory not found")
 
-        # Keep provenance order deterministic for agents: extracted first, then
-        # newer corroboration. Callers should inspect support_kind/title instead
-        # of relying on a hidden single "source".
         raw_sources = await db.get_memory_sources(memory_id)
+        raw_source_by_key = {
+            (source.source_id, source.doc_id): source for source in raw_sources
+        }
+        evidence_groups: list[MemoryEvidenceUnitDetail] = []
+        for group in await db.get_memory_evidence_units(memory_id):
+            source = await db.get_source(group.source_id)
+            if source is None:
+                continue
+            try:
+                _require_source_discoverability(request, source)
+            except HTTPException:
+                # A supporting item is unreadable, so omit the complete Unit.
+                continue
+            evidence_groups.append(_memory_evidence_unit_detail(group))
+
+        # Compatibility projections are derived from the authorized grouped
+        # result. Direct-user Virtual Documents have no Source Projection and
+        # retain their application-authoritative legacy source row.
         source_details: list[MemorySourceDetail] = []
-        for ms in raw_sources:
-            doc = await db.get_document(ms.doc_id)
-            source_details.append(_memory_source_detail(ms, doc, config, artifact_store))
-        evidence_artifacts = [item.metadata() for item in await db.get_memory_source_artifacts(memory_id)]
+        seen_source_keys: set[tuple[str, str]] = set()
+        for group in evidence_groups:
+            if group.doc_id is None:
+                continue
+            key = (group.source_id, group.doc_id)
+            if key in seen_source_keys:
+                continue
+            seen_source_keys.add(key)
+            source_row = raw_source_by_key.get(key)
+            doc = await db.get_document(group.doc_id)
+            if source_row is not None:
+                source_details.append(
+                    _memory_source_detail(
+                        source_row,
+                        doc,
+                        config,
+                        artifact_store,
+                    )
+                )
+            else:
+                primary_excerpt = next(
+                    (
+                        item.excerpt
+                        for item in group.items
+                        if item.role == "primary" and item.kind == "text"
+                    ),
+                    None,
+                )
+                source_details.append(
+                    MemorySourceDetail(
+                        doc_id=group.doc_id,
+                        source_type=group.source_type,
+                        excerpt=primary_excerpt,
+                        support_kind=(
+                            "legacy_limited"
+                            if group.legacy_limited
+                            else "corroborated"
+                        ),
+                        doc_title=doc.title if doc else None,
+                        source_url=doc.source_url if doc else None,
+                        content_url=(
+                            document_content_url_for_store(
+                                doc,
+                                config,
+                                artifact_store,
+                            )
+                            if doc is not None
+                            else None
+                        ),
+                        pdf_url=(
+                            document_pdf_url_for_store(
+                                doc,
+                                config,
+                                artifact_store,
+                            )
+                            if doc is not None
+                            else None
+                        ),
+                    )
+                )
+        for source_row in raw_sources:
+            key = (str(source_row.source_id), source_row.doc_id)
+            if key in seen_source_keys:
+                continue
+            if source_row.source_id not in VIRTUAL_DOCUMENT_SOURCE_IDS:
+                legacy_source = (
+                    await db.get_source(str(source_row.source_id))
+                    if source_row.source_id is not None
+                    else None
+                )
+                if legacy_source is None:
+                    continue
+                try:
+                    _require_source_discoverability(request, legacy_source)
+                except HTTPException:
+                    continue
+            seen_source_keys.add(key)
+            doc = await db.get_document(source_row.doc_id)
+            source_details.append(
+                _memory_source_detail(
+                    source_row,
+                    doc,
+                    config,
+                    artifact_store,
+                )
+            )
+        evidence_artifacts = [
+            item.artifact
+            for group in evidence_groups
+            for item in group.items
+            if group.current and item.current and item.artifact is not None
+        ]
 
         # Fetch linked entity names.
         entity_names = await db.get_memory_entity_names(memory_id)
@@ -3956,6 +4152,7 @@ def create_admin_app(
             entity_refs=entity_names,
             sources=source_details,
             evidence_artifacts=evidence_artifacts,
+            evidence=evidence_groups,
             conflict_contexts=[
                 MemoryConflictContextDetail(**asdict(item)) for item in conflict_contexts.get(memory_id, ())
             ],

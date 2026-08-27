@@ -41,7 +41,7 @@ from memforge.source_projection import source_projection_from_payload
 OFFLINE_EVALUATION_SCHEMA_VERSION = "1"
 OFFLINE_CONTENT_POLICY_SCHEMA_VERSION = "2"
 ACCEPTED_GROUND_TRUTH_SCHEMA_VERSION = "2"
-OFFLINE_DETERMINISTIC_EVALUATOR_VERSION = "1"
+OFFLINE_DETERMINISTIC_EVALUATOR_VERSION = "2"
 SEMANTIC_JUDGE_INPUT_MAPPING_VERSION = "1"
 SEMANTIC_JUDGE_OUTPUT_SCHEMA_VERSION = "1"
 _SEMANTIC_JUDGE_PROMPT_TEMPLATE = """You are an offline quality evaluator.
@@ -2307,22 +2307,39 @@ def deterministic_checks(
             )
         projection = _mapping(case.manifest, "projection")
         revisions = {
-            str(item.get("observation_id")): str(item.get("content") or "")
+            str(item.get("observation_id")): item
             for item in _mapping_list(projection, "observation_revisions")
         }
         invalid_evidence = sum(
             not _derivation_evidence_resolves(memory, revisions) for memory in memories
         )
+        uses_v9 = any(
+            isinstance(memory, Mapping)
+            and isinstance(memory.get("resolved_evidence_selection"), Mapping)
+            for memory in memories
+        )
         checks.append(
             DeterministicCheck(
-                criterion="claim_local_evidence",
+                criterion=(
+                    "fragment_selection_resolution"
+                    if uses_v9
+                    else "claim_local_evidence"
+                ),
                 label=(
                     DeterministicCheckLabel.FAIL if invalid_evidence else DeterministicCheckLabel.PASS
                 ),
                 reason_code=(
-                    "claim_local_evidence_missing"
-                    if invalid_evidence
-                    else "claim_local_evidence_resolved"
+                    (
+                        "fragment_selection_rejected"
+                        if invalid_evidence
+                        else "fragment_selection_accepted"
+                    )
+                    if uses_v9
+                    else (
+                        "claim_local_evidence_missing"
+                        if invalid_evidence
+                        else "claim_local_evidence_resolved"
+                    )
                 ),
             )
         )
@@ -2395,13 +2412,85 @@ def deterministic_checks(
 
 def _derivation_evidence_resolves(
     memory: object,
-    revisions: Mapping[str, str],
+    revisions: Mapping[str, Mapping[str, object]],
 ) -> bool:
     if not isinstance(memory, Mapping):
         return False
+    selection = memory.get("resolved_evidence_selection")
+    if isinstance(selection, Mapping):
+        parts = selection.get("parts")
+        if not isinstance(parts, list) or not parts:
+            return False
+        if sum(
+            isinstance(part, Mapping) and part.get("role") == "primary"
+            for part in parts
+        ) != 1:
+            return False
+        seen: set[tuple[object, ...]] = set()
+        for part in parts:
+            if not isinstance(part, Mapping):
+                return False
+            anchor = part.get("anchor")
+            if not isinstance(anchor, Mapping):
+                return False
+            observation_id = str(anchor.get("observation_id") or "")
+            revision = revisions.get(observation_id)
+            if (
+                revision is None
+                or str(revision.get("id") or "")
+                != str(anchor.get("observation_revision_id") or "")
+            ):
+                return False
+            identity = (
+                part.get("role"),
+                part.get("kind"),
+                observation_id,
+                anchor.get("observation_revision_id"),
+                anchor.get("kind"),
+                anchor.get("range_start"),
+                anchor.get("range_end"),
+                part.get("raw_content_sha256"),
+            )
+            if identity in seen:
+                return False
+            seen.add(identity)
+            if part.get("kind") == "artifact":
+                metadata = revision.get("metadata")
+                artifact = (
+                    metadata.get("source_artifact")
+                    if isinstance(metadata, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(artifact, Mapping)
+                    or artifact.get("sha256") != part.get("raw_content_sha256")
+                ):
+                    return False
+                continue
+            content = str(revision.get("content") or "")
+            start = anchor.get("range_start")
+            end = anchor.get("range_end")
+            if (
+                not isinstance(start, int)
+                or not isinstance(end, int)
+                or not 0 <= start < end <= len(content)
+            ):
+                return False
+            raw = content[start:end]
+            if hashlib.sha256(raw.encode("utf-8")).hexdigest() != part.get(
+                "raw_content_sha256"
+            ):
+                return False
+            excerpt = part.get("excerpt")
+            if not isinstance(excerpt, str) or hashlib.sha256(
+                excerpt.encode("utf-8")
+            ).hexdigest() != part.get("presentation_sha256"):
+                return False
+        return True
     observation_id = str(memory.get("source_observation_id") or "")
     quote = str(memory.get("evidence_quote") or "")
-    authority = revisions.get(observation_id)
+    revision = revisions.get(observation_id)
+    authority = str(revision.get("content") or "") if revision is not None else None
     if authority is None or not quote.strip() or quote not in authority:
         return False
     start = memory.get("evidence_range_start")

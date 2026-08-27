@@ -631,13 +631,26 @@ class MemoryExtractor:
                 error="No LLM client configured for memory extraction",
             )
         if not catalog.usable:
+            reason_codes = sorted({error.code.value for error in catalog.errors})
+            reason_code = (
+                "catalog_too_large"
+                if "catalog_too_large" in reason_codes
+                else (reason_codes[0] if reason_codes else "catalog_unusable")
+            )
+            record_quality_signal(
+                QualitySignal(
+                    event_name="evidence_admission_outcome",
+                    outcome="rejected",
+                    reason_code=reason_code,
+                )
+            )
             return MemoryExtractionResult(
                 error_type="evidence_catalog_unusable",
                 error="Evidence Fragment catalog is not usable",
                 metadata={
                     "extraction_contract_version": "projection-extraction-v9",
                     "catalog_digest": catalog.digest,
-                    "catalog_error_codes": sorted({error.code.value for error in catalog.errors}),
+                    "catalog_error_codes": reason_codes,
                 },
             )
         invoke = getattr(

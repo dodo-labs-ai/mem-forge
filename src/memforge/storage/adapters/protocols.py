@@ -31,6 +31,7 @@ from memforge.memory.evidence import (
     EvidenceReference,
     EvidenceUnit,
     MemorySupportAssertion,
+    MemoryEvidenceUnitProjection,
     MemoryUnitSupportAssertion,
     SupportScopeVersion,
     RelationOutcomeBundle,
@@ -491,6 +492,10 @@ class RelationalStore(Protocol):
         self,
         memory_id: str,
     ) -> tuple[SourceArtifactEvidence, ...]: ...
+    async def get_memory_evidence_units(
+        self,
+        memory_id: str,
+    ) -> tuple[MemoryEvidenceUnitProjection, ...]: ...
     async def find_source_unit_by_document_id(
         self,
         source_id: str,

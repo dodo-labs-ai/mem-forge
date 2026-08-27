@@ -307,6 +307,18 @@ async def test_report_then_exact_cutover_creates_one_unit_support_and_blocks_v1(
     )
     assert len(parts) == 2
     assert all(row["part_kind"] == "text" for row in parts)
+    [group] = await db.get_memory_evidence_units(memory_id)
+    assert group.evidence_unit_id == unit_id
+    assert group.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+    assert [item.role for item in group.items] == [
+        EvidenceRole.PRIMARY,
+        EvidenceRole.REQUIRED,
+    ]
+    assert all(item.grants_support for item in group.items)
+    assert [item.excerpt for item in group.items] == [
+        "Release requires approval.",
+        "Only after two reviewers agree.",
+    ]
 
     with pytest.raises(Exception, match="reference-scoped Support writer is disabled"):
         await db.upsert_memory_support_assertion(
@@ -771,6 +783,46 @@ async def test_context_replacement_does_not_change_unit_support_identity_or_hash
     after = (await db.get_active_memory_support_states((memory_id,)))[memory_id]
     assert after.unit_ids == before.unit_ids == (unit_id,)
     assert after.support_set_hash == before.support_set_hash
+    [group] = await db.get_memory_evidence_units(memory_id)
+    assert [item.role for item in group.items] == [
+        EvidenceRole.PRIMARY,
+        EvidenceRole.REQUIRED,
+        EvidenceRole.CONTEXT,
+    ]
+    assert group.items[-1].grants_support is False
+    assert group.items[-1].anchor.observation_id == "obs-context-two"
+    await db.db.execute(
+        """UPDATE evidence_references
+              SET raw_content_sha256 = ?
+            WHERE id = ?""",
+        ("0" * 64, group.items[-1].reference_id),
+    )
+    await db.db.commit()
+    [without_bad_context] = await db.get_memory_evidence_units(memory_id)
+    assert [item.role for item in without_bad_context.items] == [
+        EvidenceRole.PRIMARY,
+        EvidenceRole.REQUIRED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_invalid_supporting_part_omits_complete_evidence_unit(db) -> None:
+    memory_id, _unit_id, _source_id, _access_hash = (
+        await _seed_complete_legacy_support(db)
+    )
+    report = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=report.id,
+        owner_id="test-cutover",
+    )
+    await db.db.execute(
+        """UPDATE evidence_references
+              SET raw_content_sha256 = ?
+            WHERE id = 'eref-required'""",
+        ("0" * 64,),
+    )
+    await db.db.commit()
+    assert await db.get_memory_evidence_units(memory_id) == ()
 
 
 @pytest.mark.asyncio

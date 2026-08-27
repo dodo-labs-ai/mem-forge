@@ -112,6 +112,9 @@ class AdapterOnlyEntityDb:
     async def get_memory_source_artifacts(self, memory_id: str) -> tuple:
         return ()
 
+    async def get_memory_evidence_units(self, memory_id: str) -> tuple:
+        return ()
+
     async def get_memory_entity_names(self, memory_id: str) -> list[str]:
         return [self.entity.canonical_name] if memory_id == self.memory.id else []
 
