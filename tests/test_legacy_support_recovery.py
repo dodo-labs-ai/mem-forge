@@ -356,6 +356,26 @@ async def test_llm_failure_becomes_one_durable_inconclusive_report() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sqlite_legacy_inventory_binds_source_predicate() -> None:
+    calls = []
+
+    class Connection:
+        async def execute_fetchall(self, sql, params):
+            calls.append((" ".join(sql.split()), params))
+            return []
+
+    database = object.__new__(Database)
+    database._db = Connection()
+
+    assert await database._legacy_support_group_rows_unlocked(
+        source_id="src-1"
+    ) == []
+    assert len(calls) == 1
+    assert "WHERE msa.source_id = ?" in calls[0][0]
+    assert calls[0][1] == ("src-1",)
+
+
+@pytest.mark.asyncio
 async def test_report_identity_ignores_explanatory_llm_wording() -> None:
     candidate = _candidate()
     catalog = compile_legacy_support_revalidation_catalog(candidate)

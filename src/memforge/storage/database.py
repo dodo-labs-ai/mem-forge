@@ -7114,7 +7114,7 @@ class Database:
     ) -> tuple[LegacySupportRecoveryCandidate, ...]:
         """Load preserved legacy groups and their exact current Unit state."""
 
-        report = await self._support_scope_cutover_report_unlocked()
+        report = await self._support_scope_cutover_report_unlocked(source_id=source_id)
         reasons_by_key = {
             (
                 finding.memory_id,
@@ -7125,7 +7125,7 @@ class Database:
             for finding in report.findings
         }
         grouped: dict[tuple[str, str, str, str, bool], dict[str, object]] = {}
-        for row in await self._legacy_support_group_rows_unlocked():
+        for row in await self._legacy_support_group_rows_unlocked(source_id=source_id):
             key = (
                 str(row["memory_id"]),
                 str(row["evidence_unit_id"] or ""),
@@ -9172,9 +9172,13 @@ class Database:
             )
             await self.db.commit()
 
-    async def _support_scope_cutover_report_unlocked(self) -> SupportCutoverReport:
+    async def _support_scope_cutover_report_unlocked(
+        self,
+        *,
+        source_id: str | None = None,
+    ) -> SupportCutoverReport:
         version = await self.get_support_scope_version()
-        rows = await self._legacy_support_group_rows_unlocked()
+        rows = await self._legacy_support_group_rows_unlocked(source_id=source_id)
         findings: list[SupportCutoverFinding] = []
         eligible_count = 0
         active_eligible_count = 0
@@ -9284,9 +9288,14 @@ class Database:
             created_at=_now_iso(),
         )
 
-    async def _legacy_support_group_rows_unlocked(self):
+    async def _legacy_support_group_rows_unlocked(
+        self,
+        *,
+        source_id: str | None = None,
+    ):
+        where = "WHERE msa.source_id = ?" if source_id is not None else ""
         return await self.db.execute_fetchall(
-            """SELECT msa.memory_id, er.evidence_unit_id, msa.source_id,
+            f"""SELECT msa.memory_id, er.evidence_unit_id, msa.source_id,
                       msa.access_context_hash, eu.source_id AS unit_source_id,
                       eu.access_context_hash AS unit_access_context_hash,
                       eu.source_lineage_id AS unit_source_lineage_id,
@@ -9307,12 +9316,14 @@ class Database:
                  LEFT JOIN evidence_references er ON er.id = msa.evidence_reference_id
                  LEFT JOIN evidence_units eu ON eu.id = er.evidence_unit_id
                  LEFT JOIN source_unit_revisions sur ON sur.id = eu.doc_revision_id
+                {where}
                 GROUP BY msa.memory_id, er.evidence_unit_id, msa.source_id,
                          msa.access_context_hash, eu.source_id, eu.access_context_hash,
                          eu.source_lineage_id, sur.source_unit_id,
                          sur.observation_revision_ids_json
                 ORDER BY msa.memory_id, er.evidence_unit_id, msa.source_id,
-                         msa.access_context_hash"""
+                         msa.access_context_hash""",
+            (source_id,) if source_id is not None else (),
         )
 
     async def _legacy_reference_part_unlocked(
