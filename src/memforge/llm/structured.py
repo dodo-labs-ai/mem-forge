@@ -452,6 +452,39 @@ class IncumbentSupportAuditResponse(StructuredResponseModel):
     decisions: list[IncumbentSupportAuditDecision]
 
 
+class LegacySupportRevalidationDecision(StructuredResponseModel):
+    """One current-revision judgment for a legacy-limited Memory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_position: int = Field(ge=0)
+    decision: Literal["supported", "not_supported", "inconclusive"]
+    primary_ref: TransientEvidenceFragmentRef | None = None
+    required_refs: list[TransientEvidenceFragmentRef] = Field(default_factory=list)
+    reason: str = Field(default="", max_length=1000)
+
+    @model_validator(mode="after")
+    def _validate_selection(self):
+        if self.decision == "supported":
+            if self.primary_ref is None:
+                raise ValueError("supported revalidation requires primary_ref")
+            if self.primary_ref in self.required_refs:
+                raise ValueError("primary_ref cannot also be required")
+            if len(set(self.required_refs)) != len(self.required_refs):
+                raise ValueError("required_refs must be duplicate-free")
+        elif self.primary_ref is not None or self.required_refs:
+            raise ValueError("unsupported or inconclusive revalidation cannot select Evidence")
+        return self
+
+
+class LegacySupportRevalidationResponse(StructuredResponseModel):
+    """Complete response for one bounded legacy Support revalidation batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[LegacySupportRevalidationDecision]
+
+
 class RevisionCompositionDecision(StructuredResponseModel):
     """One transient proof that a REFINES pair is eligible for revision."""
 
@@ -919,6 +952,15 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> IncumbentSupportAuditResponse:
         """Return one support disposition for every incumbent in an audit batch."""
+
+    async def revalidate_legacy_support(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 8192,
+        model: str | None = None,
+    ) -> LegacySupportRevalidationResponse:
+        """Select current authorized Evidence for legacy-limited Memories."""
 
     async def prove_revision_compositions(
         self,
@@ -1685,6 +1727,20 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=IncumbentSupportAuditResponse,
+            max_tokens=max_tokens,
+            model=model,
+        )
+
+    async def revalidate_legacy_support(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 8192,
+        model: str | None = None,
+    ) -> LegacySupportRevalidationResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=LegacySupportRevalidationResponse,
             max_tokens=max_tokens,
             model=model,
         )

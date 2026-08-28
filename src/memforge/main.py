@@ -5912,6 +5912,127 @@ def maintenance_repair_indexes(ctx):
     asyncio.run(_run())
 
 
+@maintenance.command("recover-legacy-support")
+@click.option("--source-id", required=True, help="Configured Source to evaluate.")
+@click.option("--apply", "apply_changes", is_flag=True, help="Apply an exact reproduced report.")
+@click.option(
+    "--expected-report-id",
+    help="Exact report id required with --apply.",
+)
+@click.pass_context
+def maintenance_recover_legacy_support(
+    ctx,
+    source_id: str,
+    apply_changes: bool,
+    expected_report_id: str | None,
+):
+    """Revalidate legacy-limited Support against stored current revisions."""
+
+    if apply_changes != bool(expected_report_id):
+        raise click.UsageError("--apply requires exactly one --expected-report-id")
+
+    async def _run():
+        import uuid
+
+        from memforge.memory.cutover import run_with_lifecycle_activity_heartbeat
+        from memforge.memory.lifecycle_plan import (
+            LifecycleBackfillJob,
+            LifecycleBackfillJobStatus,
+        )
+        from memforge.memory.support_recovery import (
+            LegacySupportRecoveryDisposition,
+            apply_prepared_legacy_support_recovery,
+            prepare_legacy_support_recovery,
+        )
+        from memforge.runtime import DefaultRuntimeProvider, get_effective_llm_config
+
+        config: AppConfig = ctx.obj["config"]
+        db = await _get_db(config)
+        try:
+            llm = await get_effective_llm_config(db, config)
+            client = DefaultRuntimeProvider().build_structured_llm_client(
+                llm,
+                max_concurrent=config.llm.enrichment_max_concurrent,
+            )
+
+            async def prepare():
+                return await prepare_legacy_support_recovery(
+                    db,
+                    source_id=source_id,
+                    structured_llm_client=client,
+                    llm_model=llm.enrichment_model,
+                )
+
+            applied = 0
+            if not apply_changes:
+                prepared = await prepare()
+            else:
+                job = await db.create_lifecycle_backfill_job(
+                    LifecycleBackfillJob(
+                        id=f"legacy-support-recovery-{uuid.uuid4().hex}",
+                        source_id=source_id,
+                        status=LifecycleBackfillJobStatus.QUEUED,
+                    )
+                )
+                await db.start_lifecycle_backfill_job(job.id)
+
+                async def recover():
+                    prepared_result = await prepare()
+                    applied_count = await apply_prepared_legacy_support_recovery(
+                        db,
+                        prepared_result,
+                        expected_report_id=expected_report_id or "",
+                    )
+                    await db.complete_lifecycle_backfill_job(
+                        job.id,
+                        scanned_memories=len(prepared_result.report.entries),
+                        mapped_memories=applied_count,
+                        finding_count=(
+                            len(prepared_result.report.entries) - applied_count
+                        ),
+                    )
+                    return prepared_result, applied_count
+
+                try:
+                    prepared, applied = await run_with_lifecycle_activity_heartbeat(
+                        db,
+                        job.id,
+                        recover,
+                    )
+                except Exception as exc:
+                    try:
+                        await db.fail_lifecycle_backfill_job(job.id, error=str(exc))
+                    except Exception:
+                        pass
+                    raise
+
+            counts = {
+                disposition.value: sum(
+                    entry.disposition is disposition
+                    for entry in prepared.report.entries
+                )
+                for disposition in LegacySupportRecoveryDisposition
+            }
+            return prepared.report, counts, applied
+        finally:
+            await db.close()
+
+    try:
+        report, counts, applied = asyncio.run(_run())
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    table = Table(title="Legacy Support Recovery")
+    table.add_column("Outcome")
+    table.add_column("Count", justify="right")
+    for name, count in counts.items():
+        if count:
+            table.add_row(name, str(count))
+    if apply_changes:
+        table.add_row("applied", str(applied))
+    console.print(table)
+    console.print(f"Report ID: [bold]{report.id}[/]")
+
+
 # ---------------------------------------------------------------------------
 # config group
 # ---------------------------------------------------------------------------
