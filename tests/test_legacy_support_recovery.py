@@ -28,6 +28,7 @@ from memforge.memory.support_recovery import (
     build_legacy_support_recovery_plan,
     compile_legacy_support_revalidation_catalog,
     legacy_support_revalidation_prompt,
+    legacy_limited_recovery_reason_codes,
     prepare_legacy_support_recovery,
     resolve_legacy_support_revalidation_response,
     resolve_mechanical_legacy_support,
@@ -210,6 +211,13 @@ def test_revalidation_schema_requires_evidence_only_for_supported() -> None:
             decision="not_supported",
             primary_ref="f000001",
         )
+
+
+def test_eligible_legacy_limited_group_retains_mechanical_recovery_reason() -> None:
+    assert legacy_limited_recovery_reason_codes(()) == ("part_unresolvable",)
+    assert legacy_limited_recovery_reason_codes(
+        ("unit_revision_lineage_invalid",)
+    ) == ("unit_revision_lineage_invalid",)
 
 
 def test_recovery_cli_requires_exact_report_for_apply() -> None:
