@@ -452,29 +452,49 @@ class IncumbentSupportAuditResponse(StructuredResponseModel):
     decisions: list[IncumbentSupportAuditDecision]
 
 
-class LegacySupportRevalidationDecision(StructuredResponseModel):
-    """One current-revision judgment for a legacy-limited Memory."""
+class _LegacySupportRevalidationDecisionBase(StructuredResponseModel):
+    """Fields shared by every current-revision legacy Support judgment."""
 
     model_config = ConfigDict(extra="forbid")
 
     request_position: int = Field(ge=0)
-    decision: Literal["supported", "not_supported", "inconclusive"]
-    primary_ref: TransientEvidenceFragmentRef | None = None
-    required_refs: list[TransientEvidenceFragmentRef] = Field(default_factory=list)
     reason: str = Field(default="", max_length=1000)
+
+
+class LegacySupportedRevalidationDecision(_LegacySupportRevalidationDecisionBase):
+    """A positive judgment with application-resolvable current Evidence."""
+
+    decision: Literal["supported"]
+    primary_ref: TransientEvidenceFragmentRef
+    required_refs: list[TransientEvidenceFragmentRef] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate_selection(self):
-        if self.decision == "supported":
-            if self.primary_ref is None:
-                raise ValueError("supported revalidation requires primary_ref")
-            if self.primary_ref in self.required_refs:
-                raise ValueError("primary_ref cannot also be required")
-            if len(set(self.required_refs)) != len(self.required_refs):
-                raise ValueError("required_refs must be duplicate-free")
-        elif self.primary_ref is not None or self.required_refs:
-            raise ValueError("unsupported or inconclusive revalidation cannot select Evidence")
+        if self.primary_ref in self.required_refs:
+            raise ValueError("primary_ref cannot also be required")
+        if len(set(self.required_refs)) != len(self.required_refs):
+            raise ValueError("required_refs must be duplicate-free")
         return self
+
+
+class LegacyNotSupportedRevalidationDecision(_LegacySupportRevalidationDecisionBase):
+    """A negative judgment that cannot carry Evidence selectors."""
+
+    decision: Literal["not_supported"]
+
+
+class LegacyInconclusiveRevalidationDecision(_LegacySupportRevalidationDecisionBase):
+    """An unresolved judgment that cannot carry Evidence selectors."""
+
+    decision: Literal["inconclusive"]
+
+
+type LegacySupportRevalidationDecision = Annotated[
+    LegacySupportedRevalidationDecision
+    | LegacyNotSupportedRevalidationDecision
+    | LegacyInconclusiveRevalidationDecision,
+    Field(discriminator="decision"),
+]
 
 
 class LegacySupportRevalidationResponse(StructuredResponseModel):

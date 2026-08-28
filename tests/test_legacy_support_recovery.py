@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -9,8 +10,10 @@ from click.testing import CliRunner
 from pydantic import ValidationError
 
 from memforge.llm.structured import (
-    LegacySupportRevalidationDecision,
+    LegacyNotSupportedRevalidationDecision,
     LegacySupportRevalidationResponse,
+    LegacySupportedRevalidationDecision,
+    StructuredLlmError,
 )
 from memforge.main import cli
 from memforge.memory.evidence import (
@@ -201,18 +204,26 @@ def _candidate(*, include_artifact: bool = False) -> LegacySupportRecoveryCandid
 
 
 def test_revalidation_schema_requires_evidence_only_for_supported() -> None:
-    with pytest.raises(ValidationError, match="supported revalidation requires primary_ref"):
-        LegacySupportRevalidationDecision(
+    with pytest.raises(ValidationError, match="primary_ref"):
+        LegacySupportedRevalidationDecision(
             request_position=0,
             decision="supported",
             reason="missing selector",
         )
-    with pytest.raises(ValidationError, match="cannot select Evidence"):
-        LegacySupportRevalidationDecision(
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        LegacyNotSupportedRevalidationDecision(
             request_position=0,
             decision="not_supported",
             primary_ref="f000001",
         )
+
+    schema = LegacySupportRevalidationResponse.model_json_schema()
+    decision_items = schema["properties"]["decisions"]["items"]
+    decision_items = schema["$defs"][decision_items["$ref"].rsplit("/", 1)[-1]]
+    assert decision_items["discriminator"]["propertyName"] == "decision"
+    supported_ref = decision_items["discriminator"]["mapping"]["supported"]
+    supported_schema = schema["$defs"][supported_ref.rsplit("/", 1)[-1]]
+    assert "primary_ref" in supported_schema["required"]
 
 
 def test_eligible_legacy_limited_group_retains_mechanical_recovery_reason() -> None:
@@ -285,7 +296,7 @@ def test_revalidation_resolves_current_catalog_and_builds_support_only_plan() ->
     )
     response = LegacySupportRevalidationResponse(
         decisions=[
-            LegacySupportRevalidationDecision(
+            LegacySupportedRevalidationDecision(
                 request_position=0,
                 decision="supported",
                 primary_ref=primary_ref,
@@ -395,6 +406,130 @@ async def test_llm_failure_becomes_one_durable_inconclusive_report() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_failure_does_not_skip_an_independent_revalidation_scope() -> None:
+    first = _candidate()
+    assert first.projection is not None
+    second_unit_revision = replace(
+        first.projection.source_unit_revisions[0],
+        id="unitrev-current-second-access",
+        access_hash="workspace-access-second",
+    )
+    second_projection = replace(
+        first.projection,
+        run_id="stored-current-unitrev-current-second-access",
+        source_unit_revisions=(second_unit_revision,),
+        deltas=(
+            replace(
+                first.projection.deltas[0],
+                previous_unit_revision_id=second_unit_revision.id,
+                current_unit_revision_id=second_unit_revision.id,
+            ),
+        ),
+    )
+    second = replace(
+        first,
+        memory=replace(first.memory, id="memory-2"),
+        memory_version="memory-version-current-2",
+        support_set_hash="support-set-current-2",
+        access_context_hash="workspace-access-second",
+        projection=second_projection,
+        legacy_evidence_unit_ids=("legacy-unit-2",),
+    )
+    second_catalog = compile_legacy_support_revalidation_catalog(second)
+    second_primary_ref = next(
+        fragment.reference
+        for fragment in second_catalog.fragments
+        if EvidenceRole.PRIMARY in fragment.eligible_roles
+        and "Production release requires approval" in fragment.presentation_text
+    )
+
+    class FailThenSucceedClient:
+        calls = 0
+
+        async def revalidate_legacy_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            self.calls += 1
+            if self.calls == 1:
+                raise StructuredLlmError(
+                    "invalid structured response",
+                    terminal_category="invalid_response",
+                    error_code="ValidationError",
+                )
+            return LegacySupportRevalidationResponse(
+                decisions=[
+                    LegacySupportedRevalidationDecision(
+                        request_position=0,
+                        decision="supported",
+                        primary_ref=second_primary_ref,
+                        reason="current Evidence supports the complete claim",
+                    )
+                ]
+            )
+
+    class FakeDb:
+        persisted = None
+
+        async def list_legacy_support_recovery_candidates(self, source_id: str):
+            assert source_id == "source-1"
+            return (first, second)
+
+        async def get_lifecycle_gate(self, source_id: str):
+            assert source_id == "source-1"
+            return type("Gate", (), {"state": LifecycleGateState.GATED})()
+
+        async def persist_legacy_support_recovery_report(self, report):
+            self.persisted = report
+
+    client = FailThenSucceedClient()
+    db = FakeDb()
+    prepared = await prepare_legacy_support_recovery(
+        db,
+        source_id="source-1",
+        structured_llm_client=client,
+        llm_model="test-model",
+    )
+
+    entries = {entry.memory_id: entry for entry in prepared.report.entries}
+    assert client.calls == 2
+    assert entries["memory-1"].disposition is LegacySupportRecoveryDisposition.INCONCLUSIVE
+    assert entries["memory-1"].reason == (
+        "llm_revalidation_failed:invalid_response:ValidationError"
+    )
+    assert entries["memory-2"].disposition is LegacySupportRecoveryDisposition.SUPPORTED
+    assert db.persisted == prepared.report
+
+
+@pytest.mark.asyncio
+async def test_unexpected_revalidation_bug_is_not_persisted_as_model_inconclusive() -> None:
+    candidate = _candidate()
+
+    class BrokenClient:
+        async def revalidate_legacy_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            raise RuntimeError("programming defect")
+
+    class FakeDb:
+        persisted = None
+
+        async def list_legacy_support_recovery_candidates(self, source_id: str):
+            assert source_id == "source-1"
+            return (candidate,)
+
+        async def persist_legacy_support_recovery_report(self, report):
+            self.persisted = report
+
+    db = FakeDb()
+    with pytest.raises(RuntimeError, match="programming defect"):
+        await prepare_legacy_support_recovery(
+            db,
+            source_id="source-1",
+            structured_llm_client=BrokenClient(),
+            llm_model="test-model",
+        )
+    assert db.persisted is None
+
+
+@pytest.mark.asyncio
 async def test_sqlite_legacy_inventory_binds_source_predicate() -> None:
     calls = []
 
@@ -434,7 +569,7 @@ async def test_report_identity_ignores_explanatory_llm_wording() -> None:
             del prompt, kwargs
             return LegacySupportRevalidationResponse(
                 decisions=[
-                    LegacySupportRevalidationDecision(
+                    LegacySupportedRevalidationDecision(
                         request_position=0,
                         decision="supported",
                         primary_ref=primary_ref,
@@ -566,7 +701,7 @@ async def test_sqlite_inventory_rehydrates_current_projection_for_missing_histor
             assert "Production release requires approval" in prompt
             return LegacySupportRevalidationResponse(
                 decisions=[
-                    LegacySupportRevalidationDecision(
+                    LegacySupportedRevalidationDecision(
                         request_position=0,
                         decision="supported",
                         primary_ref="f000002",
