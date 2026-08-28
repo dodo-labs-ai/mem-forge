@@ -56,6 +56,22 @@ from memforge.source_projection import AnchorKind, SourceAnchor, SourceProjectio
 LEGACY_SUPPORT_REVALIDATION_BATCH_SIZE = 20
 
 
+def legacy_limited_recovery_reason_codes(
+    current_reason_codes: Sequence[str],
+) -> tuple[str, ...]:
+    """Retain the cutover-only mixed-part cohort after provenance relabeling.
+
+    A legacy-limited group that is fully eligible when rechecked can only have
+    lost its original `part_unresolvable` reason because cutover replaced the
+    Unit-level `source_artifact` provenance with `legacy_limited`. The recovery
+    path still reconstructs and verifies every Reference independently before
+    granting v2 Support.
+    """
+
+    normalized = tuple(sorted(set(current_reason_codes)))
+    return normalized or ("part_unresolvable",)
+
+
 class LegacySupportRecoveryDisposition(str, Enum):
     MECHANICALLY_RECOVERABLE = "mechanically_recoverable"
     SUPPORTED = "supported"
