@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping, Sequence
 
-from memforge.llm.structured import LegacySupportRevalidationResponse
+from memforge.llm.structured import LegacySupportRevalidationResponse, StructuredLlmError
 from memforge.memory.evidence import (
     EvidencePartKind,
     EvidenceReference,
@@ -54,6 +54,36 @@ from memforge.source_projection import AnchorKind, SourceAnchor, SourceProjectio
 
 
 LEGACY_SUPPORT_REVALIDATION_BATCH_SIZE = 20
+
+
+class LegacySupportRevalidationResponseError(ValueError):
+    """A content-free model-ledger violation detected by the resolver."""
+
+    def __init__(self, message: str, *, error_code: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
+def _structured_llm_failure_reason(error: BaseException) -> str:
+    """Return one content-free report reason for an exhausted model call."""
+
+    if isinstance(error, StructuredLlmError):
+        return (
+            "llm_revalidation_failed:"
+            f"{error.terminal_category}:{error.error_code}"
+        )
+    if isinstance(error, LegacySupportRevalidationResponseError):
+        return f"llm_revalidation_failed:invalid_response:{error.error_code}"
+    return f"llm_revalidation_failed:{type(error).__name__}"
+
+
+def _is_batch_local_revalidation_failure(error: BaseException) -> bool:
+    """Return whether later independent batches can still be evaluated safely."""
+
+    return isinstance(error, LegacySupportRevalidationResponseError) or (
+        isinstance(error, StructuredLlmError)
+        and error.terminal_category == "invalid_response"
+    )
 
 
 def legacy_limited_recovery_reason_codes(
@@ -373,7 +403,10 @@ def resolve_legacy_support_revalidation_response(
     by_position = {item.request_position: item for item in response.decisions}
     expected = set(range(len(candidates)))
     if len(by_position) != len(response.decisions) or set(by_position) != expected:
-        raise ValueError("legacy Support revalidation response coverage is incomplete")
+        raise LegacySupportRevalidationResponseError(
+            "legacy Support revalidation response coverage is incomplete",
+            error_code="coverage_incomplete",
+        )
     output: list[LegacySupportRecoveryDecision] = []
     for position, candidate in enumerate(candidates):
         item = by_position[position]
@@ -384,7 +417,11 @@ def resolve_legacy_support_revalidation_response(
                     required_refs=item.required_refs,
                 )
             except FragmentSelectionError as exc:
-                raise ValueError(f"legacy Support revalidation selected invalid Evidence: {exc.code.value}") from exc
+                raise LegacySupportRevalidationResponseError(
+                    "legacy Support revalidation selected invalid Evidence: "
+                    f"{exc.code.value}",
+                    error_code=f"invalid_evidence_selection_{exc.code.value}",
+                ) from exc
             output.append(
                 LegacySupportRecoveryDecision(
                     candidate=candidate,
@@ -599,14 +636,14 @@ async def prepare_legacy_support_recovery(
                 for candidate in pending
             )
     else:
-        llm_failure_reason: str | None = None
+        systemic_llm_failure_reason: str | None = None
         for pending in pending_by_scope.values():
-            if llm_failure_reason is not None:
+            if systemic_llm_failure_reason is not None:
                 decisions.extend(
                     LegacySupportRecoveryDecision(
                         candidate=candidate,
                         disposition=LegacySupportRecoveryDisposition.INCONCLUSIVE,
-                        reason=llm_failure_reason,
+                        reason=systemic_llm_failure_reason,
                     )
                     for candidate in pending
                 )
@@ -648,8 +685,14 @@ async def prepare_legacy_support_recovery(
                         candidates=batch,
                         response=response,
                     )
-                except Exception as exc:
-                    llm_failure_reason = f"llm_revalidation_failed:{type(exc).__name__}"
+                except (
+                    LegacySupportRevalidationResponseError,
+                    StructuredLlmError,
+                    TimeoutError,
+                ) as exc:
+                    llm_failure_reason = _structured_llm_failure_reason(exc)
+                    if not _is_batch_local_revalidation_failure(exc):
+                        systemic_llm_failure_reason = llm_failure_reason
                     decisions.extend(
                         LegacySupportRecoveryDecision(
                             candidate=candidate,
@@ -657,9 +700,15 @@ async def prepare_legacy_support_recovery(
                             reason=llm_failure_reason,
                             catalog_digest=catalog.digest,
                         )
-                        for candidate in pending[offset:]
+                        for candidate in (
+                            batch
+                            if systemic_llm_failure_reason is None
+                            else pending[offset:]
+                        )
                     )
-                    break
+                    if systemic_llm_failure_reason is not None:
+                        break
+                    continue
                 decisions.extend(resolved)
 
     safe_decisions: list[LegacySupportRecoveryDecision] = []

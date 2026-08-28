@@ -26,8 +26,8 @@ from memforge.llm.structured import (
     EntityValidationResponse,
     IncumbentSupportAuditDecision,
     IncumbentSupportAuditResponse,
-    LegacySupportRevalidationDecision,
     LegacySupportRevalidationResponse,
+    LegacySupportedRevalidationDecision,
     LiteLlmStructuredClient,
     MemoryCandidate,
     MemoryExtractionResponse,
@@ -1565,7 +1565,7 @@ def test_transient_batch_schemas_use_ordered_decision_arrays() -> None:
     )
     legacy_revalidation = LegacySupportRevalidationResponse(
         decisions=[
-            LegacySupportRevalidationDecision(
+            LegacySupportedRevalidationDecision(
                 request_position=0,
                 decision="supported",
                 primary_ref="f000001",
