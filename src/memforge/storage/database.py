@@ -144,6 +144,10 @@ from memforge.memory.lifecycle_plan import (
     unprovable_cutover_retirement_plan_id,
     validate_unprovable_cutover_evidence,
 )
+from memforge.memory.support_recovery import (
+    LegacySupportRecoveryCandidate,
+    LegacySupportRecoveryReport,
+)
 from memforge.memory.relation_discovery_contract import (
     CURRENT_RELATION_EVIDENCE_PREDICATE_SQL,
     PreclassifiedRelationDecision,
@@ -224,6 +228,7 @@ from memforge.source_derivation import (
 )
 from memforge.source_projection import (
     AnchorKind,
+    RevisionDelta,
     EvidenceCoordinateSpace,
     EvidenceRepresentationProfile,
     ProjectionCoverage,
@@ -231,6 +236,7 @@ from memforge.source_projection import (
     ProjectionScopeTransition,
     ProjectionScopeTransitionStatus,
     SourceObservationRevision,
+    SourceObservation,
     SourceAnchor,
     SourceProjection,
     SourceUnit,
@@ -7016,6 +7022,260 @@ class Database:
                 )
         return revisions
 
+    async def get_current_source_unit_projection(
+        self,
+        source_unit_id: str,
+    ) -> SourceProjection | None:
+        """Rehydrate one exact stored-current Unit without contacting its provider."""
+
+        async with self.db.execute(
+            """SELECT su.*, s.type AS source_type
+                 FROM source_units su
+                 JOIN sources s ON s.id = su.source_id
+                WHERE su.id = ?""",
+            (source_unit_id,),
+        ) as cursor:
+            unit_row = await cursor.fetchone()
+        if unit_row is None or not unit_row["current_revision_id"]:
+            return None
+        unit_revision = await self.get_current_source_unit_revision(source_unit_id)
+        if unit_revision is None:
+            return None
+        observation_rows = await self.db.execute_fetchall(
+            """SELECT so.*, sor.id AS revision_id, sor.semantic_hash AS revision_semantic_hash,
+                      sor.content, sor.metadata_json, sor.observed_at,
+                      sor.profile_name, sor.profile_version, sor.coordinate_space,
+                      sor.representation_schema_name,
+                      sor.representation_schema_version
+                 FROM source_observations so
+                 JOIN source_observation_revisions sor ON sor.id = so.current_revision_id
+                WHERE so.source_unit_id = ?
+                ORDER BY so.id""",
+            (source_unit_id,),
+        )
+        observations = tuple(
+            SourceObservation(
+                id=str(row["id"]),
+                source_id=str(row["source_id"]),
+                source_unit_id=str(row["source_unit_id"]),
+                observation_type=str(row["observation_type"]),
+                provider_key=str(row["provider_key"]),
+                locator=json.loads(row["locator_json"] or "{}"),
+            )
+            for row in observation_rows
+        )
+        revisions = tuple(
+            SourceObservationRevision(
+                id=str(row["revision_id"]),
+                observation_id=str(row["id"]),
+                semantic_hash=str(row["revision_semantic_hash"]),
+                content=str(row["content"]),
+                observed_at=row["observed_at"],
+                metadata=json.loads(row["metadata_json"] or "{}"),
+                evidence_profile=_evidence_profile_from_storage_row(row),
+            )
+            for row in observation_rows
+        )
+        if set(unit_revision.observation_revision_ids) != {item.id for item in revisions}:
+            raise ValueError("stored current Source Unit manifest is incomplete")
+        unit = SourceUnit(
+            id=str(unit_row["id"]),
+            source_id=str(unit_row["source_id"]),
+            unit_type=str(unit_row["unit_type"]),
+            provider_key=str(unit_row["provider_key"]),
+            locator=json.loads(unit_row["locator_json"] or "{}"),
+        )
+        return SourceProjection(
+            run_id=f"stored-current-{unit_revision.id}",
+            source_id=unit.source_id,
+            source_type=str(unit_row["source_type"]),
+            scope={"stored_current_revalidation": True},
+            coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+            observations=observations,
+            observation_revisions=revisions,
+            source_units=(unit,),
+            source_unit_revisions=(unit_revision,),
+            relations=(),
+            deltas=(
+                RevisionDelta(
+                    source_unit_id=unit.id,
+                    previous_unit_revision_id=unit_revision.id,
+                    current_unit_revision_id=unit_revision.id,
+                    axes=frozenset(),
+                    coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+                ),
+            ),
+            checkpoint={"stored_current_revalidation": True},
+        )
+
+    async def list_legacy_support_recovery_candidates(
+        self,
+        source_id: str,
+    ) -> tuple[LegacySupportRecoveryCandidate, ...]:
+        """Load preserved legacy groups and their exact current Unit state."""
+
+        report = await self._support_scope_cutover_report_unlocked()
+        reasons_by_key = {
+            (
+                finding.memory_id,
+                finding.evidence_unit_id,
+                finding.source_id,
+                finding.access_context_hash,
+            ): finding.reason_codes
+            for finding in report.findings
+        }
+        grouped: dict[tuple[str, str, str, str, bool], dict[str, object]] = {}
+        for row in await self._legacy_support_group_rows_unlocked():
+            key = (
+                str(row["memory_id"]),
+                str(row["evidence_unit_id"] or ""),
+                str(row["source_id"]),
+                str(row["access_context_hash"]),
+            )
+            reasons = reasons_by_key.get(key, ())
+            if key[2] != source_id or not set(reasons).intersection(
+                {"part_unresolvable", "unit_revision_lineage_invalid"}
+            ):
+                continue
+            if int(row["active_state_count"] or 0) != 1:
+                continue
+            legacy_support_active = int(row["active_count"] or 0) == int(
+                row["support_row_count"] or 0
+            )
+            async with self.db.execute(
+                "SELECT * FROM memories WHERE id = ?",
+                (key[0],),
+            ) as cursor:
+                memory_row = await cursor.fetchone()
+            if memory_row is None:
+                continue
+            unit = await self.get_evidence_unit(key[1])
+            if (
+                unit is None
+                or unit.source_id != source_id
+                or not unit.source_lineage_id
+                or not unit.doc_id
+            ):
+                continue
+            projection = await self.get_current_source_unit_projection(
+                unit.source_lineage_id
+            )
+            reference_rows = await self.db.execute_fetchall(
+                """SELECT * FROM evidence_references
+                    WHERE evidence_unit_id = ? AND role IN ('primary', 'required')
+                    ORDER BY CASE role WHEN 'primary' THEN 0 ELSE 1 END, id""",
+                (unit.id,),
+            )
+            references = tuple(
+                EvidenceReference(
+                    id=str(reference["id"]),
+                    evidence_unit_id=str(reference["evidence_unit_id"]),
+                    role=EvidenceRole(str(reference["role"])),
+                    anchor=SourceAnchor(
+                        kind=AnchorKind(str(reference["anchor_kind"])),
+                        observation_id=str(reference["observation_id"]),
+                        observation_revision_id=str(
+                            reference["observation_revision_id"]
+                        ),
+                        fragment_id=reference["fragment_id"],
+                        range_start=reference["range_start"],
+                        range_end=reference["range_end"],
+                    ),
+                )
+                for reference in reference_rows
+            )
+            active_v2_rows = await self.db.execute_fetchall(
+                """SELECT evidence_unit_id
+                     FROM memory_unit_support_assertions
+                    WHERE memory_id = ? AND active = 1
+                    ORDER BY evidence_unit_id""",
+                (key[0],),
+            )
+            inactive_v2_rows = await self.db.execute_fetchall(
+                """SELECT evidence_unit_id
+                     FROM memory_unit_support_assertions
+                    WHERE memory_id = ? AND active = 0
+                    ORDER BY evidence_unit_id""",
+                (key[0],),
+            )
+            async with self.db.execute(
+                """SELECT 1 FROM memory_sources
+                    WHERE memory_id = ? AND source_id = ? AND doc_id = ?""",
+                (key[0], source_id, str(unit.doc_id)),
+            ) as cursor:
+                memory_source_current = await cursor.fetchone() is not None
+            candidate_key = (
+                key[0],
+                unit.source_lineage_id,
+                key[3],
+                str(unit.doc_id),
+                legacy_support_active,
+            )
+            existing = grouped.get(candidate_key)
+            if existing is None:
+                grouped[candidate_key] = {
+                    "memory": self._row_to_memory(memory_row),
+                    "memory_version": _lifecycle_memory_version(memory_row),
+                    "support_set_hash": await self._memory_unit_support_set_hash_unlocked(
+                        key[0]
+                    ),
+                    "source_type": unit.source_type,
+                    "projection": projection,
+                    "legacy_evidence_unit_ids": [unit.id],
+                    "legacy_references": list(references),
+                    "reason_codes": set(reasons),
+                    "active_v2_unit_ids": [
+                        str(item["evidence_unit_id"]) for item in active_v2_rows
+                    ],
+                    "inactive_v2_unit_ids": [
+                        str(item["evidence_unit_id"]) for item in inactive_v2_rows
+                    ],
+                    "memory_source_current": memory_source_current,
+                    "legacy_support_active": legacy_support_active,
+                }
+                continue
+            existing["legacy_evidence_unit_ids"].append(unit.id)  # type: ignore[union-attr]
+            existing["legacy_references"].extend(references)  # type: ignore[union-attr]
+            existing["reason_codes"].update(reasons)  # type: ignore[union-attr]
+
+        candidates = []
+        for (
+            _memory_id,
+            source_unit_id,
+            access_hash,
+            doc_id,
+            legacy_support_active,
+        ), value in sorted(
+            grouped.items()
+        ):
+            unique_references = {
+                str(reference.id): reference
+                for reference in value["legacy_references"]
+            }
+            candidates.append(
+                LegacySupportRecoveryCandidate(
+                    memory=value["memory"],
+                    memory_version=str(value["memory_version"]),
+                    support_set_hash=str(value["support_set_hash"]),
+                    source_id=source_id,
+                    source_type=str(value["source_type"]),
+                    source_unit_id=source_unit_id,
+                    doc_id=doc_id,
+                    access_context_hash=access_hash,
+                    projection=value["projection"],
+                    legacy_evidence_unit_ids=tuple(
+                        sorted(set(value["legacy_evidence_unit_ids"]))
+                    ),
+                    legacy_references=tuple(unique_references.values()),
+                    reason_codes=tuple(sorted(value["reason_codes"])),
+                    active_v2_unit_ids=tuple(value["active_v2_unit_ids"]),
+                    inactive_v2_unit_ids=tuple(value["inactive_v2_unit_ids"]),
+                    memory_source_current=bool(value["memory_source_current"]),
+                    legacy_support_active=legacy_support_active,
+                )
+            )
+        return tuple(candidates)
+
     async def get_source_artifact_revision(
         self,
         observation_revision_id: str,
@@ -8878,6 +9138,39 @@ class Database:
             )
             await self.db.commit()
             return report
+
+    async def persist_legacy_support_recovery_report(
+        self,
+        report: LegacySupportRecoveryReport,
+    ) -> None:
+        """Persist one immutable recovery dry-run in the existing report store."""
+
+        payload = json.dumps(
+            report.to_payload(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        async with self._write_lock:
+            await self.db.execute(
+                """INSERT INTO support_cutover_reports (
+                       id, support_scope_version, legacy_group_count,
+                       eligible_group_count, ineligible_group_count,
+                       active_eligible_group_count, inactive_eligible_group_count,
+                       finding_payload_json, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                   ON CONFLICT(id) DO NOTHING""",
+                (
+                    report.id,
+                    SupportScopeVersion.EVIDENCE_UNIT_SET_V2.value,
+                    report.legacy_group_count,
+                    report.ready_group_count,
+                    report.legacy_group_count - report.ready_group_count,
+                    report.ready_count,
+                    payload,
+                    report.created_at,
+                ),
+            )
+            await self.db.commit()
 
     async def _support_scope_cutover_report_unlocked(self) -> SupportCutoverReport:
         version = await self.get_support_scope_version()
@@ -11024,6 +11317,25 @@ class Database:
                         unit = await cursor.fetchone()
                     if unit is None or unit["source_id"] != mutation.source_id:
                         raise ValueError("attach_support Evidence Unit belongs to another source")
+                    validation = mutation.payload.get("support_validation")
+                    if (
+                        isinstance(validation, Mapping)
+                        and validation.get("legacy_support_recovery") is True
+                    ):
+                        async with self.db.execute(
+                            """SELECT active
+                                 FROM memory_unit_support_assertions
+                                WHERE memory_id = ? AND evidence_unit_id = ?""",
+                            (mutation.memory_id, evidence_unit_id),
+                        ) as cursor:
+                            existing_recovery_support = await cursor.fetchone()
+                        if (
+                            existing_recovery_support is not None
+                            and not bool(existing_recovery_support["active"])
+                        ):
+                            raise ValueError(
+                                "legacy Support recovery cannot reactivate removed v2 Support"
+                            )
                     assertion = MemoryUnitSupportAssertion(
                         id=memory_unit_support_assertion_id(
                             memory_id=mutation.memory_id,
