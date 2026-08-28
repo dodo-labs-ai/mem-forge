@@ -241,6 +241,25 @@ class SupportCutoverReport:
     created_at: str
 
 
+def evidence_unit_revision_lineage_is_valid(
+    *,
+    evidence_unit_source_lineage_id: str | None,
+    unit_revision_source_unit_id: str | None,
+    unit_revision_observation_revision_ids: tuple[str, ...],
+    reference_observation_revision_ids: tuple[str, ...],
+) -> bool:
+    """Return whether one Evidence Unit is pinned to all supporting Revisions."""
+
+    return bool(
+        evidence_unit_source_lineage_id
+        and unit_revision_source_unit_id
+        and evidence_unit_source_lineage_id == unit_revision_source_unit_id
+        and set(reference_observation_revision_ids).issubset(
+            unit_revision_observation_revision_ids
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ActiveSupportEvidence:
     """The source excerpt and Anchor behind one active Support Assertion."""
