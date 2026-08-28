@@ -7114,7 +7114,10 @@ class Database:
     ) -> tuple[LegacySupportRecoveryCandidate, ...]:
         """Load preserved legacy groups and their exact current Unit state."""
 
-        report = await self._support_scope_cutover_report_unlocked(source_id=source_id)
+        report = await self._support_scope_cutover_report_unlocked(
+            source_id=source_id,
+            legacy_limited_only=True,
+        )
         reasons_by_key = {
             (
                 finding.memory_id,
@@ -7125,7 +7128,10 @@ class Database:
             for finding in report.findings
         }
         grouped: dict[tuple[str, str, str, str, bool], dict[str, object]] = {}
-        for row in await self._legacy_support_group_rows_unlocked(source_id=source_id):
+        for row in await self._legacy_support_group_rows_unlocked(
+            source_id=source_id,
+            legacy_limited_only=True,
+        ):
             key = (
                 str(row["memory_id"]),
                 str(row["evidence_unit_id"] or ""),
@@ -9176,9 +9182,13 @@ class Database:
         self,
         *,
         source_id: str | None = None,
+        legacy_limited_only: bool = False,
     ) -> SupportCutoverReport:
         version = await self.get_support_scope_version()
-        rows = await self._legacy_support_group_rows_unlocked(source_id=source_id)
+        rows = await self._legacy_support_group_rows_unlocked(
+            source_id=source_id,
+            legacy_limited_only=legacy_limited_only,
+        )
         findings: list[SupportCutoverFinding] = []
         eligible_count = 0
         active_eligible_count = 0
@@ -9292,8 +9302,16 @@ class Database:
         self,
         *,
         source_id: str | None = None,
+        legacy_limited_only: bool = False,
     ):
-        where = "WHERE msa.source_id = ?" if source_id is not None else ""
+        conditions: list[str] = []
+        params: list[object] = []
+        if source_id is not None:
+            conditions.append("msa.source_id = ?")
+            params.append(source_id)
+        if legacy_limited_only:
+            conditions.append("eu.evidence_provenance = 'legacy_limited'")
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
         return await self.db.execute_fetchall(
             f"""SELECT msa.memory_id, er.evidence_unit_id, msa.source_id,
                       msa.access_context_hash, eu.source_id AS unit_source_id,
@@ -9323,7 +9341,7 @@ class Database:
                          sur.observation_revision_ids_json
                 ORDER BY msa.memory_id, er.evidence_unit_id, msa.source_id,
                          msa.access_context_hash""",
-            (source_id,) if source_id is not None else (),
+            tuple(params),
         )
 
     async def _legacy_reference_part_unlocked(

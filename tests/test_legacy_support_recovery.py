@@ -368,10 +368,12 @@ async def test_sqlite_legacy_inventory_binds_source_predicate() -> None:
     database._db = Connection()
 
     assert await database._legacy_support_group_rows_unlocked(
-        source_id="src-1"
+        source_id="src-1",
+        legacy_limited_only=True,
     ) == []
     assert len(calls) == 1
     assert "WHERE msa.source_id = ?" in calls[0][0]
+    assert "AND eu.evidence_provenance = 'legacy_limited'" in calls[0][0]
     assert calls[0][1] == ("src-1",)
 
 
