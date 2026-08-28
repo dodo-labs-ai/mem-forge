@@ -147,6 +147,7 @@ from memforge.memory.lifecycle_plan import (
 from memforge.memory.support_recovery import (
     LegacySupportRecoveryCandidate,
     LegacySupportRecoveryReport,
+    legacy_limited_recovery_reason_codes,
 )
 from memforge.memory.relation_discovery_contract import (
     CURRENT_RELATION_EVIDENCE_PREDICATE_SQL,
@@ -7138,7 +7139,9 @@ class Database:
                 str(row["source_id"]),
                 str(row["access_context_hash"]),
             )
-            reasons = reasons_by_key.get(key, ())
+            reasons = legacy_limited_recovery_reason_codes(
+                reasons_by_key.get(key, ())
+            )
             if key[2] != source_id or not set(reasons).intersection(
                 {"part_unresolvable", "unit_revision_lineage_invalid"}
             ):
