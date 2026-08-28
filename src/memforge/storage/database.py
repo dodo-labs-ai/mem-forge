@@ -110,6 +110,7 @@ from memforge.memory.evidence import (
     ReviewCase,
     evidence_context_association_id,
     evidence_part_set_digest,
+    evidence_unit_revision_lineage_is_valid,
     evidence_relation_retry_identity,
     evidence_reference_id_for,
     memory_unit_support_assertion_id,
@@ -8894,7 +8895,7 @@ class Database:
                 reasons.append("missing_evidence_unit")
             else:
                 references = await self.db.execute_fetchall(
-                    """SELECT id, role FROM evidence_references
+                    """SELECT id, role, observation_revision_id FROM evidence_references
                        WHERE evidence_unit_id = ? AND role IN ('primary', 'required')
                        ORDER BY role, id""",
                     (unit_id,),
@@ -8910,6 +8911,27 @@ class Database:
                     except ValueError:
                         reasons.append("part_unresolvable")
                         break
+                try:
+                    revision_members = tuple(
+                        str(value)
+                        for value in json.loads(
+                            row["unit_revision_observation_ids_json"]
+                        )
+                    )
+                except (TypeError, ValueError):
+                    revision_members = ()
+                if not evidence_unit_revision_lineage_is_valid(
+                    evidence_unit_source_lineage_id=row["unit_source_lineage_id"],
+                    unit_revision_source_unit_id=row[
+                        "unit_revision_source_unit_id"
+                    ],
+                    unit_revision_observation_revision_ids=revision_members,
+                    reference_observation_revision_ids=tuple(
+                        str(reference["observation_revision_id"])
+                        for reference in references
+                    ),
+                ):
+                    reasons.append("unit_revision_lineage_invalid")
             if row["unit_source_id"] != row["source_id"]:
                 reasons.append("source_inconsistent")
             if row["unit_access_context_hash"] != row["access_context_hash"]:
@@ -8974,6 +8996,10 @@ class Database:
             """SELECT msa.memory_id, er.evidence_unit_id, msa.source_id,
                       msa.access_context_hash, eu.source_id AS unit_source_id,
                       eu.access_context_hash AS unit_access_context_hash,
+                      eu.source_lineage_id AS unit_source_lineage_id,
+                      sur.source_unit_id AS unit_revision_source_unit_id,
+                      sur.observation_revision_ids_json
+                          AS unit_revision_observation_ids_json,
                       COUNT(*) AS support_row_count,
                       COUNT(DISTINCT msa.active) AS active_state_count,
                       SUM(CASE WHEN msa.active = 1 THEN 1 ELSE 0 END) AS active_count,
@@ -8987,8 +9013,11 @@ class Database:
                  FROM memory_support_assertions msa
                  LEFT JOIN evidence_references er ON er.id = msa.evidence_reference_id
                  LEFT JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+                 LEFT JOIN source_unit_revisions sur ON sur.id = eu.doc_revision_id
                 GROUP BY msa.memory_id, er.evidence_unit_id, msa.source_id,
-                         msa.access_context_hash, eu.source_id, eu.access_context_hash
+                         msa.access_context_hash, eu.source_id, eu.access_context_hash,
+                         eu.source_lineage_id, sur.source_unit_id,
+                         sur.observation_revision_ids_json
                 ORDER BY msa.memory_id, er.evidence_unit_id, msa.source_id,
                          msa.access_context_hash"""
         )
@@ -9308,12 +9337,24 @@ class Database:
             (unit["doc_revision_id"],),
         ) as cursor:
             unit_revision = await cursor.fetchone()
-        if unit_revision is None or unit_revision["source_unit_id"] != unit["source_lineage_id"]:
-            raise ValueError("v2 Support Unit revision lineage is invalid")
-        if not revision_ids.issubset(
-            {str(value) for value in json.loads(unit_revision["observation_revision_ids_json"])}
+        if not evidence_unit_revision_lineage_is_valid(
+            evidence_unit_source_lineage_id=unit["source_lineage_id"],
+            unit_revision_source_unit_id=(
+                unit_revision["source_unit_id"] if unit_revision is not None else None
+            ),
+            unit_revision_observation_revision_ids=(
+                tuple(
+                    str(value)
+                    for value in json.loads(
+                        unit_revision["observation_revision_ids_json"]
+                    )
+                )
+                if unit_revision is not None
+                else ()
+            ),
+            reference_observation_revision_ids=tuple(sorted(revision_ids)),
         ):
-            raise ValueError("v2 Support references another Source Unit revision")
+            raise ValueError("v2 Support Unit revision lineage is invalid")
         await self.db.execute(
             """INSERT INTO memory_unit_support_assertions (
                    id, memory_id, evidence_unit_id, source_id,

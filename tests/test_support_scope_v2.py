@@ -17,6 +17,7 @@ from memforge.memory.evidence import (
     SupportScopeVersion,
     evidence_part_set_digest,
     evidence_unit_id_v2,
+    evidence_unit_revision_lineage_is_valid,
     memory_unit_support_assertion_id,
 )
 from memforge.memory.lifecycle_plan import ReconciliationScope
@@ -200,6 +201,27 @@ async def _seed_complete_legacy_support(db: Database) -> tuple[str, str, str, st
     return memory_id, evidence_unit_id, source_id, access_hash
 
 
+def test_evidence_unit_revision_lineage_predicate_covers_identity_and_membership() -> None:
+    valid = {
+        "evidence_unit_source_lineage_id": "unit-1",
+        "unit_revision_source_unit_id": "unit-1",
+        "unit_revision_observation_revision_ids": ("rev-1", "rev-2"),
+    }
+
+    assert evidence_unit_revision_lineage_is_valid(
+        **valid,
+        reference_observation_revision_ids=("rev-1",),
+    )
+    assert not evidence_unit_revision_lineage_is_valid(
+        **(valid | {"unit_revision_source_unit_id": "unit-2"}),
+        reference_observation_revision_ids=("rev-1",),
+    )
+    assert not evidence_unit_revision_lineage_is_valid(
+        **valid,
+        reference_observation_revision_ids=("rev-3",),
+    )
+
+
 def test_v2_part_and_support_identity_exclude_presentation_only_changes() -> None:
     anchor = SourceAnchor(
         kind=AnchorKind.REVISION_RANGE,
@@ -356,6 +378,49 @@ async def test_report_then_exact_cutover_creates_one_unit_support_and_blocks_v1(
             access_context_hash=access_hash,
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_report_gates_invalid_unit_revision_lineage_before_cutover_apply(db) -> None:
+    memory_id, unit_id, source_id, access_hash = await _seed_complete_legacy_support(db)
+    await db.db.execute(
+        "UPDATE evidence_units SET doc_revision_id = 'missing-unit-revision' WHERE id = ?",
+        (unit_id,),
+    )
+    await db.db.commit()
+
+    report = await db.report_support_scope_cutover()
+
+    assert report.legacy_group_count == 1
+    assert report.eligible_group_count == 0
+    assert report.ineligible_group_count == 1
+    assert report.findings[0].reason_codes == ("unit_revision_lineage_invalid",)
+
+    applied = await db.apply_support_scope_v2_cutover(
+        expected_report_id=report.id,
+        owner_id="test-invalid-lineage-cutover",
+    )
+
+    assert applied.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+    assert await db.get_support_scope_version() is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+    assert await db.db.execute_fetchall(
+        "SELECT id FROM memory_unit_support_assertions"
+    ) == []
+    [unit] = await db.db.execute_fetchall(
+        "SELECT evidence_provenance FROM evidence_units WHERE id = ?",
+        (unit_id,),
+    )
+    assert unit["evidence_provenance"] == "legacy_limited"
+    assert await db.db.execute_fetchall(
+        "SELECT id FROM memory_support_assertions WHERE memory_id = ?",
+        (memory_id,),
+    )
+    source_rows = await db.db.execute_fetchall(
+        "SELECT source_id FROM memory_sources WHERE memory_id = ?",
+        (memory_id,),
+    )
+    assert [row["source_id"] for row in source_rows] == [source_id]
+    assert access_hash == "access-1"
 
 
 @pytest.mark.asyncio
