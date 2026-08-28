@@ -72,6 +72,40 @@ def legacy_limited_recovery_reason_codes(
     return normalized or ("part_unresolvable",)
 
 
+def legacy_recovery_preserves_group_identity(reason_codes: Sequence[str]) -> bool:
+    """Mechanical conversion must retain each old Evidence Unit boundary."""
+
+    reasons = set(reason_codes)
+    return (
+        "part_unresolvable" in reasons
+        and "unit_revision_lineage_invalid" not in reasons
+    )
+
+
+def legacy_recovery_candidate_key(
+    *,
+    memory_id: str,
+    source_unit_id: str,
+    access_context_hash: str,
+    doc_id: str,
+    legacy_support_active: bool,
+    legacy_evidence_unit_id: str,
+    reason_codes: Sequence[str],
+) -> tuple[str, str, str, str, bool, str]:
+    return (
+        memory_id,
+        source_unit_id,
+        access_context_hash,
+        doc_id,
+        legacy_support_active,
+        (
+            legacy_evidence_unit_id
+            if legacy_recovery_preserves_group_identity(reason_codes)
+            else ""
+        ),
+    )
+
+
 class LegacySupportRecoveryDisposition(str, Enum):
     MECHANICALLY_RECOVERABLE = "mechanically_recoverable"
     SUPPORTED = "supported"
