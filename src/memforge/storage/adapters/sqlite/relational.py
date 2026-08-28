@@ -706,6 +706,15 @@ class SqliteRelationalStore:
     ) -> dict[str, SourceObservationRevision]:
         return dict(await self._db.get_current_source_observation_revisions(source_unit_id))
 
+    async def get_current_source_unit_projection(self, source_unit_id: str):
+        return await self._db.get_current_source_unit_projection(source_unit_id)
+
+    async def list_legacy_support_recovery_candidates(self, source_id: str):
+        return await self._db.list_legacy_support_recovery_candidates(source_id)
+
+    async def persist_legacy_support_recovery_report(self, report) -> None:
+        await self._db.persist_legacy_support_recovery_report(report)
+
     async def get_source_artifact_revision(
         self,
         observation_revision_id: str,

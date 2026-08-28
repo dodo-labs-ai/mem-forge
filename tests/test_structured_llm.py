@@ -26,6 +26,8 @@ from memforge.llm.structured import (
     EntityValidationResponse,
     IncumbentSupportAuditDecision,
     IncumbentSupportAuditResponse,
+    LegacySupportRevalidationDecision,
+    LegacySupportRevalidationResponse,
     LiteLlmStructuredClient,
     MemoryCandidate,
     MemoryExtractionResponse,
@@ -1088,6 +1090,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
             "ProjectionFragmentMemoryExtractionResponse": '{"memories":[]}',
         "CandidateLedgerResponse": '{"decisions":[]}',
         "IncumbentSupportAuditResponse": '{"decisions":[]}',
+        "LegacySupportRevalidationResponse": '{"decisions":[]}',
         "RevisionCompositionResponse": '{"decisions":[]}',
         "MemoryRelationResponse": '{"decisions":[]}',
         "MemorySupportValidationResponse": '{"supported":true}',
@@ -1134,6 +1137,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
             ),
         "select_memory_candidates": lambda: client.select_memory_candidates("prompt"),
         "audit_incumbent_support": lambda: client.audit_incumbent_support("prompt"),
+        "revalidate_legacy_support": lambda: client.revalidate_legacy_support("prompt"),
         "prove_revision_compositions": lambda: client.prove_revision_compositions("prompt"),
         "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
         "validate_memory_support": lambda: client.validate_memory_support("prompt"),
@@ -1559,6 +1563,15 @@ def test_transient_batch_schemas_use_ordered_decision_arrays() -> None:
     incumbent_audits = IncumbentSupportAuditResponse(
         decisions=[IncumbentSupportAuditDecision(supported=True)]
     )
+    legacy_revalidation = LegacySupportRevalidationResponse(
+        decisions=[
+            LegacySupportRevalidationDecision(
+                request_position=0,
+                decision="supported",
+                primary_ref="f000001",
+            )
+        ]
+    )
     revision_proofs = RevisionCompositionResponse(
         decisions=[
             RevisionCompositionDecision(
@@ -1574,6 +1587,7 @@ def test_transient_batch_schemas_use_ordered_decision_arrays() -> None:
     assert ledger.decisions[0].action == "KEEP"
     assert entities.decisions[0].matched_id == 7
     assert incumbent_audits.decisions[0].supported is True
+    assert legacy_revalidation.decisions[0].primary_ref == "f000001"
     assert revision_proofs.decisions[0].same_memory_identity is True
     assert set(CandidateLedgerResponse.model_json_schema()["properties"]) == {
         "decisions"
@@ -1582,6 +1596,9 @@ def test_transient_batch_schemas_use_ordered_decision_arrays() -> None:
         "decisions"
     }
     assert set(IncumbentSupportAuditResponse.model_json_schema()["properties"]) == {
+        "decisions"
+    }
+    assert set(LegacySupportRevalidationResponse.model_json_schema()["properties"]) == {
         "decisions"
     }
     assert set(RevisionCompositionResponse.model_json_schema()["properties"]) == {"decisions"}
