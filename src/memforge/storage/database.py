@@ -148,6 +148,7 @@ from memforge.memory.support_recovery import (
     LegacySupportRecoveryCandidate,
     LegacySupportRecoveryReport,
     legacy_limited_recovery_reason_codes,
+    legacy_recovery_candidate_key,
 )
 from memforge.memory.relation_discovery_contract import (
     CURRENT_RELATION_EVIDENCE_PREDICATE_SQL,
@@ -7128,7 +7129,10 @@ class Database:
             ): finding.reason_codes
             for finding in report.findings
         }
-        grouped: dict[tuple[str, str, str, str, bool], dict[str, object]] = {}
+        grouped: dict[
+            tuple[str, str, str, str, bool, str],
+            dict[str, object],
+        ] = {}
         for row in await self._legacy_support_group_rows_unlocked(
             source_id=source_id,
             legacy_limited_only=True,
@@ -7213,12 +7217,14 @@ class Database:
                 (key[0], source_id, str(unit.doc_id)),
             ) as cursor:
                 memory_source_current = await cursor.fetchone() is not None
-            candidate_key = (
-                key[0],
-                unit.source_lineage_id,
-                key[3],
-                str(unit.doc_id),
-                legacy_support_active,
+            candidate_key = legacy_recovery_candidate_key(
+                memory_id=key[0],
+                source_unit_id=unit.source_lineage_id,
+                access_context_hash=key[3],
+                doc_id=str(unit.doc_id),
+                legacy_support_active=legacy_support_active,
+                legacy_evidence_unit_id=unit.id,
+                reason_codes=reasons,
             )
             existing = grouped.get(candidate_key)
             if existing is None:
@@ -7254,6 +7260,7 @@ class Database:
             access_hash,
             doc_id,
             legacy_support_active,
+            _recovery_group_id,
         ), value in sorted(
             grouped.items()
         ):

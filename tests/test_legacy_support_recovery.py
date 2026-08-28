@@ -29,6 +29,8 @@ from memforge.memory.support_recovery import (
     compile_legacy_support_revalidation_catalog,
     legacy_support_revalidation_prompt,
     legacy_limited_recovery_reason_codes,
+    legacy_recovery_candidate_key,
+    legacy_recovery_preserves_group_identity,
     prepare_legacy_support_recovery,
     resolve_legacy_support_revalidation_response,
     resolve_mechanical_legacy_support,
@@ -218,6 +220,35 @@ def test_eligible_legacy_limited_group_retains_mechanical_recovery_reason() -> N
     assert legacy_limited_recovery_reason_codes(
         ("unit_revision_lineage_invalid",)
     ) == ("unit_revision_lineage_invalid",)
+    assert legacy_recovery_preserves_group_identity(("part_unresolvable",))
+    assert not legacy_recovery_preserves_group_identity(
+        ("unit_revision_lineage_invalid",)
+    )
+    common = {
+        "memory_id": "mem-1",
+        "source_unit_id": "unit-1",
+        "access_context_hash": "access-1",
+        "doc_id": "doc-1",
+        "legacy_support_active": True,
+    }
+    assert legacy_recovery_candidate_key(
+        **common,
+        legacy_evidence_unit_id="eu-1",
+        reason_codes=("part_unresolvable",),
+    ) != legacy_recovery_candidate_key(
+        **common,
+        legacy_evidence_unit_id="eu-2",
+        reason_codes=("part_unresolvable",),
+    )
+    assert legacy_recovery_candidate_key(
+        **common,
+        legacy_evidence_unit_id="eu-1",
+        reason_codes=("unit_revision_lineage_invalid",),
+    ) == legacy_recovery_candidate_key(
+        **common,
+        legacy_evidence_unit_id="eu-2",
+        reason_codes=("unit_revision_lineage_invalid",),
+    )
 
 
 def test_recovery_cli_requires_exact_report_for_apply() -> None:
