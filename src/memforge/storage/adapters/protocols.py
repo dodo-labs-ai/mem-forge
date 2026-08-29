@@ -500,6 +500,10 @@ class RelationalStore(Protocol):
         self,
         report: LegacySupportRecoveryReport,
     ) -> None: ...
+    async def get_legacy_support_recovery_report(
+        self,
+        report_id: str,
+    ) -> LegacySupportRecoveryReport | None: ...
     async def get_source_artifact_revision(
         self,
         observation_revision_id: str,

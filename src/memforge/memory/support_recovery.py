@@ -15,7 +15,11 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping, Sequence
 
-from memforge.llm.structured import LegacySupportRevalidationResponse, StructuredLlmError
+from memforge.llm.structured import (
+    LegacySupportRevalidationResponse,
+    LegacySupportedRevalidationDecision,
+    StructuredLlmError,
+)
 from memforge.memory.evidence import (
     EvidencePartKind,
     EvidenceReference,
@@ -294,11 +298,192 @@ class LegacySupportRecoveryReport:
         }
 
 
+def legacy_support_recovery_report_id(
+    *,
+    source_id: str,
+    llm_model: str | None,
+    entries: Sequence[LegacySupportRecoveryReportEntry],
+) -> str:
+    """Return the immutable identity of one exact recovery decision manifest."""
+
+    identity = {
+        "kind": "legacy_support_recovery",
+        "source_id": source_id,
+        "llm_model": llm_model,
+        "entries": [entry.identity_payload() for entry in entries],
+    }
+    return (
+        "legacy-support-recovery-"
+        + hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:24]
+    )
+
+
+def legacy_support_recovery_report_from_payload(
+    *,
+    report_id: str,
+    payload: Mapping[str, object],
+    created_at: str,
+) -> LegacySupportRecoveryReport:
+    """Parse and verify one persisted immutable recovery report."""
+
+    def required_text(item: Mapping[str, object], field: str) -> str:
+        value = item.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"legacy Support recovery report has invalid {field}")
+        return value
+
+    def optional_text(item: Mapping[str, object], field: str) -> str | None:
+        value = item.get(field)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"legacy Support recovery report has invalid {field}")
+        return value
+
+    def text_tuple(item: Mapping[str, object], field: str) -> tuple[str, ...]:
+        value = item.get(field)
+        if not isinstance(value, list) or any(
+            not isinstance(member, str) or not member for member in value
+        ):
+            raise ValueError(f"legacy Support recovery report has invalid {field}")
+        return tuple(value)
+
+    if payload.get("kind") != "legacy_support_recovery":
+        raise ValueError("persisted report is not a legacy Support recovery report")
+    source_id = required_text(payload, "source_id")
+    llm_model_value = payload.get("llm_model")
+    if llm_model_value is not None and (
+        not isinstance(llm_model_value, str) or not llm_model_value
+    ):
+        raise ValueError("legacy Support recovery report has invalid llm_model")
+    entries_payload = payload.get("entries")
+    if not isinstance(entries_payload, list):
+        raise ValueError("legacy Support recovery report has invalid entries")
+    entries: list[LegacySupportRecoveryReportEntry] = []
+    for raw_entry in entries_payload:
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError("legacy Support recovery report entry is invalid")
+        reason = raw_entry.get("reason")
+        if not isinstance(reason, str):
+            raise ValueError("legacy Support recovery report has invalid reason")
+        target_unit_revision_id = raw_entry.get("target_unit_revision_id")
+        if not isinstance(target_unit_revision_id, str):
+            raise ValueError(
+                "legacy Support recovery report has invalid target_unit_revision_id"
+            )
+        try:
+            disposition = LegacySupportRecoveryDisposition(
+                required_text(raw_entry, "disposition")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "legacy Support recovery report has invalid disposition"
+            ) from exc
+        entry = LegacySupportRecoveryReportEntry(
+            memory_id=required_text(raw_entry, "memory_id"),
+            memory_version=required_text(raw_entry, "memory_version"),
+            support_set_hash=required_text(raw_entry, "support_set_hash"),
+            source_unit_id=required_text(raw_entry, "source_unit_id"),
+            target_unit_revision_id=target_unit_revision_id,
+            doc_id=required_text(raw_entry, "doc_id"),
+            access_context_hash=required_text(raw_entry, "access_context_hash"),
+            legacy_evidence_unit_ids=text_tuple(
+                raw_entry,
+                "legacy_evidence_unit_ids",
+            ),
+            disposition=disposition,
+            reason=reason,
+            catalog_digest=optional_text(raw_entry, "catalog_digest"),
+            primary_ref=optional_text(raw_entry, "primary_ref"),
+            required_refs=text_tuple(raw_entry, "required_refs"),
+        )
+        entries.append(entry)
+    report = LegacySupportRecoveryReport(
+        id=report_id,
+        source_id=source_id,
+        llm_model=llm_model_value,
+        entries=tuple(entries),
+        created_at=created_at,
+    )
+    expected_id = legacy_support_recovery_report_id(
+        source_id=report.source_id,
+        llm_model=report.llm_model,
+        entries=report.entries,
+    )
+    if report.id != expected_id:
+        raise ValueError("legacy Support recovery report identity is invalid")
+    return report
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedLegacySupportRecovery:
     report: LegacySupportRecoveryReport
     decisions: tuple[LegacySupportRecoveryDecision, ...]
     plans: tuple[LifecyclePlan, ...]
+
+
+def _legacy_support_recovery_report_entry(
+    decision: LegacySupportRecoveryDecision,
+) -> LegacySupportRecoveryReportEntry:
+    candidate = decision.candidate
+    return LegacySupportRecoveryReportEntry(
+        memory_id=candidate.memory.id,
+        memory_version=candidate.memory_version,
+        support_set_hash=candidate.support_set_hash,
+        source_unit_id=candidate.source_unit_id,
+        target_unit_revision_id=(
+            candidate.projection.source_unit_revisions[0].id
+            if candidate.projection is not None
+            else ""
+        ),
+        doc_id=candidate.doc_id,
+        access_context_hash=candidate.access_context_hash,
+        legacy_evidence_unit_ids=candidate.legacy_evidence_unit_ids,
+        disposition=decision.disposition,
+        reason=decision.reason,
+        catalog_digest=decision.catalog_digest,
+        primary_ref=decision.primary_ref,
+        required_refs=decision.required_refs,
+    )
+
+
+async def _legacy_support_recovery_plans(
+    db,
+    *,
+    source_id: str,
+    report_id: str,
+    decisions: Sequence[LegacySupportRecoveryDecision],
+) -> tuple[LifecyclePlan, ...]:
+    grouped: dict[
+        tuple[str, str, str],
+        list[LegacySupportRecoveryDecision],
+    ] = {}
+    for item in decisions:
+        if item.candidate.projection is None:
+            continue
+        key = (
+            item.candidate.source_unit_id,
+            item.candidate.projection.source_unit_revisions[0].id,
+            item.candidate.access_context_hash,
+        )
+        grouped.setdefault(key, []).append(item)
+    gate = await db.get_lifecycle_gate(source_id)
+    return tuple(
+        plan
+        for group in grouped.values()
+        if (
+            plan := build_legacy_support_recovery_plan(
+                decisions=group,
+                gate_state=gate.state,
+                report_id=report_id,
+            )
+        )
+        is not None
+    )
 
 
 def compile_legacy_support_revalidation_catalog(
@@ -742,35 +927,11 @@ async def prepare_legacy_support_recovery(
             ),
         )
     )
-    entries = tuple(
-        LegacySupportRecoveryReportEntry(
-            memory_id=item.candidate.memory.id,
-            memory_version=item.candidate.memory_version,
-            support_set_hash=item.candidate.support_set_hash,
-            source_unit_id=item.candidate.source_unit_id,
-            target_unit_revision_id=(
-                item.candidate.projection.source_unit_revisions[0].id if item.candidate.projection is not None else ""
-            ),
-            doc_id=item.candidate.doc_id,
-            access_context_hash=item.candidate.access_context_hash,
-            legacy_evidence_unit_ids=item.candidate.legacy_evidence_unit_ids,
-            disposition=item.disposition,
-            reason=item.reason,
-            catalog_digest=item.catalog_digest,
-            primary_ref=item.primary_ref,
-            required_refs=item.required_refs,
-        )
-        for item in ordered
-    )
-    identity = {
-        "kind": "legacy_support_recovery",
-        "source_id": source_id,
-        "llm_model": llm_model,
-        "entries": [entry.identity_payload() for entry in entries],
-    }
-    report_id = (
-        "legacy-support-recovery-"
-        + hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
+    entries = tuple(_legacy_support_recovery_report_entry(item) for item in ordered)
+    report_id = legacy_support_recovery_report_id(
+        source_id=source_id,
+        llm_model=llm_model,
+        entries=entries,
     )
     report = LegacySupportRecoveryReport(
         id=report_id,
@@ -779,28 +940,11 @@ async def prepare_legacy_support_recovery(
         entries=entries,
         created_at=datetime.now(timezone.utc).isoformat(),
     )
-    grouped_decisions: dict[tuple[str, str, str], list[LegacySupportRecoveryDecision]] = {}
-    for item in ordered:
-        if item.candidate.projection is None:
-            continue
-        key = (
-            item.candidate.source_unit_id,
-            item.candidate.projection.source_unit_revisions[0].id,
-            item.candidate.access_context_hash,
-        )
-        grouped_decisions.setdefault(key, []).append(item)
-    gate = await db.get_lifecycle_gate(source_id)
-    plans = tuple(
-        plan
-        for group in grouped_decisions.values()
-        if (
-            plan := build_legacy_support_recovery_plan(
-                decisions=group,
-                gate_state=gate.state,
-                report_id=report.id,
-            )
-        )
-        is not None
+    plans = await _legacy_support_recovery_plans(
+        db,
+        source_id=source_id,
+        report_id=report.id,
+        decisions=ordered,
     )
     await db.persist_legacy_support_recovery_report(report)
     return PreparedLegacySupportRecovery(
@@ -833,6 +977,155 @@ def _recovery_evidence_unit_id(
         claim_content=decision.candidate.memory.content,
         part_set_digest=evidence_part_set_digest(references),
         access_context_hash=selection.access_context_hash,
+    )
+
+
+def _legacy_recovery_candidate_report_key(
+    candidate: LegacySupportRecoveryCandidate,
+) -> tuple[str, str, str, str, str, tuple[str, ...]]:
+    return (
+        candidate.memory.id,
+        candidate.source_unit_id,
+        (
+            candidate.projection.source_unit_revisions[0].id
+            if candidate.projection is not None
+            else ""
+        ),
+        candidate.doc_id,
+        candidate.access_context_hash,
+        tuple(sorted(candidate.legacy_evidence_unit_ids)),
+    )
+
+
+def _legacy_recovery_entry_candidate_key(
+    entry: LegacySupportRecoveryReportEntry,
+) -> tuple[str, str, str, str, str, tuple[str, ...]]:
+    return (
+        entry.memory_id,
+        entry.source_unit_id,
+        entry.target_unit_revision_id,
+        entry.doc_id,
+        entry.access_context_hash,
+        tuple(sorted(entry.legacy_evidence_unit_ids)),
+    )
+
+
+def _raise_stale_legacy_support_recovery_report() -> None:
+    raise ValueError("legacy Support recovery report is stale")
+
+
+async def prepare_legacy_support_recovery_from_report(
+    db,
+    *,
+    source_id: str,
+    report_id: str,
+) -> PreparedLegacySupportRecovery:
+    """Rebuild an exact persisted decision manifest without calling the LLM."""
+
+    report = await db.get_legacy_support_recovery_report(report_id)
+    if report is None or report.source_id != source_id:
+        _raise_stale_legacy_support_recovery_report()
+    candidates = await db.list_legacy_support_recovery_candidates(source_id)
+    by_key: dict[
+        tuple[str, str, str, str, str, tuple[str, ...]],
+        LegacySupportRecoveryCandidate,
+    ] = {}
+    for candidate in candidates:
+        key = _legacy_recovery_candidate_report_key(candidate)
+        if key in by_key:
+            _raise_stale_legacy_support_recovery_report()
+        by_key[key] = candidate
+    entry_keys = {
+        _legacy_recovery_entry_candidate_key(entry) for entry in report.entries
+    }
+    if len(entry_keys) != len(report.entries) or set(by_key) != entry_keys:
+        _raise_stale_legacy_support_recovery_report()
+
+    decisions: list[LegacySupportRecoveryDecision] = []
+    for entry in report.entries:
+        candidate = by_key[_legacy_recovery_entry_candidate_key(entry)]
+        if (
+            candidate.memory_version != entry.memory_version
+            or candidate.support_set_hash != entry.support_set_hash
+        ):
+            _raise_stale_legacy_support_recovery_report()
+        if entry.disposition in {
+            LegacySupportRecoveryDisposition.MECHANICALLY_RECOVERABLE,
+            LegacySupportRecoveryDisposition.SUPPORTED,
+        }:
+            if (
+                not candidate.legacy_support_active
+                or candidate.memory.status != "active"
+                or not candidate.memory_source_current
+                or candidate.active_v2_unit_ids
+                or candidate.projection is None
+            ):
+                _raise_stale_legacy_support_recovery_report()
+            if (
+                entry.disposition
+                is LegacySupportRecoveryDisposition.MECHANICALLY_RECOVERABLE
+            ):
+                try:
+                    decision = resolve_mechanical_legacy_support(candidate)
+                except ValueError:
+                    _raise_stale_legacy_support_recovery_report()
+            else:
+                try:
+                    catalog = compile_legacy_support_revalidation_catalog(candidate)
+                    if (
+                        not catalog.usable
+                        or catalog.digest != entry.catalog_digest
+                        or entry.primary_ref is None
+                    ):
+                        _raise_stale_legacy_support_recovery_report()
+                    decision = resolve_legacy_support_revalidation_response(
+                        catalog=catalog,
+                        candidates=(candidate,),
+                        response=LegacySupportRevalidationResponse(
+                            decisions=[
+                                LegacySupportedRevalidationDecision(
+                                    request_position=0,
+                                    decision="supported",
+                                    primary_ref=entry.primary_ref,
+                                    required_refs=list(entry.required_refs),
+                                    reason=entry.reason,
+                                )
+                            ]
+                        ),
+                    )[0]
+                except (
+                    FragmentSelectionError,
+                    LegacySupportRevalidationResponseError,
+                    ValueError,
+                ):
+                    _raise_stale_legacy_support_recovery_report()
+            if _recovery_evidence_unit_id(decision) in candidate.inactive_v2_unit_ids:
+                _raise_stale_legacy_support_recovery_report()
+        else:
+            decision = LegacySupportRecoveryDecision(
+                candidate=candidate,
+                disposition=entry.disposition,
+                reason=entry.reason,
+                catalog_digest=entry.catalog_digest,
+            )
+        if (
+            _legacy_support_recovery_report_entry(decision).identity_payload()
+            != entry.identity_payload()
+        ):
+            _raise_stale_legacy_support_recovery_report()
+        decisions.append(decision)
+
+    ordered = tuple(decisions)
+    plans = await _legacy_support_recovery_plans(
+        db,
+        source_id=source_id,
+        report_id=report.id,
+        decisions=ordered,
+    )
+    return PreparedLegacySupportRecovery(
+        report=report,
+        decisions=ordered,
+        plans=plans,
     )
 
 
