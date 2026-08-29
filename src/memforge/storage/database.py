@@ -8696,14 +8696,26 @@ class Database:
         job_id: str,
         *,
         error: str,
+        scanned_memories: int = 0,
+        mapped_memories: int = 0,
+        finding_count: int = 0,
     ) -> LifecycleBackfillJob:
         now = _now_iso()
         async with self._write_lock:
             cursor = await self.db.execute(
                 """UPDATE lifecycle_backfill_jobs
-                   SET status = 'failed', error = ?, completed_at = ?, updated_at = ?
+                   SET status = 'failed', scanned_memories = ?, mapped_memories = ?,
+                       finding_count = ?, error = ?, completed_at = ?, updated_at = ?
                    WHERE id = ? AND status IN ('queued', 'running')""",
-                (error, now, now, job_id),
+                (
+                    scanned_memories,
+                    mapped_memories,
+                    finding_count,
+                    error,
+                    now,
+                    now,
+                    job_id,
+                ),
             )
             if cursor.rowcount != 1:
                 await self.db.rollback()
