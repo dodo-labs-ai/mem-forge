@@ -1185,6 +1185,8 @@ def build_legacy_support_recovery_plan(
     units: dict[str, EvidenceUnit] = {}
     references: dict[str, EvidenceReference] = {}
     mutations: list[LifecycleMutation] = []
+    refresh_memory_ids: set[str] = set()
+    attached_units: set[tuple[str, tuple[str, ...]]] = set()
     for item in supporting:
         candidate = item.candidate
         if candidate.projection is None:
@@ -1222,8 +1224,10 @@ def build_legacy_support_recovery_plan(
             units.setdefault(unit.id, unit)
         for reference in evidence.references:
             references.setdefault(str(reference.id), reference)
-        mutations.extend(
-            (
+        attach_key = (candidate.memory.id, flattened_unit_ids)
+        if attach_key not in attached_units:
+            attached_units.add(attach_key)
+            mutations.append(
                 LifecycleMutation(
                     LifecycleMutationType.ATTACH_SUPPORT,
                     memory_id=candidate.memory.id,
@@ -1233,20 +1237,26 @@ def build_legacy_support_recovery_plan(
                         "access_context_hash": candidate.access_context_hash,
                         "support_validation": dict(raw.support_validation),
                     },
-                ),
-                LifecycleMutation(
-                    LifecycleMutationType.REFRESH_MEMORY_INDEX,
-                    memory_id=candidate.memory.id,
-                    source_id=candidate.source_id,
-                ),
+                )
             )
+        refresh_memory_ids.add(candidate.memory.id)
+    mutations.extend(
+        LifecycleMutation(
+            LifecycleMutationType.REFRESH_MEMORY_INDEX,
+            memory_id=memory_id,
+            source_id=first.source_id,
         )
+        for memory_id in sorted(refresh_memory_ids)
+    )
+    decisions_by_memory: dict[str, LegacySupportRecoveryDecision] = {}
+    for item in decisions:
+        decisions_by_memory.setdefault(item.candidate.memory.id, item)
     digest = hashlib.sha256(
         "\x1f".join(
             (
                 report_id,
                 *sorted(units),
-                *sorted(item.candidate.memory.id for item in decisions),
+                *sorted(decisions_by_memory),
             )
         ).encode("utf-8")
     ).hexdigest()[:20]
@@ -1262,14 +1272,14 @@ def build_legacy_support_recovery_plan(
         ),
         gate_state=gate_state,
         coverage_proof=CoverageProof(
-            mandatory_incumbent_ids=tuple(item.candidate.memory.id for item in decisions),
+            mandatory_incumbent_ids=tuple(sorted(decisions_by_memory)),
             incumbent_decisions=tuple(
                 IncumbentDecision(
                     memory_id=item.candidate.memory.id,
                     disposition=IncumbentDisposition.KEEP,
                     reason=(item.reason or item.disposition.value),
                 )
-                for item in decisions
+                for item in decisions_by_memory.values()
             ),
             batch_ids=(report_id,),
             completed_batch_ids=(report_id,),
