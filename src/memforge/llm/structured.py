@@ -505,6 +505,65 @@ class LegacySupportRevalidationResponse(StructuredResponseModel):
     decisions: list[LegacySupportRevalidationDecision]
 
 
+class _LegacySupportFragmentScanDecisionBase(StructuredResponseModel):
+    """Fields shared by one claim's bounded Fragment-window scan."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_position: int = Field(ge=0)
+    reason: str = Field(default="", max_length=1000)
+
+
+class LegacySupportFragmentCandidatesDecision(_LegacySupportFragmentScanDecisionBase):
+    """Potentially supporting refs from one complete scan window."""
+
+    outcome: Literal["candidates"]
+    refs: list[TransientEvidenceFragmentRef] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _validate_refs(self):
+        if len(set(self.refs)) != len(self.refs):
+            raise ValueError("candidate Fragment refs must be duplicate-free")
+        return self
+
+
+class LegacySupportFragmentNoneDecision(_LegacySupportFragmentScanDecisionBase):
+    """The presented window contains no potentially supporting Fragment."""
+
+    outcome: Literal["none"]
+
+
+class LegacySupportFragmentInconclusiveDecision(_LegacySupportFragmentScanDecisionBase):
+    """The model cannot safely screen the presented window."""
+
+    outcome: Literal["inconclusive"]
+
+
+class LegacySupportFragmentCandidateOverflowDecision(
+    _LegacySupportFragmentScanDecisionBase
+):
+    """The bounded candidate list cannot represent this window safely."""
+
+    outcome: Literal["candidate_overflow"]
+
+
+type LegacySupportFragmentScanDecision = Annotated[
+    LegacySupportFragmentCandidatesDecision
+    | LegacySupportFragmentNoneDecision
+    | LegacySupportFragmentInconclusiveDecision
+    | LegacySupportFragmentCandidateOverflowDecision,
+    Field(discriminator="outcome"),
+]
+
+
+class LegacySupportFragmentScanResponse(StructuredResponseModel):
+    """Complete screening ledger for one Fragment window and claim batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[LegacySupportFragmentScanDecision]
+
+
 class RevisionCompositionDecision(StructuredResponseModel):
     """One transient proof that a REFINES pair is eligible for revision."""
 
@@ -981,6 +1040,15 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> LegacySupportRevalidationResponse:
         """Select current authorized Evidence for legacy-limited Memories."""
+
+    async def screen_legacy_support_fragments(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 8192,
+        model: str | None = None,
+    ) -> LegacySupportFragmentScanResponse:
+        """Return a complete candidate ledger for one Fragment window."""
 
     async def prove_revision_compositions(
         self,
@@ -1761,6 +1829,20 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=LegacySupportRevalidationResponse,
+            max_tokens=max_tokens,
+            model=model,
+        )
+
+    async def screen_legacy_support_fragments(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 8192,
+        model: str | None = None,
+    ) -> LegacySupportFragmentScanResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=LegacySupportFragmentScanResponse,
             max_tokens=max_tokens,
             model=model,
         )
