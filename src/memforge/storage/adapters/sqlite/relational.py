@@ -715,6 +715,9 @@ class SqliteRelationalStore:
     async def persist_legacy_support_recovery_report(self, report) -> None:
         await self._db.persist_legacy_support_recovery_report(report)
 
+    async def get_legacy_support_recovery_report(self, report_id: str):
+        return await self._db.get_legacy_support_recovery_report(report_id)
+
     async def get_source_artifact_revision(
         self,
         observation_revision_id: str,

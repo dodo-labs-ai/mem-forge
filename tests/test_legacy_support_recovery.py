@@ -9,6 +9,7 @@ import pytest_asyncio
 from click.testing import CliRunner
 from pydantic import ValidationError
 
+from memforge.memory import support_recovery as support_recovery_module
 from memforge.llm.structured import (
     LegacyNotSupportedRevalidationDecision,
     LegacySupportRevalidationResponse,
@@ -28,6 +29,8 @@ from memforge.memory.lifecycle_plan import LifecycleGateState, LifecycleMutation
 from memforge.memory.support_recovery import (
     LegacySupportRecoveryCandidate,
     LegacySupportRecoveryDisposition,
+    LegacySupportRecoveryReport,
+    LegacySupportRecoveryReportEntry,
     build_legacy_support_recovery_plan,
     compile_legacy_support_revalidation_catalog,
     legacy_support_revalidation_prompt,
@@ -606,6 +609,128 @@ async def test_report_identity_ignores_explanatory_llm_wording() -> None:
 
     assert first.report.id == second.report.id
     assert first.report.entries[0].reason != second.report.entries[0].reason
+
+
+@pytest.mark.asyncio
+async def test_exact_report_replay_rebuilds_ready_selection_without_calling_llm() -> None:
+    candidate = _candidate()
+    catalog = compile_legacy_support_revalidation_catalog(candidate)
+    primary_ref = next(
+        fragment.reference
+        for fragment in catalog.fragments
+        if EvidenceRole.PRIMARY in fragment.eligible_roles
+        and "Production release requires approval" in fragment.presentation_text
+    )
+
+    class Client:
+        calls = 0
+
+        async def revalidate_legacy_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            self.calls += 1
+            return LegacySupportRevalidationResponse(
+                decisions=[
+                    LegacySupportedRevalidationDecision(
+                        request_position=0,
+                        decision="supported",
+                        primary_ref=primary_ref,
+                    )
+                ]
+            )
+
+    class FakeDb:
+        def __init__(self):
+            self.report = None
+            self.candidate = candidate
+
+        async def list_legacy_support_recovery_candidates(self, source_id: str):
+            assert source_id == "source-1"
+            return (self.candidate,)
+
+        async def get_lifecycle_gate(self, source_id: str):
+            assert source_id == "source-1"
+            return type("Gate", (), {"state": LifecycleGateState.GATED})()
+
+        async def persist_legacy_support_recovery_report(self, report):
+            self.report = report
+
+        async def get_legacy_support_recovery_report(self, report_id: str):
+            assert self.report is not None and self.report.id == report_id
+            return self.report
+
+    client = Client()
+    db = FakeDb()
+    reported = await prepare_legacy_support_recovery(
+        db,
+        source_id="source-1",
+        structured_llm_client=client,
+        llm_model="test-model",
+    )
+
+    replayed = await support_recovery_module.prepare_legacy_support_recovery_from_report(
+        db,
+        source_id="source-1",
+        report_id=reported.report.id,
+    )
+
+    assert client.calls == 1
+    assert replayed.report == reported.report
+    assert replayed.decisions[0].selection == reported.decisions[0].selection
+    assert replayed.plans == reported.plans
+
+    db.candidate = replace(candidate, support_set_hash="support-set-changed")
+    with pytest.raises(ValueError, match="report is stale"):
+        await support_recovery_module.prepare_legacy_support_recovery_from_report(
+            db,
+            source_id="source-1",
+            report_id=reported.report.id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_sqlite_round_trips_and_verifies_exact_recovery_report(
+    db: Database,
+) -> None:
+    entry = LegacySupportRecoveryReportEntry(
+        memory_id="memory-1",
+        memory_version="memory-version-current",
+        support_set_hash="support-set-current",
+        source_unit_id="unit-1",
+        target_unit_revision_id="unitrev-current",
+        doc_id="doc-1",
+        access_context_hash="workspace-access",
+        legacy_evidence_unit_ids=("legacy-unit",),
+        disposition=LegacySupportRecoveryDisposition.SUPPORTED,
+        reason="current Evidence supports the claim",
+        catalog_digest="catalog-current",
+        primary_ref="f000001",
+    )
+    report_id = support_recovery_module.legacy_support_recovery_report_id(
+        source_id="source-1",
+        llm_model="test-model",
+        entries=(entry,),
+    )
+    report = LegacySupportRecoveryReport(
+        id=report_id,
+        source_id="source-1",
+        llm_model="test-model",
+        entries=(entry,),
+        created_at="2026-08-29T00:00:00+00:00",
+    )
+
+    await db.persist_legacy_support_recovery_report(report)
+
+    assert await db.get_legacy_support_recovery_report(report.id) == report
+    tampered = dict(report.to_payload())
+    tampered_entries = [dict(item) for item in tampered["entries"]]
+    tampered_entries[0]["primary_ref"] = "f000002"
+    tampered["entries"] = tampered_entries
+    with pytest.raises(ValueError, match="identity is invalid"):
+        support_recovery_module.legacy_support_recovery_report_from_payload(
+            report_id=report.id,
+            payload=tampered,
+            created_at=report.created_at,
+        )
 
 
 @pytest.mark.asyncio

@@ -149,6 +149,7 @@ from memforge.memory.support_recovery import (
     LegacySupportRecoveryReport,
     legacy_limited_recovery_reason_codes,
     legacy_recovery_candidate_key,
+    legacy_support_recovery_report_from_payload,
 )
 from memforge.memory.relation_discovery_contract import (
     CURRENT_RELATION_EVIDENCE_PREDICATE_SQL,
@@ -9187,6 +9188,44 @@ class Database:
                 ),
             )
             await self.db.commit()
+
+    async def get_legacy_support_recovery_report(
+        self,
+        report_id: str,
+    ) -> LegacySupportRecoveryReport | None:
+        async with self.db.execute(
+            """SELECT support_scope_version, legacy_group_count,
+                      eligible_group_count, active_eligible_group_count,
+                      finding_payload_json, created_at
+               FROM support_cutover_reports WHERE id = ?""",
+            (report_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        if (
+            str(row["support_scope_version"])
+            != SupportScopeVersion.EVIDENCE_UNIT_SET_V2.value
+        ):
+            raise ValueError("persisted recovery report has an invalid Support scope")
+        try:
+            payload = json.loads(str(row["finding_payload_json"]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("persisted recovery report payload is invalid") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError("persisted recovery report payload is invalid")
+        report = legacy_support_recovery_report_from_payload(
+            report_id=report_id,
+            payload=payload,
+            created_at=str(row["created_at"]),
+        )
+        if (
+            report.legacy_group_count != int(row["legacy_group_count"])
+            or report.ready_group_count != int(row["eligible_group_count"])
+            or report.ready_count != int(row["active_eligible_group_count"])
+        ):
+            raise ValueError("persisted recovery report counts are invalid")
+        return report
 
     async def _support_scope_cutover_report_unlocked(
         self,
