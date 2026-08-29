@@ -336,6 +336,29 @@ def test_revalidation_resolves_current_catalog_and_builds_support_only_plan() ->
     assert "legacy-unit" not in {item.id for item in plan.evidence_units}
 
 
+def test_recovery_plan_coalesces_duplicate_memory_coverage_and_mutations() -> None:
+    decision = resolve_mechanical_legacy_support(_candidate(include_artifact=True))
+
+    plan = build_legacy_support_recovery_plan(
+        decisions=(decision, decision),
+        gate_state=LifecycleGateState.GATED,
+        report_id="legacy-recovery-duplicate-memory",
+    )
+
+    assert plan is not None
+    plan.validate()
+    assert plan.coverage_proof.mandatory_incumbent_ids == ("memory-1",)
+    assert [item.memory_id for item in plan.coverage_proof.incumbent_decisions] == [
+        "memory-1"
+    ]
+    assert [item.mutation_type for item in plan.mutations].count(
+        LifecycleMutationType.ATTACH_SUPPORT
+    ) == 1
+    assert [item.mutation_type for item in plan.mutations].count(
+        LifecycleMutationType.REFRESH_MEMORY_INDEX
+    ) == 1
+
+
 def test_revalidation_requires_complete_position_coverage() -> None:
     candidate = _candidate()
     catalog = compile_legacy_support_revalidation_catalog(candidate)
