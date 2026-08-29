@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from memforge.llm.structured import (
     LegacySupportRevalidationResponse,
@@ -1134,6 +1134,7 @@ async def apply_prepared_legacy_support_recovery(
     prepared: PreparedLegacySupportRecovery,
     *,
     expected_report_id: str,
+    on_progress: Callable[[int], None] | None = None,
 ) -> int:
     """Apply only an exact, freshly reproduced recovery report."""
 
@@ -1143,6 +1144,8 @@ async def apply_prepared_legacy_support_recovery(
     for plan in prepared.plans:
         await db.apply_lifecycle_plan(plan)
         applied += sum(item.mutation_type is LifecycleMutationType.ATTACH_SUPPORT for item in plan.mutations)
+        if on_progress is not None:
+            on_progress(applied)
     return applied
 
 

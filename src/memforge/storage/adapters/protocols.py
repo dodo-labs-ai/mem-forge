@@ -640,7 +640,17 @@ class RelationalStore(Protocol):
         job_id: str,
         *,
         error: str,
+        scanned_memories: int = 0,
+        mapped_memories: int = 0,
+        finding_count: int = 0,
     ) -> LifecycleBackfillJob: ...
+    async def renew_source_activity(
+        self,
+        *,
+        activity_id: str,
+        capability: str | None = None,
+        lease_seconds: int = 900,
+    ) -> SourceActivityLease: ...
     async def recover_stale_lifecycle_backfill_job(
         self,
         job_id: str,

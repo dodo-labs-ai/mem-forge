@@ -887,8 +887,30 @@ class SqliteRelationalStore:
         job_id: str,
         *,
         error: str,
+        scanned_memories: int = 0,
+        mapped_memories: int = 0,
+        finding_count: int = 0,
     ) -> LifecycleBackfillJob:
-        return await self._db.fail_lifecycle_backfill_job(job_id, error=error)
+        return await self._db.fail_lifecycle_backfill_job(
+            job_id,
+            error=error,
+            scanned_memories=scanned_memories,
+            mapped_memories=mapped_memories,
+            finding_count=finding_count,
+        )
+
+    async def renew_source_activity(
+        self,
+        *,
+        activity_id: str,
+        capability: str | None = None,
+        lease_seconds: int = 900,
+    ) -> SourceActivityLease:
+        return await self._db.renew_source_activity(
+            activity_id=activity_id,
+            capability=capability,
+            lease_seconds=lease_seconds,
+        )
 
     async def recover_stale_lifecycle_backfill_job(
         self,
