@@ -556,6 +556,44 @@ async def test_fragment_count_over_one_call_budget_is_exhaustively_scanned() -> 
 
 
 @pytest.mark.asyncio
+async def test_incomplete_window_coverage_retries_the_same_exact_batch_once() -> None:
+    filler = "\n\n".join(f"Filler paragraph {index} " + ("x" * 980) for index in range(130))
+    candidate = _candidate_with_body(f"# Large policy\n\n{filler}")
+
+    class CorrectedClient:
+        prompts: list[str] = []
+
+        async def screen_legacy_support_fragments(self, prompt: str, **kwargs):
+            del kwargs
+            self.prompts.append(prompt)
+            if len(self.prompts) == 2:
+                return SimpleNamespace(decisions=[])
+            return SimpleNamespace(
+                decisions=[SimpleNamespace(request_position=0, outcome="none")]
+            )
+
+        async def revalidate_legacy_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            raise AssertionError("complete no-candidate coverage needs no adjudication")
+
+    client = CorrectedClient()
+    prepared = await prepare_legacy_support_recovery(
+        _RecoveryFakeDb(candidate),
+        source_id="source-1",
+        structured_llm_client=client,
+        llm_model="test-model",
+    )
+
+    assert len(client.prompts) == 3
+    assert client.prompts[2].startswith(client.prompts[1])
+    assert "<coverage_correction>" in client.prompts[2]
+    assert prepared.report.entries[0].disposition is LegacySupportRecoveryDisposition.NOT_SUPPORTED
+    assert prepared.report.entries[0].reason == (
+        "complete_window_scan_found_no_candidate_evidence"
+    )
+
+
+@pytest.mark.asyncio
 async def test_incomplete_window_coverage_cannot_authorize_a_negative_decision() -> None:
     filler = "\n\n".join(f"Filler paragraph {index} " + ("x" * 980) for index in range(130))
     body = f"# Large policy\n\nPotential support.\n\n{filler}"

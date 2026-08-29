@@ -717,6 +717,25 @@ def _legacy_support_fragment_screening_prompt(
     )
 
 
+def _legacy_support_scan_coverage_correction_prompt(
+    prompt: str,
+    *,
+    candidate_count: int,
+) -> str:
+    """Request one exact same-window ledger correction without changing scope."""
+
+    expected_positions = tuple(range(candidate_count))
+    return (
+        f"{prompt}\n\n"
+        "<coverage_correction>\n"
+        "The previous response did not cover the exact request ledger. Regenerate the "
+        "complete decisions array for this same Fragment window and Memory batch. Return "
+        "each request_position exactly once and no others: "
+        f"{json.dumps(expected_positions)}.\n"
+        "</coverage_correction>"
+    )
+
+
 def _resolve_legacy_support_fragment_scan_response(
     *,
     window: _LegacySupportFragmentWindow,
@@ -843,20 +862,33 @@ async def _revalidate_legacy_support_batch(
     refs_by_position: list[list[str]] = [[] for _ in candidates]
     inconclusive_by_position: list[str | None] = [None for _ in candidates]
     for window in windows:
-        response = await scanner(
-            _legacy_support_fragment_screening_prompt(
-                catalog=catalog,
-                window=window,
-                candidates=candidates,
-            ),
-            max_tokens=8192,
-            model=llm_model,
-        )
-        scan = _resolve_legacy_support_fragment_scan_response(
+        base_prompt = _legacy_support_fragment_screening_prompt(
+            catalog=catalog,
             window=window,
             candidates=candidates,
-            response=response,
         )
+        request_prompt = base_prompt
+        for attempt in range(2):
+            response = await scanner(
+                request_prompt,
+                max_tokens=8192,
+                model=llm_model,
+            )
+            try:
+                scan = _resolve_legacy_support_fragment_scan_response(
+                    window=window,
+                    candidates=candidates,
+                    response=response,
+                )
+            except LegacySupportRevalidationResponseError as exc:
+                if attempt == 0 and exc.error_code == "scan_coverage_incomplete":
+                    request_prompt = _legacy_support_scan_coverage_correction_prompt(
+                        base_prompt,
+                        candidate_count=len(candidates),
+                    )
+                    continue
+                raise
+            break
         for position, result in enumerate(scan):
             refs_by_position[position].extend(result.refs)
             if result.inconclusive_reason is not None:
