@@ -1091,6 +1091,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "CandidateLedgerResponse": '{"decisions":[]}',
         "IncumbentSupportAuditResponse": '{"decisions":[]}',
         "LegacySupportRevalidationResponse": '{"decisions":[]}',
+        "LegacySupportFragmentScanResponse": '{"decisions":[]}',
         "RevisionCompositionResponse": '{"decisions":[]}',
         "MemoryRelationResponse": '{"decisions":[]}',
         "MemorySupportValidationResponse": '{"supported":true}',
@@ -1138,6 +1139,9 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "select_memory_candidates": lambda: client.select_memory_candidates("prompt"),
         "audit_incumbent_support": lambda: client.audit_incumbent_support("prompt"),
         "revalidate_legacy_support": lambda: client.revalidate_legacy_support("prompt"),
+        "screen_legacy_support_fragments": (
+            lambda: client.screen_legacy_support_fragments("prompt")
+        ),
         "prove_revision_compositions": lambda: client.prove_revision_compositions("prompt"),
         "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
         "validate_memory_support": lambda: client.validate_memory_support("prompt"),

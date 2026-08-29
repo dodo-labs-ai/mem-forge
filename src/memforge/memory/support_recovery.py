@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Callable, Mapping, Sequence
 
 from memforge.llm.structured import (
+    LegacySupportFragmentScanResponse,
     LegacySupportRevalidationResponse,
     LegacySupportedRevalidationDecision,
     StructuredLlmError,
@@ -43,7 +44,12 @@ from memforge.memory.lifecycle_plan import (
     StaleGuard,
 )
 from memforge.models import Memory, RawMemory
-from memforge.pipeline.evidence_fragments import COMPILER_CONTRACT_VERSION
+from memforge.pipeline.evidence_fragments import (
+    COMPILER_CONTRACT_VERSION,
+    DEFAULT_MAX_FRAGMENTS,
+    DEFAULT_MAX_PRESENTATION_CHARS,
+    EvidenceFragment,
+)
 from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
     observation_is_inference_eligible,
@@ -58,6 +64,10 @@ from memforge.source_projection import AnchorKind, SourceAnchor, SourceProjectio
 
 
 LEGACY_SUPPORT_REVALIDATION_BATCH_SIZE = 20
+LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION = 2
+LEGACY_SUPPORT_REVALIDATION_MAX_WINDOWS = 16
+LEGACY_SUPPORT_REVALIDATION_MAX_CORPUS_FRAGMENTS = DEFAULT_MAX_FRAGMENTS * LEGACY_SUPPORT_REVALIDATION_MAX_WINDOWS
+LEGACY_SUPPORT_REVALIDATION_MAX_CORPUS_CHARS = DEFAULT_MAX_PRESENTATION_CHARS * LEGACY_SUPPORT_REVALIDATION_MAX_WINDOWS
 
 
 class LegacySupportRevalidationResponseError(ValueError):
@@ -68,14 +78,19 @@ class LegacySupportRevalidationResponseError(ValueError):
         self.error_code = error_code
 
 
+class LegacySupportRevalidationCapacityError(ValueError):
+    """A complete Fragment Corpus cannot fit the bounded scan contract."""
+
+    def __init__(self, message: str, *, error_code: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
 def _structured_llm_failure_reason(error: BaseException) -> str:
     """Return one content-free report reason for an exhausted model call."""
 
     if isinstance(error, StructuredLlmError):
-        return (
-            "llm_revalidation_failed:"
-            f"{error.terminal_category}:{error.error_code}"
-        )
+        return f"llm_revalidation_failed:{error.terminal_category}:{error.error_code}"
     if isinstance(error, LegacySupportRevalidationResponseError):
         return f"llm_revalidation_failed:invalid_response:{error.error_code}"
     return f"llm_revalidation_failed:{type(error).__name__}"
@@ -85,8 +100,7 @@ def _is_batch_local_revalidation_failure(error: BaseException) -> bool:
     """Return whether later independent batches can still be evaluated safely."""
 
     return isinstance(error, LegacySupportRevalidationResponseError) or (
-        isinstance(error, StructuredLlmError)
-        and error.terminal_category == "invalid_response"
+        isinstance(error, StructuredLlmError) and error.terminal_category == "invalid_response"
     )
 
 
@@ -110,10 +124,7 @@ def legacy_recovery_preserves_group_identity(reason_codes: Sequence[str]) -> boo
     """Mechanical conversion must retain each old Evidence Unit boundary."""
 
     reasons = set(reason_codes)
-    return (
-        "part_unresolvable" in reasons
-        and "unit_revision_lineage_invalid" not in reasons
-    )
+    return "part_unresolvable" in reasons and "unit_revision_lineage_invalid" not in reasons
 
 
 def legacy_recovery_candidate_key(
@@ -132,11 +143,7 @@ def legacy_recovery_candidate_key(
         access_context_hash,
         doc_id,
         legacy_support_active,
-        (
-            legacy_evidence_unit_id
-            if legacy_recovery_preserves_group_identity(reason_codes)
-            else ""
-        ),
+        (legacy_evidence_unit_id if legacy_recovery_preserves_group_identity(reason_codes) else ""),
     )
 
 
@@ -261,6 +268,14 @@ class LegacySupportRecoveryReport:
     llm_model: str | None
     entries: tuple[LegacySupportRecoveryReportEntry, ...]
     created_at: str
+    selector_contract_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.selector_contract_version not in {
+            1,
+            LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION,
+        }:
+            raise ValueError("legacy Support selector contract version is unsupported")
 
     @property
     def ready_count(self) -> int:
@@ -294,6 +309,7 @@ class LegacySupportRecoveryReport:
             "kind": "legacy_support_recovery",
             "source_id": self.source_id,
             "llm_model": self.llm_model,
+            "selector_contract_version": self.selector_contract_version,
             "entries": [item.to_payload() for item in self.entries],
         }
 
@@ -303,6 +319,7 @@ def legacy_support_recovery_report_id(
     source_id: str,
     llm_model: str | None,
     entries: Sequence[LegacySupportRecoveryReportEntry],
+    selector_contract_version: int = 1,
 ) -> str:
     """Return the immutable identity of one exact recovery decision manifest."""
 
@@ -312,13 +329,11 @@ def legacy_support_recovery_report_id(
         "llm_model": llm_model,
         "entries": [entry.identity_payload() for entry in entries],
     }
+    if selector_contract_version != 1:
+        identity["selector_contract_version"] = selector_contract_version
     return (
         "legacy-support-recovery-"
-        + hashlib.sha256(
-            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
-                "utf-8"
-            )
-        ).hexdigest()[:24]
+        + hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
     )
 
 
@@ -346,19 +361,18 @@ def legacy_support_recovery_report_from_payload(
 
     def text_tuple(item: Mapping[str, object], field: str) -> tuple[str, ...]:
         value = item.get(field)
-        if not isinstance(value, list) or any(
-            not isinstance(member, str) or not member for member in value
-        ):
+        if not isinstance(value, list) or any(not isinstance(member, str) or not member for member in value):
             raise ValueError(f"legacy Support recovery report has invalid {field}")
         return tuple(value)
 
     if payload.get("kind") != "legacy_support_recovery":
         raise ValueError("persisted report is not a legacy Support recovery report")
     source_id = required_text(payload, "source_id")
+    selector_contract_version = payload.get("selector_contract_version", 1)
+    if not isinstance(selector_contract_version, int) or isinstance(selector_contract_version, bool):
+        raise ValueError("legacy Support recovery report has invalid selector_contract_version")
     llm_model_value = payload.get("llm_model")
-    if llm_model_value is not None and (
-        not isinstance(llm_model_value, str) or not llm_model_value
-    ):
+    if llm_model_value is not None and (not isinstance(llm_model_value, str) or not llm_model_value):
         raise ValueError("legacy Support recovery report has invalid llm_model")
     entries_payload = payload.get("entries")
     if not isinstance(entries_payload, list):
@@ -372,17 +386,11 @@ def legacy_support_recovery_report_from_payload(
             raise ValueError("legacy Support recovery report has invalid reason")
         target_unit_revision_id = raw_entry.get("target_unit_revision_id")
         if not isinstance(target_unit_revision_id, str):
-            raise ValueError(
-                "legacy Support recovery report has invalid target_unit_revision_id"
-            )
+            raise ValueError("legacy Support recovery report has invalid target_unit_revision_id")
         try:
-            disposition = LegacySupportRecoveryDisposition(
-                required_text(raw_entry, "disposition")
-            )
+            disposition = LegacySupportRecoveryDisposition(required_text(raw_entry, "disposition"))
         except ValueError as exc:
-            raise ValueError(
-                "legacy Support recovery report has invalid disposition"
-            ) from exc
+            raise ValueError("legacy Support recovery report has invalid disposition") from exc
         entry = LegacySupportRecoveryReportEntry(
             memory_id=required_text(raw_entry, "memory_id"),
             memory_version=required_text(raw_entry, "memory_version"),
@@ -408,11 +416,13 @@ def legacy_support_recovery_report_from_payload(
         llm_model=llm_model_value,
         entries=tuple(entries),
         created_at=created_at,
+        selector_contract_version=selector_contract_version,
     )
     expected_id = legacy_support_recovery_report_id(
         source_id=report.source_id,
         llm_model=report.llm_model,
         entries=report.entries,
+        selector_contract_version=report.selector_contract_version,
     )
     if report.id != expected_id:
         raise ValueError("legacy Support recovery report identity is invalid")
@@ -436,9 +446,7 @@ def _legacy_support_recovery_report_entry(
         support_set_hash=candidate.support_set_hash,
         source_unit_id=candidate.source_unit_id,
         target_unit_revision_id=(
-            candidate.projection.source_unit_revisions[0].id
-            if candidate.projection is not None
-            else ""
+            candidate.projection.source_unit_revisions[0].id if candidate.projection is not None else ""
         ),
         doc_id=candidate.doc_id,
         access_context_hash=candidate.access_context_hash,
@@ -486,8 +494,36 @@ async def _legacy_support_recovery_plans(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _LegacySupportFragmentWindow:
+    """One deterministic, model-bounded view of a complete Fragment corpus."""
+
+    position: int
+    fragments: tuple[EvidenceFragment, ...]
+
+    def model_payload(self) -> tuple[Mapping[str, object], ...]:
+        return tuple(
+            {
+                "ref": fragment.reference,
+                "kind": fragment.kind.value,
+                "type": fragment.fragment_type,
+                "text": fragment.presentation_text,
+                "eligible_roles": sorted(role.value for role in fragment.eligible_roles),
+            }
+            for fragment in self.fragments
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacySupportFragmentScanResult:
+    refs: tuple[str, ...] = ()
+    inconclusive_reason: str | None = None
+
+
 def compile_legacy_support_revalidation_catalog(
     candidate: LegacySupportRecoveryCandidate,
+    *,
+    selector_contract_version: int = 1,
 ) -> ProjectionFragmentCatalog:
     """Compile all current inference-eligible text in one Source Unit."""
 
@@ -537,19 +573,104 @@ def compile_legacy_support_revalidation_catalog(
             if revisions[observation_id].content
         ),
     )
+    compile_kwargs: dict[str, int] = {}
+    if selector_contract_version == LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION:
+        compile_kwargs = {
+            "max_fragments": LEGACY_SUPPORT_REVALIDATION_MAX_CORPUS_FRAGMENTS,
+            "max_presentation_chars": LEGACY_SUPPORT_REVALIDATION_MAX_CORPUS_CHARS,
+        }
+    elif selector_contract_version != 1:
+        raise ValueError("legacy Support selector contract version is unsupported")
     return compile_projection_fragment_catalog(
         projection,
         batch,
         access_context_hash=candidate.access_context_hash,
+        **compile_kwargs,
+    )
+
+
+def _plan_legacy_support_fragment_windows(
+    catalog: ProjectionFragmentCatalog,
+    *,
+    max_fragments: int = DEFAULT_MAX_FRAGMENTS,
+    max_presentation_chars: int = DEFAULT_MAX_PRESENTATION_CHARS,
+    max_windows: int = LEGACY_SUPPORT_REVALIDATION_MAX_WINDOWS,
+) -> tuple[_LegacySupportFragmentWindow, ...]:
+    """Partition one complete corpus without splitting or renumbering Fragments."""
+
+    if not catalog.usable:
+        raise ValueError("legacy Support Fragment corpus is unusable")
+    if max_fragments < 1 or max_presentation_chars < 1 or max_windows < 1:
+        raise ValueError("legacy Support Fragment window budgets must be positive")
+    groups: list[list[EvidenceFragment]] = []
+    current: list[EvidenceFragment] = []
+    current_chars = 0
+    for fragment in catalog.fragments:
+        fragment_chars = len(fragment.presentation_text)
+        if fragment_chars > max_presentation_chars:
+            raise LegacySupportRevalidationCapacityError(
+                "one claim-coherent Fragment exceeds the model window budget",
+                error_code="fragment_unpresentable",
+            )
+        if current and (len(current) + 1 > max_fragments or current_chars + fragment_chars > max_presentation_chars):
+            groups.append(current)
+            current = []
+            current_chars = 0
+        current.append(fragment)
+        current_chars += fragment_chars
+    if current:
+        groups.append(current)
+    if len(groups) > max_windows:
+        raise LegacySupportRevalidationCapacityError(
+            "complete Fragment scan exceeds the bounded window count",
+            error_code="scan_budget_exhausted",
+        )
+    return tuple(
+        _LegacySupportFragmentWindow(position=index, fragments=tuple(group)) for index, group in enumerate(groups)
+    )
+
+
+def _legacy_support_memory_payload(
+    candidates: Sequence[LegacySupportRecoveryCandidate],
+) -> str:
+    return json.dumps(
+        [
+            {
+                "request_position": index,
+                "memory_type": candidate.memory.memory_type,
+                "claim": candidate.memory.content,
+            }
+            for index, candidate in enumerate(candidates)
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
 
 
 def legacy_support_revalidation_prompt(
     catalog: ProjectionFragmentCatalog,
     candidates: Sequence[LegacySupportRecoveryCandidate],
+    *,
+    fragment_refs: frozenset[str] | None = None,
 ) -> str:
     """Return one bounded prompt containing judgments but no durable authority."""
 
+    fragments = catalog.fragments
+    if fragment_refs is not None:
+        by_ref = {fragment.reference: fragment for fragment in catalog.fragments}
+        if not fragment_refs.issubset(by_ref):
+            raise ValueError("final adjudication contains an unknown Fragment ref")
+        fragments = tuple(fragment for fragment in catalog.fragments if fragment.reference in fragment_refs)
+    payload = tuple(
+        {
+            "ref": fragment.reference,
+            "kind": fragment.kind.value,
+            "type": fragment.fragment_type,
+            "text": fragment.presentation_text,
+            "eligible_roles": sorted(role.value for role in fragment.eligible_roles),
+        }
+        for fragment in fragments
+    )
     return (
         "You are revalidating existing MemForge Memories against the current authoritative "
         "Source Unit revision. For every request_position, decide supported, not_supported, "
@@ -560,21 +681,76 @@ def legacy_support_revalidation_prompt(
         "does not support the claim. inconclusive means the available current Evidence is "
         "ambiguous or insufficient to decide. Return exactly one decision for every position.\n\n"
         + "AUTHORIZED_FRAGMENT_CATALOG\n"
-        + json.dumps(catalog.model_payload(), ensure_ascii=False, separators=(",", ":"))
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         + "\n\nMEMORIES\n"
+        + _legacy_support_memory_payload(candidates)
+    )
+
+
+def _legacy_support_fragment_screening_prompt(
+    *,
+    catalog: ProjectionFragmentCatalog,
+    window: _LegacySupportFragmentWindow,
+    candidates: Sequence[LegacySupportRecoveryCandidate],
+) -> str:
+    """Return one complete, bounded candidate-screening ledger request."""
+
+    return (
+        "Screen one complete ordered window from an application-owned Evidence Fragment "
+        "corpus. For every request_position, return candidates when one or more Fragments "
+        "may contribute materially to support of any clause in the complete Memory claim; "
+        "return none only when this window contains no such Fragment; return inconclusive "
+        "when the window cannot be screened safely; return candidate_overflow when more "
+        "than 16 refs are needed. This is candidate discovery, not final Support authority. "
+        "Use only refs from this window, do not return Evidence text, and return exactly one "
+        "outcome for every request_position.\n\n"
+        f"CORPUS_DIGEST\n{catalog.digest}\n\n"
+        f"WINDOW_POSITION\n{window.position}\n\n"
+        "AUTHORIZED_FRAGMENT_WINDOW\n"
         + json.dumps(
-            [
-                {
-                    "request_position": index,
-                    "memory_type": candidate.memory.memory_type,
-                    "claim": candidate.memory.content,
-                }
-                for index, candidate in enumerate(candidates)
-            ],
+            window.model_payload(),
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        + "\n\nMEMORIES\n"
+        + _legacy_support_memory_payload(candidates)
     )
+
+
+def _resolve_legacy_support_fragment_scan_response(
+    *,
+    window: _LegacySupportFragmentWindow,
+    candidates: Sequence[LegacySupportRecoveryCandidate],
+    response: LegacySupportFragmentScanResponse,
+) -> tuple[_LegacySupportFragmentScanResult, ...]:
+    """Validate complete claim coverage and window-local candidate refs."""
+
+    by_position = {item.request_position: item for item in response.decisions}
+    expected = set(range(len(candidates)))
+    if len(by_position) != len(response.decisions) or set(by_position) != expected:
+        raise LegacySupportRevalidationResponseError(
+            "legacy Support Fragment scan coverage is incomplete",
+            error_code="scan_coverage_incomplete",
+        )
+    allowed_refs = {fragment.reference for fragment in window.fragments}
+    output: list[_LegacySupportFragmentScanResult] = []
+    for position in range(len(candidates)):
+        item = by_position[position]
+        if item.outcome == "candidates":
+            refs = tuple(item.refs)
+            if len(refs) != len(set(refs)) or not set(refs).issubset(allowed_refs):
+                raise LegacySupportRevalidationResponseError(
+                    "legacy Support Fragment scan selected invalid Evidence",
+                    error_code="scan_invalid_evidence_selection",
+                )
+            output.append(_LegacySupportFragmentScanResult(refs=refs))
+        elif item.outcome == "none":
+            output.append(_LegacySupportFragmentScanResult())
+        elif item.outcome == "candidate_overflow":
+            output.append(_LegacySupportFragmentScanResult(inconclusive_reason="window_candidate_overflow"))
+        else:
+            output.append(_LegacySupportFragmentScanResult(inconclusive_reason="window_scan_inconclusive"))
+    return tuple(output)
 
 
 def resolve_legacy_support_revalidation_response(
@@ -582,6 +758,7 @@ def resolve_legacy_support_revalidation_response(
     catalog: ProjectionFragmentCatalog,
     candidates: Sequence[LegacySupportRecoveryCandidate],
     response: LegacySupportRevalidationResponse,
+    allowed_refs: frozenset[str] | None = None,
 ) -> tuple[LegacySupportRecoveryDecision, ...]:
     """Bind a complete model ledger to current application-owned Fragments."""
 
@@ -596,6 +773,12 @@ def resolve_legacy_support_revalidation_response(
     for position, candidate in enumerate(candidates):
         item = by_position[position]
         if item.decision == "supported":
+            selected_refs = {item.primary_ref, *item.required_refs}
+            if allowed_refs is not None and not selected_refs.issubset(allowed_refs):
+                raise LegacySupportRevalidationResponseError(
+                    "legacy Support revalidation selected Evidence outside final candidates",
+                    error_code="selection_outside_candidates",
+                )
             try:
                 selection = catalog.resolve_selection(
                     primary_ref=item.primary_ref or "",
@@ -603,8 +786,7 @@ def resolve_legacy_support_revalidation_response(
                 )
             except FragmentSelectionError as exc:
                 raise LegacySupportRevalidationResponseError(
-                    "legacy Support revalidation selected invalid Evidence: "
-                    f"{exc.code.value}",
+                    f"legacy Support revalidation selected invalid Evidence: {exc.code.value}",
                     error_code=f"invalid_evidence_selection_{exc.code.value}",
                 ) from exc
             output.append(
@@ -631,6 +813,123 @@ def resolve_legacy_support_revalidation_response(
             )
         )
     return tuple(output)
+
+
+async def _revalidate_legacy_support_batch(
+    *,
+    catalog: ProjectionFragmentCatalog,
+    windows: tuple[_LegacySupportFragmentWindow, ...],
+    candidates: Sequence[LegacySupportRecoveryCandidate],
+    structured_llm_client,
+    llm_model: str | None,
+) -> tuple[LegacySupportRecoveryDecision, ...]:
+    """Use one-shot adjudication or exhaustive window screening plus adjudication."""
+
+    if len(windows) == 1:
+        response = await structured_llm_client.revalidate_legacy_support(
+            legacy_support_revalidation_prompt(catalog, candidates),
+            max_tokens=8192,
+            model=llm_model,
+        )
+        return resolve_legacy_support_revalidation_response(
+            catalog=catalog,
+            candidates=candidates,
+            response=response,
+        )
+
+    scanner = getattr(structured_llm_client, "screen_legacy_support_fragments", None)
+    if not callable(scanner):
+        raise RuntimeError("structured client does not implement Fragment-window screening")
+    refs_by_position: list[list[str]] = [[] for _ in candidates]
+    inconclusive_by_position: list[str | None] = [None for _ in candidates]
+    for window in windows:
+        response = await scanner(
+            _legacy_support_fragment_screening_prompt(
+                catalog=catalog,
+                window=window,
+                candidates=candidates,
+            ),
+            max_tokens=8192,
+            model=llm_model,
+        )
+        scan = _resolve_legacy_support_fragment_scan_response(
+            window=window,
+            candidates=candidates,
+            response=response,
+        )
+        for position, result in enumerate(scan):
+            refs_by_position[position].extend(result.refs)
+            if result.inconclusive_reason is not None:
+                inconclusive_by_position[position] = result.inconclusive_reason
+
+    decisions: list[LegacySupportRecoveryDecision | None] = [None for _ in candidates]
+    adjudication_candidates: list[LegacySupportRecoveryCandidate] = []
+    adjudication_positions: list[int] = []
+    adjudication_refs: set[str] = set()
+    for position, candidate in enumerate(candidates):
+        inconclusive_reason = inconclusive_by_position[position]
+        refs = tuple(dict.fromkeys(refs_by_position[position]))
+        if inconclusive_reason is not None:
+            decisions[position] = LegacySupportRecoveryDecision(
+                candidate=candidate,
+                disposition=LegacySupportRecoveryDisposition.INCONCLUSIVE,
+                reason=inconclusive_reason,
+                catalog_digest=catalog.digest,
+            )
+        elif not refs:
+            decisions[position] = LegacySupportRecoveryDecision(
+                candidate=candidate,
+                disposition=LegacySupportRecoveryDisposition.NOT_SUPPORTED,
+                reason="complete_window_scan_found_no_candidate_evidence",
+                catalog_digest=catalog.digest,
+            )
+        else:
+            adjudication_candidates.append(candidate)
+            adjudication_positions.append(position)
+            adjudication_refs.update(refs)
+
+    if adjudication_candidates:
+        allowed_candidate_refs = frozenset(adjudication_refs)
+        selected_fragments = tuple(
+            fragment for fragment in catalog.fragments if fragment.reference in allowed_candidate_refs
+        )
+        if (
+            len(selected_fragments) > DEFAULT_MAX_FRAGMENTS
+            or sum(len(item.presentation_text) for item in selected_fragments) > DEFAULT_MAX_PRESENTATION_CHARS
+        ):
+            for position in adjudication_positions:
+                decisions[position] = LegacySupportRecoveryDecision(
+                    candidate=candidates[position],
+                    disposition=LegacySupportRecoveryDisposition.INCONCLUSIVE,
+                    reason="candidate_catalog_too_large",
+                    catalog_digest=catalog.digest,
+                )
+        else:
+            response = await structured_llm_client.revalidate_legacy_support(
+                legacy_support_revalidation_prompt(
+                    catalog,
+                    adjudication_candidates,
+                    fragment_refs=allowed_candidate_refs,
+                ),
+                max_tokens=8192,
+                model=llm_model,
+            )
+            resolved = resolve_legacy_support_revalidation_response(
+                catalog=catalog,
+                candidates=adjudication_candidates,
+                response=response,
+                allowed_refs=allowed_candidate_refs,
+            )
+            for position, decision in zip(
+                adjudication_positions,
+                resolved,
+                strict=True,
+            ):
+                decisions[position] = decision
+
+    if any(decision is None for decision in decisions):
+        raise RuntimeError("legacy Support window adjudication is incomplete")
+    return tuple(decision for decision in decisions if decision is not None)
 
 
 def resolve_mechanical_legacy_support(
@@ -834,7 +1133,10 @@ async def prepare_legacy_support_recovery(
                 )
                 continue
             try:
-                catalog = compile_legacy_support_revalidation_catalog(pending[0])
+                catalog = compile_legacy_support_revalidation_catalog(
+                    pending[0],
+                    selector_contract_version=LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION,
+                )
             except ValueError as exc:
                 decisions.extend(
                     LegacySupportRecoveryDecision(
@@ -857,18 +1159,28 @@ async def prepare_legacy_support_recovery(
                     for candidate in pending
                 )
                 continue
+            try:
+                windows = _plan_legacy_support_fragment_windows(catalog)
+            except LegacySupportRevalidationCapacityError as exc:
+                decisions.extend(
+                    LegacySupportRecoveryDecision(
+                        candidate=candidate,
+                        disposition=LegacySupportRecoveryDisposition.INCONCLUSIVE,
+                        reason=f"catalog_unusable:{exc.error_code}",
+                        catalog_digest=catalog.digest,
+                    )
+                    for candidate in pending
+                )
+                continue
             for offset in range(0, len(pending), LEGACY_SUPPORT_REVALIDATION_BATCH_SIZE):
                 batch = pending[offset : offset + LEGACY_SUPPORT_REVALIDATION_BATCH_SIZE]
                 try:
-                    response = await structured_llm_client.revalidate_legacy_support(
-                        legacy_support_revalidation_prompt(catalog, batch),
-                        max_tokens=8192,
-                        model=llm_model,
-                    )
-                    resolved = resolve_legacy_support_revalidation_response(
+                    resolved = await _revalidate_legacy_support_batch(
                         catalog=catalog,
                         candidates=batch,
-                        response=response,
+                        windows=windows,
+                        structured_llm_client=structured_llm_client,
+                        llm_model=llm_model,
                     )
                 except (
                     LegacySupportRevalidationResponseError,
@@ -885,11 +1197,7 @@ async def prepare_legacy_support_recovery(
                             reason=llm_failure_reason,
                             catalog_digest=catalog.digest,
                         )
-                        for candidate in (
-                            batch
-                            if systemic_llm_failure_reason is None
-                            else pending[offset:]
-                        )
+                        for candidate in (batch if systemic_llm_failure_reason is None else pending[offset:])
                     )
                     if systemic_llm_failure_reason is not None:
                         break
@@ -932,6 +1240,7 @@ async def prepare_legacy_support_recovery(
         source_id=source_id,
         llm_model=llm_model,
         entries=entries,
+        selector_contract_version=LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION,
     )
     report = LegacySupportRecoveryReport(
         id=report_id,
@@ -939,6 +1248,7 @@ async def prepare_legacy_support_recovery(
         llm_model=llm_model,
         entries=entries,
         created_at=datetime.now(timezone.utc).isoformat(),
+        selector_contract_version=LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION,
     )
     plans = await _legacy_support_recovery_plans(
         db,
@@ -986,11 +1296,7 @@ def _legacy_recovery_candidate_report_key(
     return (
         candidate.memory.id,
         candidate.source_unit_id,
-        (
-            candidate.projection.source_unit_revisions[0].id
-            if candidate.projection is not None
-            else ""
-        ),
+        (candidate.projection.source_unit_revisions[0].id if candidate.projection is not None else ""),
         candidate.doc_id,
         candidate.access_context_hash,
         tuple(sorted(candidate.legacy_evidence_unit_ids)),
@@ -1035,19 +1341,14 @@ async def prepare_legacy_support_recovery_from_report(
         if key in by_key:
             _raise_stale_legacy_support_recovery_report()
         by_key[key] = candidate
-    entry_keys = {
-        _legacy_recovery_entry_candidate_key(entry) for entry in report.entries
-    }
+    entry_keys = {_legacy_recovery_entry_candidate_key(entry) for entry in report.entries}
     if len(entry_keys) != len(report.entries) or set(by_key) != entry_keys:
         _raise_stale_legacy_support_recovery_report()
 
     decisions: list[LegacySupportRecoveryDecision] = []
     for entry in report.entries:
         candidate = by_key[_legacy_recovery_entry_candidate_key(entry)]
-        if (
-            candidate.memory_version != entry.memory_version
-            or candidate.support_set_hash != entry.support_set_hash
-        ):
+        if candidate.memory_version != entry.memory_version or candidate.support_set_hash != entry.support_set_hash:
             _raise_stale_legacy_support_recovery_report()
         if entry.disposition in {
             LegacySupportRecoveryDisposition.MECHANICALLY_RECOVERABLE,
@@ -1061,22 +1362,18 @@ async def prepare_legacy_support_recovery_from_report(
                 or candidate.projection is None
             ):
                 _raise_stale_legacy_support_recovery_report()
-            if (
-                entry.disposition
-                is LegacySupportRecoveryDisposition.MECHANICALLY_RECOVERABLE
-            ):
+            if entry.disposition is LegacySupportRecoveryDisposition.MECHANICALLY_RECOVERABLE:
                 try:
                     decision = resolve_mechanical_legacy_support(candidate)
                 except ValueError:
                     _raise_stale_legacy_support_recovery_report()
             else:
                 try:
-                    catalog = compile_legacy_support_revalidation_catalog(candidate)
-                    if (
-                        not catalog.usable
-                        or catalog.digest != entry.catalog_digest
-                        or entry.primary_ref is None
-                    ):
+                    catalog = compile_legacy_support_revalidation_catalog(
+                        candidate,
+                        selector_contract_version=report.selector_contract_version,
+                    )
+                    if not catalog.usable or catalog.digest != entry.catalog_digest or entry.primary_ref is None:
                         _raise_stale_legacy_support_recovery_report()
                     decision = resolve_legacy_support_revalidation_response(
                         catalog=catalog,
@@ -1108,10 +1405,7 @@ async def prepare_legacy_support_recovery_from_report(
                 reason=entry.reason,
                 catalog_digest=entry.catalog_digest,
             )
-        if (
-            _legacy_support_recovery_report_entry(decision).identity_payload()
-            != entry.identity_payload()
-        ):
+        if _legacy_support_recovery_report_entry(decision).identity_payload() != entry.identity_payload():
             _raise_stale_legacy_support_recovery_report()
         decisions.append(decision)
 
