@@ -5945,6 +5945,7 @@ def maintenance_recover_legacy_support(
             prepare_legacy_support_recovery,
         )
         from memforge.runtime import DefaultRuntimeProvider, get_effective_llm_config
+        from memforge.storage.document_store import LocalDocumentStore
 
         config: AppConfig = ctx.obj["config"]
         db = await _get_db(config)
@@ -5960,6 +5961,7 @@ def maintenance_recover_legacy_support(
                     db,
                     source_id=source_id,
                     structured_llm_client=client,
+                    document_store=LocalDocumentStore(config.storage.docs_path),
                     llm_model=llm.enrichment_model,
                 )
 

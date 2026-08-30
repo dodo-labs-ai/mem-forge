@@ -21,6 +21,7 @@ from memforge.llm.structured import (
     LegacySupportedRevalidationDecision,
     StructuredLlmError,
 )
+from memforge.llm.structured_images import StructuredLlmImage
 from memforge.memory.evidence import (
     EvidencePartKind,
     EvidenceReference,
@@ -60,11 +61,19 @@ from memforge.pipeline.projection_fragments import (
     ProjectionFragmentCatalog,
     compile_projection_fragment_catalog,
 )
+from memforge.pipeline.projection_images import (
+    ProjectionImageLoadError,
+    load_projection_images,
+    projection_inference_image_observation_ids,
+)
 from memforge.source_projection import AnchorKind, SourceAnchor, SourceProjection
+from memforge.storage.document_store import DocumentStore
 
 
 LEGACY_SUPPORT_REVALIDATION_BATCH_SIZE = 20
-LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION = 2
+LEGACY_SUPPORT_WINDOWED_SELECTOR_CONTRACT_VERSION = 2
+LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION = 3
+LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSIONS = frozenset({1, 2, 3})
 LEGACY_SUPPORT_REVALIDATION_MAX_WINDOWS = 16
 LEGACY_SUPPORT_REVALIDATION_MAX_CORPUS_FRAGMENTS = DEFAULT_MAX_FRAGMENTS * LEGACY_SUPPORT_REVALIDATION_MAX_WINDOWS
 LEGACY_SUPPORT_REVALIDATION_MAX_CORPUS_CHARS = DEFAULT_MAX_PRESENTATION_CHARS * LEGACY_SUPPORT_REVALIDATION_MAX_WINDOWS
@@ -271,10 +280,7 @@ class LegacySupportRecoveryReport:
     selector_contract_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.selector_contract_version not in {
-            1,
-            LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION,
-        }:
+        if self.selector_contract_version not in LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSIONS:
             raise ValueError("legacy Support selector contract version is unsupported")
 
     @property
@@ -509,6 +515,11 @@ class _LegacySupportFragmentWindow:
                 "type": fragment.fragment_type,
                 "text": fragment.presentation_text,
                 "eligible_roles": sorted(role.value for role in fragment.eligible_roles),
+                **(
+                    {"image_source_observation_id": fragment.anchor.observation_id}
+                    if fragment.kind.value == "artifact"
+                    else {}
+                ),
             }
             for fragment in self.fragments
         )
@@ -524,14 +535,19 @@ def compile_legacy_support_revalidation_catalog(
     candidate: LegacySupportRecoveryCandidate,
     *,
     selector_contract_version: int = 1,
+    supplied_artifact_observation_ids: tuple[str, ...] = (),
 ) -> ProjectionFragmentCatalog:
-    """Compile all current inference-eligible text in one Source Unit."""
+    """Compile the versioned current Evidence corpus for one Source Unit."""
 
     projection = candidate.projection
     if projection is None:
         raise ValueError("current Source Unit revision is unavailable")
+    if selector_contract_version not in LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSIONS:
+        raise ValueError("legacy Support selector contract version is unsupported")
+    if selector_contract_version < LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION and supplied_artifact_observation_ids:
+        raise ValueError("legacy selector contract does not admit Artifact Evidence")
     revisions = {item.observation_id: item for item in projection.observation_revisions}
-    primary_ids = tuple(
+    text_ids = tuple(
         observation.id
         for observation in projection.observations
         if observation.id in revisions
@@ -541,8 +557,16 @@ def compile_legacy_support_revalidation_catalog(
             revisions[observation.id].metadata,
         )
     )
+    supplied_artifact_ids = tuple(supplied_artifact_observation_ids)
+    if len(set(supplied_artifact_ids)) != len(supplied_artifact_ids):
+        raise ValueError("supplied Artifact identities must be duplicate-free")
+    if selector_contract_version == LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION:
+        eligible_artifact_ids = set(projection_inference_image_observation_ids(projection))
+        if not set(supplied_artifact_ids).issubset(eligible_artifact_ids):
+            raise ValueError("supplied Artifact is not current and inference-eligible")
+    primary_ids = text_ids + supplied_artifact_ids
     if not primary_ids:
-        raise ValueError("current Source Unit has no inference-eligible text Evidence")
+        raise ValueError("current Source Unit has no inference-eligible Evidence")
     batch = ProjectionExtractionBatch(
         id=(
             "legacy-support-revalidation-"
@@ -558,7 +582,10 @@ def compile_legacy_support_revalidation_catalog(
             ).hexdigest()[:20]
         ),
         source_unit_id=candidate.source_unit_id,
-        primary_image_bytes=0,
+        primary_image_bytes=sum(
+            int(revisions[observation_id].metadata["source_artifact"]["size_bytes"])
+            for observation_id in supplied_artifact_ids
+        ),
         primary_observation_ids=primary_ids,
         primary_content_by_observation_id=tuple(
             (observation_id, revisions[observation_id].content) for observation_id in primary_ids
@@ -574,17 +601,19 @@ def compile_legacy_support_revalidation_catalog(
         ),
     )
     compile_kwargs: dict[str, int] = {}
-    if selector_contract_version == LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION:
+    if selector_contract_version in {
+        LEGACY_SUPPORT_WINDOWED_SELECTOR_CONTRACT_VERSION,
+        LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION,
+    }:
         compile_kwargs = {
             "max_fragments": LEGACY_SUPPORT_REVALIDATION_MAX_CORPUS_FRAGMENTS,
             "max_presentation_chars": LEGACY_SUPPORT_REVALIDATION_MAX_CORPUS_CHARS,
         }
-    elif selector_contract_version != 1:
-        raise ValueError("legacy Support selector contract version is unsupported")
     return compile_projection_fragment_catalog(
         projection,
         batch,
         access_context_hash=candidate.access_context_hash,
+        supplied_artifact_observation_ids=supplied_artifact_ids,
         **compile_kwargs,
     )
 
@@ -668,6 +697,11 @@ def legacy_support_revalidation_prompt(
             "type": fragment.fragment_type,
             "text": fragment.presentation_text,
             "eligible_roles": sorted(role.value for role in fragment.eligible_roles),
+            **(
+                {"image_source_observation_id": fragment.anchor.observation_id}
+                if fragment.kind.value == "artifact"
+                else {}
+            ),
         }
         for fragment in fragments
     )
@@ -834,21 +868,38 @@ def resolve_legacy_support_revalidation_response(
     return tuple(output)
 
 
+def _legacy_support_images_for_fragments(
+    images: tuple[StructuredLlmImage, ...],
+    fragments: Sequence[EvidenceFragment],
+) -> tuple[StructuredLlmImage, ...]:
+    artifact_observation_ids = {
+        fragment.anchor.observation_id for fragment in fragments if fragment.kind.value == "artifact"
+    }
+    return tuple(image for image in images if image.source_observation_id in artifact_observation_ids)
+
+
 async def _revalidate_legacy_support_batch(
     *,
     catalog: ProjectionFragmentCatalog,
     windows: tuple[_LegacySupportFragmentWindow, ...],
     candidates: Sequence[LegacySupportRecoveryCandidate],
+    images: tuple[StructuredLlmImage, ...],
     structured_llm_client,
     llm_model: str | None,
 ) -> tuple[LegacySupportRecoveryDecision, ...]:
     """Use one-shot adjudication or exhaustive window screening plus adjudication."""
 
     if len(windows) == 1:
+        call_kwargs = {"max_tokens": 8192, "model": llm_model}
+        relevant_images = _legacy_support_images_for_fragments(
+            images,
+            windows[0].fragments,
+        )
+        if relevant_images:
+            call_kwargs["images"] = relevant_images
         response = await structured_llm_client.revalidate_legacy_support(
             legacy_support_revalidation_prompt(catalog, candidates),
-            max_tokens=8192,
-            model=llm_model,
+            **call_kwargs,
         )
         return resolve_legacy_support_revalidation_response(
             catalog=catalog,
@@ -868,11 +919,17 @@ async def _revalidate_legacy_support_batch(
             candidates=candidates,
         )
         request_prompt = base_prompt
+        scan_call_kwargs = {"max_tokens": 8192, "model": llm_model}
+        window_images = _legacy_support_images_for_fragments(
+            images,
+            window.fragments,
+        )
+        if window_images:
+            scan_call_kwargs["images"] = window_images
         for attempt in range(2):
             response = await scanner(
                 request_prompt,
-                max_tokens=8192,
-                model=llm_model,
+                **scan_call_kwargs,
             )
             try:
                 scan = _resolve_legacy_support_fragment_scan_response(
@@ -937,14 +994,20 @@ async def _revalidate_legacy_support_batch(
                     catalog_digest=catalog.digest,
                 )
         else:
+            call_kwargs = {"max_tokens": 8192, "model": llm_model}
+            final_images = _legacy_support_images_for_fragments(
+                images,
+                selected_fragments,
+            )
+            if final_images:
+                call_kwargs["images"] = final_images
             response = await structured_llm_client.revalidate_legacy_support(
                 legacy_support_revalidation_prompt(
                     catalog,
                     adjudication_candidates,
                     fragment_refs=allowed_candidate_refs,
                 ),
-                max_tokens=8192,
-                model=llm_model,
+                **call_kwargs,
             )
             resolved = resolve_legacy_support_revalidation_response(
                 catalog=catalog,
@@ -1067,6 +1130,7 @@ async def prepare_legacy_support_recovery(
     *,
     source_id: str,
     structured_llm_client,
+    document_store: DocumentStore | None = None,
     llm_model: str | None = None,
 ) -> PreparedLegacySupportRecovery:
     """Produce and persist one exact report without applying Support."""
@@ -1164,10 +1228,37 @@ async def prepare_legacy_support_recovery(
                     for candidate in pending
                 )
                 continue
+            projection = pending[0].projection
+            if projection is None:
+                raise RuntimeError("pending legacy recovery scope lost its Projection")
+            try:
+                artifact_observation_ids = projection_inference_image_observation_ids(projection)
+                if artifact_observation_ids and document_store is None:
+                    raise ProjectionImageLoadError(error_code="document_store_unavailable")
+                images = (
+                    load_projection_images(
+                        projection=projection,
+                        observation_ids=artifact_observation_ids,
+                        document_store=document_store,
+                    )
+                    if artifact_observation_ids
+                    else ()
+                )
+            except ProjectionImageLoadError as exc:
+                decisions.extend(
+                    LegacySupportRecoveryDecision(
+                        candidate=candidate,
+                        disposition=LegacySupportRecoveryDisposition.INCONCLUSIVE,
+                        reason=f"artifact_unavailable:{exc.error_code}",
+                    )
+                    for candidate in pending
+                )
+                continue
             try:
                 catalog = compile_legacy_support_revalidation_catalog(
                     pending[0],
                     selector_contract_version=LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION,
+                    supplied_artifact_observation_ids=tuple(image.source_observation_id for image in images),
                 )
             except ValueError as exc:
                 decisions.extend(
@@ -1211,6 +1302,7 @@ async def prepare_legacy_support_recovery(
                         catalog=catalog,
                         candidates=batch,
                         windows=windows,
+                        images=images,
                         structured_llm_client=structured_llm_client,
                         llm_model=llm_model,
                     )
@@ -1401,9 +1493,15 @@ async def prepare_legacy_support_recovery_from_report(
                     _raise_stale_legacy_support_recovery_report()
             else:
                 try:
+                    supplied_artifact_observation_ids = (
+                        projection_inference_image_observation_ids(candidate.projection)
+                        if report.selector_contract_version == LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION
+                        else ()
+                    )
                     catalog = compile_legacy_support_revalidation_catalog(
                         candidate,
                         selector_contract_version=report.selector_contract_version,
+                        supplied_artifact_observation_ids=(supplied_artifact_observation_ids),
                     )
                     if not catalog.usable or catalog.digest != entry.catalog_digest or entry.primary_ref is None:
                         _raise_stale_legacy_support_recovery_report()
@@ -1425,6 +1523,7 @@ async def prepare_legacy_support_recovery_from_report(
                 except (
                     FragmentSelectionError,
                     LegacySupportRevalidationResponseError,
+                    ProjectionImageLoadError,
                     ValueError,
                 ):
                     _raise_stale_legacy_support_recovery_report()

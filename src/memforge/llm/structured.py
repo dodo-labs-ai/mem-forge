@@ -1038,6 +1038,7 @@ class SourceSupportStructuredClient(Protocol):
         *,
         max_tokens: int = 8192,
         model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
     ) -> LegacySupportRevalidationResponse:
         """Select current authorized Evidence for legacy-limited Memories."""
 
@@ -1047,6 +1048,7 @@ class SourceSupportStructuredClient(Protocol):
         *,
         max_tokens: int = 8192,
         model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
     ) -> LegacySupportFragmentScanResponse:
         """Return a complete candidate ledger for one Fragment window."""
 
@@ -1825,12 +1827,14 @@ class LiteLlmStructuredClient:
         *,
         max_tokens: int = 8192,
         model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
     ) -> LegacySupportRevalidationResponse:
         return await self._call_schema(
             prompt=prompt,
             response_format=LegacySupportRevalidationResponse,
             max_tokens=max_tokens,
             model=model,
+            images=images,
         )
 
     async def screen_legacy_support_fragments(
@@ -1839,12 +1843,14 @@ class LiteLlmStructuredClient:
         *,
         max_tokens: int = 8192,
         model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
     ) -> LegacySupportFragmentScanResponse:
         return await self._call_schema(
             prompt=prompt,
             response_format=LegacySupportFragmentScanResponse,
             max_tokens=max_tokens,
             model=model,
+            images=images,
         )
 
     async def prove_revision_compositions(
