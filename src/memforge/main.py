@@ -5914,6 +5914,12 @@ def maintenance_repair_indexes(ctx):
 
 @maintenance.command("recover-legacy-support")
 @click.option("--source-id", required=True, help="Configured Source to evaluate.")
+@click.option(
+    "--memory-id",
+    "memory_ids",
+    multiple=True,
+    help="Exact Memory cohort for report mode; repeatable.",
+)
 @click.option("--apply", "apply_changes", is_flag=True, help="Apply an exact reproduced report.")
 @click.option(
     "--expected-report-id",
@@ -5923,6 +5929,7 @@ def maintenance_repair_indexes(ctx):
 def maintenance_recover_legacy_support(
     ctx,
     source_id: str,
+    memory_ids: tuple[str, ...],
     apply_changes: bool,
     expected_report_id: str | None,
 ):
@@ -5930,6 +5937,8 @@ def maintenance_recover_legacy_support(
 
     if apply_changes != bool(expected_report_id):
         raise click.UsageError("--apply requires exactly one --expected-report-id")
+    if apply_changes and memory_ids:
+        raise click.UsageError("--memory-id is valid only when creating a report")
 
     async def _run():
         import uuid
@@ -5943,6 +5952,7 @@ def maintenance_recover_legacy_support(
             LegacySupportRecoveryDisposition,
             apply_prepared_legacy_support_recovery,
             prepare_legacy_support_recovery,
+            prepare_legacy_support_recovery_from_report,
         )
         from memforge.runtime import DefaultRuntimeProvider, get_effective_llm_config
         from memforge.storage.document_store import LocalDocumentStore
@@ -5962,6 +5972,7 @@ def maintenance_recover_legacy_support(
                     source_id=source_id,
                     structured_llm_client=client,
                     document_store=LocalDocumentStore(config.storage.docs_path),
+                    memory_ids=memory_ids,
                     llm_model=llm.enrichment_model,
                 )
 
@@ -5979,7 +5990,11 @@ def maintenance_recover_legacy_support(
                 await db.start_lifecycle_backfill_job(job.id)
 
                 async def recover():
-                    prepared_result = await prepare()
+                    prepared_result = await prepare_legacy_support_recovery_from_report(
+                        db,
+                        source_id=source_id,
+                        report_id=expected_report_id or "",
+                    )
                     applied_count = await apply_prepared_legacy_support_recovery(
                         db,
                         prepared_result,
