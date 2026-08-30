@@ -7199,28 +7199,18 @@ class Database:
                 for reference in reference_rows
             )
             active_v2_rows = await self.db.execute_fetchall(
-                """SELECT msa.evidence_unit_id
-                     FROM memory_unit_support_assertions msa
-                     JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
-                    WHERE msa.memory_id = ? AND msa.source_id = ?
-                      AND eu.source_id = msa.source_id AND eu.doc_id = ?
-                      AND msa.access_context_hash = ?
-                      AND eu.access_context_hash = msa.access_context_hash
-                      AND msa.active = 1
-                    ORDER BY msa.evidence_unit_id""",
-                (key[0], source_id, str(unit.doc_id), key[3]),
+                """SELECT evidence_unit_id
+                     FROM memory_unit_support_assertions
+                    WHERE memory_id = ? AND active = 1
+                    ORDER BY evidence_unit_id""",
+                (key[0],),
             )
             inactive_v2_rows = await self.db.execute_fetchall(
-                """SELECT msa.evidence_unit_id
-                     FROM memory_unit_support_assertions msa
-                     JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
-                    WHERE msa.memory_id = ? AND msa.source_id = ?
-                      AND eu.source_id = msa.source_id AND eu.doc_id = ?
-                      AND msa.access_context_hash = ?
-                      AND eu.access_context_hash = msa.access_context_hash
-                      AND msa.active = 0
-                    ORDER BY msa.evidence_unit_id""",
-                (key[0], source_id, str(unit.doc_id), key[3]),
+                """SELECT evidence_unit_id
+                     FROM memory_unit_support_assertions
+                    WHERE memory_id = ? AND active = 0
+                    ORDER BY evidence_unit_id""",
+                (key[0],),
             )
             async with self.db.execute(
                 """SELECT 1 FROM memory_sources
