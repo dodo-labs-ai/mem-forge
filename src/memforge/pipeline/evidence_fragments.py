@@ -20,6 +20,7 @@ from markdown_it import MarkdownIt
 from markdown_it.rules_inline.html_inline import html_inline as _markdown_it_html_inline
 
 from memforge.memory.evidence import EvidenceRole
+from memforge.source_artifacts import source_artifact_inference_eligibility
 from memforge.source_projection import (
     AnchorKind,
     EvidenceCoordinateSpace,
@@ -365,7 +366,7 @@ def _compile_binary_artifact_profile(
                 fatal=True,
             ),
         )
-    if raw_artifact.get("inference_eligible") is not True:
+    if source_artifact_inference_eligibility(revision.metadata) is not True:
         return (), (
             _error(
                 revision,

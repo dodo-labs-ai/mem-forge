@@ -701,6 +701,8 @@ def test_binary_artifact_uses_whole_revision_byte_digest() -> None:
                 "sha256": digest,
                 "inference_eligible": True,
                 "filename": "diagram.png",
+                "media_type": "image/png",
+                "size_bytes": 128,
             }
         },
     )
