@@ -277,9 +277,14 @@ class LegacySupportRecoveryReport:
     llm_model: str | None
     entries: tuple[LegacySupportRecoveryReportEntry, ...]
     created_at: str
+    memory_ids: tuple[str, ...] = ()
     selector_contract_version: int = 1
 
     def __post_init__(self) -> None:
+        if self.memory_ids != tuple(sorted(set(self.memory_ids))) or any(
+            not value for value in self.memory_ids
+        ):
+            raise ValueError("legacy Support recovery report Memory cohort is invalid")
         if self.selector_contract_version not in LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSIONS:
             raise ValueError("legacy Support selector contract version is unsupported")
 
@@ -311,13 +316,16 @@ class LegacySupportRecoveryReport:
         )
 
     def to_payload(self) -> Mapping[str, object]:
-        return {
+        payload = {
             "kind": "legacy_support_recovery",
             "source_id": self.source_id,
             "llm_model": self.llm_model,
             "selector_contract_version": self.selector_contract_version,
             "entries": [item.to_payload() for item in self.entries],
         }
+        if self.memory_ids:
+            payload["memory_ids"] = list(self.memory_ids)
+        return payload
 
 
 def legacy_support_recovery_report_id(
@@ -325,6 +333,7 @@ def legacy_support_recovery_report_id(
     source_id: str,
     llm_model: str | None,
     entries: Sequence[LegacySupportRecoveryReportEntry],
+    memory_ids: Sequence[str] = (),
     selector_contract_version: int = 1,
 ) -> str:
     """Return the immutable identity of one exact recovery decision manifest."""
@@ -337,6 +346,8 @@ def legacy_support_recovery_report_id(
     }
     if selector_contract_version != 1:
         identity["selector_contract_version"] = selector_contract_version
+    if memory_ids:
+        identity["memory_ids"] = list(memory_ids)
     return (
         "legacy-support-recovery-"
         + hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
@@ -383,6 +394,11 @@ def legacy_support_recovery_report_from_payload(
     entries_payload = payload.get("entries")
     if not isinstance(entries_payload, list):
         raise ValueError("legacy Support recovery report has invalid entries")
+    memory_ids_payload = payload.get("memory_ids", [])
+    if not isinstance(memory_ids_payload, list) or any(
+        not isinstance(value, str) for value in memory_ids_payload
+    ):
+        raise ValueError("legacy Support recovery report has invalid memory_ids")
     entries: list[LegacySupportRecoveryReportEntry] = []
     for raw_entry in entries_payload:
         if not isinstance(raw_entry, Mapping):
@@ -422,12 +438,14 @@ def legacy_support_recovery_report_from_payload(
         llm_model=llm_model_value,
         entries=tuple(entries),
         created_at=created_at,
+        memory_ids=tuple(memory_ids_payload),
         selector_contract_version=selector_contract_version,
     )
     expected_id = legacy_support_recovery_report_id(
         source_id=report.source_id,
         llm_model=report.llm_model,
         entries=report.entries,
+        memory_ids=report.memory_ids,
         selector_contract_version=report.selector_contract_version,
     )
     if report.id != expected_id:
@@ -1131,11 +1149,30 @@ async def prepare_legacy_support_recovery(
     source_id: str,
     structured_llm_client,
     document_store: DocumentStore | None = None,
+    memory_ids: Sequence[str] = (),
     llm_model: str | None = None,
 ) -> PreparedLegacySupportRecovery:
     """Produce and persist one exact report without applying Support."""
 
+    requested_memory_ids = tuple(str(value).strip() for value in memory_ids)
+    if any(not value for value in requested_memory_ids) or len(
+        set(requested_memory_ids)
+    ) != len(requested_memory_ids):
+        raise ValueError("legacy Support recovery Memory cohort is invalid")
+    requested_memory_ids = tuple(sorted(requested_memory_ids))
     candidates = await db.list_legacy_support_recovery_candidates(source_id)
+    if requested_memory_ids:
+        candidate_counts: dict[str, int] = {}
+        for candidate in candidates:
+            candidate_counts[candidate.memory.id] = (
+                candidate_counts.get(candidate.memory.id, 0) + 1
+            )
+        if any(candidate_counts.get(memory_id, 0) < 1 for memory_id in requested_memory_ids):
+            raise ValueError("legacy Support recovery Memory cohort is incomplete")
+        requested = set(requested_memory_ids)
+        candidates = tuple(
+            candidate for candidate in candidates if candidate.memory.id in requested
+        )
     decisions: list[LegacySupportRecoveryDecision] = []
     pending_by_scope: dict[
         tuple[str, str, str],
@@ -1364,6 +1401,7 @@ async def prepare_legacy_support_recovery(
         source_id=source_id,
         llm_model=llm_model,
         entries=entries,
+        memory_ids=requested_memory_ids,
         selector_contract_version=LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION,
     )
     report = LegacySupportRecoveryReport(
@@ -1372,6 +1410,7 @@ async def prepare_legacy_support_recovery(
         llm_model=llm_model,
         entries=entries,
         created_at=datetime.now(timezone.utc).isoformat(),
+        memory_ids=requested_memory_ids,
         selector_contract_version=LEGACY_SUPPORT_SELECTOR_CONTRACT_VERSION,
     )
     plans = await _legacy_support_recovery_plans(
@@ -1456,6 +1495,18 @@ async def prepare_legacy_support_recovery_from_report(
     if report is None or report.source_id != source_id:
         _raise_stale_legacy_support_recovery_report()
     candidates = await db.list_legacy_support_recovery_candidates(source_id)
+    if report.memory_ids:
+        candidate_counts: dict[str, int] = {}
+        for candidate in candidates:
+            candidate_counts[candidate.memory.id] = (
+                candidate_counts.get(candidate.memory.id, 0) + 1
+            )
+        if any(candidate_counts.get(memory_id, 0) < 1 for memory_id in report.memory_ids):
+            _raise_stale_legacy_support_recovery_report()
+        requested = set(report.memory_ids)
+        candidates = tuple(
+            candidate for candidate in candidates if candidate.memory.id in requested
+        )
     by_key: dict[
         tuple[str, str, str, str, str, tuple[str, ...]],
         LegacySupportRecoveryCandidate,

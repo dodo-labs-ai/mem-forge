@@ -353,6 +353,135 @@ async def test_revalidation_can_select_a_verified_current_artifact_as_primary() 
 
 
 @pytest.mark.asyncio
+async def test_recovery_report_can_be_bounded_to_an_exact_memory_cohort() -> None:
+    first = _candidate()
+    second = replace(
+        first,
+        memory=replace(first.memory, id="memory-2"),
+        memory_version="memory-version-current-2",
+        support_set_hash="support-set-current-2",
+        legacy_evidence_unit_ids=("legacy-unit-2",),
+    )
+
+    class Db(_RecoveryFakeDb):
+        async def list_legacy_support_recovery_candidates(self, source_id: str):
+            assert source_id == "source-1"
+            return (first, second)
+
+    class Client:
+        async def revalidate_legacy_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return LegacySupportRevalidationResponse(
+                decisions=[
+                    LegacyNotSupportedRevalidationDecision(
+                        request_position=0,
+                        decision="not_supported",
+                        reason="current Evidence does not support the claim",
+                    )
+                ]
+            )
+
+    prepared_db = Db(first)
+    prepared = await prepare_legacy_support_recovery(
+        prepared_db,
+        source_id="source-1",
+        structured_llm_client=Client(),
+        memory_ids=("memory-2",),
+        llm_model="test-model",
+    )
+
+    assert prepared.report.memory_ids == ("memory-2",)
+    assert [entry.memory_id for entry in prepared.report.entries] == ["memory-2"]
+    assert [decision.candidate.memory.id for decision in prepared.decisions] == [
+        "memory-2"
+    ]
+
+    replayed = await support_recovery_module.prepare_legacy_support_recovery_from_report(
+        prepared_db,
+        source_id="source-1",
+        report_id=prepared.report.id,
+    )
+    assert replayed.report == prepared.report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "memory_ids",
+    [
+        ("missing-memory",),
+        ("memory-1", "memory-1"),
+    ],
+)
+async def test_invalid_recovery_cohort_fails_before_persisting_a_report(
+    memory_ids: tuple[str, ...],
+) -> None:
+    candidate = _candidate()
+    db = _RecoveryFakeDb(candidate)
+
+    class Client:
+        async def revalidate_legacy_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            raise AssertionError("invalid cohort must fail before the LLM")
+
+    with pytest.raises(ValueError, match="Memory cohort"):
+        await prepare_legacy_support_recovery(
+            db,
+            source_id="source-1",
+            structured_llm_client=Client(),
+            memory_ids=memory_ids,
+        )
+
+    assert db.persisted is None
+
+
+@pytest.mark.asyncio
+async def test_bounded_cohort_keeps_every_legacy_group_for_one_memory() -> None:
+    first = _candidate()
+    second = replace(
+        first,
+        legacy_evidence_unit_ids=("legacy-unit-2",),
+    )
+
+    class Db(_RecoveryFakeDb):
+        async def list_legacy_support_recovery_candidates(self, source_id: str):
+            assert source_id == "source-1"
+            return (first, second)
+
+    class Client:
+        async def revalidate_legacy_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            return LegacySupportRevalidationResponse(
+                decisions=[
+                    LegacyNotSupportedRevalidationDecision(
+                        request_position=position,
+                        decision="not_supported",
+                    )
+                    for position in range(2)
+                ]
+            )
+
+    db = Db(first)
+    prepared = await prepare_legacy_support_recovery(
+        db,
+        source_id="source-1",
+        structured_llm_client=Client(),
+        memory_ids=("memory-1",),
+    )
+
+    assert prepared.report.memory_ids == ("memory-1",)
+    assert [entry.legacy_evidence_unit_ids for entry in prepared.report.entries] == [
+        ("legacy-unit",),
+        ("legacy-unit-2",),
+    ]
+    replayed = await support_recovery_module.prepare_legacy_support_recovery_from_report(
+        db,
+        source_id="source-1",
+        report_id=prepared.report.id,
+    )
+    assert replayed.report == prepared.report
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("document_store", "expected_reason"),
     [
@@ -616,6 +745,7 @@ def test_recovery_cli_requires_exact_report_for_apply() -> None:
     )
     assert help_result.exit_code == 0
     assert "--expected-report-id" in help_result.output
+    assert "--memory-id" in help_result.output
 
     result = CliRunner().invoke(
         cli,
@@ -629,6 +759,23 @@ def test_recovery_cli_requires_exact_report_for_apply() -> None:
     )
     assert result.exit_code == 2
     assert "requires exactly one" in result.output
+
+    bounded_apply = CliRunner().invoke(
+        cli,
+        [
+            "maintenance",
+            "recover-legacy-support",
+            "--source-id",
+            "src-1",
+            "--memory-id",
+            "mem-1",
+            "--apply",
+            "--expected-report-id",
+            "report-1",
+        ],
+    )
+    assert bounded_apply.exit_code == 2
+    assert "valid only when creating a report" in bounded_apply.output
 
 
 def test_revalidation_resolves_current_catalog_and_builds_support_only_plan() -> None:
@@ -1462,6 +1609,7 @@ async def test_sqlite_round_trips_and_verifies_exact_recovery_report(
         source_id="source-1",
         llm_model="test-model",
         entries=(entry,),
+        memory_ids=("memory-1",),
     )
     report = LegacySupportRecoveryReport(
         id=report_id,
@@ -1469,6 +1617,7 @@ async def test_sqlite_round_trips_and_verifies_exact_recovery_report(
         llm_model="test-model",
         entries=(entry,),
         created_at="2026-08-29T00:00:00+00:00",
+        memory_ids=("memory-1",),
     )
 
     await db.persist_legacy_support_recovery_report(report)
@@ -1482,6 +1631,14 @@ async def test_sqlite_round_trips_and_verifies_exact_recovery_report(
         support_recovery_module.legacy_support_recovery_report_from_payload(
             report_id=report.id,
             payload=tampered,
+            created_at=report.created_at,
+        )
+    tampered_cohort = dict(report.to_payload())
+    tampered_cohort["memory_ids"] = ["memory-2"]
+    with pytest.raises(ValueError, match="identity is invalid"):
+        support_recovery_module.legacy_support_recovery_report_from_payload(
+            report_id=report.id,
+            payload=tampered_cohort,
             created_at=report.created_at,
         )
 
