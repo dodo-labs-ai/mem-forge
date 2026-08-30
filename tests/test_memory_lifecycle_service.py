@@ -522,6 +522,99 @@ async def test_propose_memory_correction_applies_for_complete_source_authority(d
 
 
 @pytest.mark.asyncio
+async def test_legacy_limited_correction_stages_review_without_direct_apply(
+    db: Database,
+):
+    old = _memory("mem-legacy-limited", "The legacy source-backed rule is stale.")
+    observed = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    await db.upsert_source(
+        id="src-legacy-limited",
+        type="confluence",
+        name="Legacy limited source",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="source-owner",
+    )
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="doc-legacy-limited",
+            source="src-legacy-limited",
+            source_url="https://example.test/doc-legacy-limited",
+            title="Legacy limited document",
+            space_or_project="ENG",
+            author=None,
+            last_modified=observed,
+            labels=[],
+            version="1",
+            content_hash="legacy-limited-doc-hash",
+            token_count=8,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=observed,
+        )
+    )
+    await db.insert_memory(old)
+    await db.add_memory_source(
+        old.id,
+        "doc-legacy-limited",
+        "confluence",
+        old.content,
+        support_kind="legacy_limited",
+        source_updated_at=observed,
+    )
+    service = MemoryLifecycleService(
+        db=db,
+        memory_store=_store(db, RecordingCollection()),
+    )
+
+    result = await service.propose_memory_correction(
+        old.id,
+        replacement_content="The corrected legacy source-backed rule.",
+        provenance="The user supplied a correction while legacy Support remained gated.",
+        reason="Correct the stale legacy-limited claim without claiming Source authority.",
+        expected_content_hash=old.content_hash,
+        authority=_authority("workspace-admin", "workspace_admin"),
+        replacement_kind="revision",
+    )
+
+    incumbent = await db.get_memory(old.id)
+    challenger = await db.get_memory(result.replacement_memory_id)
+    review = await db.get_memory_review(result.review_id)
+    assert result.outcome == "review_created"
+    assert incumbent is not None and incumbent.status == "active"
+    assert challenger is not None and challenger.status == "pending_review"
+    assert review is not None and review.status == "pending"
+    assert review.expected_support_set_hash is None
+    incumbent_sources = await db.get_memory_sources(old.id)
+    assert [(source.source_id, source.support_kind) for source in incumbent_sources] == [
+        ("src-legacy-limited", "legacy_limited")
+    ]
+
+    await ReviewService(
+        db=db,
+        memory_store=service.memory_store,
+    ).approve(
+        review.id,
+        reviewer="workspace-admin",
+        note="Approve the explicitly confirmed correction.",
+        expected_fingerprint=memory_review_decision_fingerprint(review),
+    )
+
+    approved_incumbent = await db.get_memory(old.id)
+    approved_challenger = await db.get_memory(result.replacement_memory_id)
+    approved_review = await db.get_memory_review(review.id)
+    assert approved_incumbent is not None and approved_incumbent.status == "superseded"
+    assert approved_challenger is not None and approved_challenger.status == "active"
+    assert approved_review is not None and approved_review.status == "approved"
+    assert await db.get_active_memory_support_reference_ids(old.id) == ()
+    assert [(source.source_id, source.support_kind) for source in await db.get_memory_sources(old.id)] == [
+        ("src-legacy-limited", "legacy_limited")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_authorized_correction_fails_atomically_when_support_changes_after_authority_snapshot(
     db: Database,
     monkeypatch,
