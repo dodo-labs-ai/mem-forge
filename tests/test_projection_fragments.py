@@ -396,6 +396,34 @@ def test_inspected_artifact_uses_same_ref_shape_as_text_required() -> None:
     assert selection.parts[1].artifact_metadata["media_type"] == "image/png"
 
 
+def test_supplied_fieldless_legacy_artifact_uses_normalized_eligibility() -> None:
+    artifact_digest = "b" * 64
+    projection = _projection(
+        context_profile=BINARY_PROFILE,
+        context_content="",
+        context_metadata={
+            "source_artifact": {
+                "sha256": artifact_digest,
+                "media_type": "image/png",
+                "size_bytes": 128,
+                "filename": "legacy-diagram.png",
+            }
+        },
+    )
+
+    catalog = compile_projection_fragment_catalog(
+        projection,
+        _batch(projection),
+        access_context_hash="access-1",
+        required_authority_observation_ids=("obs-context",),
+        supplied_artifact_observation_ids=("obs-context",),
+    )
+
+    assert catalog.usable
+    artifact = next(item for item in catalog.fragments if item.kind.value == "artifact")
+    assert artifact.raw_content_sha256 == artifact_digest
+
+
 @pytest.mark.asyncio
 async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> None:
     projection = _projection()
