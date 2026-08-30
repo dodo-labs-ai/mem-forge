@@ -331,12 +331,30 @@ class MemoryLifecycleService:
         expected_support_set_hash = (
             support_state.support_set_hash if support_state.support_ids else None
         )
+        legacy_configured_source_ids: tuple[str, ...] = ()
+        if not support_state.support_ids:
+            memory_sources = await self.db.get_memory_sources(old.id)
+            legacy_configured_source_ids = tuple(
+                sorted(
+                    {
+                        source.source_id
+                        for source in memory_sources
+                        if source.source_type
+                        not in {"user_memory", "user_correction"}
+                    }
+                )
+            )
         can_apply = await self._can_apply_correction(
             old,
             authority=authority,
             supporting_source_ids=support_state.source_ids,
+            legacy_configured_source_ids=legacy_configured_source_ids,
         )
-        if not can_apply and not support_state.support_ids:
+        if (
+            not can_apply
+            and not support_state.support_ids
+            and not legacy_configured_source_ids
+        ):
             raise MemoryLifecycleConflict(
                 "workspace_memory_correction_requires_management_authority"
             )
@@ -438,6 +456,7 @@ class MemoryLifecycleService:
         *,
         authority: CorrectionAuthority,
         supporting_source_ids: tuple[str, ...],
+        legacy_configured_source_ids: tuple[str, ...],
     ) -> bool:
         if supporting_source_ids:
             for source_id in supporting_source_ids:
@@ -448,14 +467,8 @@ class MemoryLifecycleService:
                     return False
             return True
 
-        sources = await self.db.get_memory_sources(memory.id)
-        configured_sources = [
-            source
-            for source in sources
-            if source.source_type not in {"user_memory", "user_correction"}
-        ]
-        if configured_sources:
-            raise MemoryLifecycleConflict("source_backed_memory_lineage_incomplete")
+        if legacy_configured_source_ids:
+            return False
         if memory.visibility == Visibility.PRIVATE.value:
             if memory.owner_user_id != authority.actor_user_id:
                 raise MemoryLifecycleNotFound("memory_not_found")
