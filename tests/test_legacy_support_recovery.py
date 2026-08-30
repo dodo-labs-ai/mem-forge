@@ -1721,14 +1721,99 @@ async def test_sqlite_inventory_rehydrates_current_projection_for_missing_histor
               SET marker_value = 'evidence-unit-set-v2'
             WHERE marker_key = 'support_scope_version'"""
     )
+    await db.upsert_source(
+        id="source-2",
+        type="github_repo",
+        name="Independent repository",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-1",
+    )
+    for unit_id, doc_id, active in (
+        ("unrelated-active-unit", "doc-2", 1),
+        ("unrelated-inactive-unit", "doc-3", 0),
+    ):
+        await db.upsert_evidence_unit(
+            replace(
+                legacy_unit,
+                id=unit_id,
+                doc_id=doc_id,
+                source_id="source-2",
+                evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+            )
+        )
+        await db.db.execute(
+            """INSERT INTO memory_unit_support_assertions (
+                   id, memory_id, evidence_unit_id, source_id,
+                   access_context_hash, active, created_at, removed_at
+               ) VALUES (?, ?, ?, 'source-2', 'workspace-access', ?, ?, ?)""",
+            (
+                f"support-{unit_id}",
+                memory.id,
+                unit_id,
+                active,
+                now,
+                None if active else now,
+            ),
+        )
     await db.db.commit()
 
     candidates = await db.list_legacy_support_recovery_candidates("source-1")
 
     assert len(candidates) == 1
     assert candidates[0].reason_codes == ("unit_revision_lineage_invalid",)
+    assert candidates[0].active_v2_unit_ids == ()
+    assert candidates[0].inactive_v2_unit_ids == ()
     assert candidates[0].projection.source_unit_revisions[0].id == "unitrev-current"
     assert candidates[0].memory.id == memory.id
+
+    for unit_id, active in (
+        ("same-source-other-doc-active", 1),
+        ("same-source-other-doc-inactive", 0),
+    ):
+        await db.upsert_evidence_unit(
+            replace(
+                legacy_unit,
+                id=unit_id,
+                doc_id="doc-other",
+                evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+            )
+        )
+        await db.db.execute(
+            """INSERT INTO memory_unit_support_assertions (
+                   id, memory_id, evidence_unit_id, source_id,
+                   access_context_hash, active, created_at, removed_at
+               ) VALUES (?, ?, ?, 'source-1', 'workspace-access', ?, ?, ?)""",
+            (
+                f"support-{unit_id}",
+                memory.id,
+                unit_id,
+                active,
+                now,
+                None if active else now,
+            ),
+        )
+    await db.db.commit()
+    same_source_other_doc = await db.list_legacy_support_recovery_candidates(
+        "source-1"
+    )
+    assert same_source_other_doc[0].active_v2_unit_ids == ()
+    assert same_source_other_doc[0].inactive_v2_unit_ids == ()
+    await db.db.execute(
+        """DELETE FROM memory_unit_support_assertions
+            WHERE evidence_unit_id IN (
+                'same-source-other-doc-active',
+                'same-source-other-doc-inactive'
+            )"""
+    )
+    await db.db.execute(
+        """DELETE FROM evidence_units
+            WHERE id IN (
+                'same-source-other-doc-active',
+                'same-source-other-doc-inactive'
+            )"""
+    )
+    await db.db.commit()
 
     class RevalidationClient:
         async def revalidate_legacy_support(self, prompt: str, **kwargs):
@@ -1757,6 +1842,17 @@ async def test_sqlite_inventory_rehydrates_current_projection_for_missing_histor
     support = await db.get_memory_evidence_units(memory.id)
     assert any(not unit.legacy_limited for unit in support)
     assert any(unit.legacy_limited for unit in support)
+
+    already_supported = await prepare_legacy_support_recovery(
+        db,
+        source_id="source-1",
+        structured_llm_client=RevalidationClient(),
+        llm_model="test-model",
+    )
+    assert already_supported.report.entries[0].disposition is (
+        LegacySupportRecoveryDisposition.ALREADY_SUPPORTED
+    )
+    assert already_supported.plans == ()
 
     await db.db.execute(
         """UPDATE memory_unit_support_assertions
