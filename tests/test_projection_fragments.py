@@ -380,6 +380,12 @@ def test_inspected_artifact_uses_same_ref_shape_as_text_required() -> None:
     )
     artifact = next(item for item in catalog.fragments if item.kind.value == "artifact")
     assert artifact.eligible_roles == frozenset({EvidenceRole.REQUIRED})
+    artifact_payload = next(
+        item for item in catalog.model_payload() if item["kind"] == "artifact"
+    )
+    assert artifact_payload["ref"] == artifact.reference
+    assert artifact_payload["image_source_observation_id"] == "obs-context"
+    assert "diagram.png" not in str(artifact_payload)
 
     selection = catalog.resolve_selection(
         primary_ref=primary.reference,

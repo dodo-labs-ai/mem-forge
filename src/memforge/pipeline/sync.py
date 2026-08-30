@@ -14,7 +14,6 @@ independently with retry logic and per-item error isolation.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import math
@@ -88,10 +87,8 @@ from memforge.source_projection import (
     with_source_artifact_summaries,
 )
 from memforge.source_artifacts import (
-    MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
     StoredSourceArtifact,
     materialize_source_artifacts,
-    source_artifact_revision_from_metadata,
 )
 from memforge.source_derivation import (
     DiffGuidedExtractionBatch,
@@ -107,6 +104,7 @@ from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_V9
 from memforge.pipeline.projection_fragments import (
     compile_projection_fragment_catalog,
 )
+from memforge.pipeline.projection_images import load_projection_images
 from memforge.source_access import memory_visibility_for_source_id
 from memforge.source_projection_config import canonical_projection_scope
 
@@ -2885,41 +2883,11 @@ class GeneSyncOrchestrator:
     ) -> tuple[StructuredLlmImage, ...]:
         """Load exact stored bytes for image Artifact Observations only."""
 
-        images = []
-        total_bytes = 0
-        source_unit_id = projection.source_units[0].id
-        for revision in projection.observation_revisions:
-            if revision.observation_id not in observation_ids:
-                continue
-            if "source_artifact" not in revision.metadata:
-                continue
-            artifact = source_artifact_revision_from_metadata(
-                observation_id=revision.observation_id,
-                observation_revision_id=revision.id,
-                source_id=projection.source_id,
-                source_unit_id=source_unit_id,
-                metadata=revision.metadata,
-            )
-            if artifact is None:
-                raise RuntimeError("projected Source Artifact metadata is invalid")
-            if not artifact.media_type.startswith("image/"):
-                continue
-            if not artifact.inference_eligible:
-                continue
-            total_bytes += artifact.size_bytes
-            if total_bytes > MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH:
-                raise RuntimeError("projected image batch exceeds the inference byte budget")
-            body = self.doc_store.read_artifact(artifact.uri)
-            if len(body) != artifact.size_bytes or hashlib.sha256(body).hexdigest() != artifact.sha256:
-                raise RuntimeError("projected image Artifact failed integrity validation")
-            images.append(
-                StructuredLlmImage(
-                    source_observation_id=revision.observation_id,
-                    media_type=artifact.media_type,
-                    body=body,
-                )
-            )
-        return tuple(images)
+        return load_projection_images(
+            projection=projection,
+            observation_ids=observation_ids,
+            document_store=self.doc_store,
+        )
 
     async def _extract_full_document_units(
         self,

@@ -83,6 +83,11 @@ class ProjectionFragmentCatalog:
                 "type": fragment.fragment_type,
                 "text": fragment.presentation_text,
                 "eligible_roles": sorted(role.value for role in fragment.eligible_roles),
+                **(
+                    {"image_source_observation_id": fragment.anchor.observation_id}
+                    if fragment.kind is EvidenceFragmentKind.ARTIFACT
+                    else {}
+                ),
             }
             for fragment in self.fragments
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from dataclasses import replace
@@ -238,6 +239,48 @@ def _candidate_with_body(
     )
 
 
+def _artifact_revalidation_candidate() -> tuple[LegacySupportRecoveryCandidate, bytes, str]:
+    body = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgZGIGAAAOAAfXb+R4AAAAAElFTkSuQmCC"
+    )
+    digest = hashlib.sha256(body).hexdigest()
+    uri = "stub-artifact://source-1/artifact-proof/proof.png"
+    candidate = _candidate(include_artifact=True)
+    assert candidate.projection is not None
+    revisions = tuple(
+        replace(
+            revision,
+            semantic_hash=digest,
+            metadata={
+                "source_artifact": {
+                    "artifact_id": "artifact-proof",
+                    "parent_observation_id": "obs-body",
+                    "provider_revision": "artifact-revision-1",
+                    "filename": "proof.png",
+                    "media_type": "image/png",
+                    "size_bytes": len(body),
+                    "sha256": digest,
+                    "uri": uri,
+                    "inference_eligible": True,
+                    "inference_ineligible_reason": None,
+                }
+            },
+        )
+        if revision.id == "rev-artifact"
+        else revision
+        for revision in candidate.projection.observation_revisions
+    )
+    return (
+        replace(
+            candidate,
+            projection=replace(candidate.projection, observation_revisions=revisions),
+            reason_codes=("unit_revision_lineage_invalid",),
+        ),
+        body,
+        uri,
+    )
+
+
 class _RecoveryFakeDb:
     def __init__(self, candidate: LegacySupportRecoveryCandidate) -> None:
         self.candidate = candidate
@@ -257,6 +300,239 @@ class _RecoveryFakeDb:
     async def get_legacy_support_recovery_report(self, report_id: str):
         assert self.persisted is not None and self.persisted.id == report_id
         return self.persisted
+
+
+@pytest.mark.asyncio
+async def test_revalidation_can_select_a_verified_current_artifact_as_primary() -> None:
+    candidate, image_body, artifact_uri = _artifact_revalidation_candidate()
+
+    class DocumentStore:
+        def read_artifact(self, uri: str) -> bytes:
+            assert uri == artifact_uri
+            return image_body
+
+    class Client:
+        async def revalidate_legacy_support(self, prompt: str, **kwargs):
+            images = kwargs.pop("images")
+            assert kwargs == {"max_tokens": 8192, "model": "test-model"}
+            assert len(images) == 1
+            assert images[0].source_observation_id == "obs-artifact"
+            assert images[0].media_type == "image/png"
+            assert images[0].body == image_body
+            payload = json.loads(
+                prompt.split("AUTHORIZED_FRAGMENT_CATALOG\n", 1)[1].split(
+                    "\n\nMEMORIES\n",
+                    1,
+                )[0]
+            )
+            artifact_ref = next(item["ref"] for item in payload if item["kind"] == "artifact")
+            return LegacySupportRevalidationResponse(
+                decisions=[
+                    LegacySupportedRevalidationDecision(
+                        request_position=0,
+                        decision="supported",
+                        primary_ref=artifact_ref,
+                    )
+                ]
+            )
+
+    prepared = await prepare_legacy_support_recovery(
+        _RecoveryFakeDb(candidate),
+        source_id="source-1",
+        structured_llm_client=Client(),
+        document_store=DocumentStore(),
+        llm_model="test-model",
+    )
+
+    decision = prepared.decisions[0]
+    assert decision.disposition is LegacySupportRecoveryDisposition.SUPPORTED
+    assert decision.selection is not None
+    assert [(part.role, part.kind) for part in decision.selection.parts] == [
+        (EvidenceRole.PRIMARY, support_recovery_module.EvidencePartKind.ARTIFACT)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("document_store", "expected_reason"),
+    [
+        (None, "artifact_unavailable:document_store_unavailable"),
+        (
+            SimpleNamespace(read_artifact=lambda _uri: b"wrong bytes"),
+            "artifact_unavailable:artifact_integrity_failed",
+        ),
+    ],
+)
+async def test_revalidation_fails_closed_when_current_artifact_bytes_are_unavailable(
+    document_store,
+    expected_reason: str,
+) -> None:
+    candidate, _image_body, _artifact_uri = _artifact_revalidation_candidate()
+
+    class Client:
+        async def revalidate_legacy_support(self, prompt: str, **kwargs):
+            del prompt, kwargs
+            raise AssertionError("unverified Artifact bytes must not reach the LLM")
+
+    prepared = await prepare_legacy_support_recovery(
+        _RecoveryFakeDb(candidate),
+        source_id="source-1",
+        structured_llm_client=Client(),
+        document_store=document_store,
+        llm_model="test-model",
+    )
+
+    assert prepared.report.entries[0].disposition is LegacySupportRecoveryDisposition.INCONCLUSIVE
+    assert prepared.report.entries[0].reason == expected_reason
+    assert prepared.plans == ()
+
+
+@pytest.mark.asyncio
+async def test_artifact_report_replay_uses_metadata_without_reading_bytes_or_calling_llm() -> None:
+    candidate, image_body, artifact_uri = _artifact_revalidation_candidate()
+
+    class DocumentStore:
+        reads = 0
+
+        def read_artifact(self, uri: str) -> bytes:
+            assert uri == artifact_uri
+            self.reads += 1
+            return image_body
+
+    class Client:
+        calls = 0
+
+        async def revalidate_legacy_support(self, prompt: str, **kwargs):
+            self.calls += 1
+            assert kwargs["images"][0].body == image_body
+            payload = json.loads(
+                prompt.split("AUTHORIZED_FRAGMENT_CATALOG\n", 1)[1].split(
+                    "\n\nMEMORIES\n",
+                    1,
+                )[0]
+            )
+            artifact_ref = next(item["ref"] for item in payload if item["kind"] == "artifact")
+            return LegacySupportRevalidationResponse(
+                decisions=[
+                    LegacySupportedRevalidationDecision(
+                        request_position=0,
+                        decision="supported",
+                        primary_ref=artifact_ref,
+                    )
+                ]
+            )
+
+    document_store = DocumentStore()
+    client = Client()
+    db = _RecoveryFakeDb(candidate)
+    reported = await prepare_legacy_support_recovery(
+        db,
+        source_id="source-1",
+        structured_llm_client=client,
+        document_store=document_store,
+        llm_model="test-model",
+    )
+
+    replayed = await support_recovery_module.prepare_legacy_support_recovery_from_report(
+        db,
+        source_id="source-1",
+        report_id=reported.report.id,
+    )
+
+    assert reported.report.selector_contract_version == 3
+    assert client.calls == 1
+    assert document_store.reads == 1
+    assert replayed.decisions[0].selection == reported.decisions[0].selection
+
+
+@pytest.mark.asyncio
+async def test_windowed_revalidation_sends_images_only_with_their_artifact_refs() -> None:
+    candidate, image_body, artifact_uri = _artifact_revalidation_candidate()
+    assert candidate.projection is not None
+    large_body = "\n\n".join(
+        f"Text fragment {index} " + ("x" * 980) for index in range(130)
+    )
+    revisions = tuple(
+        replace(
+            revision,
+            content=large_body,
+            semantic_hash=hashlib.sha256(large_body.encode()).hexdigest(),
+        )
+        if revision.id == "rev-body"
+        else revision
+        for revision in candidate.projection.observation_revisions
+    )
+    candidate = replace(
+        candidate,
+        projection=replace(candidate.projection, observation_revisions=revisions),
+    )
+
+    class DocumentStore:
+        def read_artifact(self, uri: str) -> bytes:
+            assert uri == artifact_uri
+            return image_body
+
+    class Client:
+        scan_calls = 0
+        final_calls = 0
+
+        async def screen_legacy_support_fragments(self, prompt: str, **kwargs):
+            self.scan_calls += 1
+            payload = json.loads(
+                prompt.split("AUTHORIZED_FRAGMENT_WINDOW\n", 1)[1].split(
+                    "\n\nMEMORIES\n",
+                    1,
+                )[0]
+            )
+            artifact_refs = [item["ref"] for item in payload if item["kind"] == "artifact"]
+            images = kwargs.get("images", ())
+            if artifact_refs:
+                assert len(images) == 1
+                decision = LegacySupportFragmentCandidatesDecision(
+                    request_position=0,
+                    outcome="candidates",
+                    refs=artifact_refs,
+                )
+            else:
+                assert images == ()
+                decision = LegacySupportFragmentNoneDecision(
+                    request_position=0,
+                    outcome="none",
+                )
+            return LegacySupportFragmentScanResponse(decisions=[decision])
+
+        async def revalidate_legacy_support(self, prompt: str, **kwargs):
+            self.final_calls += 1
+            assert len(kwargs["images"]) == 1
+            payload = json.loads(
+                prompt.split("AUTHORIZED_FRAGMENT_CATALOG\n", 1)[1].split(
+                    "\n\nMEMORIES\n",
+                    1,
+                )[0]
+            )
+            assert [item["kind"] for item in payload] == ["artifact"]
+            return LegacySupportRevalidationResponse(
+                decisions=[
+                    LegacySupportedRevalidationDecision(
+                        request_position=0,
+                        decision="supported",
+                        primary_ref=payload[0]["ref"],
+                    )
+                ]
+            )
+
+    client = Client()
+    prepared = await prepare_legacy_support_recovery(
+        _RecoveryFakeDb(candidate),
+        source_id="source-1",
+        structured_llm_client=client,
+        document_store=DocumentStore(),
+        llm_model="test-model",
+    )
+
+    assert client.scan_calls > 1
+    assert client.final_calls == 1
+    assert prepared.report.entries[0].disposition is LegacySupportRecoveryDisposition.SUPPORTED
 
 
 def test_revalidation_schema_requires_evidence_only_for_supported() -> None:
@@ -568,9 +844,7 @@ async def test_incomplete_window_coverage_retries_the_same_exact_batch_once() ->
             self.prompts.append(prompt)
             if len(self.prompts) == 2:
                 return SimpleNamespace(decisions=[])
-            return SimpleNamespace(
-                decisions=[SimpleNamespace(request_position=0, outcome="none")]
-            )
+            return SimpleNamespace(decisions=[SimpleNamespace(request_position=0, outcome="none")])
 
         async def revalidate_legacy_support(self, prompt: str, **kwargs):
             del prompt, kwargs
@@ -588,9 +862,7 @@ async def test_incomplete_window_coverage_retries_the_same_exact_batch_once() ->
     assert client.prompts[2].startswith(client.prompts[1])
     assert "<coverage_correction>" in client.prompts[2]
     assert prepared.report.entries[0].disposition is LegacySupportRecoveryDisposition.NOT_SUPPORTED
-    assert prepared.report.entries[0].reason == (
-        "complete_window_scan_found_no_candidate_evidence"
-    )
+    assert prepared.report.entries[0].reason == ("complete_window_scan_found_no_candidate_evidence")
 
 
 @pytest.mark.asyncio
@@ -724,21 +996,15 @@ async def test_window_scan_budget_exhaustion_fails_closed() -> None:
 
 @pytest.mark.asyncio
 async def test_final_adjudication_cannot_select_an_unscreened_global_ref() -> None:
-    filler = "\n\n".join(
-        f"Filler paragraph {index} " + ("x" * 980) for index in range(130)
-    )
+    filler = "\n\n".join(f"Filler paragraph {index} " + ("x" * 980) for index in range(130))
     body = f"# Large policy\n\nAlpha clause.\n\n{filler}\n\nOmega clause."
     candidate = _candidate_with_body(body)
     corpus = compile_legacy_support_revalidation_catalog(
         candidate,
         selector_contract_version=2,
     )
-    alpha_ref = next(
-        item.reference for item in corpus.fragments if "Alpha" in item.presentation_text
-    )
-    omega_ref = next(
-        item.reference for item in corpus.fragments if "Omega" in item.presentation_text
-    )
+    alpha_ref = next(item.reference for item in corpus.fragments if "Alpha" in item.presentation_text)
+    omega_ref = next(item.reference for item in corpus.fragments if "Omega" in item.presentation_text)
 
     class UnscreenedSelectionClient:
         calls = 0
