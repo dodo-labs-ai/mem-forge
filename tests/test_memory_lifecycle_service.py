@@ -12,13 +12,17 @@ from fastapi.testclient import TestClient
 
 from memforge.agent_knowledge import AgentKnowledgeBundleService, AgentKnowledgePatchProposal
 from memforge.config import AppConfig
-from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.audit import AuditContext, MemoryAuditEvent, MemoryAuditLogger
 from memforge.memory.evidence import (
     EvidenceContentProvenance,
     EvidenceUnit,
     MemorySupportAssertion,
 )
-from memforge.memory.lifecycle_service import MemoryLifecycleConflict, MemoryLifecycleService
+from memforge.memory.lifecycle_service import (
+    MaintenanceClosureEntry,
+    MemoryLifecycleConflict,
+    MemoryLifecycleService,
+)
 from memforge.memory.review_decision import memory_review_decision_fingerprint
 from memforge.memory.review_service import ReviewService, ReviewStaleConflict
 from memforge.memory.store import MemoryStore
@@ -325,12 +329,14 @@ async def test_retire_memory_uses_expected_hash_guard(db: Database):
             memory.id,
             reason="User says this is stale",
             expected_content_hash="wrong",
+            actor_user_id="dev",
         )
 
     await service.retire_memory(
         memory.id,
         reason="User says this is stale",
         expected_content_hash=memory.content_hash,
+        actor_user_id="dev",
     )
 
     stored = await db.get_memory(memory.id)
@@ -452,6 +458,7 @@ async def test_user_lifecycle_cannot_bypass_active_projected_source_support(db: 
             old.id,
             reason="manual retirement",
             expected_content_hash=old.content_hash,
+            actor_user_id="dev",
         )
     assert (await db.get_memory(old.id)).status == "active"
     assert await db.count_documents("user_correction") == 0
@@ -1052,6 +1059,7 @@ async def test_owner_retires_managed_claim_without_current_v2_support(db: Databa
         old.id,
         reason="The owner retired the obsolete managed claim.",
         expected_content_hash=old.content_hash,
+        actor_user_id="owner@example.test",
     )
 
     stored = await db.get_memory(old.id)
@@ -1062,6 +1070,470 @@ async def test_owner_retires_managed_claim_without_current_v2_support(db: Databa
     assert (await _latest_incumbent_decision(db, old.id))["authority"] == (
         "explicit_owner_managed_claim"
     )
+
+
+@pytest.mark.asyncio
+async def test_non_owner_cannot_use_owner_retirement_for_private_managed_claim(
+    db: Database,
+):
+    store, old, _ = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="non-owner-retirement",
+    )
+
+    with pytest.raises(
+        MemoryLifecycleConflict,
+        match="memory_owner_authority_required",
+    ):
+        await MemoryLifecycleService(
+            db=db,
+            memory_store=store,
+        ).retire_memory(
+            old.id,
+            reason="A different user attempted retirement.",
+            expected_content_hash=old.content_hash,
+            actor_user_id="operator@example.test",
+        )
+
+    stored = await db.get_memory(old.id)
+    assert stored is not None and stored.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_operator_closes_exact_legacy_managed_claim_without_owner_impersonation(
+    db: Database,
+):
+    store, old, claim_id = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="maintenance-closure",
+    )
+    service = MemoryLifecycleService(db=db, memory_store=store)
+    manifest = (
+        MaintenanceClosureEntry(
+            memory_id=old.id,
+            expected_content_hash=old.content_hash,
+            reason="Unsupported private claim requires bounded operator closure.",
+        ),
+    )
+
+    report = await service.report_maintenance_closures(
+        manifest,
+        operator_actor_id="operator@example.test",
+    )
+    assert report.ready_count == 1
+    assert report.entries[0].disposition == "ready"
+
+    receipts = await service.apply_maintenance_closures(
+        manifest,
+        expected_report_id=report.id,
+        operator_actor_id="operator@example.test",
+    )
+
+    stored = await db.get_memory(old.id)
+    claim = await db.get_agent_claim(claim_id)
+    assert stored is not None and stored.status == "retired"
+    assert stored.owner_user_id == "owner@example.test"
+    assert claim is not None and claim["memory_id"] == old.id
+    assert receipts[0].authority == "maintenance_operator"
+    assert receipts[0].operator_actor_id == "operator@example.test"
+    decision = await _latest_incumbent_decision(db, old.id)
+    assert decision["authority"] == "maintenance_operator"
+    assert decision["authority_actor_id"] == "operator@example.test"
+    [receipt_event] = await db.list_memory_audit_events(
+        event_type="maintenance_memory_closure_committed",
+        limit=1,
+    )
+    assert receipt_event.actor_type == "maintenance_operator"
+    assert receipt_event.actor_id == "operator@example.test"
+    assert receipt_event.payload["receipt_id"] == receipts[0].id
+
+
+@pytest.mark.asyncio
+async def test_maintenance_closure_retry_returns_same_receipt(db: Database):
+    store, old, _ = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="maintenance-retry",
+    )
+    service = MemoryLifecycleService(db=db, memory_store=store)
+    manifest = (
+        MaintenanceClosureEntry(
+            memory_id=old.id,
+            expected_content_hash=old.content_hash,
+            reason="Unsupported private claim requires bounded operator closure.",
+        ),
+    )
+    report = await service.report_maintenance_closures(
+        manifest,
+        operator_actor_id="operator@example.test",
+    )
+    first = await service.apply_maintenance_closures(
+        manifest,
+        expected_report_id=report.id,
+        operator_actor_id="operator@example.test",
+    )
+
+    retry = await service.apply_maintenance_closures(
+        manifest,
+        expected_report_id=report.id,
+        operator_actor_id="operator@example.test",
+    )
+
+    assert retry[0].id == first[0].id
+    assert retry[0].status == "already_retired"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_receipt_failure_rolls_back_retirement(
+    db: Database,
+    monkeypatch,
+):
+    store, old, _ = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="maintenance-receipt-rollback",
+    )
+    service = MemoryLifecycleService(db=db, memory_store=store)
+    manifest = (
+        MaintenanceClosureEntry(
+            memory_id=old.id,
+            expected_content_hash=old.content_hash,
+            reason="Receipt and retirement must commit atomically.",
+        ),
+    )
+    report = await service.report_maintenance_closures(
+        manifest,
+        operator_actor_id="operator@example.test",
+    )
+
+    async def fail_receipt(_event):
+        raise RuntimeError("receipt insert failed")
+
+    monkeypatch.setattr(db, "_insert_memory_audit_event_unlocked", fail_receipt)
+    with pytest.raises(RuntimeError, match="receipt insert failed"):
+        await service.apply_maintenance_closures(
+            manifest,
+            expected_report_id=report.id,
+            operator_actor_id="operator@example.test",
+        )
+
+    stored = await db.get_memory(old.id)
+    assert stored is not None and stored.status == "active"
+    assert await db.list_memory_audit_events(
+        event_type="maintenance_memory_closure_committed"
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_owner_retirement_cannot_be_relabelled_as_operator_retry(db: Database):
+    store, old, _ = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="owner-retirement-attribution",
+    )
+    service = MemoryLifecycleService(db=db, memory_store=store)
+    reason = "The owner closed this unsupported private claim."
+    await service.retire_memory(
+        old.id,
+        reason=reason,
+        expected_content_hash=old.content_hash,
+        actor_user_id="owner@example.test",
+    )
+
+    report = await service.report_maintenance_closures(
+        (
+            MaintenanceClosureEntry(
+                memory_id=old.id,
+                expected_content_hash=old.content_hash,
+                reason=reason,
+            ),
+        ),
+        operator_actor_id="operator@example.test",
+    )
+
+    assert report.entries[0].disposition == "not_active"
+
+
+@pytest.mark.asyncio
+async def test_failed_operator_receipt_cannot_relabel_owner_retirement(db: Database):
+    store, old, _ = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="failed-receipt-attribution",
+    )
+    service = MemoryLifecycleService(db=db, memory_store=store)
+    reason = "The owner closed this unsupported private claim."
+    manifest = (
+        MaintenanceClosureEntry(
+            memory_id=old.id,
+            expected_content_hash=old.content_hash,
+            reason=reason,
+        ),
+    )
+    initial_report = await service.report_maintenance_closures(
+        manifest,
+        operator_actor_id="operator@example.test",
+    )
+    await service.retire_memory(
+        old.id,
+        reason=reason,
+        expected_content_hash=old.content_hash,
+        actor_user_id="owner@example.test",
+    )
+    receipt_id = service._maintenance_receipt_id(initial_report.id, old.id)
+    await db.insert_memory_audit_event(
+        MemoryAuditEvent(
+            event_id=receipt_id,
+            event_type="maintenance_memory_closure_committed",
+            status="failed",
+            actor_type="maintenance_operator",
+            actor_id="operator@example.test",
+            memory_id=old.id,
+            reason=reason,
+            payload={
+                "authority": "maintenance_operator",
+                "report_id": initial_report.id,
+                "receipt_id": receipt_id,
+                "result": "retired",
+            },
+        )
+    )
+
+    report = await service.report_maintenance_closures(
+        manifest,
+        operator_actor_id="operator@example.test",
+    )
+
+    assert report.entries[0].disposition == "not_active"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_report_rejects_incomplete_claim_lineage_without_receipt(
+    db: Database,
+):
+    store, old, claim_id = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="maintenance-incomplete-lineage",
+    )
+    claim = await db.get_agent_claim(claim_id)
+    assert claim is not None
+    await db.db.execute(
+        "UPDATE agent_concepts SET source_id = ? WHERE id = ?",
+        ("missing-source", claim["concept_id"]),
+    )
+    await db.db.commit()
+    service = MemoryLifecycleService(db=db, memory_store=store)
+
+    report = await service.report_maintenance_closures(
+        (
+            MaintenanceClosureEntry(
+                memory_id=old.id,
+                expected_content_hash=old.content_hash,
+                reason="Incomplete lineage must fail closed.",
+            ),
+        ),
+        operator_actor_id="operator@example.test",
+    )
+
+    assert report.entries[0].disposition == "lifecycle_plan_unavailable"
+    assert await db.list_memory_audit_events(
+        event_type="maintenance_memory_closure_committed"
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_maintenance_report_rejects_mismatched_concept_document_provenance(
+    db: Database,
+):
+    store, old, claim_id = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="maintenance-document-provenance",
+    )
+    claim = await db.get_agent_claim(claim_id)
+    assert claim is not None
+    await db.upsert_source(
+        "src-wrong-document-owner",
+        "agent_session",
+        "Wrong document owner",
+        "{}",
+        "private",
+        "owner@example.test",
+        created_by_user_id="owner@example.test",
+    )
+    await db.db.execute(
+        "UPDATE documents SET source = ? WHERE doc_id = ?",
+        ("src-wrong-document-owner", claim["concept_id"]),
+    )
+    await db.db.commit()
+    service = MemoryLifecycleService(db=db, memory_store=store)
+
+    report = await service.report_maintenance_closures(
+        (
+            MaintenanceClosureEntry(
+                memory_id=old.id,
+                expected_content_hash=old.content_hash,
+                reason="Mismatched Document provenance must fail closed.",
+            ),
+        ),
+        operator_actor_id="operator@example.test",
+    )
+
+    assert report.entries[0].disposition == "lifecycle_plan_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_report_rejects_noncanonical_agent_document_identity(
+    db: Database,
+):
+    store, old, claim_id = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="maintenance-document-identity",
+    )
+    claim = await db.get_agent_claim(claim_id)
+    assert claim is not None
+    await db.db.execute(
+        "UPDATE documents SET source_url = ? WHERE doc_id = ?",
+        ("https://example.test/not-agent-knowledge", claim["concept_id"]),
+    )
+    await db.db.commit()
+
+    report = await MemoryLifecycleService(
+        db=db,
+        memory_store=store,
+    ).report_maintenance_closures(
+        (
+            MaintenanceClosureEntry(
+                memory_id=old.id,
+                expected_content_hash=old.content_hash,
+                reason="Noncanonical Document identity must fail closed.",
+            ),
+        ),
+        operator_actor_id="operator@example.test",
+    )
+
+    assert report.entries[0].disposition == "lifecycle_plan_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_workspace_admin_maintenance_route_closes_cross_owner_memory_without_owner_visibility(
+    db: Database,
+    tmp_path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    _, old, _ = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="workspace-admin-route",
+    )
+    app = create_admin_app(
+        db=db,
+        config=_api_config(tmp_path),
+        principal_resolver=lambda _request: "operator@example.test",
+        workspace_role_resolver=lambda _request: "workspace_admin",
+        maintenance_operator_resolver=lambda _request: True,
+    )
+    entries = [
+        {
+            "memory_id": old.id,
+            "expected_content_hash": old.content_hash,
+            "reason": "Unsupported private claim requires bounded operator closure.",
+        }
+    ]
+
+    with TestClient(app) as client:
+        report_response = client.post(
+            "/api/v1/memories/maintenance-closures/report",
+            json={"entries": entries},
+        )
+        assert report_response.status_code == 200
+        report = report_response.json()
+        assert report["ready_count"] == 1
+        assert report["entries"] == [
+            {"memory_id": old.id, "disposition": "ready"}
+        ]
+        apply_response = client.post(
+            "/api/v1/memories/maintenance-closures/apply",
+            json={
+                "entries": entries,
+                "expected_report_id": report["report_id"],
+            },
+        )
+
+    assert apply_response.status_code == 200
+    receipt = apply_response.json()["receipts"][0]
+    assert receipt["memory_id"] == old.id
+    assert receipt["authority"] == "maintenance_operator"
+    assert receipt["operator_actor_id"] == "operator@example.test"
+
+
+@pytest.mark.asyncio
+async def test_workspace_member_cannot_use_maintenance_closure_route(
+    db: Database,
+    tmp_path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    _, old, _ = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="member-route",
+    )
+    app = create_admin_app(
+        db=db,
+        config=_api_config(tmp_path),
+        principal_resolver=lambda _request: "member@example.test",
+        workspace_role_resolver=lambda _request: "member",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/memories/maintenance-closures/report",
+            json={
+                "entries": [
+                    {
+                        "memory_id": old.id,
+                        "expected_content_hash": old.content_hash,
+                        "reason": "Attempted closure without operator authority.",
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "maintenance_operator_authority_required"
+    stored = await db.get_memory(old.id)
+    assert stored is not None and stored.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_workspace_admin_without_explicit_operator_grant_cannot_close_memory(
+    db: Database,
+    tmp_path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    _, old, _ = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="ungranted-admin-route",
+    )
+    app = create_admin_app(
+        db=db,
+        config=_api_config(tmp_path),
+        principal_resolver=lambda _request: "admin@example.test",
+        workspace_role_resolver=lambda _request: "workspace_admin",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/memories/maintenance-closures/report",
+            json={
+                "entries": [
+                    {
+                        "memory_id": old.id,
+                        "expected_content_hash": old.content_hash,
+                        "reason": "Workspace role alone is insufficient.",
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "maintenance_operator_authority_required"
 
 
 @pytest.mark.asyncio

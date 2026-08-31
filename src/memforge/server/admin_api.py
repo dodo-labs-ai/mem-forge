@@ -59,6 +59,7 @@ from memforge.memory.audit import AuditContext
 from memforge.memory.lifecycle import normalize_memory_status
 from memforge.memory.cutover import run_with_lifecycle_activity_heartbeat
 from memforge.memory.lifecycle_service import (
+    MaintenanceClosureEntry,
     MemoryLifecycleConflict,
     MemoryLifecycleNotFound,
     MemoryLifecycleService,
@@ -596,6 +597,20 @@ def _request_audit_context(request: Request) -> AuditContext:
     return AuditContext(actor_type="user", actor_id=resolve_request_principal(request))
 
 
+def _require_maintenance_operator(request: Request) -> str:
+    resolver = getattr(request.app.state, "maintenance_operator_resolver", None)
+    if resolver is None:
+        from memforge.server.principal import resolve_maintenance_operator
+
+        resolver = resolve_maintenance_operator
+    if not resolver(request):
+        raise HTTPException(
+            status_code=403,
+            detail="maintenance_operator_authority_required",
+        )
+    return resolve_request_principal(request)
+
+
 # ---------------------------------------------------------------------------
 # Pydantic request / response models
 # ---------------------------------------------------------------------------
@@ -780,6 +795,49 @@ class MemoryRetireRequest(BaseModel):
 class MemoryLifecycleResponse(BaseModel):
     memory_id: str
     status: str
+
+
+class MemoryMaintenanceClosureItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_id: str = Field(min_length=1)
+    expected_content_hash: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class MemoryMaintenanceClosureReportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entries: list[MemoryMaintenanceClosureItem] = Field(min_length=1, max_length=100)
+
+
+class MemoryMaintenanceClosureApplyRequest(MemoryMaintenanceClosureReportRequest):
+    expected_report_id: str = Field(min_length=1)
+
+
+class MemoryMaintenanceClosureReportItemResponse(BaseModel):
+    memory_id: str
+    disposition: str
+
+
+class MemoryMaintenanceClosureReportResponse(BaseModel):
+    report_id: str
+    ready_count: int
+    entries: list[MemoryMaintenanceClosureReportItemResponse]
+
+
+class MemoryMaintenanceClosureReceiptResponse(BaseModel):
+    receipt_id: str
+    report_id: str
+    memory_id: str
+    status: str
+    authority: Literal["maintenance_operator"]
+    operator_actor_id: str
+
+
+class MemoryMaintenanceClosureApplyResponse(BaseModel):
+    report_id: str
+    receipts: list[MemoryMaintenanceClosureReceiptResponse]
 
 
 class MemoryCreateRequest(BaseModel):
@@ -3363,6 +3421,7 @@ def create_admin_app(
     runtime_provider: RuntimeProvider | None = None,
     principal_resolver: Callable[[Request], str] | None = None,
     workspace_role_resolver: Callable[[Request], str] | None = None,
+    maintenance_operator_resolver: Callable[[Request], bool] | None = None,
     document_store: DocumentArtifactStore | None = None,
     local_agent_lease_validator: Callable[[Request, str, str, int, str], Awaitable[bool]] | None = None,
     local_agent_job_enqueuer: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
@@ -3386,6 +3445,13 @@ def create_admin_app(
     if config is None:
         raise ValueError("config is required")
     runtime_provider = runtime_provider or DefaultRuntimeProvider()
+    if maintenance_operator_resolver is None and (
+        principal_resolver is not None or workspace_role_resolver is not None
+    ):
+        def deny_maintenance_operator(_request: Request) -> bool:
+            return False
+
+        maintenance_operator_resolver = deny_maintenance_operator
 
     owned_db: Database | None = None
 
@@ -3406,6 +3472,7 @@ def create_admin_app(
         app.state.runtime_provider = runtime_provider
         app.state.principal_resolver = principal_resolver
         app.state.workspace_role_resolver = workspace_role_resolver
+        app.state.maintenance_operator_resolver = maintenance_operator_resolver
         app.state.local_agent_lease_validator = local_agent_lease_validator
         app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
         app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
@@ -3508,6 +3575,7 @@ def create_admin_app(
     app.state.runtime_provider = runtime_provider
     app.state.principal_resolver = principal_resolver
     app.state.workspace_role_resolver = workspace_role_resolver
+    app.state.maintenance_operator_resolver = maintenance_operator_resolver
     app.state.local_agent_lease_validator = local_agent_lease_validator
     app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
     app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
@@ -4275,6 +4343,90 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail=str(exc))
         return MemoryCreateResponse(memory_id=result.memory_id, status=result.status)
 
+    @memory_router.post(
+        "/maintenance-closures/report",
+        response_model=MemoryMaintenanceClosureReportResponse,
+    )
+    async def report_memory_maintenance_closures(
+        req: MemoryMaintenanceClosureReportRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+    ):
+        operator_actor_id = _require_maintenance_operator(request)
+        service = await _build_lifecycle_service(
+            db,
+            config,
+            runtime_provider,
+            audit_context=AuditContext(
+                actor_type="maintenance_operator",
+                actor_id=operator_actor_id,
+            ),
+        )
+        try:
+            report = await service.report_maintenance_closures(
+                tuple(MaintenanceClosureEntry(**item.model_dump()) for item in req.entries),
+                operator_actor_id=operator_actor_id,
+            )
+        except MemoryLifecycleConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return MemoryMaintenanceClosureReportResponse(
+            report_id=report.id,
+            ready_count=report.ready_count,
+            entries=[
+                MemoryMaintenanceClosureReportItemResponse(
+                    memory_id=item.memory_id,
+                    disposition=item.disposition,
+                )
+                for item in report.entries
+            ],
+        )
+
+    @memory_router.post(
+        "/maintenance-closures/apply",
+        response_model=MemoryMaintenanceClosureApplyResponse,
+    )
+    async def apply_memory_maintenance_closures(
+        req: MemoryMaintenanceClosureApplyRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
+    ):
+        operator_actor_id = _require_maintenance_operator(request)
+        service = await _build_lifecycle_service(
+            db,
+            config,
+            runtime_provider,
+            audit_context=AuditContext(
+                actor_type="maintenance_operator",
+                actor_id=operator_actor_id,
+            ),
+        )
+        try:
+            receipts = await service.apply_maintenance_closures(
+                tuple(MaintenanceClosureEntry(**item.model_dump()) for item in req.entries),
+                expected_report_id=req.expected_report_id,
+                operator_actor_id=operator_actor_id,
+            )
+        except MemoryLifecycleConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return MemoryMaintenanceClosureApplyResponse(
+            report_id=req.expected_report_id,
+            receipts=[
+                MemoryMaintenanceClosureReceiptResponse(
+                    receipt_id=item.id,
+                    report_id=item.report_id,
+                    memory_id=item.memory_id,
+                    status=item.status,
+                    authority="maintenance_operator",
+                    operator_actor_id=item.operator_actor_id,
+                )
+                for item in receipts
+            ],
+        )
+
     @memory_router.post("/{memory_id}/retire", response_model=MemoryLifecycleResponse)
     async def retire_memory_route(
         memory_id: str,
@@ -4298,6 +4450,7 @@ def create_admin_app(
                 memory_id,
                 reason=req.reason,
                 expected_content_hash=req.expected_content_hash,
+                actor_user_id=resolve_request_principal(request),
             )
         except MemoryLifecycleNotFound:
             raise HTTPException(status_code=404, detail="Memory not found")

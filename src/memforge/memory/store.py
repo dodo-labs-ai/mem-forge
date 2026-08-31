@@ -13,7 +13,7 @@ from hashlib import sha256
 from itertools import zip_longest
 from typing import Any, Awaitable, Callable, Sequence
 
-from memforge.memory.audit import AuditContext, MemoryAuditLogger
+from memforge.memory.audit import AuditContext, MemoryAuditEvent, MemoryAuditLogger
 from memforge.memory.evidence import (
     AuthorityCase,
     CandidateBucket,
@@ -1802,6 +1802,7 @@ class MemoryStore:
         confidence: float,
         observed_at: datetime,
         concept_markdown_body: str,
+        maintenance_receipt: MemoryAuditEvent | None = None,
     ) -> None:
         """Atomically retire an Agent claim and update its canonical concept."""
 
@@ -1820,6 +1821,7 @@ class MemoryStore:
                 confidence=confidence,
                 observed_at=observed_at,
                 concept_markdown_body=concept_markdown_body,
+                maintenance_receipt=maintenance_receipt,
             )
             await self.attempt_lifecycle_vector_delivery(plan.id)
             await self._emit(

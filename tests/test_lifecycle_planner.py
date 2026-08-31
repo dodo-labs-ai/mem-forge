@@ -5,6 +5,8 @@ from dataclasses import replace
 import pytest
 
 from memforge.memory.lifecycle_plan import (
+    IncumbentAuthority,
+    IncumbentAuthorityGrant,
     LifecycleGateState,
     LifecycleMutationType,
     LifecycleReview,
@@ -166,7 +168,12 @@ def test_explicit_owner_managed_claim_authority_does_not_fabricate_old_support()
         observation_revision_ids=("obsrev-2",),
         new_evidence_reference_ids=("eref-new",),
         defaults=_defaults(),
-        explicit_owner_incumbent_ids=frozenset({old.id}),
+        incumbent_authority_grants={
+            old.id: IncumbentAuthorityGrant(
+                authority=IncumbentAuthority.EXPLICIT_OWNER_MANAGED_CLAIM,
+                actor_id="owner@example.test",
+            )
+        },
     )
 
     assert [mutation.mutation_type for mutation in plan.mutations] == [
@@ -176,6 +183,9 @@ def test_explicit_owner_managed_claim_authority_does_not_fabricate_old_support()
     ]
     assert plan.coverage_proof.incumbent_decisions[0].authority.value == (
         "explicit_owner_managed_claim"
+    )
+    assert plan.coverage_proof.incumbent_decisions[0].authority_actor_id == (
+        "owner@example.test"
     )
 
 

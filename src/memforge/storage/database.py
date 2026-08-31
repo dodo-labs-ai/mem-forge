@@ -10647,6 +10647,7 @@ class Database:
         citations: list[str] | None = None,
         concept_projection: dict[str, Any] | None = None,
         concept_markdown_body: str | None = None,
+        maintenance_receipt: MemoryAuditEvent | None = None,
     ) -> None:
         """Commit projected Memory lifecycle and the Agent Knowledge view atomically."""
 
@@ -10714,6 +10715,10 @@ class Database:
                         concept_id=concept_id,
                         markdown_body=concept_markdown_body,
                         observed=observed,
+                    )
+                if maintenance_receipt is not None:
+                    await self._insert_memory_audit_event_unlocked(
+                        maintenance_receipt
                     )
                 await self.db.commit()
             except Exception:
@@ -20992,50 +20997,55 @@ class Database:
 
     async def insert_memory_audit_event(self, event: MemoryAuditEvent) -> None:
         """Append one memory audit event."""
-        occurred_at = _utc_iso(event.occurred_at)
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO memory_audit_events (
-                    event_id, operation_id, parent_event_id, occurred_at,
-                    actor_type, actor_id, run_id, trace_id, source_id, doc_id,
-                    memory_id, candidate_id, review_id, support_kind,
-                    event_type, decision, reason, payload_class,
-                    before_snapshot, after_snapshot, evidence_refs,
-                    model, prompt_hash, config_hash, thresholds,
-                    status, payload, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    event.event_id,
-                    event.operation_id,
-                    event.parent_event_id,
-                    occurred_at,
-                    event.actor_type,
-                    event.actor_id,
-                    event.run_id,
-                    event.trace_id,
-                    event.source_id,
-                    event.doc_id,
-                    event.memory_id,
-                    event.candidate_id,
-                    event.review_id,
-                    event.support_kind,
-                    event.event_type,
-                    event.decision,
-                    event.reason,
-                    event.payload_class,
-                    json.dumps(event.before_snapshot) if event.before_snapshot is not None else None,
-                    json.dumps(event.after_snapshot) if event.after_snapshot is not None else None,
-                    json.dumps(event.evidence_refs),
-                    event.model,
-                    event.prompt_hash,
-                    event.config_hash,
-                    json.dumps(event.thresholds) if event.thresholds is not None else None,
-                    event.status,
-                    json.dumps(event.payload),
-                    event.error,
-                ),
-            )
+            await self._insert_memory_audit_event_unlocked(event)
             await self.db.commit()
+
+    async def _insert_memory_audit_event_unlocked(
+        self,
+        event: MemoryAuditEvent,
+    ) -> None:
+        await self.db.execute(
+            """INSERT INTO memory_audit_events (
+                event_id, operation_id, parent_event_id, occurred_at,
+                actor_type, actor_id, run_id, trace_id, source_id, doc_id,
+                memory_id, candidate_id, review_id, support_kind,
+                event_type, decision, reason, payload_class,
+                before_snapshot, after_snapshot, evidence_refs,
+                model, prompt_hash, config_hash, thresholds,
+                status, payload, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                event.event_id,
+                event.operation_id,
+                event.parent_event_id,
+                _utc_iso(event.occurred_at),
+                event.actor_type,
+                event.actor_id,
+                event.run_id,
+                event.trace_id,
+                event.source_id,
+                event.doc_id,
+                event.memory_id,
+                event.candidate_id,
+                event.review_id,
+                event.support_kind,
+                event.event_type,
+                event.decision,
+                event.reason,
+                event.payload_class,
+                json.dumps(event.before_snapshot) if event.before_snapshot is not None else None,
+                json.dumps(event.after_snapshot) if event.after_snapshot is not None else None,
+                json.dumps(event.evidence_refs),
+                event.model,
+                event.prompt_hash,
+                event.config_hash,
+                json.dumps(event.thresholds) if event.thresholds is not None else None,
+                event.status,
+                json.dumps(event.payload),
+                event.error,
+            ),
+        )
 
     async def list_memory_audit_events(
         self,
