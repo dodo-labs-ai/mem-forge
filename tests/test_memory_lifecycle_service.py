@@ -1064,6 +1064,46 @@ async def test_owner_retires_managed_claim_without_current_v2_support(db: Databa
     )
 
 
+@pytest.mark.asyncio
+async def test_owner_correction_returns_typed_conflict_for_unresolved_claim_evidence(
+    db: Database,
+    monkeypatch,
+):
+    store, old, claim_id = await _legacy_limited_managed_agent_claim(
+        db,
+        suffix="evidence-conflict",
+    )
+
+    def fail_localization(*_args, **_kwargs):
+        raise ValueError("projected agent claim Fragment coverage has a content gap")
+
+    monkeypatch.setattr(
+        "memforge.agent_knowledge.resolve_projected_agent_claim_fragment",
+        fail_localization,
+    )
+    with pytest.raises(
+        MemoryLifecycleConflict,
+        match="agent_claim_evidence_localization_failed",
+    ):
+        await MemoryLifecycleService(
+            db=db,
+            memory_store=store,
+        ).propose_memory_correction(
+            old.id,
+            replacement_content="The managed claim now reflects the current decision.",
+            provenance="The owner explicitly corrected the managed claim.",
+            reason="Replace the obsolete managed claim.",
+            expected_content_hash=old.content_hash,
+            authority=_authority("owner@example.test", "member"),
+            replacement_kind="revision",
+        )
+
+    current = await db.get_memory(old.id)
+    claim = await db.get_agent_claim(claim_id)
+    assert current is not None and current.status == "active"
+    assert claim is not None and claim["memory_id"] == old.id
+
+
 @pytest.mark.parametrize("action", ["correction", "retirement"])
 @pytest.mark.asyncio
 async def test_managed_claim_owner_route_returns_conflict_for_mismatched_lineage(

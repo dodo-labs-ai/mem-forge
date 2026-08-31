@@ -999,13 +999,31 @@ class AgentKnowledgeBundleService:
             project_key=project_key,
             repo_identifier=repo_identifier,
         )
+
+        def resolve_claim_fragment(
+            text: str,
+            *,
+            primary_id: str | None = None,
+            required_ids: tuple[str, ...] = (),
+        ):
+            try:
+                return resolve_projected_agent_claim_fragment(
+                    projection,
+                    claim_text=text,
+                    access_context_hash=access_hash,
+                    primary_event_id=primary_id,
+                    required_event_ids=required_ids,
+                )
+            except ValueError as exc:
+                raise AgentClaimLifecycleConflict(
+                    "agent_claim_evidence_localization_failed"
+                ) from exc
+
         if raw_memory is not None:
-            resolved_selection, event_receipt = resolve_projected_agent_claim_fragment(
-                projection,
-                claim_text=claim_text,
-                access_context_hash=access_hash,
-                primary_event_id=primary_event_id,
-                required_event_ids=required_event_ids,
+            resolved_selection, event_receipt = resolve_claim_fragment(
+                claim_text,
+                primary_id=primary_event_id,
+                required_ids=required_event_ids,
             )
             raw_memory = replace(
                 raw_memory,
@@ -1091,10 +1109,8 @@ class AgentKnowledgeBundleService:
         for memory_id, candidate in tuple(incumbent_candidates.items()):
             if memory_id == incumbent_memory_id:
                 continue
-            selection, receipt = resolve_projected_agent_claim_fragment(
-                projection,
-                claim_text=candidate.evidence_quote or "",
-                access_context_hash=access_hash,
+            selection, receipt = resolve_claim_fragment(
+                candidate.evidence_quote or "",
             )
             incumbent_candidates[memory_id] = replace(
                 candidate,
