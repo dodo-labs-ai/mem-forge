@@ -452,118 +452,6 @@ class IncumbentSupportAuditResponse(StructuredResponseModel):
     decisions: list[IncumbentSupportAuditDecision]
 
 
-class _LegacySupportRevalidationDecisionBase(StructuredResponseModel):
-    """Fields shared by every current-revision legacy Support judgment."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    request_position: int = Field(ge=0)
-    reason: str = Field(default="", max_length=1000)
-
-
-class LegacySupportedRevalidationDecision(_LegacySupportRevalidationDecisionBase):
-    """A positive judgment with application-resolvable current Evidence."""
-
-    decision: Literal["supported"]
-    primary_ref: TransientEvidenceFragmentRef
-    required_refs: list[TransientEvidenceFragmentRef] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _validate_selection(self):
-        if self.primary_ref in self.required_refs:
-            raise ValueError("primary_ref cannot also be required")
-        if len(set(self.required_refs)) != len(self.required_refs):
-            raise ValueError("required_refs must be duplicate-free")
-        return self
-
-
-class LegacyNotSupportedRevalidationDecision(_LegacySupportRevalidationDecisionBase):
-    """A negative judgment that cannot carry Evidence selectors."""
-
-    decision: Literal["not_supported"]
-
-
-class LegacyInconclusiveRevalidationDecision(_LegacySupportRevalidationDecisionBase):
-    """An unresolved judgment that cannot carry Evidence selectors."""
-
-    decision: Literal["inconclusive"]
-
-
-type LegacySupportRevalidationDecision = Annotated[
-    LegacySupportedRevalidationDecision
-    | LegacyNotSupportedRevalidationDecision
-    | LegacyInconclusiveRevalidationDecision,
-    Field(discriminator="decision"),
-]
-
-
-class LegacySupportRevalidationResponse(StructuredResponseModel):
-    """Complete response for one bounded legacy Support revalidation batch."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    decisions: list[LegacySupportRevalidationDecision]
-
-
-class _LegacySupportFragmentScanDecisionBase(StructuredResponseModel):
-    """Fields shared by one claim's bounded Fragment-window scan."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    request_position: int = Field(ge=0)
-    reason: str = Field(default="", max_length=1000)
-
-
-class LegacySupportFragmentCandidatesDecision(_LegacySupportFragmentScanDecisionBase):
-    """Potentially supporting refs from one complete scan window."""
-
-    outcome: Literal["candidates"]
-    refs: list[TransientEvidenceFragmentRef] = Field(min_length=1, max_length=16)
-
-    @model_validator(mode="after")
-    def _validate_refs(self):
-        if len(set(self.refs)) != len(self.refs):
-            raise ValueError("candidate Fragment refs must be duplicate-free")
-        return self
-
-
-class LegacySupportFragmentNoneDecision(_LegacySupportFragmentScanDecisionBase):
-    """The presented window contains no potentially supporting Fragment."""
-
-    outcome: Literal["none"]
-
-
-class LegacySupportFragmentInconclusiveDecision(_LegacySupportFragmentScanDecisionBase):
-    """The model cannot safely screen the presented window."""
-
-    outcome: Literal["inconclusive"]
-
-
-class LegacySupportFragmentCandidateOverflowDecision(
-    _LegacySupportFragmentScanDecisionBase
-):
-    """The bounded candidate list cannot represent this window safely."""
-
-    outcome: Literal["candidate_overflow"]
-
-
-type LegacySupportFragmentScanDecision = Annotated[
-    LegacySupportFragmentCandidatesDecision
-    | LegacySupportFragmentNoneDecision
-    | LegacySupportFragmentInconclusiveDecision
-    | LegacySupportFragmentCandidateOverflowDecision,
-    Field(discriminator="outcome"),
-]
-
-
-class LegacySupportFragmentScanResponse(StructuredResponseModel):
-    """Complete screening ledger for one Fragment window and claim batch."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    decisions: list[LegacySupportFragmentScanDecision]
-
-
 class RevisionCompositionDecision(StructuredResponseModel):
     """One transient proof that a REFINES pair is eligible for revision."""
 
@@ -1031,26 +919,6 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> IncumbentSupportAuditResponse:
         """Return one support disposition for every incumbent in an audit batch."""
-
-    async def revalidate_legacy_support(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 8192,
-        model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
-    ) -> LegacySupportRevalidationResponse:
-        """Select current authorized Evidence for legacy-limited Memories."""
-
-    async def screen_legacy_support_fragments(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 8192,
-        model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
-    ) -> LegacySupportFragmentScanResponse:
-        """Return a complete candidate ledger for one Fragment window."""
 
     async def prove_revision_compositions(
         self,
@@ -1819,38 +1687,6 @@ class LiteLlmStructuredClient:
             response_format=IncumbentSupportAuditResponse,
             max_tokens=max_tokens,
             model=model,
-        )
-
-    async def revalidate_legacy_support(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 8192,
-        model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
-    ) -> LegacySupportRevalidationResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=LegacySupportRevalidationResponse,
-            max_tokens=max_tokens,
-            model=model,
-            images=images,
-        )
-
-    async def screen_legacy_support_fragments(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 8192,
-        model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
-    ) -> LegacySupportFragmentScanResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=LegacySupportFragmentScanResponse,
-            max_tokens=max_tokens,
-            model=model,
-            images=images,
         )
 
     async def prove_revision_compositions(
