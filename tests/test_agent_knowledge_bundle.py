@@ -576,6 +576,86 @@ async def test_add_claim_writes_citations_and_markdown_inside_lifecycle_contract
 
 
 @pytest.mark.asyncio
+async def test_correction_rebinds_unchanged_multi_fragment_claim_in_one_v2_unit(
+    bundle_stack,
+):
+    db, store, _ = bundle_stack
+    await db.db.execute(
+        """UPDATE system_contract_markers
+              SET marker_value = 'evidence-unit-set-v2'
+            WHERE marker_key = 'support_scope_version'"""
+    )
+    await db.db.commit()
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    multi_block_claim = (
+        "MemForge Cloud uses two database tiers.\n\n"
+        "**Control plane**\n\n"
+        "- Uses native runtime DDL.\n"
+        "- Does not use the retired HDI deployer.\n\n"
+        "**Workspace plane**\n\n"
+        "Uses app-managed runtime migrations."
+    )
+    first = await service.apply_patch_proposal(
+        proposal=_proposal(
+            concept_id="concept-multi-fragment-rebind",
+            claim_id="claim-multi-fragment-rebind",
+            claim_text=multi_block_claim,
+            durable_claim=_durable("MemForge Cloud uses current runtime DDL."),
+        ),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-multi-fragment-1",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+    second = await service.apply_patch_proposal(
+        proposal=_proposal(
+            action="add_new_claim",
+            concept_id=first.concept_id,
+            claim_id="claim-simple-to-correct",
+            claim_text="The second managed claim is still stale.",
+            durable_claim=_durable("The second managed claim is still stale."),
+        ),
+        owner_user_id="u-andrew",
+        source_id="src-agent-sessions-codex",
+        client="codex",
+        session_id="sess-multi-fragment-2",
+        workspace="/workspace/memforge-cloud",
+        repo_identifier="github.tools.sap/hcm/memforge-cloud",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+    first_support_before = await db.get_active_memory_support_unit_ids(
+        first.memory_id or ""
+    )
+
+    replacement_id = await service.replace_claim_from_user_correction(
+        old_memory_id=second.memory_id or "",
+        replacement_content="The second managed claim now reflects current state.",
+        provenance="The owner supplied the corrected current claim.",
+        reason="Correct the stale second claim.",
+        replacement_kind="revision",
+        observed_at=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+
+    first_memory = await db.get_memory(first.memory_id or "")
+    old_second = await db.get_memory(second.memory_id or "")
+    replacement = await db.get_memory(replacement_id)
+    first_support_after = await db.get_active_memory_support_unit_ids(
+        first.memory_id or ""
+    )
+    assert first_memory is not None and first_memory.status == "active"
+    assert old_second is not None and old_second.status == "superseded"
+    assert replacement is not None and replacement.status == "active"
+    assert first_support_before
+    assert first_support_after
+    assert first_support_after != first_support_before
+
+
+@pytest.mark.asyncio
 async def test_update_claim_does_not_commit_projection_before_memory_lifecycle(bundle_stack, monkeypatch):
     db, store, _ = bundle_stack
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
