@@ -15,6 +15,9 @@ from memforge.source_artifacts import (
 from memforge.source_projection import SourceProjection
 
 
+PRIMARY_ELIGIBILITY_POLICY_VERSION = 2
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectionExtractionBatch:
     """Transient token-bounded work partition inside one Source Unit."""
@@ -28,11 +31,12 @@ class ProjectionExtractionBatch:
     context_observation_ids_by_primary: tuple[tuple[str, tuple[str, ...]], ...]
     primary_markdown: str
     context_markdown: str
+    authority_policy_version: int = PRIMARY_ELIGIBILITY_POLICY_VERSION
     # Exact segment coordinates in immutable Observation revisions. Kept
     # transient so EvidenceCatalog never creates a block across overlap seams.
     primary_authority_spans: tuple[tuple[str, int, str], ...] = ()
-    required_authority_observation_ids: tuple[str, ...] = ()
-    required_image_bytes: int = 0
+    candidate_context_observation_ids: tuple[str, ...] | None = None
+    candidate_context_image_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,11 +60,12 @@ def plan_projection_extraction_batches(
 ) -> tuple[ProjectionExtractionBatch, ...]:
     """Build bounded batches using only generic deltas and relations.
 
-    Changed/added observations are Primary by default. A bounded operator
-    replay may explicitly select current observations as Primary without
-    changing Source Projection truth. Directly related observations,
-    immediate sequence neighbors, and the first observation in a unit are
-    Context. Context is never promoted to extraction authority here.
+    Changed/added observations are Primary-eligible by default. A bounded
+    operator replay may explicitly select current observations without changing
+    Source Projection truth. Directly related observations, immediate sequence
+    neighbors, and the first observation in a unit are bounded Context. Exact
+    candidate Context may be selected as Required, but relations never make it
+    Primary-eligible.
     """
 
     if len(projection.source_units) != 1:
@@ -195,16 +200,6 @@ def plan_projection_extraction_batches(
             )
         )
         context_set = set(context)
-        relation_dependency_ids = {
-            related_id
-            for primary_id in primary
-            for relation in projection.relations
-            for related_id in (
-                (relation.to_id,) if relation.from_id == primary_id
-                else ((relation.from_id,) if relation.to_id == primary_id else ())
-            )
-            if related_id in context_set
-        }
         context_by_primary = tuple(
             (
                 observation_id,
@@ -225,16 +220,55 @@ def plan_projection_extraction_batches(
             for observation_id in primary
         )
         context_markdown = _observation_markdown(context, observations, revisions)[:max_context_chars]
+        presented_context: list[str] = []
+        presented_context_chars = 0
+        for observation_id in context:
+            rendered = _observation_markdown(
+                (observation_id,),
+                observations,
+                revisions,
+            )
+            separator_chars = 2 if presented_context else 0
+            if (
+                presented_context_chars + separator_chars + len(rendered)
+                > max_context_chars
+            ):
+                break
+            presented_context.append(observation_id)
+            presented_context_chars += separator_chars + len(rendered)
         segment_identity = "|".join(
             f"{segment.observation_id}:{segment.start}:{segment.end}" for segment in group
         )
         digest = hashlib.sha256(
             (
                 f"{extraction_contract_version}\x1f"
+                f"authority-policy:{PRIMARY_ELIGIBILITY_POLICY_VERSION}\x1f"
                 f"{target_unit_revision_id}\x1f{unit.id}\x1f"
                 f"{index}\x1f{segment_identity}"
             ).encode()
         ).hexdigest()[:16]
+        primary_binary_bytes = sum(
+            _observation_binary_size(revisions[observation_id].metadata)
+            for observation_id in primary
+        )
+        remaining_context_binary_bytes = max(
+            0,
+            max_primary_binary_bytes - primary_binary_bytes,
+        )
+        candidate_context: list[str] = []
+        candidate_context_binary_bytes = 0
+        for observation_id in presented_context:
+            if observations[observation_id].observation_type != "binary_artifact":
+                candidate_context.append(observation_id)
+                continue
+            binary_bytes = _observation_binary_size(revisions[observation_id].metadata)
+            if (
+                candidate_context_binary_bytes + binary_bytes
+                <= remaining_context_binary_bytes
+            ):
+                candidate_context.append(observation_id)
+                candidate_context_binary_bytes += binary_bytes
+        candidate_context_ids = tuple(candidate_context)
         batches.append(
             ProjectionExtractionBatch(
                 id=f"xbatch-{digest}",
@@ -242,10 +276,6 @@ def plan_projection_extraction_batches(
                 primary_image_bytes=sum(
                     _observation_image_size(revisions[observation_id].metadata)
                     for observation_id in primary
-                ),
-                required_image_bytes=sum(
-                    _observation_image_size(revisions[observation_id].metadata)
-                    for observation_id in relation_dependency_ids
                 ),
                 primary_observation_ids=primary,
                 primary_content_by_observation_id=primary_content_by_observation_id,
@@ -263,10 +293,10 @@ def plan_projection_extraction_batches(
                     )
                     for segment in group
                 ),
-                required_authority_observation_ids=tuple(
-                    observation_id
-                    for observation_id in context
-                    if observation_id in relation_dependency_ids
+                candidate_context_observation_ids=candidate_context_ids,
+                candidate_context_image_bytes=sum(
+                    _observation_image_size(revisions[observation_id].metadata)
+                    for observation_id in candidate_context_ids
                 ),
             )
         )
