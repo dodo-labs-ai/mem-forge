@@ -2,6 +2,11 @@
 
 ## 0.1.0 - Unreleased
 
+- Breaking: `get_memory` now exposes provenance only through grouped
+  `evidence[]`. The deprecated flat `sources[]` and `evidence_artifacts[]`
+  fields have been removed; document and PDF locators live under
+  `evidence[].document`, and Artifact locators remain under
+  `evidence[].items[].artifact.url`.
 - Initial public repository preparation.
 - Self-hosted MemForge service with FastAPI admin API, SQLite persistence,
   FTS search, Chroma vector search, and MCP tools.

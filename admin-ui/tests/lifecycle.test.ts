@@ -26,7 +26,7 @@ const baseMemory: Memory = {
   updated_at: "2026-05-26T19:44:56Z",
   extraction_context: null,
   entity_refs: [],
-  sources: [],
+  evidence: [],
   origin_source_type: null,
 };
 

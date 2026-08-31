@@ -2801,7 +2801,7 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "active_repo_identifier" not in properties
     assert "search -> get_memory -> get_resource" in tools["get_resource"]["description"]
     get_resource_url = tools["get_resource"]["inputSchema"]["properties"]["url"]["description"]
-    assert "get_memory.evidence_artifacts[].url" in get_resource_url
+    assert "get_memory.evidence[].document" in get_resource_url
     assert "/api/v1/source-artifacts/{observation_revision_id}" in get_resource_url
 
     create_schema = tools["create_memory"]["inputSchema"]
@@ -2817,9 +2817,10 @@ def test_mcp_proxy_search_schema_exposes_validated_facets_not_recent_changes():
     assert "durable memory content" in tools["create_memory"]["description"]
     assert "provenance" in tools["create_memory"]["description"]
     assert "one self-contained" in create_schema["properties"]["content"]["description"].lower()
-    assert "get_memory.sources[].excerpt" in create_schema["properties"]["provenance"]["description"]
+    assert "get_memory.evidence[].items[].excerpt" in create_schema["properties"]["provenance"]["description"]
     assert "canonical content" in tools["get_memory"]["description"]
-    assert "sources[].excerpt" in tools["get_memory"]["description"]
+    assert "grouped Evidence" in tools["get_memory"]["description"]
+    assert "sources[]" not in tools["get_memory"]["description"]
     assert "Do not put confirmation details" in create_schema["properties"]["content"]["description"]
 
     retire_schema = tools["retire_memory"]["inputSchema"]
@@ -3980,18 +3981,35 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
                     "replacement_reason": None,
                     "extraction_context": "large admin context",
                     "entity_refs": ["periodcutoffblockerhint"],
-                    "sources": [
+                    "evidence": [
                         {
-                            "doc_id": "jira-SFPAY-179397",
+                            "kind": "document",
+                            "evidence_unit_id": None,
+                            "support_ids": [],
+                            "support_scope_version": None,
+                            "source_id": "src-jira",
                             "source_type": "jira",
-                            "support_kind": "extracted",
-                            "doc_title": "SFPAY-179397: Create Blocker Hint",
-                            "source_url": "https://jira.example/browse/SFPAY-179397",
-                            "content_url": "/api/v1/documents/jira-SFPAY-179397/content",
-                            "pdf_url": None,
-                            "source_updated_at": "2026-07-02T03:50:32+00:00",
-                            "excerpt": "large excerpt",
-                            "added_at": "2026-07-02T04:00:00+00:00",
+                            "doc_id": "jira-SFPAY-179397",
+                            "current": True,
+                            "legacy_limited": False,
+                            "document": {
+                                "doc_id": "jira-SFPAY-179397",
+                                "title": "SFPAY-179397: Create Blocker Hint",
+                                "source_url": "https://jira.example/browse/SFPAY-179397",
+                                "content_url": "/api/v1/documents/jira-SFPAY-179397/content",
+                                "pdf_url": None,
+                                "source_updated_at": "2026-07-02T03:50:32+00:00",
+                            },
+                            "items": [
+                                {
+                                    "authority": "application_document",
+                                    "role": "primary",
+                                    "kind": "text",
+                                    "support_contribution": True,
+                                    "excerpt": "large excerpt",
+                                    "current": True,
+                                }
+                            ],
                         }
                     ],
                 }
@@ -4015,17 +4033,34 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
         "confidence": 0.93,
         "status": "active",
         "entity_refs": ["periodcutoffblockerhint"],
-        "sources": [
+        "evidence": [
             {
-                "doc_id": "jira-SFPAY-179397",
+                "kind": "document",
+                "evidence_unit_id": None,
+                "support_scope_version": None,
+                "source_id": "src-jira",
                 "source_type": "jira",
-                "support_kind": "extracted",
-                "doc_title": "SFPAY-179397: Create Blocker Hint",
-                "source_url": "https://jira.example/browse/SFPAY-179397",
-                "content_url": "/api/v1/documents/jira-SFPAY-179397/content",
-                "pdf_url": None,
-                "source_updated_at": "2026-07-02T03:50:32+00:00",
-                "excerpt": "large excerpt",
+                "doc_id": "jira-SFPAY-179397",
+                "current": True,
+                "legacy_limited": False,
+                "document": {
+                    "doc_id": "jira-SFPAY-179397",
+                    "title": "SFPAY-179397: Create Blocker Hint",
+                    "source_url": "https://jira.example/browse/SFPAY-179397",
+                    "content_url": "/api/v1/documents/jira-SFPAY-179397/content",
+                    "pdf_url": None,
+                    "source_updated_at": "2026-07-02T03:50:32+00:00",
+                },
+                "items": [
+                    {
+                        "authority": "application_document",
+                        "role": "primary",
+                        "kind": "text",
+                        "support_contribution": True,
+                        "excerpt": "large excerpt",
+                        "current": True,
+                    }
+                ],
             }
         ],
     }
@@ -4285,42 +4320,48 @@ def test_mcp_proxy_preserves_claim_local_evidence_on_get_memory(monkeypatch):
             "id": "mem-1",
             "memory_type": "fact",
             "content": "A visual claim",
-            "sources": [
+            "evidence": [
                 {
-                    "doc_id": "doc-1",
+                    "kind": "evidence_unit",
+                    "evidence_unit_id": "evidence-1",
+                    "support_scope_version": "evidence-unit-set-v2",
+                    "source_id": "src-github",
                     "source_type": "github",
-                    "support_kind": "extracted",
-                    "doc_title": "Architecture",
-                    "excerpt": "The request flow is gateway then worker.",
-                    "content_url": "/api/v1/documents/doc-1/content",
+                    "doc_id": "doc-1",
+                    "current": True,
+                    "legacy_limited": False,
+                    "document": {
+                        "doc_id": "doc-1",
+                        "title": "Architecture",
+                        "content_url": "/api/v1/documents/doc-1/content",
+                    },
+                    "items": [
+                        {
+                            "authority": "revision_pinned",
+                            "role": "primary",
+                            "kind": "artifact",
+                            "support_contribution": True,
+                            "current": True,
+                            "artifact": artifact,
+                        }
+                    ],
                 }
             ],
-            "evidence_artifacts": [artifact],
         },
     )
 
     result = proxy._call_tool("get_memory", {"memory_id": "mem-1"})
 
-    assert result["sources"] == [
-        {
-            "doc_id": "doc-1",
-            "source_type": "github",
-            "support_kind": "extracted",
-            "doc_title": "Architecture",
-            "excerpt": "The request flow is gateway then worker.",
-            "content_url": "/api/v1/documents/doc-1/content",
-        }
-    ]
-    assert result["evidence_artifacts"] == [
-        {
-            "summary": "Architecture diagram showing the request flow.",
-            "evidence_role": "primary",
-            "filename": "diagram.png",
-            "content_type": "image/png",
-            "size_bytes": 3,
-            "url": "/api/v1/source-artifacts/obsrev-1",
-        }
-    ]
+    [group] = result["evidence"]
+    assert group["document"]["content_url"] == "/api/v1/documents/doc-1/content"
+    assert group["items"][0]["artifact"] == {
+        "summary": "Architecture diagram showing the request flow.",
+        "evidence_role": "primary",
+        "filename": "diagram.png",
+        "content_type": "image/png",
+        "size_bytes": 3,
+        "url": "/api/v1/source-artifacts/obsrev-1",
+    }
 
 
 def test_mcp_proxy_returns_source_artifact_as_native_image_content(monkeypatch):
