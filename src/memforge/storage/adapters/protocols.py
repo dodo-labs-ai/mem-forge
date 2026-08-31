@@ -48,10 +48,6 @@ from memforge.memory.lifecycle_plan import (
     LifecycleReviewStatus,
     LifecycleVectorTask,
 )
-from memforge.memory.support_recovery import (
-    LegacySupportRecoveryCandidate,
-    LegacySupportRecoveryReport,
-)
 from memforge.memory.relation_discovery_contract import RelationDiscoveryWork
 from memforge.memory.review_decision import ReviewVectorTask
 from memforge.source_projection import (
@@ -493,18 +489,6 @@ class RelationalStore(Protocol):
         self,
         source_unit_id: str,
     ) -> SourceProjection | None: ...
-    async def list_legacy_support_recovery_candidates(
-        self,
-        source_id: str,
-    ) -> tuple[LegacySupportRecoveryCandidate, ...]: ...
-    async def persist_legacy_support_recovery_report(
-        self,
-        report: LegacySupportRecoveryReport,
-    ) -> None: ...
-    async def get_legacy_support_recovery_report(
-        self,
-        report_id: str,
-    ) -> LegacySupportRecoveryReport | None: ...
     async def get_source_artifact_revision(
         self,
         observation_revision_id: str,
