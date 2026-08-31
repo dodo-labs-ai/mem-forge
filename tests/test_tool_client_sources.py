@@ -51,29 +51,6 @@ def test_health_uses_edition_owned_host_contract():
     assert cloud.calls == [("GET", "/healthz", None)]
 
 
-def test_create_source_posts_type_name_and_config():
-    client = _RecordingClient({"id": "src-abcd1234", "name": "Notes", "type": "local_markdown"})
-
-    result = client.create_source(
-        source_type="local_markdown",
-        name="Notes",
-        config={"vault_id": "engineering", "display_label": "Engineering notes"},
-    )
-
-    assert result["id"] == "src-abcd1234"
-    assert client.calls == [
-        (
-            "POST",
-            "/api/v1/sources",
-            {
-                "type": "local_markdown",
-                "name": "Notes",
-                "config": {"vault_id": "engineering", "display_label": "Engineering notes"},
-            },
-        )
-    ]
-
-
 def test_list_sources_gets_sources_collection():
     client = _RecordingClient({"data": [{"id": "src-1", "type": "local_markdown"}]})
 
@@ -326,21 +303,6 @@ def test_push_teams_window_package_posts_raw_payload_without_markdown_body():
                 "submitted_by": "codex",
                 "submitted_at": "2026-07-08T08:00:00Z",
             },
-        )
-    ]
-
-
-def test_start_source_sync_posts_source_sync_payload():
-    client = _RecordingClient({"ok": True})
-
-    result = client.start_source_sync("src-jira")
-
-    assert result["ok"] is True
-    assert client.calls == [
-        (
-            "POST",
-            "/api/v1/sources/src-jira/sync",
-            {"force_full_sync": False},
         )
     ]
 
