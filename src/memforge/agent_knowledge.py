@@ -38,7 +38,12 @@ from memforge.memory.evidence import (
     build_mandatory_candidate_bucket_results,
     relation_bundle_snapshot_audit,
 )
-from memforge.memory.lifecycle_plan import LifecycleMutationType, LifecyclePlan, ReconciliationScope
+from memforge.memory.lifecycle_plan import (
+    IncumbentAuthority,
+    LifecycleMutationType,
+    LifecyclePlan,
+    ReconciliationScope,
+)
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
     build_lifecycle_plan,
@@ -614,6 +619,43 @@ class AgentKnowledgeBundleService:
     ) -> str:
         """Retire one managed Agent claim through its Source Projection."""
 
+        return await self._retire_claim(
+            old_memory_id=old_memory_id,
+            reason=reason,
+            observed_at=observed_at,
+            unsupported_incumbent_authority=(
+                IncumbentAuthority.EXPLICIT_OWNER_MANAGED_CLAIM
+            ),
+            client="user_retirement",
+        )
+
+    async def retire_claim_from_maintenance_operator(
+        self,
+        *,
+        old_memory_id: str,
+        reason: str,
+        observed_at: datetime,
+    ) -> str:
+        """Close one unsupported managed Agent claim without owner impersonation."""
+
+        return await self._retire_claim(
+            old_memory_id=old_memory_id,
+            reason=reason,
+            observed_at=observed_at,
+            unsupported_incumbent_authority=IncumbentAuthority.MAINTENANCE_OPERATOR,
+            client="maintenance_operator_closure",
+        )
+
+    async def _retire_claim(
+        self,
+        *,
+        old_memory_id: str,
+        reason: str,
+        observed_at: datetime,
+        unsupported_incumbent_authority: IncumbentAuthority,
+        client: str,
+    ) -> str:
+
         claim = await self.db.get_agent_claim_by_memory_id(old_memory_id)
         concept = (
             await self.db.get_agent_concept(claim["concept_id"])
@@ -634,7 +676,7 @@ class AgentKnowledgeBundleService:
         projection, plan, target_memory_id = await self._build_agent_claim_lifecycle(
             concept_id=str(concept["id"]),
             source_id=str(concept["source_id"]),
-            client="user_retirement",
+            client=client,
             session_id=session_id,
             workspace=str(concept["workspace"]),
             claim_text=str(claim["claim_text"]),
@@ -651,6 +693,7 @@ class AgentKnowledgeBundleService:
             incumbent_memory_id=old_memory_id,
             reconcile_action=ReconcileAction.DELETE,
             reconciliation_reason=reason,
+            unsupported_incumbent_authority=unsupported_incumbent_authority,
         )
         if not any(
             mutation.mutation_type is LifecycleMutationType.RETIRE_MEMORY
@@ -893,6 +936,9 @@ class AgentKnowledgeBundleService:
         memory_extraction_context: str | None = None,
         primary_event_id: str | None = None,
         required_event_ids: tuple[str, ...] = (),
+        unsupported_incumbent_authority: IncumbentAuthority = (
+            IncumbentAuthority.EXPLICIT_OWNER_MANAGED_CLAIM
+        ),
     ):
         """Build the provider-neutral projection and complete claim plan.
 
@@ -1225,6 +1271,16 @@ class AgentKnowledgeBundleService:
                 frozenset({incumbent_memory_id})
                 if incumbent_memory_id is not None
                 and not source_support.get(incumbent_memory_id)
+                and unsupported_incumbent_authority
+                is IncumbentAuthority.EXPLICIT_OWNER_MANAGED_CLAIM
+                else frozenset()
+            ),
+            maintenance_operator_incumbent_ids=(
+                frozenset({incumbent_memory_id})
+                if incumbent_memory_id is not None
+                and not source_support.get(incumbent_memory_id)
+                and unsupported_incumbent_authority
+                is IncumbentAuthority.MAINTENANCE_OPERATOR
                 else frozenset()
             ),
         )

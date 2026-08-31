@@ -7,6 +7,8 @@ structured lifecycle transition without raw status mutation.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
@@ -15,6 +17,7 @@ from memforge.agent_knowledge import (
     AgentClaimLifecycleConflict,
     AgentKnowledgeBundleService,
 )
+from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.correction_authority import CorrectionAuthority
 from memforge.memory.store import MemoryStore
 from memforge.models import (
@@ -50,6 +53,39 @@ class MemoryLifecycleConflict(MemoryLifecycleError):
 class RetireMemoryResult:
     memory_id: str
     status: str
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceClosureEntry:
+    memory_id: str
+    expected_content_hash: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceClosureReportEntry:
+    memory_id: str
+    disposition: str
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceClosureReport:
+    id: str
+    entries: tuple[MaintenanceClosureReportEntry, ...]
+
+    @property
+    def ready_count(self) -> int:
+        return sum(item.disposition in {"ready", "already_closed"} for item in self.entries)
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceClosureReceipt:
+    id: str
+    report_id: str
+    memory_id: str
+    status: str
+    authority: str
+    operator_actor_id: str
 
 
 @dataclass(frozen=True)
@@ -148,8 +184,14 @@ class MemoryLifecycleService:
         *,
         reason: str,
         expected_content_hash: str,
+        actor_user_id: str,
     ) -> RetireMemoryResult:
+        actor_user_id = actor_user_id.strip()
+        if not actor_user_id:
+            raise MemoryLifecycleConflict("actor_user_id_required")
         memory = await self._active_target(memory_id, expected_content_hash=expected_content_hash)
+        if memory.visibility == Visibility.PRIVATE.value and memory.owner_user_id != actor_user_id:
+            raise MemoryLifecycleConflict("memory_owner_authority_required")
         claim = await self.db.get_agent_claim_by_memory_id(memory.id)
         if claim is not None:
             try:
@@ -164,20 +206,163 @@ class MemoryLifecycleService:
             except AgentClaimLifecycleConflict as exc:
                 raise MemoryLifecycleConflict(exc.code) from exc
             return RetireMemoryResult(memory_id=memory.id, status="retired")
-        support_state = (
-            await self.db.get_active_memory_support_states((memory.id,))
-        )[memory.id]
+        support_state = (await self.db.get_active_memory_support_states((memory.id,)))[memory.id]
         if support_state.support_ids:
             raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review")
         try:
             await self.memory_store.retire_memory(memory.id, reason=reason)
         except ValueError as exc:
             if "active source support" in str(exc):
-                raise MemoryLifecycleConflict(
-                    "source_backed_memory_requires_lifecycle_review"
-                ) from exc
+                raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review") from exc
             raise
         return RetireMemoryResult(memory_id=memory.id, status="retired")
+
+    async def report_maintenance_closures(
+        self,
+        manifest: tuple[MaintenanceClosureEntry, ...],
+    ) -> MaintenanceClosureReport:
+        normalized = self._normalize_maintenance_manifest(manifest)
+        entries: list[MaintenanceClosureReportEntry] = []
+        for item in normalized:
+            memory = await self.db.get_memory(item.memory_id)
+            disposition = "ready"
+            if memory is None:
+                disposition = "not_found"
+            elif memory.content_hash != item.expected_content_hash:
+                disposition = "content_hash_mismatch"
+            elif memory.status == "retired" and memory.retirement_reason == item.reason:
+                disposition = "already_closed"
+            elif memory.status != "active":
+                disposition = "not_active"
+            elif memory.visibility != Visibility.PRIVATE.value:
+                disposition = "not_private"
+            else:
+                support_state = (await self.db.get_active_memory_support_states((memory.id,)))[memory.id]
+                if support_state.support_ids:
+                    disposition = "active_support"
+            entries.append(
+                MaintenanceClosureReportEntry(
+                    memory_id=item.memory_id,
+                    disposition=disposition,
+                )
+            )
+        payload = [
+            {
+                "memory_id": item.memory_id,
+                "expected_content_hash": item.expected_content_hash,
+                "reason": item.reason,
+                "disposition": (
+                    "ready" if report_item.disposition in {"ready", "already_closed"} else report_item.disposition
+                ),
+            }
+            for item, report_item in zip(normalized, entries, strict=True)
+        ]
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return MaintenanceClosureReport(
+            id=f"maintenance-closure-report-{digest}",
+            entries=tuple(entries),
+        )
+
+    async def apply_maintenance_closures(
+        self,
+        manifest: tuple[MaintenanceClosureEntry, ...],
+        *,
+        expected_report_id: str,
+        operator_actor_id: str,
+    ) -> tuple[MaintenanceClosureReceipt, ...]:
+        operator_actor_id = operator_actor_id.strip()
+        if not operator_actor_id:
+            raise MemoryLifecycleConflict("operator_actor_id_required")
+        normalized = self._normalize_maintenance_manifest(manifest)
+        report = await self.report_maintenance_closures(normalized)
+        if report.id != expected_report_id:
+            raise MemoryLifecycleConflict("maintenance_closure_report_mismatch")
+        blocked = [item for item in report.entries if item.disposition not in {"ready", "already_closed"}]
+        if blocked:
+            raise MemoryLifecycleConflict("maintenance_closure_manifest_not_ready")
+
+        receipts: list[MaintenanceClosureReceipt] = []
+        report_by_id = {item.memory_id: item for item in report.entries}
+        for item in normalized:
+            status = "already_retired"
+            if report_by_id[item.memory_id].disposition == "ready":
+                memory = await self._active_target(
+                    item.memory_id,
+                    expected_content_hash=item.expected_content_hash,
+                )
+                claim = await self.db.get_agent_claim_by_memory_id(memory.id)
+                if claim is not None:
+                    try:
+                        await AgentKnowledgeBundleService(
+                            db=self.db,
+                            memory_store=self.memory_store,
+                        ).retire_claim_from_maintenance_operator(
+                            old_memory_id=memory.id,
+                            reason=item.reason,
+                            observed_at=datetime.now(timezone.utc),
+                        )
+                    except AgentClaimLifecycleConflict as exc:
+                        raise MemoryLifecycleConflict(exc.code) from exc
+                else:
+                    await self.memory_store.retire_memory(memory.id, reason=item.reason)
+                status = "retired"
+            receipt_id = (
+                "maintenance-closure-receipt-"
+                + hashlib.sha256(f"{report.id}\x1f{item.memory_id}".encode("utf-8")).hexdigest()
+            )
+            await self.db.insert_memory_audit_event(
+                MemoryAuditEvent(
+                    event_type="maintenance_memory_closure_committed",
+                    status="committed",
+                    actor_type="maintenance_operator",
+                    actor_id=operator_actor_id,
+                    memory_id=item.memory_id,
+                    reason=item.reason,
+                    payload={
+                        "authority": "maintenance_operator",
+                        "report_id": report.id,
+                        "receipt_id": receipt_id,
+                        "result": status,
+                    },
+                )
+            )
+            receipts.append(
+                MaintenanceClosureReceipt(
+                    id=receipt_id,
+                    report_id=report.id,
+                    memory_id=item.memory_id,
+                    status=status,
+                    authority="maintenance_operator",
+                    operator_actor_id=operator_actor_id,
+                )
+            )
+        return tuple(receipts)
+
+    @staticmethod
+    def _normalize_maintenance_manifest(
+        manifest: tuple[MaintenanceClosureEntry, ...],
+    ) -> tuple[MaintenanceClosureEntry, ...]:
+        if not manifest:
+            raise MemoryLifecycleConflict("maintenance_closure_manifest_required")
+        normalized: list[MaintenanceClosureEntry] = []
+        seen: set[str] = set()
+        for item in manifest:
+            memory_id = item.memory_id.strip()
+            expected_hash = item.expected_content_hash.strip()
+            reason = item.reason.strip()
+            if not memory_id or not expected_hash or not reason:
+                raise MemoryLifecycleConflict("maintenance_closure_entry_incomplete")
+            if memory_id in seen:
+                raise MemoryLifecycleConflict("maintenance_closure_duplicate_memory")
+            seen.add(memory_id)
+            normalized.append(
+                MaintenanceClosureEntry(
+                    memory_id=memory_id,
+                    expected_content_hash=expected_hash,
+                    reason=reason,
+                )
+            )
+        return tuple(normalized)
 
     async def _replace_owned_memory(
         self,
@@ -233,13 +418,9 @@ class MemoryLifecycleService:
                 raise MemoryLifecycleConflict(exc.code) from exc
             new_memory.id = replacement_id
         else:
-            support_state = (
-                await self.db.get_active_memory_support_states((old.id,))
-            )[old.id]
+            support_state = (await self.db.get_active_memory_support_states((old.id,)))[old.id]
             if support_state.support_ids:
-                raise MemoryLifecycleConflict(
-                    "source_backed_memory_requires_lifecycle_review"
-                )
+                raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review")
             correction_doc_id = f"correction-{new_memory.id}"
             await self._write_correction_document(
                 doc_id=correction_doc_id,
@@ -268,9 +449,7 @@ class MemoryLifecycleService:
                 # document and return the same explicit conflict.
                 await self.db.delete_document(correction_doc_id)
                 if "active source support" in str(exc):
-                    raise MemoryLifecycleConflict(
-                        "source_backed_memory_requires_lifecycle_review"
-                    ) from exc
+                    raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review") from exc
                 raise
 
         return _ReplaceOwnedMemoryResult(
@@ -337,9 +516,7 @@ class MemoryLifecycleService:
             )
 
         support_state = (await self.db.get_active_memory_support_states((old.id,)))[old.id]
-        expected_support_set_hash = (
-            support_state.support_set_hash if support_state.support_ids else None
-        )
+        expected_support_set_hash = support_state.support_set_hash if support_state.support_ids else None
         legacy_configured_source_ids: tuple[str, ...] = ()
         if not support_state.support_ids:
             memory_sources = await self.db.get_memory_sources(old.id)
@@ -348,8 +525,7 @@ class MemoryLifecycleService:
                     {
                         source.source_id
                         for source in memory_sources
-                        if source.source_type
-                        not in {"user_memory", "user_correction"}
+                        if source.source_type not in {"user_memory", "user_correction"}
                     }
                 )
             )
@@ -359,14 +535,8 @@ class MemoryLifecycleService:
             supporting_source_ids=support_state.source_ids,
             legacy_configured_source_ids=legacy_configured_source_ids,
         )
-        if (
-            not can_apply
-            and not support_state.support_ids
-            and not legacy_configured_source_ids
-        ):
-            raise MemoryLifecycleConflict(
-                "workspace_memory_correction_requires_management_authority"
-            )
+        if not can_apply and not support_state.support_ids and not legacy_configured_source_ids:
+            raise MemoryLifecycleConflict("workspace_memory_correction_requires_management_authority")
 
         now = datetime.now(timezone.utc)
         challenger = Memory(
