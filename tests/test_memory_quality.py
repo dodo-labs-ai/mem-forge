@@ -466,11 +466,56 @@ async def test_admin_memory_detail_exposes_service_artifact_urls_only(db: Databa
         response = client.get(f"/api/v1/memories/{memory.id}")
 
     assert response.status_code == 200
-    source = response.json()["sources"][0]
-    assert source["content_url"] is None
-    assert source["pdf_url"] == "/api/v1/documents/doc-pdf-uri/pdf"
-    assert "file_uri" not in source
-    assert "pdf_uri" not in source
+    evidence = response.json()["evidence"][0]
+    assert evidence["kind"] == "document"
+    document = evidence["document"]
+    assert document["content_url"] is None
+    assert document["pdf_url"] == "/api/v1/documents/doc-pdf-uri/pdf"
+    assert "file_uri" not in document
+    assert "pdf_uri" not in document
+    assert evidence["items"][0]["excerpt"] == "source excerpt"
+
+
+@pytest.mark.asyncio
+async def test_memory_detail_represents_unprojected_legacy_provenance_without_revision_identity(
+    db: Database,
+    tmp_path: Path,
+) -> None:
+    from memforge.server.admin_api import create_admin_app
+
+    doc = await _insert_document(db, doc_id="doc-legacy-unprojected")
+    memory = await _insert_memory(
+        db,
+        mem_id="mem-legacy-unprojected",
+        content="A preserved legacy claim.",
+    )
+    await db.add_memory_source(
+        memory.id,
+        doc.doc_id,
+        "confluence",
+        excerpt="Legacy source excerpt.",
+        source_updated_at=None,
+        support_kind="legacy_limited",
+    )
+
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        response = client.get(f"/api/v1/memories/{memory.id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "sources" not in payload
+    assert "evidence_artifacts" not in payload
+    [group] = payload["evidence"]
+    assert group["kind"] == "document"
+    assert group["legacy_limited"] is True
+    assert group["evidence_unit_id"] is None
+    assert group["source_unit_id"] is None
+    [item] = group["items"]
+    assert item["authority"] == "application_document"
+    assert item["observation_id"] is None
+    assert item["observation_revision_id"] is None
+    assert item["excerpt"] == "Legacy source excerpt."
 
 
 @pytest.mark.asyncio
@@ -550,11 +595,13 @@ async def test_admin_document_artifact_urls_serve_docker_safe_content(db: Databa
         pdf = client.get("/api/v1/documents/doc-artifact-url/pdf")
 
     assert detail.status_code == 200
-    source = detail.json()["sources"][0]
-    assert source["content_url"] == "/api/v1/documents/doc-artifact-url/content"
-    assert source["pdf_url"] == "/api/v1/documents/doc-artifact-url/pdf"
-    assert "file_uri" not in source
-    assert "pdf_uri" not in source
+    evidence = detail.json()["evidence"][0]
+    assert evidence["kind"] == "document"
+    document = evidence["document"]
+    assert document["content_url"] == "/api/v1/documents/doc-artifact-url/content"
+    assert document["pdf_url"] == "/api/v1/documents/doc-artifact-url/pdf"
+    assert "file_uri" not in document
+    assert "pdf_uri" not in document
     assert manifest.status_code == 200
     artifacts = manifest.json()["artifacts"]
     assert artifacts["normalized_markdown"]["url"] == (
@@ -757,7 +804,8 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
         resource_head = client.head("/api/v1/source-artifacts/obsrev-image")
 
     assert detail.status_code == 200
-    [artifact] = detail.json()["evidence_artifacts"]
+    [evidence_unit] = detail.json()["evidence"]
+    artifact = evidence_unit["items"][-1]["artifact"]
     assert artifact["observation_revision_id"] == "obsrev-image"
     assert artifact["evidence_reference_id"] == "eref-image"
     assert artifact["evidence_role"] == "context"
@@ -765,7 +813,6 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     assert artifact["sha256"] == digest
     assert artifact["summary"] == ("Service case review screen showing the investigation areas.")
     assert artifact["url"] == "/api/v1/source-artifacts/obsrev-image"
-    [evidence_unit] = detail.json()["evidence"]
     assert [item["role"] for item in evidence_unit["items"]] == [
         "primary",
         "required",
@@ -788,7 +835,13 @@ async def test_memory_detail_and_source_artifact_route_preserve_exact_image_evid
     with TestClient(app) as client:
         stale_support_detail = client.get(f"/api/v1/memories/{memory.id}")
     assert stale_support_detail.status_code == 200
-    assert stale_support_detail.json()["evidence_artifacts"] == []
+    assert not [
+        item["artifact"]
+        for group in stale_support_detail.json()["evidence"]
+        if group["current"]
+        for item in group["items"]
+        if item["current"] and item["artifact"] is not None
+    ]
     assert resource.status_code == 200
     assert resource_head.status_code == 200
     assert resource.headers["content-type"] == "image/png"
@@ -1003,8 +1056,10 @@ async def test_admin_document_artifacts_can_use_non_filesystem_store(db: Databas
         content = client.get("/api/v1/documents/doc-object-artifact-url/content")
 
     assert detail.status_code == 200
-    source = detail.json()["sources"][0]
-    assert source["content_url"] == "/api/v1/documents/doc-object-artifact-url/content"
+    evidence = detail.json()["evidence"][0]
+    assert evidence["document"]["content_url"] == (
+        "/api/v1/documents/doc-object-artifact-url/content"
+    )
     assert manifest.status_code == 200
     assert manifest.json()["artifacts"]["normalized_markdown"]["size_bytes"] == 55
     assert content.status_code == 200

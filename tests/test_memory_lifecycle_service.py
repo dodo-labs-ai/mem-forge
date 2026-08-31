@@ -1249,17 +1249,27 @@ async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_searc
     assert "User confirmed this after validating the payroll smoke flow." not in str(search_result)
     assert "sources" not in search_result
     detail = detail_response.json()
+    assert "sources" not in detail
+    assert "evidence_artifacts" not in detail
     assert detail["id"] == payload["memory_id"]
     assert detail["content"] == "Use canonical payroll trigger status fields."
-    [source] = detail["sources"]
-    assert source["doc_id"] == f"user-memory-{payload['memory_id']}"
-    assert source["source_type"] == "user_memory"
-    assert source["support_kind"] == "extracted"
-    assert source["doc_title"] == f"User memory {payload['memory_id']}"
-    assert source["source_url"] == f"memforge://user-memory/user-memory-{payload['memory_id']}"
-    assert source["content_url"] is None
-    assert source["pdf_url"] is None
-    assert source["excerpt"] == "User confirmed this after validating the payroll smoke flow."
+    [evidence] = detail["evidence"]
+    assert evidence["kind"] == "document"
+    assert evidence["source_id"] == "user_memory"
+    assert evidence["source_type"] == "user_memory"
+    assert evidence["evidence_unit_id"] is None
+    assert evidence["source_unit_id"] is None
+    document = evidence["document"]
+    assert document["doc_id"] == f"user-memory-{payload['memory_id']}"
+    assert document["title"] == f"User memory {payload['memory_id']}"
+    assert document["source_url"] == f"memforge://user-memory/user-memory-{payload['memory_id']}"
+    assert document["content_url"] is None
+    assert document["pdf_url"] is None
+    [item] = evidence["items"]
+    assert item["authority"] == "application_document"
+    assert item["observation_id"] is None
+    assert item["observation_revision_id"] is None
+    assert item["excerpt"] == "User confirmed this after validating the payroll smoke flow."
     stored = await db.get_memory(payload["memory_id"])
     assert payload["status"] == "inserted"
     assert stored is not None

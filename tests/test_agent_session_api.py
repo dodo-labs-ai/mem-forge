@@ -2008,9 +2008,9 @@ def test_agent_session_memory_detail_exposes_source_updated_at(tmp_path):
 
         assert detail.status_code == 200, detail.text
         body = detail.json()
-        source = body["sources"][0]
-        assert source["source_updated_at"] == "2026-06-20T04:23:51+00:00"
-        assert source["added_at"] != source["source_updated_at"]
+        evidence = body["evidence"][0]
+        assert evidence["document"]["source_updated_at"] == "2026-06-20T04:23:51+00:00"
+        assert "added_at" not in evidence["document"]
         assert not body["created_at"].startswith("2026-06-20T04:23:51")
 
         async def _claim() -> dict:
@@ -2129,9 +2129,9 @@ def test_agent_session_memory_detail_does_not_fallback_source_updated_at(tmp_pat
             detail = client.get(f"/api/v1/memories/{memory_id}")
 
         assert detail.status_code == 200, detail.text
-        source = detail.json()["sources"][0]
-        assert source["source_updated_at"] is None
-        assert source["added_at"] != "2026-06-23T22:00:00+00:00"
+        evidence = detail.json()["evidence"][0]
+        assert evidence["document"]["source_updated_at"] is None
+        assert "added_at" not in evidence["document"]
     finally:
         asyncio.run(database.close())
 

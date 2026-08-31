@@ -29,7 +29,7 @@ export interface Memory {
   updated_at: string;
   extraction_context: string | null;
   entity_refs: string[];
-  sources: MemorySource[];
+  evidence: MemoryEvidenceGroup[];
   /** Source type for the leading glyph: extraction origin, else first source. */
   origin_source_type: string | null;
   /**
@@ -40,19 +40,56 @@ export interface Memory {
   origin_client?: string | null;
 }
 
-export type MemorySourceSupportKind = "extracted" | "corroborated";
-
-export interface MemorySource {
+export interface MemoryEvidenceDocument {
   doc_id: string;
-  source_type: string;
+  title: string | null;
+  source_url: string | null;
+  content_url: string | null;
+  pdf_url: string | null;
+  source_updated_at: string | null;
+}
+
+export interface MemoryEvidenceArtifact {
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  sha256: string;
+  summary: string | null;
+  url: string;
+}
+
+export interface MemoryEvidenceItem {
+  authority: "revision_pinned" | "application_document";
+  evidence_reference_id: string | null;
+  role: "primary" | "required" | "context";
+  kind: "text" | "artifact";
+  support_contribution: boolean;
+  observation_id: string | null;
+  observation_revision_id: string | null;
+  anchor_kind: string;
+  range_start: number | null;
+  range_end: number | null;
   excerpt: string | null;
-  added_at: string;
-  source_observed_at?: string | null;
-  doc_title?: string | null;
-  source_url?: string | null;
-  file_uri?: string | null;
-  pdf_uri?: string | null;
-  support_kind?: MemorySourceSupportKind;
+  raw_content_sha256: string | null;
+  presentation_sha256: string | null;
+  current: boolean;
+  artifact: MemoryEvidenceArtifact | null;
+}
+
+export interface MemoryEvidenceGroup {
+  kind: "evidence_unit" | "document";
+  evidence_unit_id: string | null;
+  support_ids: string[];
+  support_scope_version: "reference-set-v1" | "evidence-unit-set-v2" | null;
+  source_id: string;
+  source_type: string;
+  source_unit_id: string | null;
+  source_unit_revision_id: string | null;
+  doc_id: string | null;
+  document: MemoryEvidenceDocument | null;
+  current: boolean;
+  legacy_limited: boolean;
+  items: MemoryEvidenceItem[];
 }
 
 export interface Entity {
@@ -799,7 +836,7 @@ export interface MemoryReviewMemorySummary {
   corroboration_count: number;
   status: string;
   entity_refs: string[];
-  sources: MemorySource[];
+  evidence: MemoryEvidenceGroup[];
   created_at: string | null;
   updated_at: string | null;
   origin_source_type?: string | null;
