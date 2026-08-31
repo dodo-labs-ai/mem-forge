@@ -35,7 +35,6 @@ class FakeToolClient:
     calls: list[tuple[str, dict]] = []
     response: dict = {}
     list_response: dict = {"data": []}
-    create_response: dict = {"id": "src-created"}
     projection_inventory_response: dict = {"units": []}
     snapshot_plan_response: dict | None = None
 
@@ -54,11 +53,10 @@ class FakeToolClient:
         self.timeout_seconds = timeout_seconds
 
     @classmethod
-    def reset(cls, response: dict, *, list_response: dict | None = None, create_response: dict | None = None) -> None:
+    def reset(cls, response: dict, *, list_response: dict | None = None) -> None:
         cls.calls = []
         cls.response = response
         cls.list_response = {"data": []} if list_response is None else list_response
-        cls.create_response = {"id": "src-created"} if create_response is None else create_response
         cls.projection_inventory_response = {"units": []}
         cls.snapshot_plan_response = None
 
@@ -82,10 +80,6 @@ class FakeToolClient:
             )
         )
         return self.projection_inventory_response
-
-    def create_source(self, **kwargs):
-        self.calls.append(("create_source", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
-        return self.create_response
 
     def get_source_schedule(self, source_id: str):
         self.calls.append(
@@ -112,15 +106,6 @@ class FakeToolClient:
 
     def get_resource(self, **kwargs):
         self.calls.append(("get_resource", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
-        return self.response
-
-    def start_source_sync(self, **kwargs):
-        self.calls.append(
-            (
-                "start_source_sync",
-                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-            )
-        )
         return self.response
 
     def start_source_processing(self, **kwargs):
