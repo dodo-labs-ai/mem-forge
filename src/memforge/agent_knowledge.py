@@ -84,6 +84,14 @@ PatchOutcome = Literal[
 PatchResultBucket = Literal["applied", "failed", "no_output"]
 
 
+class AgentClaimLifecycleConflict(ValueError):
+    """A managed Agent Claim cannot enter the ordinary projected lifecycle."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class DurableClaim(BaseModel):
     """Durable memory shape produced by the LLM and rendered by the service."""
 
@@ -1032,7 +1040,54 @@ class AgentKnowledgeBundleService:
                     evidence_quote=str(claim["claim_text"]).strip(),
                 )
         if incumbent_memory_id is not None and incumbent_memory_id not in incumbents:
-            raise ValueError("agent claim replacement lacks current Source Unit support")
+            requested_memory = await self.db.get_memory(incumbent_memory_id)
+            requested_claim = await self.db.get_agent_claim_by_memory_id(
+                incumbent_memory_id
+            )
+            requested_concept = await self.db.get_agent_concept(concept_id)
+            requested_source = await self.db.get_source(source_id)
+            requested_sources = await self.db.get_memory_sources(
+                incumbent_memory_id
+            )
+            requested_support = (
+                await self.db.get_active_memory_support_states(
+                    (incumbent_memory_id,)
+                )
+            )[incumbent_memory_id]
+            owner_authorized = (
+                requested_memory is not None
+                and requested_memory.status == "active"
+                and requested_memory.visibility == Visibility.PRIVATE.value
+                and requested_memory.owner_user_id == owner_user_id
+                and requested_claim is not None
+                and str(requested_claim["concept_id"]) == concept_id
+                and requested_concept is not None
+                and str(requested_concept["source_id"]) == source_id
+                and str(requested_concept["owner_user_id"]) == owner_user_id
+                and requested_source is not None
+                and str(requested_source["type"]) == "agent_session"
+                and str(requested_source["owner_user_id"]) == owner_user_id
+                and any(
+                    edge.source_id == source_id
+                    and edge.doc_id == concept_id
+                    and edge.source_type == "agent_session"
+                    for edge in requested_sources
+                )
+                and not requested_support.support_ids
+            )
+            if not owner_authorized:
+                raise AgentClaimLifecycleConflict(
+                    "source_backed_memory_lineage_incomplete"
+                )
+            incumbents[incumbent_memory_id] = requested_memory
+            incumbent_candidates[incumbent_memory_id] = RawMemory(
+                content=requested_memory.content,
+                memory_type=requested_memory.memory_type,
+                confidence=requested_memory.confidence,
+                extraction_context=str(requested_claim["claim_text"]).strip(),
+                evidence_quote=str(requested_claim["claim_text"]).strip(),
+            )
+            source_support = {**source_support, incumbent_memory_id: ()}
         for memory_id, candidate in tuple(incumbent_candidates.items()):
             if memory_id == incumbent_memory_id:
                 continue
@@ -1150,6 +1205,12 @@ class AgentKnowledgeBundleService:
             ),
             evidence_units=evidence.units,
             evidence_references=evidence.references,
+            explicit_owner_incumbent_ids=(
+                frozenset({incumbent_memory_id})
+                if incumbent_memory_id is not None
+                and not source_support.get(incumbent_memory_id)
+                else frozenset()
+            ),
         )
         memory_id = next(
             (
@@ -1177,6 +1238,13 @@ class AgentKnowledgeBundleService:
         revision-pinned Evidence References used by Support Assertions.
         """
 
+        support_unit_ids = {
+            evidence_unit_id
+            for mutation in plan.mutations
+            if mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
+            and mutation.memory_id == target_memory_id
+            for evidence_unit_id in mutation.evidence_unit_ids
+        }
         support_reference_ids = {
             reference_id
             for mutation in plan.mutations
@@ -1184,7 +1252,7 @@ class AgentKnowledgeBundleService:
             and mutation.memory_id == target_memory_id
             for reference_id in mutation.evidence_reference_ids
         }
-        evidence_unit_ids = {
+        evidence_unit_ids = support_unit_ids or {
             reference.evidence_unit_id
             for reference in plan.evidence_references
             if reference.id in support_reference_ids
