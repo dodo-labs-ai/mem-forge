@@ -14,6 +14,7 @@ from memforge.memory.evidence import (
 )
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
+    IncumbentAuthority,
     IncumbentDecision,
     IncumbentDisposition,
     LifecycleGateState,
@@ -80,10 +81,26 @@ def build_lifecycle_plan(
     evidence_units: Sequence[EvidenceUnit] = (),
     evidence_references: Sequence[EvidenceReference] = (),
     incumbent_batch_size: int = 30,
+    explicit_owner_incumbent_ids: frozenset[str] = frozenset(),
 ) -> LifecyclePlan:
     """Build a complete plan without performing any storage mutation."""
 
     incumbent_ids = tuple(sorted(incumbents))
+    unknown_explicit_owner_incumbents = explicit_owner_incumbent_ids.difference(
+        incumbents
+    )
+    if unknown_explicit_owner_incumbents:
+        raise ValueError(
+            "explicit owner authority targets an unknown incumbent: "
+            f"{sorted(unknown_explicit_owner_incumbents)}"
+        )
+
+    def incumbent_authority(memory_id: str) -> IncumbentAuthority:
+        return (
+            IncumbentAuthority.EXPLICIT_OWNER_MANAGED_CLAIM
+            if memory_id in explicit_owner_incumbent_ids
+            else IncumbentAuthority.CURRENT_SOURCE_SUPPORT
+        )
     by_incumbent: dict[str, ReconcileOperation] = {}
     add_operations: list[ReconcileOperation] = []
     for operation in operations:
@@ -328,18 +345,21 @@ def build_lifecycle_plan(
             continue
 
         if operation.action is ReconcileAction.DELETE:
-            if not current_source_support:
+            explicit_owner_action = memory_id in explicit_owner_incumbent_ids
+            if not current_source_support and not explicit_owner_action:
                 raise ValueError(f"destructive incumbent lacks current-scope support: {memory_id}")
             if gate_state is LifecycleGateState.GATED or operation.flag_for_review:
-                proposed_mutations = [
-                    LifecycleMutation(
-                        LifecycleMutationType.REMOVE_SUPPORT,
-                        memory_id=memory_id,
-                        source_id=scope.source_id,
-                        **support_identity(current_source_support),
-                        payload={"document_id": defaults.doc_id},
+                proposed_mutations = []
+                if current_source_support:
+                    proposed_mutations.append(
+                        LifecycleMutation(
+                            LifecycleMutationType.REMOVE_SUPPORT,
+                            memory_id=memory_id,
+                            source_id=scope.source_id,
+                            **support_identity(current_source_support),
+                            payload={"document_id": defaults.doc_id},
+                        )
                     )
-                ]
                 if not external_support:
                     proposed_mutations.append(
                         LifecycleMutation(
@@ -357,7 +377,14 @@ def build_lifecycle_plan(
                             source_id=scope.source_id,
                         )
                     )
-                decisions.append(IncumbentDecision(memory_id, IncumbentDisposition.REVIEW, operation.reason or "gate"))
+                decisions.append(
+                    IncumbentDecision(
+                        memory_id,
+                        IncumbentDisposition.REVIEW,
+                        operation.reason or "gate",
+                        authority=incumbent_authority(memory_id),
+                    )
+                )
                 mutations.append(
                     _review_mutation(
                         scope,
@@ -373,17 +400,19 @@ def build_lifecycle_plan(
                     memory_id,
                     IncumbentDisposition.REMOVE_SUPPORT,
                     operation.reason or "source evidence removed",
+                    authority=incumbent_authority(memory_id),
                 )
             )
-            mutations.append(
-                LifecycleMutation(
-                    LifecycleMutationType.REMOVE_SUPPORT,
-                    memory_id=memory_id,
-                    source_id=scope.source_id,
-                    **support_identity(current_source_support),
-                    payload={"document_id": defaults.doc_id},
+            if current_source_support:
+                mutations.append(
+                    LifecycleMutation(
+                        LifecycleMutationType.REMOVE_SUPPORT,
+                        memory_id=memory_id,
+                        source_id=scope.source_id,
+                        **support_identity(current_source_support),
+                        payload={"document_id": defaults.doc_id},
+                    )
                 )
-            )
             if not external_support:
                 mutations.append(
                     LifecycleMutation(
@@ -406,7 +435,8 @@ def build_lifecycle_plan(
         if operation.action in {ReconcileAction.UPDATE, ReconcileAction.SUPERSEDE}:
             if operation.memory is None:
                 raise ValueError("replacement operation requires a new Memory candidate")
-            if not current_source_support:
+            explicit_owner_action = memory_id in explicit_owner_incumbent_ids
+            if not current_source_support and not explicit_owner_action:
                 raise ValueError(f"replacement incumbent lacks current-scope support: {memory_id}")
             if gate_state is LifecycleGateState.GATED or external_support or operation.flag_for_review:
                 replacement_id, creation_mutations = memory_creation_mutations(operation.memory)
@@ -445,7 +475,12 @@ def build_lifecycle_plan(
                         )
                     )
                 decisions.append(
-                    IncumbentDecision(memory_id, IncumbentDisposition.REVIEW, operation.reason or "review")
+                    IncumbentDecision(
+                        memory_id,
+                        IncumbentDisposition.REVIEW,
+                        operation.reason or "review",
+                        authority=incumbent_authority(memory_id),
+                    )
                 )
                 mutations.append(
                     _review_mutation(
@@ -477,29 +512,31 @@ def build_lifecycle_plan(
                     IncumbentDisposition.SUPERSEDE,
                     operation.reason or "authoritative replacement",
                     replacement_memory_id=replacement_id,
+                    authority=incumbent_authority(memory_id),
                 )
             )
-            mutations.extend(
-                (
+            if current_source_support:
+                mutations.append(
                     LifecycleMutation(
                         LifecycleMutationType.REMOVE_SUPPORT,
                         memory_id=memory_id,
                         source_id=scope.source_id,
                         **support_identity(current_source_support),
                         payload={"document_id": defaults.doc_id},
-                    ),
-                    LifecycleMutation(
-                        LifecycleMutationType.SUPERSEDE_MEMORY,
-                        memory_id=memory_id,
-                        source_id=scope.source_id,
-                        replacement_memory_id=replacement_id,
-                        payload={
-                            "reason": operation.reason or "authoritative replacement",
-                            "replacement_kind": (
-                                "revision" if operation.action is ReconcileAction.UPDATE else "supersession"
-                            ),
-                        },
-                    ),
+                    )
+                )
+            mutations.append(
+                LifecycleMutation(
+                    LifecycleMutationType.SUPERSEDE_MEMORY,
+                    memory_id=memory_id,
+                    source_id=scope.source_id,
+                    replacement_memory_id=replacement_id,
+                    payload={
+                        "reason": operation.reason or "authoritative replacement",
+                        "replacement_kind": (
+                            "revision" if operation.action is ReconcileAction.UPDATE else "supersession"
+                        ),
+                    },
                 )
             )
             continue

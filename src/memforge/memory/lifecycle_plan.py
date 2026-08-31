@@ -299,6 +299,13 @@ class IncumbentDisposition(str, Enum):
     REVIEW = "review"
 
 
+class IncumbentAuthority(str, Enum):
+    """Authority that admits an incumbent to one destructive decision."""
+
+    CURRENT_SOURCE_SUPPORT = "current_source_support"
+    EXPLICIT_OWNER_MANAGED_CLAIM = "explicit_owner_managed_claim"
+
+
 class LifecycleMutationType(str, Enum):
     CREATE_MEMORY = "create_memory"
     REACTIVATE_MEMORY = "reactivate_memory"
@@ -345,6 +352,7 @@ class IncumbentDecision:
     disposition: IncumbentDisposition
     reason: str
     replacement_memory_id: str | None = None
+    authority: IncumbentAuthority = IncumbentAuthority.CURRENT_SOURCE_SUPPORT
 
     def __post_init__(self) -> None:
         if self.disposition is IncumbentDisposition.SUPERSEDE and not self.replacement_memory_id:
@@ -605,6 +613,12 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
                     "disposition": item.disposition.value,
                     "reason": item.reason,
                     "replacement_memory_id": item.replacement_memory_id,
+                    **(
+                        {"authority": item.authority.value}
+                        if item.authority
+                        is not IncumbentAuthority.CURRENT_SOURCE_SUPPORT
+                        else {}
+                    ),
                 }
                 for item in plan.coverage_proof.incumbent_decisions
             ],
