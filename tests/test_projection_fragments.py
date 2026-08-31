@@ -75,11 +75,11 @@ async def db(tmp_path):
 
 def _projection(
     *,
+    primary_content: str = "# Release rule\n\nUse approval before release.\n",
     context_profile=MARKDOWN_PROFILE,
     context_content: str = "# Dependency\n\nApproval means two reviewers.\n",
     context_metadata=None,
 ) -> SourceProjection:
-    primary_content = "# Release rule\n\nUse approval before release.\n"
     revisions = (
         SourceObservationRevision(
             id="rev-primary",
@@ -333,6 +333,50 @@ def test_agent_event_receipt_maps_authority_to_one_projected_markdown_fragment()
         ("E2", EvidenceRole.REQUIRED),
     ]
     assert receipt.to_payload()["catalog_digest"] == selection.catalog_digest
+
+
+def test_agent_claim_spanning_structural_blocks_uses_one_primary_required_unit() -> None:
+    claim = (
+        "MemForge Cloud uses two database tiers.\n\n"
+        "**Control plane**\n\n"
+        "- Uses native runtime DDL.\n"
+        "- Does not use the retired HDI deployer.\n\n"
+        "**Workspace plane**\n\n"
+        "Uses app-managed runtime migrations."
+    )
+    projection = _projection(primary_content=f"# Database architecture\n\n{claim}\n")
+
+    selection, receipt = resolve_projected_agent_claim_fragment(
+        projection,
+        claim_text=claim,
+        access_context_hash="access-1",
+        primary_event_id="E1",
+    )
+
+    assert len(selection.parts) > 1
+    assert selection.parts[0].role is EvidenceRole.PRIMARY
+    assert all(part.role is EvidenceRole.REQUIRED for part in selection.parts[1:])
+    assert {part.anchor.observation_revision_id for part in selection.parts} == {
+        "rev-primary"
+    }
+    assert receipt.claim_anchor.range_start == projection.observation_revisions[
+        0
+    ].content.index(claim)
+    assert receipt.claim_anchor.range_end == receipt.claim_anchor.range_start + len(
+        claim
+    )
+
+
+def test_agent_claim_fragment_set_rejects_uncovered_markdown_content() -> None:
+    claim = "First paragraph.\n\n---\n\nSecond paragraph."
+    projection = _projection(primary_content=f"# Rule\n\n{claim}\n")
+
+    with pytest.raises(ValueError, match="content gap"):
+        resolve_projected_agent_claim_fragment(
+            projection,
+            claim_text=claim,
+            access_context_hash="access-1",
+        )
 
 
 def test_missing_profile_makes_complete_catalog_unusable_without_widening() -> None:

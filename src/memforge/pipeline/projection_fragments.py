@@ -448,9 +448,31 @@ def resolve_projected_agent_claim_fragment(
         and fragment.anchor.range_start <= claim_start
         and claim_end <= fragment.anchor.range_end
     ]
-    if len(candidates) != 1:
-        raise ValueError("projected agent claim must map to one claim-coherent Fragment")
-    selection = catalog.resolve_selection(primary_ref=candidates[0].reference)
+    if len(candidates) == 1:
+        selected_fragments = (candidates[0],)
+        claim_anchor = candidates[0].anchor
+    elif candidates:
+        raise ValueError("projected agent claim maps to ambiguous enclosing Fragments")
+    else:
+        selected_fragments = _claim_covering_fragments(
+            catalog.fragments,
+            revision=revision,
+            claim_start=claim_start,
+            claim_end=claim_end,
+        )
+        claim_anchor = SourceAnchor(
+            kind=AnchorKind.REVISION_RANGE,
+            observation_id=revision.observation_id,
+            observation_revision_id=revision.id,
+            range_start=claim_start,
+            range_end=claim_end,
+        )
+    selection = catalog.resolve_selection(
+        primary_ref=selected_fragments[0].reference,
+        required_refs=tuple(
+            fragment.reference for fragment in selected_fragments[1:]
+        ),
+    )
     selected_events: list[tuple[EvidenceRole, str]] = []
     if primary_event_id is not None:
         selected_events.append((EvidenceRole.PRIMARY, primary_event_id))
@@ -461,16 +483,74 @@ def resolve_projected_agent_claim_fragment(
         AgentEventSourceRange(
             event_id=event_id,
             role=role,
-            anchor=candidates[0].anchor,
+            anchor=claim_anchor,
         )
         for role, event_id in selected_events
     )
     return selection, AgentEventSourceRangeReceipt(
         target_unit_revision_id=catalog.target_unit_revision_id,
         catalog_digest=catalog.digest,
-        claim_anchor=candidates[0].anchor,
+        claim_anchor=claim_anchor,
         event_ranges=event_ranges,
     )
+
+
+def _claim_covering_fragments(
+    fragments: tuple[EvidenceFragment, ...],
+    *,
+    revision: SourceObservationRevision,
+    claim_start: int,
+    claim_end: int,
+) -> tuple[EvidenceFragment, ...]:
+    """Return the minimal ordered structural set covering one exact claim."""
+
+    selected = tuple(
+        sorted(
+            (
+                fragment
+                for fragment in fragments
+                if fragment.kind is EvidenceFragmentKind.TEXT
+                and fragment.anchor.observation_revision_id == revision.id
+                and fragment.anchor.range_start is not None
+                and fragment.anchor.range_end is not None
+                and fragment.anchor.range_start < claim_end
+                and claim_start < fragment.anchor.range_end
+            ),
+            key=lambda fragment: (
+                fragment.anchor.range_start,
+                fragment.anchor.range_end,
+                fragment.reference,
+            ),
+        )
+    )
+    if not selected or EvidenceRole.PRIMARY not in selected[0].eligible_roles:
+        raise ValueError("projected agent claim has no Primary Fragment coverage")
+    if any(
+        EvidenceRole.REQUIRED not in fragment.eligible_roles
+        for fragment in selected[1:]
+    ):
+        raise ValueError("projected agent claim has ineligible Required Fragment coverage")
+
+    cursor = claim_start
+    previous_fragment_end: int | None = None
+    for fragment in selected:
+        fragment_start = fragment.anchor.range_start
+        fragment_end = fragment.anchor.range_end
+        assert fragment_start is not None and fragment_end is not None
+        if (
+            previous_fragment_end is not None
+            and fragment_start < previous_fragment_end
+        ):
+            raise ValueError("projected agent claim Fragment coverage is ambiguous")
+        previous_fragment_end = fragment_end
+        start = max(claim_start, fragment_start)
+        end = min(claim_end, fragment_end)
+        if start > cursor and revision.content[cursor:start].strip():
+            raise ValueError("projected agent claim Fragment coverage has a content gap")
+        cursor = max(cursor, end)
+    if cursor < claim_end and revision.content[cursor:claim_end].strip():
+        raise ValueError("projected agent claim Fragment coverage is incomplete")
+    return selected
 
 
 def _roles(primary: bool) -> frozenset[EvidenceRole]:
