@@ -870,6 +870,7 @@ async def test_retired_claim_backed_memory_is_removed_from_active_claim_projecti
         created.memory_id,
         reason="user_retired",
         expected_content_hash=old.content_hash,
+        actor_user_id="u-andrew",
     )
 
     active_claims = await db.list_agent_claims(created.concept_id)

@@ -304,6 +304,19 @@ class IncumbentAuthority(str, Enum):
 
     CURRENT_SOURCE_SUPPORT = "current_source_support"
     EXPLICIT_OWNER_MANAGED_CLAIM = "explicit_owner_managed_claim"
+    MAINTENANCE_OPERATOR = "maintenance_operator"
+
+
+@dataclass(frozen=True, slots=True)
+class IncumbentAuthorityGrant:
+    authority: IncumbentAuthority
+    actor_id: str
+
+    def __post_init__(self) -> None:
+        if self.authority is IncumbentAuthority.CURRENT_SOURCE_SUPPORT:
+            raise ValueError("current Source Support does not use an actor grant")
+        if not self.actor_id.strip():
+            raise ValueError("incumbent authority grant requires actor_id")
 
 
 class LifecycleMutationType(str, Enum):
@@ -353,10 +366,16 @@ class IncumbentDecision:
     reason: str
     replacement_memory_id: str | None = None
     authority: IncumbentAuthority = IncumbentAuthority.CURRENT_SOURCE_SUPPORT
+    authority_actor_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.disposition is IncumbentDisposition.SUPERSEDE and not self.replacement_memory_id:
             raise ValueError("supersede decision requires replacement_memory_id")
+        if self.authority is IncumbentAuthority.CURRENT_SOURCE_SUPPORT:
+            if self.authority_actor_id is not None:
+                raise ValueError("current Source Support decision cannot carry an authority actor")
+        elif not (self.authority_actor_id or "").strip():
+            raise ValueError("non-Source authority decision requires authority actor")
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,6 +459,23 @@ class LifecyclePlan:
         ):
             raise ValueError("destructive mutation rejected by lifecycle gate")
         incumbents = set(self.coverage_proof.mandatory_incumbent_ids)
+        for decision in self.coverage_proof.incumbent_decisions:
+            if decision.authority is not IncumbentAuthority.MAINTENANCE_OPERATOR:
+                continue
+            target_mutations = tuple(
+                mutation
+                for mutation in self.mutations
+                if mutation.memory_id == decision.memory_id
+            )
+            if (
+                decision.disposition is not IncumbentDisposition.REMOVE_SUPPORT
+                or len(target_mutations) != 1
+                or target_mutations[0].mutation_type
+                is not LifecycleMutationType.RETIRE_MEMORY
+            ):
+                raise ValueError(
+                    "maintenance operator authority permits retirement only"
+                )
         for item in self.mutations:
             if item.mutation_type in DESTRUCTIVE_MUTATIONS and item.memory_id not in incumbents:
                 raise ValueError("destructive mutation targets memory outside mandatory incumbent ledger")
@@ -614,7 +650,10 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
                     "reason": item.reason,
                     "replacement_memory_id": item.replacement_memory_id,
                     **(
-                        {"authority": item.authority.value}
+                        {
+                            "authority": item.authority.value,
+                            "authority_actor_id": item.authority_actor_id,
+                        }
                         if item.authority
                         is not IncumbentAuthority.CURRENT_SOURCE_SUPPORT
                         else {}
