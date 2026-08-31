@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
 
-from memforge.agent_knowledge import AgentKnowledgeBundleService
+from memforge.agent_knowledge import (
+    AgentClaimLifecycleConflict,
+    AgentKnowledgeBundleService,
+)
 from memforge.memory.correction_authority import CorrectionAuthority
 from memforge.memory.store import MemoryStore
 from memforge.models import (
@@ -149,14 +152,17 @@ class MemoryLifecycleService:
         memory = await self._active_target(memory_id, expected_content_hash=expected_content_hash)
         claim = await self.db.get_agent_claim_by_memory_id(memory.id)
         if claim is not None:
-            await AgentKnowledgeBundleService(
-                db=self.db,
-                memory_store=self.memory_store,
-            ).retire_claim_from_user_request(
-                old_memory_id=memory.id,
-                reason=reason,
-                observed_at=datetime.now(timezone.utc),
-            )
+            try:
+                await AgentKnowledgeBundleService(
+                    db=self.db,
+                    memory_store=self.memory_store,
+                ).retire_claim_from_user_request(
+                    old_memory_id=memory.id,
+                    reason=reason,
+                    observed_at=datetime.now(timezone.utc),
+                )
+            except AgentClaimLifecycleConflict as exc:
+                raise MemoryLifecycleConflict(exc.code) from exc
             return RetireMemoryResult(memory_id=memory.id, status="retired")
         support_state = (
             await self.db.get_active_memory_support_states((memory.id,))
@@ -211,17 +217,20 @@ class MemoryLifecycleService:
 
         claim = await self.db.get_agent_claim_by_memory_id(old.id)
         if claim is not None:
-            replacement_id = await AgentKnowledgeBundleService(
-                db=self.db,
-                memory_store=self.memory_store,
-            ).replace_claim_from_user_correction(
-                old_memory_id=old.id,
-                replacement_content=replacement_content,
-                provenance=provenance,
-                reason=reason,
-                replacement_kind=replacement_kind,
-                observed_at=now,
-            )
+            try:
+                replacement_id = await AgentKnowledgeBundleService(
+                    db=self.db,
+                    memory_store=self.memory_store,
+                ).replace_claim_from_user_correction(
+                    old_memory_id=old.id,
+                    replacement_content=replacement_content,
+                    provenance=provenance,
+                    reason=reason,
+                    replacement_kind=replacement_kind,
+                    observed_at=now,
+                )
+            except AgentClaimLifecycleConflict as exc:
+                raise MemoryLifecycleConflict(exc.code) from exc
             new_memory.id = replacement_id
         else:
             support_state = (

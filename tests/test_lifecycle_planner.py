@@ -110,6 +110,73 @@ def test_gated_replacement_stages_review_without_mutating_incumbent() -> None:
     create_payload = staged["proposed_mutations"][0]["payload"]["memory"]
     assert create_payload["extraction_context"] == "A7 is retained"
     assert create_payload["document_source"]["excerpt"] == "A7 is retained"
+    assert "authority" not in lifecycle_plan_to_payload(plan)["coverage_proof"][
+        "incumbent_decisions"
+    ][0]
+
+
+def test_unsupported_destructive_incumbent_still_fails_without_explicit_owner_authority() -> None:
+    old = _memory()
+
+    with pytest.raises(
+        ValueError,
+        match="replacement incumbent lacks current-scope support",
+    ):
+        build_lifecycle_plan(
+            plan_id="plan-unsupported-ordinary",
+            scope=_scope(),
+            gate_state=LifecycleGateState.ENABLED,
+            operations=(
+                ReconcileOperation(
+                    action=ReconcileAction.SUPERSEDE,
+                    memory_id=old.id,
+                    memory=_replacement(),
+                    reason="current source changed",
+                ),
+            ),
+            incumbents={old.id: old},
+            source_support_reference_ids={old.id: ()},
+            all_active_support_reference_ids={old.id: ()},
+            support_set_hashes={old.id: "empty-support-hash"},
+            observation_revision_ids=("obsrev-2",),
+            new_evidence_reference_ids=("eref-new",),
+            defaults=_defaults(),
+        )
+
+
+def test_explicit_owner_managed_claim_authority_does_not_fabricate_old_support() -> None:
+    old = _memory()
+
+    plan = build_lifecycle_plan(
+        plan_id="plan-unsupported-owner",
+        scope=_scope(),
+        gate_state=LifecycleGateState.ENABLED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.SUPERSEDE,
+                memory_id=old.id,
+                memory=_replacement(),
+                reason="owner corrected managed claim",
+            ),
+        ),
+        incumbents={old.id: old},
+        source_support_reference_ids={old.id: ()},
+        all_active_support_reference_ids={old.id: ()},
+        support_set_hashes={old.id: "empty-support-hash"},
+        observation_revision_ids=("obsrev-2",),
+        new_evidence_reference_ids=("eref-new",),
+        defaults=_defaults(),
+        explicit_owner_incumbent_ids=frozenset({old.id}),
+    )
+
+    assert [mutation.mutation_type for mutation in plan.mutations] == [
+        LifecycleMutationType.CREATE_MEMORY,
+        LifecycleMutationType.ATTACH_SUPPORT,
+        LifecycleMutationType.SUPERSEDE_MEMORY,
+    ]
+    assert plan.coverage_proof.incumbent_decisions[0].authority.value == (
+        "explicit_owner_managed_claim"
+    )
 
 
 def test_gated_noop_evidence_rebind_stages_review_without_mutating_incumbent() -> None:
