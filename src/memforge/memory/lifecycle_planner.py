@@ -15,6 +15,7 @@ from memforge.memory.evidence import (
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
     IncumbentAuthority,
+    IncumbentAuthorityGrant,
     IncumbentDecision,
     IncumbentDisposition,
     LifecycleGateState,
@@ -81,45 +82,26 @@ def build_lifecycle_plan(
     evidence_units: Sequence[EvidenceUnit] = (),
     evidence_references: Sequence[EvidenceReference] = (),
     incumbent_batch_size: int = 30,
-    explicit_owner_incumbent_ids: frozenset[str] = frozenset(),
-    maintenance_operator_incumbent_ids: frozenset[str] = frozenset(),
+    incumbent_authority_grants: Mapping[str, IncumbentAuthorityGrant] | None = None,
 ) -> LifecyclePlan:
     """Build a complete plan without performing any storage mutation."""
 
     incumbent_ids = tuple(sorted(incumbents))
-    unknown_explicit_owner_incumbents = explicit_owner_incumbent_ids.difference(
-        incumbents
-    )
-    if unknown_explicit_owner_incumbents:
+    authority_grants = dict(incumbent_authority_grants or {})
+    unknown_authority_incumbents = set(authority_grants).difference(incumbents)
+    if unknown_authority_incumbents:
         raise ValueError(
-            "explicit owner authority targets an unknown incumbent: "
-            f"{sorted(unknown_explicit_owner_incumbents)}"
-        )
-    unknown_maintenance_incumbents = maintenance_operator_incumbent_ids.difference(
-        incumbents
-    )
-    if unknown_maintenance_incumbents:
-        raise ValueError(
-            "maintenance operator authority targets an unknown incumbent: "
-            f"{sorted(unknown_maintenance_incumbents)}"
-        )
-    overlapping_authorities = explicit_owner_incumbent_ids.intersection(
-        maintenance_operator_incumbent_ids
-    )
-    if overlapping_authorities:
-        raise ValueError(
-            "incumbent has multiple lifecycle authorities: "
-            f"{sorted(overlapping_authorities)}"
+            "lifecycle authority targets an unknown incumbent: "
+            f"{sorted(unknown_authority_incumbents)}"
         )
 
     def incumbent_authority(memory_id: str) -> IncumbentAuthority:
-        if memory_id in maintenance_operator_incumbent_ids:
-            return IncumbentAuthority.MAINTENANCE_OPERATOR
-        return (
-            IncumbentAuthority.EXPLICIT_OWNER_MANAGED_CLAIM
-            if memory_id in explicit_owner_incumbent_ids
-            else IncumbentAuthority.CURRENT_SOURCE_SUPPORT
-        )
+        grant = authority_grants.get(memory_id)
+        return grant.authority if grant is not None else IncumbentAuthority.CURRENT_SOURCE_SUPPORT
+
+    def incumbent_authority_actor(memory_id: str) -> str | None:
+        grant = authority_grants.get(memory_id)
+        return grant.actor_id if grant is not None else None
     by_incumbent: dict[str, ReconcileOperation] = {}
     add_operations: list[ReconcileOperation] = []
     for operation in operations:
@@ -364,9 +346,7 @@ def build_lifecycle_plan(
             continue
 
         if operation.action is ReconcileAction.DELETE:
-            evidence_free_action = memory_id in (
-                explicit_owner_incumbent_ids | maintenance_operator_incumbent_ids
-            )
+            evidence_free_action = memory_id in authority_grants
             if not current_source_support and not evidence_free_action:
                 raise ValueError(f"destructive incumbent lacks current-scope support: {memory_id}")
             if gate_state is LifecycleGateState.GATED or operation.flag_for_review:
@@ -404,6 +384,7 @@ def build_lifecycle_plan(
                         IncumbentDisposition.REVIEW,
                         operation.reason or "gate",
                         authority=incumbent_authority(memory_id),
+                        authority_actor_id=incumbent_authority_actor(memory_id),
                     )
                 )
                 mutations.append(
@@ -422,6 +403,7 @@ def build_lifecycle_plan(
                     IncumbentDisposition.REMOVE_SUPPORT,
                     operation.reason or "source evidence removed",
                     authority=incumbent_authority(memory_id),
+                    authority_actor_id=incumbent_authority_actor(memory_id),
                 )
             )
             if current_source_support:
@@ -456,8 +438,12 @@ def build_lifecycle_plan(
         if operation.action in {ReconcileAction.UPDATE, ReconcileAction.SUPERSEDE}:
             if operation.memory is None:
                 raise ValueError("replacement operation requires a new Memory candidate")
-            explicit_owner_action = memory_id in explicit_owner_incumbent_ids
-            if memory_id in maintenance_operator_incumbent_ids:
+            grant = authority_grants.get(memory_id)
+            explicit_owner_action = (
+                grant is not None
+                and grant.authority is IncumbentAuthority.EXPLICIT_OWNER_MANAGED_CLAIM
+            )
+            if grant is not None and grant.authority is IncumbentAuthority.MAINTENANCE_OPERATOR:
                 raise ValueError(
                     f"maintenance operator cannot replace incumbent: {memory_id}"
                 )
@@ -505,6 +491,7 @@ def build_lifecycle_plan(
                         IncumbentDisposition.REVIEW,
                         operation.reason or "review",
                         authority=incumbent_authority(memory_id),
+                        authority_actor_id=incumbent_authority_actor(memory_id),
                     )
                 )
                 mutations.append(
@@ -538,6 +525,7 @@ def build_lifecycle_plan(
                     operation.reason or "authoritative replacement",
                     replacement_memory_id=replacement_id,
                     authority=incumbent_authority(memory_id),
+                    authority_actor_id=incumbent_authority_actor(memory_id),
                 )
             )
             if current_source_support:

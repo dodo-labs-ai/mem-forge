@@ -36,6 +36,7 @@ from memforge.memory.evidence import (
     SupportScopeVersion,
     RelationOutcomeBundle,
 )
+from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle_plan import (
     LegacyMemoryProvenance,
     LifecycleCutoverFinding,
@@ -787,6 +788,7 @@ class RelationalStore(Protocol):
         citations: list[str] | None = None,
         concept_projection: Mapping[str, object] | None = None,
         concept_markdown_body: str | None = None,
+        maintenance_receipt: MemoryAuditEvent | None = None,
     ) -> None: ...
     async def apply_lifecycle_plan(self, plan: LifecyclePlan) -> None: ...
     async def get_lifecycle_plan_payload(

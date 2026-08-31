@@ -202,6 +202,7 @@ class MemoryLifecycleService:
                     old_memory_id=memory.id,
                     reason=reason,
                     observed_at=datetime.now(timezone.utc),
+                    actor_user_id=actor_user_id,
                 )
             except AgentClaimLifecycleConflict as exc:
                 raise MemoryLifecycleConflict(exc.code) from exc
@@ -220,8 +221,29 @@ class MemoryLifecycleService:
     async def report_maintenance_closures(
         self,
         manifest: tuple[MaintenanceClosureEntry, ...],
+        *,
+        operator_actor_id: str,
     ) -> MaintenanceClosureReport:
+        operator_actor_id = operator_actor_id.strip()
+        if not operator_actor_id:
+            raise MemoryLifecycleConflict("operator_actor_id_required")
         normalized = self._normalize_maintenance_manifest(manifest)
+        digest = hashlib.sha256(
+            json.dumps(
+                [
+                    {
+                        "memory_id": item.memory_id,
+                        "expected_content_hash": item.expected_content_hash,
+                        "reason": item.reason,
+                    }
+                    for item in normalized
+                ]
+                + [{"operator_actor_id": operator_actor_id}],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        report_id = f"maintenance-closure-report-{digest}"
         entries: list[MaintenanceClosureReportEntry] = []
         for item in normalized:
             memory = await self.db.get_memory(item.memory_id)
@@ -231,7 +253,26 @@ class MemoryLifecycleService:
             elif memory.content_hash != item.expected_content_hash:
                 disposition = "content_hash_mismatch"
             elif memory.status == "retired" and memory.retirement_reason == item.reason:
-                disposition = "already_closed"
+                receipt_id = self._maintenance_receipt_id(report_id, item.memory_id)
+                prior_receipts = await self.db.list_memory_audit_events(
+                    memory_id=item.memory_id,
+                    event_type="maintenance_memory_closure_committed",
+                    limit=1000,
+                )
+                disposition = (
+                    "already_closed"
+                    if any(
+                        self._maintenance_receipt_matches(
+                            event,
+                            item=item,
+                            report_id=report_id,
+                            receipt_id=receipt_id,
+                            operator_actor_id=operator_actor_id,
+                        )
+                        for event in prior_receipts
+                    )
+                    else "not_active"
+                )
             elif memory.status != "active":
                 disposition = "not_active"
             elif memory.visibility != Visibility.PRIVATE.value:
@@ -240,26 +281,26 @@ class MemoryLifecycleService:
                 support_state = (await self.db.get_active_memory_support_states((memory.id,)))[memory.id]
                 if support_state.support_ids:
                     disposition = "active_support"
+                else:
+                    try:
+                        await AgentKnowledgeBundleService(
+                            db=self.db,
+                            memory_store=self.memory_store,
+                        ).validate_maintenance_retirement(memory.id)
+                    except AgentClaimLifecycleConflict as exc:
+                        disposition = (
+                            "lifecycle_plan_unavailable"
+                            if exc.code == "source_backed_memory_lineage_incomplete"
+                            else exc.code
+                        )
             entries.append(
                 MaintenanceClosureReportEntry(
                     memory_id=item.memory_id,
                     disposition=disposition,
                 )
             )
-        payload = [
-            {
-                "memory_id": item.memory_id,
-                "expected_content_hash": item.expected_content_hash,
-                "reason": item.reason,
-                "disposition": (
-                    "ready" if report_item.disposition in {"ready", "already_closed"} else report_item.disposition
-                ),
-            }
-            for item, report_item in zip(normalized, entries, strict=True)
-        ]
-        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         return MaintenanceClosureReport(
-            id=f"maintenance-closure-report-{digest}",
+            id=report_id,
             entries=tuple(entries),
         )
 
@@ -274,7 +315,10 @@ class MemoryLifecycleService:
         if not operator_actor_id:
             raise MemoryLifecycleConflict("operator_actor_id_required")
         normalized = self._normalize_maintenance_manifest(manifest)
-        report = await self.report_maintenance_closures(normalized)
+        report = await self.report_maintenance_closures(
+            normalized,
+            operator_actor_id=operator_actor_id,
+        )
         if report.id != expected_report_id:
             raise MemoryLifecycleConflict("maintenance_closure_report_mismatch")
         blocked = [item for item in report.entries if item.disposition not in {"ready", "already_closed"}]
@@ -285,6 +329,7 @@ class MemoryLifecycleService:
         report_by_id = {item.memory_id: item for item in report.entries}
         for item in normalized:
             status = "already_retired"
+            receipt_id = self._maintenance_receipt_id(report.id, item.memory_id)
             if report_by_id[item.memory_id].disposition == "ready":
                 memory = await self._active_target(
                     item.memory_id,
@@ -292,6 +337,21 @@ class MemoryLifecycleService:
                 )
                 claim = await self.db.get_agent_claim_by_memory_id(memory.id)
                 if claim is not None:
+                    receipt_event = MemoryAuditEvent(
+                        event_id=receipt_id,
+                        event_type="maintenance_memory_closure_committed",
+                        status="committed",
+                        actor_type="maintenance_operator",
+                        actor_id=operator_actor_id,
+                        memory_id=item.memory_id,
+                        reason=item.reason,
+                        payload={
+                            "authority": "maintenance_operator",
+                            "report_id": report.id,
+                            "receipt_id": receipt_id,
+                            "result": "retired",
+                        },
+                    )
                     try:
                         await AgentKnowledgeBundleService(
                             db=self.db,
@@ -300,32 +360,14 @@ class MemoryLifecycleService:
                             old_memory_id=memory.id,
                             reason=item.reason,
                             observed_at=datetime.now(timezone.utc),
+                            operator_actor_id=operator_actor_id,
+                            maintenance_receipt=receipt_event,
                         )
                     except AgentClaimLifecycleConflict as exc:
                         raise MemoryLifecycleConflict(exc.code) from exc
                 else:
-                    await self.memory_store.retire_memory(memory.id, reason=item.reason)
+                    raise MemoryLifecycleConflict("maintenance_closure_lifecycle_plan_required")
                 status = "retired"
-            receipt_id = (
-                "maintenance-closure-receipt-"
-                + hashlib.sha256(f"{report.id}\x1f{item.memory_id}".encode("utf-8")).hexdigest()
-            )
-            await self.db.insert_memory_audit_event(
-                MemoryAuditEvent(
-                    event_type="maintenance_memory_closure_committed",
-                    status="committed",
-                    actor_type="maintenance_operator",
-                    actor_id=operator_actor_id,
-                    memory_id=item.memory_id,
-                    reason=item.reason,
-                    payload={
-                        "authority": "maintenance_operator",
-                        "report_id": report.id,
-                        "receipt_id": receipt_id,
-                        "result": status,
-                    },
-                )
-            )
             receipts.append(
                 MaintenanceClosureReceipt(
                     id=receipt_id,
@@ -337,6 +379,35 @@ class MemoryLifecycleService:
                 )
             )
         return tuple(receipts)
+
+    @staticmethod
+    def _maintenance_receipt_id(report_id: str, memory_id: str) -> str:
+        return "maintenance-closure-receipt-" + hashlib.sha256(
+            f"{report_id}\x1f{memory_id}".encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _maintenance_receipt_matches(
+        event: MemoryAuditEvent,
+        *,
+        item: MaintenanceClosureEntry,
+        report_id: str,
+        receipt_id: str,
+        operator_actor_id: str,
+    ) -> bool:
+        return (
+            event.event_id == receipt_id
+            and event.event_type == "maintenance_memory_closure_committed"
+            and event.status == "committed"
+            and event.actor_type == "maintenance_operator"
+            and event.actor_id == operator_actor_id
+            and event.memory_id == item.memory_id
+            and event.reason == item.reason
+            and event.payload.get("authority") == "maintenance_operator"
+            and event.payload.get("report_id") == report_id
+            and event.payload.get("receipt_id") == receipt_id
+            and event.payload.get("result") == "retired"
+        )
 
     @staticmethod
     def _normalize_maintenance_manifest(
