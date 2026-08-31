@@ -2789,10 +2789,12 @@ class GeneSyncOrchestrator:
 
             primary_ids = set(batch.primary_observation_ids)
             supplied_observation_ids = primary_ids | set(
-                batch.required_authority_observation_ids
+                batch.context_observation_ids
+                if batch.candidate_context_observation_ids is None
+                else batch.candidate_context_observation_ids
             )
             input_binary_bytes = (
-                batch.primary_image_bytes + batch.required_image_bytes
+                batch.primary_image_bytes + batch.candidate_context_image_bytes
             )
             async with self._heavy_work_slot(
                 source_id,

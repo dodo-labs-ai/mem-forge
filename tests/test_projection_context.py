@@ -231,6 +231,43 @@ def test_jira_short_comments_are_batched_with_core_and_adjacent_context() -> Non
     ]
 
 
+def test_all_bounded_text_context_is_candidate_context_independent_of_relation_type() -> None:
+    projection = _jira_projection(3)
+    comments = [
+        observation
+        for observation in projection.observations
+        if observation.observation_type == "comment"
+    ]
+    revisions = {
+        revision.observation_id: revision
+        for revision in projection.observation_revisions
+    }
+    changed = comments[1]
+    projection = replace(
+        projection,
+        deltas=(
+            replace(
+                projection.deltas[0],
+                changed_anchors=(
+                    SourceAnchor(
+                        kind=AnchorKind.WHOLE_OBSERVATION,
+                        observation_id=changed.id,
+                        observation_revision_id=revisions[changed.id].id,
+                    ),
+                ),
+                added_observation_ids=(),
+            ),
+        ),
+    )
+
+    [batch] = plan_projection_extraction_batches(projection)
+
+    assert batch.primary_observation_ids == (changed.id,)
+    assert set(batch.candidate_context_observation_ids) == set(
+        batch.context_observation_ids
+    )
+
+
 def test_many_messages_use_bounded_transient_batches_not_persisted_units() -> None:
     projection = _jira_projection(20)
 
@@ -275,6 +312,17 @@ def test_scoped_replay_can_select_all_current_observations_without_a_delta() -> 
         for batch in batches
         for observation_id in batch.primary_observation_ids
     } == {observation.id for observation in current.observations}
+
+
+def test_projection_batch_records_primary_eligibility_policy_identity() -> None:
+    projection = _jira_projection(1)
+
+    [batch] = plan_projection_extraction_batches(
+        projection,
+        max_primary_observations=8,
+    )
+
+    assert batch.authority_policy_version == 2
 
 
 def test_many_images_use_bounded_multimodal_batches_without_losing_artifacts() -> None:
@@ -348,6 +396,31 @@ def test_multimodal_batches_bound_bytes_and_exclude_ineligible_originals() -> No
         )
         for batch in ineligible_batches
     )
+
+
+def test_candidate_context_artifacts_share_the_batch_binary_budget() -> None:
+    projection = _confluence_projection_with_images(2, artifact_size=4)
+    artifact_ids = [
+        observation.id
+        for observation in projection.observations
+        if observation.observation_type == "binary_artifact"
+    ]
+
+    batches = plan_projection_extraction_batches(
+        projection,
+        max_primary_observations=1,
+        max_primary_binary_bytes=5,
+    )
+    first_artifact_batch = next(
+        batch
+        for batch in batches
+        if batch.primary_observation_ids == (artifact_ids[0],)
+    )
+
+    assert first_artifact_batch.primary_image_bytes == 4
+    assert artifact_ids[1] in first_artifact_batch.context_observation_ids
+    assert artifact_ids[1] not in first_artifact_batch.candidate_context_observation_ids
+    assert first_artifact_batch.candidate_context_image_bytes == 0
 
 
 def test_multimodal_batches_admit_legacy_artifact_without_eligibility_metadata() -> None:

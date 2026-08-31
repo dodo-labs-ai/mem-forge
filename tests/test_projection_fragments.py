@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -17,7 +18,10 @@ from memforge.agent_knowledge import (
 )
 from memforge.memory.evidence import EvidencePartKind, EvidenceRole
 from memforge.pipeline.memory_extractor import MemoryExtractor
-from memforge.pipeline.projection_context import ProjectionExtractionBatch
+from memforge.pipeline.projection_context import (
+    ProjectionExtractionBatch,
+    plan_projection_extraction_batches,
+)
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
     FragmentSelectionErrorCode,
@@ -230,13 +234,11 @@ def test_catalog_resolves_one_primary_and_canonical_required_order() -> None:
         projection,
         _batch(projection),
         access_context_hash="access-1",
-        required_authority_observation_ids=("obs-context",),
     )
     replay = compile_projection_fragment_catalog(
         projection,
         _batch(projection),
         access_context_hash="access-1",
-        required_authority_observation_ids=("obs-context",),
     )
     assert catalog.usable
     assert replay.digest == catalog.digest
@@ -246,7 +248,7 @@ def test_catalog_resolves_one_primary_and_canonical_required_order() -> None:
         item
         for item in catalog.fragments
         if item.anchor.observation_id == "obs-primary"
-        and EvidenceRole.PRIMARY in item.eligible_roles
+        and item.primary_eligible
         and "approval" in item.presentation_text.lower()
     )
     required = next(
@@ -255,7 +257,7 @@ def test_catalog_resolves_one_primary_and_canonical_required_order() -> None:
         if item.anchor.observation_id == "obs-context"
         and "reviewers" in item.presentation_text.lower()
     )
-    assert required.eligible_roles == frozenset({EvidenceRole.REQUIRED})
+    assert required.primary_eligible is False
 
     selection = catalog.resolve_selection(
         primary_ref=primary.reference,
@@ -278,7 +280,6 @@ def test_catalog_rejects_unknown_duplicate_and_primary_from_required_only() -> N
         projection,
         _batch(projection),
         access_context_hash="access-1",
-        required_authority_observation_ids=("obs-context",),
     )
     primary = next(
         item for item in catalog.fragments if item.anchor.observation_id == "obs-primary"
@@ -303,14 +304,118 @@ def test_catalog_rejects_unknown_duplicate_and_primary_from_required_only() -> N
     assert ineligible.value.code is FragmentSelectionErrorCode.INELIGIBLE_ROLE
 
 
-def test_read_only_context_is_not_selectable_without_explicit_dependency_authority() -> None:
+def test_selection_fingerprint_distinguishes_refs_without_exposing_them() -> None:
     projection = _projection()
     catalog = compile_projection_fragment_catalog(
         projection,
         _batch(projection),
         access_context_hash="access-1",
     )
-    assert catalog.usable
+    primary = next(fragment for fragment in catalog.fragments if fragment.primary_eligible)
+    context = next(
+        fragment for fragment in catalog.fragments if not fragment.primary_eligible
+    )
+    content_hash = hashlib.sha256(b"Release requires approval.").hexdigest()
+
+    accepted = catalog.selection_fingerprint(
+        candidate_content_hash=content_hash,
+        primary_ref=primary.reference,
+        required_refs=[context.reference],
+    )
+    invalid_role = catalog.selection_fingerprint(
+        candidate_content_hash=content_hash,
+        primary_ref=context.reference,
+        required_refs=[primary.reference],
+    )
+
+    assert accepted != invalid_role
+    assert len(accepted) == 64
+    assert primary.reference not in accepted
+    assert context.reference not in accepted
+
+
+def test_bounded_context_is_required_selectable_but_never_primary_eligible() -> None:
+    projection = _projection()
+    projection = replace(
+        projection,
+        deltas=(
+            replace(
+                projection.deltas[0],
+                added_observation_ids=("obs-primary",),
+            ),
+        ),
+    )
+    [batch] = plan_projection_extraction_batches(projection)
+
+    assert batch.primary_observation_ids == ("obs-primary",)
+    assert batch.context_observation_ids == ("obs-context",)
+
+    catalog = compile_projection_fragment_catalog(
+        projection,
+        batch,
+        access_context_hash="access-1",
+    )
+    payload_by_observation = {
+        fragment.anchor.observation_id: payload
+        for fragment, payload in zip(
+            catalog.fragments,
+            catalog.model_payload(),
+            strict=True,
+        )
+    }
+
+    assert payload_by_observation["obs-primary"]["primary_eligible"] is True
+    assert payload_by_observation["obs-context"]["primary_eligible"] is False
+    assert all("eligible_roles" not in payload for payload in catalog.model_payload())
+
+    primary = next(
+        fragment
+        for fragment in catalog.fragments
+        if fragment.anchor.observation_id == "obs-primary"
+    )
+    context = next(
+        fragment
+        for fragment in catalog.fragments
+        if fragment.anchor.observation_id == "obs-context"
+    )
+    selection = catalog.resolve_selection(
+        primary_ref=primary.reference,
+        required_refs=[context.reference],
+    )
+    assert [part.role for part in selection.parts] == [
+        EvidenceRole.PRIMARY,
+        EvidenceRole.REQUIRED,
+    ]
+
+    with pytest.raises(FragmentSelectionError) as ineligible:
+        catalog.resolve_selection(primary_ref=context.reference)
+    assert ineligible.value.code is FragmentSelectionErrorCode.INELIGIBLE_ROLE
+
+
+def test_truncated_context_is_display_only_and_not_selectable() -> None:
+    projection = _projection(context_content="Context that does not fit. " * 20)
+    projection = replace(
+        projection,
+        deltas=(
+            replace(
+                projection.deltas[0],
+                added_observation_ids=("obs-primary",),
+            ),
+        ),
+    )
+    [batch] = plan_projection_extraction_batches(
+        projection,
+        max_context_chars=80,
+    )
+
+    assert batch.context_observation_ids == ("obs-context",)
+    assert batch.candidate_context_observation_ids == ()
+
+    catalog = compile_projection_fragment_catalog(
+        projection,
+        batch,
+        access_context_hash="access-1",
+    )
     assert {
         fragment.anchor.observation_id for fragment in catalog.fragments
     } == {"obs-primary"}
@@ -385,7 +490,6 @@ def test_missing_profile_makes_complete_catalog_unusable_without_widening() -> N
         projection,
         _batch(projection),
         access_context_hash="access-1",
-        required_authority_observation_ids=("obs-context",),
     )
     assert not catalog.usable
     assert catalog.fragments == ()
@@ -414,16 +518,15 @@ def test_inspected_artifact_uses_same_ref_shape_as_text_required() -> None:
         projection,
         _batch(projection),
         access_context_hash="access-1",
-        required_authority_observation_ids=("obs-context",),
         supplied_artifact_observation_ids=("obs-context",),
     )
     primary = next(
         item
         for item in catalog.fragments
-        if item.kind.value == "text" and EvidenceRole.PRIMARY in item.eligible_roles
+        if item.kind.value == "text" and item.primary_eligible
     )
     artifact = next(item for item in catalog.fragments if item.kind.value == "artifact")
-    assert artifact.eligible_roles == frozenset({EvidenceRole.REQUIRED})
+    assert artifact.primary_eligible is False
     artifact_payload = next(
         item for item in catalog.model_payload() if item["kind"] == "artifact"
     )
@@ -459,7 +562,6 @@ def test_supplied_fieldless_legacy_artifact_uses_normalized_eligibility() -> Non
         projection,
         _batch(projection),
         access_context_hash="access-1",
-        required_authority_observation_ids=("obs-context",),
         supplied_artifact_observation_ids=("obs-context",),
     )
 
@@ -476,13 +578,12 @@ async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> 
         projection,
         batch,
         access_context_hash="access-1",
-        required_authority_observation_ids=("obs-context",),
     )
     primary = next(
         item
         for item in catalog.fragments
         if item.anchor.observation_id == "obs-primary"
-        and EvidenceRole.PRIMARY in item.eligible_roles
+        and item.primary_eligible
         and "approval" in item.presentation_text.lower()
     )
     required = next(
