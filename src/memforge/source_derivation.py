@@ -1025,15 +1025,18 @@ def _batch_input_payload_hash(
         "target_unit_revision_id": target_revision_id,
         "extraction_contract_version": extraction_contract_version,
         "batch_id": batch.id,
+        "authority_policy_version": batch.authority_policy_version,
         "primary_observation_ids": list(batch.primary_observation_ids),
         "primary_content_sha256": hashlib.sha256(batch.primary_markdown.encode("utf-8")).hexdigest(),
         "context_observation_ids": list(batch.context_observation_ids),
         "context_content_sha256": hashlib.sha256(batch.context_markdown.encode("utf-8")).hexdigest(),
         "primary_image_bytes": batch.primary_image_bytes,
-        "required_authority_observation_ids": list(
-            batch.required_authority_observation_ids
+        "candidate_context_observation_ids": list(
+            batch.context_observation_ids
+            if batch.candidate_context_observation_ids is None
+            else batch.candidate_context_observation_ids
         ),
-        "required_image_bytes": batch.required_image_bytes,
+        "candidate_context_image_bytes": batch.candidate_context_image_bytes,
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 

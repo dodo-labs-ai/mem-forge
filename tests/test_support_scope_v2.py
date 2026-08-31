@@ -545,7 +545,7 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
         fragment
         for fragment in catalog.fragments
         if "approval" in fragment.presentation_text.lower()
-        and EvidenceRole.PRIMARY in fragment.eligible_roles
+        and fragment.primary_eligible
     )
 
     class Client:
@@ -681,7 +681,7 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
         fragment
         for fragment in updated_catalog.fragments
         if "two approvals" in fragment.presentation_text.lower()
-        and EvidenceRole.PRIMARY in fragment.eligible_roles
+        and fragment.primary_eligible
     )
 
     class UpdatedClient:
