@@ -25,7 +25,7 @@ from memforge.pipeline.evidence_fragments import (
     COMPILER_CONTRACT_VERSION,
     DEFAULT_MAX_FRAGMENTS,
     DEFAULT_MAX_PRESENTATION_CHARS,
-    EvidenceAuthorityRange,
+    EvidenceCandidateRange,
     EvidenceFragment,
     EvidenceFragmentKind,
     FragmentCompilationError,
@@ -82,7 +82,7 @@ class ProjectionFragmentCatalog:
                 "kind": fragment.kind.value,
                 "type": fragment.fragment_type,
                 "text": fragment.presentation_text,
-                "eligible_roles": sorted(role.value for role in fragment.eligible_roles),
+                "primary_eligible": fragment.primary_eligible,
                 **(
                     {"image_source_observation_id": fragment.anchor.observation_id}
                     if fragment.kind is EvidenceFragmentKind.ARTIFACT
@@ -91,6 +91,30 @@ class ProjectionFragmentCatalog:
             }
             for fragment in self.fragments
         )
+
+    def selection_fingerprint(
+        self,
+        *,
+        candidate_content_hash: str,
+        primary_ref: str,
+        required_refs: tuple[str, ...] | list[str] = (),
+    ) -> str:
+        """Return one content-free identity for a model candidate and selectors."""
+
+        payload = {
+            "catalog_digest": self.digest,
+            "candidate_content_hash": candidate_content_hash,
+            "primary_ref": primary_ref,
+            "required_refs": sorted(required_refs),
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
 
     def resolve_selection(
         self,
@@ -134,7 +158,7 @@ class ProjectionFragmentCatalog:
                     FragmentSelectionErrorCode.UNKNOWN_REF,
                     f"unknown, stale, or cross-catalog Fragment reference: {reference}",
                 )
-            if role not in fragment.eligible_roles:
+            if role is EvidenceRole.PRIMARY and not fragment.primary_eligible:
                 raise FragmentSelectionError(
                     FragmentSelectionErrorCode.INELIGIBLE_ROLE,
                     f"Fragment reference is not eligible for {role.value}: {reference}",
@@ -228,7 +252,6 @@ def compile_projection_fragment_catalog(
     batch: ProjectionExtractionBatch,
     *,
     access_context_hash: str,
-    required_authority_observation_ids: tuple[str, ...] | None = None,
     supplied_artifact_observation_ids: tuple[str, ...] = (),
     max_fragments: int = DEFAULT_MAX_FRAGMENTS,
     max_presentation_chars: int = DEFAULT_MAX_PRESENTATION_CHARS,
@@ -253,14 +276,14 @@ def compile_projection_fragment_catalog(
         if revision.id in set(unit_revision.observation_revision_ids)
     }
     observation_ids = {observation.id for observation in projection.observations}
-    required_ids = set(
-        batch.required_authority_observation_ids
-        if required_authority_observation_ids is None
-        else required_authority_observation_ids
+    candidate_context_ids = set(
+        batch.context_observation_ids
+        if batch.candidate_context_observation_ids is None
+        else batch.candidate_context_observation_ids
     )
-    if not required_ids.issubset(batch.context_observation_ids):
-        raise ValueError("Required authority must come from the bounded batch dependency input")
-    selectable_ids = set(batch.primary_observation_ids) | required_ids
+    if not candidate_context_ids.issubset(batch.context_observation_ids):
+        raise ValueError("candidate Context must come from the bounded batch input")
+    selectable_ids = set(batch.primary_observation_ids) | candidate_context_ids
     if not selectable_ids.issubset(revisions) or not selectable_ids.issubset(observation_ids):
         raise ValueError("projection Fragment batch contains stale Observation identity")
     supplied_artifacts = set(supplied_artifact_observation_ids)
@@ -278,7 +301,7 @@ def compile_projection_fragment_catalog(
         revision = revisions[observation_id]
         is_primary = observation_id in set(batch.primary_observation_ids)
         if revision.evidence_profile is None:
-            ranges = (_whole_range(revision, _roles(is_primary)),)
+            ranges = (_whole_range(revision, primary_eligible=is_primary),)
         elif revision.evidence_profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT:
             if observation_id not in supplied_artifacts:
                 if is_primary:
@@ -290,7 +313,7 @@ def compile_projection_fragment_catalog(
                         )
                     )
                 continue
-            ranges = (_whole_range(revision, _roles(is_primary)),)
+            ranges = (_whole_range(revision, primary_eligible=is_primary),)
             raw_artifact = revision.metadata.get("source_artifact")
             artifact_metadata[revision.id] = (
                 dict(raw_artifact) if isinstance(raw_artifact, Mapping) else {}
@@ -307,11 +330,11 @@ def compile_projection_fragment_catalog(
                 )
                 continue
             ranges = tuple(
-                _text_range(revision, start, end, _roles(True))
+                _text_range(revision, start, end, primary_eligible=True)
                 for start, end in spans
             )
         else:
-            ranges = (_whole_range(revision, _roles(False)),)
+            ranges = (_whole_range(revision, primary_eligible=False),)
 
         authority_payload.extend(_authority_payload(revision, ranges))
         compiled = compile_fragments(
@@ -441,7 +464,7 @@ def resolve_projected_agent_claim_fragment(
         fragment
         for fragment in catalog.fragments
         if fragment.kind is EvidenceFragmentKind.TEXT
-        and EvidenceRole.PRIMARY in fragment.eligible_roles
+        and fragment.primary_eligible
         and fragment.anchor.observation_revision_id == revision.id
         and fragment.anchor.range_start is not None
         and fragment.anchor.range_end is not None
@@ -523,13 +546,8 @@ def _claim_covering_fragments(
             ),
         )
     )
-    if not selected or EvidenceRole.PRIMARY not in selected[0].eligible_roles:
+    if not selected or not selected[0].primary_eligible:
         raise ValueError("projected agent claim has no Primary Fragment coverage")
-    if any(
-        EvidenceRole.REQUIRED not in fragment.eligible_roles
-        for fragment in selected[1:]
-    ):
-        raise ValueError("projected agent claim has ineligible Required Fragment coverage")
 
     cursor = claim_start
     previous_fragment_end: int | None = None
@@ -553,25 +571,18 @@ def _claim_covering_fragments(
     return selected
 
 
-def _roles(primary: bool) -> frozenset[EvidenceRole]:
-    return (
-        frozenset({EvidenceRole.PRIMARY, EvidenceRole.REQUIRED})
-        if primary
-        else frozenset({EvidenceRole.REQUIRED})
-    )
-
-
 def _whole_range(
     revision: SourceObservationRevision,
-    roles: frozenset[EvidenceRole],
-) -> EvidenceAuthorityRange:
-    return EvidenceAuthorityRange(
+    *,
+    primary_eligible: bool,
+) -> EvidenceCandidateRange:
+    return EvidenceCandidateRange(
         anchor=SourceAnchor(
             kind=AnchorKind.WHOLE_OBSERVATION,
             observation_id=revision.observation_id,
             observation_revision_id=revision.id,
         ),
-        eligible_roles=roles,
+        primary_eligible=primary_eligible,
     )
 
 
@@ -579,11 +590,12 @@ def _text_range(
     revision: SourceObservationRevision,
     start: int,
     end: int,
-    roles: frozenset[EvidenceRole],
-) -> EvidenceAuthorityRange:
+    *,
+    primary_eligible: bool,
+) -> EvidenceCandidateRange:
     if start == 0 and end == len(revision.content):
-        return _whole_range(revision, roles)
-    return EvidenceAuthorityRange(
+        return _whole_range(revision, primary_eligible=primary_eligible)
+    return EvidenceCandidateRange(
         anchor=SourceAnchor(
             kind=AnchorKind.REVISION_RANGE,
             observation_id=revision.observation_id,
@@ -591,7 +603,7 @@ def _text_range(
             range_start=start,
             range_end=end,
         ),
-        eligible_roles=roles,
+        primary_eligible=primary_eligible,
     )
 
 
@@ -633,7 +645,7 @@ def _fragment_sort_key(fragment: EvidenceFragment) -> tuple[object, ...]:
 
 def _authority_payload(
     revision: SourceObservationRevision,
-    ranges: tuple[EvidenceAuthorityRange, ...],
+    ranges: tuple[EvidenceCandidateRange, ...],
 ) -> tuple[Mapping[str, object], ...]:
     return tuple(
         {
@@ -642,7 +654,7 @@ def _authority_payload(
             "anchor_kind": item.anchor.kind.value,
             "range_start": item.anchor.range_start,
             "range_end": item.anchor.range_end,
-            "eligible_roles": sorted(role.value for role in item.eligible_roles),
+            "primary_eligible": item.primary_eligible,
         }
         for item in ranges
     )
@@ -706,7 +718,7 @@ def _catalog_digest(
                 "observation_revision_id": fragment.anchor.observation_revision_id,
                 "range_start": fragment.anchor.range_start,
                 "range_end": fragment.anchor.range_end,
-                "roles": sorted(role.value for role in fragment.eligible_roles),
+                "primary_eligible": fragment.primary_eligible,
                 "raw_sha256": fragment.raw_content_sha256,
                 "presentation_sha256": fragment.presentation_sha256,
             }

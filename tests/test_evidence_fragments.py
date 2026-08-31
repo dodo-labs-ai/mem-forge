@@ -7,7 +7,7 @@ import pytest
 
 from memforge.memory.evidence import EvidenceRole
 from memforge.pipeline.evidence_fragments import (
-    EvidenceAuthorityRange,
+    EvidenceCandidateRange,
     EvidenceFragmentKind,
     FragmentCompilationErrorCode,
     compile_fragments,
@@ -69,7 +69,7 @@ def _authority(
     *roles: EvidenceRole,
     start: int | None = None,
     end: int | None = None,
-) -> EvidenceAuthorityRange:
+) -> EvidenceCandidateRange:
     anchor = SourceAnchor(
         kind=AnchorKind.REVISION_RANGE if start is not None else AnchorKind.WHOLE_OBSERVATION,
         observation_id=revision.observation_id,
@@ -77,7 +77,30 @@ def _authority(
         range_start=start,
         range_end=end,
     )
-    return EvidenceAuthorityRange(anchor=anchor, eligible_roles=frozenset(roles))
+    return EvidenceCandidateRange(
+        anchor=anchor,
+        primary_eligible=EvidenceRole.PRIMARY in roles,
+    )
+
+
+def test_candidate_range_has_one_primary_eligibility_dimension() -> None:
+    revision = _revision("Supporting context.", PLAIN_PROFILE)
+    candidate_range = EvidenceCandidateRange(
+        anchor=SourceAnchor(
+            kind=AnchorKind.WHOLE_OBSERVATION,
+            observation_id=revision.observation_id,
+            observation_revision_id=revision.id,
+        ),
+        primary_eligible=False,
+    )
+
+    catalog = compile_fragments(revision, (candidate_range,))
+
+    [fragment] = catalog.fragments
+    assert fragment.primary_eligible is False
+    assert catalog.model_payload()[0]["primary_eligible"] is False
+    assert catalog.resolve(fragment.reference, EvidenceRole.REQUIRED) == fragment
+    assert catalog.resolve(fragment.reference, EvidenceRole.PRIMARY) is None
 
 
 def test_profile_name_and_version_are_separate_and_schema_is_typed() -> None:
@@ -617,7 +640,7 @@ def test_structural_fragment_crossing_authority_boundary_is_rejected_not_clipped
     assert catalog.errors[0].range_end == len(content)
 
 
-def test_separate_authority_ranges_assign_roles_without_cross_range_widening() -> None:
+def test_separate_candidate_ranges_assign_primary_eligibility_without_widening() -> None:
     content = "Primary claim.\n\nRequired condition."
     revision = _revision(content, PLAIN_PROFILE)
     required_start = content.index("Required")
@@ -642,7 +665,7 @@ def test_separate_authority_ranges_assign_roles_without_cross_range_widening() -
 
     primary, required = catalog.fragments
     assert catalog.resolve(primary.reference, EvidenceRole.PRIMARY) == primary
-    assert catalog.resolve(primary.reference, EvidenceRole.REQUIRED) is None
+    assert catalog.resolve(primary.reference, EvidenceRole.REQUIRED) == primary
     assert catalog.resolve(required.reference, EvidenceRole.PRIMARY) is None
     assert catalog.resolve(required.reference, EvidenceRole.REQUIRED) == required
 

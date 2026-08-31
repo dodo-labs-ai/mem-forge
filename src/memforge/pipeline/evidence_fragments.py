@@ -35,7 +35,7 @@ from memforge.source_representation import (
 )
 
 
-COMPILER_CONTRACT_VERSION = 1
+COMPILER_CONTRACT_VERSION = 2
 DEFAULT_MAX_FRAGMENTS = 2_048
 DEFAULT_MAX_PRESENTATION_CHARS = 120_000
 _SUPPORTING_ROLES = frozenset({EvidenceRole.PRIMARY, EvidenceRole.REQUIRED})
@@ -85,16 +85,19 @@ class FragmentCompilationError:
 
 
 @dataclass(frozen=True, slots=True)
-class EvidenceAuthorityRange:
-    """One application-owned Anchor and the roles selectable from it."""
+class EvidenceCandidateRange:
+    """One exact candidate Anchor and whether current work permits Primary."""
 
     anchor: SourceAnchor
-    eligible_roles: frozenset[EvidenceRole]
+    primary_eligible: bool
 
-    def __post_init__(self) -> None:
-        allowed = {EvidenceRole.PRIMARY, EvidenceRole.REQUIRED}
-        if not self.eligible_roles or not self.eligible_roles.issubset(allowed):
-            raise ValueError("Evidence Authority Range requires Primary and/or Required eligibility")
+    @property
+    def eligible_roles(self) -> frozenset[EvidenceRole]:
+        return (
+            _SUPPORTING_ROLES
+            if self.primary_eligible
+            else frozenset({EvidenceRole.REQUIRED})
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +106,7 @@ class EvidenceFragment:
     kind: EvidenceFragmentKind
     fragment_type: str
     anchor: SourceAnchor
-    eligible_roles: frozenset[EvidenceRole]
+    primary_eligible: bool
     raw_content_sha256: str
     presentation_text: str
     presentation_sha256: str
@@ -130,7 +133,9 @@ class EvidenceFragmentCatalog:
             return None
         for fragment in self.fragments:
             if fragment.reference == reference:
-                return fragment if role in fragment.eligible_roles else None
+                if role is EvidenceRole.PRIMARY:
+                    return fragment if fragment.primary_eligible else None
+                return fragment
         return None
 
     def model_payload(self) -> tuple[Mapping[str, object], ...]:
@@ -142,7 +147,7 @@ class EvidenceFragmentCatalog:
                 "kind": fragment.kind.value,
                 "type": fragment.fragment_type,
                 "text": fragment.presentation_text,
-                "eligible_roles": sorted(role.value for role in fragment.eligible_roles),
+                "primary_eligible": fragment.primary_eligible,
             }
             for fragment in self.fragments
         )
@@ -158,6 +163,10 @@ class _FragmentCandidate:
     presentation_text: str
     raw_content_sha256: str | None = None
 
+    @property
+    def primary_eligible(self) -> bool:
+        return EvidenceRole.PRIMARY in self.eligible_roles
+
 
 @dataclass(frozen=True, slots=True)
 class _InlineHTMLRegion:
@@ -169,7 +178,7 @@ class _InlineHTMLRegion:
 
 def compile_fragments(
     revision: SourceObservationRevision,
-    authority_ranges: tuple[EvidenceAuthorityRange, ...],
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
     *,
     max_fragments: int = DEFAULT_MAX_FRAGMENTS,
     max_presentation_chars: int = DEFAULT_MAX_PRESENTATION_CHARS,
@@ -230,7 +239,7 @@ def compile_fragments(
 def _validate_authority_ranges(
     revision: SourceObservationRevision,
     profile: EvidenceRepresentationProfile,
-    authority_ranges: tuple[EvidenceAuthorityRange, ...],
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
 ) -> FragmentCompilationError | None:
     expected_coordinate_space = (
         EvidenceCoordinateSpace.WHOLE_ARTIFACT
@@ -312,7 +321,7 @@ def _validate_authority_ranges(
 def _compile_markdown_profile(
     revision: SourceObservationRevision,
     contract: EvidenceRepresentationContract,
-    authority_ranges: tuple[EvidenceAuthorityRange, ...],
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
 ) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
     del contract
     candidates, errors = _markdown_candidates(
@@ -332,7 +341,7 @@ def _compile_markdown_profile(
 def _compile_plain_text_profile(
     revision: SourceObservationRevision,
     contract: EvidenceRepresentationContract,
-    authority_ranges: tuple[EvidenceAuthorityRange, ...],
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
 ) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
     del contract
     candidates: list[_FragmentCandidate] = []
@@ -353,7 +362,7 @@ def _compile_plain_text_profile(
 def _compile_binary_artifact_profile(
     revision: SourceObservationRevision,
     contract: EvidenceRepresentationContract,
-    authority_ranges: tuple[EvidenceAuthorityRange, ...],
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
 ) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
     del contract
     raw_artifact = revision.metadata.get("source_artifact")
@@ -405,7 +414,7 @@ def _compile_binary_artifact_profile(
 def _compile_canonical_record_profile(
     revision: SourceObservationRevision,
     contract: EvidenceRepresentationContract,
-    authority_ranges: tuple[EvidenceAuthorityRange, ...],
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
 ) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
     if any(item.anchor.kind is not AnchorKind.WHOLE_OBSERVATION for item in authority_ranges):
         return (), (
@@ -517,7 +526,7 @@ def _compile_canonical_record_profile(
 
 
 _ProfileCompiler = Callable[
-    [SourceObservationRevision, EvidenceRepresentationContract, tuple[EvidenceAuthorityRange, ...]],
+    [SourceObservationRevision, EvidenceRepresentationContract, tuple[EvidenceCandidateRange, ...]],
     tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]],
 ]
 
@@ -1199,7 +1208,7 @@ def _parse_json_string(source: str, start: int) -> tuple[str, int, tuple[int, ..
 def _catalog_from_candidates(
     revision: SourceObservationRevision,
     profile: EvidenceRepresentationProfile | None,
-    authority_ranges: tuple[EvidenceAuthorityRange, ...],
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
     candidates: tuple[_FragmentCandidate, ...],
     errors: tuple[FragmentCompilationError, ...],
     *,
@@ -1262,7 +1271,7 @@ def _catalog_from_candidates(
 def _fatal_catalog(
     revision: SourceObservationRevision,
     profile: EvidenceRepresentationProfile | None,
-    authority_ranges: tuple[EvidenceAuthorityRange, ...],
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
     code: FragmentCompilationErrorCode,
     message: str,
     *,
@@ -1307,7 +1316,7 @@ def _materialize_fragment(
         kind=candidate.kind,
         fragment_type=candidate.fragment_type,
         anchor=anchor,
-        eligible_roles=candidate.eligible_roles,
+        primary_eligible=candidate.primary_eligible,
         raw_content_sha256=raw_digest,
         presentation_text=candidate.presentation_text,
         presentation_sha256=hashlib.sha256(candidate.presentation_text.encode("utf-8")).hexdigest(),
@@ -1317,7 +1326,7 @@ def _materialize_fragment(
 def _catalog_digest(
     revision: SourceObservationRevision,
     profile: EvidenceRepresentationProfile | None,
-    authority_ranges: tuple[EvidenceAuthorityRange, ...],
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
     candidates: tuple[_FragmentCandidate, ...],
     errors: tuple[FragmentCompilationError, ...],
     *,
@@ -1339,12 +1348,12 @@ def _catalog_digest(
             if profile is not None
             else "absent"
         ),
-        "authority_ranges": [
+        "candidate_ranges": [
             {
                 "kind": item.anchor.kind.value,
                 "range_start": item.anchor.range_start,
                 "range_end": item.anchor.range_end,
-                "eligible_roles": sorted(role.value for role in item.eligible_roles),
+                "primary_eligible": item.primary_eligible,
             }
             for item in sorted(authority_ranges, key=_authority_sort_key)
         ],
@@ -1358,7 +1367,7 @@ def _catalog_digest(
                 "fragment_type": item.fragment_type,
                 "start": item.start,
                 "end": item.end,
-                "eligible_roles": sorted(role.value for role in item.eligible_roles),
+                "primary_eligible": item.primary_eligible,
                 "raw_content_sha256": (
                     item.raw_content_sha256
                     if item.raw_content_sha256 is not None
@@ -1401,7 +1410,7 @@ def _candidate_overlap_error(
     return None
 
 
-def _candidate_sort_key(item: _FragmentCandidate) -> tuple[int, int, str, str, tuple[str, ...]]:
+def _candidate_sort_key(item: _FragmentCandidate) -> tuple[int, int, str, str, bool]:
     start = item.start if item.start is not None else -1
     end = item.end if item.end is not None else -1
     raw_digest = item.raw_content_sha256 or ""
@@ -1411,15 +1420,15 @@ def _candidate_sort_key(item: _FragmentCandidate) -> tuple[int, int, str, str, t
         end,
         item.fragment_type,
         raw_digest + presentation_digest,
-        tuple(sorted(role.value for role in item.eligible_roles)),
+        item.primary_eligible,
     )
 
 
-def _authority_sort_key(item: EvidenceAuthorityRange) -> tuple[int, int, tuple[str, ...]]:
+def _authority_sort_key(item: EvidenceCandidateRange) -> tuple[int, int, bool]:
     return (
         item.anchor.range_start if item.anchor.range_start is not None else -1,
         item.anchor.range_end if item.anchor.range_end is not None else -1,
-        tuple(sorted(role.value for role in item.eligible_roles)),
+        item.primary_eligible,
     )
 
 
@@ -1480,7 +1489,7 @@ def _anchor_span(anchor: SourceAnchor, content: str) -> tuple[int, int]:
 def _bind_candidates_to_authority(
     revision: SourceObservationRevision,
     candidates: tuple[_FragmentCandidate, ...],
-    authority_ranges: tuple[EvidenceAuthorityRange, ...],
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
 ) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
     bound: list[_FragmentCandidate] = []
     errors: list[FragmentCompilationError] = []
@@ -1507,7 +1516,7 @@ def _bind_candidates_to_authority(
 
 def _errors_inside_authority(
     errors: tuple[FragmentCompilationError, ...],
-    authority_ranges: tuple[EvidenceAuthorityRange, ...],
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
     content: str,
 ) -> tuple[FragmentCompilationError, ...]:
     spans = tuple(_anchor_span(item.anchor, content) for item in authority_ranges)
