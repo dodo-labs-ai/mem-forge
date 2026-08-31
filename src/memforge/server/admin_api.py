@@ -598,7 +598,12 @@ def _request_audit_context(request: Request) -> AuditContext:
 
 
 def _require_maintenance_operator(request: Request) -> str:
-    if resolve_request_workspace_role(request) not in {"owner", "workspace_admin"}:
+    resolver = getattr(request.app.state, "maintenance_operator_resolver", None)
+    if resolver is None:
+        from memforge.server.principal import resolve_maintenance_operator
+
+        resolver = resolve_maintenance_operator
+    if not resolver(request):
         raise HTTPException(
             status_code=403,
             detail="maintenance_operator_authority_required",
@@ -3416,6 +3421,7 @@ def create_admin_app(
     runtime_provider: RuntimeProvider | None = None,
     principal_resolver: Callable[[Request], str] | None = None,
     workspace_role_resolver: Callable[[Request], str] | None = None,
+    maintenance_operator_resolver: Callable[[Request], bool] | None = None,
     document_store: DocumentArtifactStore | None = None,
     local_agent_lease_validator: Callable[[Request, str, str, int, str], Awaitable[bool]] | None = None,
     local_agent_job_enqueuer: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
@@ -3439,6 +3445,13 @@ def create_admin_app(
     if config is None:
         raise ValueError("config is required")
     runtime_provider = runtime_provider or DefaultRuntimeProvider()
+    if maintenance_operator_resolver is None and (
+        principal_resolver is not None or workspace_role_resolver is not None
+    ):
+        def deny_maintenance_operator(_request: Request) -> bool:
+            return False
+
+        maintenance_operator_resolver = deny_maintenance_operator
 
     owned_db: Database | None = None
 
@@ -3459,6 +3472,7 @@ def create_admin_app(
         app.state.runtime_provider = runtime_provider
         app.state.principal_resolver = principal_resolver
         app.state.workspace_role_resolver = workspace_role_resolver
+        app.state.maintenance_operator_resolver = maintenance_operator_resolver
         app.state.local_agent_lease_validator = local_agent_lease_validator
         app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
         app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
@@ -3561,6 +3575,7 @@ def create_admin_app(
     app.state.runtime_provider = runtime_provider
     app.state.principal_resolver = principal_resolver
     app.state.workspace_role_resolver = workspace_role_resolver
+    app.state.maintenance_operator_resolver = maintenance_operator_resolver
     app.state.local_agent_lease_validator = local_agent_lease_validator
     app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
     app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
@@ -4351,7 +4366,8 @@ def create_admin_app(
         )
         try:
             report = await service.report_maintenance_closures(
-                tuple(MaintenanceClosureEntry(**item.model_dump()) for item in req.entries)
+                tuple(MaintenanceClosureEntry(**item.model_dump()) for item in req.entries),
+                operator_actor_id=operator_actor_id,
             )
         except MemoryLifecycleConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

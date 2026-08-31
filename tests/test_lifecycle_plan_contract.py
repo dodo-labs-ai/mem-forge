@@ -182,6 +182,7 @@ def test_maintenance_operator_authority_cannot_supersede_a_memory() -> None:
                 "operator replacement",
                 replacement_memory_id="mem-new",
                 authority=IncumbentAuthority.MAINTENANCE_OPERATOR,
+                authority_actor_id="operator@example.test",
             ),
             IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "keep"),
         ),
@@ -194,6 +195,75 @@ def test_maintenance_operator_authority_cannot_supersede_a_memory() -> None:
                 source_id="src-1",
             ),
         ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="maintenance operator authority permits retirement only",
+    ):
+        plan.validate()
+
+
+def test_maintenance_operator_authority_cannot_attach_support_during_retirement() -> None:
+    plan = LifecyclePlan(
+        id="plan-maintenance-support",
+        scope=_scope(),
+        gate_state=LifecycleGateState.ENABLED,
+        coverage_proof=_proof(
+            IncumbentDecision(
+                "mem-a",
+                IncumbentDisposition.REMOVE_SUPPORT,
+                "operator retirement",
+                authority=IncumbentAuthority.MAINTENANCE_OPERATOR,
+                authority_actor_id="operator@example.test",
+            ),
+            IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "keep"),
+        ),
+        stale_guard=_guard(),
+        mutations=(
+            LifecycleMutation(
+                mutation_type=LifecycleMutationType.RETIRE_MEMORY,
+                memory_id="mem-a",
+                source_id="src-1",
+            ),
+            LifecycleMutation(
+                mutation_type=LifecycleMutationType.ATTACH_SUPPORT,
+                memory_id="mem-a",
+                source_id="src-1",
+                evidence_reference_ids=("eref-new",),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="maintenance operator authority permits retirement only",
+    ):
+        plan.validate()
+
+
+def test_maintenance_operator_authority_requires_exactly_one_retirement() -> None:
+    retire = LifecycleMutation(
+        mutation_type=LifecycleMutationType.RETIRE_MEMORY,
+        memory_id="mem-a",
+        source_id="src-1",
+    )
+    plan = LifecyclePlan(
+        id="plan-maintenance-duplicate-retirement",
+        scope=_scope(),
+        gate_state=LifecycleGateState.ENABLED,
+        coverage_proof=_proof(
+            IncumbentDecision(
+                "mem-a",
+                IncumbentDisposition.REMOVE_SUPPORT,
+                "operator retirement",
+                authority=IncumbentAuthority.MAINTENANCE_OPERATOR,
+                authority_actor_id="operator@example.test",
+            ),
+            IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "keep"),
+        ),
+        stale_guard=_guard(),
+        mutations=(retire, retire),
     )
 
     with pytest.raises(

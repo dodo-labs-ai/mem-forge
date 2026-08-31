@@ -34,3 +34,9 @@ def resolve_workspace_role(request: Request) -> str:
     instead of trusting client input.
     """
     return LOCAL_DEV_WORKSPACE_ROLE
+
+
+def resolve_maintenance_operator(request: Request) -> bool:
+    """Authorize the single self-hosted owner for break-glass closure."""
+
+    return resolve_workspace_role(request) == LOCAL_DEV_WORKSPACE_ROLE

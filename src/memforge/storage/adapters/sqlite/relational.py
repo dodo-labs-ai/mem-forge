@@ -17,7 +17,7 @@ from typing import Any, Mapping, Sequence
 import aiosqlite
 
 from memforge.evals.agent_evaluation import AgentRuntimeBundle
-from memforge.memory.audit import MemoryAuditLogger
+from memforge.memory.audit import MemoryAuditEvent, MemoryAuditLogger
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
     CandidateMemory,
@@ -1142,6 +1142,7 @@ class SqliteRelationalStore:
         citations: list[str] | None = None,
         concept_projection: Mapping[str, object] | None = None,
         concept_markdown_body: str | None = None,
+        maintenance_receipt: MemoryAuditEvent | None = None,
     ) -> None:
         await self._db.apply_agent_claim_source_projection_lifecycle(
             projection,
@@ -1158,6 +1159,7 @@ class SqliteRelationalStore:
             citations=citations,
             concept_projection=dict(concept_projection) if concept_projection is not None else None,
             concept_markdown_body=concept_markdown_body,
+            maintenance_receipt=maintenance_receipt,
         )
 
     async def apply_lifecycle_plan(self, plan: LifecyclePlan) -> None:
