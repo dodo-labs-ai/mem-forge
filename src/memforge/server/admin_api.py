@@ -643,16 +643,12 @@ class StatsResponse(BaseModel):
 # -- Memories --
 
 
-class MemorySourceDetail(BaseModel):
+class MemoryEvidenceDocumentDetail(BaseModel):
     doc_id: str
-    source_type: str
-    excerpt: str | None = None
-    support_kind: str = "extracted"
-    doc_title: str | None = None
+    title: str | None = None
     source_url: str | None = None
     content_url: str | None = None
     pdf_url: str | None = None
-    added_at: str | None = None
     source_updated_at: str | None = None
 
 
@@ -673,31 +669,34 @@ class MemoryEvidenceArtifactDetail(BaseModel):
 
 
 class MemoryEvidenceItemDetail(BaseModel):
-    evidence_reference_id: str
+    authority: Literal["revision_pinned", "application_document"]
+    evidence_reference_id: str | None = None
     role: Literal["primary", "required", "context"]
     kind: Literal["text", "artifact"]
     support_contribution: bool
-    observation_id: str
-    observation_revision_id: str
+    observation_id: str | None = None
+    observation_revision_id: str | None = None
     anchor_kind: str
     range_start: int | None = None
     range_end: int | None = None
     excerpt: str | None = None
-    raw_content_sha256: str
-    presentation_sha256: str
+    raw_content_sha256: str | None = None
+    presentation_sha256: str | None = None
     current: bool
     artifact: MemoryEvidenceArtifactDetail | None = None
 
 
-class MemoryEvidenceUnitDetail(BaseModel):
-    evidence_unit_id: str
+class MemoryEvidenceGroupDetail(BaseModel):
+    kind: Literal["evidence_unit", "document"]
+    evidence_unit_id: str | None = None
     support_ids: list[str]
-    support_scope_version: Literal["reference-set-v1", "evidence-unit-set-v2"]
+    support_scope_version: Literal["reference-set-v1", "evidence-unit-set-v2"] | None = None
     source_id: str
     source_type: str
-    source_unit_id: str
+    source_unit_id: str | None = None
     source_unit_revision_id: str | None = None
     doc_id: str | None = None
+    document: MemoryEvidenceDocumentDetail | None = None
     current: bool
     legacy_limited: bool
     items: list[MemoryEvidenceItemDetail]
@@ -748,9 +747,7 @@ class MemoryResponse(BaseModel):
 
 class MemoryDetailResponse(MemoryResponse):
     entity_refs: list[str] = []
-    sources: list[MemorySourceDetail] = []
-    evidence_artifacts: list[MemoryEvidenceArtifactDetail] = []
-    evidence: list[MemoryEvidenceUnitDetail] = []
+    evidence: list[MemoryEvidenceGroupDetail] = []
     conflict_contexts: list[MemoryConflictContextDetail] = []
 
 
@@ -1625,7 +1622,7 @@ class MemoryReviewMemorySummary(BaseModel):
     corroboration_count: int
     status: str
     entity_refs: list[str] = []
-    sources: list[MemorySourceDetail] = []
+    evidence: list[MemoryEvidenceGroupDetail] = []
     created_at: str | None = None
     updated_at: str | None = None
     origin_source_type: str | None = None
@@ -2620,12 +2617,13 @@ def _json_ready(value: Any) -> Any:
     return value
 
 
-def _memory_source_detail(
-    ms: Any,
+def _memory_evidence_document_detail(
+    doc_id: str,
     doc: Any | None,
+    source_row: Any | None,
     config: AppConfig | None = None,
     artifact_store: DocumentArtifactStore | None = None,
-) -> MemorySourceDetail:
+) -> MemoryEvidenceDocumentDetail:
     content_url = None
     pdf_url = None
     if doc is not None and config is not None:
@@ -2634,21 +2632,25 @@ def _memory_source_detail(
     elif doc is not None:
         content_url = document_content_url(doc, config)
         pdf_url = document_pdf_url(doc, config)
-    return MemorySourceDetail(
-        doc_id=ms.doc_id,
-        source_type=ms.source_type,
-        excerpt=ms.excerpt,
-        support_kind=ms.support_kind,
-        doc_title=doc.title if doc else None,
+    return MemoryEvidenceDocumentDetail(
+        doc_id=doc_id,
+        title=doc.title if doc else None,
         source_url=doc.source_url if doc else None,
         content_url=content_url,
         pdf_url=pdf_url,
-        added_at=_dt_iso(ms.added_at),
-        source_updated_at=_dt_iso(ms.source_updated_at),
+        source_updated_at=(
+            _dt_iso(source_row.source_updated_at)
+            if source_row is not None
+            else None
+        ),
     )
 
 
-def _memory_evidence_unit_detail(group) -> MemoryEvidenceUnitDetail:
+def _memory_evidence_unit_detail(
+    group,
+    *,
+    document: MemoryEvidenceDocumentDetail | None,
+) -> MemoryEvidenceGroupDetail:
     items: list[MemoryEvidenceItemDetail] = []
     for item in group.items:
         artifact = None
@@ -2678,6 +2680,7 @@ def _memory_evidence_unit_detail(group) -> MemoryEvidenceUnitDetail:
             )
         items.append(
             MemoryEvidenceItemDetail(
+                authority="revision_pinned",
                 evidence_reference_id=item.reference_id,
                 role=item.role.value,
                 kind=item.kind.value,
@@ -2694,7 +2697,8 @@ def _memory_evidence_unit_detail(group) -> MemoryEvidenceUnitDetail:
                 artifact=artifact,
             )
         )
-    return MemoryEvidenceUnitDetail(
+    return MemoryEvidenceGroupDetail(
+        kind="evidence_unit",
         evidence_unit_id=group.evidence_unit_id,
         support_ids=list(group.support_ids),
         support_scope_version=group.support_scope_version.value,
@@ -2703,10 +2707,123 @@ def _memory_evidence_unit_detail(group) -> MemoryEvidenceUnitDetail:
         source_unit_id=group.source_unit_id,
         source_unit_revision_id=group.source_unit_revision_id,
         doc_id=group.doc_id,
+        document=document,
         current=group.current,
         legacy_limited=group.legacy_limited,
         items=items,
     )
+
+
+def _application_document_evidence_detail(
+    source_row: Any,
+    *,
+    document: MemoryEvidenceDocumentDetail,
+) -> MemoryEvidenceGroupDetail:
+    excerpt = source_row.excerpt
+    digest = (
+        hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
+        if isinstance(excerpt, str)
+        else None
+    )
+    return MemoryEvidenceGroupDetail(
+        kind="document",
+        support_ids=[],
+        source_id=str(source_row.source_id),
+        source_type=source_row.source_type,
+        doc_id=source_row.doc_id,
+        document=document,
+        current=True,
+        legacy_limited=source_row.support_kind == "legacy_limited",
+        items=[
+            MemoryEvidenceItemDetail(
+                authority="application_document",
+                role="primary",
+                kind="text",
+                support_contribution=True,
+                anchor_kind="document",
+                excerpt=excerpt,
+                raw_content_sha256=digest,
+                presentation_sha256=digest,
+                current=True,
+            )
+        ],
+    )
+
+
+async def _memory_evidence_details(
+    db: Database,
+    memory_id: str,
+    *,
+    request: Request,
+    config: AppConfig | None,
+    artifact_store: DocumentArtifactStore | None,
+) -> list[MemoryEvidenceGroupDetail]:
+    """Build the sole visibility-safe Memory provenance projection."""
+
+    raw_sources = await db.get_memory_sources(memory_id)
+    raw_source_by_key = {
+        (str(source.source_id), source.doc_id): source for source in raw_sources
+    }
+    details: list[MemoryEvidenceGroupDetail] = []
+    seen_source_keys: set[tuple[str, str]] = set()
+    for group in await db.get_memory_evidence_units(memory_id):
+        source = await db.get_source(group.source_id)
+        if source is None:
+            continue
+        try:
+            _require_source_discoverability(request, source)
+        except HTTPException:
+            # An unreadable supporting item omits the complete Unit.
+            continue
+        source_row = (
+            raw_source_by_key.get((group.source_id, group.doc_id))
+            if group.doc_id is not None
+            else None
+        )
+        document = None
+        if group.doc_id is not None:
+            seen_source_keys.add((group.source_id, group.doc_id))
+            doc = await db.get_document(group.doc_id)
+            document = _memory_evidence_document_detail(
+                group.doc_id,
+                doc,
+                source_row,
+                config,
+                artifact_store,
+            )
+        details.append(
+            _memory_evidence_unit_detail(group, document=document)
+        )
+
+    for source_row in raw_sources:
+        source_id = str(source_row.source_id)
+        key = (source_id, source_row.doc_id)
+        if key in seen_source_keys:
+            continue
+        if source_id not in VIRTUAL_DOCUMENT_SOURCE_IDS:
+            source = await db.get_source(source_id)
+            if source is None:
+                continue
+            try:
+                _require_source_discoverability(request, source)
+            except HTTPException:
+                continue
+        doc = await db.get_document(source_row.doc_id)
+        document = _memory_evidence_document_detail(
+            source_row.doc_id,
+            doc,
+            source_row,
+            config,
+            artifact_store,
+        )
+        details.append(
+            _application_document_evidence_detail(
+                source_row,
+                document=document,
+            )
+        )
+        seen_source_keys.add(key)
+    return details
 
 
 def _pick_origin_source_type(pairs: list[tuple[str, str | None, str | None]]) -> tuple[str | None, str | None]:
@@ -2817,16 +2934,18 @@ def _presentation_response(value: ReviewPresentation) -> ReviewPresentationRespo
 async def _build_memory_summary(
     db: Database,
     memory: Memory,
+    request: Request,
     config: AppConfig | None = None,
     artifact_store: DocumentArtifactStore | None = None,
 ) -> MemoryReviewMemorySummary:
     """Hydrate a memory with provenance and entity refs for the review detail view."""
-    raw_sources = await db.get_memory_sources(memory.id)
-    sources: list[MemorySourceDetail] = []
-    for ms in raw_sources:
-        doc = await db.get_document(ms.doc_id)
-        sources.append(_memory_source_detail(ms, doc, config, artifact_store))
-
+    evidence = await _memory_evidence_details(
+        db,
+        memory.id,
+        request=request,
+        config=config,
+        artifact_store=artifact_store,
+    )
     entity_names = await db.get_memory_entity_names(memory.id)
 
     return MemoryReviewMemorySummary(
@@ -2837,7 +2956,7 @@ async def _build_memory_summary(
         corroboration_count=memory.corroboration_count,
         status=memory.status,
         entity_refs=entity_names,
-        sources=sources,
+        evidence=evidence,
         created_at=_dt_iso(memory.created_at),
         updated_at=_dt_iso(memory.updated_at),
     )
@@ -2897,6 +3016,7 @@ async def _lifecycle_review_response(
     review: Any,
     source: Mapping[str, object],
     *,
+    request: Request,
     detail: bool,
     config: AppConfig | None = None,
     artifact_store: DocumentArtifactStore | None = None,
@@ -2910,7 +3030,9 @@ async def _lifecycle_review_response(
     incumbent_summary = None
     if incumbent is not None:
         incumbent_summary = (
-            await _build_memory_summary(db, incumbent, config, artifact_store)
+            await _build_memory_summary(
+                db, incumbent, request, config, artifact_store
+            )
             if detail
             else _build_memory_review_list_summary(incumbent)
         )
@@ -2926,7 +3048,9 @@ async def _lifecycle_review_response(
     challenger_summary = None
     if candidate_memory is not None:
         challenger_summary = (
-            await _build_memory_summary(db, candidate_memory, config, artifact_store)
+            await _build_memory_summary(
+                db, candidate_memory, request, config, artifact_store
+            )
             if detail
             else _build_memory_review_list_summary(candidate_memory)
         )
@@ -4003,118 +4127,13 @@ def create_admin_app(
         if memory_id not in visible:
             raise HTTPException(status_code=404, detail="Memory not found")
 
-        raw_sources = await db.get_memory_sources(memory_id)
-        raw_source_by_key = {
-            (source.source_id, source.doc_id): source for source in raw_sources
-        }
-        evidence_groups: list[MemoryEvidenceUnitDetail] = []
-        for group in await db.get_memory_evidence_units(memory_id):
-            source = await db.get_source(group.source_id)
-            if source is None:
-                continue
-            try:
-                _require_source_discoverability(request, source)
-            except HTTPException:
-                # A supporting item is unreadable, so omit the complete Unit.
-                continue
-            evidence_groups.append(_memory_evidence_unit_detail(group))
-
-        # Compatibility projections are derived from the authorized grouped
-        # result. Direct-user Virtual Documents have no Source Projection and
-        # retain their application-authoritative legacy source row.
-        source_details: list[MemorySourceDetail] = []
-        seen_source_keys: set[tuple[str, str]] = set()
-        for group in evidence_groups:
-            if group.doc_id is None:
-                continue
-            key = (group.source_id, group.doc_id)
-            if key in seen_source_keys:
-                continue
-            seen_source_keys.add(key)
-            source_row = raw_source_by_key.get(key)
-            doc = await db.get_document(group.doc_id)
-            if source_row is not None:
-                source_details.append(
-                    _memory_source_detail(
-                        source_row,
-                        doc,
-                        config,
-                        artifact_store,
-                    )
-                )
-            else:
-                primary_excerpt = next(
-                    (
-                        item.excerpt
-                        for item in group.items
-                        if item.role == "primary" and item.kind == "text"
-                    ),
-                    None,
-                )
-                source_details.append(
-                    MemorySourceDetail(
-                        doc_id=group.doc_id,
-                        source_type=group.source_type,
-                        excerpt=primary_excerpt,
-                        support_kind=(
-                            "legacy_limited"
-                            if group.legacy_limited
-                            else "corroborated"
-                        ),
-                        doc_title=doc.title if doc else None,
-                        source_url=doc.source_url if doc else None,
-                        content_url=(
-                            document_content_url_for_store(
-                                doc,
-                                config,
-                                artifact_store,
-                            )
-                            if doc is not None
-                            else None
-                        ),
-                        pdf_url=(
-                            document_pdf_url_for_store(
-                                doc,
-                                config,
-                                artifact_store,
-                            )
-                            if doc is not None
-                            else None
-                        ),
-                    )
-                )
-        for source_row in raw_sources:
-            key = (str(source_row.source_id), source_row.doc_id)
-            if key in seen_source_keys:
-                continue
-            if source_row.source_id not in VIRTUAL_DOCUMENT_SOURCE_IDS:
-                legacy_source = (
-                    await db.get_source(str(source_row.source_id))
-                    if source_row.source_id is not None
-                    else None
-                )
-                if legacy_source is None:
-                    continue
-                try:
-                    _require_source_discoverability(request, legacy_source)
-                except HTTPException:
-                    continue
-            seen_source_keys.add(key)
-            doc = await db.get_document(source_row.doc_id)
-            source_details.append(
-                _memory_source_detail(
-                    source_row,
-                    doc,
-                    config,
-                    artifact_store,
-                )
-            )
-        evidence_artifacts = [
-            item.artifact
-            for group in evidence_groups
-            for item in group.items
-            if group.current and item.current and item.artifact is not None
-        ]
+        evidence_groups = await _memory_evidence_details(
+            db,
+            memory_id,
+            request=request,
+            config=config,
+            artifact_store=artifact_store,
+        )
 
         # Fetch linked entity names.
         entity_names = await db.get_memory_entity_names(memory_id)
@@ -4150,8 +4169,6 @@ def create_admin_app(
             created_at=_dt_iso(mem.created_at),
             updated_at=_dt_iso(mem.updated_at),
             entity_refs=entity_names,
-            sources=source_details,
-            evidence_artifacts=evidence_artifacts,
             evidence=evidence_groups,
             conflict_contexts=[
                 MemoryConflictContextDetail(**asdict(item)) for item in conflict_contexts.get(memory_id, ())
@@ -8118,6 +8135,7 @@ def create_admin_app(
                         db,
                         review,
                         source,
+                        request=request,
                         detail=False,
                         memory_cache=lifecycle_memory_cache,
                     )
@@ -8165,6 +8183,7 @@ def create_admin_app(
                 db,
                 lifecycle_review,
                 source,
+                request=request,
                 detail=True,
                 config=config,
                 artifact_store=artifact_store,
@@ -8181,10 +8200,20 @@ def create_admin_app(
             challenger=challenger,
             related_challengers=related_memories,
         )
-        incumbent_summary = await _build_memory_summary(db, incumbent, config, artifact_store) if incumbent else None
-        challenger_summary = await _build_memory_summary(db, challenger, config, artifact_store) if challenger else None
+        incumbent_summary = (
+            await _build_memory_summary(db, incumbent, request, config, artifact_store)
+            if incumbent
+            else None
+        )
+        challenger_summary = (
+            await _build_memory_summary(db, challenger, request, config, artifact_store)
+            if challenger
+            else None
+        )
         related_challengers = [
-            await _build_memory_summary(db, related_memory, config, artifact_store)
+            await _build_memory_summary(
+                db, related_memory, request, config, artifact_store
+            )
             for related_memory in related_memories
         ]
         return MemoryReviewDetailResponse(
@@ -8249,6 +8278,7 @@ def create_admin_app(
             db,
             refreshed,
             source,
+            request=request,
             detail=True,
             config=config,
             artifact_store=artifact_store,
@@ -8290,6 +8320,7 @@ def create_admin_app(
                 db,
                 updated,
                 source,
+                request=request,
                 detail=True,
                 config=config,
                 artifact_store=artifact_store,
@@ -8340,13 +8371,24 @@ def create_admin_app(
             related_challengers=related_after,
         )
         incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent, config, artifact_store) if result.incumbent else None
+            await _build_memory_summary(
+                db, result.incumbent, request, config, artifact_store
+            )
+            if result.incumbent
+            else None
         )
         challenger_summary = (
-            await _build_memory_summary(db, result.challenger, config, artifact_store) if result.challenger else None
+            await _build_memory_summary(
+                db, result.challenger, request, config, artifact_store
+            )
+            if result.challenger
+            else None
         )
         related_challenger_summaries = [
-            await _build_memory_summary(db, related_memory, config, artifact_store) for related_memory in related_after
+            await _build_memory_summary(
+                db, related_memory, request, config, artifact_store
+            )
+            for related_memory in related_after
         ]
         return MemoryReviewDetailResponse(
             **base.model_dump(),
@@ -8392,6 +8434,7 @@ def create_admin_app(
                 db,
                 updated,
                 source,
+                request=request,
                 detail=True,
                 config=config,
                 artifact_store=artifact_store,
@@ -8440,13 +8483,24 @@ def create_admin_app(
             related_challengers=related_after,
         )
         incumbent_summary = (
-            await _build_memory_summary(db, result.incumbent, config, artifact_store) if result.incumbent else None
+            await _build_memory_summary(
+                db, result.incumbent, request, config, artifact_store
+            )
+            if result.incumbent
+            else None
         )
         challenger_summary = (
-            await _build_memory_summary(db, result.challenger, config, artifact_store) if result.challenger else None
+            await _build_memory_summary(
+                db, result.challenger, request, config, artifact_store
+            )
+            if result.challenger
+            else None
         )
         related_challenger_summaries = [
-            await _build_memory_summary(db, related_memory, config, artifact_store) for related_memory in related_after
+            await _build_memory_summary(
+                db, related_memory, request, config, artifact_store
+            )
+            for related_memory in related_after
         ]
         return MemoryReviewDetailResponse(
             **base.model_dump(),

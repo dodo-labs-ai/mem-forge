@@ -493,9 +493,9 @@ TOOLS: list[dict[str, Any]] = [
         "name": "get_memory",
         "description": (
             "Fetch full memory detail by ID when a search result is insufficient. Returns "
-            "canonical content together with independent Evidence Units in evidence[], "
-            "explicit Primary/Required/Context roles, compatibility source and artifact "
-            "locators including sources[].excerpt, entity links, lifecycle metadata, and "
+            "canonical content together with grouped Evidence in evidence[], explicit "
+            "Primary/Required/Context roles, document and Artifact resource locators, "
+            "entity links, lifecycle metadata, and "
             "visibility-safe cross-source Review dispositions in conflict_contexts."
         ),
         "inputSchema": {
@@ -510,8 +510,8 @@ TOOLS: list[dict[str, Any]] = [
         "name": "get_resource",
         "description": (
             "Fetch a MemForge source artifact from get_memory.evidence[].items[].artifact.url, "
-            "get_memory.sources[].content_url, get_memory.sources[].pdf_url, or the "
-            "compatibility get_memory.evidence_artifacts[].url. "
+            "get_memory.evidence[].document.content_url, or "
+            "get_memory.evidence[].document.pdf_url. "
             "In file mode this local proxy writes the "
             "artifact to the agent host cache and returns a real local_path. Use "
             "search -> get_memory -> get_resource "
@@ -523,9 +523,8 @@ TOOLS: list[dict[str, Any]] = [
                 "url": {
                     "type": "string",
                     "description": (
-                        "A MemForge artifact URL from get_memory.sources[], "
-                        "get_memory.evidence[].items[].artifact.url, or "
-                        "get_memory.evidence_artifacts[].url, such as "
+                        "A MemForge URL from get_memory.evidence[].document or "
+                        "get_memory.evidence[].items[].artifact.url, such as "
                         "/api/v1/documents/{doc_id}/content, /api/v1/documents/{doc_id}/pdf, "
                         "/api/v1/documents/{doc_id}/artifacts/{kind}, or "
                         "/api/v1/source-artifacts/{observation_revision_id}."
@@ -572,7 +571,7 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": (
                         "Required claim-local evidence or source context. It is stored separately from "
-                        "canonical content and returned as get_memory.sources[].excerpt. Use it for "
+                        "canonical content and returned as grouped get_memory.evidence[].items[].excerpt. Use it for "
                         "details that explain where the memory came from or how it was verified, but "
                         "exclude secrets and raw oversized logs."
                     ),
@@ -1752,14 +1751,6 @@ def _compact_memory_response(payload: dict[str, Any]) -> dict[str, Any]:
         if key in payload:
             compact[key] = payload[key]
 
-    sources = payload.get("sources")
-    if isinstance(sources, list):
-        compact["sources"] = [_compact_memory_source(source) for source in sources if isinstance(source, dict)]
-    evidence_artifacts = payload.get("evidence_artifacts")
-    if isinstance(evidence_artifacts, list):
-        compact["evidence_artifacts"] = [
-            _compact_memory_evidence_artifact(artifact) for artifact in evidence_artifacts if isinstance(artifact, dict)
-        ]
     evidence = payload.get("evidence")
     if isinstance(evidence, list):
         compact["evidence"] = [
@@ -1774,8 +1765,10 @@ def _compact_memory_evidence_unit(unit: dict[str, Any]) -> dict[str, Any]:
     compact = {
         key: unit[key]
         for key in (
+            "kind",
             "evidence_unit_id",
             "support_scope_version",
+            "source_id",
             "source_type",
             "doc_id",
             "current",
@@ -1783,6 +1776,9 @@ def _compact_memory_evidence_unit(unit: dict[str, Any]) -> dict[str, Any]:
         )
         if key in unit
     }
+    document = unit.get("document")
+    if isinstance(document, dict):
+        compact["document"] = _compact_memory_evidence_document(document)
     items = unit.get("items")
     if isinstance(items, list):
         compact["items"] = [
@@ -1797,6 +1793,7 @@ def _compact_memory_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
     compact = {
         key: item[key]
         for key in (
+            "authority",
             "role",
             "kind",
             "support_contribution",
@@ -1809,6 +1806,23 @@ def _compact_memory_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
     if isinstance(artifact, dict):
         compact["artifact"] = _compact_memory_evidence_artifact(artifact)
     return compact
+
+
+def _compact_memory_evidence_document(
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        key: document[key]
+        for key in (
+            "doc_id",
+            "title",
+            "source_url",
+            "content_url",
+            "pdf_url",
+            "source_updated_at",
+        )
+        if key in document
+    }
 
 
 def _compact_memory_evidence_artifact(
@@ -1825,24 +1839,6 @@ def _compact_memory_evidence_artifact(
     ):
         if key in artifact:
             compact[key] = artifact[key]
-    return compact
-
-
-def _compact_memory_source(source: dict[str, Any]) -> dict[str, Any]:
-    compact: dict[str, Any] = {}
-    for key in (
-        "doc_id",
-        "source_type",
-        "support_kind",
-        "doc_title",
-        "excerpt",
-        "source_url",
-        "content_url",
-        "pdf_url",
-        "source_updated_at",
-    ):
-        if key in source:
-            compact[key] = source[key]
     return compact
 
 

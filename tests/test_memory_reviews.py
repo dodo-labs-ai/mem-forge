@@ -617,12 +617,12 @@ class TestReviewCrud:
 
         assert response.status_code == 200
         payload = response.json()
-        incumbent_source = payload["incumbent"]["sources"][0]
-        challenger_source = payload["challenger"]["sources"][0]
-        assert incumbent_source["content_url"] == "/api/v1/documents/doc-review-incumbent/content"
-        assert challenger_source["content_url"] is None
-        assert "file_uri" not in incumbent_source
-        assert "pdf_uri" not in incumbent_source
+        incumbent_document = payload["incumbent"]["evidence"][0]["document"]
+        challenger_document = payload["challenger"]["evidence"][0]["document"]
+        assert incumbent_document["content_url"] == "/api/v1/documents/doc-review-incumbent/content"
+        assert challenger_document["content_url"] is None
+        assert "file_uri" not in incumbent_document
+        assert "pdf_uri" not in incumbent_document
 
     @pytest.mark.asyncio
     async def test_review_detail_uses_injected_document_store_for_artifact_urls(
@@ -689,8 +689,10 @@ class TestReviewCrud:
             content = client.get("/api/v1/documents/doc-review-object-incumbent/content")
 
         assert detail.status_code == 200
-        incumbent_source = detail.json()["incumbent"]["sources"][0]
-        assert incumbent_source["content_url"] == ("/api/v1/documents/doc-review-object-incumbent/content")
+        incumbent_document = detail.json()["incumbent"]["evidence"][0]["document"]
+        assert incumbent_document["content_url"] == (
+            "/api/v1/documents/doc-review-object-incumbent/content"
+        )
         assert content.status_code == 200
         assert content.text == "# Incumbent object evidence"
 

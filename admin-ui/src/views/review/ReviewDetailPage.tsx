@@ -55,20 +55,26 @@ function StateCard({
       <p className="mt-3 whitespace-pre-wrap text-sm leading-6">
         {memory?.content || emptyCopy}
       </p>
-      {memory?.sources?.length ? (
+      {memory?.evidence?.length ? (
         <div className="mt-4 space-y-2 border-t pt-3">
-          {memory.sources.slice(0, 3).map((source, index) => (
-            <div key={`${source.doc_id}-${index}`} className="text-xs text-muted-foreground">
+          {memory.evidence.slice(0, 3).map((group, index) => (
+            <div
+              key={group.evidence_unit_id ?? `${group.source_id}-${group.doc_id}-${index}`}
+              className="text-xs text-muted-foreground"
+            >
               <div className="flex items-center gap-2">
                 <span className="font-medium text-foreground">
-                  {source.doc_title ?? source.doc_id}
+                  {group.document?.title ?? group.document?.doc_id ?? group.doc_id ?? group.source_id}
                 </span>
                 <Badge variant="secondary" className="text-[10px]">
-                  {source.source_type}
+                  {group.source_type}
                 </Badge>
-                {source.source_url && (
+                {group.legacy_limited && (
+                  <Badge variant="outline" className="text-[10px]">Legacy limited</Badge>
+                )}
+                {group.document?.source_url && (
                   <a
-                    href={source.source_url}
+                    href={group.document.source_url}
                     target="_blank"
                     rel="noreferrer"
                     className="inline-flex items-center gap-1 hover:text-foreground"
@@ -77,9 +83,9 @@ function StateCard({
                   </a>
                 )}
               </div>
-              {source.excerpt && (
+              {group.items.find((item) => item.role === "primary")?.excerpt && (
                 <blockquote className="mt-1 border-l-2 pl-2 leading-relaxed">
-                  {source.excerpt}
+                  {group.items.find((item) => item.role === "primary")?.excerpt}
                 </blockquote>
               )}
             </div>

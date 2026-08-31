@@ -2,7 +2,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, ArrowLeft, ExternalLink, Loader2 } from "lucide-react";
 import { resourceClient } from "@/api/client";
-import type { Memory, MemorySource } from "@/api/types";
+import type { Memory, MemoryEvidenceGroup } from "@/api/types";
 import { ConfidenceBadge, MemoryTypeBadge, StatusDot } from "@/components/admin/StatusBadge";
 import { MemoryTypeIcon } from "@/components/memories/MemoryTypeIcon";
 import { SourceIcon } from "@/components/sources/SourceIcon";
@@ -169,13 +169,13 @@ export function MemoryDetailPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-sm">Provenance ({memory.sources.length} sources)</CardTitle>
+          <CardTitle className="text-sm">Evidence ({memory.evidence.length} groups)</CardTitle>
         </CardHeader>
         <CardContent>
-          {memory.sources.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No provenance sources recorded.</p>
+          {memory.evidence.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No readable Evidence recorded.</p>
           ) : (
-            <ProvenanceSections sources={memory.sources} />
+            <EvidenceSections evidence={memory.evidence} />
           )}
         </CardContent>
       </Card>
@@ -227,69 +227,99 @@ function LifecycleCard({ detail }: { detail: LifecycleDetail }) {
   );
 }
 
-function ProvenanceSections({ sources }: { sources: MemorySource[] }) {
-  const extracted = sources.filter((src) => src.support_kind !== "corroborated");
-  const corroborated = sources.filter((src) => src.support_kind === "corroborated");
-
+function EvidenceSections({ evidence }: { evidence: MemoryEvidenceGroup[] }) {
   return (
-    <div className="space-y-6">
-      {extracted.length > 0 && (
-        <section className="space-y-3">
-          <h3 className="text-xs font-medium uppercase text-muted-foreground">
-            Extracted from
-          </h3>
-          <div className="space-y-4">
-            {extracted.map((src, index) => (
-              <SourceCard key={`extracted-${src.doc_id}-${index}`} source={src} />
-            ))}
-          </div>
-        </section>
-      )}
-      {corroborated.length > 0 && (
-        <section className="space-y-3">
-          <h3 className="text-xs font-medium uppercase text-muted-foreground">
-            Also supported by
-          </h3>
-          <div className="space-y-4">
-            {corroborated.map((src, index) => (
-              <SourceCard key={`corroborated-${src.doc_id}-${index}`} source={src} />
-            ))}
-          </div>
-        </section>
-      )}
+    <div className="space-y-4">
+      {evidence.map((group, index) => (
+        <EvidenceGroupCard
+          key={group.evidence_unit_id ?? `${group.source_id}-${group.doc_id}-${index}`}
+          group={group}
+        />
+      ))}
     </div>
   );
 }
 
-function SourceCard({ source }: { source: MemorySource }) {
+function EvidenceGroupCard({ group }: { group: MemoryEvidenceGroup }) {
+  const document = group.document;
   return (
     <div className="rounded-lg border p-4">
-      <div className="mb-2 flex items-center gap-2">
-        <Badge variant="secondary">{source.source_type}</Badge>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <Badge variant="secondary">{group.source_type}</Badge>
+        <Badge variant="outline">
+          {group.kind === "evidence_unit" ? "Evidence Unit" : "Document Evidence"}
+        </Badge>
+        {group.legacy_limited && <Badge variant="outline">Legacy limited</Badge>}
+        {!group.current && <Badge variant="outline">Historical</Badge>}
         <span className="text-sm font-medium text-foreground">
-          {source.doc_title ?? source.doc_id}
+          {document?.title ?? document?.doc_id ?? group.doc_id ?? group.source_id}
         </span>
-        {source.source_url && (
+        {document?.source_url && (
           <a
-            href={source.source_url}
+            href={document.source_url}
             target="_blank"
             rel="noopener noreferrer"
             className="text-muted-foreground hover:text-foreground"
+            aria-label="Open source"
           >
             <ExternalLink className="size-3.5" />
           </a>
         )}
       </div>
-      {source.excerpt && (
-        <p className="mb-2 border-l-2 border-border pl-3 text-sm italic text-muted-foreground">
-          "{source.excerpt}"
-        </p>
-      )}
-      <div className="text-xs text-muted-foreground">
-        {source.source_observed_at
-          ? `Source observed: ${formatDateTime(source.source_observed_at)}`
-          : `Linked: ${formatDateTime(source.added_at)}`}
+
+      <div className="space-y-3">
+        {group.items.map((item, index) => (
+          <div
+            key={item.evidence_reference_id ?? `${item.authority}-${item.role}-${index}`}
+            className="rounded-md bg-muted/30 p-3"
+          >
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <Badge variant={item.role === "primary" ? "default" : "outline"}>
+                {item.role}
+              </Badge>
+              <span className="text-xs text-muted-foreground">
+                {item.kind === "artifact" ? "Artifact" : "Text"}
+                {!item.support_contribution ? " · context only" : ""}
+              </span>
+            </div>
+            {item.excerpt && (
+              <blockquote className="border-l-2 border-border pl-3 text-sm text-muted-foreground">
+                {item.excerpt}
+              </blockquote>
+            )}
+            {item.artifact && (
+              <a
+                href={item.artifact.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-sm text-primary hover:underline"
+              >
+                {item.artifact.filename} <ExternalLink className="size-3" />
+              </a>
+            )}
+          </div>
+        ))}
       </div>
+
+      {(document?.content_url || document?.pdf_url) && (
+        <div className="mt-3 flex flex-wrap gap-3 text-xs">
+          {document.content_url && (
+            <a href={document.content_url} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+              Open content
+            </a>
+          )}
+          {document.pdf_url && (
+            <a href={document.pdf_url} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
+              Open PDF
+            </a>
+          )}
+        </div>
+      )}
+      {document?.source_updated_at && (
+        <div className="mt-3 text-xs text-muted-foreground">
+          Source updated: {formatDateTime(document.source_updated_at)}
+        </div>
+      )}
     </div>
   );
 }
