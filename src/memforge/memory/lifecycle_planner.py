@@ -82,6 +82,7 @@ def build_lifecycle_plan(
     evidence_references: Sequence[EvidenceReference] = (),
     incumbent_batch_size: int = 30,
     explicit_owner_incumbent_ids: frozenset[str] = frozenset(),
+    maintenance_operator_incumbent_ids: frozenset[str] = frozenset(),
 ) -> LifecyclePlan:
     """Build a complete plan without performing any storage mutation."""
 
@@ -94,8 +95,26 @@ def build_lifecycle_plan(
             "explicit owner authority targets an unknown incumbent: "
             f"{sorted(unknown_explicit_owner_incumbents)}"
         )
+    unknown_maintenance_incumbents = maintenance_operator_incumbent_ids.difference(
+        incumbents
+    )
+    if unknown_maintenance_incumbents:
+        raise ValueError(
+            "maintenance operator authority targets an unknown incumbent: "
+            f"{sorted(unknown_maintenance_incumbents)}"
+        )
+    overlapping_authorities = explicit_owner_incumbent_ids.intersection(
+        maintenance_operator_incumbent_ids
+    )
+    if overlapping_authorities:
+        raise ValueError(
+            "incumbent has multiple lifecycle authorities: "
+            f"{sorted(overlapping_authorities)}"
+        )
 
     def incumbent_authority(memory_id: str) -> IncumbentAuthority:
+        if memory_id in maintenance_operator_incumbent_ids:
+            return IncumbentAuthority.MAINTENANCE_OPERATOR
         return (
             IncumbentAuthority.EXPLICIT_OWNER_MANAGED_CLAIM
             if memory_id in explicit_owner_incumbent_ids
@@ -345,8 +364,10 @@ def build_lifecycle_plan(
             continue
 
         if operation.action is ReconcileAction.DELETE:
-            explicit_owner_action = memory_id in explicit_owner_incumbent_ids
-            if not current_source_support and not explicit_owner_action:
+            evidence_free_action = memory_id in (
+                explicit_owner_incumbent_ids | maintenance_operator_incumbent_ids
+            )
+            if not current_source_support and not evidence_free_action:
                 raise ValueError(f"destructive incumbent lacks current-scope support: {memory_id}")
             if gate_state is LifecycleGateState.GATED or operation.flag_for_review:
                 proposed_mutations = []
@@ -436,6 +457,10 @@ def build_lifecycle_plan(
             if operation.memory is None:
                 raise ValueError("replacement operation requires a new Memory candidate")
             explicit_owner_action = memory_id in explicit_owner_incumbent_ids
+            if memory_id in maintenance_operator_incumbent_ids:
+                raise ValueError(
+                    f"maintenance operator cannot replace incumbent: {memory_id}"
+                )
             if not current_source_support and not explicit_owner_action:
                 raise ValueError(f"replacement incumbent lacks current-scope support: {memory_id}")
             if gate_state is LifecycleGateState.GATED or external_support or operation.flag_for_review:

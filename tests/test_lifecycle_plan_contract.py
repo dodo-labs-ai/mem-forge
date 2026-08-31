@@ -4,6 +4,7 @@ import pytest
 
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
+    IncumbentAuthority,
     IncumbentDecision,
     IncumbentDisposition,
     LifecycleGateState,
@@ -167,6 +168,39 @@ def test_supersession_is_distinct_from_support_removal_and_retirement() -> None:
         LifecycleMutationType.REMOVE_SUPPORT,
         LifecycleMutationType.RETIRE_MEMORY,
     ]
+
+
+def test_maintenance_operator_authority_cannot_supersede_a_memory() -> None:
+    plan = LifecyclePlan(
+        id="plan-maintenance-supersede",
+        scope=_scope(),
+        gate_state=LifecycleGateState.ENABLED,
+        coverage_proof=_proof(
+            IncumbentDecision(
+                "mem-a",
+                IncumbentDisposition.SUPERSEDE,
+                "operator replacement",
+                replacement_memory_id="mem-new",
+                authority=IncumbentAuthority.MAINTENANCE_OPERATOR,
+            ),
+            IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "keep"),
+        ),
+        stale_guard=_guard(),
+        mutations=(
+            LifecycleMutation(
+                mutation_type=LifecycleMutationType.SUPERSEDE_MEMORY,
+                memory_id="mem-a",
+                replacement_memory_id="mem-new",
+                source_id="src-1",
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="maintenance operator authority permits retirement only",
+    ):
+        plan.validate()
 
 
 def test_plan_rejects_mutation_for_memory_outside_incumbent_ledger() -> None:

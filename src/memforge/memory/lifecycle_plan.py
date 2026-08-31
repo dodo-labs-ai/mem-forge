@@ -304,6 +304,7 @@ class IncumbentAuthority(str, Enum):
 
     CURRENT_SOURCE_SUPPORT = "current_source_support"
     EXPLICIT_OWNER_MANAGED_CLAIM = "explicit_owner_managed_claim"
+    MAINTENANCE_OPERATOR = "maintenance_operator"
 
 
 class LifecycleMutationType(str, Enum):
@@ -440,6 +441,22 @@ class LifecyclePlan:
         ):
             raise ValueError("destructive mutation rejected by lifecycle gate")
         incumbents = set(self.coverage_proof.mandatory_incumbent_ids)
+        for decision in self.coverage_proof.incumbent_decisions:
+            if decision.authority is not IncumbentAuthority.MAINTENANCE_OPERATOR:
+                continue
+            destructive_types = {
+                mutation.mutation_type
+                for mutation in self.mutations
+                if mutation.memory_id == decision.memory_id
+                and mutation.mutation_type in DESTRUCTIVE_MUTATIONS
+            }
+            if (
+                decision.disposition is not IncumbentDisposition.REMOVE_SUPPORT
+                or destructive_types != {LifecycleMutationType.RETIRE_MEMORY}
+            ):
+                raise ValueError(
+                    "maintenance operator authority permits retirement only"
+                )
         for item in self.mutations:
             if item.mutation_type in DESTRUCTIVE_MUTATIONS and item.memory_id not in incumbents:
                 raise ValueError("destructive mutation targets memory outside mandatory incumbent ledger")
