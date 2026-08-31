@@ -128,16 +128,6 @@ class ToolClient:
             return {"error": "memory_id is required"}
         return self._resource_json("GET", f"/memories/{quote(memory_id, safe='')}?include_private=true", None)
 
-    def start_source_sync(self, source_id: str, *, force_full_sync: bool = False) -> dict[str, Any]:
-        source_id = source_id.strip()
-        if not source_id:
-            return {"error": "source_id is required"}
-        return self._resource_json(
-            "POST",
-            f"/sources/{quote(source_id, safe='')}/sync",
-            {"force_full_sync": force_full_sync},
-        )
-
     def create_memory(
         self,
         *,
@@ -707,14 +697,6 @@ class ToolClient:
             "POST",
             "/memory-reviews/decisions/apply",
             {"decisions": decisions, "validation_receipt": validation_receipt},
-        )
-
-    def create_source(self, *, source_type: str, name: str, config: dict[str, Any]) -> dict[str, Any]:
-        """Create a source (gene instance) of ``source_type`` with the given config."""
-        return self._resource_json(
-            "POST",
-            "/sources",
-            {"type": source_type, "name": name, "config": config},
         )
 
     def get_source_schedule(self, source_id: str) -> dict[str, Any]:
