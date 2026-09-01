@@ -76,6 +76,27 @@ class RevalidatedSelectionError(ValueError):
         self.code = code
 
 
+def group_revalidated_support_unit(
+    support: tuple[ActiveSupportEvidence, ...],
+) -> tuple[ActiveSupportEvidence, ...]:
+    """Return one complete alternative or a typed non-collapsing outcome."""
+
+    grouped: dict[str, list[ActiveSupportEvidence]] = {}
+    for item in support:
+        grouped.setdefault(item.evidence_unit_id, []).append(item)
+    if not grouped:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.UNPRESENTABLE,
+            "NOOP revalidation has no scoped Evidence Unit",
+        )
+    if len(grouped) != 1:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.AMBIGUOUS,
+            "NOOP revalidation cannot collapse independent Evidence Units",
+        )
+    return tuple(next(iter(grouped.values())))
+
+
 def resolve_revalidated_noop_selection(
     projection: SourceProjection,
     *,
@@ -90,9 +111,8 @@ def resolve_revalidated_noop_selection(
         raise ValueError("NOOP revalidation requires one Source Unit revision")
     if not access_context_hash:
         raise ValueError("NOOP revalidation requires an access context")
-    unit_ids = {item.evidence_unit_id for item in support}
-    if len(unit_ids) != 1:
-        raise ValueError("NOOP revalidation requires one complete Evidence Unit")
+    support = group_revalidated_support_unit(support)
+    unit_id = support[0].evidence_unit_id
     ordered_support = tuple(
         sorted(
             support,
@@ -161,7 +181,7 @@ def resolve_revalidated_noop_selection(
         access_context_hash=access_context_hash,
         catalog_identity={
             "kind": "revalidated_noop",
-            "prior_evidence_unit_id": next(iter(unit_ids)),
+            "prior_evidence_unit_id": unit_id,
         },
         compiled_fragments=compiled_fragments,
         errors=errors,
@@ -252,6 +272,11 @@ def _unique_revalidation_fragment(
     )
     if len(exact_anchor) == 1:
         return exact_anchor[0]
+    if len(exact_anchor) > 1:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.AMBIGUOUS,
+            "NOOP revalidation anchor resolves to multiple current Fragments",
+        )
     exact_text = tuple(
         fragment
         for fragment in candidates
@@ -259,6 +284,11 @@ def _unique_revalidation_fragment(
     )
     if len(exact_text) == 1:
         return exact_text[0]
+    if len(exact_text) > 1:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.AMBIGUOUS,
+            "NOOP revalidation quote resolves to multiple current Fragments",
+        )
     enclosing = tuple(
         fragment
         for fragment in candidates
@@ -266,6 +296,11 @@ def _unique_revalidation_fragment(
     )
     if len(enclosing) == 1:
         return enclosing[0]
+    if len(enclosing) > 1:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.AMBIGUOUS,
+            "NOOP revalidation quote is enclosed by multiple current Fragments",
+        )
     if len(candidates) == 1 and (
         not expected
         or prior.anchor.observation_revision_id
@@ -273,11 +308,7 @@ def _unique_revalidation_fragment(
     ):
         return candidates[0]
     raise RevalidatedSelectionError(
-        (
-            RevalidatedSelectionErrorCode.UNPRESENTABLE
-            if not candidates
-            else RevalidatedSelectionErrorCode.AMBIGUOUS
-        ),
+        RevalidatedSelectionErrorCode.UNPRESENTABLE,
         "NOOP revalidation Evidence does not resolve to one current Fragment",
     )
 
