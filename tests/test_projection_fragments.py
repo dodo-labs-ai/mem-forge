@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -18,6 +19,10 @@ from memforge.agent_knowledge import (
 )
 from memforge.memory.evidence import EvidencePartKind, EvidenceRole
 from memforge.pipeline.memory_extractor import MemoryExtractor
+from memforge.pipeline.extraction_contract import (
+    PROJECTION_EXTRACTION_V8,
+    PROJECTION_EXTRACTION_V9,
+)
 from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
     plan_projection_extraction_batches,
@@ -45,6 +50,11 @@ from memforge.source_projection import (
     SourceUnit,
     SourceUnitRevision,
 )
+from memforge.source_representation import (
+    BINARY_ARTIFACT_PROFILE,
+    PLAIN_TEXT_PROFILE,
+    representation_profile_for_observation_contract,
+)
 
 
 MARKDOWN_PROFILE = EvidenceRepresentationProfile(
@@ -57,6 +67,68 @@ BINARY_PROFILE = EvidenceRepresentationProfile(
     version=1,
     coordinate_space=EvidenceCoordinateSpace.WHOLE_ARTIFACT,
 )
+
+
+def _canonical_projection(
+    *,
+    observation_type: str,
+    content: str,
+) -> SourceProjection:
+    profile = representation_profile_for_observation_contract(
+        source_type="jira",
+        observation_type=observation_type,
+    )
+    assert profile is not None
+    revision = SourceObservationRevision(
+        id=f"rev-{observation_type}",
+        observation_id=f"obs-{observation_type}",
+        semantic_hash=hashlib.sha256(content.encode()).hexdigest(),
+        content=content,
+        evidence_profile=profile,
+    )
+    unit = SourceUnit(
+        id="unit-canonical",
+        source_id="source-jira",
+        unit_type="jira_issue",
+        provider_key="SFPAY-182601",
+    )
+    unit_revision = SourceUnitRevision(
+        id="unit-revision-canonical",
+        source_unit_id=unit.id,
+        semantic_hash="unit-canonical-hash",
+        observation_revision_ids=(revision.id,),
+    )
+    return SourceProjection(
+        run_id="run-canonical",
+        source_id="source-jira",
+        source_type="jira",
+        scope={},
+        coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+        observations=(
+            SourceObservation(
+                id=revision.observation_id,
+                source_id="source-jira",
+                source_unit_id=unit.id,
+                observation_type=observation_type,
+                provider_key=f"provider-{observation_type}",
+            ),
+        ),
+        observation_revisions=(revision,),
+        source_units=(unit,),
+        source_unit_revisions=(unit_revision,),
+        relations=(),
+        deltas=(
+            RevisionDelta(
+                source_unit_id=unit.id,
+                previous_unit_revision_id=None,
+                current_unit_revision_id=unit_revision.id,
+                axes=frozenset({DeltaAxis.SEMANTIC}),
+                coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
+                added_observation_ids=(revision.observation_id,),
+            ),
+        ),
+        checkpoint={},
+    )
 
 
 @pytest_asyncio.fixture
@@ -272,6 +344,274 @@ def test_catalog_resolves_one_primary_and_canonical_required_order() -> None:
     assert all(part.kind is EvidencePartKind.TEXT for part in selection.parts)
     assert selection.parts[0].anchor.observation_revision_id == "rev-primary"
     assert selection.parts[1].anchor.observation_revision_id == "rev-context"
+
+
+@pytest.mark.parametrize("observation_type", ("comment", "changelog"))
+def test_large_canonical_observation_compiles_from_whole_authority(
+    observation_type: str,
+) -> None:
+    content = (
+        json.dumps(
+            {
+                "body": "\n\n".join(
+                    f"Decision paragraph {index}: retain exact Jira authority."
+                    for index in range(700)
+                )
+            },
+            separators=(",", ":"),
+        )
+        if observation_type == "comment"
+        else json.dumps(
+            {
+                "field": "description",
+                "from": "old",
+                "to": "x" * 31_000,
+            },
+            separators=(",", ":"),
+        )
+    )
+    assert len(content) > 30_000
+    projection = _canonical_projection(
+        observation_type=observation_type,
+        content=content,
+    )
+
+    [batch] = plan_projection_extraction_batches(
+        projection,
+        max_primary_chars=30_000,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    catalog = compile_projection_fragment_catalog(
+        projection,
+        batch,
+        access_context_hash="access-canonical",
+    )
+
+    assert batch.primary_authority_spans == (
+        (f"obs-{observation_type}", 0, content),
+    )
+    assert catalog.usable
+    assert catalog.fragments
+    assert all(fragment.primary_eligible for fragment in catalog.fragments)
+    assert not any(
+        error.code.value == "invalid_authority_range"
+        for error in catalog.errors
+    )
+
+
+def test_legacy_v8_large_canonical_observation_keeps_bounded_text_segments() -> None:
+    content = json.dumps(
+        {"body": "Legacy projection prompt. " * 2_000},
+        separators=(",", ":"),
+    )
+    assert len(content) > 30_000
+    projection = _canonical_projection(observation_type="comment", content=content)
+
+    batches = plan_projection_extraction_batches(
+        projection,
+        max_primary_chars=30_000,
+        extraction_contract_version=PROJECTION_EXTRACTION_V8,
+    )
+
+    assert len(batches) > 1
+    assert all(len(batch.primary_markdown) <= 30_000 for batch in batches)
+    assert all(
+        len(span_text) < len(content)
+        for batch in batches
+        for _, _, span_text in batch.primary_authority_spans
+    )
+
+
+@pytest.mark.parametrize("future_profile_kind", ("canonical", "artifact"))
+def test_v9_unknown_whole_authority_profile_fails_in_compiler_not_planner(
+    future_profile_kind: str,
+) -> None:
+    content = json.dumps(
+        {"body": "Future representation content. " * 2_000},
+        separators=(",", ":"),
+    )
+    base = _canonical_projection(observation_type="comment", content=content)
+    [observation] = base.observations
+    [revision] = base.observation_revisions
+    if future_profile_kind == "canonical":
+        assert revision.evidence_profile is not None
+        future = replace(
+            base,
+            observation_revisions=(
+                replace(
+                    revision,
+                    evidence_profile=replace(
+                        revision.evidence_profile,
+                        version=99,
+                    ),
+                ),
+            ),
+        )
+        supplied_artifacts: tuple[str, ...] = ()
+    else:
+        future = replace(
+            base,
+            observations=(replace(observation, observation_type="binary_artifact"),),
+            observation_revisions=(
+                replace(
+                    revision,
+                    evidence_profile=EvidenceRepresentationProfile(
+                        name="future-artifact",
+                        version=7,
+                        coordinate_space=EvidenceCoordinateSpace.WHOLE_ARTIFACT,
+                    ),
+                    metadata={
+                        "source_artifact": {
+                            "inference_eligible": True,
+                            "sha256": "b" * 64,
+                            "media_type": "application/pdf",
+                            "size_bytes": 1,
+                        }
+                    },
+                ),
+            ),
+        )
+        supplied_artifacts = (observation.id,)
+
+    [batch] = plan_projection_extraction_batches(
+        future,
+        max_primary_chars=5_000,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    catalog = compile_projection_fragment_catalog(
+        future,
+        batch,
+        access_context_hash="access-future-profile",
+        supplied_artifact_observation_ids=supplied_artifacts,
+    )
+
+    assert batch.primary_authority_spans == ((observation.id, 0, content),)
+    assert not catalog.usable
+    assert {
+        error.code.value for error in catalog.errors if error.fatal
+    } == {"unsupported_profile"}
+
+
+def test_canonical_nested_markdown_preserves_escaped_raw_json_ranges() -> None:
+    body = 'Decision: keep "quoted" values and C:\\temp.\n\nUnicode: 雪.'
+    content = json.dumps({"body": body}, ensure_ascii=True, separators=(",", ":"))
+    projection = _canonical_projection(observation_type="comment", content=content)
+
+    [batch] = plan_projection_extraction_batches(
+        projection,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    catalog = compile_projection_fragment_catalog(
+        projection,
+        batch,
+        access_context_hash="access-escaped",
+    )
+
+    assert catalog.usable
+    assert [fragment.presentation_text for fragment in catalog.fragments] == [
+        'Decision: keep "quoted" values and C:\\temp.',
+        "Unicode: 雪.",
+    ]
+    for fragment in catalog.fragments:
+        assert fragment.anchor.range_start is not None
+        assert fragment.anchor.range_end is not None
+        raw = content[
+            fragment.anchor.range_start : fragment.anchor.range_end
+        ]
+        assert json.loads(f'"{raw}"') == fragment.presentation_text
+
+
+def test_representation_policy_keeps_binary_whole_and_plain_text_range_addressable() -> None:
+    content = "paragraph text\n\n" * 2_500
+    base = _canonical_projection(observation_type="comment", content=content)
+    [observation] = base.observations
+    [revision] = base.observation_revisions
+
+    plain = replace(
+        base,
+        observation_revisions=(
+            replace(revision, evidence_profile=PLAIN_TEXT_PROFILE),
+        ),
+    )
+    plain_batches = plan_projection_extraction_batches(
+        plain,
+        max_primary_chars=5_000,
+        primary_overlap_chars=0,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    assert len(plain_batches) > 1
+    assert all(
+        len(span_text) < len(content)
+        for batch in plain_batches
+        for _, _, span_text in batch.primary_authority_spans
+    )
+
+    binary = replace(
+        base,
+        observations=(replace(observation, observation_type="binary_artifact"),),
+        observation_revisions=(
+            replace(
+                revision,
+                evidence_profile=BINARY_ARTIFACT_PROFILE,
+                metadata={
+                    "source_artifact": {
+                        "inference_eligible": True,
+                        "sha256": "a" * 64,
+                        "media_type": "application/pdf",
+                        "size_bytes": 1,
+                    }
+                },
+            ),
+        ),
+    )
+    [binary_batch] = plan_projection_extraction_batches(
+        binary,
+        max_primary_chars=5_000,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    assert binary_batch.primary_authority_spans == (
+        (observation.id, 0, content),
+    )
+    binary_catalog = compile_projection_fragment_catalog(
+        binary,
+        binary_batch,
+        access_context_hash="access-binary",
+        supplied_artifact_observation_ids=(observation.id,),
+    )
+    assert binary_catalog.usable
+    assert [
+        fragment.anchor.kind.value for fragment in binary_catalog.fragments
+    ] == ["whole_observation"]
+
+
+def test_large_canonical_fragment_fails_with_capacity_error_without_raw_slicing() -> None:
+    content = json.dumps(
+        {"field": "description", "to": "x" * 2_000},
+        separators=(",", ":"),
+    )
+    projection = _canonical_projection(
+        observation_type="changelog",
+        content=content,
+    )
+
+    [batch] = plan_projection_extraction_batches(
+        projection,
+        max_primary_chars=200,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    catalog = compile_projection_fragment_catalog(
+        projection,
+        batch,
+        access_context_hash="access-capacity",
+        max_presentation_chars=1_000,
+    )
+
+    assert batch.primary_authority_spans == (("obs-changelog", 0, content),)
+    assert not catalog.usable
+    assert catalog.fragments == ()
+    assert {
+        error.code.value for error in catalog.errors if error.fatal
+    } == {"catalog_too_large"}
 
 
 def test_catalog_rejects_unknown_duplicate_and_primary_from_required_only() -> None:
