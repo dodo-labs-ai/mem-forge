@@ -4935,6 +4935,63 @@ async def test_v2_pending_review_ignores_unrelated_stale_cross_unit_support(
 
 
 @pytest.mark.asyncio
+async def test_v2_noop_rebind_ignores_unrelated_stale_cross_unit_support(
+    db: Database,
+) -> None:
+    scenario = await _seed_v2_stale_cross_unit_scenario(
+        db,
+        prefix="projection-v2-causal-rebind",
+    )
+    old_scope_support = set(
+        await db.get_source_unit_support_unit_ids(
+            scenario.first.source_units[0].id
+        )
+    )
+    second = _projection(
+        run_id="projection-v2-causal-rebind-2",
+        body="A7 remains excluded.",
+        prior=scenario.first.source_unit_revisions[0],
+        prior_observations={
+            scenario.first.observations[0].id:
+                scenario.first.observation_revisions[0]
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_SupportValidatingNoopClient(
+            scenario.incumbent.id,
+            supported=True,
+            evidence_quote="A7 remains excluded.",
+        ),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=second.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="A7 is removed. -> A7 remains excluded.",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+    )
+
+    current_support = set(
+        await db.get_active_memory_support_unit_ids(scenario.incumbent.id)
+    )
+    assert stats["noop"] == 1
+    assert scenario.alternative_unit_id in current_support
+    assert current_support.isdisjoint(old_scope_support)
+    assert len(current_support) == 2
+
+
+@pytest.mark.asyncio
 async def test_v2_destructive_commit_defers_on_stale_cross_unit_support(
     db: Database,
 ) -> None:
