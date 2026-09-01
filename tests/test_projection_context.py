@@ -322,7 +322,8 @@ def test_projection_batch_records_primary_eligibility_policy_identity() -> None:
         max_primary_observations=8,
     )
 
-    assert batch.authority_policy_version == 2
+    assert batch.authority_policy_version == 3
+    assert batch.id != "xbatch-838f89fac7f4082c"
 
 
 def test_many_images_use_bounded_multimodal_batches_without_losing_artifacts() -> None:
