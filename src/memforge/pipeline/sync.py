@@ -1493,19 +1493,21 @@ class GeneSyncOrchestrator:
                     break
                 result = pending[source_unit_id]
                 deferred = result["deferred_lifecycle"]
-                attempts += 1
                 try:
                     lifecycle_stats = (
                         await self.memory_engine.retry_deferred_projected_lifecycle(
                             deferred.handle,
-                            eligible_same_run_owner_ids=run_source_unit_ids,
+                            eligible_same_run_source_unit_ids=run_source_unit_ids,
                         )
                     )
                 except SourceUnitLifecycleDeferred as exc:
+                    attempts += 1
                     result["deferred_lifecycle"] = exc
                     result["runtime_bundle"] = exc.runtime_bundle
                     continue
                 except Exception as exc:
+                    if bool(getattr(exc, "commit_attempted", True)):
+                        attempts += 1
                     result["terminal_error"] = _retained_document_error(exc)
                     result["runtime_bundle"] = getattr(
                         exc,
@@ -1515,6 +1517,7 @@ class GeneSyncOrchestrator:
                     pending.pop(source_unit_id)
                     continue
 
+                attempts += 1
                 result["processed"] = True
                 result["updated"] = True
                 result["memories_extracted"] = int(

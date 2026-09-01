@@ -134,10 +134,12 @@ class SourceUnitLifecycleExecutionError(RuntimeError):
         runtime_bundle: AgentRuntimeBundle,
         *,
         retryable: bool = True,
+        commit_attempted: bool = True,
     ) -> None:
         super().__init__(message)
         self.runtime_bundle = runtime_bundle
         self.retryable = retryable
+        self.commit_attempted = commit_attempted
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,7 +219,7 @@ class DeferredProjectedLifecycleHandle:
     """Opaque same-process handle for one deferred projected commit."""
 
     source_unit_id: str
-    blocker_owner_ids: tuple[str, ...]
+    blocking_source_unit_ids: tuple[str, ...]
     _prepared: _PreparedProjectedLifecycleCommit = field(repr=False)
     _runtime_bundle: AgentRuntimeBundle = field(repr=False)
 
@@ -1120,7 +1122,7 @@ class MemoryEngine:
                 failure_bundle,
                 handle=DeferredProjectedLifecycleHandle(
                     source_unit_id=prepared.source_unit_id,
-                    blocker_owner_ids=exc.blocking_source_unit_ids,
+                    blocking_source_unit_ids=exc.blocking_source_unit_ids,
                     _prepared=prepared,
                     _runtime_bundle=failure_bundle,
                 ),
@@ -1193,22 +1195,23 @@ class MemoryEngine:
         self,
         handle: DeferredProjectedLifecycleHandle,
         *,
-        eligible_same_run_owner_ids: set[str] | frozenset[str],
+        eligible_same_run_source_unit_ids: set[str] | frozenset[str],
     ) -> dict[str, int]:
         """Authorize and retry one opaque deferred handle without semantic replay."""
 
         prepared = handle._prepared
         if prepared.applied_stats is not None:
             return dict(prepared.applied_stats)
-        eligible = set(eligible_same_run_owner_ids)
-        if not set(handle.blocker_owner_ids).issubset(eligible):
+        eligible = set(eligible_same_run_source_unit_ids)
+        if not set(handle.blocking_source_unit_ids).issubset(eligible):
             raise SourceUnitLifecycleExecutionError(
                 "deferred lifecycle blocker is outside the current Source run",
                 handle._runtime_bundle,
                 retryable=False,
+                commit_attempted=False,
             )
         prepared.allowed_blocker_source_unit_ids.update(
-            handle.blocker_owner_ids
+            handle.blocking_source_unit_ids
         )
         prepared.retry_attempt_count += 1
         return await self._commit_prepared_projected_lifecycle(

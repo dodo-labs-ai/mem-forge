@@ -3343,7 +3343,7 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
             )
             handle = DeferredProjectedLifecycleHandle(
                 source_unit_id=source_unit_id,
-                blocker_owner_ids=(blocker_unit_id,),
+                blocking_source_unit_ids=(blocker_unit_id,),
                 _prepared=prepared,
                 _runtime_bundle=bundle,
             )
@@ -3360,10 +3360,10 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
         self,
         handle,
         *,
-        eligible_same_run_owner_ids,
+        eligible_same_run_source_unit_ids,
     ):
-        assert set(handle.blocker_owner_ids).issubset(
-            eligible_same_run_owner_ids
+        assert set(handle.blocking_source_unit_ids).issubset(
+            eligible_same_run_source_unit_ids
         )
         prepared = handle._prepared
         prepared.retry_attempt_count += 1
@@ -3419,7 +3419,7 @@ class RoundControlledConvergenceMemoryEngine(NoopMemoryEngine):
         )
         handle = DeferredProjectedLifecycleHandle(
             source_unit_id=prepared.source_unit_id,
-            blocker_owner_ids=(blocker_unit_id,),
+            blocking_source_unit_ids=(blocker_unit_id,),
             _prepared=prepared,
             _runtime_bundle=bundle,
         )
@@ -3444,10 +3444,10 @@ class RoundControlledConvergenceMemoryEngine(NoopMemoryEngine):
         self,
         handle,
         *,
-        eligible_same_run_owner_ids,
+        eligible_same_run_source_unit_ids,
     ):
-        assert set(handle.blocker_owner_ids).issubset(
-            eligible_same_run_owner_ids
+        assert set(handle.blocking_source_unit_ids).issubset(
+            eligible_same_run_source_unit_ids
         )
         prepared = handle._prepared
         prepared.retry_attempt_count += 1
@@ -3518,7 +3518,7 @@ class TombstoneUnlockingMemoryEngine(NoopMemoryEngine):
             )
             handle = DeferredProjectedLifecycleHandle(
                 source_unit_id=prepared.source_unit_id,
-                blocker_owner_ids=(self.blocker_source_unit_id,),
+                blocking_source_unit_ids=(self.blocker_source_unit_id,),
                 _prepared=prepared,
                 _runtime_bundle=bundle,
             )
@@ -3539,14 +3539,99 @@ class TombstoneUnlockingMemoryEngine(NoopMemoryEngine):
         self,
         handle,
         *,
-        eligible_same_run_owner_ids,
+        eligible_same_run_source_unit_ids,
     ):
-        assert set(handle.blocker_owner_ids).issubset(
-            eligible_same_run_owner_ids
+        assert set(handle.blocking_source_unit_ids).issubset(
+            eligible_same_run_source_unit_ids
         )
         prepared = handle._prepared
         assert self.events == ["tombstone"]
         self.events.append("commit")
+        return await NoopMemoryEngine.prepare_and_commit_projected_lifecycle(
+            self,
+            **prepared.kwargs,
+        )
+
+
+class MixedBudgetConvergenceMemoryEngine(NoopMemoryEngine):
+    def __init__(
+        self,
+        *,
+        external_doc_id: str,
+        eligible_doc_id: str,
+        eligible_blocker_unit_id: str,
+    ) -> None:
+        self.external_doc_id = external_doc_id
+        self.eligible_doc_id = eligible_doc_id
+        self.eligible_blocker_unit_id = eligible_blocker_unit_id
+        self.retry_doc_ids: list[str] = []
+
+    def _deferred(self, kwargs, blocker_owner_id: str):
+        projection = kwargs["projection"]
+        source_unit_id = projection.deltas[0].source_unit_id
+        bundle = bind_source_lifecycle_outcome(
+            source_id=projection.source_id,
+            source_type=projection.source_type,
+            doc_id=kwargs["doc_id"],
+            source_unit_id=source_unit_id,
+            base_unit_revision_id=projection.deltas[0].previous_unit_revision_id,
+            target_unit_revision_id=projection.deltas[0].current_unit_revision_id,
+            projection_run_id=projection.run_id,
+            operation_input_hash="d" * 64,
+            execution_owner_id=kwargs["lifecycle_execution_owner_id"],
+            outcome="failed",
+            reason_code="lifecycle_commit_deferred",
+            attempt_count=kwargs["lifecycle_attempt_count"],
+            duration_ms=1,
+            incumbent_count=1,
+            relation_pair_count=0,
+            mutation_count=1,
+            review_count=0,
+            model_call_count=0,
+            deployment_revision="test",
+        )
+        prepared = SimpleNamespace(
+            source_unit_id=source_unit_id,
+            prepared_at_attempt_count=kwargs["lifecycle_attempt_count"],
+            retry_attempt_count=0,
+            kwargs=dict(kwargs),
+        )
+        return SourceUnitLifecycleDeferred(
+            "mixed convergence blocker",
+            bundle,
+            handle=DeferredProjectedLifecycleHandle(
+                source_unit_id=source_unit_id,
+                blocking_source_unit_ids=(blocker_owner_id,),
+                _prepared=prepared,
+                _runtime_bundle=bundle,
+            ),
+        )
+
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
+        doc_id = kwargs["doc_id"]
+        if doc_id == self.external_doc_id:
+            raise self._deferred(kwargs, "unit-external")
+        if doc_id == self.eligible_doc_id:
+            raise self._deferred(kwargs, self.eligible_blocker_unit_id)
+        return await super().prepare_and_commit_projected_lifecycle(**kwargs)
+
+    async def retry_deferred_projected_lifecycle(
+        self,
+        handle,
+        *,
+        eligible_same_run_source_unit_ids,
+    ):
+        prepared = handle._prepared
+        self.retry_doc_ids.append(prepared.kwargs["doc_id"])
+        if not set(handle.blocking_source_unit_ids).issubset(
+            eligible_same_run_source_unit_ids
+        ):
+            raise SourceUnitLifecycleExecutionError(
+                "external blocker",
+                handle._runtime_bundle,
+                retryable=False,
+                commit_attempted=False,
+            )
         return await NoopMemoryEngine.prepare_and_commit_projected_lifecycle(
             self,
             **prepared.kwargs,
@@ -11990,6 +12075,83 @@ async def test_deferred_lifecycle_converges_after_same_run_tombstone(
     assert state.docs_failed == 0
     assert engine.events == ["tombstone", "commit"]
     assert await db.get_document("jira-1") is None
+
+
+@pytest.mark.asyncio
+async def test_external_blocker_does_not_consume_commit_attempt_budget(
+    db: Database,
+    monkeypatch,
+) -> None:
+    source_id = "src-mixed-budget-convergence"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    item_ids = ("jira-0", "jira-1", "jira-2")
+    first = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+    ).sync_gene(
+        gene=BlockingFetchGene(item_count=3, release=release),
+        source_name="Jira",
+        source_id=source_id,
+        force_full_sync=True,
+    )
+    units_by_doc = {
+        doc_id: await db.find_source_unit_by_document_id(source_id, doc_id)
+        for doc_id in item_ids
+    }
+    assert first.last_sync_status == "success"
+    assert all(units_by_doc.values())
+    ordered = sorted(
+        (
+            unit.id,  # type: ignore[union-attr]
+            doc_id,
+        )
+        for doc_id, unit in units_by_doc.items()
+    )
+    external_doc_id = ordered[0][1]
+    eligible_doc_id = ordered[1][1]
+    success_unit_id = ordered[2][0]
+    engine = MixedBudgetConvergenceMemoryEngine(
+        external_doc_id=external_doc_id,
+        eligible_doc_id=eligible_doc_id,
+        eligible_blocker_unit_id=success_unit_id,
+    )
+    monkeypatch.setattr(
+        "memforge.pipeline.sync.MAX_LIFECYCLE_CONVERGENCE_ATTEMPTS",
+        1,
+    )
+
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=BlockingFetchGene(item_count=3, release=release),
+        source_name="Jira",
+        source_id=source_id,
+        force_full_sync=True,
+        reprocess_doc_ids=frozenset(item_ids),
+    )
+
+    assert state.last_sync_status == "partial"
+    assert state.docs_failed == 1
+    assert engine.retry_doc_ids == [external_doc_id, eligible_doc_id]
 
 
 @pytest.mark.asyncio
