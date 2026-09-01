@@ -18,6 +18,9 @@ def test_provider_backed_memory_writes_expose_only_projected_lifecycle_entrypoin
 
     engine_methods = _method_names(root / "src/memforge/memory/engine.py")
     assert "prepare_and_commit_projected_lifecycle" in engine_methods
+    assert "retry_deferred_projected_lifecycle" in engine_methods
+    assert "apply_projected_lifecycle" not in engine_methods
+    assert "commit_prepared_projected_lifecycle" not in engine_methods
     assert "apply_projected_tombstone" in engine_methods
     assert "process_memories" not in engine_methods
     assert not {

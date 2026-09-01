@@ -5256,6 +5256,12 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
         )
     assert isinstance(raised.value.handle, DeferredProjectedLifecycleHandle)
     assert not hasattr(raised.value, "prepared_commit")
+    with pytest.raises(SourceUnitLifecycleExecutionError) as ineligible:
+        await engine.retry_deferred_projected_lifecycle(
+            raised.value.handle,
+            eligible_same_run_source_unit_ids=set(),
+        )
+    assert ineligible.value.commit_attempted is False
 
     await db.db.execute(
         "UPDATE memories SET confidence = ? WHERE id = ?",
@@ -5268,7 +5274,7 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
     ):
         await engine.retry_deferred_projected_lifecycle(
             raised.value.handle,
-            eligible_same_run_owner_ids={scenario.alternative.source_units[0].id},
+            eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
         )
     await db.db.execute(
         "UPDATE memories SET confidence = ? WHERE id = ?",
@@ -5286,7 +5292,7 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
     ):
         await engine.retry_deferred_projected_lifecycle(
             raised.value.handle,
-            eligible_same_run_owner_ids={scenario.alternative.source_units[0].id},
+            eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
         )
     await db.db.execute(
         "UPDATE source_lifecycle_gates SET state = 'enabled' WHERE source_id = ?",
@@ -5303,7 +5309,7 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
     ):
         await engine.retry_deferred_projected_lifecycle(
             raised.value.handle,
-            eligible_same_run_owner_ids={scenario.alternative.source_units[0].id},
+            eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
         )
     await db.db.execute(
         "UPDATE sources SET access_policy = 'workspace' WHERE id = ?",
@@ -5330,7 +5336,7 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
 
     stats = await engine.retry_deferred_projected_lifecycle(
         raised.value.handle,
-        eligible_same_run_owner_ids={scenario.alternative.source_units[0].id},
+        eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
     )
 
     assert client.validation_calls == semantic_calls
@@ -5346,7 +5352,7 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
 
     replayed = await engine.retry_deferred_projected_lifecycle(
         raised.value.handle,
-        eligible_same_run_owner_ids={scenario.alternative.source_units[0].id},
+        eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
     )
     assert replayed == stats
     assert client.validation_calls == semantic_calls
@@ -5414,7 +5420,7 @@ async def test_v2_prepared_commit_rejects_undeclared_support_drift(
     ):
         await engine.retry_deferred_projected_lifecycle(
             raised.value.handle,
-            eligible_same_run_owner_ids={scenario.alternative.source_units[0].id},
+            eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
         )
 
 
