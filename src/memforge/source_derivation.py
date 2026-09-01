@@ -38,8 +38,8 @@ from memforge.pipeline.bounded_work import collect_bounded
 from memforge.pipeline.extraction_contract import (
     CONTRACT_SUPERSEDED,
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
-    PROJECTION_EXTRACTION_V9,
     PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION,
+    projection_extraction_contract,
 )
 from memforge.pipeline.document_units import (
     ExtractionContext,
@@ -279,7 +279,9 @@ class SourceUnitDeriver:
                 ),
                 extraction_contract_version=request.extraction_contract_version,
             )
-            if request.extraction_contract_version == PROJECTION_EXTRACTION_V9
+            if projection_extraction_contract(
+                request.extraction_contract_version
+            ).uses_fragment_catalog
             else self._plan_work(request.projection, request.context)
         )
         manifest = source_derivation_manifest(
@@ -479,7 +481,9 @@ async def replay_source_unit_derivation(
             ),
             extraction_contract_version=request.extraction_contract_version,
         )
-        if request.extraction_contract_version == PROJECTION_EXTRACTION_V9
+        if projection_extraction_contract(
+            request.extraction_contract_version
+        ).uses_fragment_catalog
         else plan_source_derivation_work(request.projection, request.context)
     )
     results = await collect_bounded(
@@ -1040,7 +1044,9 @@ def _batch_input_payload_hash(
         ),
         "candidate_context_image_bytes": batch.candidate_context_image_bytes,
     }
-    if extraction_contract_version == PROJECTION_EXTRACTION_V9:
+    if projection_extraction_contract(
+        extraction_contract_version
+    ).uses_fragment_catalog:
         payload["model_presentation_policy_version"] = (
             PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
         )
