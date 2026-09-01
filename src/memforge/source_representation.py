@@ -63,6 +63,7 @@ class EvidenceRepresentationContract:
         if (self.profile.name == "canonical-record") != (self.canonical_schema is not None):
             raise ValueError("canonical schema ownership must match the representation profile")
 
+
 def _canonical_record_profile(schema_name: str) -> EvidenceRepresentationProfile:
     return EvidenceRepresentationProfile(
         name="canonical-record",
