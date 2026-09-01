@@ -10036,8 +10036,7 @@ class Database:
                            er.anchor_kind, er.observation_id,
                            er.observation_revision_id, er.fragment_id,
                            er.range_start, er.range_end,
-                           COALESCE(er.excerpt, eu.excerpt) AS excerpt,
-                           msa.access_context_hash
+                           COALESCE(er.excerpt, eu.excerpt) AS excerpt
                     FROM memory_support_assertions msa
                     JOIN evidence_references er ON er.id = msa.evidence_reference_id
                     JOIN evidence_units eu ON eu.id = er.evidence_unit_id
@@ -10064,7 +10063,6 @@ class Database:
                             range_end=row["range_end"],
                         ),
                         excerpt=row["excerpt"],
-                        access_context_hash=str(row["access_context_hash"]),
                     )
                 )
         return {memory_id: tuple(grouped[memory_id]) for memory_id in ids}
@@ -10091,7 +10089,7 @@ class Database:
                            er.id AS reference_id, er.role, er.anchor_kind,
                            er.observation_id, er.observation_revision_id,
                            er.fragment_id, er.range_start, er.range_end,
-                           er.excerpt, msa.access_context_hash
+                           er.excerpt
                     FROM memory_unit_support_assertions msa
                     JOIN evidence_references er
                       ON er.evidence_unit_id = msa.evidence_unit_id
@@ -10135,7 +10133,6 @@ class Database:
                             if row["excerpt"] is not None
                             else None
                         ),
-                        access_context_hash=str(row["access_context_hash"]),
                     )
                 )
         return {memory_id: tuple(grouped[memory_id]) for memory_id in memory_ids}

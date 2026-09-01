@@ -2031,7 +2031,6 @@ async def test_backfill_trusts_existing_active_support_only_at_current_revision(
                 observation_revision_id=revision_id,
             ),
             excerpt="Exact supported claim",
-            access_context_hash="access-1",
         )
         for revision_id in support_revision_ids
     )
