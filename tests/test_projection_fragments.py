@@ -19,6 +19,7 @@ from memforge.agent_knowledge import (
     AgentKnowledgePatchProposal,
 )
 from memforge.memory.evidence import EvidencePartKind, EvidenceRole
+from memforge.models import DocumentRecord
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_V8,
@@ -35,8 +36,10 @@ from memforge.pipeline.projection_fragments import (
     resolve_projected_agent_claim_fragment,
 )
 from memforge.source_derivation import (
+    SourceUnitDerivationContext,
     memory_extraction_output_payload,
     memory_extraction_result_from_output_payload,
+    source_derivation_manifest,
 )
 from memforge.storage.database import Database
 from memforge.source_projection import (
@@ -289,13 +292,13 @@ def test_v9_response_accepts_redundant_selectors_for_admission_normalization() -
             {
                 "content": "Approval is required.",
                 "memory_type": "fact",
-                "primary_ref": "f000001",
+                "primary_ref": "p000001",
                 "required_refs": [
-                    "f000003",
-                    "f000001",
-                    "f000002",
-                    "f000003",
-                    "f000002",
+                    "r000003",
+                    "p000001",
+                    "p000002",
+                    "r000003",
+                    "p000002",
                 ],
             }
         ]
@@ -303,7 +306,7 @@ def test_v9_response_accepts_redundant_selectors_for_admission_normalization() -
 
     response = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
 
-    assert response.memories[0].primary_ref == "f000001"
+    assert response.memories[0].primary_ref == "p000001"
     assert response.memories[0].required_refs == payload["memories"][0]["required_refs"]
     reconstructed = ProjectionFragmentMemoryExtractionResponse.model_validate_json(
         response.model_dump_json()
@@ -321,8 +324,8 @@ def test_v9_well_formed_response_remains_byte_stable() -> None:
                 "entity_refs": [],
                 "valid_from": None,
                 "valid_until": None,
-                "primary_ref": "f000001",
-                "required_refs": ["f000002"],
+                "primary_ref": "p000001",
+                "required_refs": ["r000002"],
             }
         ]
     }
@@ -338,8 +341,8 @@ def test_v9_response_accepts_redundant_stringified_and_json_text_fallback_shapes
 ) -> None:
     payload = {
         "memories": "[{\"content\":\"Approval is required.\","
-        "\"memory_type\":\"fact\",\"primary_ref\":\"f000001\","
-        "\"required_refs\":[\"f000002\",\"f000002\"]}]"
+        "\"memory_type\":\"fact\",\"primary_ref\":\"p000001\","
+        "\"required_refs\":[\"r000002\",\"r000002\"]}]"
     }
 
     response = (
@@ -350,14 +353,14 @@ def test_v9_response_accepts_redundant_stringified_and_json_text_fallback_shapes
         else ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
     )
 
-    assert response.memories[0].required_refs == ["f000002", "f000002"]
+    assert response.memories[0].required_refs == ["r000002", "r000002"]
 
 
 @pytest.mark.parametrize(
     ("primary_ref", "required_refs"),
     [
         ("not-a-fragment", []),
-        ("f000001", ["not-a-fragment"]),
+        ("p000001", ["not-a-fragment"]),
     ],
 )
 def test_v9_response_still_rejects_malformed_fragment_refs(
@@ -377,6 +380,37 @@ def test_v9_response_still_rejects_malformed_fragment_refs(
                 ]
             }
         )
+
+
+def test_v9_schema_rejects_required_only_ref_as_primary() -> None:
+    with pytest.raises(ValidationError):
+        ProjectionFragmentMemoryExtractionResponse.model_validate(
+            {
+                "memories": [
+                    {
+                        "content": "Historical context cannot authorize a new claim.",
+                        "memory_type": "fact",
+                        "primary_ref": "r000004",
+                        "required_refs": [],
+                    }
+                ]
+            }
+        )
+
+    accepted = ProjectionFragmentMemoryExtractionResponse.model_validate(
+        {
+            "memories": [
+                {
+                    "content": "Current work authorizes the claim.",
+                    "memory_type": "fact",
+                    "primary_ref": "p000001",
+                    "required_refs": ["p000002", "r000004"],
+                }
+            ]
+        }
+    )
+    assert accepted.memories[0].primary_ref == "p000001"
+    assert accepted.memories[0].required_refs == ["p000002", "r000004"]
 
 
 def test_catalog_resolves_one_primary_and_canonical_required_order() -> None:
@@ -708,7 +742,7 @@ def test_catalog_rejects_duplicate_unknown_and_ineligible_selectors() -> None:
     )
 
     with pytest.raises(FragmentSelectionError) as unknown:
-        catalog.resolve_selection(primary_ref="f999999")
+        catalog.resolve_selection(primary_ref="p999999")
     assert unknown.value.code is FragmentSelectionErrorCode.UNKNOWN_REF
 
     with pytest.raises(FragmentSelectionError) as duplicate:
@@ -774,18 +808,24 @@ def test_bounded_context_is_required_selectable_but_never_primary_eligible() -> 
         batch,
         access_context_hash="access-1",
     )
+    model_payload = catalog.model_payload()
+    payload_by_ref = {
+        item["ref"]: item
+        for group in model_payload.values()
+        for item in group
+    }
     payload_by_observation = {
-        fragment.anchor.observation_id: payload
-        for fragment, payload in zip(
-            catalog.fragments,
-            catalog.model_payload(),
-            strict=True,
-        )
+        fragment.anchor.observation_id: payload_by_ref[fragment.reference]
+        for fragment in catalog.fragments
     }
 
-    assert payload_by_observation["obs-primary"]["primary_eligible"] is True
-    assert payload_by_observation["obs-context"]["primary_eligible"] is False
-    assert all("eligible_roles" not in payload for payload in catalog.model_payload())
+    assert payload_by_observation["obs-primary"]["ref"].startswith("p")
+    assert payload_by_observation["obs-context"]["ref"].startswith("r")
+    assert all(
+        "eligible_roles" not in payload
+        for group in model_payload.values()
+        for payload in group
+    )
 
     primary = next(
         fragment
@@ -809,6 +849,181 @@ def test_bounded_context_is_required_selectable_but_never_primary_eligible() -> 
     with pytest.raises(FragmentSelectionError) as ineligible:
         catalog.resolve_selection(primary_ref=context.reference)
     assert ineligible.value.code is FragmentSelectionErrorCode.INELIGIBLE_ROLE
+
+
+def test_model_catalog_separates_primary_capable_from_required_only_refs() -> None:
+    projection = _projection()
+    projection = replace(
+        projection,
+        deltas=(
+            replace(
+                projection.deltas[0],
+                added_observation_ids=("obs-primary",),
+            ),
+        ),
+    )
+    [batch] = plan_projection_extraction_batches(projection)
+    catalog = compile_projection_fragment_catalog(
+        projection,
+        batch,
+        access_context_hash="access-1",
+    )
+
+    payload = catalog.model_payload()
+
+    assert set(payload) == {"primary_candidates", "required_only_candidates"}
+    assert payload["primary_candidates"]
+    assert payload["required_only_candidates"]
+    assert all(
+        item["ref"].startswith("p")
+        for item in payload["primary_candidates"]
+    )
+    assert all(
+        item["ref"].startswith("r")
+        for item in payload["required_only_candidates"]
+    )
+    assert all(
+        "primary_eligible" not in item
+        for group in payload.values()
+        for item in group
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_requires_empty_output_when_only_required_only_context_has_claim() -> None:
+    projection = _projection()
+    projection = replace(
+        projection,
+        deltas=(
+            replace(
+                projection.deltas[0],
+                added_observation_ids=("obs-primary",),
+            ),
+        ),
+    )
+    [batch] = plan_projection_extraction_batches(projection)
+    catalog = compile_projection_fragment_catalog(
+        projection,
+        batch,
+        access_context_hash="access-1",
+    )
+    prompts: list[str] = []
+
+    class Client:
+        async def extract_projection_fragment_memories(self, prompt: str, **kwargs):
+            del kwargs
+            prompts.append(prompt)
+            return ProjectionFragmentMemoryExtractionResponse(memories=[])
+
+    result = await MemoryExtractor(
+        structured_llm_client=Client(),
+    ).extract_projection_fragment_memories(
+        catalog,
+        source_type="jira",
+        context_markdown="",
+    )
+
+    assert result.error_type is None
+    assert len(prompts) == 1
+    assert '"primary_candidates"' in prompts[0]
+    assert '"required_only_candidates"' in prompts[0]
+    assert (
+        "If a durable claim is stated only by required_only_candidates, "
+        "return an empty memories array."
+    ) in prompts[0]
+
+
+def test_v9_derivation_identity_includes_model_presentation_policy(
+    monkeypatch,
+) -> None:
+    import memforge.source_derivation as source_derivation_module
+
+    projection = _projection()
+    now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    context = SourceUnitDerivationContext(
+        document=DocumentRecord(
+            doc_id="doc-1",
+            source="source-1",
+            source_url="https://example.test/doc-1",
+            title="Document",
+            space_or_project="ENG",
+            author=None,
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="document-hash",
+            token_count=10,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        ),
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=projection.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="current work changed",
+        update_plan_stats=None,
+        source_updated_at=now.isoformat(),
+        user_id=None,
+        source_activity_epoch=None,
+    )
+    v9_batches = plan_projection_extraction_batches(
+        projection,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    v8_batches = plan_projection_extraction_batches(
+        projection,
+        extraction_contract_version=PROJECTION_EXTRACTION_V8,
+    )
+
+    monkeypatch.setattr(
+        source_derivation_module,
+        "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
+        1,
+        raising=False,
+    )
+    old_v9 = source_derivation_manifest(
+        projection,
+        v9_batches,
+        context=context,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    old_v8 = source_derivation_manifest(
+        projection,
+        v8_batches,
+        context=context,
+        extraction_contract_version=PROJECTION_EXTRACTION_V8,
+    )
+    monkeypatch.setattr(
+        source_derivation_module,
+        "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
+        2,
+        raising=False,
+    )
+    current_v9 = source_derivation_manifest(
+        projection,
+        v9_batches,
+        context=context,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    current_v8 = source_derivation_manifest(
+        projection,
+        v8_batches,
+        context=context,
+        extraction_contract_version=PROJECTION_EXTRACTION_V8,
+    )
+
+    assert current_v9.id != old_v9.id
+    assert current_v9.batches[0].input_payload_hash != (
+        old_v9.batches[0].input_payload_hash
+    )
+    assert current_v8.id == old_v8.id
+    assert current_v8.batches[0].input_payload_hash == (
+        old_v8.batches[0].input_payload_hash
+    )
 
 
 def test_truncated_context_is_display_only_and_not_selectable() -> None:
@@ -947,7 +1162,9 @@ def test_inspected_artifact_uses_same_ref_shape_as_text_required() -> None:
     artifact = next(item for item in catalog.fragments if item.kind.value == "artifact")
     assert artifact.primary_eligible is False
     artifact_payload = next(
-        item for item in catalog.model_payload() if item["kind"] == "artifact"
+        item
+        for item in catalog.model_payload()["required_only_candidates"]
+        if item["kind"] == "artifact"
     )
     assert artifact_payload["ref"] == artifact.reference
     assert artifact_payload["image_source_observation_id"] == "obs-context"
@@ -1031,31 +1248,25 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
                         {
                             "content": "Unknown evidence must fail closed.",
                             "memory_type": "fact",
-                            "primary_ref": "f999999",
-                            "required_refs": [artifact.reference, artifact.reference],
-                        },
-                        {
-                            "content": "Required-only evidence cannot become Primary.",
-                            "memory_type": "fact",
-                            "primary_ref": artifact.reference,
+                            "primary_ref": "p999999",
                             "required_refs": [artifact.reference, artifact.reference],
                         },
                         {
                             "content": "A stale selector must fail closed.",
                             "memory_type": "fact",
-                            "primary_ref": "f900001",
+                            "primary_ref": "p900001",
                             "required_refs": [artifact.reference, artifact.reference],
                         },
                         {
                             "content": "A cross-catalog selector must fail closed.",
                             "memory_type": "fact",
-                            "primary_ref": "f900002",
+                            "primary_ref": "p900002",
                             "required_refs": [artifact.reference, artifact.reference],
                         },
                         {
                             "content": "An inaccessible selector must fail closed.",
                             "memory_type": "fact",
-                            "primary_ref": "f900003",
+                            "primary_ref": "p900003",
                             "required_refs": [artifact.reference, artifact.reference],
                         },
                     ]
@@ -1077,16 +1288,15 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
         EvidencePartKind.TEXT,
         EvidencePartKind.ARTIFACT,
     ]
-    assert result.metadata["selector_normalized_candidate_count"] == 6
-    assert result.metadata["selector_normalization_count"] == 8
+    assert result.metadata["selector_normalized_candidate_count"] == 5
+    assert result.metadata["selector_normalization_count"] == 6
     fingerprints = result.metadata["selector_normalization_fingerprints"]
-    assert len(fingerprints) == 6
+    assert len(fingerprints) == 5
     assert all(len(value) == 64 for value in fingerprints)
     assert all(primary.reference not in value for value in fingerprints)
     assert all(artifact.reference not in value for value in fingerprints)
     assert result.metadata["fragment_selection_rejection_counts"] == {
         "unknown_ref": 4,
-        "ineligible_role": 1,
     }
 
     normalization_signals = [
@@ -1108,7 +1318,7 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
     restored = memory_extraction_result_from_output_payload(
         memory_extraction_output_payload(result)
     )
-    assert restored.metadata["selector_normalization_count"] == 8
+    assert restored.metadata["selector_normalization_count"] == 6
     assert restored.metadata["selector_normalization_fingerprints"] == fingerprints
 
 

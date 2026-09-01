@@ -42,9 +42,13 @@ type TransientEvidenceBlockId = Annotated[
     str,
     Field(min_length=1, pattern=r"^EB-\d{3,}$"),
 ]
-type TransientEvidenceFragmentRef = Annotated[
+type TransientPrimaryEvidenceFragmentRef = Annotated[
     str,
-    Field(min_length=1, pattern=r"^f\d{6}$"),
+    Field(min_length=1, pattern=r"^p\d{6}$"),
+]
+type TransientRequiredEvidenceFragmentRef = Annotated[
+    str,
+    Field(min_length=1, pattern=r"^[pr]\d{6}$"),
 ]
 
 
@@ -397,8 +401,8 @@ class ProjectionFragmentMemoryCandidate(StructuredResponseModel):
     entity_refs: list[str] = Field(default_factory=list)
     valid_from: str | None = None
     valid_until: str | None = None
-    primary_ref: TransientEvidenceFragmentRef
-    required_refs: list[TransientEvidenceFragmentRef] = Field(default_factory=list)
+    primary_ref: TransientPrimaryEvidenceFragmentRef
+    required_refs: list[TransientRequiredEvidenceFragmentRef] = Field(default_factory=list)
 
 class ProjectionFragmentMemoryExtractionResponse(StructuredResponseModel):
     """projection-extraction-v9 response containing model judgments only."""
