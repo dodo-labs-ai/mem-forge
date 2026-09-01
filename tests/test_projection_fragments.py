@@ -19,6 +19,10 @@ from memforge.agent_knowledge import (
 )
 from memforge.memory.evidence import EvidencePartKind, EvidenceRole
 from memforge.pipeline.memory_extractor import MemoryExtractor
+from memforge.pipeline.extraction_contract import (
+    PROJECTION_EXTRACTION_V8,
+    PROJECTION_EXTRACTION_V9,
+)
 from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
     plan_projection_extraction_batches,
@@ -375,6 +379,7 @@ def test_large_canonical_observation_compiles_from_whole_authority(
     [batch] = plan_projection_extraction_batches(
         projection,
         max_primary_chars=30_000,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
     catalog = compile_projection_fragment_catalog(
         projection,
@@ -394,12 +399,108 @@ def test_large_canonical_observation_compiles_from_whole_authority(
     )
 
 
+def test_legacy_v8_large_canonical_observation_keeps_bounded_text_segments() -> None:
+    content = json.dumps(
+        {"body": "Legacy projection prompt. " * 2_000},
+        separators=(",", ":"),
+    )
+    assert len(content) > 30_000
+    projection = _canonical_projection(observation_type="comment", content=content)
+
+    batches = plan_projection_extraction_batches(
+        projection,
+        max_primary_chars=30_000,
+        extraction_contract_version=PROJECTION_EXTRACTION_V8,
+    )
+
+    assert len(batches) > 1
+    assert all(len(batch.primary_markdown) <= 30_000 for batch in batches)
+    assert all(
+        len(span_text) < len(content)
+        for batch in batches
+        for _, _, span_text in batch.primary_authority_spans
+    )
+
+
+@pytest.mark.parametrize("future_profile_kind", ("canonical", "artifact"))
+def test_v9_unknown_whole_authority_profile_fails_in_compiler_not_planner(
+    future_profile_kind: str,
+) -> None:
+    content = json.dumps(
+        {"body": "Future representation content. " * 2_000},
+        separators=(",", ":"),
+    )
+    base = _canonical_projection(observation_type="comment", content=content)
+    [observation] = base.observations
+    [revision] = base.observation_revisions
+    if future_profile_kind == "canonical":
+        assert revision.evidence_profile is not None
+        future = replace(
+            base,
+            observation_revisions=(
+                replace(
+                    revision,
+                    evidence_profile=replace(
+                        revision.evidence_profile,
+                        version=99,
+                    ),
+                ),
+            ),
+        )
+        supplied_artifacts: tuple[str, ...] = ()
+    else:
+        future = replace(
+            base,
+            observations=(replace(observation, observation_type="binary_artifact"),),
+            observation_revisions=(
+                replace(
+                    revision,
+                    evidence_profile=EvidenceRepresentationProfile(
+                        name="future-artifact",
+                        version=7,
+                        coordinate_space=EvidenceCoordinateSpace.WHOLE_ARTIFACT,
+                    ),
+                    metadata={
+                        "source_artifact": {
+                            "inference_eligible": True,
+                            "sha256": "b" * 64,
+                            "media_type": "application/pdf",
+                            "size_bytes": 1,
+                        }
+                    },
+                ),
+            ),
+        )
+        supplied_artifacts = (observation.id,)
+
+    [batch] = plan_projection_extraction_batches(
+        future,
+        max_primary_chars=5_000,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    catalog = compile_projection_fragment_catalog(
+        future,
+        batch,
+        access_context_hash="access-future-profile",
+        supplied_artifact_observation_ids=supplied_artifacts,
+    )
+
+    assert batch.primary_authority_spans == ((observation.id, 0, content),)
+    assert not catalog.usable
+    assert {
+        error.code.value for error in catalog.errors if error.fatal
+    } == {"unsupported_profile"}
+
+
 def test_canonical_nested_markdown_preserves_escaped_raw_json_ranges() -> None:
     body = 'Decision: keep "quoted" values and C:\\temp.\n\nUnicode: 雪.'
     content = json.dumps({"body": body}, ensure_ascii=True, separators=(",", ":"))
     projection = _canonical_projection(observation_type="comment", content=content)
 
-    [batch] = plan_projection_extraction_batches(projection)
+    [batch] = plan_projection_extraction_batches(
+        projection,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
     catalog = compile_projection_fragment_catalog(
         projection,
         batch,
@@ -436,6 +537,7 @@ def test_representation_policy_keeps_binary_whole_and_plain_text_range_addressab
         plain,
         max_primary_chars=5_000,
         primary_overlap_chars=0,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
     assert len(plain_batches) > 1
     assert all(
@@ -465,6 +567,7 @@ def test_representation_policy_keeps_binary_whole_and_plain_text_range_addressab
     [binary_batch] = plan_projection_extraction_batches(
         binary,
         max_primary_chars=5_000,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
     assert binary_batch.primary_authority_spans == (
         (observation.id, 0, content),
@@ -494,6 +597,7 @@ def test_large_canonical_fragment_fails_with_capacity_error_without_raw_slicing(
     [batch] = plan_projection_extraction_batches(
         projection,
         max_primary_chars=200,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
     catalog = compile_projection_fragment_catalog(
         projection,

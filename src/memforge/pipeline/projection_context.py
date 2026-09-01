@@ -7,18 +7,17 @@ from dataclasses import dataclass
 
 from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
+    PROJECTION_EXTRACTION_V9,
 )
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
     source_artifact_inference_eligibility,
 )
 from memforge.source_projection import EvidenceRepresentationProfile, SourceProjection
-from memforge.source_representation import representation_contract_for_profile
 
 
-# Covers both Primary eligibility and the exact authority segmentation policy.
-# Bump it whenever either changes so completed derivation batches are not reused.
-PRIMARY_ELIGIBILITY_POLICY_VERSION = 3
+LEGACY_PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 2
+PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +33,7 @@ class ProjectionExtractionBatch:
     context_observation_ids_by_primary: tuple[tuple[str, tuple[str, ...]], ...]
     primary_markdown: str
     context_markdown: str
-    authority_policy_version: int = PRIMARY_ELIGIBILITY_POLICY_VERSION
+    authority_policy_version: int = PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
     # Exact segment coordinates in immutable Observation revisions. Kept
     # transient so EvidenceCatalog never creates a block across overlap seams.
     primary_authority_spans: tuple[tuple[str, int, str], ...] = ()
@@ -68,9 +67,10 @@ def plan_projection_extraction_batches(
     Source Projection truth. Directly related observations, immediate sequence
     neighbors, and the first observation in a unit are bounded Context. Exact
     candidate Context may be selected as Required, but relations never make it
-    Primary-eligible. The primary character budget segments only range-addressable
+    Primary-eligible. Compiler-backed v9 planning segments only range-addressable
     text profiles; canonical records and binary Artifacts retain whole-Observation
-    authority until their representation compiler applies catalog limits.
+    authority until compilation. Legacy projection extraction keeps its bounded
+    character segmentation because it presents batch Markdown directly.
     """
 
     if len(projection.source_units) != 1:
@@ -128,6 +128,13 @@ def plan_projection_extraction_batches(
     if primary_overlap_chars < 0:
         raise ValueError("primary overlap cannot be negative")
 
+    compiler_backed = extraction_contract_version == PROJECTION_EXTRACTION_V9
+    authority_policy_version = (
+        PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
+        if compiler_backed
+        else LEGACY_PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
+    )
+
     segments = [
         segment
         for observation_id in primary_ids
@@ -136,6 +143,7 @@ def plan_projection_extraction_batches(
             observations[observation_id].observation_type,
             revisions[observation_id].content,
             evidence_profile=revisions[observation_id].evidence_profile,
+            preserve_whole_authority=compiler_backed,
             max_chars=max_primary_chars,
             overlap_chars=primary_overlap_chars,
         )
@@ -248,7 +256,7 @@ def plan_projection_extraction_batches(
         digest = hashlib.sha256(
             (
                 f"{extraction_contract_version}\x1f"
-                f"authority-policy:{PRIMARY_ELIGIBILITY_POLICY_VERSION}\x1f"
+                f"authority-policy:{authority_policy_version}\x1f"
                 f"{target_unit_revision_id}\x1f{unit.id}\x1f"
                 f"{index}\x1f{segment_identity}"
             ).encode()
@@ -289,6 +297,7 @@ def plan_projection_extraction_batches(
                 context_observation_ids_by_primary=context_by_primary,
                 primary_markdown=primary_markdown,
                 context_markdown=context_markdown,
+                authority_policy_version=authority_policy_version,
                 primary_authority_spans=tuple(
                     (
                         segment.observation_id,
@@ -385,16 +394,17 @@ def _primary_segments(
     content: str,
     *,
     evidence_profile: EvidenceRepresentationProfile | None,
+    preserve_whole_authority: bool,
     max_chars: int,
     overlap_chars: int,
 ) -> tuple[_PrimarySegment, ...]:
     """Plan exact authority without violating the Revision's representation."""
 
     plain_header = f"### Observation {observation_id} ({observation_type})\n"
-    representation_contract = representation_contract_for_profile(evidence_profile)
     if (
-        representation_contract is not None
-        and representation_contract.requires_whole_observation_authority
+        preserve_whole_authority
+        and evidence_profile is not None
+        and evidence_profile.requires_whole_observation_authority
     ):
         return (_PrimarySegment(observation_id, 0, len(content), plain_header + content),)
     if len(plain_header) + len(content) <= max_chars:
