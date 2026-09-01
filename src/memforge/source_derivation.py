@@ -39,6 +39,7 @@ from memforge.pipeline.extraction_contract import (
     CONTRACT_SUPERSEDED,
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
     PROJECTION_EXTRACTION_V9,
+    PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION,
 )
 from memforge.pipeline.document_units import (
     ExtractionContext,
@@ -1039,6 +1040,10 @@ def _batch_input_payload_hash(
         ),
         "candidate_context_image_bytes": batch.candidate_context_image_bytes,
     }
+    if extraction_contract_version == PROJECTION_EXTRACTION_V9:
+        payload["model_presentation_policy_version"] = (
+            PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
+        )
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 

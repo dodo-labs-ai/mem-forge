@@ -284,12 +284,12 @@ Each Memory must contain exactly:
 - "entity_refs": entity names copied from supporting Fragments
 - "valid_from": YYYY-MM-DD or null
 - "valid_until": YYYY-MM-DD or null
-- "primary_ref": exactly one Fragment ref with `primary_eligible=true` that directly states the claim
-- "required_refs": a duplicate-free list of any presented Fragment refs without which the claim would be invalid or ambiguous
+- "primary_ref": exactly one `pNNNNNN` ref from `primary_candidates` that directly states the claim
+- "required_refs": a duplicate-free list of presented `pNNNNNN` or `rNNNNNN` refs without which the claim would be invalid or ambiguous
 
 Do not return Evidence text, quotes, Observation or Revision IDs, offsets, hashes, profile names, catalog digests, Context refs, or lifecycle actions. Split a candidate that would otherwise need multiple independently claim-bearing Primary refs.
 
-""" + DURABLE_MEMORY_QUALITY_RULES + """Context outside the Fragment catalog is read-only. A catalog Fragment with `primary_eligible=false` may be selected as Required but never as Primary. Fragment refs are valid only in this catalog. Never invent or transform a ref.
+""" + DURABLE_MEMORY_QUALITY_RULES + """Context outside the Fragment catalog is read-only. `required_only_candidates` may be selected as Required but never as Primary. If a durable claim is stated only by required_only_candidates, return an empty memories array. Fragment refs are valid only in this catalog. Never invent or transform a ref.
 
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memories."""
 

@@ -352,22 +352,30 @@ class ProjectionFragmentCatalog:
     def usable(self) -> bool:
         return bool(self.fragments) and not any(error.fatal for error in self.errors)
 
-    def model_payload(self) -> tuple[Mapping[str, object], ...]:
-        return tuple(
-            {
+    def model_payload(self) -> Mapping[str, tuple[Mapping[str, object], ...]]:
+        primary_candidates: list[Mapping[str, object]] = []
+        required_only_candidates: list[Mapping[str, object]] = []
+        for fragment in self.fragments:
+            payload = {
                 "ref": fragment.reference,
                 "kind": fragment.kind.value,
                 "type": fragment.fragment_type,
                 "text": fragment.presentation_text,
-                "primary_eligible": fragment.primary_eligible,
                 **(
                     {"image_source_observation_id": fragment.anchor.observation_id}
                     if fragment.kind is EvidenceFragmentKind.ARTIFACT
                     else {}
                 ),
             }
-            for fragment in self.fragments
-        )
+            (
+                primary_candidates
+                if fragment.primary_eligible
+                else required_only_candidates
+            ).append(payload)
+        return {
+            "primary_candidates": tuple(primary_candidates),
+            "required_only_candidates": tuple(required_only_candidates),
+        }
 
     def selection_fingerprint(
         self,
@@ -668,7 +676,14 @@ def _compose_projection_fragment_catalog(
         )
     exposed = () if any(error.fatal for error in errors) else ordered
     fragments = tuple(
-        replace(fragment, reference=f"f{index:06d}")
+        replace(
+            fragment,
+            reference=(
+                f"p{index:06d}"
+                if fragment.primary_eligible
+                else f"r{index:06d}"
+            ),
+        )
         for index, fragment in enumerate(exposed, start=1)
     )
     digest = _catalog_digest(
