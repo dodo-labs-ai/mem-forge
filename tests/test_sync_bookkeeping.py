@@ -22,7 +22,11 @@ from memforge.llm.structured import (
 )
 from memforge.genes.base import SourceConfigurationError
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
-from memforge.memory.engine import MemoryEngine, SourceUnitLifecycleExecutionError
+from memforge.memory.engine import (
+    MemoryEngine,
+    SourceUnitLifecycleDeferred,
+    SourceUnitLifecycleExecutionError,
+)
 from memforge.memory.lifecycle_planner import lifecycle_plan_id
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.lifecycle_plan import (
@@ -31,6 +35,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleBackfillJobStatus,
     LifecycleGateState,
     LifecyclePlan,
+    ProjectedLifecycleBlocker,
     ReconciliationScope,
     StaleGuard,
 )
@@ -3273,6 +3278,265 @@ class NonRetryableProjectedMemoryEngine(NoopMemoryEngine):
             retryable=False,
         )
         raise error
+
+
+class DeferredOnceMemoryEngine(NoopMemoryEngine):
+    def __init__(
+        self,
+        *,
+        external_blocker: bool = False,
+        prepared_attempt_count: int | None = None,
+    ) -> None:
+        self.external_blocker = external_blocker
+        self.prepared_attempt_count = prepared_attempt_count
+        self.apply_doc_ids: list[str] = []
+        self.committed_unit_ids: list[str] = []
+        self.commit_only_attempts: list[int] = []
+        self.deferred = False
+
+    async def apply_projected_lifecycle(self, **kwargs):
+        projection = kwargs["projection"]
+        source_unit_id = projection.deltas[0].source_unit_id
+        doc_id = kwargs["doc_id"]
+        self.apply_doc_ids.append(doc_id)
+        if doc_id == "jira-1" and not self.deferred:
+            self.deferred = True
+            assert self.committed_unit_ids
+            blocker_unit_id = (
+                "unit-external"
+                if self.external_blocker
+                else self.committed_unit_ids[0]
+            )
+            bundle = bind_source_lifecycle_outcome(
+                source_id=projection.source_id,
+                source_type=projection.source_type,
+                doc_id=doc_id,
+                source_unit_id=source_unit_id,
+                base_unit_revision_id=(
+                    projection.deltas[0].previous_unit_revision_id
+                ),
+                target_unit_revision_id=(
+                    projection.deltas[0].current_unit_revision_id
+                ),
+                projection_run_id=projection.run_id,
+                operation_input_hash="a" * 64,
+                execution_owner_id=kwargs["lifecycle_execution_owner_id"],
+                outcome="failed",
+                reason_code="lifecycle_commit_deferred",
+                attempt_count=1,
+                duration_ms=1,
+                incumbent_count=1,
+                relation_pair_count=0,
+                mutation_count=1,
+                review_count=0,
+                model_call_count=0,
+                deployment_revision="test",
+            )
+            prepared = SimpleNamespace(
+                source_unit_id=source_unit_id,
+                prepared_at_attempt_count=(
+                    self.prepared_attempt_count
+                    or kwargs["lifecycle_attempt_count"]
+                ),
+                kwargs=dict(kwargs),
+            )
+            raise SourceUnitLifecycleDeferred(
+                "same-run cross-Unit Support is stale",
+                bundle,
+                prepared_commit=prepared,
+                blockers=(
+                    ProjectedLifecycleBlocker(
+                        memory_id="mem-shared",
+                        source_unit_id=blocker_unit_id,
+                        evidence_unit_id="eu-blocker",
+                        supported_unit_revision_id="unitrev-old",
+                        current_unit_revision_id="unitrev-current",
+                    ),
+                ),
+            )
+        result = await super().apply_projected_lifecycle(**kwargs)
+        self.committed_unit_ids.append(source_unit_id)
+        return result
+
+    async def commit_prepared_projected_lifecycle(
+        self,
+        prepared,
+        *,
+        lifecycle_attempt_count: int,
+    ):
+        self.commit_only_attempts.append(lifecycle_attempt_count)
+        result = await NoopMemoryEngine.apply_projected_lifecycle(
+            self,
+            **prepared.kwargs,
+        )
+        self.committed_unit_ids.append(prepared.source_unit_id)
+        return result
+
+
+class RoundControlledConvergenceMemoryEngine(NoopMemoryEngine):
+    def __init__(self, *, never_converge: bool = False) -> None:
+        self.never_converge = never_converge
+        self.apply_doc_ids: list[str] = []
+        self.committed_unit_ids: list[str] = []
+        self.commit_only_attempts: list[tuple[str, int]] = []
+        self.first_retry_deferred = False
+        self.unlocked = False
+
+    def _deferred(self, projection, kwargs, prepared=None):
+        blocker_unit_id = self.committed_unit_ids[0]
+        bundle = bind_source_lifecycle_outcome(
+            source_id=projection.source_id,
+            source_type=projection.source_type,
+            doc_id=kwargs["doc_id"],
+            source_unit_id=projection.deltas[0].source_unit_id,
+            base_unit_revision_id=projection.deltas[0].previous_unit_revision_id,
+            target_unit_revision_id=projection.deltas[0].current_unit_revision_id,
+            projection_run_id=projection.run_id,
+            operation_input_hash="b" * 64,
+            execution_owner_id=kwargs["lifecycle_execution_owner_id"],
+            outcome="failed",
+            reason_code="lifecycle_commit_deferred",
+            attempt_count=1,
+            duration_ms=1,
+            incumbent_count=1,
+            relation_pair_count=0,
+            mutation_count=1,
+            review_count=0,
+            model_call_count=0,
+            deployment_revision="test",
+        )
+        prepared = prepared or SimpleNamespace(
+            source_unit_id=projection.deltas[0].source_unit_id,
+            kwargs=dict(kwargs),
+        )
+        return SourceUnitLifecycleDeferred(
+            "same-run cross-Unit Support is stale",
+            bundle,
+            prepared_commit=prepared,
+            blockers=(
+                ProjectedLifecycleBlocker(
+                    memory_id="mem-shared",
+                    source_unit_id=blocker_unit_id,
+                    evidence_unit_id="eu-blocker",
+                    supported_unit_revision_id="unitrev-old",
+                    current_unit_revision_id="unitrev-current",
+                ),
+            ),
+        )
+
+    async def apply_projected_lifecycle(self, **kwargs):
+        projection = kwargs["projection"]
+        source_unit_id = projection.deltas[0].source_unit_id
+        doc_id = kwargs["doc_id"]
+        self.apply_doc_ids.append(doc_id)
+        if doc_id != "jira-0":
+            raise self._deferred(projection, kwargs)
+        result = await super().apply_projected_lifecycle(**kwargs)
+        self.committed_unit_ids.append(source_unit_id)
+        return result
+
+    async def commit_prepared_projected_lifecycle(
+        self,
+        prepared,
+        *,
+        lifecycle_attempt_count: int,
+    ):
+        self.commit_only_attempts.append(
+            (prepared.source_unit_id, lifecycle_attempt_count)
+        )
+        if self.never_converge:
+            raise self._deferred(
+                prepared.kwargs["projection"],
+                prepared.kwargs,
+                prepared,
+            )
+        if not self.first_retry_deferred:
+            self.first_retry_deferred = True
+            raise self._deferred(
+                prepared.kwargs["projection"],
+                prepared.kwargs,
+                prepared,
+            )
+        self.unlocked = True
+        result = await NoopMemoryEngine.apply_projected_lifecycle(
+            self,
+            **prepared.kwargs,
+        )
+        self.committed_unit_ids.append(prepared.source_unit_id)
+        return result
+
+
+class TombstoneUnlockingMemoryEngine(NoopMemoryEngine):
+    def __init__(self, blocker_source_unit_id: str) -> None:
+        self.blocker_source_unit_id = blocker_source_unit_id
+        self.events: list[str] = []
+        self.deferred = False
+
+    async def apply_projected_lifecycle(self, **kwargs):
+        projection = kwargs["projection"]
+        if not self.deferred:
+            self.deferred = True
+            prepared = SimpleNamespace(
+                source_unit_id=projection.deltas[0].source_unit_id,
+                prepared_at_attempt_count=kwargs["lifecycle_attempt_count"],
+                kwargs=dict(kwargs),
+            )
+            bundle = bind_source_lifecycle_outcome(
+                source_id=projection.source_id,
+                source_type=projection.source_type,
+                doc_id=kwargs["doc_id"],
+                source_unit_id=prepared.source_unit_id,
+                base_unit_revision_id=projection.deltas[0].previous_unit_revision_id,
+                target_unit_revision_id=projection.deltas[0].current_unit_revision_id,
+                projection_run_id=projection.run_id,
+                operation_input_hash="c" * 64,
+                execution_owner_id=kwargs["lifecycle_execution_owner_id"],
+                outcome="failed",
+                reason_code="lifecycle_commit_deferred",
+                attempt_count=kwargs["lifecycle_attempt_count"],
+                duration_ms=1,
+                incumbent_count=1,
+                relation_pair_count=0,
+                mutation_count=1,
+                review_count=0,
+                model_call_count=0,
+                deployment_revision="test",
+            )
+            raise SourceUnitLifecycleDeferred(
+                "same-run tombstone owner has stale Support",
+                bundle,
+                prepared_commit=prepared,
+                blockers=(
+                    ProjectedLifecycleBlocker(
+                        memory_id="mem-shared",
+                        source_unit_id=self.blocker_source_unit_id,
+                        evidence_unit_id="eu-blocker",
+                        supported_unit_revision_id="unitrev-old",
+                        current_unit_revision_id="unitrev-current",
+                    ),
+                ),
+            )
+        return await super().apply_projected_lifecycle(**kwargs)
+
+    async def apply_projected_tombstone(self, **kwargs):
+        source_unit_id = kwargs["projection"].deltas[0].source_unit_id
+        assert source_unit_id == self.blocker_source_unit_id
+        self.events.append("tombstone")
+        return await super().apply_projected_tombstone(**kwargs)
+
+    async def commit_prepared_projected_lifecycle(
+        self,
+        prepared,
+        *,
+        lifecycle_attempt_count: int,
+    ):
+        del lifecycle_attempt_count
+        assert self.events == ["tombstone"]
+        self.events.append("commit")
+        return await NoopMemoryEngine.apply_projected_lifecycle(
+            self,
+            **prepared.kwargs,
+        )
 
 
 class FailingLifecycleOutboxMemoryStore:
@@ -11499,6 +11763,219 @@ async def test_non_retryable_lifecycle_failure_stops_document_and_run_retry(
     assert state.last_sync_status == "failed"
     assert state.failure_retryable is False
     assert state.docs_failed == 1
+
+
+@pytest.mark.asyncio
+async def test_same_run_deferred_lifecycle_uses_commit_only_convergence(
+    db: Database,
+) -> None:
+    source_id = "src-deferred-convergence"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    engine = DeferredOnceMemoryEngine(prepared_attempt_count=3)
+
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=BlockingFetchGene(item_count=2, release=release),
+        source_name="Jira",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_failed == 0
+    assert engine.apply_doc_ids == ["jira-0", "jira-1"]
+    assert engine.commit_only_attempts == [4]
+    assert len(engine.committed_unit_ids) == 2
+
+
+@pytest.mark.asyncio
+async def test_deferred_lifecycle_does_not_retry_external_blocker(
+    db: Database,
+) -> None:
+    source_id = "src-external-blocker"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    engine = DeferredOnceMemoryEngine(external_blocker=True)
+
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=BlockingFetchGene(item_count=2, release=release),
+        source_name="Jira",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "partial"
+    assert state.failure_retryable is False
+    assert state.docs_failed == 1
+    assert engine.apply_doc_ids == ["jira-0", "jira-1"]
+    assert engine.commit_only_attempts == []
+
+
+@pytest.mark.asyncio
+async def test_deferred_lifecycle_converges_across_bounded_rounds(
+    db: Database,
+) -> None:
+    source_id = "src-multi-round-convergence"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    engine = RoundControlledConvergenceMemoryEngine()
+
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=BlockingFetchGene(item_count=3, release=release),
+        source_name="Jira",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_failed == 0
+    assert engine.apply_doc_ids == ["jira-0", "jira-1", "jira-2"]
+    assert sorted(attempt for _unit, attempt in engine.commit_only_attempts) == [
+        2,
+        2,
+        3,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deferred_lifecycle_stops_immediately_when_round_makes_no_progress(
+    db: Database,
+) -> None:
+    source_id = "src-no-progress-convergence"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    engine = RoundControlledConvergenceMemoryEngine(never_converge=True)
+
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=BlockingFetchGene(item_count=3, release=release),
+        source_name="Jira",
+        source_id=source_id,
+    )
+
+    assert state.last_sync_status == "partial"
+    assert state.failure_retryable is False
+    assert state.docs_failed == 2
+    assert engine.apply_doc_ids == ["jira-0", "jira-1", "jira-2"]
+    assert len(engine.commit_only_attempts) == 2
+    assert {attempt for _unit, attempt in engine.commit_only_attempts} == {2}
+
+
+@pytest.mark.asyncio
+async def test_deferred_lifecycle_converges_after_same_run_tombstone(
+    db: Database,
+) -> None:
+    source_id = "src-tombstone-convergence"
+    await db.upsert_source(
+        id=source_id,
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    release = asyncio.Event()
+    release.set()
+    first = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+    ).sync_gene(
+        gene=BlockingFetchGene(item_count=2, release=release),
+        source_name="Jira",
+        source_id=source_id,
+        force_full_sync=True,
+    )
+    removed_unit = await db.find_source_unit_by_document_id(
+        source_id,
+        "jira-1",
+    )
+    assert first.last_sync_status == "success"
+    assert removed_unit is not None
+
+    engine = TombstoneUnlockingMemoryEngine(removed_unit.id)
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=engine,
+        memory_store=RecordingDocumentDeleteMemoryStore(db),
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=BlockingFetchGene(item_count=1, release=release),
+        source_name="Jira",
+        source_id=source_id,
+        force_full_sync=True,
+    )
+
+    assert state.last_sync_status == "success"
+    assert state.docs_failed == 0
+    assert engine.events == ["tombstone", "commit"]
+    assert await db.get_document("jira-1") is None
 
 
 @pytest.mark.asyncio

@@ -135,6 +135,8 @@ from memforge.memory.lifecycle_plan import (
     LifecycleMutationType,
     LifecyclePlan,
     ProjectedSupportInvariantError,
+    ProjectedLifecycleBlocker,
+    ProjectedLifecycleDeferredError,
     LifecycleReview,
     LifecycleReviewStatus,
     LifecycleVectorOperation,
@@ -142,6 +144,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleVectorTaskStatus,
     lifecycle_plan_to_payload,
     pending_review_contested_supports,
+    plan_requires_complete_current_support,
     unprovable_cutover_retirement_plan_id,
     validate_unprovable_cutover_evidence,
 )
@@ -10806,6 +10809,7 @@ class Database:
                 memory_ids=candidate_ids,
             )
         )
+        all_deferred_blockers: list[ProjectedLifecycleBlocker] = []
         for memory_id in sorted(candidate_ids):
             async with self.db.execute(
                 "SELECT status FROM memories WHERE id = ?",
@@ -10845,6 +10849,12 @@ class Database:
             )
             accepted = []
             current_scope_count = 0
+            deferred_blockers: list[ProjectedLifecycleBlocker] = []
+            invalid_support = False
+            requires_complete_support = plan_requires_complete_current_support(
+                plan,
+                memory_id,
+            )
             for support in supports:
                 structurally_valid = (
                     support["evidence_source_id"] == plan.scope.source_id
@@ -10865,16 +10875,46 @@ class Database:
                     source_unit_id=str(support["source_lineage_id"]),
                     evidence_unit_id=str(support["evidence_unit_id"]),
                 )
+                unrelated_cross_unit_support = (
+                    structurally_valid
+                    and support["source_lineage_id"]
+                    != plan.scope.source_unit_id
+                )
                 if current or (structurally_valid and contested_edge in contested):
                     accepted.append(support)
+                elif unrelated_cross_unit_support and not requires_complete_support:
+                    accepted.append(support)
+                elif unrelated_cross_unit_support:
+                    deferred_blockers.append(
+                        ProjectedLifecycleBlocker(
+                            memory_id=memory_id,
+                            source_unit_id=str(support["source_lineage_id"]),
+                            evidence_unit_id=str(support["evidence_unit_id"]),
+                            supported_unit_revision_id=str(
+                                support["doc_revision_id"]
+                            ),
+                            current_unit_revision_id=str(
+                                support["current_unit_revision_id"]
+                            ),
+                        )
+                    )
+                else:
+                    invalid_support = True
             if memory_id in created_ids and current_scope_count == 0:
                 raise ProjectedSupportInvariantError(
                     f"projected lifecycle activated Memory without complete Unit support: {memory_id}"
                 )
-            if len(accepted) != len(supports):
+            if invalid_support:
                 raise ProjectedSupportInvariantError(
                     f"projected lifecycle left stale or incomplete Unit support: {memory_id}"
                 )
+            if deferred_blockers:
+                all_deferred_blockers.extend(deferred_blockers)
+        if all_deferred_blockers:
+            raise ProjectedLifecycleDeferredError(
+                "projected lifecycle depends on stale cross-Unit Support",
+                all_deferred_blockers,
+            )
 
     async def _durable_pending_review_contested_supports_unlocked(
         self,

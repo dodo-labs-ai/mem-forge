@@ -33,6 +33,49 @@ class ProjectedSupportInvariantError(ValueError):
     """A deterministic fail-closed projected Support postcondition failure."""
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectedLifecycleBlocker:
+    """One stale cross-Unit Support consumed by a prepared Plan."""
+
+    memory_id: str
+    source_unit_id: str
+    evidence_unit_id: str
+    supported_unit_revision_id: str
+    current_unit_revision_id: str
+
+
+class ProjectedLifecycleDeferredError(ProjectedSupportInvariantError):
+    """A safe-to-defer commit whose declared cross-Unit inputs may converge."""
+
+    def __init__(
+        self,
+        message: str,
+        blockers: Sequence[ProjectedLifecycleBlocker],
+    ) -> None:
+        ordered = tuple(
+            sorted(
+                blockers,
+                key=lambda item: (
+                    item.source_unit_id,
+                    item.evidence_unit_id,
+                    item.memory_id,
+                ),
+            )
+        )
+        if not ordered:
+            raise ValueError("deferred projected lifecycle requires blockers")
+        super().__init__(message)
+        self.blockers = ordered
+
+    @property
+    def blocking_source_unit_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(item.source_unit_id for item in self.blockers))
+
+    @property
+    def blocking_evidence_unit_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(item.evidence_unit_id for item in self.blockers))
+
+
 class CutoverFindingStatus(str, Enum):
     OPEN = "open"
     RESOLVED = "resolved"
@@ -349,6 +392,36 @@ DESTRUCTIVE_MUTATIONS = frozenset(
         LifecycleMutationType.RETIRE_MEMORY,
     }
 )
+
+
+def plan_requires_complete_current_support(
+    plan: "LifecyclePlan",
+    memory_id: str,
+) -> bool:
+    """Return whether this Plan consumes the Memory's complete Support set.
+
+    An unrelated historical Support edge cannot authorize a destructive
+    decision, but it also must not block a support-preserving write that does
+    not consume that edge.  Pending Review creation is support-preserving: its
+    proposed mutations remain staged until a later authorized resolution.
+    """
+
+    mutation_types = {
+        mutation.mutation_type
+        for mutation in plan.mutations
+        if mutation.memory_id == memory_id
+    }
+    if mutation_types.intersection(
+        {
+            LifecycleMutationType.SUPERSEDE_MEMORY,
+            LifecycleMutationType.RETIRE_MEMORY,
+        }
+    ):
+        return True
+    return (
+        LifecycleMutationType.REMOVE_SUPPORT in mutation_types
+        and LifecycleMutationType.ATTACH_SUPPORT not in mutation_types
+    )
 
 
 @dataclass(frozen=True, slots=True)
