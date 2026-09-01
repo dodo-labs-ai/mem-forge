@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -31,7 +31,11 @@ from memforge.evals.agent_evaluation import (
     record_quality_signal,
 )
 from memforge.memory.audit import MemoryAuditLogger
-from memforge.memory.engine import MemoryEngine, SourceUnitLifecycleExecutionError
+from memforge.memory.engine import (
+    MemoryEngine,
+    SourceUnitLifecycleDeferred,
+    SourceUnitLifecycleExecutionError,
+)
 from memforge.memory.evidence import (
     AuthorityCase,
     CandidateMemory,
@@ -46,6 +50,7 @@ from memforge.memory.evidence import (
     RelationOutcomeBundle,
     RelationRunRecord,
     RelationType,
+    SupportScopeVersion,
 )
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
@@ -56,6 +61,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleMutation,
     LifecycleMutationType,
     LifecyclePlan,
+    ProjectedLifecycleDeferredError,
     ProjectedSupportInvariantError,
     LifecycleReviewStatus,
     LifecycleVectorDeliveryResult,
@@ -1719,9 +1725,11 @@ class _SupportValidatingNoopClient(_NoopClient):
         self.evidence_quote = evidence_quote
         self.required_evidence_quote = required_evidence_quote
         self.required_evidence_quotes = required_evidence_quotes
+        self.validation_calls = 0
 
     async def validate_memory_support(self, prompt: str, **kwargs):
         del kwargs
+        self.validation_calls += 1
         assert '"memory_claim"' in prompt
         assert "A7 is retained for regular payroll." in prompt or "A7 is removed." in prompt
         payload = json.loads(
@@ -1934,6 +1942,74 @@ async def _add_independent_legacy_support_alternative(
         )
     )
     return unit_id
+
+
+@dataclass(frozen=True, slots=True)
+class _V2StaleCrossUnitScenario:
+    access_context_hash: str
+    first: SourceProjection
+    incumbent: Memory
+    alternative: SourceProjection
+    alternative_unit_id: str
+    alternative_current: SourceProjection
+
+
+async def _seed_v2_stale_cross_unit_scenario(
+    db: Database,
+    *,
+    prefix: str,
+) -> _V2StaleCrossUnitScenario:
+    access_context_hash = lifecycle_access_context_hash(
+        visibility="workspace",
+        owner_user_id=None,
+        project_key="ENG",
+        repo_identifier=None,
+    )
+    first = _projection(run_id=f"{prefix}-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db,
+        projection=first,
+        access_context_hash=access_context_hash,
+    )
+    alternative = _projection(
+        run_id=f"{prefix}-alternative-1",
+        body="A7 is removed.",
+        item_id="confluence-456",
+        page_id="456",
+    )
+    alternative_unit_id = await _add_independent_legacy_support_alternative(
+        db,
+        incumbent=incumbent,
+        projection=alternative,
+        doc_id="confluence-456",
+        access_context_hash=access_context_hash,
+    )
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=cutover.id,
+        owner_id=prefix,
+    )
+    await db.enable_lifecycle_gate("src-1")
+    alternative_current = _projection(
+        run_id=f"{prefix}-alternative-2",
+        body="A7 is excluded in the current release.",
+        item_id="confluence-456",
+        page_id="456",
+        prior=alternative.source_unit_revisions[0],
+        prior_observations={
+            alternative.observations[0].id: alternative.observation_revisions[0]
+        },
+    )
+    await db.record_source_projection(alternative_current)
+    return _V2StaleCrossUnitScenario(
+        access_context_hash=access_context_hash,
+        first=first,
+        incumbent=incumbent,
+        alternative=alternative,
+        alternative_unit_id=alternative_unit_id,
+        alternative_current=alternative_current,
+    )
 
 
 async def _add_same_unit_legacy_support_alternative(
@@ -4798,6 +4874,426 @@ async def test_v2_noop_unpresentable_current_fragment_stages_review(
     [review] = await db.list_lifecycle_reviews("src-1")
     assert review.status is LifecycleReviewStatus.PENDING
     assert review.reason.endswith(": unpresentable")
+
+
+@pytest.mark.asyncio
+async def test_v2_pending_review_ignores_unrelated_stale_cross_unit_support(
+    db: Database,
+) -> None:
+    scenario = await _seed_v2_stale_cross_unit_scenario(
+        db,
+        prefix="projection-v2-causal-review",
+    )
+    second = _projection(
+        run_id="projection-v2-causal-review-2",
+        body="<!-- no selectable current claim -->",
+        prior=scenario.first.source_unit_revisions[0],
+        prior_observations={
+            scenario.first.observations[0].id:
+                scenario.first.observation_revisions[0]
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_SupportValidatingNoopClient(
+            scenario.incumbent.id,
+            supported=True,
+            evidence_quote="<!-- no selectable current claim -->",
+        ),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=second.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="supporting claim removed from selectable content",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["pending_review"] == 1
+    assert (
+        scenario.alternative_unit_id
+        in await db.get_active_memory_support_unit_ids(scenario.incumbent.id)
+    )
+    current = await db.get_current_source_unit_revision(
+        scenario.first.source_units[0].id
+    )
+    assert current is not None
+    assert current.id == second.source_unit_revisions[0].id
+    [review] = await db.list_lifecycle_reviews("src-1")
+    assert review.status is LifecycleReviewStatus.PENDING
+    assert review.reason.endswith(": unpresentable")
+
+
+@pytest.mark.asyncio
+async def test_v2_destructive_commit_defers_on_stale_cross_unit_support(
+    db: Database,
+) -> None:
+    scenario = await _seed_v2_stale_cross_unit_scenario(
+        db,
+        prefix="projection-v2-causal-deferred",
+    )
+    old_support = await db.get_active_memory_support_unit_ids(
+        scenario.incumbent.id
+    )
+    second = _projection(
+        run_id="projection-v2-causal-deferred-2",
+        body="",
+        prior=scenario.first.source_unit_revisions[0],
+        prior_observations={
+            scenario.first.observations[0].id:
+                scenario.first.observation_revisions[0]
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=None,
+    )
+
+    with pytest.raises(ProjectedLifecycleDeferredError) as raised:
+        await engine.apply_projected_lifecycle(
+            projection=second,
+            doc_id="confluence-123",
+            raw_memories=[],
+            doc_type="design-doc",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content="",
+            update_mode="diff_guided",
+            changed_hunks="A7 is removed. -> empty",
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+        )
+
+    assert raised.value.blocking_source_unit_ids == (
+        scenario.alternative.source_units[0].id,
+    )
+    assert raised.value.blocking_evidence_unit_ids == (
+        scenario.alternative_unit_id,
+    )
+    assert (
+        await db.get_active_memory_support_unit_ids(scenario.incumbent.id)
+        == old_support
+    )
+    current = await db.get_current_source_unit_revision(
+        scenario.first.source_units[0].id
+    )
+    assert current is not None
+    assert current.id == scenario.first.source_unit_revisions[0].id
+
+
+@pytest.mark.asyncio
+async def test_v2_deferred_plan_rolls_back_every_memory_in_source_unit(
+    db: Database,
+) -> None:
+    access_context_hash = lifecycle_access_context_hash(
+        visibility="workspace",
+        owner_user_id=None,
+        project_key="ENG",
+        repo_identifier=None,
+    )
+    first = _projection(
+        run_id="projection-v2-multi-memory-1",
+        body="A7 is removed.\nB8 is removed.",
+    )
+    await db.record_source_projection(first)
+    first_memory = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-a7",
+        memory_content="A7 is removed.",
+        access_context_hash=access_context_hash,
+    )
+    second_memory = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-b8",
+        memory_content="B8 is removed.",
+        access_context_hash=access_context_hash,
+    )
+    alternative = _projection(
+        run_id="projection-v2-multi-memory-alternative-1",
+        body="A7 is removed.\nB8 is removed.",
+        item_id="confluence-456",
+        page_id="456",
+    )
+    alternative_units = {
+        await _add_independent_legacy_support_alternative(
+            db,
+            incumbent=memory,
+            projection=alternative,
+            doc_id="confluence-456",
+            access_context_hash=access_context_hash,
+        )
+        for memory in (first_memory, second_memory)
+    }
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=cutover.id,
+        owner_id="test-v2-multi-memory",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    memory_ids = (first_memory.id, second_memory.id)
+    old_support = {
+        memory_id: await db.get_active_memory_support_unit_ids(memory_id)
+        for memory_id in memory_ids
+    }
+    alternative_current = _projection(
+        run_id="projection-v2-multi-memory-alternative-2",
+        body="A7 and B8 are excluded in the current release.",
+        item_id="confluence-456",
+        page_id="456",
+        prior=alternative.source_unit_revisions[0],
+        prior_observations={
+            alternative.observations[0].id: alternative.observation_revisions[0]
+        },
+    )
+    await db.record_source_projection(alternative_current)
+    target = _projection(
+        run_id="projection-v2-multi-memory-2",
+        body="",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            first.observations[0].id: first.observation_revisions[0]
+        },
+    )
+    source_support = await db.get_source_unit_support_unit_ids(
+        first.source_units[0].id
+    )
+    support_states = await db.get_active_memory_support_states(memory_ids)
+    current_memories = {
+        memory_id: await db.get_memory(memory_id)
+        for memory_id in memory_ids
+    }
+    assert all(current_memories.values())
+    plan = build_lifecycle_plan(
+        plan_id=lifecycle_plan_id(
+            ReconciliationScope(
+                id=f"scope:{target.run_id}",
+                source_id="src-1",
+                source_unit_id=first.source_units[0].id,
+                base_unit_revision_id=first.source_unit_revisions[0].id,
+                target_unit_revision_id=target.source_unit_revisions[0].id,
+            )
+        ),
+        scope=ReconciliationScope(
+            id=f"scope:{target.run_id}",
+            source_id="src-1",
+            source_unit_id=first.source_units[0].id,
+            base_unit_revision_id=first.source_unit_revisions[0].id,
+            target_unit_revision_id=target.source_unit_revisions[0].id,
+        ),
+        gate_state=LifecycleGateState.ENABLED,
+        operations=tuple(
+            ReconcileOperation(
+                action=ReconcileAction.DELETE,
+                memory_id=memory_id,
+                reason="current Source Unit is empty",
+            )
+            for memory_id in memory_ids
+        ),
+        incumbents={
+            memory_id: current_memories[memory_id]  # type: ignore[dict-item]
+            for memory_id in memory_ids
+        },
+        source_support_reference_ids=source_support,
+        all_active_support_reference_ids={
+            memory_id: support_states[memory_id].support_ids
+            for memory_id in memory_ids
+        },
+        support_set_hashes={
+            memory_id: support_states[memory_id].support_set_hash
+            for memory_id in memory_ids
+        },
+        observation_revision_ids=(),
+        new_evidence_reference_ids=(),
+        support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
+        source_support_unit_ids=source_support,
+        all_active_support_unit_ids={
+            memory_id: support_states[memory_id].support_ids
+            for memory_id in memory_ids
+        },
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+            doc_id="confluence-123",
+            source_type="confluence",
+            access_context_hash=access_context_hash,
+        ),
+    )
+
+    with pytest.raises(ProjectedLifecycleDeferredError) as raised:
+        await db.apply_source_projection_lifecycle(target, plan)
+
+    assert raised.value.blocking_source_unit_ids == (
+        alternative.source_units[0].id,
+    )
+    assert set(raised.value.blocking_evidence_unit_ids) == alternative_units
+    assert {
+        memory_id: await db.get_active_memory_support_unit_ids(memory_id)
+        for memory_id in memory_ids
+    } == old_support
+    current_rows = [await db.get_memory(memory_id) for memory_id in memory_ids]
+    assert all(memory is not None and memory.status == "active" for memory in current_rows)
+
+
+@pytest.mark.asyncio
+async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
+    db: Database,
+) -> None:
+    scenario = await _seed_v2_stale_cross_unit_scenario(
+        db,
+        prefix="projection-v2-prepared",
+    )
+    second = _projection(
+        run_id="projection-v2-prepared-2",
+        body="",
+        prior=scenario.first.source_unit_revisions[0],
+        prior_observations={
+            scenario.first.observations[0].id:
+                scenario.first.observation_revisions[0]
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    client = _SupportValidatingNoopClient(
+        scenario.incumbent.id,
+        supported=True,
+        evidence_quote="A7 is excluded in the current release.",
+    )
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=client,
+    )
+
+    with pytest.raises(SourceUnitLifecycleDeferred) as raised:
+        await engine.apply_projected_lifecycle(
+            projection=second,
+            doc_id="confluence-123",
+            raw_memories=[],
+            doc_type="design-doc",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content="",
+            update_mode="diff_guided",
+            changed_hunks="A7 is removed. -> empty",
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+            lifecycle_execution_owner_id="sync-prepared:lease-1",
+        )
+
+    await db.db.execute(
+        "UPDATE memories SET confidence = ? WHERE id = ?",
+        (0.1, scenario.incumbent.id),
+    )
+    await db.db.commit()
+    with pytest.raises(
+        ProjectedSupportInvariantError,
+        match="Memory changed before commit",
+    ):
+        await engine.commit_prepared_projected_lifecycle(
+            raised.value.prepared_commit,
+            lifecycle_attempt_count=2,
+        )
+    await db.db.execute(
+        "UPDATE memories SET confidence = ? WHERE id = ?",
+        (scenario.incumbent.confidence, scenario.incumbent.id),
+    )
+    await db.db.commit()
+    await db.db.execute(
+        "UPDATE source_lifecycle_gates SET state = 'gated' WHERE source_id = ?",
+        ("src-1",),
+    )
+    await db.db.commit()
+    with pytest.raises(
+        ProjectedSupportInvariantError,
+        match="gate changed before commit",
+    ):
+        await engine.commit_prepared_projected_lifecycle(
+            raised.value.prepared_commit,
+            lifecycle_attempt_count=2,
+        )
+    await db.db.execute(
+        "UPDATE source_lifecycle_gates SET state = 'enabled' WHERE source_id = ?",
+        ("src-1",),
+    )
+    await db.db.execute(
+        "UPDATE sources SET access_policy = 'private' WHERE id = ?",
+        ("src-1",),
+    )
+    await db.db.commit()
+    with pytest.raises(
+        ProjectedSupportInvariantError,
+        match="access context changed before commit",
+    ):
+        await engine.commit_prepared_projected_lifecycle(
+            raised.value.prepared_commit,
+            lifecycle_attempt_count=2,
+        )
+    await db.db.execute(
+        "UPDATE sources SET access_policy = 'workspace' WHERE id = ?",
+        ("src-1",),
+    )
+    await db.db.commit()
+
+    await engine.apply_projected_lifecycle(
+        projection=scenario.alternative_current,
+        doc_id="confluence-456",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=(
+            scenario.alternative_current.observation_revisions[0].content
+        ),
+        update_mode="diff_guided",
+        changed_hunks="A7 is removed. -> A7 is excluded in the current release.",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 37, tzinfo=timezone.utc),
+    )
+    semantic_calls = client.validation_calls
+
+    stats = await engine.commit_prepared_projected_lifecycle(
+        raised.value.prepared_commit,
+        lifecycle_attempt_count=2,
+    )
+
+    assert client.validation_calls == semantic_calls
+    assert stats["deleted"] == 0
+    current_support = await db.get_active_memory_support_unit_ids(
+        scenario.incumbent.id
+    )
+    assert scenario.alternative_unit_id not in current_support
+    assert len(current_support) == 1
+    current_memory = await db.get_memory(scenario.incumbent.id)
+    assert current_memory is not None
+    assert current_memory.status == "active"
+
+    replayed = await engine.commit_prepared_projected_lifecycle(
+        raised.value.prepared_commit,
+        lifecycle_attempt_count=3,
+    )
+    assert replayed == stats
+    assert client.validation_calls == semantic_calls
+    assert (
+        await db.get_active_memory_support_unit_ids(scenario.incumbent.id)
+        == current_support
+    )
 
 
 @pytest.mark.asyncio

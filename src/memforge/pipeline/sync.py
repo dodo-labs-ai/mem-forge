@@ -69,6 +69,7 @@ from memforge.memory.lifecycle_plan import (
     AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON,
     ReconciliationScope,
 )
+from memforge.memory.engine import SourceUnitLifecycleDeferred
 from memforge.memory.evidence import SupportScopeVersion
 from memforge.memory.lifecycle_planner import (
     lifecycle_access_context_hash,
@@ -357,6 +358,8 @@ def get_process_document_lifecycle_admission(max_active: int) -> DocumentLifecyc
 
 
 MAX_RETRIES = 3
+MAX_LIFECYCLE_CONVERGENCE_ROUNDS = 3
+MAX_LIFECYCLE_CONVERGENCE_ATTEMPTS = 128
 """Number of retry attempts per content item before marking as failed."""
 
 
@@ -959,6 +962,10 @@ class GeneSyncOrchestrator:
                     "preflight_source_unit_id": None,
                     "preflight_observation_ids": (),
                     "runtime_bundle": None,
+                    "source_unit_id": None,
+                    "deferred_lifecycle": None,
+                    "doc_id": item.item_id,
+                    "title": item.title,
                 }
                 document_completed = False
 
@@ -1033,7 +1040,18 @@ class GeneSyncOrchestrator:
                                 "preflight_observation_ids",
                                 (),
                             )
+                            stats["source_unit_id"] = item_stats.get(
+                                "source_unit_id"
+                            )
                             last_error = None
+                        except SourceUnitLifecycleDeferred as exc:
+                            stats["deferred_lifecycle"] = exc
+                            stats["source_unit_id"] = (
+                                exc.prepared_commit.source_unit_id
+                            )
+                            stats["runtime_bundle"] = exc.runtime_bundle
+                            attempt_error = None
+                            retry_document = False
                         except Exception as exc:
                             attempt_error = _retained_document_error(exc)
                             stats["runtime_bundle"] = getattr(exc, "runtime_bundle", None)
@@ -1046,6 +1064,8 @@ class GeneSyncOrchestrator:
                             )
                             if not explicitly_retryable:
                                 failure_retryable = False
+                        if stats["deferred_lifecycle"] is not None:
+                            break
                         if attempt_error is None:
                             stats["runtime_bundle"] = None
                             break
@@ -1129,6 +1149,21 @@ class GeneSyncOrchestrator:
                         task.cancel()
                 await asyncio.gather(*item_tasks, return_exceptions=True)
                 raise
+
+            await self._converge_deferred_projected_lifecycle(results)
+            for result in results:
+                terminal_error = result.get("terminal_error")
+                if terminal_error is None:
+                    continue
+                result["failed"] = True
+                failure_retryable = False
+                failed_docs.append(
+                    FailedDoc(
+                        doc_id=str(result["doc_id"]),
+                        title=str(result["title"]),
+                        error=str(terminal_error),
+                    )
+                )
 
             # Aggregate stats
             for r in results:
@@ -1393,6 +1428,93 @@ class GeneSyncOrchestrator:
         )
 
         return sync_state
+
+    async def _converge_deferred_projected_lifecycle(
+        self,
+        results: list[dict[str, Any]],
+    ) -> None:
+        """Commit same-run deferred intents without repeating semantic work."""
+
+        run_source_unit_ids = {
+            str(result["source_unit_id"])
+            for result in results
+            if result.get("source_unit_id")
+        }
+        pending = {
+            str(result["source_unit_id"]): result
+            for result in results
+            if result.get("deferred_lifecycle") is not None
+            and result.get("source_unit_id")
+        }
+        if not pending:
+            return
+
+        for source_unit_id, result in tuple(pending.items()):
+            deferred = result["deferred_lifecycle"]
+            if set(deferred.blocking_source_unit_ids).issubset(
+                run_source_unit_ids
+            ):
+                continue
+            result["terminal_error"] = (
+                "deferred lifecycle blocker is outside the current Source run"
+            )
+            pending.pop(source_unit_id)
+
+        attempt_budget = min(
+            MAX_LIFECYCLE_CONVERGENCE_ROUNDS * len(pending),
+            MAX_LIFECYCLE_CONVERGENCE_ATTEMPTS,
+        )
+        attempts = 0
+        for round_index in range(MAX_LIFECYCLE_CONVERGENCE_ROUNDS):
+            if not pending or attempts >= attempt_budget:
+                break
+            successful = 0
+            for source_unit_id in sorted(tuple(pending)):
+                if attempts >= attempt_budget:
+                    break
+                result = pending[source_unit_id]
+                deferred = result["deferred_lifecycle"]
+                attempts += 1
+                try:
+                    lifecycle_stats = (
+                        await self.memory_engine.commit_prepared_projected_lifecycle(
+                            deferred.prepared_commit,
+                            lifecycle_attempt_count=round_index + 2,
+                        )
+                    )
+                except SourceUnitLifecycleDeferred as exc:
+                    result["deferred_lifecycle"] = exc
+                    result["runtime_bundle"] = exc.runtime_bundle
+                    continue
+                except Exception as exc:
+                    result["terminal_error"] = _retained_document_error(exc)
+                    result["runtime_bundle"] = getattr(
+                        exc,
+                        "runtime_bundle",
+                        result.get("runtime_bundle"),
+                    )
+                    pending.pop(source_unit_id)
+                    continue
+
+                result["processed"] = True
+                result["updated"] = True
+                result["memories_extracted"] = int(
+                    lifecycle_stats.get("added", 0)
+                )
+                result["memories_corroborated"] = int(
+                    lifecycle_stats.get("updated", 0)
+                )
+                result["failed"] = False
+                result["deferred_lifecycle"] = None
+                result["runtime_bundle"] = None
+                pending.pop(source_unit_id)
+                successful += 1
+            if successful == 0:
+                break
+
+        for result in pending.values():
+            deferred = result["deferred_lifecycle"]
+            result["terminal_error"] = _retained_document_error(deferred)
 
     async def _resume_source_derivations(
         self,
@@ -1670,6 +1792,12 @@ class GeneSyncOrchestrator:
                     )
                 lifecycle_ok = True
                 return result
+            except SourceUnitLifecycleDeferred:
+                # Semantic work completed successfully.  The caller owns the
+                # bounded commit-only convergence and must not misclassify this
+                # as an LLM/extraction failure.
+                lifecycle_ok = True
+                raise
             except Exception as exc:
                 lifecycle_error = exc
                 raise
@@ -1978,6 +2106,7 @@ class GeneSyncOrchestrator:
 
         if source_unit_id_callback is not None:
             source_unit_id_callback(source_unit.id)
+        stats["source_unit_id"] = source_unit.id
         stats["source_unit_id"] = source_unit.id
 
         projection_run_id = f"{run_id or 'direct'}:{source_unit.id}:{projection_probe.source_unit_revisions[0].id}"

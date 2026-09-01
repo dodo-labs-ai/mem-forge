@@ -12,7 +12,7 @@ import json
 import hashlib
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
@@ -34,12 +34,21 @@ from memforge.memory.candidate_ledger import (
     select_unique_memory_candidates,
 )
 from memforge.memory.entity_resolver import EntityResolver
-from memforge.memory.evidence import EvidenceRole, SupportScopeVersion
+from memforge.memory.evidence import (
+    EvidenceReference,
+    EvidenceRole,
+    EvidenceUnit,
+    SupportScopeVersion,
+)
 from memforge.memory.identity_resolver import (
     IdentityResolutionRequest,
     IdentityResolver,
 )
 from memforge.memory.lifecycle_plan import (
+    LifecycleGateState,
+    LifecyclePlan,
+    ProjectedLifecycleBlocker,
+    ProjectedLifecycleDeferredError,
     ProjectedSupportInvariantError,
     ReconciliationScope,
 )
@@ -91,7 +100,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MemoryEngine", "SourceUnitLifecycleExecutionError"]
+__all__ = [
+    "MemoryEngine",
+    "PreparedProjectedLifecycleCommit",
+    "SourceUnitLifecycleDeferred",
+    "SourceUnitLifecycleExecutionError",
+]
 
 
 MEMORY_SUPPORT_VALIDATION_PROMPT = """Determine whether the current evidence still supports the exact Memory claim.
@@ -125,6 +139,109 @@ class SourceUnitLifecycleExecutionError(RuntimeError):
         super().__init__(message)
         self.runtime_bundle = runtime_bundle
         self.retryable = retryable
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedLifecyclePlanInputs:
+    plan_id: str
+    scope: ReconciliationScope
+    gate_state: LifecycleGateState
+    operations: tuple[ReconcileOperation, ...]
+    incumbents: Mapping[str, Memory]
+    memory_authority_hashes: Mapping[str, str]
+    observation_revision_ids: tuple[str, ...]
+    support_scope_version: SupportScopeVersion
+    evidence_reference_ids_by_claim_hash: Mapping[str, tuple[str, ...]]
+    evidence_unit_ids_by_claim_hash: Mapping[str, tuple[str, ...]]
+    corroboration_targets_by_claim_hash: Mapping[str, Memory]
+    corroboration_proofs_by_claim_hash: Mapping[str, Mapping[str, object]]
+    defaults: NewMemoryDefaults
+    evidence_units: tuple[EvidenceUnit, ...]
+    evidence_references: tuple[EvidenceReference, ...]
+
+
+@dataclass(slots=True)
+class PreparedProjectedLifecycleCommit:
+    """Opaque same-process semantic result for deterministic commit replay."""
+
+    projection: "SourceProjection"
+    plan_inputs: _PreparedLifecyclePlanInputs
+    document: "DocumentRecord | None"
+    derivation_id: str | None
+    derivation_context_identity_hash: str | None
+    expected_source_activity_epoch: int | None
+    base_stats: Mapping[str, int]
+    corroboration_target_ids: frozenset[str]
+    lifecycle_execution_owner_id: str | None
+    operation_input_hash: str
+    doc_id: str
+    source_type: str
+    started_at: float
+    incumbent_count: int
+    relation_pair_count: int
+    model_call_count: int
+    applied_stats: dict[str, int] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def source_unit_id(self) -> str:
+        return self.plan_inputs.scope.source_unit_id
+
+
+class SourceUnitLifecycleDeferred(SourceUnitLifecycleExecutionError):
+    """A non-terminal same-run commit conflict with an opaque prepared intent."""
+
+    def __init__(
+        self,
+        message: str,
+        runtime_bundle: AgentRuntimeBundle,
+        *,
+        prepared_commit: PreparedProjectedLifecycleCommit,
+        blockers: Sequence[ProjectedLifecycleBlocker],
+    ) -> None:
+        super().__init__(message, runtime_bundle, retryable=False)
+        self.prepared_commit = prepared_commit
+        self.blockers = tuple(blockers)
+
+    @property
+    def blocking_source_unit_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(item.source_unit_id for item in self.blockers))
+
+
+def _prepared_memory_authority_hash(memory: Memory) -> str:
+    """Hash Memory facts that semantic preparation was authorized to consume."""
+
+    payload = {
+        "id": memory.id,
+        "memory_type": memory.memory_type,
+        "content_hash": memory.content_hash,
+        "visibility": memory.visibility,
+        "owner_user_id": memory.owner_user_id,
+        "project_key": memory.project_key,
+        "repo_identifier": memory.repo_identifier,
+        "confidence": memory.confidence,
+        "valid_from": memory.valid_from.isoformat() if memory.valid_from else None,
+        "valid_until": memory.valid_until.isoformat() if memory.valid_until else None,
+        "status": memory.status,
+        "superseded_by": memory.superseded_by,
+        "retirement_reason": memory.retirement_reason,
+        "replacement_kind": (
+            memory.replacement_kind.value
+            if memory.replacement_kind is not None
+            else None
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(slots=True)
@@ -758,6 +875,276 @@ class MemoryEngine:
                 retryable=not isinstance(exc, ProjectedSupportInvariantError),
             ) from exc
 
+    async def _materialize_prepared_projected_plan(
+        self,
+        prepared: PreparedProjectedLifecycleCommit,
+    ) -> LifecyclePlan:
+        """Refresh only deterministic commit inputs for one prepared intent."""
+
+        inputs = prepared.plan_inputs
+        gate = await self.db.get_lifecycle_gate(inputs.scope.source_id)
+        if gate.state is not inputs.gate_state:
+            raise ProjectedSupportInvariantError(
+                "prepared lifecycle gate changed before commit"
+            )
+        visibility, owner_user_id = await memory_visibility_for_source_id(
+            self.db,
+            source_id=inputs.scope.source_id,
+        )
+        current_access_hash = lifecycle_access_context_hash(
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            project_key=inputs.defaults.project_key,
+            repo_identifier=inputs.defaults.repo_identifier,
+        )
+        if current_access_hash != inputs.defaults.access_context_hash:
+            raise ProjectedSupportInvariantError(
+                "prepared lifecycle access context changed before commit"
+            )
+
+        memory_ids = tuple(sorted(inputs.memory_authority_hashes))
+        current_memories = {
+            memory.id: memory
+            for memory in await self.db.list_memories_by_ids(memory_ids)
+        }
+        if set(current_memories) != set(memory_ids):
+            raise ProjectedSupportInvariantError(
+                "prepared lifecycle Memory set changed before commit"
+            )
+        for memory_id, expected_hash in inputs.memory_authority_hashes.items():
+            if (
+                _prepared_memory_authority_hash(current_memories[memory_id])
+                != expected_hash
+            ):
+                raise ProjectedSupportInvariantError(
+                    f"prepared lifecycle Memory changed before commit: {memory_id}"
+                )
+
+        incumbent_ids = tuple(sorted(inputs.incumbents))
+        current_incumbents = {
+            memory_id: current_memories[memory_id]
+            for memory_id in incumbent_ids
+        }
+        current_corroboration_targets = {
+            claim_hash: current_memories[target.id]
+            for claim_hash, target in inputs.corroboration_targets_by_claim_hash.items()
+        }
+        support_states = await self.db.get_active_memory_support_states(
+            memory_ids
+        )
+        all_support = {
+            memory_id: support_states[memory_id].support_ids
+            for memory_id in memory_ids
+        }
+        support_hashes = {
+            memory_id: support_states[memory_id].support_set_hash
+            for memory_id in memory_ids
+        }
+        source_support = (
+            await self.db.get_source_unit_support_unit_ids(
+                inputs.scope.source_unit_id
+            )
+            if inputs.support_scope_version
+            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+            else await self.db.get_source_unit_support_reference_ids(
+                inputs.scope.source_unit_id
+            )
+        )
+
+        return build_lifecycle_plan(
+            plan_id=inputs.plan_id,
+            scope=inputs.scope,
+            gate_state=inputs.gate_state,
+            operations=inputs.operations,
+            incumbents=current_incumbents,
+            source_support_reference_ids=source_support,
+            all_active_support_reference_ids=all_support,
+            support_set_hashes=support_hashes,
+            observation_revision_ids=inputs.observation_revision_ids,
+            new_evidence_reference_ids=(),
+            evidence_reference_ids_by_claim_hash=(
+                inputs.evidence_reference_ids_by_claim_hash
+            ),
+            support_scope_version=inputs.support_scope_version,
+            source_support_unit_ids=(
+                source_support
+                if inputs.support_scope_version
+                is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                else None
+            ),
+            all_active_support_unit_ids=(
+                all_support
+                if inputs.support_scope_version
+                is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                else None
+            ),
+            evidence_unit_ids_by_claim_hash=(
+                inputs.evidence_unit_ids_by_claim_hash
+            ),
+            corroboration_targets_by_claim_hash=current_corroboration_targets,
+            corroboration_proofs_by_claim_hash=(
+                inputs.corroboration_proofs_by_claim_hash
+            ),
+            defaults=inputs.defaults,
+            evidence_units=inputs.evidence_units,
+            evidence_references=inputs.evidence_references,
+        )
+
+    def _prepared_runtime_bundle(
+        self,
+        prepared: PreparedProjectedLifecycleCommit,
+        plan: LifecyclePlan,
+        *,
+        lifecycle_attempt_count: int,
+        outcome: str,
+        reason_code: str,
+    ) -> AgentRuntimeBundle | None:
+        if prepared.lifecycle_execution_owner_id is None:
+            return None
+        scope = prepared.plan_inputs.scope
+        return bind_source_lifecycle_outcome(
+            source_id=prepared.projection.source_id,
+            source_type=prepared.source_type,
+            doc_id=prepared.doc_id,
+            source_unit_id=scope.source_unit_id,
+            base_unit_revision_id=scope.base_unit_revision_id,
+            target_unit_revision_id=scope.target_unit_revision_id,
+            projection_run_id=prepared.projection.run_id,
+            operation_input_hash=prepared.operation_input_hash,
+            execution_owner_id=prepared.lifecycle_execution_owner_id,
+            outcome=outcome,
+            reason_code=reason_code,
+            attempt_count=lifecycle_attempt_count,
+            duration_ms=max(
+                0,
+                round((perf_counter() - prepared.started_at) * 1000),
+            ),
+            incumbent_count=prepared.incumbent_count,
+            relation_pair_count=prepared.relation_pair_count,
+            mutation_count=len(plan.mutations),
+            review_count=sum(
+                mutation.mutation_type.value == "create_review"
+                for mutation in plan.mutations
+            ),
+            model_call_count=prepared.model_call_count,
+            deployment_revision=current_deployment_revision(),
+        )
+
+    async def commit_prepared_projected_lifecycle(
+        self,
+        prepared: PreparedProjectedLifecycleCommit,
+        *,
+        lifecycle_attempt_count: int,
+    ) -> dict[str, int]:
+        """Rematerialize stale guards and atomically commit without semantic replay."""
+
+        if lifecycle_attempt_count < 1:
+            raise ValueError("lifecycle_attempt_count must be positive")
+        if prepared.applied_stats is not None:
+            return dict(prepared.applied_stats)
+        plan = await self._materialize_prepared_projected_plan(prepared)
+        runtime_bundle = self._prepared_runtime_bundle(
+            prepared,
+            plan,
+            lifecycle_attempt_count=lifecycle_attempt_count,
+            outcome="expected",
+            reason_code="lifecycle_plan_applied",
+        )
+        try:
+            await self.db.apply_source_projection_lifecycle(
+                prepared.projection,
+                plan,
+                document=prepared.document,
+                derivation_id=prepared.derivation_id,
+                derivation_context_identity_hash=(
+                    prepared.derivation_context_identity_hash
+                ),
+                expected_source_activity_epoch=(
+                    prepared.expected_source_activity_epoch
+                ),
+                runtime_bundle=runtime_bundle,
+            )
+        except ProjectedLifecycleDeferredError as exc:
+            if prepared.lifecycle_execution_owner_id is None:
+                raise
+            failure_bundle = self._prepared_runtime_bundle(
+                prepared,
+                plan,
+                lifecycle_attempt_count=lifecycle_attempt_count,
+                outcome="failed",
+                reason_code="lifecycle_commit_deferred",
+            )
+            assert failure_bundle is not None
+            raise SourceUnitLifecycleDeferred(
+                str(exc),
+                failure_bundle,
+                prepared_commit=prepared,
+                blockers=exc.blockers,
+            ) from exc
+        except Exception as exc:
+            if prepared.lifecycle_execution_owner_id is None:
+                raise
+            failure_bundle = self._prepared_runtime_bundle(
+                prepared,
+                plan,
+                lifecycle_attempt_count=lifecycle_attempt_count,
+                outcome="failed",
+                reason_code="lifecycle_commit_failed",
+            )
+            assert failure_bundle is not None
+            raise SourceUnitLifecycleExecutionError(
+                str(exc),
+                failure_bundle,
+                retryable=not isinstance(exc, ProjectedSupportInvariantError),
+            ) from exc
+
+        if runtime_bundle is not None:
+            publish_runtime_events(
+                self.runtime_event_trace_sink,
+                runtime_bundle.events,
+            )
+            publish_agent_assessments(
+                self.agent_assessment_sink,
+                runtime_bundle.assessments,
+                runtime_bundle.events,
+            )
+        delivery = await self.memory_store.attempt_lifecycle_vector_delivery(
+            plan.id
+        )
+        stats = dict(prepared.base_stats)
+        stats["vector_delivery_pending"] = int(delivery.pending)
+        stats["relation_discovery_enqueued"] = len(
+            plan.relation_discovery_requests
+        )
+        for mutation in plan.mutations:
+            if mutation.mutation_type.value == "create_memory":
+                stats["added"] += 1
+            elif mutation.mutation_type.value == "reactivate_memory":
+                stats["reactivated"] += 1
+            elif mutation.mutation_type.value == "supersede_memory":
+                if mutation.payload.get("replacement_kind") == "revision":
+                    stats["updated"] += 1
+                else:
+                    stats["superseded"] += 1
+            elif mutation.mutation_type.value == "retire_memory":
+                stats["deleted"] += 1
+            elif mutation.mutation_type.value == "create_review":
+                stats["pending_review"] += 1
+        stats["corroborated"] = len(
+            {
+                mutation.memory_id
+                for mutation in plan.mutations
+                if mutation.mutation_type.value == "attach_support"
+                and mutation.memory_id in prepared.corroboration_target_ids
+            }
+        )
+        stats["noop"] = sum(
+            decision.disposition.value == "keep"
+            for decision in plan.coverage_proof.incumbent_decisions
+        )
+        prepared.applied_stats = dict(stats)
+        return stats
+
     async def _apply_projected_lifecycle_once(
         self,
         *,
@@ -841,10 +1228,6 @@ class MemoryEngine:
         incumbent_support_states = await self.db.get_active_memory_support_states(
             tuple(memory.id for memory in incumbents)
         )
-        all_support = {
-            memory_id: state.support_ids
-            for memory_id, state in incumbent_support_states.items()
-        }
         support_hashes = {
             memory_id: state.support_set_hash
             for memory_id, state in incumbent_support_states.items()
@@ -1217,12 +1600,6 @@ class MemoryEngine:
             corroboration_targets[claim_hash] = target
             corroboration_proofs[claim_hash] = dict(equivalence_proof)
             attached_target_ids.append(target.id)
-        attached_support_states = {
-            memory_id: classified_candidate_support[memory_id] for memory_id in attached_target_ids
-        }
-        for memory_id, state in attached_support_states.items():
-            all_support[memory_id] = state.support_ids
-            support_hashes[memory_id] = state.support_set_hash
         evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
         projected_evidence = build_projected_claim_evidence(
             projection=projection,
@@ -1249,152 +1626,110 @@ class MemoryEngine:
             else operation
             for operation in operations
         )
-        plan_id = lifecycle_plan_id(scope)
-        plan = build_lifecycle_plan(
-            plan_id=plan_id,
-            scope=scope,
-            gate_state=gate.state,
-            operations=operations,
-            incumbents=incumbents_by_id,
-            source_support_reference_ids=unit_support,
-            all_active_support_reference_ids=all_support,
-            support_set_hashes=support_hashes,
-            observation_revision_ids=observation_revision_ids,
-            new_evidence_reference_ids=(),
-            evidence_reference_ids_by_claim_hash=(projected_evidence.reference_ids_by_claim_hash),
-            support_scope_version=support_scope_version,
-            source_support_unit_ids=(
-                unit_support
-                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+        defaults = NewMemoryDefaults(
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            project_key=project_key,
+            repo_identifier=repo_identifier,
+            doc_id=doc_id,
+            source_type=source_type,
+            access_context_hash=access_context_hash,
+            actor_user_id=user_id,
+            entity_ids_by_claim_hash=entity_ids_by_claim_hash,
+            preclassified_relations_by_claim_hash=preclassified_relations,
+            source_updated_at=(
+                source_updated_at.isoformat()
+                if source_updated_at is not None
                 else None
             ),
-            all_active_support_unit_ids=(
-                all_support
-                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-                else None
-            ),
-            evidence_unit_ids_by_claim_hash=(
-                projected_evidence.evidence_unit_ids_by_claim_hash
-            ),
-            corroboration_targets_by_claim_hash=corroboration_targets,
-            corroboration_proofs_by_claim_hash=corroboration_proofs,
-            defaults=NewMemoryDefaults(
-                visibility=visibility,
-                owner_user_id=owner_user_id,
-                project_key=project_key,
-                repo_identifier=repo_identifier,
-                doc_id=doc_id,
-                source_type=source_type,
-                access_context_hash=access_context_hash,
-                actor_user_id=user_id,
-                entity_ids_by_claim_hash=entity_ids_by_claim_hash,
-                preclassified_relations_by_claim_hash=preclassified_relations,
-                source_updated_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
-            ),
-            evidence_units=projected_evidence.units,
-            evidence_references=projected_evidence.references,
         )
-        runtime_bundle = None
-        if lifecycle_execution_owner_id is not None:
-            runtime_bundle = bind_source_lifecycle_outcome(
-                source_id=projection.source_id,
-                source_type=source_type,
-                doc_id=doc_id,
-                source_unit_id=scope.source_unit_id,
-                base_unit_revision_id=scope.base_unit_revision_id,
-                target_unit_revision_id=scope.target_unit_revision_id,
-                projection_run_id=projection.run_id,
-                operation_input_hash=operation_input_hash,
-                execution_owner_id=lifecycle_execution_owner_id,
-                outcome="expected",
-                reason_code="lifecycle_plan_applied",
-                attempt_count=lifecycle_attempt_count,
-                duration_ms=max(0, round((perf_counter() - lifecycle_started) * 1000)),
-                incumbent_count=len(incumbents),
-                relation_pair_count=int(stats.get("reconciliation_relation_pair_count", 0)),
-                mutation_count=len(plan.mutations),
-                review_count=sum(
-                    mutation.mutation_type.value == "create_review"
-                    for mutation in plan.mutations
-                ),
-                model_call_count=(
-                    candidate_ledger.structured_llm_calls
-                    + structured_llm_call_count
-                    + entity_resolution.metrics.structured_llm_calls
-                    + identity_resolution.metrics.llm_calls
-                ),
-                deployment_revision=current_deployment_revision(),
+        prepared_memories = {
+            **incumbents_by_id,
+            **{
+                target.id: target
+                for target in corroboration_targets.values()
+            },
+        }
+        derivation_context_identity_hash = (
+            source_derivation_context_identity_hash(
+                SourceUnitDerivationContext(
+                    document=document,
+                    doc_type=doc_type,
+                    project_key=project_key,
+                    repo_identifier=repo_identifier,
+                    document_content=document_content,
+                    update_mode=update_mode,
+                    changed_hunks=changed_hunks,
+                    update_plan_stats=update_plan_stats,
+                    source_updated_at=(
+                        source_updated_at.isoformat()
+                        if source_updated_at is not None
+                        else None
+                    ),
+                    user_id=user_id,
+                    source_activity_epoch=expected_source_activity_epoch,
+                    current_changed_ranges=current_changed_ranges,
+                    reprocess_all_current_observations=(
+                        derivation_reprocess_all_current_observations
+                    ),
+                )
             )
-        _runtime_context.stage = "lifecycle_commit"
-        await self.db.apply_source_projection_lifecycle(
-            projection,
-            plan,
+            if derivation_id is not None and document is not None
+            else None
+        )
+        prepared = PreparedProjectedLifecycleCommit(
+            projection=projection,
+            plan_inputs=_PreparedLifecyclePlanInputs(
+                plan_id=lifecycle_plan_id(scope),
+                scope=scope,
+                gate_state=gate.state,
+                operations=operations,
+                incumbents=incumbents_by_id,
+                memory_authority_hashes={
+                    memory_id: _prepared_memory_authority_hash(memory)
+                    for memory_id, memory in prepared_memories.items()
+                },
+                observation_revision_ids=observation_revision_ids,
+                support_scope_version=support_scope_version,
+                evidence_reference_ids_by_claim_hash=(
+                    projected_evidence.reference_ids_by_claim_hash
+                ),
+                evidence_unit_ids_by_claim_hash=(
+                    projected_evidence.evidence_unit_ids_by_claim_hash
+                ),
+                corroboration_targets_by_claim_hash=corroboration_targets,
+                corroboration_proofs_by_claim_hash=corroboration_proofs,
+                defaults=defaults,
+                evidence_units=projected_evidence.units,
+                evidence_references=projected_evidence.references,
+            ),
             document=document,
             derivation_id=derivation_id,
-            derivation_context_identity_hash=(
-                source_derivation_context_identity_hash(
-                    SourceUnitDerivationContext(
-                        document=document,
-                        doc_type=doc_type,
-                        project_key=project_key,
-                        repo_identifier=repo_identifier,
-                        document_content=document_content,
-                        update_mode=update_mode,
-                        changed_hunks=changed_hunks,
-                        update_plan_stats=update_plan_stats,
-                        source_updated_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
-                        user_id=user_id,
-                        source_activity_epoch=(expected_source_activity_epoch),
-                        current_changed_ranges=current_changed_ranges,
-                        reprocess_all_current_observations=(
-                            derivation_reprocess_all_current_observations
-                        ),
-                    )
-                )
-                if derivation_id is not None and document is not None
-                else None
-            ),
+            derivation_context_identity_hash=derivation_context_identity_hash,
             expected_source_activity_epoch=expected_source_activity_epoch,
-            runtime_bundle=runtime_bundle,
+            base_stats=dict(stats),
+            corroboration_target_ids=frozenset(attached_target_ids),
+            lifecycle_execution_owner_id=lifecycle_execution_owner_id,
+            operation_input_hash=operation_input_hash,
+            doc_id=doc_id,
+            source_type=source_type,
+            started_at=lifecycle_started,
+            incumbent_count=len(incumbents),
+            relation_pair_count=int(
+                stats.get("reconciliation_relation_pair_count", 0)
+            ),
+            model_call_count=(
+                candidate_ledger.structured_llm_calls
+                + structured_llm_call_count
+                + entity_resolution.metrics.structured_llm_calls
+                + identity_resolution.metrics.llm_calls
+            ),
         )
-        if runtime_bundle is not None:
-            publish_runtime_events(self.runtime_event_trace_sink, runtime_bundle.events)
-            publish_agent_assessments(
-                self.agent_assessment_sink,
-                runtime_bundle.assessments,
-                runtime_bundle.events,
-            )
-        delivery = await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
-        stats["vector_delivery_pending"] = int(delivery.pending)
-
-        stats["relation_discovery_enqueued"] = len(plan.relation_discovery_requests)
-
-        for mutation in plan.mutations:
-            if mutation.mutation_type.value == "create_memory":
-                stats["added"] += 1
-            elif mutation.mutation_type.value == "reactivate_memory":
-                stats["reactivated"] += 1
-            elif mutation.mutation_type.value == "supersede_memory":
-                if mutation.payload.get("replacement_kind") == "revision":
-                    stats["updated"] += 1
-                else:
-                    stats["superseded"] += 1
-            elif mutation.mutation_type.value == "retire_memory":
-                stats["deleted"] += 1
-            elif mutation.mutation_type.value == "create_review":
-                stats["pending_review"] += 1
-        stats["corroborated"] = len(
-            {
-                mutation.memory_id
-                for mutation in plan.mutations
-                if mutation.mutation_type.value == "attach_support"
-                and mutation.memory_id in {target.id for target in corroboration_targets.values()}
-            }
+        _runtime_context.stage = "lifecycle_commit"
+        return await self.commit_prepared_projected_lifecycle(
+            prepared,
+            lifecycle_attempt_count=lifecycle_attempt_count,
         )
-        stats["noop"] = sum(
-            decision.disposition.value == "keep" for decision in plan.coverage_proof.incumbent_decisions
-        )
-        return stats
 
     async def _select_projected_candidates(
         self,
