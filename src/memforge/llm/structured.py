@@ -400,15 +400,6 @@ class ProjectionFragmentMemoryCandidate(StructuredResponseModel):
     primary_ref: TransientEvidenceFragmentRef
     required_refs: list[TransientEvidenceFragmentRef] = Field(default_factory=list)
 
-    @model_validator(mode="after")
-    def _require_one_duplicate_free_support_set(self):
-        if self.primary_ref in self.required_refs:
-            raise ValueError("primary_ref cannot also appear in required_refs")
-        if len(set(self.required_refs)) != len(self.required_refs):
-            raise ValueError("required_refs must be duplicate-free")
-        return self
-
-
 class ProjectionFragmentMemoryExtractionResponse(StructuredResponseModel):
     """projection-extraction-v9 response containing model judgments only."""
 

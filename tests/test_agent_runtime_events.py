@@ -623,6 +623,11 @@ def test_v9_evidence_evaluation_distinguishes_selection_outcome_taxonomy() -> No
             "expected",
             "fragment_selection_resolved",
         ),
+        QualitySignal(
+            "evidence_admission_outcome",
+            "degraded",
+            "fragment_selector_normalized",
+        ),
         QualitySignal("evidence_admission_outcome", "rejected", "unknown_ref"),
         QualitySignal("evidence_admission_outcome", "rejected", "ineligible_role"),
         QualitySignal("evidence_admission_outcome", "rejected", "catalog_too_large"),
@@ -633,6 +638,7 @@ def test_v9_evidence_evaluation_distinguishes_selection_outcome_taxonomy() -> No
 
     assert [(item.criterion, item.label, item.reason_code) for item in assessments] == [
         ("evidence_fragment_acceptance", "pass", "fragment_selection_resolved"),
+        ("evidence_fragment_acceptance", "pass", "fragment_selector_normalized"),
         ("evidence_fragment_staleness", "fail", "unknown_ref"),
         ("evidence_fragment_selectability", "fail", "ineligible_role"),
         ("evidence_catalog_capacity", "fail", "catalog_too_large"),
