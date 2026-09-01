@@ -406,10 +406,21 @@ def plan_requires_complete_current_support(
     proposed mutations remain staged until a later authorized resolution.
     """
 
-    return any(
-        mutation.memory_id == memory_id
-        and mutation.mutation_type in DESTRUCTIVE_MUTATIONS
+    mutation_types = {
+        mutation.mutation_type
         for mutation in plan.mutations
+        if mutation.memory_id == memory_id
+    }
+    if mutation_types.intersection(
+        {
+            LifecycleMutationType.SUPERSEDE_MEMORY,
+            LifecycleMutationType.RETIRE_MEMORY,
+        }
+    ):
+        return True
+    return (
+        LifecycleMutationType.REMOVE_SUPPORT in mutation_types
+        and LifecycleMutationType.ATTACH_SUPPORT not in mutation_types
     )
 
 
