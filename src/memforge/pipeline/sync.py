@@ -70,7 +70,6 @@ from memforge.memory.lifecycle_plan import (
     ReconciliationScope,
 )
 from memforge.memory.engine import SourceUnitLifecycleDeferred
-from memforge.memory.evidence import SupportScopeVersion
 from memforge.memory.lifecycle_planner import (
     lifecycle_access_context_hash,
     lifecycle_plan_id,
@@ -93,7 +92,6 @@ from memforge.source_artifacts import (
 )
 from memforge.source_derivation import (
     DiffGuidedExtractionBatch,
-    SOURCE_DERIVATION_CONTRACT_VERSION,
     SourceDerivationAttempt,
     StructuralExtractionBatch,
     SourceUnitDerivationContext,
@@ -101,7 +99,10 @@ from memforge.source_derivation import (
     SourceUnitDeriver,
     aggregate_extraction_metrics,
 )
-from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_V9
+from memforge.pipeline.extraction_contract import (
+    CONTRACT_SUPERSEDED,
+    active_projection_extraction_contract,
+)
 from memforge.pipeline.projection_fragments import (
     compile_projection_fragment_catalog,
 )
@@ -1563,18 +1564,23 @@ class GeneSyncOrchestrator:
                 "completed",
             ),
         )
+        active_contract = active_projection_extraction_contract(
+            await self.db.get_support_scope_version()
+        )
         latest_by_projection: dict[
             tuple[int | None, str, str, str],
             SourceDerivationAttempt,
         ] = {}
-        superseded_attempts: list[SourceDerivationAttempt] = []
+        superseded_attempts: list[tuple[SourceDerivationAttempt, str | None]] = []
         for attempt in attempts:
-            if (
-                attempt.context.source_activity_epoch != source_activity_epoch
-                or attempt.extraction_contract_version
-                != SOURCE_DERIVATION_CONTRACT_VERSION
-            ):
-                superseded_attempts.append(attempt)
+            if attempt.extraction_contract_version != active_contract.version:
+                if attempt.status in {"pending", "retryable_failure"}:
+                    superseded_attempts.append(
+                        (attempt, CONTRACT_SUPERSEDED)
+                    )
+                continue
+            if attempt.context.source_activity_epoch != source_activity_epoch:
+                superseded_attempts.append((attempt, None))
                 continue
             projection_scope = (
                 attempt.context.source_activity_epoch,
@@ -1584,10 +1590,13 @@ class GeneSyncOrchestrator:
             )
             previous = latest_by_projection.get(projection_scope)
             if previous is not None:
-                superseded_attempts.append(previous)
+                superseded_attempts.append((previous, None))
             latest_by_projection[projection_scope] = attempt
-        for attempt in superseded_attempts:
-            await self.db.supersede_source_derivation(attempt.id)
+        for attempt, reason_code in superseded_attempts:
+            await self.db.supersede_source_derivation(
+                attempt.id,
+                reason_code=reason_code,
+            )
         if superseded_attempts:
             logger.info(
                 "Superseded %d stale or older Source derivation context(s) before recovery for source %s",
@@ -2894,12 +2903,10 @@ class GeneSyncOrchestrator:
     ) -> MemoryExtractionResult:
         """Execute durable extraction work for one Source Unit revision."""
 
-        support_scope_version = await self.db.get_support_scope_version()
-        extraction_contract_version = (
-            PROJECTION_EXTRACTION_V9
-            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else SOURCE_DERIVATION_CONTRACT_VERSION
+        active_contract = active_projection_extraction_contract(
+            await self.db.get_support_scope_version()
         )
+        extraction_contract_version = active_contract.version
         visibility, owner_user_id = await memory_visibility_for_source_id(
             self.db,
             source_id=source_id,
@@ -2963,10 +2970,7 @@ class GeneSyncOrchestrator:
                     projection=projection,
                     observation_ids=supplied_observation_ids,
                 )
-                if (
-                    support_scope_version
-                    is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-                ):
+                if active_contract.uses_fragment_catalog:
                     catalog = compile_projection_fragment_catalog(
                         projection,
                         batch,

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
-    PROJECTION_EXTRACTION_V9,
+    projection_extraction_contract,
 )
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
@@ -128,7 +128,9 @@ def plan_projection_extraction_batches(
     if primary_overlap_chars < 0:
         raise ValueError("primary overlap cannot be negative")
 
-    compiler_backed = extraction_contract_version == PROJECTION_EXTRACTION_V9
+    compiler_backed = projection_extraction_contract(
+        extraction_contract_version
+    ).uses_fragment_catalog
     authority_policy_version = (
         PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
         if compiler_backed
