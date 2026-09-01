@@ -17,6 +17,7 @@ from memforge.llm.structured import (
 )
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.evidence_catalog import EvidenceAuthoritySpan, EvidenceCatalog
+from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_V9
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import plan_projection_extraction_batches
 from memforge.pipeline.source_projection_adapters import project_source_item
@@ -314,15 +315,23 @@ def test_scoped_replay_can_select_all_current_observations_without_a_delta() -> 
     } == {observation.id for observation in current.observations}
 
 
-def test_projection_batch_records_primary_eligibility_policy_identity() -> None:
+def test_projection_batch_records_authority_segmentation_policy_identity() -> None:
     projection = _jira_projection(1)
 
-    [batch] = plan_projection_extraction_batches(
+    [legacy_batch] = plan_projection_extraction_batches(
         projection,
         max_primary_observations=8,
     )
+    [v9_batch] = plan_projection_extraction_batches(
+        projection,
+        max_primary_observations=8,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
 
-    assert batch.authority_policy_version == 2
+    assert legacy_batch.authority_policy_version == 2
+    assert legacy_batch.id == "xbatch-838f89fac7f4082c"
+    assert v9_batch.authority_policy_version == 3
+    assert v9_batch.id != "xbatch-cf8d7fcc531f2ca6"
 
 
 def test_many_images_use_bounded_multimodal_batches_without_losing_artifacts() -> None:
