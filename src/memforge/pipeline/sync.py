@@ -948,7 +948,8 @@ class GeneSyncOrchestrator:
 
             async def _process_one(item: ContentItem) -> dict:
                 """Process a single item with retry logic and error isolation."""
-                nonlocal docs_updated_counter, memories_extracted_counter, progress_counter
+                nonlocal docs_updated_counter, failure_retryable
+                nonlocal memories_extracted_counter, progress_counter
                 stats = {
                     "processed": False,
                     "updated": False,
@@ -1036,10 +1037,15 @@ class GeneSyncOrchestrator:
                         except Exception as exc:
                             attempt_error = _retained_document_error(exc)
                             stats["runtime_bundle"] = getattr(exc, "runtime_bundle", None)
-                            retry_document = not isinstance(
-                                exc,
-                                MemoryExtractionFailure,
+                            explicitly_retryable = bool(
+                                getattr(exc, "retryable", True)
                             )
+                            retry_document = (
+                                not isinstance(exc, MemoryExtractionFailure)
+                                and explicitly_retryable
+                            )
+                            if not explicitly_retryable:
+                                failure_retryable = False
                         if attempt_error is None:
                             stats["runtime_bundle"] = None
                             break
@@ -1263,7 +1269,10 @@ class GeneSyncOrchestrator:
             )
             status = "failed"
             error_message = str(e)
-            failure_retryable = not isinstance(e, SourceConfigurationError)
+            failure_retryable = (
+                not isinstance(e, SourceConfigurationError)
+                and bool(getattr(e, "retryable", True))
+            )
             if (runtime_bundle := getattr(e, "runtime_bundle", None)) is not None:
                 runtime_bundles.append(runtime_bundle)
             if scope_transition is not None and transition_started:
