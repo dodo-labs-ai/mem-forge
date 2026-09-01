@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import hashlib
 import json
 import sqlite3
 import weakref
@@ -28,6 +29,7 @@ from memforge.memory.engine import (
     SourceUnitLifecycleDeferred,
     SourceUnitLifecycleExecutionError,
 )
+from memforge.memory.evidence import SupportScopeVersion
 from memforge.memory.lifecycle_planner import lifecycle_plan_id
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.lifecycle_plan import (
@@ -45,6 +47,7 @@ from memforge.local_agent.document_identity import build_teams_doc_id
 from memforge.local_agent.teams_ledger import build_teams_window_id
 from memforge.models import (
     ContentItem,
+    DocumentRecord,
     GeneMetadata,
     Memory,
     MemoryExtractionResult,
@@ -85,9 +88,12 @@ from memforge.source_artifacts import (
 )
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
+    SourceUnitDerivationRequest,
+    SourceUnitDeriver,
     source_derivation_context_identity_hash,
     source_derivation_manifest,
 )
+from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_V9
 from memforge.config import AgentEvaluationConfig, AppConfig, SyncConfig
 from memforge.evals.agent_evaluation import (
     AgentAssessmentQuery,
@@ -3138,6 +3144,9 @@ class NoopMemoryEngine:
             stale_guard=StaleGuard(
                 observation_revision_ids=(),
                 support_set_hashes={},
+                support_scope_version=(
+                    await self.db.get_support_scope_version()
+                ),
             ),
             mutations=(),
         )
@@ -3716,6 +3725,20 @@ class ProjectionBatchRecordingExtractor(RecordingMemoryExtractor):
     async def extract_projection_batch_memories(self, batch, **kwargs):
         del kwargs
         self.projection_calls.append(batch)
+        return MemoryExtractionResult(memories=[])
+
+
+class ProjectionFragmentRecordingExtractor(RecordingMemoryExtractor):
+    def __init__(self, *, fail_if_called: bool = False) -> None:
+        super().__init__()
+        self.fail_if_called = fail_if_called
+        self.fragment_calls: list[object] = []
+
+    async def extract_projection_fragment_memories(self, catalog, **kwargs):
+        del kwargs
+        if self.fail_if_called:
+            raise AssertionError("completed v9 derivation must not repeat extraction")
+        self.fragment_calls.append(catalog)
         return MemoryExtractionResult(memories=[])
 
 
@@ -5299,6 +5322,156 @@ async def test_derivation_recovery_supersedes_an_old_extraction_contract(
     }
     [superseded] = await db.list_source_derivation_attempts(source_id=source_id)
     assert superseded.status == "superseded"
+    assert superseded.terminal_reason_code == "CONTRACT_SUPERSEDED"
+
+    await db.db.execute(
+        "UPDATE source_derivation_attempts "
+        "SET status = 'completed', terminal_reason_code = NULL WHERE id = ?",
+        (attempt.id,),
+    )
+    await db.db.commit()
+
+    repeated = await recovery._resume_source_derivations(
+        source_id=source_id,
+        source_activity_epoch=(
+            (attempt.context.source_activity_epoch or 0) + 1
+        ),
+        run_id="run-completed-contract-history",
+    )
+
+    assert repeated == {
+        "processed": 0,
+        "updated": 0,
+        "memories_extracted": 0,
+        "memories_corroborated": 0,
+    }
+    [completed_history] = await db.list_source_derivation_attempts(
+        source_id=source_id
+    )
+    assert completed_history.status == "completed"
+    assert completed_history.terminal_reason_code is None
+
+
+@pytest.mark.asyncio
+async def test_v2_derivation_recovery_resumes_active_v9_before_provider_work(
+    db: Database,
+) -> None:
+    source_id = "src-v9-recovery"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="V9 recovery",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    await db.db.execute(
+        "UPDATE system_contract_markers SET marker_value = ? "
+        "WHERE marker_key = 'support_scope_version'",
+        (SupportScopeVersion.EVIDENCE_UNIT_SET_V2.value,),
+    )
+    await db.db.commit()
+    body = "# Current rule\n\nUse the active extraction contract for recovery.\n"
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    item = ContentItem(
+        item_id="doc-v9-recovery",
+        title="V9 recovery",
+        source_url="https://example.test/v9-recovery",
+        last_modified=now,
+        content_type="text/markdown",
+        version="1",
+    )
+    projection = project_source_item(
+        source_id=source_id,
+        source_type="confluence",
+        run_id="run-v9-stage",
+        item=item,
+        raw=RawContent(
+            item=item,
+            body=body.encode(),
+            content_type="text/markdown",
+        ),
+        normalized=NormalizedContent(item=item, markdown_body=body),
+        scope={},
+        access_context={"visibility": "workspace"},
+    )
+    document = DocumentRecord(
+        doc_id=item.item_id,
+        source=source_id,
+        source_url=item.source_url,
+        title=item.title,
+        space_or_project="TEST",
+        author=None,
+        last_modified=now,
+        labels=[],
+        version="1",
+        content_hash=hashlib.sha256(body.encode()).hexdigest(),
+        token_count=12,
+        raw_content_uri=None,
+        raw_content_type="text/markdown",
+        normalized_content_uri=None,
+        pdf_content_uri=None,
+        last_synced=now,
+    )
+    context = SourceUnitDerivationContext(
+        document=document,
+        doc_type="document",
+        project_key=None,
+        repo_identifier=None,
+        document_content=body,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=now.isoformat(),
+        user_id=None,
+        source_activity_epoch=None,
+    )
+
+    async def extract(_batch):
+        return MemoryExtractionResult(memories=[])
+
+    staged = await SourceUnitDeriver(db).derive(
+        SourceUnitDerivationRequest(
+            projection=projection,
+            context=context,
+            extract_batch=extract,
+            max_concurrent=1,
+            extraction_contract_version=PROJECTION_EXTRACTION_V9,
+        )
+    )
+
+    [attempt] = await db.list_source_derivation_attempts(source_id=source_id)
+    assert attempt.id == staged.derivation.id
+    assert attempt.extraction_contract_version == PROJECTION_EXTRACTION_V9
+    assert attempt.status == "completed"
+
+    recovery_engine = RecordingMemoryEngine()
+    recovery = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=ProjectionFragmentRecordingExtractor(
+            fail_if_called=True,
+        ),
+        memory_engine=recovery_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    stats = await recovery._resume_source_derivations(
+        source_id=source_id,
+        source_activity_epoch=attempt.context.source_activity_epoch,
+        run_id="run-v9-recovery",
+    )
+
+    assert stats == {
+        "processed": 1,
+        "updated": 1,
+        "memories_extracted": 0,
+        "memories_corroborated": 0,
+    }
+    assert len(recovery_engine.projected_lifecycle_calls) == 1
+    [preserved] = await db.list_source_derivation_attempts(source_id=source_id)
+    assert preserved.status == "applied"
 
 
 @pytest.mark.asyncio
