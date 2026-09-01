@@ -32,6 +32,7 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.engine import (
+    DeferredProjectedLifecycleHandle,
     MemoryEngine,
     SourceUnitLifecycleDeferred,
     SourceUnitLifecycleExecutionError,
@@ -603,7 +604,7 @@ async def test_lifecycle_commit_rejection_returns_failure_bundle_without_success
     )
 
     with pytest.raises(SourceUnitLifecycleExecutionError) as failure:
-        await engine.apply_projected_lifecycle(
+        await engine.prepare_and_commit_projected_lifecycle(
             projection=projection,
             doc_id="confluence-123",
             raw_memories=[
@@ -657,7 +658,7 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
         memory_store=_OutboxDrainer(db),
         runtime_event_trace_sink=runtime_sink,
     )
-    await engine.apply_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
         raw_memories=[
@@ -694,7 +695,7 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
     )
 
     event_window_start = datetime.now(timezone.utc) - timedelta(seconds=1)
-    stats = await reviewing_engine.apply_projected_lifecycle(
+    stats = await reviewing_engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[
@@ -754,7 +755,7 @@ async def test_additive_refinement_commits_revision_with_candidate_local_evidenc
         db=db,
         memory_store=_OutboxDrainer(db),
     )
-    await initial_engine.apply_projected_lifecycle(
+    await initial_engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
         raw_memories=[
@@ -791,7 +792,7 @@ async def test_additive_refinement_commits_revision_with_candidate_local_evidenc
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_AdditiveRevisionClient(),
     )
-    stats = await revision_engine.apply_projected_lifecycle(
+    stats = await revision_engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[
@@ -846,7 +847,7 @@ async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branc
             _candidate_ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in branch_claims))
         ),
     )
-    await initial_engine.apply_projected_lifecycle(
+    await initial_engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
         raw_memories=[
@@ -888,7 +889,7 @@ async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branc
         structured_llm_client=_RunbookComponentFallbackClient(),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[
@@ -945,7 +946,7 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
             _candidate_ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in branch_claims))
         ),
     )
-    await initial_engine.apply_projected_lifecycle(
+    await initial_engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
         raw_memories=[
@@ -987,7 +988,7 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
         structured_llm_client=_RunbookComponentRevisionClient(),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[
@@ -1046,7 +1047,7 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
         db=db,
         memory_store=_OutboxDrainer(db),
     )
-    await engine.apply_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
         raw_memories=[
@@ -1091,7 +1092,7 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_UnexpectedReconciliationClient(),
     )
-    stats = await protected_engine.apply_projected_lifecycle(
+    stats = await protected_engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -1142,7 +1143,7 @@ async def test_context_artifact_does_not_become_active_support_dependency(
         db=db,
         memory_store=_OutboxDrainer(db),
     )
-    await engine.apply_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=[
@@ -1196,7 +1197,7 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
         db=db,
         memory_store=_OutboxDrainer(db),
     )
-    await engine.apply_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
         raw_memories=[
@@ -1232,7 +1233,7 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
         structured_llm_client=_NoopClient(incumbent.id),
     )
 
-    stats = await reviewing_engine.apply_projected_lifecycle(
+    stats = await reviewing_engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -1454,7 +1455,7 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
         structured_llm_client=None,
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=[canonical, duplicate],
@@ -1547,7 +1548,7 @@ async def test_projected_lifecycle_records_low_value_admission_without_content(
         structured_llm_client=client,
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=[durable, instance_output],
@@ -1596,7 +1597,7 @@ async def test_projected_create_persists_validity_as_dates(db: Database) -> None
         structured_llm_client=None,
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=[raw],
@@ -1634,7 +1635,7 @@ async def test_incomplete_candidate_ledger_is_audited_as_fallback_and_keeps_memo
         structured_llm_client=client,
     )
 
-    await engine.apply_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=[
@@ -3595,7 +3596,7 @@ async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extrac
         structured_llm_client=_NoopClient(incumbent.id),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -3664,7 +3665,7 @@ async def test_v2_incremental_noop_rebinds_complete_unit_to_current_revision(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -3755,7 +3756,7 @@ async def test_v2_noop_rebind_preserves_independent_support_alternative(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -3833,7 +3834,7 @@ async def test_v2_noop_same_unit_alternatives_stage_review_without_collapsing(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -3928,7 +3929,7 @@ async def test_v2_noop_postcondition_failure_rolls_back_and_is_non_retryable(
     )
 
     with pytest.raises(SourceUnitLifecycleExecutionError) as raised:
-        await engine.apply_projected_lifecycle(
+        await engine.prepare_and_commit_projected_lifecycle(
             projection=second,
             doc_id="confluence-123",
             raw_memories=[],
@@ -3982,7 +3983,7 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4036,7 +4037,7 @@ async def test_incremental_noop_inexact_current_quote_creates_review(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4083,7 +4084,7 @@ async def test_incremental_noop_unavailable_support_validation_creates_review(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4131,7 +4132,7 @@ async def test_incremental_noop_invalidated_primary_creates_review(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4181,7 +4182,7 @@ async def test_persistent_incomplete_incumbent_audit_fails_closed_without_mutati
         SourceUnitLifecycleExecutionError,
         match="incumbent support response count 0 does not match expected count 1",
     ) as failure:
-        await engine.apply_projected_lifecycle(
+        await engine.prepare_and_commit_projected_lifecycle(
             projection=second,
             doc_id="confluence-123",
             raw_memories=[],
@@ -4234,7 +4235,7 @@ async def test_explicit_empty_revision_deterministically_removes_incumbent_suppo
         structured_llm_client=None,
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4404,7 +4405,7 @@ async def test_partial_jira_projection_skips_llm_for_proven_disjoint_incumbent(
         structured_llm_client=_UnexpectedReconciliationClient(),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4491,7 +4492,7 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
 
     monkeypatch.setattr(engine, "_projected_incumbent_impacts", unexpected_impact_scan)
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[candidate],
@@ -4559,7 +4560,7 @@ async def test_partial_jira_projection_admits_directly_affected_incumbent_delete
         structured_llm_client=_DeleteClient(incumbent.id),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4607,7 +4608,7 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4701,7 +4702,7 @@ async def test_v2_noop_revalidates_revised_required_jira_description(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4787,7 +4788,7 @@ async def test_v2_noop_ambiguous_current_required_fragment_stages_review(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4855,7 +4856,7 @@ async def test_v2_noop_unpresentable_current_fragment_stages_review(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4905,7 +4906,7 @@ async def test_v2_pending_review_ignores_unrelated_stale_cross_unit_support(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -4968,7 +4969,7 @@ async def test_v2_noop_rebind_ignores_unrelated_stale_cross_unit_support(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -5020,7 +5021,7 @@ async def test_v2_destructive_commit_defers_on_stale_cross_unit_support(
     )
 
     with pytest.raises(ProjectedLifecycleDeferredError) as raised:
-        await engine.apply_projected_lifecycle(
+        await engine.prepare_and_commit_projected_lifecycle(
             projection=second,
             doc_id="confluence-123",
             raw_memories=[],
@@ -5239,7 +5240,7 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
     )
 
     with pytest.raises(SourceUnitLifecycleDeferred) as raised:
-        await engine.apply_projected_lifecycle(
+        await engine.prepare_and_commit_projected_lifecycle(
             projection=second,
             doc_id="confluence-123",
             raw_memories=[],
@@ -5253,6 +5254,14 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
             source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
             lifecycle_execution_owner_id="sync-prepared:lease-1",
         )
+    assert isinstance(raised.value.handle, DeferredProjectedLifecycleHandle)
+    assert not hasattr(raised.value, "prepared_commit")
+    with pytest.raises(SourceUnitLifecycleExecutionError) as ineligible:
+        await engine.retry_deferred_projected_lifecycle(
+            raised.value.handle,
+            eligible_same_run_source_unit_ids=set(),
+        )
+    assert ineligible.value.commit_attempted is False
 
     await db.db.execute(
         "UPDATE memories SET confidence = ? WHERE id = ?",
@@ -5263,9 +5272,9 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
         ProjectedSupportInvariantError,
         match="Memory changed before commit",
     ):
-        await engine.commit_prepared_projected_lifecycle(
-            raised.value.prepared_commit,
-            lifecycle_attempt_count=2,
+        await engine.retry_deferred_projected_lifecycle(
+            raised.value.handle,
+            eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
         )
     await db.db.execute(
         "UPDATE memories SET confidence = ? WHERE id = ?",
@@ -5281,9 +5290,9 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
         ProjectedSupportInvariantError,
         match="gate changed before commit",
     ):
-        await engine.commit_prepared_projected_lifecycle(
-            raised.value.prepared_commit,
-            lifecycle_attempt_count=2,
+        await engine.retry_deferred_projected_lifecycle(
+            raised.value.handle,
+            eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
         )
     await db.db.execute(
         "UPDATE source_lifecycle_gates SET state = 'enabled' WHERE source_id = ?",
@@ -5298,9 +5307,9 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
         ProjectedSupportInvariantError,
         match="access context changed before commit",
     ):
-        await engine.commit_prepared_projected_lifecycle(
-            raised.value.prepared_commit,
-            lifecycle_attempt_count=2,
+        await engine.retry_deferred_projected_lifecycle(
+            raised.value.handle,
+            eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
         )
     await db.db.execute(
         "UPDATE sources SET access_policy = 'workspace' WHERE id = ?",
@@ -5308,7 +5317,7 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
     )
     await db.db.commit()
 
-    await engine.apply_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=scenario.alternative_current,
         doc_id="confluence-456",
         raw_memories=[],
@@ -5325,9 +5334,9 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
     )
     semantic_calls = client.validation_calls
 
-    stats = await engine.commit_prepared_projected_lifecycle(
-        raised.value.prepared_commit,
-        lifecycle_attempt_count=2,
+    stats = await engine.retry_deferred_projected_lifecycle(
+        raised.value.handle,
+        eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
     )
 
     assert client.validation_calls == semantic_calls
@@ -5341,9 +5350,9 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
     assert current_memory is not None
     assert current_memory.status == "active"
 
-    replayed = await engine.commit_prepared_projected_lifecycle(
-        raised.value.prepared_commit,
-        lifecycle_attempt_count=3,
+    replayed = await engine.retry_deferred_projected_lifecycle(
+        raised.value.handle,
+        eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
     )
     assert replayed == stats
     assert client.validation_calls == semantic_calls
@@ -5378,7 +5387,7 @@ async def test_v2_prepared_commit_rejects_undeclared_support_drift(
         structured_llm_client=None,
     )
     with pytest.raises(SourceUnitLifecycleDeferred) as raised:
-        await engine.apply_projected_lifecycle(
+        await engine.prepare_and_commit_projected_lifecycle(
             projection=target,
             doc_id="confluence-123",
             raw_memories=[],
@@ -5409,9 +5418,9 @@ async def test_v2_prepared_commit_rejects_undeclared_support_drift(
         ProjectedSupportInvariantError,
         match="Support topology changed outside declared blockers",
     ):
-        await engine.commit_prepared_projected_lifecycle(
-            raised.value.prepared_commit,
-            lifecycle_attempt_count=2,
+        await engine.retry_deferred_projected_lifecycle(
+            raised.value.handle,
+            eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
         )
 
 
@@ -5471,7 +5480,7 @@ async def test_v2_noop_preserves_multiple_required_parts_in_one_observation(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -5558,7 +5567,7 @@ async def test_v2_noop_resolves_decoded_canonical_quotes_to_raw_json_ranges(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -5658,7 +5667,7 @@ async def test_v2_noop_propagates_representation_compiler_contract_failure(
     )
 
     with pytest.raises(RuntimeError, match="revalidation compiler contract"):
-        await engine.apply_projected_lifecycle(
+        await engine.prepare_and_commit_projected_lifecycle(
             projection=second,
             doc_id="confluence-123",
             raw_memories=[],
@@ -5726,7 +5735,7 @@ async def test_noop_revalidates_revised_required_with_artifact_primary(
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -5780,7 +5789,7 @@ async def test_noop_with_invalidated_required_evidence_creates_review(db: Databa
         ),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -6142,7 +6151,7 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
         structured_llm_client=client,
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-456",
         raw_memories=[raw],
@@ -6226,7 +6235,7 @@ async def test_same_source_cross_unit_semantic_equivalent_claim_reuses_memory_id
         structured_llm_client=_SemanticEquivalentClient(),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-456",
         raw_memories=[
@@ -6293,7 +6302,7 @@ async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves
         evidence_quote="A7 is retained for regular payroll.",
         source_observation_id=first.observations[0].id,
     )
-    first_stats = await engine.apply_projected_lifecycle(
+    first_stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
         raw_memories=[first_raw],
@@ -6336,7 +6345,7 @@ async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves
         source_observation_id=second.observations[0].id,
     )
 
-    second_stats = await engine.apply_projected_lifecycle(
+    second_stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-456",
         raw_memories=[second_raw],
@@ -6445,7 +6454,7 @@ async def test_cross_source_exact_claim_reuses_memory_without_llm_and_preserves_
         structured_llm_client=None,
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-456",
         raw_memories=[raw],
@@ -6577,7 +6586,7 @@ async def test_ordinary_exact_admission_preserves_agent_claim_identity(
         structured_llm_client=None,
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="private-confluence-123",
         raw_memories=[raw],
@@ -6776,7 +6785,7 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
         structured_llm_client=_SemanticEquivalentClient(),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=[raw],
@@ -7074,7 +7083,7 @@ async def _create_relation_discovery_fixture(
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SemanticEquivalentClient(),
     )
-    await engine.apply_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=[
@@ -7435,7 +7444,7 @@ async def test_relation_discovery_persists_direction_after_lifecycle_commit(
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SemanticEquivalentClient(),
     )
-    await engine.apply_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=[raw],
@@ -7534,7 +7543,7 @@ async def test_new_projected_memory_commit_survives_vector_outbox_delivery_failu
         structured_llm_client=_SemanticEquivalentClient(),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=[raw],
@@ -7623,7 +7632,7 @@ async def test_rebaseline_replay_reuses_memory_with_explicit_observation_support
         "source_updated_at": datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
     }
 
-    first = await engine.apply_projected_lifecycle(projection=projection, **arguments)
+    first = await engine.prepare_and_commit_projected_lifecycle(projection=projection, **arguments)
     [memory] = await db.list_memories(source="src-1", status="active")
     assert first["added"] == 1
     assert await db.get_active_memory_support_evidence(memory.id, source_id="src-1")
@@ -7634,7 +7643,7 @@ async def test_rebaseline_replay_reuses_memory_with_explicit_observation_support
         description="A7 applies only to regular payroll.",
         comment_body="The rollout note is unrelated.",
     )
-    second = await engine.apply_projected_lifecycle(projection=replay, **arguments)
+    second = await engine.prepare_and_commit_projected_lifecycle(projection=replay, **arguments)
 
     replayed = await db.get_memory(memory.id)
     support = await db.get_active_memory_support_evidence(memory.id, source_id="src-1")
@@ -8159,7 +8168,7 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_ReplacementClient(incumbent.id),
     )
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[raw],
@@ -8233,7 +8242,7 @@ async def test_projected_quality_consumes_typed_observation_semantics(
         memory_store=_OutboxDrainer(db),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=[raw],
@@ -8303,7 +8312,7 @@ async def test_projected_lifecycle_enforces_candidate_quality_before_persistence
         memory_store=_OutboxDrainer(db),
     )
 
-    stats = await engine.apply_projected_lifecycle(
+    stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
         raw_memories=[raw],
