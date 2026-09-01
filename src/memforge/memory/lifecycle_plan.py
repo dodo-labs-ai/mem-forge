@@ -29,6 +29,10 @@ class LifecyclePlanStatus(str, Enum):
     STALE = "stale"
 
 
+class ProjectedSupportInvariantError(ValueError):
+    """A deterministic fail-closed projected Support postcondition failure."""
+
+
 class CutoverFindingStatus(str, Enum):
     OPEN = "open"
     RESOLVED = "resolved"

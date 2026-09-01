@@ -513,6 +513,15 @@ class MemoryRelationResponse(StructuredResponseModel):
     decisions: list[MemoryRelationDecision]
 
 
+class MemorySupportValidationRequiredEvidence(StructuredResponseModel):
+    """One exact current Required quote selected during revalidation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    observation_id: str = Field(min_length=1)
+    evidence_quote: str = Field(min_length=1, max_length=4000)
+
+
 class MemorySupportValidationResponse(StructuredResponseModel):
     """Schema proving whether revised dependencies still support a claim."""
 
@@ -521,6 +530,10 @@ class MemorySupportValidationResponse(StructuredResponseModel):
     supported: bool
     reason: str = Field(default="", max_length=1000)
     evidence_quote: str = Field(default="", max_length=4000)
+    required_evidence: list[MemorySupportValidationRequiredEvidence] = Field(
+        default_factory=list,
+        max_length=32,
+    )
 
 
 class EntityValidationResponse(StructuredResponseModel):
