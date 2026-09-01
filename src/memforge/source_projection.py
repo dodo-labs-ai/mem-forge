@@ -139,6 +139,15 @@ class EvidenceRepresentationProfile:
         if self.name != "canonical-record" and self.schema_name is not None:
             raise ValueError("only canonical-record accepts a representation schema")
 
+    @property
+    def requires_whole_observation_authority(self) -> bool:
+        """Whether selectable ranges can exist only after profile compilation."""
+
+        return (
+            self.name == "canonical-record"
+            or self.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class SourceAnchor:
