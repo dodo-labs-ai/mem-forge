@@ -23,6 +23,7 @@ from memforge.llm.structured import (
 from memforge.genes.base import SourceConfigurationError
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import (
+    DeferredProjectedLifecycleHandle,
     MemoryEngine,
     SourceUnitLifecycleDeferred,
     SourceUnitLifecycleExecutionError,
@@ -35,7 +36,6 @@ from memforge.memory.lifecycle_plan import (
     LifecycleBackfillJobStatus,
     LifecycleGateState,
     LifecyclePlan,
-    ProjectedLifecycleBlocker,
     ReconciliationScope,
     StaleGuard,
 )
@@ -3105,7 +3105,7 @@ class NoopMemoryEngine:
     async def process_enrichment(self, *, doc_id, enrichment, doc_context=None):
         return []
 
-    async def apply_projected_lifecycle(self, **kwargs):
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
         projection = kwargs["projection"]
         delta = projection.deltas[0]
         is_update = delta.previous_unit_revision_id is not None
@@ -3236,18 +3236,18 @@ class CountingMemoryEngine(NoopMemoryEngine):
         self.enrichment_calls += 1
         return []
 
-    async def apply_projected_lifecycle(self, **kwargs):
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
         self.projected_lifecycle_calls += 1
-        return await super().apply_projected_lifecycle(**kwargs)
+        return await super().prepare_and_commit_projected_lifecycle(**kwargs)
 
 
 class RecordingMemoryEngine(NoopMemoryEngine):
     def __init__(self) -> None:
         self.projected_lifecycle_calls: list[dict] = []
 
-    async def apply_projected_lifecycle(self, **kwargs):
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
         self.projected_lifecycle_calls.append(kwargs)
-        return await super().apply_projected_lifecycle(**kwargs)
+        return await super().prepare_and_commit_projected_lifecycle(**kwargs)
 
 
 class FailingProjectedMemoryEngine(NoopMemoryEngine):
@@ -3256,7 +3256,7 @@ class FailingProjectedMemoryEngine(NoopMemoryEngine):
         self.lifecycle_attempt_counts: list[int] = []
         self.lifecycle_execution_owner_ids: list[str | None] = []
 
-    async def apply_projected_lifecycle(self, **kwargs):
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
         self.calls += 1
         self.lifecycle_attempt_counts.append(kwargs.get("lifecycle_attempt_count"))
         self.lifecycle_execution_owner_ids.append(
@@ -3269,7 +3269,7 @@ class NonRetryableProjectedMemoryEngine(NoopMemoryEngine):
     def __init__(self) -> None:
         self.calls = 0
 
-    async def apply_projected_lifecycle(self, **kwargs):
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
         del kwargs
         self.calls += 1
         error = SourceUnitLifecycleExecutionError(
@@ -3294,7 +3294,7 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
         self.commit_only_attempts: list[int] = []
         self.deferred = False
 
-    async def apply_projected_lifecycle(self, **kwargs):
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
         projection = kwargs["projection"]
         source_unit_id = projection.deltas[0].source_unit_id
         doc_id = kwargs["doc_id"]
@@ -3338,34 +3338,40 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
                     self.prepared_attempt_count
                     or kwargs["lifecycle_attempt_count"]
                 ),
+                retry_attempt_count=0,
                 kwargs=dict(kwargs),
+            )
+            handle = DeferredProjectedLifecycleHandle(
+                source_unit_id=source_unit_id,
+                blocker_owner_ids=(blocker_unit_id,),
+                _prepared=prepared,
+                _runtime_bundle=bundle,
             )
             raise SourceUnitLifecycleDeferred(
                 "same-run cross-Unit Support is stale",
                 bundle,
-                prepared_commit=prepared,
-                blockers=(
-                    ProjectedLifecycleBlocker(
-                        memory_id="mem-shared",
-                        source_unit_id=blocker_unit_id,
-                        evidence_unit_id="eu-blocker",
-                        supported_unit_revision_id="unitrev-old",
-                        current_unit_revision_id="unitrev-current",
-                    ),
-                ),
+                handle=handle,
             )
-        result = await super().apply_projected_lifecycle(**kwargs)
+        result = await super().prepare_and_commit_projected_lifecycle(**kwargs)
         self.committed_unit_ids.append(source_unit_id)
         return result
 
-    async def commit_prepared_projected_lifecycle(
+    async def retry_deferred_projected_lifecycle(
         self,
-        prepared,
+        handle,
         *,
-        lifecycle_attempt_count: int,
+        eligible_same_run_owner_ids,
     ):
+        assert set(handle.blocker_owner_ids).issubset(
+            eligible_same_run_owner_ids
+        )
+        prepared = handle._prepared
+        prepared.retry_attempt_count += 1
+        lifecycle_attempt_count = (
+            prepared.prepared_at_attempt_count + prepared.retry_attempt_count
+        )
         self.commit_only_attempts.append(lifecycle_attempt_count)
-        result = await NoopMemoryEngine.apply_projected_lifecycle(
+        result = await NoopMemoryEngine.prepare_and_commit_projected_lifecycle(
             self,
             **prepared.kwargs,
         )
@@ -3407,40 +3413,47 @@ class RoundControlledConvergenceMemoryEngine(NoopMemoryEngine):
         )
         prepared = prepared or SimpleNamespace(
             source_unit_id=projection.deltas[0].source_unit_id,
+            prepared_at_attempt_count=kwargs["lifecycle_attempt_count"],
+            retry_attempt_count=0,
             kwargs=dict(kwargs),
+        )
+        handle = DeferredProjectedLifecycleHandle(
+            source_unit_id=prepared.source_unit_id,
+            blocker_owner_ids=(blocker_unit_id,),
+            _prepared=prepared,
+            _runtime_bundle=bundle,
         )
         return SourceUnitLifecycleDeferred(
             "same-run cross-Unit Support is stale",
             bundle,
-            prepared_commit=prepared,
-            blockers=(
-                ProjectedLifecycleBlocker(
-                    memory_id="mem-shared",
-                    source_unit_id=blocker_unit_id,
-                    evidence_unit_id="eu-blocker",
-                    supported_unit_revision_id="unitrev-old",
-                    current_unit_revision_id="unitrev-current",
-                ),
-            ),
+            handle=handle,
         )
 
-    async def apply_projected_lifecycle(self, **kwargs):
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
         projection = kwargs["projection"]
         source_unit_id = projection.deltas[0].source_unit_id
         doc_id = kwargs["doc_id"]
         self.apply_doc_ids.append(doc_id)
         if doc_id != "jira-0":
             raise self._deferred(projection, kwargs)
-        result = await super().apply_projected_lifecycle(**kwargs)
+        result = await super().prepare_and_commit_projected_lifecycle(**kwargs)
         self.committed_unit_ids.append(source_unit_id)
         return result
 
-    async def commit_prepared_projected_lifecycle(
+    async def retry_deferred_projected_lifecycle(
         self,
-        prepared,
+        handle,
         *,
-        lifecycle_attempt_count: int,
+        eligible_same_run_owner_ids,
     ):
+        assert set(handle.blocker_owner_ids).issubset(
+            eligible_same_run_owner_ids
+        )
+        prepared = handle._prepared
+        prepared.retry_attempt_count += 1
+        lifecycle_attempt_count = (
+            prepared.prepared_at_attempt_count + prepared.retry_attempt_count
+        )
         self.commit_only_attempts.append(
             (prepared.source_unit_id, lifecycle_attempt_count)
         )
@@ -3458,7 +3471,7 @@ class RoundControlledConvergenceMemoryEngine(NoopMemoryEngine):
                 prepared,
             )
         self.unlocked = True
-        result = await NoopMemoryEngine.apply_projected_lifecycle(
+        result = await NoopMemoryEngine.prepare_and_commit_projected_lifecycle(
             self,
             **prepared.kwargs,
         )
@@ -3472,13 +3485,14 @@ class TombstoneUnlockingMemoryEngine(NoopMemoryEngine):
         self.events: list[str] = []
         self.deferred = False
 
-    async def apply_projected_lifecycle(self, **kwargs):
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
         projection = kwargs["projection"]
         if not self.deferred:
             self.deferred = True
             prepared = SimpleNamespace(
                 source_unit_id=projection.deltas[0].source_unit_id,
                 prepared_at_attempt_count=kwargs["lifecycle_attempt_count"],
+                retry_attempt_count=0,
                 kwargs=dict(kwargs),
             )
             bundle = bind_source_lifecycle_outcome(
@@ -3502,21 +3516,18 @@ class TombstoneUnlockingMemoryEngine(NoopMemoryEngine):
                 model_call_count=0,
                 deployment_revision="test",
             )
+            handle = DeferredProjectedLifecycleHandle(
+                source_unit_id=prepared.source_unit_id,
+                blocker_owner_ids=(self.blocker_source_unit_id,),
+                _prepared=prepared,
+                _runtime_bundle=bundle,
+            )
             raise SourceUnitLifecycleDeferred(
                 "same-run tombstone owner has stale Support",
                 bundle,
-                prepared_commit=prepared,
-                blockers=(
-                    ProjectedLifecycleBlocker(
-                        memory_id="mem-shared",
-                        source_unit_id=self.blocker_source_unit_id,
-                        evidence_unit_id="eu-blocker",
-                        supported_unit_revision_id="unitrev-old",
-                        current_unit_revision_id="unitrev-current",
-                    ),
-                ),
+                handle=handle,
             )
-        return await super().apply_projected_lifecycle(**kwargs)
+        return await super().prepare_and_commit_projected_lifecycle(**kwargs)
 
     async def apply_projected_tombstone(self, **kwargs):
         source_unit_id = kwargs["projection"].deltas[0].source_unit_id
@@ -3524,16 +3535,19 @@ class TombstoneUnlockingMemoryEngine(NoopMemoryEngine):
         self.events.append("tombstone")
         return await super().apply_projected_tombstone(**kwargs)
 
-    async def commit_prepared_projected_lifecycle(
+    async def retry_deferred_projected_lifecycle(
         self,
-        prepared,
+        handle,
         *,
-        lifecycle_attempt_count: int,
+        eligible_same_run_owner_ids,
     ):
-        del lifecycle_attempt_count
+        assert set(handle.blocker_owner_ids).issubset(
+            eligible_same_run_owner_ids
+        )
+        prepared = handle._prepared
         assert self.events == ["tombstone"]
         self.events.append("commit")
-        return await NoopMemoryEngine.apply_projected_lifecycle(
+        return await NoopMemoryEngine.prepare_and_commit_projected_lifecycle(
             self,
             **prepared.kwargs,
         )
@@ -9536,7 +9550,7 @@ async def test_projection_repair_targets_only_requested_documents_without_semant
         async def process_enrichment(self, **kwargs):
             raise AssertionError("projection repair must not process enrichment")
 
-        async def apply_projected_lifecycle(self, **kwargs):
+        async def prepare_and_commit_projected_lifecycle(self, **kwargs):
             raise AssertionError("projection repair must not apply lifecycle")
 
     release = asyncio.Event()
@@ -9603,7 +9617,7 @@ async def test_rebaseline_preflight_reads_full_provider_corpus_without_persistin
         async def process_enrichment(self, **kwargs):
             raise AssertionError("rebaseline preflight must not process enrichment")
 
-        async def apply_projected_lifecycle(self, **kwargs):
+        async def prepare_and_commit_projected_lifecycle(self, **kwargs):
             raise AssertionError("rebaseline preflight must not apply lifecycle")
 
     release = asyncio.Event()
@@ -9746,7 +9760,7 @@ async def test_rebaseline_preflight_accepts_proven_authoritative_teams_package(
         async def process_enrichment(self, **kwargs):
             raise AssertionError("rebaseline preflight must not process enrichment")
 
-        async def apply_projected_lifecycle(self, **kwargs):
+        async def prepare_and_commit_projected_lifecycle(self, **kwargs):
             raise AssertionError("rebaseline preflight must not apply lifecycle")
 
     semantic_guard = SemanticWorkMustNotRun()
@@ -12048,11 +12062,11 @@ async def test_new_document_lifecycle_retry_reuses_staged_document(
         def __init__(self) -> None:
             self.calls = 0
 
-        async def apply_projected_lifecycle(self, **kwargs):
+        async def prepare_and_commit_projected_lifecycle(self, **kwargs):
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("lifecycle apply failed")
-            return await super().apply_projected_lifecycle(**kwargs)
+            return await super().prepare_and_commit_projected_lifecycle(**kwargs)
 
     engine = FailOnceProjectedMemoryEngine()
     state = await GeneSyncOrchestrator(
