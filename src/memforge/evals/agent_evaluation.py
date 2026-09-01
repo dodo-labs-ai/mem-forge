@@ -27,7 +27,7 @@ AGENT_RUNTIME_EVENT_SCHEMA_VERSION = "agent-runtime-event-v3"
 AGENT_ASSESSMENT_SCHEMA_VERSION = "agent-assessment-v5"
 SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION = "source-unit-lifecycle-v1"
 DETERMINISTIC_RUNTIME_EVALUATOR_NAME = "memforge.deterministic.runtime_contract"
-DETERMINISTIC_RUNTIME_EVALUATOR_VERSION = "2"
+DETERMINISTIC_RUNTIME_EVALUATOR_VERSION = "3"
 ONLINE_EVALUATION_COVERAGE_POLICY = "semantic_evaluator_v1"
 AgentRuntimeOutcome = Literal["expected", "degraded", "rejected", "failed"]
 AgentAssessmentStatus = Literal["completed", "failed"]
@@ -1099,7 +1099,10 @@ def evidence_selection_outcome_bucket(
     """Classify v9 selection outcomes without rewriting historical v8 events."""
 
     reason = event.reason_code
-    if event.outcome == "expected" or reason == "fragment_selection_resolved":
+    if event.outcome == "expected" or reason in {
+        "fragment_selection_resolved",
+        "fragment_selector_normalized",
+    }:
         return "accepted"
     if reason == "catalog_too_large":
         return "catalog_too_large"

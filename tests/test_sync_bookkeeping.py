@@ -168,6 +168,35 @@ def test_projection_fanout_aggregates_bounded_block_fallback_telemetry() -> None
     assert metrics["invalid_evidence_block_count"] == 1
 
 
+def test_projection_fanout_aggregates_selector_normalization_telemetry() -> None:
+    metrics = _aggregate_extraction_metrics(
+        (
+            MemoryExtractionResult(
+                metadata={
+                    "selector_normalized_candidate_count": 1,
+                    "selector_normalization_count": 2,
+                    "selector_normalization_fingerprints": ["a" * 64],
+                }
+            ),
+            MemoryExtractionResult(
+                metadata={
+                    "selector_normalized_candidate_count": 2,
+                    "selector_normalization_count": 3,
+                    "selector_normalization_fingerprints": ["b" * 64, "c" * 64],
+                }
+            ),
+        )
+    )
+
+    assert metrics["selector_normalized_candidate_count"] == 3
+    assert metrics["selector_normalization_count"] == 5
+    assert metrics["selector_normalization_fingerprints"] == [
+        "a" * 64,
+        "b" * 64,
+        "c" * 64,
+    ]
+
+
 @pytest.mark.asyncio
 async def test_expired_source_activity_can_be_reacquired_with_same_id(
     db: Database,

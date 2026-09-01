@@ -727,7 +727,13 @@ class MemoryExtractor:
 
         memories: list[RawMemory] = []
         rejection_counts: dict[str, int] = {}
-        for candidate in response.memories:
+        selector_normalizations = tuple(
+            getattr(response, "selector_normalizations", ())
+        )
+        normalization_by_candidate_index = {
+            item.candidate_index: item for item in selector_normalizations
+        }
+        for candidate_index, candidate in enumerate(response.memories):
             candidate_content_hash = hashlib.sha256(
                 candidate.content.encode("utf-8")
             ).hexdigest()
@@ -753,13 +759,22 @@ class MemoryExtractor:
                     )
                 )
                 continue
+            normalization = normalization_by_candidate_index.get(candidate_index)
             record_quality_signal(
                 QualitySignal(
                     event_name="evidence_admission_outcome",
-                    outcome="expected",
-                    reason_code="fragment_selection_resolved",
+                    outcome="degraded" if normalization is not None else "expected",
+                    reason_code=(
+                        "fragment_selector_normalized"
+                        if normalization is not None
+                        else "fragment_selection_resolved"
+                    ),
                     prompt_hash=metrics["prompt_sha256"],
-                    candidate_hash=candidate_hash,
+                    candidate_hash=(
+                        normalization.fingerprint
+                        if normalization is not None
+                        else candidate_hash
+                    ),
                 )
             )
             memories.append(
@@ -789,6 +804,22 @@ class MemoryExtractor:
                     len(response.memories) - len(memories)
                 ),
                 "fragment_selection_rejection_counts": rejection_counts,
+                **(
+                    {
+                        "selector_normalized_candidate_count": len(
+                            selector_normalizations
+                        ),
+                        "selector_normalization_count": sum(
+                            item.removed_ref_count
+                            for item in selector_normalizations
+                        ),
+                        "selector_normalization_fingerprints": [
+                            item.fingerprint for item in selector_normalizations
+                        ],
+                    }
+                    if selector_normalizations
+                    else {}
+                ),
                 "structured_llm_elapsed_ms": max(
                     0, round((perf_counter() - started) * 1000)
                 ),
