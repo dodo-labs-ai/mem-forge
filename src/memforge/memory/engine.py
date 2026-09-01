@@ -149,6 +149,7 @@ class _PreparedLifecyclePlanInputs:
     operations: tuple[ReconcileOperation, ...]
     incumbents: Mapping[str, Memory]
     memory_authority_hashes: Mapping[str, str]
+    initial_support_owners: Mapping[str, Mapping[str, str]]
     observation_revision_ids: tuple[str, ...]
     support_scope_version: SupportScopeVersion
     evidence_reference_ids_by_claim_hash: Mapping[str, tuple[str, ...]]
@@ -180,8 +181,14 @@ class PreparedProjectedLifecycleCommit:
     incumbent_count: int
     relation_pair_count: int
     model_call_count: int
+    prepared_at_attempt_count: int
     applied_stats: dict[str, int] | None = field(
         default=None,
+        repr=False,
+        compare=False,
+    )
+    allowed_blocker_source_unit_ids: set[str] = field(
+        default_factory=set,
         repr=False,
         compare=False,
     )
@@ -920,6 +927,35 @@ class MemoryEngine:
                     f"prepared lifecycle Memory changed before commit: {memory_id}"
                 )
 
+        current_support_owners = await self._active_v2_support_owners(
+            memory_ids
+        )
+        changed_owner_units: set[str] = set()
+        for memory_id in memory_ids:
+            initial = dict(inputs.initial_support_owners.get(memory_id, {}))
+            current = dict(current_support_owners.get(memory_id, {}))
+            shared_ids = set(initial).intersection(current)
+            if any(initial[unit_id] != current[unit_id] for unit_id in shared_ids):
+                raise ProjectedSupportInvariantError(
+                    "prepared lifecycle Support ownership changed before commit"
+                )
+            changed_owner_units.update(
+                initial[unit_id]
+                for unit_id in set(initial).difference(current)
+            )
+            changed_owner_units.update(
+                current[unit_id]
+                for unit_id in set(current).difference(initial)
+            )
+        undeclared_changes = changed_owner_units.difference(
+            prepared.allowed_blocker_source_unit_ids
+        )
+        if undeclared_changes:
+            raise ProjectedSupportInvariantError(
+                "prepared lifecycle Support topology changed outside declared "
+                f"blockers: {sorted(undeclared_changes)}"
+            )
+
         incumbent_ids = tuple(sorted(inputs.incumbents))
         current_incumbents = {
             memory_id: current_memories[memory_id]
@@ -1065,6 +1101,9 @@ class MemoryEngine:
                 runtime_bundle=runtime_bundle,
             )
         except ProjectedLifecycleDeferredError as exc:
+            prepared.allowed_blocker_source_unit_ids.update(
+                exc.blocking_source_unit_ids
+            )
             if prepared.lifecycle_execution_owner_id is None:
                 raise
             failure_bundle = self._prepared_runtime_bundle(
@@ -1144,6 +1183,25 @@ class MemoryEngine:
         )
         prepared.applied_stats = dict(stats)
         return stats
+
+    async def _active_v2_support_owners(
+        self,
+        memory_ids: Sequence[str],
+    ) -> dict[str, dict[str, str]]:
+        """Return exact active v2 Support ownership for prepared drift guards."""
+
+        owners: dict[str, dict[str, str]] = {
+            memory_id: {} for memory_id in memory_ids
+        }
+        for memory_id in memory_ids:
+            for unit in await self.db.get_memory_evidence_units(memory_id):
+                if (
+                    unit.support_scope_version
+                    is not SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+                ):
+                    continue
+                owners[memory_id][unit.evidence_unit_id] = unit.source_unit_id
+        return owners
 
     async def _apply_projected_lifecycle_once(
         self,
@@ -1650,6 +1708,9 @@ class MemoryEngine:
                 for target in corroboration_targets.values()
             },
         }
+        initial_support_owners = await self._active_v2_support_owners(
+            tuple(sorted(prepared_memories))
+        )
         derivation_context_identity_hash = (
             source_derivation_context_identity_hash(
                 SourceUnitDerivationContext(
@@ -1689,6 +1750,7 @@ class MemoryEngine:
                     memory_id: _prepared_memory_authority_hash(memory)
                     for memory_id, memory in prepared_memories.items()
                 },
+                initial_support_owners=initial_support_owners,
                 observation_revision_ids=observation_revision_ids,
                 support_scope_version=support_scope_version,
                 evidence_reference_ids_by_claim_hash=(
@@ -1724,6 +1786,7 @@ class MemoryEngine:
                 + entity_resolution.metrics.structured_llm_calls
                 + identity_resolution.metrics.llm_calls
             ),
+            prepared_at_attempt_count=lifecycle_attempt_count,
         )
         _runtime_context.stage = "lifecycle_commit"
         return await self.commit_prepared_projected_lifecycle(
