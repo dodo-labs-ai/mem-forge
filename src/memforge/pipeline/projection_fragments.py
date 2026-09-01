@@ -411,20 +411,17 @@ class ProjectionFragmentCatalog:
                 FragmentSelectionErrorCode.INVALID_SELECTION,
                 "primary_ref is required",
             )
-        supplied_required = tuple(required_refs)
-        if any(not isinstance(value, str) or not value.strip() for value in supplied_required):
+        normalized_required = tuple(required_refs)
+        if any(not isinstance(value, str) or not value.strip() for value in normalized_required):
             raise FragmentSelectionError(
                 FragmentSelectionErrorCode.INVALID_SELECTION,
                 "required_refs must contain non-empty references",
             )
-        seen_required: set[str] = set()
-        normalized_required_values: list[str] = []
-        for reference in supplied_required:
-            if reference == primary_ref or reference in seen_required:
-                continue
-            seen_required.add(reference)
-            normalized_required_values.append(reference)
-        normalized_required = tuple(normalized_required_values)
+        if primary_ref in normalized_required or len(set(normalized_required)) != len(normalized_required):
+            raise FragmentSelectionError(
+                FragmentSelectionErrorCode.DUPLICATE_REF,
+                "Primary and Required references must be duplicate-free",
+            )
 
         by_reference = {fragment.reference: fragment for fragment in self.fragments}
         selected: list[tuple[EvidenceRole, EvidenceFragment]] = []
