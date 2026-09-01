@@ -12,10 +12,13 @@ from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
     source_artifact_inference_eligibility,
 )
-from memforge.source_projection import SourceProjection
+from memforge.source_projection import EvidenceRepresentationProfile, SourceProjection
+from memforge.source_representation import representation_contract_for_profile
 
 
-PRIMARY_ELIGIBILITY_POLICY_VERSION = 2
+# Covers both Primary eligibility and the exact authority segmentation policy.
+# Bump it whenever either changes so completed derivation batches are not reused.
+PRIMARY_ELIGIBILITY_POLICY_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +68,9 @@ def plan_projection_extraction_batches(
     Source Projection truth. Directly related observations, immediate sequence
     neighbors, and the first observation in a unit are bounded Context. Exact
     candidate Context may be selected as Required, but relations never make it
-    Primary-eligible.
+    Primary-eligible. The primary character budget segments only range-addressable
+    text profiles; canonical records and binary Artifacts retain whole-Observation
+    authority until their representation compiler applies catalog limits.
     """
 
     if len(projection.source_units) != 1:
@@ -130,6 +135,7 @@ def plan_projection_extraction_batches(
             observation_id,
             observations[observation_id].observation_type,
             revisions[observation_id].content,
+            evidence_profile=revisions[observation_id].evidence_profile,
             max_chars=max_primary_chars,
             overlap_chars=primary_overlap_chars,
         )
@@ -378,12 +384,19 @@ def _primary_segments(
     observation_type: str,
     content: str,
     *,
+    evidence_profile: EvidenceRepresentationProfile | None,
     max_chars: int,
     overlap_chars: int,
 ) -> tuple[_PrimarySegment, ...]:
-    """Slice one large Observation without changing its lifecycle identity."""
+    """Plan exact authority without violating the Revision's representation."""
 
     plain_header = f"### Observation {observation_id} ({observation_type})\n"
+    representation_contract = representation_contract_for_profile(evidence_profile)
+    if (
+        representation_contract is not None
+        and representation_contract.requires_whole_observation_authority
+    ):
+        return (_PrimarySegment(observation_id, 0, len(content), plain_header + content),)
     if len(plain_header) + len(content) <= max_chars:
         return (_PrimarySegment(observation_id, 0, len(content), plain_header + content),)
 
