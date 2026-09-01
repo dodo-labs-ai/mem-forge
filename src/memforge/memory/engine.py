@@ -53,6 +53,7 @@ from memforge.memory.lifecycle_planner import (
 from memforge.memory.quality import classify_memory_candidate
 from memforge.pipeline.projection_fragments import (
     RevalidatedSelectionError,
+    group_revalidated_support_unit,
     resolve_revalidated_noop_selection,
 )
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
@@ -418,6 +419,23 @@ class MemoryEngine:
             if not stale:
                 rebound.append(operation)
                 continue
+            if v2:
+                try:
+                    support = group_revalidated_support_unit(support)
+                except RevalidatedSelectionError as exc:
+                    rebound.append(
+                        ReconcileOperation(
+                            action=ReconcileAction.DELETE,
+                            memory_id=operation.memory_id,
+                            reason=(
+                                "revised Evidence Unit could not be exactly "
+                                "recompiled from the current Source Projection: "
+                                f"{exc.code.value}"
+                            ),
+                            flag_for_review=True,
+                        )
+                    )
+                    continue
             primary = [item for item in support if item.role is EvidenceRole.PRIMARY]
             if len(primary) != 1:
                 raise RuntimeError(f"NOOP incumbent lacks exactly one PRIMARY dependency: {operation.memory_id}")
