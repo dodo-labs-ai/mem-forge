@@ -127,7 +127,7 @@ class _SpyMemoryEngine:
     async def process_enrichment(self, *, doc_id, enrichment, doc_context=None):
         return []
 
-    async def apply_projected_lifecycle(self, **kwargs):
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
         self.projected_lifecycle_calls.append(kwargs)
         return {
             "added": len(kwargs.get("raw_memories") or []),
@@ -267,7 +267,7 @@ async def test_agent_session_gene_exposes_explicit_source_updated_at(database_fi
 @pytest.mark.asyncio
 async def test_orchestrator_forwards_uploader_user_id_on_new_documents(database_fixture, tmp_path):
     """First sync (new docs): the orchestrator MUST forward each uploader's id
-    on its ``apply_projected_lifecycle`` call.
+    on its ``prepare_and_commit_projected_lifecycle`` call.
 
     The spy engine records the kwargs the orchestrator passed; the assertion
     reads them back. If ``user_id=uploader_user_id`` is removed from the

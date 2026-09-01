@@ -47,7 +47,6 @@ from memforge.memory.identity_resolver import (
 from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
     LifecyclePlan,
-    ProjectedLifecycleBlocker,
     ProjectedLifecycleDeferredError,
     ProjectedSupportInvariantError,
     ReconciliationScope,
@@ -101,8 +100,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DeferredProjectedLifecycleHandle",
     "MemoryEngine",
-    "PreparedProjectedLifecycleCommit",
     "SourceUnitLifecycleDeferred",
     "SourceUnitLifecycleExecutionError",
 ]
@@ -135,10 +134,12 @@ class SourceUnitLifecycleExecutionError(RuntimeError):
         runtime_bundle: AgentRuntimeBundle,
         *,
         retryable: bool = True,
+        commit_attempted: bool = True,
     ) -> None:
         super().__init__(message)
         self.runtime_bundle = runtime_bundle
         self.retryable = retryable
+        self.commit_attempted = commit_attempted
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +163,7 @@ class _PreparedLifecyclePlanInputs:
 
 
 @dataclass(slots=True)
-class PreparedProjectedLifecycleCommit:
+class _PreparedProjectedLifecycleCommit:
     """Opaque same-process semantic result for deterministic commit replay."""
 
     projection: "SourceProjection"
@@ -182,6 +183,7 @@ class PreparedProjectedLifecycleCommit:
     relation_pair_count: int
     model_call_count: int
     prepared_at_attempt_count: int
+    retry_attempt_count: int = 0
     applied_stats: dict[str, int] | None = field(
         default=None,
         repr=False,
@@ -206,16 +208,20 @@ class SourceUnitLifecycleDeferred(SourceUnitLifecycleExecutionError):
         message: str,
         runtime_bundle: AgentRuntimeBundle,
         *,
-        prepared_commit: PreparedProjectedLifecycleCommit,
-        blockers: Sequence[ProjectedLifecycleBlocker],
+        handle: "DeferredProjectedLifecycleHandle",
     ) -> None:
         super().__init__(message, runtime_bundle, retryable=False)
-        self.prepared_commit = prepared_commit
-        self.blockers = tuple(blockers)
+        self.handle = handle
 
-    @property
-    def blocking_source_unit_ids(self) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(item.source_unit_id for item in self.blockers))
+
+@dataclass(frozen=True, slots=True)
+class DeferredProjectedLifecycleHandle:
+    """Opaque same-process handle for one deferred projected commit."""
+
+    source_unit_id: str
+    blocking_source_unit_ids: tuple[str, ...]
+    _prepared: _PreparedProjectedLifecycleCommit = field(repr=False)
+    _runtime_bundle: AgentRuntimeBundle = field(repr=False)
 
 
 def _prepared_memory_authority_hash(memory: Memory) -> str:
@@ -783,7 +789,7 @@ class MemoryEngine:
             )
         return tuple(rebound)
 
-    async def apply_projected_lifecycle(
+    async def prepare_and_commit_projected_lifecycle(
         self,
         *,
         projection: SourceProjection,
@@ -811,7 +817,7 @@ class MemoryEngine:
 
         runtime_context = _LifecycleExecutionContext(started_at=perf_counter())
         try:
-            return await self._apply_projected_lifecycle_once(
+            return await self._prepare_and_commit_projected_lifecycle_once(
                 projection=projection,
                 doc_id=doc_id,
                 raw_memories=raw_memories,
@@ -884,7 +890,7 @@ class MemoryEngine:
 
     async def _materialize_prepared_projected_plan(
         self,
-        prepared: PreparedProjectedLifecycleCommit,
+        prepared: _PreparedProjectedLifecycleCommit,
     ) -> LifecyclePlan:
         """Refresh only deterministic commit inputs for one prepared intent."""
 
@@ -1028,7 +1034,7 @@ class MemoryEngine:
 
     def _prepared_runtime_bundle(
         self,
-        prepared: PreparedProjectedLifecycleCommit,
+        prepared: _PreparedProjectedLifecycleCommit,
         plan: LifecyclePlan,
         *,
         lifecycle_attempt_count: int,
@@ -1066,9 +1072,9 @@ class MemoryEngine:
             deployment_revision=current_deployment_revision(),
         )
 
-    async def commit_prepared_projected_lifecycle(
+    async def _commit_prepared_projected_lifecycle(
         self,
-        prepared: PreparedProjectedLifecycleCommit,
+        prepared: _PreparedProjectedLifecycleCommit,
         *,
         lifecycle_attempt_count: int,
     ) -> dict[str, int]:
@@ -1101,9 +1107,6 @@ class MemoryEngine:
                 runtime_bundle=runtime_bundle,
             )
         except ProjectedLifecycleDeferredError as exc:
-            prepared.allowed_blocker_source_unit_ids.update(
-                exc.blocking_source_unit_ids
-            )
             if prepared.lifecycle_execution_owner_id is None:
                 raise
             failure_bundle = self._prepared_runtime_bundle(
@@ -1117,8 +1120,12 @@ class MemoryEngine:
             raise SourceUnitLifecycleDeferred(
                 str(exc),
                 failure_bundle,
-                prepared_commit=prepared,
-                blockers=exc.blockers,
+                handle=DeferredProjectedLifecycleHandle(
+                    source_unit_id=prepared.source_unit_id,
+                    blocking_source_unit_ids=exc.blocking_source_unit_ids,
+                    _prepared=prepared,
+                    _runtime_bundle=failure_bundle,
+                ),
             ) from exc
         except Exception as exc:
             if prepared.lifecycle_execution_owner_id is None:
@@ -1184,6 +1191,37 @@ class MemoryEngine:
         prepared.applied_stats = dict(stats)
         return stats
 
+    async def retry_deferred_projected_lifecycle(
+        self,
+        handle: DeferredProjectedLifecycleHandle,
+        *,
+        eligible_same_run_source_unit_ids: set[str] | frozenset[str],
+    ) -> dict[str, int]:
+        """Authorize and retry one opaque deferred handle without semantic replay."""
+
+        prepared = handle._prepared
+        if prepared.applied_stats is not None:
+            return dict(prepared.applied_stats)
+        eligible = set(eligible_same_run_source_unit_ids)
+        if not set(handle.blocking_source_unit_ids).issubset(eligible):
+            raise SourceUnitLifecycleExecutionError(
+                "deferred lifecycle blocker is outside the current Source run",
+                handle._runtime_bundle,
+                retryable=False,
+                commit_attempted=False,
+            )
+        prepared.allowed_blocker_source_unit_ids.update(
+            handle.blocking_source_unit_ids
+        )
+        prepared.retry_attempt_count += 1
+        return await self._commit_prepared_projected_lifecycle(
+            prepared,
+            lifecycle_attempt_count=(
+                prepared.prepared_at_attempt_count
+                + prepared.retry_attempt_count
+            ),
+        )
+
     async def _active_v2_support_owners(
         self,
         memory_ids: Sequence[str],
@@ -1203,7 +1241,7 @@ class MemoryEngine:
                 owners[memory_id][unit.evidence_unit_id] = unit.source_unit_id
         return owners
 
-    async def _apply_projected_lifecycle_once(
+    async def _prepare_and_commit_projected_lifecycle_once(
         self,
         *,
         projection: SourceProjection,
@@ -1738,7 +1776,7 @@ class MemoryEngine:
             if derivation_id is not None and document is not None
             else None
         )
-        prepared = PreparedProjectedLifecycleCommit(
+        prepared = _PreparedProjectedLifecycleCommit(
             projection=projection,
             plan_inputs=_PreparedLifecyclePlanInputs(
                 plan_id=lifecycle_plan_id(scope),
@@ -1789,7 +1827,7 @@ class MemoryEngine:
             prepared_at_attempt_count=lifecycle_attempt_count,
         )
         _runtime_context.stage = "lifecycle_commit"
-        return await self.commit_prepared_projected_lifecycle(
+        return await self._commit_prepared_projected_lifecycle(
             prepared,
             lifecycle_attempt_count=lifecycle_attempt_count,
         )
