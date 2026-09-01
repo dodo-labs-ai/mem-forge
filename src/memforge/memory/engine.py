@@ -39,7 +39,10 @@ from memforge.memory.identity_resolver import (
     IdentityResolutionRequest,
     IdentityResolver,
 )
-from memforge.memory.lifecycle_plan import ReconciliationScope
+from memforge.memory.lifecycle_plan import (
+    ProjectedSupportInvariantError,
+    ReconciliationScope,
+)
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
     build_lifecycle_plan,
@@ -48,6 +51,9 @@ from memforge.memory.lifecycle_planner import (
     lifecycle_plan_id,
 )
 from memforge.memory.quality import classify_memory_candidate
+from memforge.pipeline.projection_fragments import (
+    resolve_revalidated_noop_selection,
+)
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.relation_classifier import (
     MEMORY_PAIR_CLASSIFIER_VERSION,
@@ -93,6 +99,9 @@ polarity, or applicability means supported=false.
 When supported=true and the previous Primary quote is no longer present verbatim, return
 evidence_quote as one exact, non-empty substring copied from the current Primary observation
 that directly supports the claim. Never paraphrase evidence_quote.
+When supported=true, return required_evidence with one observation_id and one exact,
+non-empty evidence_quote copied from each current Required observation. Do not return
+background or an observation that was not supplied in required.
 
 <case_json>
 {case_json}
@@ -103,9 +112,16 @@ that directly supports the claim. Never paraphrase evidence_quote.
 class SourceUnitLifecycleExecutionError(RuntimeError):
     """A failed lifecycle execution carrying its content-free terminal bundle."""
 
-    def __init__(self, message: str, runtime_bundle: AgentRuntimeBundle) -> None:
+    def __init__(
+        self,
+        message: str,
+        runtime_bundle: AgentRuntimeBundle,
+        *,
+        retryable: bool = True,
+    ) -> None:
         super().__init__(message)
         self.runtime_bundle = runtime_bundle
+        self.retryable = retryable
 
 
 @dataclass(slots=True)
@@ -351,6 +367,10 @@ class MemoryEngine:
         """
 
         current_revisions = {revision.observation_id: revision for revision in projection.observation_revisions}
+        v2 = (
+            await self.db.get_support_scope_version()
+            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+        )
         rebound: list[ReconcileOperation] = []
         for operation in operations:
             if (
@@ -366,7 +386,15 @@ class MemoryEngine:
                 source_id=projection.source_id,
             )
             scoped_reference_ids = frozenset(unit_support.get(operation.memory_id, ()))
-            support = tuple(item for item in source_support if item.reference_id in scoped_reference_ids)
+            support = tuple(
+                item
+                for item in source_support
+                if (
+                    item.evidence_unit_id in scoped_reference_ids
+                    if v2
+                    else item.reference_id in scoped_reference_ids
+                )
+            )
             missing_dependencies = [item for item in support if item.anchor.observation_id not in current_revisions]
             if missing_dependencies and projection.coverage.proves_absence:
                 rebound.append(
@@ -402,6 +430,11 @@ class MemoryEngine:
             stale_required = [item for item in stale if item.role is EvidenceRole.REQUIRED]
             support_validation: dict[str, object] = {}
             current_primary_quote = selected.excerpt or ""
+            current_required_quotes = {
+                item.anchor.observation_id: item.excerpt or ""
+                for item in support
+                if item.role is EvidenceRole.REQUIRED
+            }
             if primary_needs_validation or stale_required:
                 validator = getattr(
                     self.structured_llm_client,
@@ -424,7 +457,14 @@ class MemoryEngine:
                                     "previous_primary_quote": selected.excerpt,
                                     "primary": current_primary.content,
                                     "required": [
-                                        current_revisions[item.anchor.observation_id].content for item in stale_required
+                                        {
+                                            "observation_id": item.anchor.observation_id,
+                                            "previous_quote": item.excerpt,
+                                            "current": current_revisions[
+                                                item.anchor.observation_id
+                                            ].content,
+                                        }
+                                        for item in stale_required
                                     ],
                                 },
                                 ensure_ascii=False,
@@ -474,6 +514,68 @@ class MemoryEngine:
                             )
                         )
                         continue
+                returned_required = {
+                    item.observation_id: item.evidence_quote.strip()
+                    for item in validation.required_evidence
+                }
+                if len(returned_required) != len(validation.required_evidence):
+                    rebound.append(
+                        ReconcileOperation(
+                            action=ReconcileAction.DELETE,
+                            memory_id=operation.memory_id,
+                            reason="revised REQUIRED evidence response was ambiguous",
+                            flag_for_review=True,
+                        )
+                    )
+                    continue
+                expected_required_ids = {
+                    item.anchor.observation_id for item in stale_required
+                }
+                if v2 and (
+                    set(returned_required) != expected_required_ids
+                    or any(
+                        not quote
+                        or quote
+                        not in current_revisions[observation_id].content
+                        for observation_id, quote in returned_required.items()
+                    )
+                ):
+                    rebound.append(
+                        ReconcileOperation(
+                            action=ReconcileAction.DELETE,
+                            memory_id=operation.memory_id,
+                            reason=(
+                                "revised REQUIRED evidence could not be "
+                                "exactly re-anchored"
+                            ),
+                            flag_for_review=True,
+                        )
+                    )
+                    continue
+                current_required_quotes.update(returned_required)
+            resolved_selection = None
+            if v2:
+                try:
+                    resolved_selection = resolve_revalidated_noop_selection(
+                        projection,
+                        support=support,
+                        current_primary_quote=current_primary_quote,
+                        current_required_quotes=current_required_quotes,
+                    )
+                except ValueError as exc:
+                    rebound.append(
+                        ReconcileOperation(
+                            action=ReconcileAction.DELETE,
+                            memory_id=operation.memory_id,
+                            reason=(
+                                "revised Evidence Unit could not be exactly "
+                                "recompiled from the current Source Projection: "
+                                f"{exc}"
+                            ),
+                            flag_for_review=True,
+                        )
+                    )
+                    continue
             rebound.append(
                 ReconcileOperation(
                     action=operation.action,
@@ -487,6 +589,7 @@ class MemoryEngine:
                         evidence_anchor="revalidated_noop",
                         source_observation_id=selected.anchor.observation_id,
                         required_source_observation_ids=required_observation_ids,
+                        resolved_evidence_selection=resolved_selection,
                         support_validation=support_validation,
                     ),
                     reason=operation.reason,
@@ -588,7 +691,11 @@ class MemoryEngine:
                 model_call_count=runtime_context.model_call_count,
                 deployment_revision=current_deployment_revision(),
             )
-            raise SourceUnitLifecycleExecutionError(str(exc), bundle) from exc
+            raise SourceUnitLifecycleExecutionError(
+                str(exc),
+                bundle,
+                retryable=not isinstance(exc, ProjectedSupportInvariantError),
+            ) from exc
 
     async def _apply_projected_lifecycle_once(
         self,

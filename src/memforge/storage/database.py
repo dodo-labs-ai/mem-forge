@@ -134,6 +134,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
     LifecycleMutationType,
     LifecyclePlan,
+    ProjectedSupportInvariantError,
     LifecycleReview,
     LifecycleReviewStatus,
     LifecycleVectorOperation,
@@ -10034,7 +10035,9 @@ class Database:
                            er.id AS reference_id, er.evidence_unit_id, er.role,
                            er.anchor_kind, er.observation_id,
                            er.observation_revision_id, er.fragment_id,
-                           er.range_start, er.range_end, eu.excerpt
+                           er.range_start, er.range_end,
+                           COALESCE(er.excerpt, eu.excerpt) AS excerpt,
+                           msa.access_context_hash
                     FROM memory_support_assertions msa
                     JOIN evidence_references er ON er.id = msa.evidence_reference_id
                     JOIN evidence_units eu ON eu.id = er.evidence_unit_id
@@ -10061,6 +10064,7 @@ class Database:
                             range_end=row["range_end"],
                         ),
                         excerpt=row["excerpt"],
+                        access_context_hash=str(row["access_context_hash"]),
                     )
                 )
         return {memory_id: tuple(grouped[memory_id]) for memory_id in ids}
@@ -10087,7 +10091,7 @@ class Database:
                            er.id AS reference_id, er.role, er.anchor_kind,
                            er.observation_id, er.observation_revision_id,
                            er.fragment_id, er.range_start, er.range_end,
-                           er.excerpt
+                           er.excerpt, msa.access_context_hash
                     FROM memory_unit_support_assertions msa
                     JOIN evidence_references er
                       ON er.evidence_unit_id = msa.evidence_unit_id
@@ -10131,6 +10135,7 @@ class Database:
                             if row["excerpt"] is not None
                             else None
                         ),
+                        access_context_hash=str(row["access_context_hash"]),
                     )
                 )
         return {memory_id: tuple(grouped[memory_id]) for memory_id in memory_ids}
@@ -10866,11 +10871,11 @@ class Database:
                 if current or (structurally_valid and contested_edge in contested):
                     accepted.append(support)
             if memory_id in created_ids and current_scope_count == 0:
-                raise ValueError(
+                raise ProjectedSupportInvariantError(
                     f"projected lifecycle activated Memory without complete Unit support: {memory_id}"
                 )
             if len(accepted) != len(supports):
-                raise ValueError(
+                raise ProjectedSupportInvariantError(
                     f"projected lifecycle left stale or incomplete Unit support: {memory_id}"
                 )
 

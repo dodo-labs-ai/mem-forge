@@ -271,6 +271,7 @@ class ActiveSupportEvidence:
     role: EvidenceRole
     anchor: SourceAnchor
     excerpt: str | None
+    access_context_hash: str
 
 
 @dataclass(frozen=True, slots=True)

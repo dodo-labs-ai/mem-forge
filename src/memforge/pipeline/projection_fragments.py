@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Mapping
 
 from memforge.memory.evidence import (
+    ActiveSupportEvidence,
     EvidencePartKind,
     EvidenceRole,
     ResolvedEvidencePart,
@@ -56,6 +57,217 @@ class FragmentSelectionError(ValueError):
     def __init__(self, code: FragmentSelectionErrorCode, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def resolve_revalidated_noop_selection(
+    projection: SourceProjection,
+    *,
+    support: tuple[ActiveSupportEvidence, ...],
+    current_primary_quote: str,
+    current_required_quotes: Mapping[str, str],
+) -> ResolvedEvidenceSelection:
+    """Recompile one current v2 Unit without widening its prior Support parts.
+
+    NOOP revalidation is application-authorized work, not a model selection.
+    Each prior supporting Observation is compiled through its declared current
+    representation.  The prior exact excerpt (or the validator's current
+    Primary quote) must resolve to one current Fragment; ambiguous or
+    unrepresentable parts fail closed for the caller to stage Review.
+    """
+
+    if len(projection.source_units) != 1 or len(projection.source_unit_revisions) != 1:
+        raise ValueError("NOOP revalidation requires one Source Unit revision")
+    unit_ids = {item.evidence_unit_id for item in support}
+    if len(unit_ids) != 1:
+        raise ValueError("NOOP revalidation requires one complete Evidence Unit")
+    access_hashes = {item.access_context_hash for item in support}
+    if len(access_hashes) != 1 or not next(iter(access_hashes)):
+        raise ValueError("NOOP revalidation requires one access context")
+    primary_count = sum(item.role is EvidenceRole.PRIMARY for item in support)
+    if primary_count != 1:
+        raise ValueError("NOOP revalidation requires exactly one Primary")
+
+    revisions = {
+        revision.observation_id: revision
+        for revision in projection.observation_revisions
+    }
+    resolved: list[ResolvedEvidencePart] = []
+    component_digests: list[str] = []
+    for item in sorted(
+        support,
+        key=lambda value: (
+            value.role is not EvidenceRole.PRIMARY,
+            value.anchor.observation_id,
+            value.reference_id,
+        ),
+    ):
+        revision = revisions.get(item.anchor.observation_id)
+        if revision is None:
+            raise ValueError("NOOP revalidation Evidence is unavailable")
+        catalog = compile_fragments(
+            revision,
+            (
+                EvidenceCandidateRange(
+                    anchor=_revalidation_candidate_anchor(revision),
+                    primary_eligible=item.role is EvidenceRole.PRIMARY,
+                ),
+            ),
+        )
+        if not catalog.usable:
+            raise ValueError("NOOP revalidation Fragment catalog is unusable")
+        expected = (
+            current_primary_quote
+            if item.role is EvidenceRole.PRIMARY
+            else current_required_quotes.get(
+                item.anchor.observation_id,
+                item.excerpt or "",
+            )
+        )
+        fragment = _unique_revalidation_fragment(
+            catalog.fragments,
+            prior=item,
+            expected=expected,
+        )
+        resolved.append(
+            ResolvedEvidencePart(
+                role=item.role,
+                kind=(
+                    EvidencePartKind.ARTIFACT
+                    if fragment.kind is EvidenceFragmentKind.ARTIFACT
+                    else EvidencePartKind.TEXT
+                ),
+                anchor=fragment.anchor,
+                raw_content_sha256=fragment.raw_content_sha256,
+                presentation_sha256=fragment.presentation_sha256,
+                excerpt=(
+                    None
+                    if fragment.kind is EvidenceFragmentKind.ARTIFACT
+                    else fragment.presentation_text
+                ),
+                artifact_metadata=(
+                    dict(revision.metadata.get("source_artifact") or {})
+                    if fragment.kind is EvidenceFragmentKind.ARTIFACT
+                    else {}
+                ),
+            )
+        )
+        component_digests.append(catalog.digest)
+
+    target = projection.source_unit_revisions[0]
+    access_context_hash = next(iter(access_hashes))
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "contract": COMPILER_CONTRACT_VERSION,
+                "kind": "revalidated_noop",
+                "source_id": projection.source_id,
+                "source_unit_id": projection.source_units[0].id,
+                "target_unit_revision_id": target.id,
+                "access_context_hash": access_context_hash,
+                "prior_evidence_unit_id": next(iter(unit_ids)),
+                "component_digests": component_digests,
+                "parts": [
+                    {
+                        "role": part.role.value,
+                        "kind": part.kind.value,
+                        "anchor": {
+                            "kind": part.anchor.kind.value,
+                            "observation_id": part.anchor.observation_id,
+                            "observation_revision_id": (
+                                part.anchor.observation_revision_id
+                            ),
+                            "fragment_id": part.anchor.fragment_id,
+                            "range_start": part.anchor.range_start,
+                            "range_end": part.anchor.range_end,
+                        },
+                        "raw_content_sha256": part.raw_content_sha256,
+                        "presentation_sha256": part.presentation_sha256,
+                    }
+                    for part in resolved
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return ResolvedEvidenceSelection(
+        source_id=projection.source_id,
+        source_unit_id=projection.source_units[0].id,
+        target_unit_revision_id=target.id,
+        access_context_hash=access_context_hash,
+        catalog_digest=digest,
+        compiler_contract_version=COMPILER_CONTRACT_VERSION,
+        parts=tuple(resolved),
+    )
+
+
+def _unique_revalidation_fragment(
+    fragments: tuple[EvidenceFragment, ...],
+    *,
+    prior: ActiveSupportEvidence,
+    expected: str,
+) -> EvidenceFragment:
+    candidates = tuple(
+        fragment
+        for fragment in fragments
+        if fragment.anchor.observation_id == prior.anchor.observation_id
+    )
+    exact_anchor = tuple(
+        fragment
+        for fragment in candidates
+        if fragment.anchor.range_start == prior.anchor.range_start
+        and fragment.anchor.range_end == prior.anchor.range_end
+        and (not expected or fragment.presentation_text == expected)
+    )
+    if len(exact_anchor) == 1:
+        return exact_anchor[0]
+    exact_text = tuple(
+        fragment
+        for fragment in candidates
+        if expected and fragment.presentation_text == expected
+    )
+    if len(exact_text) == 1:
+        return exact_text[0]
+    enclosing = tuple(
+        fragment
+        for fragment in candidates
+        if expected and expected in fragment.presentation_text
+    )
+    if len(enclosing) == 1:
+        return enclosing[0]
+    if len(candidates) == 1 and (
+        not expected
+        or prior.anchor.observation_revision_id
+        == candidates[0].anchor.observation_revision_id
+    ):
+        return candidates[0]
+    raise ValueError(
+        "NOOP revalidation "
+        f"{prior.role.value} Evidence does not resolve to one current Fragment "
+        f"({len(candidates)} candidates)"
+    )
+
+
+def _revalidation_candidate_anchor(
+    revision: SourceObservationRevision,
+) -> SourceAnchor:
+    profile = revision.evidence_profile
+    whole_authority = (
+        profile is None
+        or profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
+        or profile.name == "canonical-record"
+    )
+    return SourceAnchor(
+        kind=(
+            AnchorKind.WHOLE_OBSERVATION
+            if whole_authority
+            else AnchorKind.REVISION_RANGE
+        ),
+        observation_id=revision.observation_id,
+        observation_revision_id=revision.id,
+        range_start=None if whole_authority else 0,
+        range_end=None if whole_authority else len(revision.content),
+    )
 
 
 @dataclass(frozen=True, slots=True)
