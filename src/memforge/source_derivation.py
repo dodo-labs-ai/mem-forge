@@ -75,6 +75,7 @@ SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE = "retryable_failure"
 _SAFE_DERIVATION_DIAGNOSTIC_RE = re.compile(r"^[A-Za-z0-9_.\[\]$-]+$")
 _MAX_SAFE_DERIVATION_ERROR_FIELDS = 32
 _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT = 16
+_SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT = 32
 
 logger = logging.getLogger(__name__)
 
@@ -1336,6 +1337,10 @@ def aggregate_extraction_metrics(
     refinement_counts: dict[str, int] = {}
     fallback_samples: list[dict[str, object]] = []
     fallback_sample_truncated_count = 0
+    selector_normalization_present = False
+    selector_normalized_candidate_count = 0
+    selector_normalization_count = 0
+    selector_normalization_fingerprints: list[str] = []
     for result in results:
         telemetry = _safe_evidence_telemetry(result.metadata)
         for refinement, count in telemetry.get(
@@ -1354,6 +1359,22 @@ def aggregate_extraction_metrics(
                 0,
             )
         )
+        if "selector_normalization_count" in telemetry:
+            selector_normalization_present = True
+            selector_normalized_candidate_count += int(
+                telemetry.get("selector_normalized_candidate_count", 0)
+            )
+            selector_normalization_count += int(
+                telemetry.get("selector_normalization_count", 0)
+            )
+            for fingerprint in telemetry.get(
+                "selector_normalization_fingerprints", []
+            ):
+                if (
+                    len(selector_normalization_fingerprints)
+                    < _SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT
+                ):
+                    selector_normalization_fingerprints.append(fingerprint)
     aggregated["evidence_refinement_counts"] = refinement_counts
     aggregated["evidence_block_fallback_samples"] = fallback_samples
     aggregated["evidence_block_fallback_sample_truncated_count"] = (
@@ -1363,6 +1384,18 @@ def aggregate_extraction_metrics(
         int((result.metadata or {}).get("invalid_evidence_block_count", 0) or 0)
         for result in results
     )
+    if selector_normalization_present:
+        aggregated.update(
+            {
+                "selector_normalized_candidate_count": (
+                    selector_normalized_candidate_count
+                ),
+                "selector_normalization_count": selector_normalization_count,
+                "selector_normalization_fingerprints": (
+                    selector_normalization_fingerprints
+                ),
+            }
+        )
     return aggregated
 
 
@@ -1406,7 +1439,20 @@ def _safe_evidence_telemetry(value: object) -> dict[str, object]:
                     )
                 }
             )
-    return {
+    raw_normalization_fingerprints = value.get(
+        "selector_normalization_fingerprints"
+    )
+    normalization_fingerprints = [
+        fingerprint
+        for fingerprint in (
+            raw_normalization_fingerprints
+            if isinstance(raw_normalization_fingerprints, list)
+            else []
+        )
+        if isinstance(fingerprint, str)
+        and re.fullmatch(r"[0-9a-f]{64}", fingerprint) is not None
+    ][:_SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT]
+    telemetry = {
         "evidence_refinement_counts": counts,
         "evidence_block_fallback_samples": samples,
         "evidence_block_fallback_sample_truncated_count": max(
@@ -1424,3 +1470,25 @@ def _safe_evidence_telemetry(value: object) -> dict[str, object]:
             int(value.get("invalid_evidence_block_count", 0) or 0),
         ),
     }
+    if any(
+        key in value
+        for key in (
+            "selector_normalized_candidate_count",
+            "selector_normalization_count",
+            "selector_normalization_fingerprints",
+        )
+    ):
+        telemetry.update(
+            {
+                "selector_normalized_candidate_count": max(
+                    0,
+                    int(value.get("selector_normalized_candidate_count", 0) or 0),
+                ),
+                "selector_normalization_count": max(
+                    0,
+                    int(value.get("selector_normalization_count", 0) or 0),
+                ),
+                "selector_normalization_fingerprints": normalization_fingerprints,
+            }
+        )
+    return telemetry

@@ -9,6 +9,7 @@ import pytest
 import pytest_asyncio
 from pydantic import ValidationError
 
+from memforge.evals.agent_evaluation import QualitySignalCollector, quality_signal_scope
 from memforge.llm.structured import (
     ProjectionFragmentMemoryCandidate,
     ProjectionFragmentMemoryExtractionResponse,
@@ -242,7 +243,7 @@ def _batch(projection: SourceProjection) -> ProjectionExtractionBatch:
     )
 
 
-def test_v9_candidate_rejects_legacy_authority_and_duplicate_refs() -> None:
+def test_v9_candidate_rejects_legacy_authority() -> None:
     with pytest.raises(ValidationError):
         ProjectionFragmentMemoryCandidate.model_validate(
             {
@@ -280,22 +281,100 @@ def test_agent_patch_model_uses_one_primary_event_and_reads_one_legacy_id() -> N
         )
     with pytest.raises(ValidationError):
         AgentKnowledgePatchModelResponse(action="create_new_concept")
-    with pytest.raises(ValidationError):
-        ProjectionFragmentMemoryCandidate.model_validate(
+
+
+def test_v9_response_accepts_redundant_selectors_for_admission_normalization() -> None:
+    payload = {
+        "memories": [
             {
                 "content": "Approval is required.",
                 "memory_type": "fact",
                 "primary_ref": "f000001",
-                "required_refs": ["f000002", "f000002"],
+                "required_refs": [
+                    "f000003",
+                    "f000001",
+                    "f000002",
+                    "f000003",
+                    "f000002",
+                ],
             }
-        )
-    with pytest.raises(ValidationError):
-        ProjectionFragmentMemoryCandidate.model_validate(
+        ]
+    }
+
+    response = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
+
+    assert response.memories[0].primary_ref == "f000001"
+    assert response.memories[0].required_refs == payload["memories"][0]["required_refs"]
+    reconstructed = ProjectionFragmentMemoryExtractionResponse.model_validate_json(
+        response.model_dump_json()
+    )
+    assert reconstructed == response
+
+
+def test_v9_well_formed_response_remains_byte_stable() -> None:
+    payload = {
+        "memories": [
             {
                 "content": "Approval is required.",
                 "memory_type": "fact",
+                "confidence": 0.7,
+                "entity_refs": [],
+                "valid_from": None,
+                "valid_until": None,
                 "primary_ref": "f000001",
-                "required_refs": ["f000001"],
+                "required_refs": ["f000002"],
+            }
+        ]
+    }
+
+    response = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
+
+    assert response.model_dump() == payload
+
+
+@pytest.mark.parametrize("json_text", [False, True])
+def test_v9_response_accepts_redundant_stringified_and_json_text_fallback_shapes(
+    json_text: bool,
+) -> None:
+    payload = {
+        "memories": "[{\"content\":\"Approval is required.\","
+        "\"memory_type\":\"fact\",\"primary_ref\":\"f000001\","
+        "\"required_refs\":[\"f000002\",\"f000002\"]}]"
+    }
+
+    response = (
+        ProjectionFragmentMemoryExtractionResponse.model_validate_json(
+            json.dumps(payload)
+        )
+        if json_text
+        else ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
+    )
+
+    assert response.memories[0].required_refs == ["f000002", "f000002"]
+
+
+@pytest.mark.parametrize(
+    ("primary_ref", "required_refs"),
+    [
+        ("not-a-fragment", []),
+        ("f000001", ["not-a-fragment"]),
+    ],
+)
+def test_v9_response_still_rejects_malformed_fragment_refs(
+    primary_ref: str,
+    required_refs: list[str],
+) -> None:
+    with pytest.raises(ValidationError):
+        ProjectionFragmentMemoryExtractionResponse.model_validate(
+            {
+                "memories": [
+                    {
+                        "content": "Approval is required.",
+                        "memory_type": "fact",
+                        "primary_ref": primary_ref,
+                        "required_refs": required_refs,
+                    }
+                ]
             }
         )
 
@@ -614,7 +693,7 @@ def test_large_canonical_fragment_fails_with_capacity_error_without_raw_slicing(
     } == {"catalog_too_large"}
 
 
-def test_catalog_rejects_unknown_duplicate_and_primary_from_required_only() -> None:
+def test_catalog_rejects_duplicate_unknown_and_ineligible_selectors() -> None:
     projection = _projection()
     catalog = compile_projection_fragment_catalog(
         projection,
@@ -911,6 +990,129 @@ def test_supplied_fieldless_legacy_artifact_uses_normalized_eligibility() -> Non
 
 
 @pytest.mark.asyncio
+async def test_extractor_admits_normalized_candidates_with_candidate_local_telemetry() -> None:
+    projection = _projection(
+        context_profile=BINARY_PROFILE,
+        context_content="",
+        context_metadata={
+            "source_artifact": {
+                "inference_eligible": True,
+                "sha256": "a" * 64,
+                "media_type": "image/png",
+                "size_bytes": 128,
+                "filename": "diagram.png",
+            }
+        },
+    )
+    catalog = compile_projection_fragment_catalog(
+        projection,
+        _batch(projection),
+        access_context_hash="access-1",
+        supplied_artifact_observation_ids=("obs-context",),
+    )
+    primary = next(item for item in catalog.fragments if item.primary_eligible)
+    artifact = next(item for item in catalog.fragments if item.kind.value == "artifact")
+
+    class Client:
+        async def extract_projection_fragment_memories(self, prompt: str, **kwargs):
+            return ProjectionFragmentMemoryExtractionResponse.model_validate(
+                {
+                    "memories": [
+                        {
+                            "content": "Release requires approval.",
+                            "memory_type": "convention",
+                            "primary_ref": primary.reference,
+                            "required_refs": [
+                                artifact.reference,
+                                primary.reference,
+                                artifact.reference,
+                            ],
+                        },
+                        {
+                            "content": "Unknown evidence must fail closed.",
+                            "memory_type": "fact",
+                            "primary_ref": "f999999",
+                            "required_refs": [artifact.reference, artifact.reference],
+                        },
+                        {
+                            "content": "Required-only evidence cannot become Primary.",
+                            "memory_type": "fact",
+                            "primary_ref": artifact.reference,
+                            "required_refs": [artifact.reference, artifact.reference],
+                        },
+                        {
+                            "content": "A stale selector must fail closed.",
+                            "memory_type": "fact",
+                            "primary_ref": "f900001",
+                            "required_refs": [artifact.reference, artifact.reference],
+                        },
+                        {
+                            "content": "A cross-catalog selector must fail closed.",
+                            "memory_type": "fact",
+                            "primary_ref": "f900002",
+                            "required_refs": [artifact.reference, artifact.reference],
+                        },
+                        {
+                            "content": "An inaccessible selector must fail closed.",
+                            "memory_type": "fact",
+                            "primary_ref": "f900003",
+                            "required_refs": [artifact.reference, artifact.reference],
+                        },
+                    ]
+                }
+            )
+
+    collector = QualitySignalCollector()
+    with quality_signal_scope(collector):
+        result = await MemoryExtractor(
+            structured_llm_client=Client(),
+        ).extract_projection_fragment_memories(
+            catalog,
+            source_type="github_repo",
+            context_markdown="",
+        )
+
+    assert len(result.memories) == 1
+    assert [part.kind for part in result.memories[0].resolved_evidence_selection.parts] == [
+        EvidencePartKind.TEXT,
+        EvidencePartKind.ARTIFACT,
+    ]
+    assert result.metadata["selector_normalized_candidate_count"] == 6
+    assert result.metadata["selector_normalization_count"] == 8
+    fingerprints = result.metadata["selector_normalization_fingerprints"]
+    assert len(fingerprints) == 6
+    assert all(len(value) == 64 for value in fingerprints)
+    assert all(primary.reference not in value for value in fingerprints)
+    assert all(artifact.reference not in value for value in fingerprints)
+    assert result.metadata["fragment_selection_rejection_counts"] == {
+        "unknown_ref": 4,
+        "ineligible_role": 1,
+    }
+
+    normalization_signals = [
+        signal
+        for signal in collector.snapshot()
+        if signal.reason_code == "fragment_selector_normalized"
+    ]
+    assert len(normalization_signals) == 1
+    strong_candidate_hash = catalog.selection_fingerprint(
+        candidate_content_hash=hashlib.sha256(
+            b"Release requires approval."
+        ).hexdigest(),
+        primary_ref=primary.reference,
+        required_refs=[artifact.reference],
+    )
+    assert normalization_signals[0].candidate_hash == strong_candidate_hash
+    assert normalization_signals[0].candidate_hash != fingerprints[0]
+
+    restored = memory_extraction_result_from_output_payload(
+        memory_extraction_output_payload(result)
+    )
+    assert restored.metadata["selector_normalization_count"] == 8
+    assert restored.metadata["selector_normalization_fingerprints"] == fingerprints
+
+
+@pytest.mark.asyncio
 async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> None:
     projection = _projection()
     batch = _batch(projection)
@@ -969,6 +1171,7 @@ async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> 
     assert restored.memories[0].resolved_evidence_selection == (
         memory.resolved_evidence_selection
     )
+    assert "selector_normalization_count" not in restored.metadata
 
 
 @pytest.mark.asyncio
