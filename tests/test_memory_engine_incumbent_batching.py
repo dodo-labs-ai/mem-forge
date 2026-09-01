@@ -71,7 +71,6 @@ class _IncumbentStore:
                         observation_revision_id="obsrev-1",
                     ),
                     excerpt=None,
-                    access_context_hash="access-1",
                 ),
             )
             for memory_id in requested

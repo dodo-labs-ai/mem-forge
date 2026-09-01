@@ -52,6 +52,7 @@ from memforge.memory.lifecycle_planner import (
 )
 from memforge.memory.quality import classify_memory_candidate
 from memforge.pipeline.projection_fragments import (
+    RevalidatedSelectionError,
     resolve_revalidated_noop_selection,
 )
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
@@ -99,9 +100,10 @@ polarity, or applicability means supported=false.
 When supported=true and the previous Primary quote is no longer present verbatim, return
 evidence_quote as one exact, non-empty substring copied from the current Primary observation
 that directly supports the claim. Never paraphrase evidence_quote.
-When supported=true, return required_evidence with one observation_id and one exact,
-non-empty evidence_quote copied from each current Required observation. Do not return
-background or an observation that was not supplied in required.
+When supported=true, return required_evidence with the exact selector and one exact,
+non-empty evidence_quote copied for every supplied Required item. Preserve distinct
+selectors even when multiple Required items share one observation. Do not return
+background or a selector that was not supplied in required.
 
 <case_json>
 {case_json}
@@ -353,6 +355,7 @@ class MemoryEngine:
         incumbents: dict[str, Memory],
         unit_support: Mapping[str, tuple[str, ...]],
         projection: SourceProjection,
+        access_context_hash: str,
         protected_memory_ids: frozenset[str] = frozenset(),
     ) -> tuple[ReconcileOperation, ...]:
         """Carry an exact, still-present claim forward without re-extracting it.
@@ -420,20 +423,37 @@ class MemoryEngine:
                 raise RuntimeError(f"NOOP incumbent lacks exactly one PRIMARY dependency: {operation.memory_id}")
             selected = primary[0]
             primary_needs_validation = selected in stale and (
-                not selected.excerpt
-                or selected.excerpt not in current_revisions[selected.anchor.observation_id].content
+                v2
+                or not selected.excerpt
+                or selected.excerpt
+                not in current_revisions[
+                    selected.anchor.observation_id
+                ].content
             )
             required_observation_ids = sorted(
                 {item.anchor.observation_id for item in support if item.role is EvidenceRole.REQUIRED}
             )
             incumbent = incumbents[operation.memory_id]
             stale_required = [item for item in stale if item.role is EvidenceRole.REQUIRED]
+            ordered_required = tuple(
+                sorted(
+                    (
+                        item
+                        for item in support
+                        if item.role is EvidenceRole.REQUIRED
+                    ),
+                    key=lambda item: item.reference_id,
+                )
+            )
+            required_selector_by_reference_id = {
+                item.reference_id: f"r{index:06d}"
+                for index, item in enumerate(ordered_required, start=1)
+            }
             support_validation: dict[str, object] = {}
             current_primary_quote = selected.excerpt or ""
-            current_required_quotes = {
-                item.anchor.observation_id: item.excerpt or ""
-                for item in support
-                if item.role is EvidenceRole.REQUIRED
+            current_required_quotes_by_reference_id = {
+                item.reference_id: item.excerpt or ""
+                for item in ordered_required
             }
             if primary_needs_validation or stale_required:
                 validator = getattr(
@@ -458,6 +478,11 @@ class MemoryEngine:
                                     "primary": current_primary.content,
                                     "required": [
                                         {
+                                            "selector": (
+                                                required_selector_by_reference_id[
+                                                    item.reference_id
+                                                ]
+                                            ),
                                             "observation_id": item.anchor.observation_id,
                                             "previous_quote": item.excerpt,
                                             "current": current_revisions[
@@ -504,7 +529,10 @@ class MemoryEngine:
                     continue
                 if primary_needs_validation:
                     current_primary_quote = str(getattr(validation, "evidence_quote", "") or "").strip()
-                    if not current_primary_quote or current_primary_quote not in current_primary.content:
+                    if not current_primary_quote or (
+                        not v2
+                        and current_primary_quote not in current_primary.content
+                    ):
                         rebound.append(
                             ReconcileOperation(
                                 action=ReconcileAction.DELETE,
@@ -514,11 +542,13 @@ class MemoryEngine:
                             )
                         )
                         continue
-                returned_required = {
-                    item.observation_id: item.evidence_quote.strip()
+                returned_required_by_selector = {
+                    item.selector: item.evidence_quote.strip()
                     for item in validation.required_evidence
                 }
-                if len(returned_required) != len(validation.required_evidence):
+                if len(returned_required_by_selector) != len(
+                    validation.required_evidence
+                ):
                     rebound.append(
                         ReconcileOperation(
                             action=ReconcileAction.DELETE,
@@ -528,17 +558,13 @@ class MemoryEngine:
                         )
                     )
                     continue
-                expected_required_ids = {
-                    item.anchor.observation_id for item in stale_required
+                expected_required_selectors = {
+                    required_selector_by_reference_id[item.reference_id]
+                    for item in stale_required
                 }
                 if v2 and (
-                    set(returned_required) != expected_required_ids
-                    or any(
-                        not quote
-                        or quote
-                        not in current_revisions[observation_id].content
-                        for observation_id, quote in returned_required.items()
-                    )
+                    set(returned_required_by_selector)
+                    != expected_required_selectors
                 ):
                     rebound.append(
                         ReconcileOperation(
@@ -552,17 +578,34 @@ class MemoryEngine:
                         )
                     )
                     continue
-                current_required_quotes.update(returned_required)
+                if v2:
+                    reference_id_by_selector = {
+                        selector: reference_id
+                        for reference_id, selector in (
+                            required_selector_by_reference_id.items()
+                        )
+                    }
+                    current_required_quotes_by_reference_id.update(
+                        {
+                            reference_id_by_selector[selector]: quote
+                            for selector, quote in (
+                                returned_required_by_selector.items()
+                            )
+                        }
+                    )
             resolved_selection = None
             if v2:
                 try:
                     resolved_selection = resolve_revalidated_noop_selection(
                         projection,
                         support=support,
+                        access_context_hash=access_context_hash,
                         current_primary_quote=current_primary_quote,
-                        current_required_quotes=current_required_quotes,
+                        current_required_quotes_by_reference_id=(
+                            current_required_quotes_by_reference_id
+                        ),
                     )
-                except ValueError as exc:
+                except RevalidatedSelectionError as exc:
                     rebound.append(
                         ReconcileOperation(
                             action=ReconcileAction.DELETE,
@@ -570,7 +613,7 @@ class MemoryEngine:
                             reason=(
                                 "revised Evidence Unit could not be exactly "
                                 "recompiled from the current Source Projection: "
-                                f"{exc}"
+                                f"{exc.code.value}"
                             ),
                             flag_for_review=True,
                         )
@@ -1020,14 +1063,6 @@ class MemoryEngine:
                     "complete lifecycle reconciliation produced an unsafe Memory candidate: "
                     f"{quality.skip_reason or 'quality_rejected'}"
                 )
-        incumbents_by_id = {memory.id: memory for memory in incumbents}
-        operations = await self._rebind_noop_evidence_to_current_revision(
-            operations=operations,
-            incumbents=incumbents_by_id,
-            unit_support=unit_support,
-            projection=projection,
-            protected_memory_ids=derivation_protected_ids,
-        )
         visibility, owner_user_id = await memory_visibility_for_source_id(
             self.db,
             source_id=projection.source_id,
@@ -1039,6 +1074,15 @@ class MemoryEngine:
             owner_user_id=owner_user_id,
             project_key=project_key,
             repo_identifier=repo_identifier,
+        )
+        incumbents_by_id = {memory.id: memory for memory in incumbents}
+        operations = await self._rebind_noop_evidence_to_current_revision(
+            operations=operations,
+            incumbents=incumbents_by_id,
+            unit_support=unit_support,
+            projection=projection,
+            access_context_hash=access_context_hash,
+            protected_memory_ids=derivation_protected_ids,
         )
         corroboration_targets: dict[str, Memory] = {}
         corroboration_proofs: dict[str, dict[str, object]] = {}

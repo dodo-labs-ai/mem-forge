@@ -518,7 +518,7 @@ class MemorySupportValidationRequiredEvidence(StructuredResponseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    observation_id: str = Field(min_length=1)
+    selector: str = Field(pattern=r"^r\d{6}$")
     evidence_quote: str = Field(min_length=1, max_length=4000)
 
 

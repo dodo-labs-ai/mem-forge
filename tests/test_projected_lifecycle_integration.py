@@ -108,6 +108,8 @@ from memforge.pipeline.source_projection_adapters import (
 )
 from memforge.source_projection import (
     AnchorKind,
+    EvidenceCoordinateSpace,
+    EvidenceRepresentationProfile,
     ProjectionCoverage,
     SourceAnchor,
     SourceProjection,
@@ -1710,11 +1712,13 @@ class _SupportValidatingNoopClient(_NoopClient):
         supported: bool,
         evidence_quote: str = "",
         required_evidence_quote: str = "",
+        required_evidence_quotes: tuple[str, ...] = (),
     ) -> None:
         super().__init__(memory_id)
         self.supported = supported
         self.evidence_quote = evidence_quote
         self.required_evidence_quote = required_evidence_quote
+        self.required_evidence_quotes = required_evidence_quotes
 
     async def validate_memory_support(self, prompt: str, **kwargs):
         del kwargs
@@ -1728,11 +1732,19 @@ class _SupportValidatingNoopClient(_NoopClient):
             evidence_quote=self.evidence_quote,
             required_evidence=[
                 MemorySupportValidationRequiredEvidence(
-                    observation_id=item["observation_id"],
-                    evidence_quote=self.required_evidence_quote,
+                    selector=item["selector"],
+                    evidence_quote=quote,
                 )
-                for item in payload["required"]
-                if self.required_evidence_quote
+                for item, quote in zip(
+                    payload["required"],
+                    self.required_evidence_quotes
+                    or tuple(
+                        self.required_evidence_quote
+                        for _item in payload["required"]
+                    ),
+                    strict=True,
+                )
+                if quote
             ],
             reason=(
                 "The applicability remains regular payroll."
@@ -3414,6 +3426,7 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
         incumbents={incumbent.id: incumbent},
         unit_support=await db.get_source_unit_support_reference_ids(first.source_units[0].id),
         projection=second,
+        access_context_hash="workspace-eng",
     )
 
     assert rebound.action is ReconcileAction.NOOP
@@ -4032,6 +4045,7 @@ async def _seed_jira_required_incumbent(
     primary_provenance: EvidenceContentProvenance | None = None,
     source_type: str = "jira",
     access_context_hash: str = "workspace-eng",
+    required_excerpts: tuple[str, ...] = (),
 ) -> Memory:
     incumbent = Memory(
         id="mem-jira-required",
@@ -4076,6 +4090,35 @@ async def _seed_jira_required_incumbent(
         access_context_hash=access_context_hash,
     )
     await db.upsert_evidence_unit(unit)
+    required_references = (
+        tuple(
+            EvidenceReference(
+                role=EvidenceRole.REQUIRED,
+                anchor=SourceAnchor(
+                    kind=AnchorKind.REVISION_RANGE,
+                    observation_id=required.id,
+                    observation_revision_id=revisions[required.id].id,
+                    range_start=revisions[required.id].content.index(excerpt),
+                    range_end=(
+                        revisions[required.id].content.index(excerpt)
+                        + len(excerpt)
+                    ),
+                ),
+            )
+            for excerpt in required_excerpts
+        )
+        if required_excerpts
+        else (
+            EvidenceReference(
+                role=EvidenceRole.REQUIRED,
+                anchor=SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=required.id,
+                    observation_revision_id=revisions[required.id].id,
+                ),
+            ),
+        )
+    )
     references = await db.record_evidence_references(
         unit.id,
         (
@@ -4087,14 +4130,7 @@ async def _seed_jira_required_incumbent(
                     observation_revision_id=revisions[primary.id].id,
                 ),
             ),
-            EvidenceReference(
-                role=EvidenceRole.REQUIRED,
-                anchor=SourceAnchor(
-                    kind=AnchorKind.WHOLE_OBSERVATION,
-                    observation_id=required.id,
-                    observation_revision_id=revisions[required.id].id,
-                ),
-            ),
+            *required_references,
         ),
     )
     for index, reference in enumerate(references):
@@ -4482,6 +4518,344 @@ async def test_v2_noop_revalidates_revised_required_jira_description(
         == current_revisions[item.anchor.observation_id]
         for item in evidence
     )
+
+
+@pytest.mark.asyncio
+async def test_v2_noop_ambiguous_current_required_fragment_stages_review(
+    db: Database,
+) -> None:
+    await _set_fixture_source_type(db, "jira")
+    access_context_hash = lifecycle_access_context_hash(
+        visibility="workspace",
+        owner_user_id=None,
+        project_key="ENG",
+        repo_identifier=None,
+    )
+    first = _jira_projection(
+        run_id="projection-v2-jira-ambiguous-required-1",
+        description="A7 applies only to regular payroll.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_jira_required_incumbent(
+        db,
+        first,
+        access_context_hash=access_context_hash,
+    )
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=cutover.id,
+        owner_id="test-v2-ambiguous-required",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    second = _jira_projection(
+        run_id="projection-v2-jira-ambiguous-required-2",
+        description="A7 remains limited to regular payroll runs.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            item.observation_id: item
+            for item in first.observation_revisions
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_SupportValidatingNoopClient(
+            incumbent.id,
+            supported=True,
+            required_evidence_quote="not one current Jira Fragment",
+        ),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="PAY-12",
+        update_mode="diff_guided",
+        changed_hunks="description wording changed ambiguously",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["pending_review"] == 1
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
+    [review] = await db.list_lifecycle_reviews("src-1")
+    assert review.status is LifecycleReviewStatus.PENDING
+    assert review.reason.endswith(": ambiguous")
+
+
+@pytest.mark.asyncio
+async def test_v2_noop_preserves_multiple_required_parts_in_one_observation(
+    db: Database,
+) -> None:
+    await _set_fixture_source_type(db, "jira")
+    access_context_hash = lifecycle_access_context_hash(
+        visibility="workspace",
+        owner_user_id=None,
+        project_key="ENG",
+        repo_identifier=None,
+    )
+    first = _jira_projection(
+        run_id="projection-v2-jira-multi-required-1",
+        description="A7 applies only to regular payroll.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_jira_required_incumbent(
+        db,
+        first,
+        access_context_hash=access_context_hash,
+        required_excerpts=(
+            "A7 applies only to regular payroll.",
+            "Payroll",
+        ),
+    )
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=cutover.id,
+        owner_id="test-v2-multi-required-rebind",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    second = _jira_projection(
+        run_id="projection-v2-jira-multi-required-2",
+        description="A7 remains limited to regular payroll runs.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            item.observation_id: item
+            for item in first.observation_revisions
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_SupportValidatingNoopClient(
+            incumbent.id,
+            supported=True,
+            required_evidence_quotes=(
+                "A7 remains limited to regular payroll runs.",
+                "Payroll",
+            ),
+        ),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="PAY-12",
+        update_mode="diff_guided",
+        changed_hunks="description wording clarified",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+    )
+
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    assert stats["noop"] == 1
+    assert set(current_support).isdisjoint(old_support)
+    evidence = await db.get_active_memory_support_evidence(
+        incumbent.id,
+        source_id="src-1",
+    )
+    assert [item.role for item in evidence].count(EvidenceRole.PRIMARY) == 1
+    required = [
+        item for item in evidence if item.role is EvidenceRole.REQUIRED
+    ]
+    assert len(required) == 2
+    assert len({item.reference_id for item in required}) == 2
+    assert len({item.anchor.observation_id for item in required}) == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_noop_resolves_decoded_canonical_quotes_to_raw_json_ranges(
+    db: Database,
+) -> None:
+    await _set_fixture_source_type(db, "jira")
+    access_context_hash = lifecycle_access_context_hash(
+        visibility="workspace",
+        owner_user_id=None,
+        project_key="ENG",
+        repo_identifier=None,
+    )
+    old_primary = 'Decision "A7"\n保留。'
+    old_required = 'Policy "A7"\n适用于常规工资。'
+    first = _jira_projection(
+        run_id="projection-v2-jira-escaped-1",
+        description=old_required,
+        comment_body=old_primary,
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_jira_required_incumbent(
+        db,
+        first,
+        primary_excerpt=old_primary,
+        access_context_hash=access_context_hash,
+    )
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=cutover.id,
+        owner_id="test-v2-escaped-rebind",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    new_primary = 'Decision "A7"\n仍然保留。'
+    new_required = 'Policy "A7"\n仅适用于常规工资。'
+    second = _jira_projection(
+        run_id="projection-v2-jira-escaped-2",
+        description=new_required,
+        comment_body=new_primary,
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            item.observation_id: item
+            for item in first.observation_revisions
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_SupportValidatingNoopClient(
+            incumbent.id,
+            supported=True,
+            evidence_quote=new_primary,
+            required_evidence_quote=new_required,
+        ),
+    )
+
+    stats = await engine.apply_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="PAY-12",
+        update_mode="diff_guided",
+        changed_hunks="quoted multilingual Jira fields changed",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+    )
+
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    assert stats["noop"] == 1
+    assert set(current_support).isdisjoint(old_support)
+    evidence = await db.get_active_memory_support_evidence(
+        incumbent.id,
+        source_id="src-1",
+    )
+    assert {item.excerpt for item in evidence} == {
+        new_primary,
+        new_required,
+    }
+    current_revisions = {
+        item.observation_id: item
+        for item in second.observation_revisions
+    }
+    for item in evidence:
+        revision = current_revisions[item.anchor.observation_id]
+        assert item.anchor.kind is AnchorKind.REVISION_RANGE
+        raw_slice = revision.content[
+            item.anchor.range_start : item.anchor.range_end
+        ]
+        assert "\\n" in raw_slice
+        assert '\\"A7\\"' in raw_slice
+
+
+@pytest.mark.asyncio
+async def test_v2_noop_propagates_representation_compiler_contract_failure(
+    db: Database,
+) -> None:
+    access_context_hash = lifecycle_access_context_hash(
+        visibility="workspace",
+        owner_user_id=None,
+        project_key="ENG",
+        repo_identifier=None,
+    )
+    first = _projection(
+        run_id="projection-v2-compiler-contract-1",
+        body="A7 is removed.\nOld deployment note.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db,
+        projection=first,
+        access_context_hash=access_context_hash,
+    )
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=cutover.id,
+        owner_id="test-v2-compiler-contract",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    second = _projection(
+        run_id="projection-v2-compiler-contract-2",
+        body="A7 is removed.\nNew deployment note.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            first.observations[0].id: first.observation_revisions[0]
+        },
+    )
+    second = replace(
+        second,
+        observation_revisions=tuple(
+            replace(
+                revision,
+                evidence_profile=EvidenceRepresentationProfile(
+                    name="unsupported-test-profile",
+                    version=1,
+                    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
+                ),
+            )
+            for revision in second.observation_revisions
+        ),
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_SupportValidatingNoopClient(
+            incumbent.id,
+            supported=True,
+            evidence_quote="A7 is removed.",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="revalidation compiler contract"):
+        await engine.apply_projected_lifecycle(
+            projection=second,
+            doc_id="confluence-123",
+            raw_memories=[],
+            doc_type="design-doc",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content=second.observation_revisions[0].content,
+            update_mode="diff_guided",
+            changed_hunks="representation contract changed",
+            update_plan_stats=None,
+            source_updated_at=datetime(
+                2026,
+                7,
+                15,
+                10,
+                36,
+                tzinfo=timezone.utc,
+            ),
+        )
+
+    assert await db.get_active_memory_support_unit_ids(incumbent.id)
+    assert await db.list_lifecycle_reviews("src-1") == []
 
 
 @pytest.mark.asyncio
