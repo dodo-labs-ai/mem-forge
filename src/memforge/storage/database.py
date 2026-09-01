@@ -134,6 +134,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
     LifecycleMutationType,
     LifecyclePlan,
+    ProjectedSupportInvariantError,
     LifecycleReview,
     LifecycleReviewStatus,
     LifecycleVectorOperation,
@@ -10034,7 +10035,8 @@ class Database:
                            er.id AS reference_id, er.evidence_unit_id, er.role,
                            er.anchor_kind, er.observation_id,
                            er.observation_revision_id, er.fragment_id,
-                           er.range_start, er.range_end, eu.excerpt
+                           er.range_start, er.range_end,
+                           COALESCE(er.excerpt, eu.excerpt) AS excerpt
                     FROM memory_support_assertions msa
                     JOIN evidence_references er ON er.id = msa.evidence_reference_id
                     JOIN evidence_units eu ON eu.id = er.evidence_unit_id
@@ -10866,11 +10868,11 @@ class Database:
                 if current or (structurally_valid and contested_edge in contested):
                     accepted.append(support)
             if memory_id in created_ids and current_scope_count == 0:
-                raise ValueError(
+                raise ProjectedSupportInvariantError(
                     f"projected lifecycle activated Memory without complete Unit support: {memory_id}"
                 )
             if len(accepted) != len(supports):
-                raise ValueError(
+                raise ProjectedSupportInvariantError(
                     f"projected lifecycle left stale or incomplete Unit support: {memory_id}"
                 )
 

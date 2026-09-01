@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Mapping
 
 from memforge.memory.evidence import (
+    ActiveSupportEvidence,
     EvidencePartKind,
     EvidenceRole,
     ResolvedEvidencePart,
@@ -56,6 +57,282 @@ class FragmentSelectionError(ValueError):
     def __init__(self, code: FragmentSelectionErrorCode, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class RevalidatedSelectionErrorCode(str, Enum):
+    AMBIGUOUS = "ambiguous"
+    UNPRESENTABLE = "unpresentable"
+
+
+class RevalidatedSelectionError(ValueError):
+    """An expected fail-closed NOOP selection outcome safe for Review."""
+
+    def __init__(
+        self,
+        code: RevalidatedSelectionErrorCode,
+        message: str,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def group_revalidated_support_unit(
+    support: tuple[ActiveSupportEvidence, ...],
+) -> tuple[ActiveSupportEvidence, ...]:
+    """Return one complete alternative or a typed non-collapsing outcome."""
+
+    grouped: dict[str, list[ActiveSupportEvidence]] = {}
+    for item in support:
+        grouped.setdefault(item.evidence_unit_id, []).append(item)
+    if not grouped:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.UNPRESENTABLE,
+            "NOOP revalidation has no scoped Evidence Unit",
+        )
+    if len(grouped) != 1:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.AMBIGUOUS,
+            "NOOP revalidation cannot collapse independent Evidence Units",
+        )
+    return tuple(next(iter(grouped.values())))
+
+
+def resolve_revalidated_noop_selection(
+    projection: SourceProjection,
+    *,
+    support: tuple[ActiveSupportEvidence, ...],
+    access_context_hash: str,
+    current_primary_quote: str,
+    current_required_quotes_by_reference_id: Mapping[str, str],
+) -> ResolvedEvidenceSelection:
+    """Resolve one complete current v2 Unit through the shared catalog seam."""
+
+    if len(projection.source_units) != 1 or len(projection.source_unit_revisions) != 1:
+        raise ValueError("NOOP revalidation requires one Source Unit revision")
+    if not access_context_hash:
+        raise ValueError("NOOP revalidation requires an access context")
+    support = group_revalidated_support_unit(support)
+    unit_id = support[0].evidence_unit_id
+    ordered_support = tuple(
+        sorted(
+            support,
+            key=lambda item: (
+                item.role is not EvidenceRole.PRIMARY,
+                item.reference_id,
+            ),
+        )
+    )
+    if sum(item.role is EvidenceRole.PRIMARY for item in ordered_support) != 1:
+        raise ValueError("NOOP revalidation requires exactly one Primary")
+
+    revisions = {
+        revision.observation_id: revision
+        for revision in projection.observation_revisions
+    }
+    ranges_by_observation: dict[str, EvidenceCandidateRange] = {}
+    for item in ordered_support:
+        revision = revisions.get(item.anchor.observation_id)
+        if revision is None:
+            raise RevalidatedSelectionError(
+                RevalidatedSelectionErrorCode.UNPRESENTABLE,
+                "NOOP revalidation Evidence is unavailable",
+            )
+        previous = ranges_by_observation.get(revision.observation_id)
+        ranges_by_observation[revision.observation_id] = EvidenceCandidateRange(
+            anchor=_revalidation_candidate_anchor(revision),
+            primary_eligible=(
+                item.role is EvidenceRole.PRIMARY
+                or bool(previous and previous.primary_eligible)
+            ),
+        )
+
+    compiled_fragments: list[EvidenceFragment] = []
+    errors: list[FragmentCompilationError] = []
+    component_digests: list[str] = []
+    authority_payload: list[Mapping[str, object]] = []
+    artifact_metadata: dict[str, Mapping[str, object]] = {}
+    for observation_id in sorted(
+        ranges_by_observation,
+        key=lambda value: revisions[value].id,
+    ):
+        revision = revisions[observation_id]
+        candidate_range = ranges_by_observation[observation_id]
+        authority_payload.extend(
+            _authority_payload(revision, (candidate_range,))
+        )
+        compiled = compile_fragments(revision, (candidate_range,))
+        compiled_fragments.extend(compiled.fragments)
+        errors.extend(compiled.errors)
+        component_digests.append(compiled.digest)
+        if (
+            revision.evidence_profile is not None
+            and revision.evidence_profile.coordinate_space
+            is EvidenceCoordinateSpace.WHOLE_ARTIFACT
+        ):
+            raw_artifact = revision.metadata.get("source_artifact")
+            artifact_metadata[revision.id] = (
+                dict(raw_artifact)
+                if isinstance(raw_artifact, Mapping)
+                else {}
+            )
+
+    catalog = _compose_projection_fragment_catalog(
+        projection=projection,
+        access_context_hash=access_context_hash,
+        catalog_identity={
+            "kind": "revalidated_noop",
+            "prior_evidence_unit_id": unit_id,
+        },
+        compiled_fragments=compiled_fragments,
+        errors=errors,
+        component_digests=component_digests,
+        authority_payload=authority_payload,
+        artifact_metadata=artifact_metadata,
+        max_fragments=DEFAULT_MAX_FRAGMENTS,
+        max_presentation_chars=DEFAULT_MAX_PRESENTATION_CHARS,
+    )
+    if not catalog.usable:
+        expected_codes = {
+            FragmentCompilationErrorCode.NO_SELECTABLE_CONTENT,
+            FragmentCompilationErrorCode.CATALOG_TOO_LARGE,
+        }
+        if catalog.errors and all(
+            error.code in expected_codes for error in catalog.errors
+        ):
+            raise RevalidatedSelectionError(
+                RevalidatedSelectionErrorCode.UNPRESENTABLE,
+                "NOOP revalidation Evidence is not presentable",
+            )
+        codes = ",".join(sorted({error.code.value for error in catalog.errors}))
+        raise RuntimeError(
+            "NOOP revalidation compiler contract failed: "
+            f"{codes or 'empty_catalog'}"
+        )
+
+    primary_ref: str | None = None
+    required_refs: list[str] = []
+    selected_refs: set[str] = set()
+    for item in ordered_support:
+        expected = (
+            current_primary_quote
+            if item.role is EvidenceRole.PRIMARY
+            else current_required_quotes_by_reference_id.get(
+                item.reference_id,
+                item.excerpt or "",
+            )
+        )
+        fragment = _unique_revalidation_fragment(
+            catalog.fragments,
+            prior=item,
+            expected=expected,
+        )
+        if fragment.reference in selected_refs:
+            raise RevalidatedSelectionError(
+                RevalidatedSelectionErrorCode.AMBIGUOUS,
+                "NOOP revalidation collapsed distinct Evidence parts",
+            )
+        selected_refs.add(fragment.reference)
+        if item.role is EvidenceRole.PRIMARY:
+            primary_ref = fragment.reference
+        else:
+            required_refs.append(fragment.reference)
+    if primary_ref is None:
+        raise RuntimeError("NOOP revalidation lost its Primary selector")
+    try:
+        return catalog.resolve_selection(
+            primary_ref=primary_ref,
+            required_refs=tuple(required_refs),
+        )
+    except FragmentSelectionError as exc:
+        if exc.code is FragmentSelectionErrorCode.DUPLICATE_REF:
+            raise RevalidatedSelectionError(
+                RevalidatedSelectionErrorCode.AMBIGUOUS,
+                "NOOP revalidation selected duplicate Evidence parts",
+            ) from exc
+        raise RuntimeError("NOOP revalidation catalog resolver contract failed") from exc
+
+
+def _unique_revalidation_fragment(
+    fragments: tuple[EvidenceFragment, ...],
+    *,
+    prior: ActiveSupportEvidence,
+    expected: str,
+) -> EvidenceFragment:
+    candidates = tuple(
+        fragment
+        for fragment in fragments
+        if fragment.anchor.observation_id == prior.anchor.observation_id
+    )
+    exact_anchor = tuple(
+        fragment
+        for fragment in candidates
+        if fragment.anchor.range_start == prior.anchor.range_start
+        and fragment.anchor.range_end == prior.anchor.range_end
+        and (not expected or fragment.presentation_text == expected)
+    )
+    if len(exact_anchor) == 1:
+        return exact_anchor[0]
+    if len(exact_anchor) > 1:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.AMBIGUOUS,
+            "NOOP revalidation anchor resolves to multiple current Fragments",
+        )
+    exact_text = tuple(
+        fragment
+        for fragment in candidates
+        if expected and fragment.presentation_text == expected
+    )
+    if len(exact_text) == 1:
+        return exact_text[0]
+    if len(exact_text) > 1:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.AMBIGUOUS,
+            "NOOP revalidation quote resolves to multiple current Fragments",
+        )
+    enclosing = tuple(
+        fragment
+        for fragment in candidates
+        if expected and expected in fragment.presentation_text
+    )
+    if len(enclosing) == 1:
+        return enclosing[0]
+    if len(enclosing) > 1:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.AMBIGUOUS,
+            "NOOP revalidation quote is enclosed by multiple current Fragments",
+        )
+    if len(candidates) == 1 and (
+        not expected
+        or prior.anchor.observation_revision_id
+        == candidates[0].anchor.observation_revision_id
+    ):
+        return candidates[0]
+    raise RevalidatedSelectionError(
+        RevalidatedSelectionErrorCode.UNPRESENTABLE,
+        "NOOP revalidation Evidence does not resolve to one current Fragment",
+    )
+
+
+def _revalidation_candidate_anchor(
+    revision: SourceObservationRevision,
+) -> SourceAnchor:
+    profile = revision.evidence_profile
+    whole_authority = (
+        profile is None
+        or profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
+        or profile.name == "canonical-record"
+    )
+    return SourceAnchor(
+        kind=(
+            AnchorKind.WHOLE_OBSERVATION
+            if whole_authority
+            else AnchorKind.REVISION_RANGE
+        ),
+        observation_id=revision.observation_id,
+        observation_revision_id=revision.id,
+        range_start=None if whole_authority else 0,
+        range_end=None if whole_authority else len(revision.content),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,10 +624,41 @@ def compile_projection_fragment_catalog(
         compiled_fragments.extend(compiled.fragments)
         errors.extend(compiled.errors)
 
+    return _compose_projection_fragment_catalog(
+        projection=projection,
+        access_context_hash=access_context_hash,
+        catalog_identity={"batch_id": batch.id},
+        compiled_fragments=compiled_fragments,
+        errors=errors,
+        component_digests=component_digests,
+        authority_payload=authority_payload,
+        artifact_metadata=artifact_metadata,
+        max_fragments=max_fragments,
+        max_presentation_chars=max_presentation_chars,
+    )
+
+
+def _compose_projection_fragment_catalog(
+    *,
+    projection: SourceProjection,
+    access_context_hash: str,
+    catalog_identity: Mapping[str, object],
+    compiled_fragments: list[EvidenceFragment],
+    errors: list[FragmentCompilationError],
+    component_digests: list[str],
+    authority_payload: list[Mapping[str, object]],
+    artifact_metadata: Mapping[str, Mapping[str, object]],
+    max_fragments: int,
+    max_presentation_chars: int,
+) -> ProjectionFragmentCatalog:
+    """Compose revision-local compiler outputs behind one catalog interface."""
+
     ordered = tuple(sorted(compiled_fragments, key=_fragment_sort_key))
-    presentation_chars = sum(len(fragment.presentation_text) for fragment in ordered)
+    presentation_chars = sum(
+        len(fragment.presentation_text) for fragment in ordered
+    )
     if len(ordered) > max_fragments or presentation_chars > max_presentation_chars:
-        representative = next(iter(revisions.values()))
+        representative = next(iter(projection.observation_revisions))
         errors.append(
             _fatal_error(
                 representative,
@@ -365,7 +673,7 @@ def compile_projection_fragment_catalog(
     )
     digest = _catalog_digest(
         projection=projection,
-        batch=batch,
+        catalog_identity=catalog_identity,
         access_context_hash=access_context_hash,
         authority_payload=authority_payload,
         component_digests=component_digests,
@@ -374,6 +682,8 @@ def compile_projection_fragment_catalog(
         max_fragments=max_fragments,
         max_presentation_chars=max_presentation_chars,
     )
+    source_unit = projection.source_units[0]
+    unit_revision = projection.source_unit_revisions[0]
     return ProjectionFragmentCatalog(
         source_id=projection.source_id,
         source_unit_id=source_unit.id,
@@ -384,7 +694,7 @@ def compile_projection_fragment_catalog(
         digest=digest,
         max_fragments=max_fragments,
         max_presentation_chars=max_presentation_chars,
-        artifact_metadata_by_revision_id=artifact_metadata,
+        artifact_metadata_by_revision_id=dict(artifact_metadata),
     )
 
 
@@ -687,7 +997,7 @@ def _anchor_payload(anchor: SourceAnchor) -> Mapping[str, object]:
 def _catalog_digest(
     *,
     projection: SourceProjection,
-    batch: ProjectionExtractionBatch,
+    catalog_identity: Mapping[str, object],
     access_context_hash: str,
     authority_payload: list[Mapping[str, object]],
     component_digests: list[str],
@@ -701,7 +1011,7 @@ def _catalog_digest(
         "source_id": projection.source_id,
         "source_unit_id": projection.source_units[0].id,
         "target_unit_revision_id": projection.source_unit_revisions[0].id,
-        "batch_id": batch.id,
+        **dict(catalog_identity),
         "access_context_hash": access_context_hash,
         "authority_ranges": authority_payload,
         "component_digests": component_digests,

@@ -22,7 +22,7 @@ from memforge.llm.structured import (
 )
 from memforge.genes.base import SourceConfigurationError
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
-from memforge.memory.engine import MemoryEngine
+from memforge.memory.engine import MemoryEngine, SourceUnitLifecycleExecutionError
 from memforge.memory.lifecycle_planner import lifecycle_plan_id
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.lifecycle_plan import (
@@ -3229,6 +3229,21 @@ class FailingProjectedMemoryEngine(NoopMemoryEngine):
             kwargs.get("lifecycle_execution_owner_id")
         )
         raise RuntimeError("lifecycle apply failed")
+
+
+class NonRetryableProjectedMemoryEngine(NoopMemoryEngine):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def apply_projected_lifecycle(self, **kwargs):
+        del kwargs
+        self.calls += 1
+        error = SourceUnitLifecycleExecutionError(
+            "projected lifecycle left stale or incomplete Unit support",
+            None,
+            retryable=False,
+        )
+        raise error
 
 
 class FailingLifecycleOutboxMemoryStore:
@@ -11418,6 +11433,43 @@ async def test_lifecycle_failure_preserves_projection_delta_for_ordinary_retry(d
     )
     current_revision = await db.get_current_source_unit_revision(source_unit.id)
     assert current_revision is not None and current_revision.id != prior_revision.id
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_lifecycle_failure_stops_document_and_run_retry(
+    db: Database,
+) -> None:
+    source_id = "src-non-retryable-lifecycle"
+    await db.upsert_source(
+        id=source_id,
+        type="docs",
+        name="Documents",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    engine = NonRetryableProjectedMemoryEngine()
+    state = await GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=RecordingMemoryExtractor(),
+        memory_engine=engine,
+        memory_store=None,
+        max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(
+        gene=UpdatingDocumentGene(
+            "# Design Doc\n\nThe service uses PostgreSQL 15.",
+            version="2",
+        ),
+        source_name="Documents",
+        source_id=source_id,
+    )
+
+    assert engine.calls == 1
+    assert state.last_sync_status == "failed"
+    assert state.failure_retryable is False
+    assert state.docs_failed == 1
 
 
 @pytest.mark.asyncio
