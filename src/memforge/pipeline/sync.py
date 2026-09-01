@@ -1150,23 +1150,19 @@ class GeneSyncOrchestrator:
                 await asyncio.gather(*item_tasks, return_exceptions=True)
                 raise
 
-            await self._converge_deferred_projected_lifecycle(results)
-            for result in results:
-                terminal_error = result.get("terminal_error")
-                if terminal_error is None:
-                    continue
-                result["failed"] = True
-                failure_retryable = False
-                failed_docs.append(
-                    FailedDoc(
-                        doc_id=str(result["doc_id"]),
-                        title=str(result["title"]),
-                        error=str(terminal_error),
-                    )
-                )
+            deferred_results = [
+                result
+                for result in results
+                if result.get("deferred_lifecycle") is not None
+            ]
+            deferred_result_ids = {id(result) for result in deferred_results}
 
-            # Aggregate stats
+            # Aggregate completed normal work first. Deferred work is not a
+            # failure and must not prevent authoritative tombstones that may
+            # heal its blocker later in this same Source run.
             for r in results:
+                if id(r) in deferred_result_ids:
+                    continue
                 if r["processed"]:
                     docs_processed += 1
                 if r["updated"]:
@@ -1207,6 +1203,7 @@ class GeneSyncOrchestrator:
             # Pages not returned aren't deleted — they're just unchanged.
             # Only run deletion detection on full syncs (since=None).
             deleted_count = 0
+            tombstoned_source_unit_ids: set[str] = set()
             absence_is_authoritative = not non_mutating_run and run_coverage.proves_absence and docs_failed == 0
 
             if absence_is_authoritative:
@@ -1220,7 +1217,11 @@ class GeneSyncOrchestrator:
                         }
                     )
 
-                deleted_count, deletion_failures = await self._detect_deletions(
+                (
+                    deleted_count,
+                    deletion_failures,
+                    tombstoned_source_unit_ids,
+                ) = await self._detect_deletions(
                     source_id=source_id,
                     source_type=configured_source_type,
                     source_name=source_name,
@@ -1249,6 +1250,33 @@ class GeneSyncOrchestrator:
                     len(crawled_doc_ids),
                     len(indexed_doc_ids),
                 )
+
+            await self._converge_deferred_projected_lifecycle(
+                results,
+                additional_source_unit_ids=tombstoned_source_unit_ids,
+            )
+            for result in deferred_results:
+                terminal_error = result.get("terminal_error")
+                if terminal_error is not None:
+                    result["failed"] = True
+                    failure_retryable = False
+                    docs_failed += 1
+                    failed_docs.append(
+                        FailedDoc(
+                            doc_id=str(result["doc_id"]),
+                            title=str(result["title"]),
+                            error=str(terminal_error),
+                        )
+                    )
+                    if result.get("runtime_bundle") is not None:
+                        runtime_bundles.append(result["runtime_bundle"])
+                    continue
+                if result["processed"]:
+                    docs_processed += 1
+                if result["updated"]:
+                    docs_updated += 1
+                memories_extracted += result["memories_extracted"]
+                memories_corroborated += result["memories_corroborated"]
 
             if scope_transition is not None:
                 scoped_reconciliation_coverage = None
@@ -1432,6 +1460,8 @@ class GeneSyncOrchestrator:
     async def _converge_deferred_projected_lifecycle(
         self,
         results: list[dict[str, Any]],
+        *,
+        additional_source_unit_ids: set[str] | frozenset[str] = frozenset(),
     ) -> None:
         """Commit same-run deferred intents without repeating semantic work."""
 
@@ -1439,7 +1469,7 @@ class GeneSyncOrchestrator:
             str(result["source_unit_id"])
             for result in results
             if result.get("source_unit_id")
-        }
+        } | set(additional_source_unit_ids)
         pending = {
             str(result["source_unit_id"]): result
             for result in results
@@ -1479,12 +1509,30 @@ class GeneSyncOrchestrator:
                     lifecycle_stats = (
                         await self.memory_engine.commit_prepared_projected_lifecycle(
                             deferred.prepared_commit,
-                            lifecycle_attempt_count=round_index + 2,
+                            lifecycle_attempt_count=(
+                                int(
+                                    getattr(
+                                        deferred.prepared_commit,
+                                        "prepared_at_attempt_count",
+                                        1,
+                                    )
+                                )
+                                + round_index
+                                + 1
+                            ),
                         )
                     )
                 except SourceUnitLifecycleDeferred as exc:
                     result["deferred_lifecycle"] = exc
                     result["runtime_bundle"] = exc.runtime_bundle
+                    if not set(exc.blocking_source_unit_ids).issubset(
+                        run_source_unit_ids
+                    ):
+                        result["terminal_error"] = (
+                            "deferred lifecycle blocker is outside the current "
+                            "Source run"
+                        )
+                        pending.pop(source_unit_id)
                     continue
                 except Exception as exc:
                     result["terminal_error"] = _retained_document_error(exc)
@@ -2106,7 +2154,6 @@ class GeneSyncOrchestrator:
 
         if source_unit_id_callback is not None:
             source_unit_id_callback(source_unit.id)
-        stats["source_unit_id"] = source_unit.id
         stats["source_unit_id"] = source_unit.id
 
         projection_run_id = f"{run_id or 'direct'}:{source_unit.id}:{projection_probe.source_unit_revisions[0].id}"
@@ -3447,18 +3494,18 @@ class GeneSyncOrchestrator:
         source_filter_summary: str | None,
         allow_legacy_orphan_cleanup: bool = False,
         expected_source_activity_epoch: int | None = None,
-    ) -> tuple[int, list[FailedDoc]]:
+    ) -> tuple[int, list[FailedDoc], set[str]]:
         """Detect and handle documents deleted from the source.
 
         For each deleted document, persist an explicit Source Unit tombstone,
         apply a gate-checked complete lifecycle ledger, and only then remove
         document storage when no review is required.
 
-        Returns the count of successfully handled deletions plus failures.
+        Returns the count, failures, and Source Units whose tombstones committed.
         """
         deleted_ids = indexed_doc_ids - crawled_doc_ids
         if not deleted_ids:
-            return 0, []
+            return 0, [], set()
 
         logger.info(
             "Detected %d deletions for source %s",
@@ -3468,6 +3515,7 @@ class GeneSyncOrchestrator:
 
         deleted_count = 0
         failed_deletions: list[FailedDoc] = []
+        tombstoned_source_unit_ids: set[str] = set()
         for doc_id in deleted_ids:
             title = doc_id
             try:
@@ -3570,6 +3618,7 @@ class GeneSyncOrchestrator:
                     tombstone,
                     expected_source_activity_epoch=expected_source_activity_epoch,
                 )
+                tombstoned_source_unit_ids.add(source_unit.id)
                 if lifecycle_result["can_delete_document"]:
                     await self.memory_store.delete_projected_document(
                         doc_id,
@@ -3606,7 +3655,7 @@ class GeneSyncOrchestrator:
                     )
                 )
 
-        return deleted_count, failed_deletions
+        return deleted_count, failed_deletions, tombstoned_source_unit_ids
 
     # ==================================================================
     # Private: helpers

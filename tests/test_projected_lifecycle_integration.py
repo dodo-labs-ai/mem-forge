@@ -5354,6 +5354,68 @@ async def test_v2_deferred_commit_rematerializes_without_semantic_replay(
 
 
 @pytest.mark.asyncio
+async def test_v2_prepared_commit_rejects_undeclared_support_drift(
+    db: Database,
+) -> None:
+    scenario = await _seed_v2_stale_cross_unit_scenario(
+        db,
+        prefix="projection-v2-prepared-drift",
+    )
+    target = _projection(
+        run_id="projection-v2-prepared-drift-2",
+        body="",
+        prior=scenario.first.source_unit_revisions[0],
+        prior_observations={
+            scenario.first.observations[0].id:
+                scenario.first.observation_revisions[0]
+        },
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=None,
+    )
+    with pytest.raises(SourceUnitLifecycleDeferred) as raised:
+        await engine.apply_projected_lifecycle(
+            projection=target,
+            doc_id="confluence-123",
+            raw_memories=[],
+            doc_type="design-doc",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content="",
+            update_mode="diff_guided",
+            changed_hunks="A7 is removed. -> empty",
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+            lifecycle_execution_owner_id="sync-prepared-drift:lease-1",
+        )
+
+    await db.db.execute(
+        """UPDATE memory_unit_support_assertions
+              SET active = 0, removed_at = ?
+            WHERE memory_id = ? AND evidence_unit_id = ?""",
+        (
+            datetime(2026, 7, 16, 10, 37, tzinfo=timezone.utc).isoformat(),
+            scenario.incumbent.id,
+            f"eu-{scenario.incumbent.id}",
+        ),
+    )
+    await db.db.commit()
+
+    with pytest.raises(
+        ProjectedSupportInvariantError,
+        match="Support topology changed outside declared blockers",
+    ):
+        await engine.commit_prepared_projected_lifecycle(
+            raised.value.prepared_commit,
+            lifecycle_attempt_count=2,
+        )
+
+
+@pytest.mark.asyncio
 async def test_v2_noop_preserves_multiple_required_parts_in_one_observation(
     db: Database,
 ) -> None:
