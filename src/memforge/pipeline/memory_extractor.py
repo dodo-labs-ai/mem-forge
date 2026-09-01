@@ -42,6 +42,41 @@ __all__ = ["MemoryExtractor"]
 
 _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT = 16
 
+
+def _normalize_projection_fragment_selector_refs(
+    *,
+    candidate_index: int,
+    primary_ref: str,
+    required_refs: list[str],
+) -> tuple[list[str], int, str | None]:
+    """Remove only unambiguous selector redundancy before strict resolution."""
+
+    seen: set[str] = set()
+    normalized_required: list[str] = []
+    for reference in required_refs:
+        if reference == primary_ref or reference in seen:
+            continue
+        seen.add(reference)
+        normalized_required.append(reference)
+    removed_ref_count = len(required_refs) - len(normalized_required)
+    if not removed_ref_count:
+        return normalized_required, 0, None
+    repair_shape = {
+        "candidate_index": candidate_index,
+        "primary_ref": primary_ref,
+        "required_refs": required_refs,
+        "normalized_required_refs": normalized_required,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            repair_shape,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return normalized_required, removed_ref_count, fingerprint
+
 # ---------------------------------------------------------------------------
 # Caps and bands shared by the extraction prompts and runtime truncation. Both
 # the prompt prose and the .format() arguments reference these constants so the
@@ -727,25 +762,31 @@ class MemoryExtractor:
 
         memories: list[RawMemory] = []
         rejection_counts: dict[str, int] = {}
-        selector_normalizations = tuple(
-            getattr(response, "selector_normalizations", ())
-        )
-        normalization_by_candidate_index = {
-            item.candidate_index: item for item in selector_normalizations
-        }
+        selector_normalization_count = 0
+        selector_normalization_fingerprints: list[str] = []
         for candidate_index, candidate in enumerate(response.memories):
+            normalized_required, removed_ref_count, repair_fingerprint = (
+                _normalize_projection_fragment_selector_refs(
+                    candidate_index=candidate_index,
+                    primary_ref=candidate.primary_ref,
+                    required_refs=candidate.required_refs,
+                )
+            )
+            selector_normalization_count += removed_ref_count
+            if repair_fingerprint is not None:
+                selector_normalization_fingerprints.append(repair_fingerprint)
             candidate_content_hash = hashlib.sha256(
                 candidate.content.encode("utf-8")
             ).hexdigest()
             candidate_hash = catalog.selection_fingerprint(
                 candidate_content_hash=candidate_content_hash,
                 primary_ref=candidate.primary_ref,
-                required_refs=candidate.required_refs,
+                required_refs=normalized_required,
             )
             try:
                 selection = catalog.resolve_selection(
                     primary_ref=candidate.primary_ref,
-                    required_refs=candidate.required_refs,
+                    required_refs=normalized_required,
                 )
             except FragmentSelectionError as error:
                 rejection_counts[error.code.value] = rejection_counts.get(error.code.value, 0) + 1
@@ -759,22 +800,17 @@ class MemoryExtractor:
                     )
                 )
                 continue
-            normalization = normalization_by_candidate_index.get(candidate_index)
             record_quality_signal(
                 QualitySignal(
                     event_name="evidence_admission_outcome",
-                    outcome="degraded" if normalization is not None else "expected",
+                    outcome="degraded" if removed_ref_count else "expected",
                     reason_code=(
                         "fragment_selector_normalized"
-                        if normalization is not None
+                        if removed_ref_count
                         else "fragment_selection_resolved"
                     ),
                     prompt_hash=metrics["prompt_sha256"],
-                    candidate_hash=(
-                        normalization.fingerprint
-                        if normalization is not None
-                        else candidate_hash
-                    ),
+                    candidate_hash=candidate_hash,
                 )
             )
             memories.append(
@@ -807,17 +843,16 @@ class MemoryExtractor:
                 **(
                     {
                         "selector_normalized_candidate_count": len(
-                            selector_normalizations
+                            selector_normalization_fingerprints
                         ),
-                        "selector_normalization_count": sum(
-                            item.removed_ref_count
-                            for item in selector_normalizations
+                        "selector_normalization_count": (
+                            selector_normalization_count
                         ),
-                        "selector_normalization_fingerprints": [
-                            item.fingerprint for item in selector_normalizations
-                        ],
+                        "selector_normalization_fingerprints": (
+                            selector_normalization_fingerprints
+                        ),
                     }
-                    if selector_normalizations
+                    if selector_normalization_fingerprints
                     else {}
                 ),
                 "structured_llm_elapsed_ms": max(

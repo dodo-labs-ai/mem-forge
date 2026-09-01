@@ -17,7 +17,7 @@ from typing import Annotated, Any, Callable, Iterator, Literal, Mapping, Protoco
 from weakref import WeakKeyDictionary
 
 import litellm
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from memforge.llm.providers import litellm_optional_kwargs
 from memforge.llm.structured_images import (
@@ -400,125 +400,12 @@ class ProjectionFragmentMemoryCandidate(StructuredResponseModel):
     primary_ref: TransientEvidenceFragmentRef
     required_refs: list[TransientEvidenceFragmentRef] = Field(default_factory=list)
 
-    @model_validator(mode="after")
-    def _require_one_duplicate_free_support_set(self):
-        if self.primary_ref in self.required_refs:
-            raise ValueError("primary_ref cannot also appear in required_refs")
-        if len(set(self.required_refs)) != len(self.required_refs):
-            raise ValueError("required_refs must be duplicate-free")
-        return self
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectionFragmentSelectorNormalization:
-    """Content-free receipt for one deterministically normalized candidate."""
-
-    candidate_index: int
-    removed_ref_count: int
-    fingerprint: str
-
-
-def _normalize_projection_fragment_selectors(
-    value: object,
-) -> tuple[object, tuple[ProjectionFragmentSelectorNormalization, ...]]:
-    if not isinstance(value, Mapping):
-        return value, ()
-    memories = value.get("memories")
-    if isinstance(memories, str):
-        try:
-            memories = json.loads(memories)
-        except (TypeError, ValueError):
-            return value, ()
-    if not isinstance(memories, list):
-        return value, ()
-
-    normalized_memories: list[object] = []
-    receipts: list[ProjectionFragmentSelectorNormalization] = []
-    changed = memories is not value.get("memories")
-    for candidate_index, candidate in enumerate(memories):
-        if not isinstance(candidate, Mapping):
-            normalized_memories.append(candidate)
-            continue
-        primary_ref = candidate.get("primary_ref")
-        required_refs = candidate.get("required_refs", [])
-        if isinstance(required_refs, str):
-            try:
-                required_refs = json.loads(required_refs)
-            except (TypeError, ValueError):
-                normalized_memories.append(candidate)
-                continue
-        if not isinstance(primary_ref, str) or not isinstance(required_refs, list):
-            normalized_memories.append(candidate)
-            continue
-        if any(not isinstance(reference, str) for reference in required_refs):
-            normalized_memories.append(candidate)
-            continue
-
-        seen: set[str] = set()
-        normalized_required: list[str] = []
-        for reference in required_refs:
-            if reference == primary_ref or reference in seen:
-                continue
-            seen.add(reference)
-            normalized_required.append(reference)
-        removed_ref_count = len(required_refs) - len(normalized_required)
-        if removed_ref_count:
-            fingerprint_payload = {
-                "candidate_index": candidate_index,
-                "primary_ref": primary_ref,
-                "required_refs": required_refs,
-                "normalized_required_refs": normalized_required,
-            }
-            fingerprint = hashlib.sha256(
-                json.dumps(
-                    fingerprint_payload,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
-            ).hexdigest()
-            receipts.append(
-                ProjectionFragmentSelectorNormalization(
-                    candidate_index=candidate_index,
-                    removed_ref_count=removed_ref_count,
-                    fingerprint=fingerprint,
-                )
-            )
-            changed = True
-        if normalized_required != required_refs:
-            candidate = {**candidate, "required_refs": normalized_required}
-        normalized_memories.append(candidate)
-
-    if not changed:
-        return value, ()
-    return {**value, "memories": normalized_memories}, tuple(receipts)
-
-
 class ProjectionFragmentMemoryExtractionResponse(StructuredResponseModel):
     """projection-extraction-v9 response containing model judgments only."""
 
     model_config = ConfigDict(extra="forbid")
 
     memories: list[ProjectionFragmentMemoryCandidate]
-    _selector_normalizations: tuple[
-        ProjectionFragmentSelectorNormalization, ...
-    ] = PrivateAttr(default=())
-
-    @model_validator(mode="wrap")
-    @classmethod
-    def _normalize_redundant_selectors(cls, value: object, handler):
-        if isinstance(value, cls):
-            return handler(value)
-        normalized, receipts = _normalize_projection_fragment_selectors(value)
-        response = handler(normalized)
-        response._selector_normalizations = receipts
-        return response
-
-    @property
-    def selector_normalizations(
-        self,
-    ) -> tuple[ProjectionFragmentSelectorNormalization, ...]:
-        return self._selector_normalizations
 
 
 class CandidateLedgerDecision(StructuredResponseModel):

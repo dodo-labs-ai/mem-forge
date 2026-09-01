@@ -283,7 +283,7 @@ def test_agent_patch_model_uses_one_primary_event_and_reads_one_legacy_id() -> N
         AgentKnowledgePatchModelResponse(action="create_new_concept")
 
 
-def test_v9_response_normalizes_redundant_selectors_at_the_structured_seam() -> None:
+def test_v9_response_accepts_redundant_selectors_for_admission_normalization() -> None:
     payload = {
         "memories": [
             {
@@ -304,18 +304,11 @@ def test_v9_response_normalizes_redundant_selectors_at_the_structured_seam() -> 
     response = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
 
     assert response.memories[0].primary_ref == "f000001"
-    assert response.memories[0].required_refs == ["f000003", "f000002"]
-    assert [item.removed_ref_count for item in response.selector_normalizations] == [3]
-    assert len(response.selector_normalizations[0].fingerprint) == 64
-    assert "f000001" not in response.selector_normalizations[0].fingerprint
-    assert "f000002" not in response.selector_normalizations[0].fingerprint
-    assert "selector_normalizations" not in response.model_dump()
-    assert "selector_normalizations" not in str(
-        ProjectionFragmentMemoryExtractionResponse.model_json_schema()
+    assert response.memories[0].required_refs == payload["memories"][0]["required_refs"]
+    reconstructed = ProjectionFragmentMemoryExtractionResponse.model_validate_json(
+        response.model_dump_json()
     )
-    receipts = response.selector_normalizations
-    reconstructed = ProjectionFragmentMemoryExtractionResponse.model_validate(response)
-    assert reconstructed.selector_normalizations == receipts
+    assert reconstructed == response
 
 
 def test_v9_well_formed_response_remains_byte_stable() -> None:
@@ -337,11 +330,10 @@ def test_v9_well_formed_response_remains_byte_stable() -> None:
     response = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
 
     assert response.model_dump() == payload
-    assert response.selector_normalizations == ()
 
 
 @pytest.mark.parametrize("json_text", [False, True])
-def test_v9_response_normalizes_stringified_and_json_text_fallback_shapes(
+def test_v9_response_accepts_redundant_stringified_and_json_text_fallback_shapes(
     json_text: bool,
 ) -> None:
     payload = {
@@ -358,8 +350,33 @@ def test_v9_response_normalizes_stringified_and_json_text_fallback_shapes(
         else ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
     )
 
-    assert response.memories[0].required_refs == ["f000002"]
-    assert response.selector_normalizations[0].removed_ref_count == 1
+    assert response.memories[0].required_refs == ["f000002", "f000002"]
+
+
+@pytest.mark.parametrize(
+    ("primary_ref", "required_refs"),
+    [
+        ("not-a-fragment", []),
+        ("f000001", ["not-a-fragment"]),
+    ],
+)
+def test_v9_response_still_rejects_malformed_fragment_refs(
+    primary_ref: str,
+    required_refs: list[str],
+) -> None:
+    with pytest.raises(ValidationError):
+        ProjectionFragmentMemoryExtractionResponse.model_validate(
+            {
+                "memories": [
+                    {
+                        "content": "Approval is required.",
+                        "memory_type": "fact",
+                        "primary_ref": primary_ref,
+                        "required_refs": required_refs,
+                    }
+                ]
+            }
+        )
 
 
 def test_catalog_resolves_one_primary_and_canonical_required_order() -> None:
@@ -676,7 +693,7 @@ def test_large_canonical_fragment_fails_with_capacity_error_without_raw_slicing(
     } == {"catalog_too_large"}
 
 
-def test_catalog_normalizes_duplicates_but_rejects_unknown_and_ineligible_primary() -> None:
+def test_catalog_rejects_duplicate_unknown_and_ineligible_selectors() -> None:
     projection = _projection()
     catalog = compile_projection_fragment_catalog(
         projection,
@@ -694,29 +711,12 @@ def test_catalog_normalizes_duplicates_but_rejects_unknown_and_ineligible_primar
         catalog.resolve_selection(primary_ref="f999999")
     assert unknown.value.code is FragmentSelectionErrorCode.UNKNOWN_REF
 
-    context_refs = [
-        item.reference
-        for item in catalog.fragments
-        if item.anchor.observation_id == "obs-context"
-    ]
-    normalized = catalog.resolve_selection(
-        primary_ref=primary.reference,
-        required_refs=[
-            context_refs[1],
-            primary.reference,
-            context_refs[0],
-            context_refs[1],
-        ],
-    )
-    assert [part.anchor.range_start for part in normalized.parts[1:]] == sorted(
-        part.anchor.range_start for part in normalized.parts[1:]
-    )
-    assert len(normalized.parts) == 3
-    expected = catalog.resolve_selection(
-        primary_ref=primary.reference,
-        required_refs=context_refs,
-    )
-    assert normalized == expected
+    with pytest.raises(FragmentSelectionError) as duplicate:
+        catalog.resolve_selection(
+            primary_ref=primary.reference,
+            required_refs=[primary.reference],
+        )
+    assert duplicate.value.code is FragmentSelectionErrorCode.DUPLICATE_REF
 
     with pytest.raises(FragmentSelectionError) as ineligible:
         catalog.resolve_selection(primary_ref=required_only.reference)
@@ -1034,6 +1034,30 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
                             "primary_ref": "f999999",
                             "required_refs": [artifact.reference, artifact.reference],
                         },
+                        {
+                            "content": "Required-only evidence cannot become Primary.",
+                            "memory_type": "fact",
+                            "primary_ref": artifact.reference,
+                            "required_refs": [artifact.reference, artifact.reference],
+                        },
+                        {
+                            "content": "A stale selector must fail closed.",
+                            "memory_type": "fact",
+                            "primary_ref": "f900001",
+                            "required_refs": [artifact.reference, artifact.reference],
+                        },
+                        {
+                            "content": "A cross-catalog selector must fail closed.",
+                            "memory_type": "fact",
+                            "primary_ref": "f900002",
+                            "required_refs": [artifact.reference, artifact.reference],
+                        },
+                        {
+                            "content": "An inaccessible selector must fail closed.",
+                            "memory_type": "fact",
+                            "primary_ref": "f900003",
+                            "required_refs": [artifact.reference, artifact.reference],
+                        },
                     ]
                 }
             )
@@ -1053,14 +1077,17 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
         EvidencePartKind.TEXT,
         EvidencePartKind.ARTIFACT,
     ]
-    assert result.metadata["selector_normalized_candidate_count"] == 2
-    assert result.metadata["selector_normalization_count"] == 3
+    assert result.metadata["selector_normalized_candidate_count"] == 6
+    assert result.metadata["selector_normalization_count"] == 8
     fingerprints = result.metadata["selector_normalization_fingerprints"]
-    assert len(fingerprints) == 2
+    assert len(fingerprints) == 6
     assert all(len(value) == 64 for value in fingerprints)
     assert all(primary.reference not in value for value in fingerprints)
     assert all(artifact.reference not in value for value in fingerprints)
-    assert result.metadata["fragment_selection_rejection_counts"] == {"unknown_ref": 1}
+    assert result.metadata["fragment_selection_rejection_counts"] == {
+        "unknown_ref": 4,
+        "ineligible_role": 1,
+    }
 
     normalization_signals = [
         signal
@@ -1068,12 +1095,20 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
         if signal.reason_code == "fragment_selector_normalized"
     ]
     assert len(normalization_signals) == 1
-    assert normalization_signals[0].candidate_hash == fingerprints[0]
+    strong_candidate_hash = catalog.selection_fingerprint(
+        candidate_content_hash=hashlib.sha256(
+            b"Release requires approval."
+        ).hexdigest(),
+        primary_ref=primary.reference,
+        required_refs=[artifact.reference],
+    )
+    assert normalization_signals[0].candidate_hash == strong_candidate_hash
+    assert normalization_signals[0].candidate_hash != fingerprints[0]
 
     restored = memory_extraction_result_from_output_payload(
         memory_extraction_output_payload(result)
     )
-    assert restored.metadata["selector_normalization_count"] == 3
+    assert restored.metadata["selector_normalization_count"] == 8
     assert restored.metadata["selector_normalization_fingerprints"] == fingerprints
 
 
