@@ -1047,7 +1047,7 @@ class GeneSyncOrchestrator:
                         except SourceUnitLifecycleDeferred as exc:
                             stats["deferred_lifecycle"] = exc
                             stats["source_unit_id"] = (
-                                exc.prepared_commit.source_unit_id
+                                exc.handle.source_unit_id
                             )
                             stats["runtime_bundle"] = exc.runtime_bundle
                             attempt_error = None
@@ -1479,17 +1479,6 @@ class GeneSyncOrchestrator:
         if not pending:
             return
 
-        for source_unit_id, result in tuple(pending.items()):
-            deferred = result["deferred_lifecycle"]
-            if set(deferred.blocking_source_unit_ids).issubset(
-                run_source_unit_ids
-            ):
-                continue
-            result["terminal_error"] = (
-                "deferred lifecycle blocker is outside the current Source run"
-            )
-            pending.pop(source_unit_id)
-
         attempt_budget = min(
             MAX_LIFECYCLE_CONVERGENCE_ROUNDS * len(pending),
             MAX_LIFECYCLE_CONVERGENCE_ATTEMPTS,
@@ -1507,32 +1496,14 @@ class GeneSyncOrchestrator:
                 attempts += 1
                 try:
                     lifecycle_stats = (
-                        await self.memory_engine.commit_prepared_projected_lifecycle(
-                            deferred.prepared_commit,
-                            lifecycle_attempt_count=(
-                                int(
-                                    getattr(
-                                        deferred.prepared_commit,
-                                        "prepared_at_attempt_count",
-                                        1,
-                                    )
-                                )
-                                + round_index
-                                + 1
-                            ),
+                        await self.memory_engine.retry_deferred_projected_lifecycle(
+                            deferred.handle,
+                            eligible_same_run_owner_ids=run_source_unit_ids,
                         )
                     )
                 except SourceUnitLifecycleDeferred as exc:
                     result["deferred_lifecycle"] = exc
                     result["runtime_bundle"] = exc.runtime_bundle
-                    if not set(exc.blocking_source_unit_ids).issubset(
-                        run_source_unit_ids
-                    ):
-                        result["terminal_error"] = (
-                            "deferred lifecycle blocker is outside the current "
-                            "Source run"
-                        )
-                        pending.pop(source_unit_id)
                     continue
                 except Exception as exc:
                     result["terminal_error"] = _retained_document_error(exc)
@@ -1744,7 +1715,7 @@ class GeneSyncOrchestrator:
         source_updated_at = (
             datetime.fromisoformat(context.source_updated_at) if context.source_updated_at is not None else None
         )
-        return await self.memory_engine.apply_projected_lifecycle(
+        return await self.memory_engine.prepare_and_commit_projected_lifecycle(
             projection=projection,
             doc_id=context.document.doc_id,
             raw_memories=extraction.memories,
@@ -2430,7 +2401,7 @@ class GeneSyncOrchestrator:
             )
 
         if empty_content and not stored_source_artifacts:
-            memory_stats = await self.memory_engine.apply_projected_lifecycle(
+            memory_stats = await self.memory_engine.prepare_and_commit_projected_lifecycle(
                 projection=projection,
                 doc_id=doc_id,
                 raw_memories=[],
@@ -2568,7 +2539,7 @@ class GeneSyncOrchestrator:
         # 8. Bind claims to revision-pinned evidence and apply one complete,
         # stale-guarded Lifecycle Plan for this Source Unit.
         # ------------------------------------------------------------------
-        memory_stats = await self.memory_engine.apply_projected_lifecycle(
+        memory_stats = await self.memory_engine.prepare_and_commit_projected_lifecycle(
             projection=projection,
             doc_id=doc_id,
             raw_memories=raw_memories,
