@@ -108,6 +108,22 @@ export function selectSourceSyncActivity({
   if (lifecycleMaintenance && ["queued", "running"].includes(lifecycleMaintenance.status)) {
     return sourceSyncActivityFromLifecycleMaintenance(lifecycleMaintenance);
   }
+  const handedOffRunId = localJob?.status === "succeeded"
+    ? localJob.result?.source_sync_run_id?.trim()
+    : undefined;
+  if (handedOffRunId) {
+    if (sync?.run_id === handedOffRunId) return sourceSyncActivityFromStatus(sync);
+    return {
+      kind: "sync",
+      state: "active",
+      progress: {
+        schema_version: 1,
+        phase: "waiting_for_cloud",
+      },
+      startedAt: localJob?.created_at,
+      updatedAt: localJob?.updated_at,
+    };
+  }
   if (sync && ["pending", "running", "recovering"].includes(sync.status)) {
     return sourceSyncActivityFromStatus(sync);
   }
@@ -217,6 +233,8 @@ export function presentSourceSyncActivity(
   switch (snapshot.phase) {
     case "waiting_for_device":
       return { message: "Waiting for your device", detail: "Local sync queued" };
+    case "waiting_for_cloud":
+      return { message: "Processing in Cloud", detail: "Waiting for Cloud processing" };
     case "connecting":
       return { message: `Connecting to ${sourceName}`, detail: "Checking access" };
     case "discovering":

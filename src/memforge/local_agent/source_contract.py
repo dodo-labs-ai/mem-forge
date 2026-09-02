@@ -452,10 +452,16 @@ def source_with_sync_inputs(
     source: Mapping[str, Any],
     inputs: list[Any],
     *,
+    input_snapshot_supplied: bool = False,
     authoritative_snapshot: bool = False,
     preserve_version_history: bool = False,
 ) -> dict[str, Any]:
-    """Project immutable raw inputs into the connector's runtime manifest."""
+    """Project immutable raw inputs into the connector's runtime manifest.
+
+    Snapshot presence and snapshot authority are separate facts.  In
+    particular, an incremental local collection may legitimately supply an
+    empty snapshot without claiming complete provider coverage.
+    """
     latest_entries: dict[str, dict[str, Any]] = {}
     historical_entries: list[dict[str, Any]] = []
     for source_input in sorted(
@@ -480,7 +486,7 @@ def source_with_sync_inputs(
         latest_entries[doc_id] = projected_entry
         historical_entries.append(projected_entry)
     projected = dict(source)
-    if latest_entries or authoritative_snapshot:
+    if latest_entries or input_snapshot_supplied or authoritative_snapshot:
         config = dict(_source_config(source.get("config")))
         config["local_agent_package_manifest"] = (
             historical_entries if preserve_version_history else list(latest_entries.values())

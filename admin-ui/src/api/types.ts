@@ -142,6 +142,7 @@ export interface SyncStatus {
 
 export type SyncProgressPhase =
   | "waiting_for_device"
+  | "waiting_for_cloud"
   | "connecting"
   | "discovering"
   | "fetching"
@@ -683,6 +684,7 @@ export interface LocalAgentJobStatusResponse {
     messages?: number;
     conversations?: number;
     sync_started?: boolean;
+    source_sync_run_id?: string;
   } | null;
   last_error?: string | null;
 }

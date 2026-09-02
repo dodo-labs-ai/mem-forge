@@ -139,7 +139,7 @@ from memforge.source_projection import (
     SourceUnitInventoryFilter,
 )
 from memforge.source_projection_config import projection_scope_transition_id
-from memforge.source_activity import SourceActivityConflict
+from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
 from memforge.server.memory_admin_service import (
@@ -6866,9 +6866,9 @@ def create_admin_app(
         sync_service: SyncService = Depends(get_sync_service),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        """Delete a source, its documents, and retire memories left without support."""
+        """Functionally remove a Source and retire Memories left unsupported."""
         existing = await db.get_source(source_id)
-        if not existing:
+        if not existing or existing.get("status") == "retired":
             return {
                 "ok": True,
                 "deleted_source": source_id,
@@ -6881,11 +6881,27 @@ def create_admin_app(
             owner_id=source_id,
         )
 
-        memory_store = await _build_memory_store(db, config, runtime_provider)
+        activity_id = f"source-delete-{uuid.uuid4().hex}"
         try:
-            await memory_store.delete_source_cascade(source_id)
-        except ValueError as exc:
+            source_activity = await db.acquire_source_activity(
+                activity_id=activity_id,
+                source_id=source_id,
+                kind=SourceActivityKind.MAINTENANCE,
+                capability=activity_id,
+                lease_seconds=900,
+            )
+            memory_store = await _build_memory_store(db, config, runtime_provider)
+            await memory_store.delete_source_cascade(
+                source_id,
+                source_activity=source_activity,
+            )
+        except (SourceActivityConflict, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            await db.release_source_activity(
+                activity_id=activity_id,
+                capability=activity_id,
+            )
         await SourceArtifactCleanupService(db, document_store).run_pending(limit=1000)
         return {"ok": True, "deleted_source": source_id}
 

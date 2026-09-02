@@ -285,6 +285,7 @@ async def list_source_admin_rows(
             if history:
                 latest = history[0]
                 row["sync"] = {
+                    "run_id": latest.get("run_id"),
                     "status": latest.get("status", "success"),
                     "started_at": latest.get("started_at"),
                     "finished_at": latest.get("finished_at"),

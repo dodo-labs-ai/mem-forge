@@ -1229,6 +1229,7 @@ class SourceSyncWorker:
             source = source_with_sync_inputs(
                 source,
                 inputs,
+                input_snapshot_supplied=run.input_snapshot_id is not None,
                 authoritative_snapshot=authoritative_collection,
             )
 

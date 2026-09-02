@@ -8000,6 +8000,65 @@ async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_sn
 
 
 @pytest.mark.asyncio
+async def test_source_sync_worker_preserves_empty_incremental_local_snapshot(db: Database):
+    import memforge.runtime as runtime
+
+    source_id = "src-empty-teams-snapshot"
+    await db.upsert_source(
+        id=source_id,
+        type="teams",
+        name="Empty Teams snapshot",
+        config_json=json.dumps(
+            {
+                "conversation_ids": ["19:conversation@example.test"],
+                "region": "emea",
+            }
+        ),
+        access_policy="private",
+        owner_user_id="dev",
+    )
+
+    class CapturingRuntimeProvider:
+        def __init__(self) -> None:
+            self.source: dict | None = None
+            self.authoritative_snapshot: bool | None = None
+            self.runtime_event_trace_sink = None
+
+        async def build_sync_runtime(self, db, config, **kwargs):
+            del db, config, kwargs
+            return self
+
+        async def run_source_sync(self, **kwargs):
+            self.source = kwargs["source"]
+            self.authoritative_snapshot = kwargs["authoritative_snapshot"]
+            return SyncState(
+                source=source_id,
+                last_sync_at=datetime.now(timezone.utc),
+                last_sync_status="success",
+            )
+
+    provider = CapturingRuntimeProvider()
+    await db.enqueue_source_sync_run(
+        source_id=source_id,
+        trigger="local_agent",
+        force_full_sync=False,
+        input_snapshot_id="laj-empty-teams:attempt:1",
+    )
+    worker = runtime.SourceSyncWorker(
+        db,
+        AppConfig(),
+        runtime_provider=provider,
+        worker_id="worker-empty-teams-snapshot",
+    )
+
+    await worker.run_once()
+
+    assert provider.authoritative_snapshot is False
+    assert provider.source is not None
+    assert provider.source["config"]["local_agent_package_manifest"] == []
+
+
+@pytest.mark.asyncio
 async def test_source_sync_worker_does_not_treat_direct_cloud_jira_as_authoritative_snapshot(
     db: Database,
 ):
