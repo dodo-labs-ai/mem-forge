@@ -75,6 +75,77 @@ class FragmentCompilationErrorCode(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class StructuralUnit:
+    """One complete representation-owned range safe for Planner authority."""
+
+    start: int
+    end: int
+
+
+class StructuralUnitTooLargeError(ValueError):
+    """One complete structure cannot fit the configured presentation budget."""
+
+    code = "structural_unit_too_large"
+
+    def __init__(self, *, revision_id: str, start: int, end: int, budget: int) -> None:
+        super().__init__(
+            f"structural unit exceeds presentation budget: {revision_id}:{start}:{end}"
+        )
+        self.revision_id = revision_id
+        self.start = start
+        self.end = end
+        self.budget = budget
+
+
+def plan_revision_structural_units(
+    revision: SourceObservationRevision,
+    *,
+    max_content_chars: int,
+) -> tuple[StructuralUnit, ...]:
+    """Pack complete representation structures without granting authority."""
+
+    if max_content_chars < 1:
+        raise ValueError("structural planning budget must be positive")
+    profile = revision.evidence_profile
+    if (
+        profile is None
+        or profile.requires_whole_observation_authority
+        or profile.name not in {"markdown-structural", "plain-text"}
+    ):
+        return (StructuralUnit(0, len(revision.content)),)
+    protected = (
+        _markdown_protected_ranges(revision.content)
+        if profile.name == "markdown-structural"
+        else _paragraph_ranges(revision.content)
+    )
+    if not protected and revision.content:
+        protected = ((0, len(revision.content)),)
+    packed: list[StructuralUnit] = []
+    current_start: int | None = None
+    current_end: int | None = None
+    for start, end in protected:
+        if end - start > max_content_chars:
+            raise StructuralUnitTooLargeError(
+                revision_id=revision.id,
+                start=start,
+                end=end,
+                budget=max_content_chars,
+            )
+        if current_start is None:
+            current_start, current_end = start, end
+            continue
+        assert current_end is not None
+        if end - current_start <= max_content_chars:
+            current_end = end
+            continue
+        packed.append(StructuralUnit(current_start, current_end))
+        current_start, current_end = start, end
+    if current_start is not None and current_end is not None:
+        packed.append(StructuralUnit(current_start, current_end))
+    return tuple(packed)
+
+
+@dataclass(frozen=True, slots=True)
 class FragmentCompilationError:
     code: FragmentCompilationErrorCode
     observation_revision_id: str
@@ -536,6 +607,48 @@ _PROFILE_COMPILERS: Mapping[tuple[str, int], _ProfileCompiler] = {
     ("plain-text", 1): _compile_plain_text_profile,
     ("binary-artifact", 1): _compile_binary_artifact_profile,
 }
+
+
+def _markdown_protected_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    """Return outermost CommonMark structures in one ordered parser pass."""
+
+    try:
+        tokens = _markdown_parser().parse(text)
+    except Exception as exc:
+        raise ValueError(
+            f"Markdown parser rejected structural planning: {type(exc).__name__}"
+        ) from exc
+    line_starts = _line_starts(text)
+    protected_types = {
+        "html_block",
+        "table_open",
+        "list_item_open",
+        "blockquote_open",
+        "heading_open",
+        "fence",
+        "code_block",
+        "paragraph_open",
+    }
+    candidates = []
+    for token in tokens:
+        if token.type not in protected_types or token.map is None:
+            continue
+        start, end = _token_range(
+            text,
+            line_starts,
+            token.map[0],
+            token.map[1],
+        )
+        if start < end:
+            candidates.append((start, end))
+    selected: list[tuple[int, int]] = []
+    selected_end = -1
+    for start, end in sorted(candidates, key=lambda item: (item[0], -item[1])):
+        if start < selected_end:
+            continue
+        selected.append((start, end))
+        selected_end = end
+    return tuple(selected)
 
 
 def _markdown_candidates(
