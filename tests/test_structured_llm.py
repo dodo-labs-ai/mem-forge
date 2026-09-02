@@ -32,6 +32,7 @@ from memforge.llm.structured import (
     MemoryRelationResponse,
     MemorySupportValidationResponse,
     OfflineSemanticJudgeResponse,
+    ProjectionFragmentMemoryExtractionResponse,
     ProjectionMemoryExtractionResponse,
     RevisionCompositionDecision,
     RevisionCompositionResponse,
@@ -1729,17 +1730,26 @@ async def test_litellm_structured_client_records_each_invalid_provider_attempt(m
 
 
 @pytest.mark.asyncio
-async def test_litellm_structured_client_retries_invalid_json_fallback_once(monkeypatch):
+async def test_litellm_structured_client_repairs_invalid_json_fallback_with_validation_feedback(
+    monkeypatch,
+):
     calls = []
     telemetry: list[StructuredLlmCallTelemetry] = []
 
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         if len(calls) < 3:
-            return CompletionResponse("{}")
+            return CompletionResponse(
+                '{"memories":[{"content":"A durable constraint.",'
+                '"memory_type":"unsupported","confidence":0.9,'
+                '"entity_refs":[],"valid_from":null,"valid_until":null,'
+                '"primary_ref":"p000001","required_refs":[]}]}'
+            )
         return CompletionResponse(
-            '{"memories":[{"content":"A durable fact.","memory_type":"fact",'
-            '"evidence_block_id":"EB-001"}]}'
+            '{"memories":[{"content":"A durable constraint.",'
+            '"memory_type":"convention","confidence":0.9,'
+            '"entity_refs":[],"valid_from":null,"valid_until":null,'
+            '"primary_ref":"p000001","required_refs":[]}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1755,17 +1765,135 @@ async def test_litellm_structured_client_retries_invalid_json_fallback_once(monk
         telemetry_sink=telemetry.append,
     )
 
-    response = await client.extract_memories("prompt", max_tokens=1024)
+    response = await client.extract_projection_fragment_memories(
+        "prompt",
+        max_tokens=1024,
+    )
 
-    assert response.memories[0].content == "A durable fact."
+    assert response.memories[0].content == "A durable constraint."
     assert len(calls) == 3
-    assert calls[0]["response_format"] is MemoryExtractionResponse
+    assert calls[0]["response_format"] is ProjectionFragmentMemoryExtractionResponse
     assert "response_format" not in calls[1]
     assert "response_format" not in calls[2]
+    second_prompt = calls[1]["messages"][0]["content"]
+    repair_prompt = calls[2]["messages"][0]["content"]
+    assert repair_prompt != second_prompt
+    assert "preceding JSON-text response" in repair_prompt
+    assert "memories.0.memory_type" in repair_prompt
+    assert "literal_error" in repair_prompt
+    assert "unsupported" not in repair_prompt
     assert telemetry[0].attempt_count == 3
     assert telemetry[0].retry_count == 1
     assert telemetry[0].fallback_count == 1
     assert telemetry[0].terminal_category == "success"
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_repairs_invalid_json_first_response(
+    monkeypatch,
+):
+    calls = []
+    telemetry: list[StructuredLlmCallTelemetry] = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return CompletionResponse(
+                '{"memories":[{"content":"A durable constraint.",'
+                '"memory_type":"unsupported","confidence":0.9,'
+                '"entity_refs":[],"valid_from":null,"valid_until":null,'
+                '"primary_ref":"p000001","required_refs":[]}]}'
+            )
+        return CompletionResponse(
+            '{"memories":[{"content":"A durable constraint.",'
+            '"memory_type":"convention","confidence":0.9,'
+            '"entity_refs":[],"valid_from":null,"valid_until":null,'
+            '"primary_ref":"p000001","required_refs":[]}]}'
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="provider/model-without-native-schema",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+            num_retries=1,
+        ),
+        telemetry_sink=telemetry.append,
+    )
+
+    response = await client.extract_projection_fragment_memories(
+        "prompt",
+        max_tokens=1024,
+    )
+
+    assert response.memories[0].content == "A durable constraint."
+    assert len(calls) == 2
+    assert all("response_format" not in call for call in calls)
+    initial_prompt = calls[0]["messages"][0]["content"]
+    repair_prompt = calls[1]["messages"][0]["content"]
+    assert repair_prompt != initial_prompt
+    assert "preceding JSON-text response" in repair_prompt
+    assert "memories.0.memory_type" in repair_prompt
+    assert "literal_error" in repair_prompt
+    assert "unsupported" not in repair_prompt
+    assert telemetry[0].attempt_count == 2
+    assert telemetry[0].retry_count == 1
+    assert telemetry[0].fallback_count == 0
+    assert telemetry[0].terminal_category == "success"
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_bounds_schema_repair_diagnostics(
+    monkeypatch,
+):
+    calls = []
+    invalid_memories = [
+        {
+            "content": f"Sensitive candidate {index}.",
+            "memory_type": "secret-invalid-type",
+            "confidence": 0.9,
+            "entity_refs": [],
+            "valid_from": None,
+            "valid_until": None,
+            "primary_ref": "p000001",
+            "required_refs": [],
+        }
+        for index in range(9)
+    ]
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return CompletionResponse(json.dumps({"memories": invalid_memories}))
+        return CompletionResponse('{"memories":[]}')
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="provider/model-without-native-schema",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+            num_retries=1,
+        )
+    )
+
+    response = await client.extract_projection_fragment_memories(
+        "prompt",
+        max_tokens=1024,
+    )
+
+    assert response.memories == []
+    repair_prompt = calls[1]["messages"][0]["content"]
+    assert repair_prompt.count('"rule":"literal_error"') == 8
+    assert "memories.7.memory_type" in repair_prompt
+    assert "memories.8.memory_type" not in repair_prompt
+    assert "secret-invalid-type" not in repair_prompt
+    assert "Sensitive candidate" not in repair_prompt
 
 
 @pytest.mark.asyncio
