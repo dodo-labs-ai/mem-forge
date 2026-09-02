@@ -9,15 +9,16 @@ from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
     projection_extraction_contract,
 )
+from memforge.pipeline.evidence_fragments import plan_revision_structural_units
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
     source_artifact_inference_eligibility,
 )
-from memforge.source_projection import EvidenceRepresentationProfile, SourceProjection
+from memforge.source_projection import SourceObservationRevision, SourceProjection
 
 
 LEGACY_PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 2
-PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 3
+PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,8 +144,7 @@ def plan_projection_extraction_batches(
         for segment in _primary_segments(
             observation_id,
             observations[observation_id].observation_type,
-            revisions[observation_id].content,
-            evidence_profile=revisions[observation_id].evidence_profile,
+            revisions[observation_id],
             preserve_whole_authority=compiler_backed,
             max_chars=max_primary_chars,
             overlap_chars=primary_overlap_chars,
@@ -163,7 +163,10 @@ def plan_projection_extraction_batches(
             else 0
         )
         if current and (
-            len(current) >= max_primary_observations
+            (
+                segment.observation_id not in current_observation_ids
+                and len(current_observation_ids) >= max_primary_observations
+            )
             or current_chars + content_chars > max_primary_chars
             or current_binary_bytes + new_binary_bytes > max_primary_binary_bytes
         ):
@@ -393,15 +396,16 @@ def context_observation_ids_for(
 def _primary_segments(
     observation_id: str,
     observation_type: str,
-    content: str,
+    revision: SourceObservationRevision,
     *,
-    evidence_profile: EvidenceRepresentationProfile | None,
     preserve_whole_authority: bool,
     max_chars: int,
     overlap_chars: int,
 ) -> tuple[_PrimarySegment, ...]:
     """Plan exact authority without violating the Revision's representation."""
 
+    content = revision.content
+    evidence_profile = revision.evidence_profile
     plain_header = f"### Observation {observation_id} ({observation_type})\n"
     if (
         preserve_whole_authority
@@ -420,6 +424,23 @@ def _primary_segments(
     content_budget = max_chars - len(ranged_header)
     if content_budget < 1:
         raise ValueError("primary character budget is too small for the Observation header")
+    if preserve_whole_authority:
+        return tuple(
+            _PrimarySegment(
+                observation_id=observation_id,
+                start=unit.start,
+                end=unit.end,
+                markdown=(
+                    f"### Observation {observation_id} ({observation_type}) "
+                    f"[characters {unit.start}:{unit.end}]\n"
+                    f"{content[unit.start:unit.end]}"
+                ),
+            )
+            for unit in plan_revision_structural_units(
+                revision,
+                max_content_chars=content_budget,
+            )
+        )
     overlap = min(overlap_chars, content_budget // 4)
     step = content_budget - overlap
     segments = []
