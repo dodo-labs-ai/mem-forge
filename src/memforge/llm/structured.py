@@ -51,6 +51,10 @@ type TransientRequiredEvidenceFragmentRef = Annotated[
     Field(min_length=1, pattern=r"^[pr]\d{6}$"),
 ]
 
+_SCHEMA_REPAIR_MAX_VALIDATION_FIELDS = 8
+_SCHEMA_REPAIR_LOCATION_CHAR_CAP = 256
+_SCHEMA_REPAIR_RULE_CHAR_CAP = 128
+
 
 @dataclass(frozen=True, slots=True)
 class _StructuredLlmAdmission:
@@ -1356,12 +1360,51 @@ def litellm_model_name(model: str) -> str:
     return f"anthropic/{model}"
 
 
-def _json_text_prompt(prompt: str, response_format: type[BaseModel]) -> str:
+def _json_text_prompt(
+    prompt: str,
+    response_format: type[BaseModel],
+    *,
+    validation_failure: _StructuredLlmFailure | None = None,
+    validation_source: Literal["native_schema", "json_text"] | None = None,
+) -> str:
     """Append the schema as a text instruction for the no-tool JSON path."""
     schema = json.dumps(response_format.model_json_schema(), ensure_ascii=False)
-    return (
+    request_prompt = (
         f"{prompt}\n\nReturn ONLY a single JSON object that matches this JSON Schema, "
         f"with no markdown fences and no commentary:\n{schema}"
+    )
+    if validation_failure is None:
+        return request_prompt
+
+    validation_fields = [
+        {
+            "location": location[:_SCHEMA_REPAIR_LOCATION_CHAR_CAP],
+            "rule": rule[:_SCHEMA_REPAIR_RULE_CHAR_CAP],
+        }
+        for location, rule in validation_failure.validation_fields[
+            :_SCHEMA_REPAIR_MAX_VALIDATION_FIELDS
+        ]
+    ]
+    diagnostic = json.dumps(
+        {
+            "error_code": validation_failure.error_code[
+                :_SCHEMA_REPAIR_RULE_CHAR_CAP
+            ],
+            "validation_errors": validation_fields,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    previous_attempt = (
+        "The preceding native-schema response"
+        if validation_source == "native_schema"
+        else "The preceding JSON-text response"
+    )
+    return (
+        f"{request_prompt}\n\n{previous_attempt} failed local schema validation. "
+        "Return the complete JSON object again after correcting these diagnostics. "
+        "The prior response body and invalid values are intentionally not repeated:\n"
+        f"{diagnostic}"
     )
 
 
@@ -1966,24 +2009,16 @@ class LiteLlmStructuredClient:
                 model_name,
                 response_format.__name__,
             )
-            failure: _StructuredLlmFailure | None = None
-            try:
-                result = await self._attempt_schema(
-                    prompt=prompt,
-                    response_format=response_format,
-                    model_name=model_name,
-                    max_tokens=max_tokens,
-                    native_schema=False,
-                    native_schema_transport=native_schema_transport,
-                    deadline=deadline,
-                    state=state,
-                    images=images,
-                )
-            except Exception as exc:
-                failure = _structured_failure(exc)
-            if failure is not None:
-                raise failure.to_error()
-            return result
+            return await self._attempt_json_text_with_repair(
+                prompt=prompt,
+                response_format=response_format,
+                model_name=model_name,
+                max_tokens=max_tokens,
+                native_schema_transport=native_schema_transport,
+                deadline=deadline,
+                state=state,
+                images=images,
+            )
 
         state.final_mode = "native_schema"
         schema_failure: _StructuredLlmFailure | None = None
@@ -2016,7 +2051,34 @@ class LiteLlmStructuredClient:
             schema_failure.error_code,
             schema_failure.terminal_category,
         )
-        fallback_failure: _StructuredLlmFailure | None = None
+        return await self._attempt_json_text_with_repair(
+            prompt=prompt,
+            response_format=response_format,
+            model_name=model_name,
+            max_tokens=max_tokens,
+            native_schema_transport=native_schema_transport,
+            deadline=deadline,
+            state=state,
+            images=images,
+            initial_validation_failure=schema_failure,
+        )
+
+    async def _attempt_json_text_with_repair(
+        self,
+        *,
+        prompt: str,
+        response_format: type[BaseModel],
+        model_name: str,
+        max_tokens: int,
+        native_schema_transport: NativeSchemaTransport,
+        deadline: float,
+        state: _StructuredCallState,
+        images: tuple[StructuredLlmImage, ...],
+        initial_validation_failure: _StructuredLlmFailure | None = None,
+    ):
+        """Attempt JSON text and repair one invalid response under the shared budget."""
+
+        failure: _StructuredLlmFailure | None = None
         try:
             result = await self._attempt_schema(
                 prompt=prompt,
@@ -2028,13 +2090,19 @@ class LiteLlmStructuredClient:
                 deadline=deadline,
                 state=state,
                 images=images,
+                validation_failure=initial_validation_failure,
+                validation_source=(
+                    "native_schema"
+                    if initial_validation_failure is not None
+                    else None
+                ),
             )
         except Exception as exc:
-            fallback_failure = _structured_failure(exc)
+            failure = _structured_failure(exc)
         if (
-            fallback_failure is not None
-            and fallback_failure.terminal_category == "invalid_response"
-            and fallback_failure.error_code == "ValidationError"
+            failure is not None
+            and failure.terminal_category == "invalid_response"
+            and failure.error_code == "ValidationError"
             and state.retry_budget > 0
         ):
             state.retry_budget -= 1
@@ -2044,7 +2112,7 @@ class LiteLlmStructuredClient:
                 "retrying once within the logical deadline (error_code=%s)",
                 model_name,
                 response_format.__name__,
-                fallback_failure.error_code,
+                failure.error_code,
             )
             try:
                 result = await self._attempt_schema(
@@ -2057,13 +2125,15 @@ class LiteLlmStructuredClient:
                     deadline=deadline,
                     state=state,
                     images=images,
+                    validation_failure=failure,
+                    validation_source="json_text",
                 )
             except Exception as exc:
-                fallback_failure = _structured_failure(exc)
+                failure = _structured_failure(exc)
             else:
-                fallback_failure = None
-        if fallback_failure is not None:
-            raise fallback_failure.to_error()
+                failure = None
+        if failure is not None:
+            raise failure.to_error()
         return result
 
     async def _attempt_schema(
@@ -2078,8 +2148,19 @@ class LiteLlmStructuredClient:
         deadline: float,
         state: _StructuredCallState,
         images: tuple[StructuredLlmImage, ...],
+        validation_failure: _StructuredLlmFailure | None = None,
+        validation_source: Literal["native_schema", "json_text"] | None = None,
     ):
-        request_prompt = prompt if native_schema else _json_text_prompt(prompt, response_format)
+        request_prompt = (
+            prompt
+            if native_schema
+            else _json_text_prompt(
+                prompt,
+                response_format,
+                validation_failure=validation_failure,
+                validation_source=validation_source,
+            )
+        )
         messages = [{"role": "user", "content": _structured_user_content(request_prompt, images)}]
         provider_kwargs: dict[str, Any] = {}
         prompt_template_variable = self.config.prompt_template_variable
