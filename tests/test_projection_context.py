@@ -20,6 +20,8 @@ from memforge.pipeline.evidence_catalog import EvidenceAuthoritySpan, EvidenceCa
 from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_V9
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import plan_projection_extraction_batches
+from memforge.pipeline.projection_fragments import compile_projection_fragment_catalog
+from memforge.pipeline.evidence_fragments import StructuralUnitTooLargeError
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_projection import (
     AnchorKind,
@@ -330,8 +332,8 @@ def test_projection_batch_records_authority_segmentation_policy_identity() -> No
 
     assert legacy_batch.authority_policy_version == 2
     assert legacy_batch.id == "xbatch-838f89fac7f4082c"
-    assert v9_batch.authority_policy_version == 3
-    assert v9_batch.id != "xbatch-cf8d7fcc531f2ca6"
+    assert v9_batch.authority_policy_version == 4
+    assert v9_batch.id == "xbatch-fd04fcaa54e35c3f"
 
 
 def test_many_images_use_bounded_multimodal_batches_without_losing_artifacts() -> None:
@@ -529,6 +531,113 @@ def test_default_large_page_batches_bound_primary_output_pressure() -> None:
     assert {batch.primary_observation_ids for batch in batches} == {
         (projection.observations[0].id,)
     }
+
+
+def test_v9_batches_keep_one_crossing_markdown_structure_complete() -> None:
+    prefix = ("Short paragraph.\n\n" * 3_100)
+    code_block = "```text\n" + ("x" * 12_000) + "\n```\n"
+    body = prefix + code_block
+    projection = _confluence_projection(body)
+
+    batches = plan_projection_extraction_batches(
+        projection,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    catalogs = [
+        compile_projection_fragment_catalog(
+            projection,
+            batch,
+            access_context_hash="access-v9-structural",
+        )
+        for batch in batches
+    ]
+
+    assert all(catalog.usable for catalog in catalogs)
+    revision_content = projection.observation_revisions[0].content
+    code_start = revision_content.index("```text")
+    code_end = len(revision_content)
+    code_fragments = [
+        fragment
+        for catalog in catalogs
+        for fragment in catalog.fragments
+        if fragment.fragment_type == "markdown-code-block"
+    ]
+    assert len(code_fragments) == 1
+    assert code_fragments[0].anchor.range_start == code_start
+    assert code_fragments[0].anchor.range_end == code_end
+
+
+def test_v9_rejects_one_structural_unit_larger_than_the_batch_budget() -> None:
+    projection = _confluence_projection(
+        "```text\n" + ("x" * 1_000) + "\n```\n"
+    )
+
+    with pytest.raises(StructuralUnitTooLargeError):
+        plan_projection_extraction_batches(
+            projection,
+            max_primary_chars=500,
+            extraction_contract_version=PROJECTION_EXTRACTION_V9,
+        )
+
+
+def test_v9_structure_planning_keeps_commonmark_protectors_complete() -> None:
+    body = """# Heading
+
+Paragraph with <strong>inline HTML</strong>.
+
+- parent item
+  - nested item
+- sibling item
+
+| Key | Value |
+| --- | --- |
+| A | B |
+
+> quoted paragraph
+
+```python
+print("safe")
+```
+
+<section><p>Raw HTML block</p></section>
+"""
+    projection = _confluence_projection(body)
+
+    batches = plan_projection_extraction_batches(
+        projection,
+        max_primary_chars=140,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    catalogs = [
+        compile_projection_fragment_catalog(
+            projection,
+            batch,
+            access_context_hash="access-v9-protectors",
+        )
+        for batch in batches
+    ]
+
+    assert len(batches) > 1
+    assert all(catalog.usable for catalog in catalogs)
+    assert all(
+        error.code.value != "invalid_authority_range"
+        for catalog in catalogs
+        for error in catalog.errors
+    )
+    fragment_types = {
+        fragment.fragment_type
+        for catalog in catalogs
+        for fragment in catalog.fragments
+    }
+    assert {
+        "markdown-heading",
+        "markdown-inline-html",
+        "markdown-list-item",
+        "markdown-table-row",
+        "markdown-blockquote",
+        "markdown-code-block",
+        "html-p",
+    }.issubset(fragment_types)
 
 
 @pytest.mark.asyncio
