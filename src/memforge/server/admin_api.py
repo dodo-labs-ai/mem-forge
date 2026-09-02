@@ -159,6 +159,7 @@ from memforge.source_access_transition import (
 from memforge.local_agent.readiness import connection_status_from_browser_session
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_SYNC_OPERATIONS,
+    LOCAL_AGENT_SOURCE_ACTIVITY_EPOCH_STALE,
     TEAMS_ROLLING_RETENTION_PRESETS,
     execution_owner_user_id,
     is_local_agent_backed_source,
@@ -9132,13 +9133,54 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
+        requester = resolve_request_principal(request)
+        job = await db.get_local_agent_job(job_id)
+        if (
+            job is not None
+            and job.get("status") == "leased"
+            and job.get("execution_owner_user_id") == requester
+            and int(job.get("attempt_count") or 0) == req.attempt_count
+            and job.get("operation") in LOCAL_AGENT_SYNC_OPERATIONS
+        ):
+            source = await db.get_source(str(job.get("source_id") or ""))
+            payload = job.get("payload") or {}
+            expected_epoch = payload.get("source_activity_epoch")
+            current_epoch = source.get("activity_epoch") if source is not None else None
+            if expected_epoch is not None and int(expected_epoch) != int(current_epoch or 0):
+                terminalized = await db.complete_local_agent_job(
+                    job_id=job_id,
+                    user_id=requester,
+                    attempt_count=req.attempt_count,
+                    status="failed",
+                    result={
+                        "error_code": LOCAL_AGENT_SOURCE_ACTIVITY_EPOCH_STALE,
+                        "retryable": False,
+                    },
+                    error=LOCAL_AGENT_SOURCE_ACTIVITY_EPOCH_STALE,
+                    retryable=False,
+                )
+                if not terminalized:
+                    raise HTTPException(status_code=404, detail="local_agent_job_not_found")
+                logger.info(
+                    "Terminally failed stale local-agent sync job",
+                    extra={
+                        "job_id": job_id,
+                        "source_id": str(job.get("source_id") or ""),
+                        "expected_source_activity_epoch": int(expected_epoch),
+                        "current_source_activity_epoch": int(current_epoch or 0),
+                    },
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=LOCAL_AGENT_SOURCE_ACTIVITY_EPOCH_STALE,
+                )
         try:
             progress = normalize_sync_progress_snapshot(req.progress) if req.progress is not None else None
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         wrote = await db.heartbeat_local_agent_job(
             job_id=job_id,
-            user_id=resolve_request_principal(request),
+            user_id=requester,
             attempt_count=req.attempt_count,
             lease_seconds=req.lease_seconds,
             progress=progress,

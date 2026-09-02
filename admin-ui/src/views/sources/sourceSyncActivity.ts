@@ -321,6 +321,9 @@ function safeFailureDetail(error: SourceSyncActivity["error"]): string {
   )) {
     return "Sign in to Teams in Chrome, then retry sync.";
   }
+  if (normalized.includes("local_agent_source_activity_epoch_stale")) {
+    return "The source changed while this sync was waiting. Retry to sync its current state.";
+  }
   if (normalized.includes("github pages discovery") && normalized.includes("max pages")) {
     return (
       "GitHub Pages reached Max Pages. Increase Max Pages or narrow the configured "
