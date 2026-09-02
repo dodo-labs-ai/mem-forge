@@ -91,6 +91,7 @@ from memforge.source_artifacts import (
     materialize_source_artifacts,
 )
 from memforge.source_derivation import (
+    DERIVATION_INPUT_SUPERSEDED,
     DiffGuidedExtractionBatch,
     SourceDerivationAttempt,
     StructuralExtractionBatch,
@@ -98,6 +99,7 @@ from memforge.source_derivation import (
     SourceUnitDerivationRequest,
     SourceUnitDeriver,
     aggregate_extraction_metrics,
+    plan_source_derivation_recovery_commit,
 )
 from memforge.pipeline.extraction_contract import (
     CONTRACT_SUPERSEDED,
@@ -1720,6 +1722,15 @@ class GeneSyncOrchestrator:
         )
         if extraction.error_type:
             return None
+        recovery_commit = plan_source_derivation_recovery_commit(
+            stored_derivation_id=attempt.id,
+            produced_derivation_id=extraction.derivation_id,
+        )
+        if recovery_commit.superseded_derivation_id is not None:
+            await self.db.supersede_source_derivation(
+                recovery_commit.superseded_derivation_id,
+                reason_code=DERIVATION_INPUT_SUPERSEDED,
+            )
         projection = with_source_artifact_summaries(
             projection,
             extraction.artifact_summaries,
@@ -1743,7 +1754,7 @@ class GeneSyncOrchestrator:
             user_id=context.user_id,
             protected_source_observation_ids=(extraction.protected_source_observation_ids),
             document=context.document,
-            derivation_id=attempt.id,
+            derivation_id=recovery_commit.applied_derivation_id,
             derivation_reprocess_all_current_observations=(
                 context.reprocess_all_current_observations
             ),

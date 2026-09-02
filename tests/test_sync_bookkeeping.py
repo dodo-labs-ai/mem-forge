@@ -16,6 +16,8 @@ import pytest
 from PIL import Image
 from apscheduler.triggers.date import DateTrigger
 
+import memforge.source_derivation as source_derivation_module
+
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
     StructuredLlmConfig,
@@ -87,6 +89,7 @@ from memforge.source_artifacts import (
     SourceArtifactSummary,
 )
 from memforge.source_derivation import (
+    SourceDerivationAttempt,
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
     SourceUnitDeriver,
@@ -5352,14 +5355,14 @@ async def test_derivation_recovery_supersedes_an_old_extraction_contract(
     assert completed_history.terminal_reason_code is None
 
 
-@pytest.mark.asyncio
-async def test_v2_derivation_recovery_resumes_active_v9_before_provider_work(
+async def _stage_completed_v9_recovery_attempt(
     db: Database,
-) -> None:
-    source_id = "src-v9-recovery"
+    *,
+    source_id: str,
+) -> SourceDerivationAttempt:
     await db.upsert_source(
         id=source_id,
-        type="confluence",
+        type="github_repo",
         name="V9 recovery",
         config_json="{}",
         access_policy="workspace",
@@ -5383,7 +5386,7 @@ async def test_v2_derivation_recovery_resumes_active_v9_before_provider_work(
     )
     projection = project_source_item(
         source_id=source_id,
-        source_type="confluence",
+        source_type="github_repo",
         run_id="run-v9-stage",
         item=item,
         raw=RawContent(
@@ -5444,6 +5447,18 @@ async def test_v2_derivation_recovery_resumes_active_v9_before_provider_work(
     assert attempt.id == staged.derivation.id
     assert attempt.extraction_contract_version == PROJECTION_EXTRACTION_V9
     assert attempt.status == "completed"
+    return attempt
+
+
+@pytest.mark.asyncio
+async def test_v2_derivation_recovery_resumes_active_v9_before_provider_work(
+    db: Database,
+) -> None:
+    source_id = "src-v9-recovery"
+    attempt = await _stage_completed_v9_recovery_attempt(
+        db,
+        source_id=source_id,
+    )
 
     recovery_engine = RecordingMemoryEngine()
     recovery = GeneSyncOrchestrator(
@@ -5472,6 +5487,113 @@ async def test_v2_derivation_recovery_resumes_active_v9_before_provider_work(
     assert len(recovery_engine.projected_lifecycle_calls) == 1
     [preserved] = await db.list_source_derivation_attempts(source_id=source_id)
     assert preserved.status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_v2_derivation_recovery_commits_the_current_policy_identity(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_id = "src-v9-policy-replacement"
+    attempt = await _stage_completed_v9_recovery_attempt(
+        db,
+        source_id=source_id,
+    )
+    monkeypatch.setattr(
+        source_derivation_module,
+        "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
+        (
+            source_derivation_module.PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
+            + 1
+        ),
+    )
+    extractor = ProjectionFragmentRecordingExtractor()
+    recovery_engine = RecordingMemoryEngine()
+    recovery = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=extractor,
+        memory_engine=recovery_engine,
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    stats = await recovery._resume_source_derivations(
+        source_id=source_id,
+        source_activity_epoch=attempt.context.source_activity_epoch,
+        run_id="run-v9-policy-replacement",
+    )
+
+    assert stats == {
+        "processed": 1,
+        "updated": 1,
+        "memories_extracted": 0,
+        "memories_corroborated": 0,
+    }
+    assert extractor.fragment_calls
+    [lifecycle_call] = recovery_engine.projected_lifecycle_calls
+    replacement_id = lifecycle_call["derivation_id"]
+    assert replacement_id != attempt.id
+    attempts = {
+        item.id: item
+        for item in await db.list_source_derivation_attempts(source_id=source_id)
+    }
+    assert attempts[attempt.id].status == "superseded"
+    assert (
+        attempts[attempt.id].terminal_reason_code
+        == "DERIVATION_INPUT_SUPERSEDED"
+    )
+    assert attempts[replacement_id].status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_v2_policy_replacement_failure_preserves_recoverable_new_work(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_id = "src-v9-policy-replacement-failure"
+    attempt = await _stage_completed_v9_recovery_attempt(
+        db,
+        source_id=source_id,
+    )
+    monkeypatch.setattr(
+        source_derivation_module,
+        "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
+        (
+            source_derivation_module.PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
+            + 1
+        ),
+    )
+    recovery = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=FailingProjectedMemoryEngine(),
+        memory_store=None,
+        max_concurrent=1,
+    )
+
+    with pytest.raises(RuntimeError, match="lifecycle apply failed"):
+        await recovery._resume_source_derivations(
+            source_id=source_id,
+            source_activity_epoch=attempt.context.source_activity_epoch,
+            run_id="run-v9-policy-replacement-failure",
+        )
+
+    attempts = {
+        item.id: item
+        for item in await db.list_source_derivation_attempts(source_id=source_id)
+    }
+    assert attempts[attempt.id].status == "superseded"
+    assert (
+        attempts[attempt.id].terminal_reason_code
+        == "DERIVATION_INPUT_SUPERSEDED"
+    )
+    [replacement] = [
+        item for item in attempts.values() if item.id != attempt.id
+    ]
+    assert replacement.status == "completed"
+    assert await db.get_current_source_unit_revision(attempt.source_unit_id) is None
 
 
 @pytest.mark.asyncio

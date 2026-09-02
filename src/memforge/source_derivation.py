@@ -9,6 +9,7 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import Enum
 from typing import Any, Literal, Protocol
 
 from memforge.models import DocumentRecord, MemoryExtractionResult, RawMemory
@@ -68,6 +69,7 @@ SOURCE_DERIVATION_RETRYABLE_FAILURE = "retryable_failure"
 SOURCE_DERIVATION_COMPLETED = "completed"
 SOURCE_DERIVATION_APPLIED = "applied"
 SOURCE_DERIVATION_SUPERSEDED = "superseded"
+DERIVATION_INPUT_SUPERSEDED = "DERIVATION_INPUT_SUPERSEDED"
 
 SOURCE_DERIVATION_BATCH_PENDING = "pending"
 SOURCE_DERIVATION_BATCH_COMPLETED = "completed"
@@ -79,6 +81,48 @@ _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT = 16
 _SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT = 32
 
 logger = logging.getLogger(__name__)
+
+
+class SourceDerivationRecoveryDisposition(str, Enum):
+    """How current-policy work relates to one stored recovery attempt."""
+
+    RESUME_EXACT_DERIVATION = "resume_exact_derivation"
+    COMMIT_POLICY_REPLACEMENT = "commit_policy_replacement"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceDerivationRecoveryCommit:
+    """Exact derivation identities for one readable recovery commit."""
+
+    disposition: SourceDerivationRecoveryDisposition
+    applied_derivation_id: str
+    superseded_derivation_id: str | None
+
+
+def plan_source_derivation_recovery_commit(
+    *,
+    stored_derivation_id: str,
+    produced_derivation_id: str | None,
+) -> SourceDerivationRecoveryCommit:
+    """Classify exact replay versus a current-policy replacement."""
+
+    if not stored_derivation_id or not produced_derivation_id:
+        raise ValueError("Source derivation recovery requires both identities")
+    if produced_derivation_id == stored_derivation_id:
+        return SourceDerivationRecoveryCommit(
+            disposition=(
+                SourceDerivationRecoveryDisposition.RESUME_EXACT_DERIVATION
+            ),
+            applied_derivation_id=stored_derivation_id,
+            superseded_derivation_id=None,
+        )
+    return SourceDerivationRecoveryCommit(
+        disposition=(
+            SourceDerivationRecoveryDisposition.COMMIT_POLICY_REPLACEMENT
+        ),
+        applied_derivation_id=produced_derivation_id,
+        superseded_derivation_id=stored_derivation_id,
+    )
 
 
 @dataclass(frozen=True, slots=True)
