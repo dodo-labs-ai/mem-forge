@@ -27,7 +27,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
-from memforge.genes.base import Gene
+from memforge.genes.base import Gene, SourceConfigurationError
 from memforge.genes.local_adapter_packages import (
     has_package_manifest,
     open_packaged_source_artifact,
@@ -951,7 +951,7 @@ class _TeamsAPIClient:
 # ============================================================================
 
 
-class AuthenticationError(Exception):
+class AuthenticationError(SourceConfigurationError):
     """Raised when Teams authentication fails."""
 
 

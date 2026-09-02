@@ -2202,8 +2202,13 @@ class MemoryStore:
             payload=deletion_context or {},
         )
 
-    async def delete_source_cascade(self, source_id: str) -> list[str]:
-        """Delete a source and remove newly retired memories from search indexes."""
+    async def delete_source_cascade(
+        self,
+        source_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> list[str]:
+        """Remove a Source and drain vector cleanup for newly retired Memories."""
         context = self._operation_context(source_id=source_id)
         source_snapshot = await self.db.get_source(source_id)
         document_snapshots = await self.db.list_documents(source=source_id, limit=100000)
@@ -2216,7 +2221,10 @@ class MemoryStore:
         memory_snapshots = await self._memory_snapshots(memory_ids)
         source_snapshots = await self._source_snapshots(memory_ids)
         try:
-            deletion_result = await self.db.delete_source_cascade(source_id)
+            deletion_result = await self.db.delete_source_cascade(
+                source_id,
+                source_activity=source_activity,
+            )
         except Exception:
             await self._restore_deleted_source_state(
                 source_snapshot=source_snapshot,

@@ -160,6 +160,48 @@ assert.equal(selectSourceSyncActivity({
   localJob,
 })?.progress?.phase, "processing");
 
+const completedLocalHandoff: LocalAgentJobStatusResponse = {
+  ...localJob,
+  status: "succeeded",
+  result: {
+    source_sync_run_id: "run-cloud-processing",
+    progress: {
+      schema_version: 1,
+      phase: "uploading",
+      progress: { completed: 0, total: 400, unit: "message" },
+    },
+  },
+  finished_at: "2026-07-08T09:01:00Z",
+};
+
+const waitingForCloud = selectSourceSyncActivity({
+  sync: {
+    ...activeServerRun,
+    run_id: "run-previous",
+    status: "failed",
+    finished_at: "2026-07-08T08:59:00Z",
+  },
+  localJob: completedLocalHandoff,
+});
+assert.deepEqual(
+  presentSourceSyncActivity(waitingForCloud!, "Microsoft Teams", "conversations"),
+  { message: "Processing in Cloud", detail: "Waiting for Cloud processing" },
+);
+assert.equal(sourceSyncActivityBlocksActions(waitingForCloud), true);
+
+assert.equal(
+  selectSourceSyncActivity({
+    sync: {
+      ...activeServerRun,
+      run_id: "run-cloud-processing",
+      status: "failed",
+      finished_at: "2026-07-08T09:02:00Z",
+    },
+    localJob: completedLocalHandoff,
+  })?.state,
+  "failed",
+);
+
 assert.deepEqual(
   selectSourceSyncActivity({
     sync: {

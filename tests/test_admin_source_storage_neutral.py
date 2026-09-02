@@ -387,6 +387,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
             assert limit == 1
             return [
                 {
+                    "run_id": "run-neutral",
                     "status": "partial",
                     "started_at": "2026-06-13T00:00:01+00:00",
                     "finished_at": "2026-06-13T00:00:10+00:00",
@@ -464,6 +465,7 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
     assert source["access_policy"] == "private"
     assert source["owner_user_id"] == "dev"
     assert source["sync"] == {
+        "run_id": "run-neutral",
         "status": "partial",
         "started_at": "2026-06-13T00:00:01+00:00",
         "finished_at": "2026-06-13T00:00:10+00:00",

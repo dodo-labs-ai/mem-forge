@@ -43,6 +43,7 @@ from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 from memforge.pipeline.projection_fragments import compile_projection_fragment_catalog
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_projection import AnchorKind, SourceAnchor
+from memforge.source_access import source_is_discoverable
 from memforge.storage.database import Database
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
@@ -479,6 +480,107 @@ async def test_v2_lifecycle_removes_one_complete_unit_then_retires_last_support(
     retired = await db.get_memory(memory_id)
     assert retired is not None and retired.status == "retired"
     assert await db.get_active_memory_support_unit_ids(memory_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_v2_source_removal_retires_last_support_without_deleting_history(db) -> None:
+    memory_id, unit_id, source_id, _access_hash = await _seed_complete_legacy_support(db)
+    report = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=report.id,
+        owner_id="test-source-removal-cutover",
+    )
+
+    result = await db.delete_source_cascade(source_id)
+
+    assert result.retired_memory_ids == (memory_id,)
+    source = await db.get_source(source_id)
+    assert source is not None
+    assert source["status"] == "retired"
+    assert source["sync_schedule"]["enabled"] is False
+    assert source_is_discoverable(source, viewer_id="owner-1") is False
+    memory = await db.get_memory(memory_id)
+    assert memory is not None
+    assert memory.status == "retired"
+    assert memory.retirement_reason == "source_deleted"
+    assert await db.get_memory_sources(memory_id) == []
+    assert await db.get_evidence_unit(unit_id) is not None
+    support_rows = await db.db.execute_fetchall(
+        "SELECT active, removed_at FROM memory_unit_support_assertions WHERE memory_id = ?",
+        (memory_id,),
+    )
+    assert [(row["active"], bool(row["removed_at"])) for row in support_rows] == [(0, True)]
+    assert await db.db.execute_fetchall(
+        "SELECT id FROM evidence_references WHERE evidence_unit_id = ?",
+        (unit_id,),
+    )
+    assert await db.db.execute_fetchall(
+        "SELECT id FROM source_units WHERE source_id = ?",
+        (source_id,),
+    )
+
+
+@pytest.mark.asyncio
+async def test_v2_source_removal_preserves_memory_with_independent_support(db) -> None:
+    memory_id, unit_id, source_id, _access_hash = await _seed_complete_legacy_support(db)
+    report = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=report.id,
+        owner_id="test-shared-source-removal-cutover",
+    )
+    now = datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc).isoformat()
+    await db.upsert_source(
+        id="source-2",
+        type="jira",
+        name="Independent source",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="owner-2",
+    )
+    await db.db.execute(
+        """INSERT INTO evidence_units (
+               id, source_id, doc_id, doc_revision_id, source_type,
+               source_anchor, source_lineage_id, source_metadata_json,
+               visibility, access_context_hash, content, excerpt,
+               evidence_provenance, part_set_digest, created_at, updated_at
+           ) VALUES ('evidence-unit-2', 'source-2', 'doc-1', NULL, 'jira',
+                     'PAY-2-description', 'unit-2', '{}', 'workspace',
+                     'access-2', 'Independent support', 'Independent support',
+                     'source_excerpt', 'part-digest-2', ?, ?)""",
+        (now, now),
+    )
+    await db.db.execute(
+        """INSERT INTO memory_unit_support_assertions (
+               id, memory_id, evidence_unit_id, source_id,
+               access_context_hash, active, created_at
+           ) VALUES ('support-v2-independent', ?, 'evidence-unit-2',
+                     'source-2', 'access-2', 1, ?)""",
+        (memory_id, now),
+    )
+    await db.db.execute(
+        """INSERT INTO memory_sources (
+               memory_id, doc_id, source_id, source_type, excerpt,
+               support_kind, added_at
+           ) VALUES (?, 'doc-1', 'source-2', 'jira', 'Independent support',
+                     'corroborated', ?)""",
+        (memory_id, now),
+    )
+    await db.db.commit()
+
+    result = await db.delete_source_cascade(source_id)
+
+    assert result.retired_memory_ids == ()
+    memory = await db.get_memory(memory_id)
+    assert memory is not None and memory.status == "active"
+    assert await db.get_active_memory_support_unit_ids(memory_id) == (
+        "evidence-unit-2",
+    )
+    assert [(item.source_id, item.doc_id) for item in await db.get_memory_sources(memory_id)] == [
+        ("source-2", "doc-1"),
+    ]
+    document = await db.get_document("doc-1")
+    assert document is not None and document.source == "source-2"
+    assert await db.get_evidence_unit(unit_id) is not None
 
 
 @pytest.mark.asyncio

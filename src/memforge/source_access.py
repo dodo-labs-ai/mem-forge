@@ -97,6 +97,8 @@ def source_owner_user_id(source: Mapping[str, Any]) -> str:
 
 
 def source_is_discoverable(source: Mapping[str, Any], *, viewer_id: str) -> bool:
+    if str(source.get("status") or "") == "retired":
+        return False
     owner = source_owner_user_id(source)
     policy = source_access_policy(source)
     state = source_access_state(source)

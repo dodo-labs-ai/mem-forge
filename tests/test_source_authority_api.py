@@ -673,6 +673,51 @@ def test_member_can_pin_source_only_for_their_own_source_list(tmp_path):
         asyncio.run(database.close())
 
 
+def test_delete_source_is_idempotent_functional_removal_after_v2_cutover(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        app = _app(tmp_path, database)
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/v1/sources",
+                headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
+                json=_confluence_payload("Disposable canary"),
+            )
+            assert created.status_code == 200, created.text
+            source_id = created.json()["id"]
+            asyncio.run(
+                database.db.execute(
+                    """UPDATE system_contract_markers
+                          SET marker_value = 'evidence-unit-set-v2'
+                        WHERE marker_key = 'support_scope_version'"""
+                )
+            )
+            asyncio.run(database.db.commit())
+
+            removed = client.delete(
+                f"/api/v1/sources/{source_id}",
+                headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
+            )
+            listed = client.get(
+                "/api/v1/sources",
+                headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
+            )
+            removed_again = client.delete(
+                f"/api/v1/sources/{source_id}",
+                headers={"x-test-user": "owner-user", "x-test-workspace-role": "member"},
+            )
+
+        assert removed.status_code == 200, removed.text
+        assert removed.json() == {"ok": True, "deleted_source": source_id}
+        assert all(source["id"] != source_id for source in listed.json()["data"])
+        assert removed_again.status_code == 200, removed_again.text
+        assert removed_again.json()["already_deleted"] is True
+        stored = asyncio.run(database.get_source(source_id))
+        assert stored is not None and stored["status"] == "retired"
+    finally:
+        asyncio.run(database.close())
+
+
 def test_source_list_sort_preference_is_personal_and_validated(tmp_path):
     database = _connect_database(tmp_path)
     try:

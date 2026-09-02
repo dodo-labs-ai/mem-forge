@@ -1132,8 +1132,11 @@ async def test_delete_source_uses_injected_document_store(
         def __init__(self, database: Database) -> None:
             self.database = database
 
-        async def delete_source_cascade(self, source_id: str):
-            return await self.database.delete_source_cascade(source_id)
+        async def delete_source_cascade(self, source_id: str, *, source_activity=None):
+            return await self.database.delete_source_cascade(
+                source_id,
+                source_activity=source_activity,
+            )
 
     async def fake_build_memory_store(*args, **kwargs):
         return DatabaseMemoryStore(db)
@@ -1209,8 +1212,11 @@ async def test_delete_source_succeeds_and_retains_cleanup_task_when_artifact_del
             raise AssertionError("not used")
 
     class DatabaseMemoryStore:
-        async def delete_source_cascade(self, source_id: str):
-            return await db.delete_source_cascade(source_id)
+        async def delete_source_cascade(self, source_id: str, *, source_activity=None):
+            return await db.delete_source_cascade(
+                source_id,
+                source_activity=source_activity,
+            )
 
     async def fake_build_memory_store(*args, **kwargs):
         return DatabaseMemoryStore()
@@ -1251,7 +1257,8 @@ async def test_delete_source_restores_previous_status_when_delete_transaction_fa
     from memforge.server.admin_api import create_admin_app
 
     class FailingMemoryStore:
-        async def delete_source_cascade(self, source_id: str):
+        async def delete_source_cascade(self, source_id: str, *, source_activity=None):
+            del source_id, source_activity
             raise RuntimeError("delete transaction failed")
 
     async def fake_build_memory_store(*args, **kwargs):
