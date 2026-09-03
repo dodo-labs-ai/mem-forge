@@ -75,7 +75,6 @@ from memforge.models import (
     SourceSyncRun,
     SyncState,
     UNSORTED_PROJECT_KEY,
-    VIRTUAL_DOCUMENT_SOURCE_IDS,
     Visibility,
     canonicalize_entity_name,
     conflict_disposition_for_review_status,
@@ -150,6 +149,7 @@ from memforge.memory.lifecycle_plan import (
     unprovable_cutover_retirement_plan_id,
     validate_unprovable_cutover_evidence,
 )
+from memforge.memory.origin import references_source_row
 from memforge.memory.relation_discovery_contract import (
     CURRENT_RELATION_EVIDENCE_PREDICATE_SQL,
     PreclassifiedRelationDecision,
@@ -15475,7 +15475,7 @@ class Database:
             ) as cursor:
                 async for row in cursor:
                     source_id = str(row["source_id"])
-                    if source_id and source_id not in VIRTUAL_DOCUMENT_SOURCE_IDS:
+                    if source_id and references_source_row(source_id):
                         grouped[str(row["memory_id"])].append(source_id)
         return {memory_id: tuple(dict.fromkeys(grouped[memory_id])) for memory_id in ids}
 

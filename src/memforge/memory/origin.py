@@ -23,3 +23,14 @@ def classify_memory_origin(source_type: str) -> MemoryOriginKind:
     if source_type == "agent_session":
         return MemoryOriginKind.MANAGED_CAPTURE
     return MemoryOriginKind.CONFIGURED_SOURCE
+
+
+def references_source_row(source_id: str | None) -> bool:
+    """Whether a provenance reference names a configured or managed Source row.
+
+    Direct User document namespaces are provenance, not Source identities. All
+    other non-null identifiers remain Source dependencies, even if unresolved.
+    This classification does not establish current provenance or grant access.
+    """
+
+    return source_id is not None and source_id not in VIRTUAL_DOCUMENT_SOURCE_IDS
