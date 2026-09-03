@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import selectors
 import shutil
 import subprocess
 import sys
@@ -36,8 +37,10 @@ from memforge.capability_discovery import discover_target
 from memforge.config import DEFAULT_SEARCH_TOP_K, AppConfig, load_config
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSION_LIST,
+    GitHubBlobBuffer,
     build_github_repo_doc_id,
     decode_github_base64_content,
+    decode_github_text,
     github_content_type,
     github_content_type_is_binary,
     github_exclude_paths,
@@ -46,6 +49,7 @@ from memforge.github_repo_utils import (
     github_include_paths,
     github_path_in_scope,
     parse_github_repo_url,
+    validate_github_file_mode,
 )
 from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPickerUnavailable, pick_folder
 from memforge.local_agent.document_identity import (
@@ -64,6 +68,7 @@ from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT,
     SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
+    SOURCE_ARTIFACT_STREAM_CHUNK_BYTES,
     read_source_artifact_bytes,
 )
 from memforge.sync_progress import normalize_sync_progress_snapshot
@@ -97,6 +102,7 @@ DEFAULT_KB_INCLUDE = [
 DEFAULT_KB_EXCLUDE = [".obsidian/**", ".trash/**", ".git/**", "**/.git/**"]
 LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
+GITHUB_RAW_TRANSFER_TIMEOUT_SECONDS = 30.0
 JIRA_SOURCE_TYPE = "jira"
 DEFAULT_GITHUB_INCLUDE_EXTENSIONS = DEFAULT_INCLUDE_EXTENSION_LIST
 # Watch defaults. The tick interval is deliberately shorter than a typical Jira
@@ -459,29 +465,23 @@ def _gh_api_json(repo: dict[str, str], endpoint: str) -> dict[str, Any]:
         raise click.ClickException("GitHub CLI `gh` is required for local GitHub repository sync.") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "gh api failed").strip()
-        normalized_detail = detail.lower()
-        if any(
-            marker in normalized_detail
-            for marker in (
-                "error connecting to",
-                "check your internet connection",
-                "could not resolve host",
-                "no such host",
-                "temporary failure in name resolution",
-                "network is unreachable",
-                "connection refused",
-                "connection timed out",
-                "i/o timeout",
-                "tls handshake timeout",
-            )
-        ):
-            raise GitHubProviderConnectionError(f"GitHub CLI request failed: {detail}")
-        raise click.ClickException(f"GitHub CLI request failed: {detail}")
+        _raise_github_cli_error(detail)
     try:
         payload = json.loads(result.stdout or "{}")
     except ValueError as exc:
         raise click.ClickException("GitHub CLI returned invalid JSON.") from exc
     return payload if isinstance(payload, dict) else {}
+
+
+def _raise_github_cli_error(detail: str) -> None:
+    normalized_detail = detail.lower()
+    if any(marker in normalized_detail for marker in (
+        "error connecting to", "check your internet connection", "could not resolve host",
+        "no such host", "temporary failure in name resolution", "network is unreachable",
+        "connection refused", "connection timed out", "i/o timeout", "tls handshake timeout",
+    )):
+        raise GitHubProviderConnectionError(f"GitHub CLI request failed: {detail}")
+    raise click.ClickException(f"GitHub CLI request failed: {detail}")
 
 
 @dataclass(frozen=True)
@@ -547,6 +547,55 @@ def _github_blob(repo: dict[str, str], blob_sha: str, relative_path: str) -> byt
         raise click.ClickException(str(exc)) from exc
 
 
+def _github_text_blob(
+    repo: dict[str, str], blob_sha: str, relative_path: str, *, size: object,
+) -> bytes:
+    """Read one immutable raw body with bounded pipes and a transport deadline."""
+    try:
+        buffer = GitHubBlobBuffer(sha=blob_sha, size=size, label=relative_path)
+        command = ["gh", "api", f"repos/{repo['owner']}/{repo['repo']}/git/blobs/{blob_sha}",
+                   "-H", "Accept: application/vnd.github.raw+json", "-H", "Accept-Encoding: identity"]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=_github_gh_env(repo["host"]))
+    except FileNotFoundError as exc:
+        raise click.ClickException("GitHub CLI `gh` is required for local GitHub repository sync.") from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    stderr = bytearray()
+    deadline = time.monotonic() + GITHUB_RAW_TRANSFER_TIMEOUT_SECONDS
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ, "body")
+            selector.register(process.stderr, selectors.EVENT_READ, "error")
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GitHubProviderConnectionError("GitHub raw blob request timed out")
+                for key, _ in selector.select(remaining):
+                    chunk = os.read(key.fd, SOURCE_ARTIFACT_STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    elif key.data == "body":
+                        buffer.write(chunk)
+                    else:
+                        stderr.extend(chunk[:max(0, 8192 - len(stderr))])
+            process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        if process.returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip() or "gh api failed"
+            _raise_github_cli_error(detail)
+        return buffer.finish()
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitHubProviderConnectionError("GitHub raw blob request timed out") from exc
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        process.stdout.close()
+        process.stderr.close()
+
+
 def _resolve_github_profile(
     name: str,
     profile: dict[str, Any],
@@ -580,7 +629,7 @@ def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | 
     items: list[dict[str, Any]] = []
     tree = _github_tree(repo, snapshot.root_tree_sha)
     for entry in tree:
-        if entry.get("type") != "blob":
+        if entry.get("type") not in {"blob", "commit"}:
             continue
         relative_path = str(entry.get("path") or "")
         if not github_path_in_scope(relative_path, include_paths, exclude_paths):
@@ -598,7 +647,8 @@ def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | 
                 {
                     "relative_path": relative_path,
                     "blob_sha": entry.get("sha"),
-                    "bytes": entry.get("size", 0),
+                    "bytes": entry.get("size"),
+                    "file_mode": entry.get("mode"),
                     "content_type": github_content_type(relative_path),
                 }
             )
@@ -2597,12 +2647,16 @@ def _push_github_source_entry(
                 raise click.ClickException("GitHub tree did not return a valid blob size")
             if declared_size > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
                 raise click.ClickException("Source Artifact exceeds storage limit")
-        raw = _github_blob(repo, blob_sha, relative_path)
+        raw = (
+            _github_blob(repo, blob_sha, relative_path)
+            if is_source_artifact
+            else _github_text_blob(repo, blob_sha, relative_path, size=entry.get("bytes"))
+        )
         if is_source_artifact and len(raw) != declared_size:
             raise click.ClickException("GitHub blob size changed after tree discovery")
-        text_body = "" if is_source_artifact else raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return _GitHubTransferResult({"relative_path": relative_path, "error": "invalid utf-8"})
+        text_body = "" if is_source_artifact else decode_github_text(raw, label=relative_path)
+    except ValueError as exc:
+        return _GitHubTransferResult({"relative_path": relative_path, "error": str(exc)})
     except click.ClickException as exc:
         return _GitHubTransferResult({"relative_path": relative_path, "error": str(exc)})
 
@@ -2709,6 +2763,10 @@ def _push_github_profile_to_source(
     revisions_complete = True
     for entry in selected_entries:
         relative_path = str(entry["relative_path"])
+        try:
+            validate_github_file_mode(entry.get("file_mode"), label=relative_path)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
         revision = str(entry.get("blob_sha") or "").strip()
         if not revision:
             revisions_complete = False
