@@ -5328,8 +5328,7 @@ async def test_derivation_recovery_supersedes_an_old_extraction_contract(
     assert superseded.terminal_reason_code == "CONTRACT_SUPERSEDED"
 
     await db.db.execute(
-        "UPDATE source_derivation_attempts "
-        "SET status = 'completed', terminal_reason_code = NULL WHERE id = ?",
+        "UPDATE source_derivation_attempts SET status = 'completed', terminal_reason_code = NULL WHERE id = ?",
         (attempt.id,),
     )
     await db.db.commit()
@@ -5369,8 +5368,7 @@ async def _stage_completed_v9_recovery_attempt(
         owner_user_id="dev",
     )
     await db.db.execute(
-        "UPDATE system_contract_markers SET marker_value = ? "
-        "WHERE marker_key = 'support_scope_version'",
+        "UPDATE system_contract_markers SET marker_value = ? WHERE marker_key = 'support_scope_version'",
         (SupportScopeVersion.EVIDENCE_UNIT_SET_V2.value,),
     )
     await db.db.commit()
@@ -7181,11 +7179,14 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
         retryable=True,
         now=now + timedelta(seconds=1),
     )
+    assert await db.lease_local_agent_jobs(
+        user_id="owner-a", limit=1, lease_seconds=60, now=now + timedelta(seconds=2),
+    ) == []
     second = await db.lease_local_agent_jobs(
         user_id="owner-a",
         limit=1,
         lease_seconds=60,
-        now=now + timedelta(seconds=2),
+        now=now + timedelta(hours=1, seconds=1),
     )
 
     assert completed is True
@@ -10000,7 +10001,7 @@ async def test_projection_repair_targets_only_requested_documents_without_semant
         doc_store=StubDocumentStore(),
         memory_extractor=semantic_guard,
         memory_engine=semantic_guard,
-        memory_store=None,
+        memory_store=_audited_memory_store(db),
         max_concurrent=1,
     )
 
@@ -10067,7 +10068,7 @@ async def test_rebaseline_preflight_reads_full_provider_corpus_without_persistin
         doc_store=StubDocumentStore(),
         memory_extractor=semantic_guard,
         memory_engine=semantic_guard,
-        memory_store=None,
+        memory_store=_audited_memory_store(db),
         max_concurrent=1,
     )
 
@@ -10082,6 +10083,7 @@ async def test_rebaseline_preflight_reads_full_provider_corpus_without_persistin
     assert state.docs_processed == 2
     assert await db.count_documents(source=source_id) == 0
     assert await db.get_sync_state(source_id) is None
+    assert await db.list_memory_audit_events(event_type="source_unit_llm_summary") == []
     assert (
         await db.db.execute_fetchall(
             "SELECT id FROM source_units WHERE source_id = ?",
@@ -11881,9 +11883,11 @@ async def test_sync_gene_records_source_unit_llm_summary_for_changed_and_noop_ru
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["provider_error", "invalid_response", "deadline_exceeded"])
 async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fails(
     db: Database,
     monkeypatch,
+    failure_mode,
 ):
     source_id = "src-source-unit-llm-summary-failure"
     await db.upsert_source(
@@ -11897,6 +11901,18 @@ async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fail
 
     async def failing_acompletion(**kwargs):
         del kwargs
+        if failure_mode == "invalid_response":
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="{invalid"),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+        if failure_mode == "deadline_exceeded":
+            await asyncio.sleep(0.1)
         raise TimeoutError("provider unavailable")
 
     monkeypatch.setattr(
@@ -11912,7 +11928,7 @@ async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fail
             model="anthropic--claude-sonnet-latest",
             base_url=None,
             api_key=None,
-            timeout_s=1.0,
+            timeout_s=0.02 if failure_mode == "deadline_exceeded" else 1.0,
             num_retries=0,
         )
     )
@@ -11936,14 +11952,14 @@ async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fail
 
     gene = UpdatingDocumentGene("# Design\n\nOne durable statement.", version="1")
     item = await anext(gene.discover())
-    with pytest.raises(StructuredLlmError, match="structured LLM provider request failed") as raised:
+    with pytest.raises(StructuredLlmError) as raised:
         await orchestrator._process_item(
             gene=gene,
             item=item,
             source_name="Documents",
             source_id=source_id,
         )
-    assert raised.value.error_code == "TimeoutError"
+    assert raised.value.terminal_category == failure_mode
 
     audit_rows = await db.list_memory_audit_events(
         event_type="source_unit_llm_summary",
@@ -11955,9 +11971,117 @@ async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fail
     assert audit_row.payload["provider_attempts"] == 1
     assert audit_row.payload["usage_known_calls"] == 0
     assert audit_row.payload["usage_unknown_calls"] == 1
-    assert audit_row.payload["terminal_category_counts"] == {"provider_error": 1}
+    assert audit_row.payload["terminal_category_counts"] == {failure_mode: 1}
     assert audit_row.payload["operation_counts"] == {"memory_extraction": 1}
-    assert audit_row.payload["error_code_counts"] == {"TimeoutError": 1}
+    assert audit_row.payload["error_code_counts"] == {raised.value.error_code: 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["provider_error", "invalid_response", "deadline_exceeded"])
+async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: Database, monkeypatch, failure_mode):
+    source_id = "src-recovery-llm-summary"
+    attempt = await _stage_completed_v9_recovery_attempt(db, source_id=source_id)
+
+    async def unavailable(**kwargs):
+        if failure_mode == "invalid_response":
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="{invalid"),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+        if failure_mode == "deadline_exceeded":
+            await asyncio.sleep(0.1)
+        raise TimeoutError("private provider failure")
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", unavailable)
+    monkeypatch.setattr("memforge.llm.structured.litellm.supports_response_schema", lambda **_: False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic/test",
+            base_url=None,
+            api_key=None,
+            timeout_s=0.02 if failure_mode == "deadline_exceeded" else 1.0,
+            num_retries=0,
+        )
+    )
+
+    class AuditingEngine(NoopMemoryEngine):
+        async def prepare_and_commit_projected_lifecycle(self, **kwargs):
+            await client.audit_incumbent_support("audit", max_tokens=32)
+            raise AssertionError("failed mandatory audit must not commit")
+
+    orchestrator = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_store=_audited_memory_store(db),
+        memory_extractor=ProjectionFragmentRecordingExtractor(fail_if_called=True),
+        memory_engine=AuditingEngine(),
+        structured_llm_client=client,
+        max_concurrent=1,
+    )
+    with pytest.raises(StructuredLlmError) as raised:
+        await orchestrator._resume_source_derivations(
+            source_id=source_id,
+            source_activity_epoch=attempt.context.source_activity_epoch,
+            run_id="run-recovery-summary",
+            lifecycle_execution_owner_id="run-recovery-summary:attempt:1",
+        )
+    summaries = await db.list_memory_audit_events(event_type="source_unit_llm_summary")
+    assert len(summaries) == 1
+    assert summaries[0].status == "failed"
+    assert summaries[0].payload["source_unit_id"] == attempt.source_unit_id
+    assert summaries[0].payload["logical_calls"] == 1
+    assert summaries[0].payload["provider_attempts"] == 1
+    assert summaries[0].payload["terminal_category_counts"] == {failure_mode: 1}
+    assert summaries[0].payload["error_code_counts"] == {raised.value.error_code: 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["returned_error", "stale", "success"])
+async def test_recovery_summary_distinguishes_nonthrowing_outcomes(db: Database, monkeypatch, outcome):
+    source_id = "src-recovery-summary-outcome"
+    attempt = await _stage_completed_v9_recovery_attempt(db, source_id=source_id)
+    if outcome == "returned_error":
+        monkeypatch.setattr(
+            source_derivation_module,
+            "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
+            source_derivation_module.PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION + 1,
+        )
+
+    class FailingFragmentExtractor(ProjectionFragmentRecordingExtractor):
+        async def extract_projection_fragment_memories(self, catalog, **kwargs):
+            return MemoryExtractionResult(memories=[], error_type="invalid_response", error="Invalid schema")
+
+    engine = RecordingMemoryEngine()
+    recovery = GeneSyncOrchestrator(
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_store=_audited_memory_store(db),
+        memory_extractor=FailingFragmentExtractor(),
+        memory_engine=engine,
+        max_concurrent=1,
+    )
+    stats = await recovery._resume_source_derivations(
+        source_id=source_id,
+        source_activity_epoch=1 if outcome == "stale" else attempt.context.source_activity_epoch,
+        run_id="run-summary-outcome",
+    )
+    summaries = await db.list_memory_audit_events(event_type="source_unit_llm_summary")
+    if outcome == "stale":
+        # Stale attempts are filtered before execution; do not fabricate a scope.
+        assert summaries == []
+        assert stats["processed"] == 0
+        assert engine.projected_lifecycle_calls == []
+        return
+    assert len(summaries) == 1
+    assert summaries[0].status == {"returned_error": "failed", "stale": "skipped", "success": "committed"}[outcome]
+    assert summaries[0].payload["logical_calls"] == 0
+    assert stats["processed"] == (1 if outcome == "success" else 0)
+    assert len(engine.projected_lifecycle_calls) == (1 if outcome == "success" else 0)
 
 
 @pytest.mark.asyncio

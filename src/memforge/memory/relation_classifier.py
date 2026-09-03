@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
 
-from memforge.llm.structured import structured_llm_max_concurrent
+from memforge.llm.structured import StructuredLlmError, structured_llm_max_concurrent
 from memforge.memory.evidence import RelationDirection
 from memforge.models import Memory
 from memforge.pipeline.bounded_work import collect_bounded
@@ -24,11 +24,15 @@ class MemoryPairClassificationError(RuntimeError):
         pair_count: int = 0,
         llm_calls: int = 0,
         prompt_chars: int = 0,
+        terminal_category: str | None = None,
+        error_code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.pair_count = pair_count
         self.llm_calls = llm_calls
         self.prompt_chars = prompt_chars
+        self.terminal_category = terminal_category
+        self.error_code = error_code
 
 
 class MemoryRelationType(str, Enum):
@@ -184,10 +188,7 @@ def _auditable_relation_reason(decision: Any) -> str:
         return reason
     incompatible = str(getattr(decision, "incompatible_assertions", "") or "").strip()
     scope_proof = bool(getattr(decision, "same_subject_and_scope", False))
-    proof = (
-        f"same_subject_and_scope={str(scope_proof).lower()}; "
-        f"incompatible_assertions={incompatible}"
-    )
+    proof = f"same_subject_and_scope={str(scope_proof).lower()}; incompatible_assertions={incompatible}"
     return f"{reason} [{proof}]" if reason else proof
 
 
@@ -349,6 +350,15 @@ class StructuredMemoryPairClassifier:
                 pair_count=attempted_pairs,
                 llm_calls=llm_calls + coverage_retry_calls,
                 prompt_chars=prompt_chars + coverage_retry_prompt_chars,
+            ) from error
+        except StructuredLlmError as error:
+            raise MemoryPairClassificationError(
+                str(error),
+                pair_count=attempted_pairs,
+                llm_calls=llm_calls + coverage_retry_calls,
+                prompt_chars=prompt_chars + coverage_retry_prompt_chars,
+                terminal_category=error.terminal_category,
+                error_code=error.error_code,
             ) from error
         except Exception as error:
             raise MemoryPairClassificationError(

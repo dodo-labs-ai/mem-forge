@@ -112,6 +112,7 @@ export interface EntityAlias {
 }
 
 export interface SyncStatus {
+  created_at?: string | null;
   status: "pending" | "running" | "recovering" | "success" | "partial" | "failed";
   run_id?: string;
   trigger?: string;
@@ -640,8 +641,9 @@ export interface GitHubRepoTreeResponse {
 }
 
 export interface LocalAgentJobCreateResponse {
+  created_at?: string | null;
   job_id: string;
-  status: "queued";
+  status: "queued" | "leased" | "succeeded" | "failed";
 }
 
 export interface LocalAgentJobCounts {
@@ -659,6 +661,7 @@ export interface LocalAgentJobStatusResponse {
   status: "queued" | "leased" | "succeeded" | "failed";
   attempt_count?: number;
   leased_until?: string | null;
+  next_attempt_at?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
   finished_at?: string | null;

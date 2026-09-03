@@ -118,41 +118,9 @@ assert.match(
   /resourceClient\.put\(`\/sources\/\$\{sourceId\}`,\s*\{\s*status\s*\}\)/,
   "Pause and resume should use the relative PUT /sources/{id} resource path",
 );
-assert.match(
-  sourcesPageSource,
-  /pollLocalAgentSyncJob/,
-  "Internal network GitHub sync should keep the row pending until the local daemon job finishes",
-);
-assert.match(
-  sourcesPageSource,
-  /getLocalAgentJob\(jobId\)/,
-  "Internal network GitHub sync should poll through the target-aware local-agent helper",
-);
-assert.match(
-  sourcesPageSource,
-  /Waiting for local daemon/,
-  "Local-agent sync should tell users when Cloud is waiting for their daemon",
-);
-assert.match(
-  sourcesPageSource,
-  /LOCAL_AGENT_TIMEOUT_MESSAGE/,
-  "Local-agent sync should use a distinct timeout message after polling gives up",
-);
-assert.match(
-  sourcesPageSource,
-  /memforge adapter daemon run/,
-  "Local-agent sync timeout should show the daemon command when a job is still waiting",
-);
-assert.match(
-  sourcesPageSource,
-  /localAgentJobBySource/,
-  "Local-agent sync should retain the durable job record used by the shared activity projector",
-);
-assert.match(
-  sourcesPageSource,
-  /LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS/,
-  "Successful local-agent sync should keep a short row-level terminal summary visible",
-);
+// Sync admission, durable polling, terminal handoff and retry presentation are
+// exercised through rendered interactions in SourcesPage.retry.test.tsx and
+// sourceSyncActivity.test.tsx rather than private variable names.
 assert.match(
   sourcesPageSource,
   /function localAgentJobPayload/,
@@ -205,7 +173,7 @@ assert.match(
 );
 assert.match(
   syncStatusCardSource,
-  /failed && policy\.canRetry && onRetry/,
+  /\(failed \|\| \(queued && activity\.retryTarget\)\) && policy\.canRetry && onRetry/,
   "Lifecycle-maintenance failures must not expose an ordinary sync retry",
 );
 assert.match(
@@ -300,7 +268,7 @@ assert.match(
 );
 assert.match(
   sourceRowSource,
-  /disabled=\{isSourceBusy \|\| isDeleting \|\| isPaused\}/,
+  /disabled=\{\(isSourceBusy && !canRetryWaiting\) \|\| isDeleting \|\| isPaused\}/,
   "Paused sources should not expose an enabled primary Sync button",
 );
 assert.doesNotMatch(

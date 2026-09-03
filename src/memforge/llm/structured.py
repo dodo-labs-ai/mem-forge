@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 type StructuredLlmTerminalCategory = Literal[
     "success",
+    "cancelled",
     "deadline_exceeded",
     "provider_error",
     "invalid_response",
@@ -244,8 +245,7 @@ class MemoryCandidate(StructuredResponseModel):
     def _reject_model_owned_observation_authority(cls, value: object):
         if isinstance(value, Mapping) and "source_observation_id" in value:
             raise ValueError(
-                "textual candidates must select evidence_block_id; "
-                "source_observation_id is application-owned"
+                "textual candidates must select evidence_block_id; source_observation_id is application-owned"
             )
         return value
 
@@ -274,15 +274,9 @@ class ArtifactSelectionSummary(StructuredResponseModel):
             return {}
         return {
             "source_observation_id": (
-                value.get("source_observation_id")
-                if isinstance(value.get("source_observation_id"), str)
-                else ""
+                value.get("source_observation_id") if isinstance(value.get("source_observation_id"), str) else ""
             ),
-            "summary": (
-                value.get("summary")
-                if isinstance(value.get("summary"), str)
-                else ""
-            ),
+            "summary": (value.get("summary") if isinstance(value.get("summary"), str) else ""),
         }
 
     @model_validator(mode="after")
@@ -334,8 +328,7 @@ class ProjectionTextMemoryCandidate(_ProjectionMemoryCandidateBase):
     def _reject_model_owned_observation_authority(cls, value: object):
         if isinstance(value, Mapping) and "source_observation_id" in value:
             raise ValueError(
-                "textual candidates must select evidence_block_id; "
-                "source_observation_id is application-owned"
+                "textual candidates must select evidence_block_id; source_observation_id is application-owned"
             )
         return value
 
@@ -708,9 +701,14 @@ class StructuredLlmMetricsCollector:
         with self._lock:
             self._calls.append(telemetry)
 
-    def summary(self, *, source_unit_elapsed_ms: int) -> StructuredLlmMetricsSummary:
+    def checkpoint(self) -> int:
+        """Mark the start of a stage without replacing its Unit collector."""
         with self._lock:
-            calls = tuple(self._calls)
+            return len(self._calls)
+
+    def summary(self, *, source_unit_elapsed_ms: int, since: int = 0) -> StructuredLlmMetricsSummary:
+        with self._lock:
+            calls = tuple(self._calls[since:])
 
         terminal_category_counts: dict[str, int] = {}
         operation_counts: dict[str, int] = {}
@@ -748,6 +746,27 @@ class StructuredLlmMetricsCollector:
             operation_counts=dict(sorted(operation_counts.items())),
             error_code_counts=dict(sorted(error_code_counts.items())),
         )
+
+
+_scoped_metrics_collector: ContextVar[StructuredLlmMetricsCollector | None] = ContextVar(
+    "memforge_structured_llm_metrics_collector",
+    default=None,
+)
+
+
+@contextmanager
+def structured_llm_metrics_scope(
+    collector: StructuredLlmMetricsCollector | None = None,
+) -> Iterator[StructuredLlmMetricsCollector]:
+    """Reuse the execution collector for nested stages, or start an explicit Unit."""
+    selected = collector if collector is not None else _scoped_metrics_collector.get()
+    if selected is None:
+        selected = StructuredLlmMetricsCollector()
+    token = _scoped_metrics_collector.set(selected)
+    try:
+        yield selected
+    finally:
+        _scoped_metrics_collector.reset(token)
 
 
 @dataclass
@@ -1627,10 +1646,6 @@ class LiteLlmStructuredClient:
     ) -> None:
         self.config = config
         self._telemetry_sink = telemetry_sink
-        self._scoped_metrics_collector: ContextVar[StructuredLlmMetricsCollector | None] = ContextVar(
-            f"memforge_structured_llm_metrics_collector_{id(self)}",
-            default=None,
-        )
 
     @property
     def max_concurrent(self) -> int:
@@ -1645,11 +1660,8 @@ class LiteLlmStructuredClient:
     ) -> Iterator[StructuredLlmMetricsCollector]:
         """Route calls in the current async context to one request-local collector."""
 
-        token = self._scoped_metrics_collector.set(collector)
-        try:
-            yield collector
-        finally:
-            self._scoped_metrics_collector.reset(token)
+        with structured_llm_metrics_scope(collector) as selected:
+            yield selected
 
     async def verify_source_support(
         self,
@@ -1952,6 +1964,15 @@ class LiteLlmStructuredClient:
                     state=state,
                     images=prepared_images.images,
                 )
+        except asyncio.CancelledError:
+            self._emit_telemetry(
+                state.telemetry(
+                    elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
+                    terminal_category="cancelled",
+                    error_code="call_cancelled",
+                )
+            )
+            raise
         except TimeoutError:
             failure = _StructuredLlmFailure(
                 terminal_category="deadline_exceeded",
@@ -2298,7 +2319,10 @@ class LiteLlmStructuredClient:
         }
         logger.info("structured_llm_call %s", json.dumps(payload, sort_keys=True, separators=(",", ":")))
         recovered_with_fallback = telemetry.terminal_category == "success" and telemetry.fallback_count > 0
-        if telemetry.terminal_category == "success":
+        if telemetry.terminal_category == "cancelled":
+            outcome = "expected"
+            reason_code = "call_cancelled"
+        elif telemetry.terminal_category == "success":
             outcome = "degraded" if recovered_with_fallback else "expected"
             reason_code = "schema_fallback_recovered" if recovered_with_fallback else "schema_conformant"
         else:
@@ -2364,7 +2388,7 @@ class LiteLlmStructuredClient:
                     json_error_column=attempt.json_error_column,
                 )
             )
-        scoped_collector = self._scoped_metrics_collector.get()
+        scoped_collector = _scoped_metrics_collector.get()
         if scoped_collector is not None:
             scoped_collector.record(telemetry)
         if self._telemetry_sink is not None:

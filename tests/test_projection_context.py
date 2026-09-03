@@ -640,6 +640,42 @@ print("safe")
     }.issubset(fragment_types)
 
 
+def test_structural_planner_avoids_inline_allocation_but_compiler_still_validates_html(monkeypatch) -> None:
+    from markdown_it.parser_inline import ParserInline
+
+    original_parse = ParserInline.parse
+    inline_calls = []
+
+    def track_inline(self, src, md, env, tokens):
+        inline_calls.append(src)
+        return original_parse(self, src, md, env, tokens)
+
+    monkeypatch.setattr(ParserInline, "parse", track_inline)
+    projection = _confluence_projection(
+        "# Guide\n\n" + "Paragraph with **bold** and <strong>inline HTML</strong>.\n\n" * 8
+    )
+    batches = plan_projection_extraction_batches(
+        projection, max_primary_chars=200,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+
+    assert len(batches) > 1
+    assert inline_calls == []
+
+    catalogs = [
+        compile_projection_fragment_catalog(projection, batch, access_context_hash="allocation-test")
+        for batch in batches
+    ]
+    assert inline_calls
+    assert all(catalog.usable for catalog in catalogs)
+    html_fragments = [
+        fragment for catalog in catalogs for fragment in catalog.fragments
+        if fragment.fragment_type == "markdown-inline-html"
+    ]
+    assert len(html_fragments) == 8
+    assert all("<strong>" not in fragment.presentation_text for fragment in html_fragments)
+
+
 @pytest.mark.asyncio
 async def test_projection_batch_extractor_rejects_claim_grounded_only_in_context() -> None:
     projection = _jira_projection(3)

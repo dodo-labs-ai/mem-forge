@@ -494,6 +494,7 @@ def test_source_list_projects_a_retried_sync_as_a_fresh_attempt(tmp_path):
     now = datetime.now(timezone.utc)
     active_retry = SimpleNamespace(
         run_id="run-retry",
+        created_at=now,
         status="running",
         trigger="scheduled",
         force_full_sync=False,

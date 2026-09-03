@@ -613,7 +613,9 @@ def _markdown_protected_ranges(text: str) -> tuple[tuple[int, int], ...]:
     """Return outermost CommonMark structures in one ordered parser pass."""
 
     try:
-        tokens = _markdown_parser().parse(text)
+        # Planning consumes block coordinates only. Inline validation belongs to
+        # Fragment compilation, where its tokens and source ranges are needed.
+        tokens = _markdown_parser().disable("inline").parse(text)
     except Exception as exc:
         raise ValueError(
             f"Markdown parser rejected structural planning: {type(exc).__name__}"

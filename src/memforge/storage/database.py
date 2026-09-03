@@ -27,7 +27,9 @@ from memforge.agent_session_contract import (
     successful_agent_session_activity_at,
 )
 from memforge.local_agent.source_contract import (
+    LOCAL_AGENT_SYNC_OPERATIONS,
     local_agent_completion_status,
+    local_agent_retry_delay,
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
@@ -1690,6 +1692,7 @@ CREATE TABLE IF NOT EXISTS local_agent_jobs (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     result_json TEXT,
     last_error TEXT,
+    next_attempt_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     finished_at TEXT
@@ -4288,6 +4291,11 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                END""",
         ],
     ),
+    (
+        91,
+        "Persist local-agent retry due time",
+        ["ALTER TABLE local_agent_jobs ADD COLUMN next_attempt_at TEXT"],
+    ),
 ]
 
 
@@ -5322,78 +5330,128 @@ class Database:
         created_by_user_id: str,
         execution_owner_user_id: str,
         workspace_id: str = "default",
+        trigger: str = "manual",
+        retry_job_id: str | None = None,
     ) -> tuple[str, bool]:
-        now_iso = _utc_iso(None)
-        requested_force = bool(payload.get("force_full_sync"))
         async with self._write_lock:
             try:
-                source_lock = await self.db.execute(
-                    "UPDATE sources SET status = status WHERE id = ?",
-                    (source_id,),
+                result = await self._enqueue_local_agent_job_locked(
+                    job_id=job_id,
+                    source_id=source_id,
+                    source_type=source_type,
+                    operation=operation,
+                    payload=payload,
+                    created_by_user_id=created_by_user_id,
+                    execution_owner_user_id=execution_owner_user_id,
+                    workspace_id=workspace_id,
+                    trigger=trigger,
+                    retry_job_id=retry_job_id,
+                    now_iso=_utc_iso(None),
                 )
-                if source_lock.rowcount != 1:
-                    raise ValueError(f"Source not found: {source_id}")
-                async with self.db.execute(
-                    """SELECT id FROM lifecycle_backfill_jobs
-                       WHERE source_id = ? AND status IN ('queued', 'running')
-                       ORDER BY created_at LIMIT 1""",
-                    (source_id,),
-                ) as cursor:
-                    lifecycle_job = await cursor.fetchone()
-                if lifecycle_job is not None:
-                    raise ValueError(f"source lifecycle maintenance active: {lifecycle_job['id']}")
+                await self.db.commit()
+                return result
             except Exception:
                 await self.db.rollback()
                 raise
-            async with self.db.execute(
-                """SELECT * FROM local_agent_jobs
-                   WHERE workspace_id = ? AND source_id = ? AND operation = ?
-                     AND execution_owner_user_id = ? AND status IN ('queued', 'leased')
-                   ORDER BY created_at LIMIT 1""",
-                (workspace_id, source_id, operation, execution_owner_user_id),
-            ) as cursor:
-                existing = await cursor.fetchone()
-            if existing is not None:
-                existing_payload = json.loads(existing["payload_json"] or "{}")
-                if existing["status"] == "queued":
-                    replacement = dict(payload)
-                    if bool(existing_payload.get("force_full_sync")):
-                        replacement["force_full_sync"] = True
-                    if replacement != existing_payload:
-                        await self.db.execute(
-                            """UPDATE local_agent_jobs SET payload_json = ?, updated_at = ?
-                               WHERE job_id = ? AND status IN ('queued', 'leased')""",
-                            (
-                                json.dumps(replacement, sort_keys=True),
-                                now_iso,
-                                existing["job_id"],
-                            ),
-                        )
-                        await self.db.commit()
-                    return str(existing["job_id"]), False
-                same_revision = existing_payload.get("source_config_revision") == payload.get("source_config_revision")
-                if same_revision and (not requested_force or bool(existing_payload.get("force_full_sync"))):
-                    return str(existing["job_id"]), False
+
+    async def _enqueue_local_agent_job_locked(
+        self,
+        *,
+        job_id: str,
+        source_id: str,
+        source_type: str,
+        operation: str,
+        payload: Mapping[str, Any],
+        created_by_user_id: str,
+        execution_owner_user_id: str,
+        workspace_id: str,
+        trigger: str,
+        now_iso: str,
+        retry_job_id: str | None = None,
+    ) -> tuple[str, bool]:
+        """Coalesce work inside the caller's source-write transaction."""
+        source_lock = await self.db.execute(
+            "UPDATE sources SET status = status WHERE id = ?",
+            (source_id,),
+        )
+        if source_lock.rowcount != 1:
+            raise ValueError(f"Source not found: {source_id}")
+        source = await self.get_source(source_id)
+        if source["status"] != "active":
+            raise ValueError(f"Source is not active: {source_id}")
+        async with self.db.execute(
+            """SELECT id FROM lifecycle_backfill_jobs
+               WHERE source_id = ? AND status IN ('queued', 'running')
+               ORDER BY created_at LIMIT 1""",
+            (source_id,),
+        ) as cursor:
+            lifecycle_job = await cursor.fetchone()
+        if lifecycle_job is not None:
+            raise ValueError(f"source lifecycle maintenance active: {lifecycle_job['id']}")
+
+        if retry_job_id is not None:
+            target = await self.get_local_agent_job(retry_job_id)
+            if target is None or any(
+                target[key] != value
+                for key, value in (
+                    ("workspace_id", workspace_id),
+                    ("source_id", source_id),
+                    ("operation", operation),
+                    ("execution_owner_user_id", execution_owner_user_id),
+                )
+            ):
+                raise ValueError("local agent retry target does not match source and owner")
+            if target["status"] != "queued":
+                return retry_job_id, False
+            current_payload = local_agent_sync_job_payload(source)
+            if any(
+                target["payload"].get(key) != current_payload[key]
+                for key in ("source_config_revision", "source_activity_epoch")
+            ):
+                raise ValueError("local agent retry target configuration or activity epoch is stale")
+            if trigger != "manual":
+                raise ValueError("targeted retry requires manual intent")
             await self.db.execute(
-                """INSERT INTO local_agent_jobs (
-                    job_id, workspace_id, source_id, source_type, operation,
-                    payload_json, created_by_user_id, execution_owner_user_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    job_id,
-                    workspace_id,
-                    source_id,
-                    source_type,
-                    operation,
-                    json.dumps(dict(payload), sort_keys=True),
-                    created_by_user_id,
-                    execution_owner_user_id,
-                    now_iso,
-                    now_iso,
-                ),
+                """UPDATE local_agent_jobs SET next_attempt_at = NULL, updated_at = ?
+                   WHERE job_id = ? AND status = 'queued'""",
+                (now_iso, retry_job_id),
             )
-            await self.db.commit()
+            return retry_job_id, False
+
+        async with self.db.execute(
+            """SELECT * FROM local_agent_jobs
+               WHERE workspace_id = ? AND source_id = ? AND operation = ?
+                 AND execution_owner_user_id = ? AND status IN ('queued', 'leased')
+               ORDER BY created_at LIMIT 1""",
+            (workspace_id, source_id, operation, execution_owner_user_id),
+        ) as cursor:
+            existing = await cursor.fetchone()
+        if existing is not None:
+            existing_payload = json.loads(existing["payload_json"] or "{}")
+            if existing["status"] == "queued":
+                replacement = dict(payload)
+                if bool(existing_payload.get("force_full_sync")):
+                    replacement["force_full_sync"] = True
+                await self.db.execute(
+                    """UPDATE local_agent_jobs SET payload_json = ?, updated_at = ?,
+                           next_attempt_at = CASE WHEN ? THEN NULL ELSE next_attempt_at END
+                       WHERE job_id = ? AND status = 'queued'""",
+                    (json.dumps(replacement, sort_keys=True), now_iso, trigger == "manual", existing["job_id"]),
+                )
+                return str(existing["job_id"]), False
+            same_revision = existing_payload.get("source_config_revision") == payload.get("source_config_revision")
+            if same_revision and (not payload.get("force_full_sync") or existing_payload.get("force_full_sync")):
+                return str(existing["job_id"]), False
+        await self.db.execute(
+            """INSERT INTO local_agent_jobs (
+                job_id, workspace_id, source_id, source_type, operation,
+                payload_json, created_by_user_id, execution_owner_user_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job_id, workspace_id, source_id, source_type, operation,
+             json.dumps(dict(payload), sort_keys=True), created_by_user_id,
+             execution_owner_user_id, now_iso, now_iso),
+        )
         return job_id, True
 
     async def get_local_agent_job(self, job_id: str) -> dict[str, Any] | None:
@@ -5407,12 +5465,15 @@ class Database:
         workspace_id: str,
         user_id: str,
     ) -> list[dict[str, Any]]:
+        operations = sorted(LOCAL_AGENT_SYNC_OPERATIONS)
+        placeholders = ",".join("?" for _ in operations)
         async with self.db.execute(
-            """SELECT * FROM local_agent_jobs
+            f"""SELECT * FROM local_agent_jobs
                WHERE workspace_id = ? AND execution_owner_user_id = ? AND source_id <> ''
+               AND operation IN ({placeholders})
                ORDER BY CASE WHEN status IN ('queued', 'leased') THEN 0 ELSE 1 END,
                         created_at DESC LIMIT 200""",
-            (workspace_id, user_id),
+            (workspace_id, user_id, *operations),
         ) as cursor:
             rows = await cursor.fetchall()
         latest_by_source: dict[str, dict[str, Any]] = {}
@@ -5443,7 +5504,7 @@ class Database:
             async with self.db.execute(
                 """SELECT j.job_id FROM local_agent_jobs j
                    WHERE j.execution_owner_user_id = ?
-                     AND (j.status = 'queued' OR
+                     AND ((j.status = 'queued' AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ?)) OR
                           (j.status = 'leased' AND j.leased_until <= ?))
                      AND NOT EXISTS (
                          SELECT 1 FROM local_agent_jobs active
@@ -5456,7 +5517,7 @@ class Database:
                            AND active.job_id <> j.job_id
                      )
                    ORDER BY j.created_at, j.job_id LIMIT ?""",
-                (user_id, now_iso, now_iso, limit),
+                (user_id, now_iso, now_iso, now_iso, limit),
             ) as cursor:
                 rows = await cursor.fetchall()
             for row in rows:
@@ -5464,9 +5525,9 @@ class Database:
                     """UPDATE local_agent_jobs SET status = 'leased',
                        lease_owner_user_id = ?, leased_until = ?,
                        attempt_count = attempt_count + 1, result_json = NULL,
-                       last_error = NULL, finished_at = NULL, updated_at = ?
+                       last_error = NULL, next_attempt_at = NULL, finished_at = NULL, updated_at = ?
                        WHERE job_id = ? AND execution_owner_user_id = ?
-                         AND (status = 'queued' OR
+                         AND ((status = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) OR
                               (status = 'leased' AND leased_until <= ?))
                          AND NOT EXISTS (
                              SELECT 1 FROM local_agent_jobs active
@@ -5484,6 +5545,7 @@ class Database:
                         now_iso,
                         row["job_id"],
                         user_id,
+                        now_iso,
                         now_iso,
                         now_iso,
                     ),
@@ -5543,25 +5605,29 @@ class Database:
         retryable: bool = False,
         now: datetime | None = None,
     ) -> bool:
-        now_iso = _utc_iso(now)
+        completed_at = now or datetime.now(timezone.utc)
+        now_iso = _utc_iso(completed_at)
         stored_status = local_agent_completion_status(
             status,
             retryable=retryable,
             attempt_count=attempt_count,
         )
         should_retry = stored_status == "queued"
+        delay = local_agent_retry_delay(status, retryable=retryable, attempt_count=attempt_count)
+        next_attempt_at = _utc_iso(completed_at + delay) if delay is not None else None
         finished_at = None if should_retry else now_iso
         async with self._write_lock:
             cursor = await self.db.execute(
                 """UPDATE local_agent_jobs SET status = ?, result_json = ?,
                    last_error = ?, lease_owner_user_id = NULL,
-                   leased_until = NULL, finished_at = ?, updated_at = ?
+                   leased_until = NULL, next_attempt_at = ?, finished_at = ?, updated_at = ?
                    WHERE job_id = ? AND status = 'leased'
                      AND lease_owner_user_id = ? AND attempt_count = ?""",
                 (
                     stored_status,
                     json.dumps(dict(result), sort_keys=True),
                     error,
+                    next_attempt_at,
                     finished_at,
                     now_iso,
                     job_id,
@@ -5591,31 +5657,53 @@ class Database:
         due_at = _utc_iso(claim_time)
         enqueued = 0
         async with self._write_lock:
-            async with self.db.execute(
-                """SELECT * FROM sources s WHERE status = 'active'
-                   AND sync_schedule_enabled = 1
-                   AND sync_schedule_next_at IS NOT NULL
-                   AND sync_schedule_next_at <= ?
-                   AND NOT EXISTS (
-                       SELECT 1 FROM lifecycle_backfill_jobs j
-                       WHERE j.source_id = s.id
-                         AND j.status IN ('queued', 'running')
-                   )
-                   ORDER BY s.sync_schedule_next_at, s.created_at LIMIT ?""",
-                (due_at, limit),
-            ) as cursor:
-                rows = [dict(row) async for row in cursor]
-            for row in rows:
-                operation = local_agent_sync_operation(row["type"], row["config"])
-                if operation is None:
-                    continue
-                owner = str(row.get("execution_owner_user_id") or "").strip()
-                expected_due = str(row["sync_schedule_next_at"])
-                interval = int(
-                    row.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
-                )
-                if not owner:
-                    await self.db.execute(
+            try:
+                async with self.db.execute(
+                    """SELECT * FROM sources s WHERE status = 'active'
+                       AND sync_schedule_enabled = 1
+                       AND sync_schedule_next_at IS NOT NULL
+                       AND sync_schedule_next_at <= ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM lifecycle_backfill_jobs j
+                           WHERE j.source_id = s.id
+                             AND j.status IN ('queued', 'running')
+                       )
+                       ORDER BY s.sync_schedule_next_at, s.created_at LIMIT ?""",
+                    (due_at, limit),
+                ) as cursor:
+                    rows = [dict(row) async for row in cursor]
+                for row in rows:
+                    operation = local_agent_sync_operation(row["type"], row["config"])
+                    if operation is None:
+                        continue
+                    owner = str(row.get("execution_owner_user_id") or "").strip()
+                    expected_due = str(row["sync_schedule_next_at"])
+                    interval = int(
+                        row.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
+                    )
+                    if not owner:
+                        await self.db.execute(
+                            """UPDATE sources SET sync_schedule_next_at = ?,
+                               sync_schedule_updated_at = ?
+                               WHERE id = ? AND status = 'active'
+                                 AND sync_schedule_enabled = 1
+                                 AND sync_schedule_next_at = ?""",
+                            (
+                                _utc_iso(claim_time + timedelta(minutes=interval)),
+                                due_at,
+                                row["id"],
+                                expected_due,
+                            ),
+                        )
+                        continue
+                    job_id = (
+                        "laj-schedule-"
+                        + uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"memforge:{workspace_id}:{row['id']}:{expected_due}",
+                        ).hex
+                    )
+                    cursor = await self.db.execute(
                         """UPDATE sources SET sync_schedule_next_at = ?,
                            sync_schedule_updated_at = ?
                            WHERE id = ? AND status = 'active'
@@ -5628,49 +5716,18 @@ class Database:
                             expected_due,
                         ),
                     )
-                    continue
-                job_id = (
-                    "laj-schedule-"
-                    + uuid.uuid5(
-                        uuid.NAMESPACE_URL,
-                        f"memforge:{workspace_id}:{row['id']}:{expected_due}",
-                    ).hex
-                )
-                cursor = await self.db.execute(
-                    """UPDATE sources SET sync_schedule_next_at = ?,
-                       sync_schedule_updated_at = ?
-                       WHERE id = ? AND status = 'active'
-                         AND sync_schedule_enabled = 1
-                         AND sync_schedule_next_at = ?""",
-                    (
-                        _utc_iso(claim_time + timedelta(minutes=interval)),
-                        due_at,
-                        row["id"],
-                        expected_due,
-                    ),
-                )
-                if cursor.rowcount:
-                    await self.db.execute(
-                        """INSERT OR IGNORE INTO local_agent_jobs (
-                            job_id, workspace_id, source_id, source_type, operation,
-                            payload_json, created_by_user_id, execution_owner_user_id,
-                            created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            job_id,
-                            workspace_id,
-                            row["id"],
-                            row["type"],
-                            operation,
-                            json.dumps(local_agent_sync_job_payload(row), sort_keys=True),
-                            owner,
-                            owner,
-                            due_at,
-                            due_at,
-                        ),
-                    )
-                    enqueued += 1
-            await self.db.commit()
+                    if cursor.rowcount:
+                        _, created = await self._enqueue_local_agent_job_locked(
+                            job_id=job_id, workspace_id=workspace_id, source_id=row["id"],
+                            source_type=row["type"], operation=operation,
+                            payload=local_agent_sync_job_payload(row), created_by_user_id=owner,
+                            execution_owner_user_id=owner, now_iso=due_at, trigger="scheduled",
+                        )
+                        enqueued += int(created)
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
         return enqueued
 
     async def count_documents(self, source: str | None = None) -> int:
@@ -19472,6 +19529,7 @@ class Database:
         input_snapshot_id: str | None = None,
         source_config_revision: str | None = None,
         predecessor_activity_id: str | None = None,
+        retry_run_id: str | None = None,
     ) -> SourceSyncRun:
         for _attempt in range(3):
             async with self._write_lock:
@@ -19484,6 +19542,7 @@ class Database:
                         input_snapshot_id=input_snapshot_id,
                         source_config_revision=source_config_revision,
                         predecessor_activity_id=predecessor_activity_id,
+                        retry_run_id=retry_run_id,
                     )
                     await self.db.commit()
                     return run
@@ -19505,6 +19564,7 @@ class Database:
         input_snapshot_id: str | None = None,
         source_config_revision: str | None = None,
         predecessor_activity_id: str | None = None,
+        retry_run_id: str | None = None,
         now: str | None = None,
     ) -> SourceSyncRun:
         now_iso = now or _now_iso()
@@ -19544,6 +19604,23 @@ class Database:
             lifecycle_job = await cursor.fetchone()
         if lifecycle_job is not None:
             raise SourceActivityConflict(f"source lifecycle maintenance active: {lifecycle_job['id']}")
+        if retry_run_id is not None:
+            target = await self.get_source_sync_run(retry_run_id)
+            if target is None or target.source_id != source_id or target.workspace_id != workspace_id:
+                raise ValueError("source sync retry target does not match source and workspace")
+            if target.status != "pending":
+                return replace(target, coalesced=True)
+            if trigger != "manual":
+                raise ValueError("targeted retry requires manual intent")
+            if target.source_config_revision is not None and target.source_config_revision != local_agent_source_config_revision(dict(source)):
+                raise ValueError("source sync retry target configuration is stale")
+            await self.db.execute(
+                """UPDATE source_sync_runs SET next_attempt_at = NULL, updated_at = ?
+                   WHERE run_id = ? AND status = 'pending'""", (now_iso, retry_run_id),
+            )
+            current = await self.get_source_sync_run(retry_run_id)
+            return replace(current, coalesced=True)
+
         async with self.db.execute(
             """SELECT MAX(input_generation) AS watermark
                FROM source_sync_inputs
@@ -19623,6 +19700,8 @@ class Database:
                            WHEN status = 'running' AND ? THEN ?
                            ELSE rerun_predecessor_activity_id
                        END,
+                       next_attempt_at = CASE
+                           WHEN status = 'pending' AND ? THEN NULL ELSE next_attempt_at END,
                        updated_at = ?
                    WHERE run_id = ? AND status IN ('pending', 'running')""",
                 (
@@ -19644,6 +19723,7 @@ class Database:
                     normalized_predecessor_activity_id,
                     int(mark_rerun),
                     normalized_predecessor_activity_id,
+                    trigger in {"manual", "force"},
                     now_iso,
                     existing["run_id"],
                 ),

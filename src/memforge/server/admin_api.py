@@ -1331,11 +1331,17 @@ class SourceAccessTransitionRequest(BaseModel):
     target_policy: Literal["private", "workspace"]
 
 
+class SourceSyncRetryTarget(BaseModel):
+    execution_kind: Literal["source_sync_run"]
+    execution_id: str = Field(min_length=1, max_length=255)
+
+
 class SourceSyncRequest(BaseModel):
     force_full_sync: bool = False
     sync_snapshot_id: str | None = None
     local_agent_job_id: str | None = None
     local_agent_attempt_count: int | None = Field(default=None, ge=1)
+    retry_target: SourceSyncRetryTarget | None = None
 
 
 class SourceRebaselineRequest(BaseModel):
@@ -1353,6 +1359,7 @@ class LocalAgentJobCreateRequest(BaseModel):
     source_type: str
     operation: str
     payload: dict[str, Any] = Field(default_factory=dict)
+    retry_job_id: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class LocalAgentJobLeaseRequest(BaseModel):
@@ -6935,6 +6942,8 @@ def create_admin_app(
         operation = local_agent_sync_operation(source["type"], source.get("config"))
         if operation is None:
             return None
+        if source.get("status") != "active":
+            raise HTTPException(status_code=409, detail="source_not_active")
         owner = execution_owner_user_id(source)
         if owner is None:
             raise HTTPException(
@@ -6973,6 +6982,24 @@ def create_admin_app(
             "coalesced": not created,
         }
 
+    @source_router.get("/{source_id}/sync-runs/{run_id}")
+    async def read_source_sync_run(
+        request: Request,
+        source_id: str,
+        run_id: str,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Resolve an exact admission receipt without advancing or replaying it."""
+        source = await db.get_source(source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_sync_execution(request, source)
+        run = await db.get_source_sync_run(run_id)
+        if run is None or run.source_id != source_id or run.workspace_id != workspace_id:
+            raise HTTPException(status_code=404, detail="Sync run not found")
+        return {"run_id": run.run_id, "status": run.status}
+
     @source_router.post("/{source_id}/sync", status_code=202)
     async def trigger_sync(
         request: Request,
@@ -6988,20 +7015,20 @@ def create_admin_app(
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
 
-        local_job = await _enqueue_local_source_collection_job(
-            request,
-            db,
-            source,
-            force_full_sync=bool(req and req.force_full_sync),
-        )
-        if local_job is not None:
-            return local_job
+        retry_run_id = req.retry_target.execution_id if req and req.retry_target else None
+        if retry_run_id is None:
+            local_job = await _enqueue_local_source_collection_job(
+                request, db, source, force_full_sync=bool(req and req.force_full_sync),
+            )
+            if local_job is not None:
+                return local_job
 
         try:
             run = await sync_service.enqueue_source(
                 source_id,
                 trigger="manual",
                 force_full_sync=bool(req and req.force_full_sync),
+                retry_run_id=retry_run_id,
             )
         except SourcePausedError:
             raise _source_paused_http_error()
@@ -7009,6 +7036,7 @@ def create_admin_app(
             SourceLifecycleMaintenanceError,
             SourceActivityConflict,
             SourceSyncUnsupportedError,
+            ValueError,
         ) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
@@ -7017,6 +7045,7 @@ def create_admin_app(
             "source_id": source_id,
             "run_id": run.run_id,
             "status": run.status,
+            "created_at": run.created_at.isoformat(),
             "coalesced": run.coalesced,
         }
 
@@ -7106,6 +7135,7 @@ def create_admin_app(
             "source_id": source_id,
             "run_id": run.run_id,
             "status": run.status,
+            "created_at": run.created_at.isoformat(),
             "coalesced": run.coalesced,
         }
 
@@ -7152,6 +7182,7 @@ def create_admin_app(
             "source_id": source_id,
             "run_id": run.run_id,
             "status": run.status,
+            "created_at": run.created_at.isoformat(),
             "coalesced": run.coalesced,
         }
 
@@ -9046,6 +9077,7 @@ def create_admin_app(
             "execution_owner_user_id": job["execution_owner_user_id"],
             "result": job.get("result") or {},
             "last_error": job.get("last_error"),
+            "next_attempt_at": job.get("next_attempt_at"),
             "leased_until": job.get("leased_until"),
             "attempt_count": int(job.get("attempt_count") or 0),
             "created_at": job.get("created_at"),
@@ -9063,6 +9095,8 @@ def create_admin_app(
         requester = resolve_request_principal(request)
         source_id = req.source_id.strip()
         payload = dict(req.payload)
+        if req.retry_job_id is not None and req.operation not in LOCAL_AGENT_SYNC_OPERATIONS:
+            raise HTTPException(status_code=400, detail="retry_target_requires_sync_operation")
         if req.operation in LOCAL_AGENT_SYNC_OPERATIONS:
             if not source_id:
                 raise HTTPException(status_code=400, detail="local_agent_sync_requires_source_id")
@@ -9104,10 +9138,14 @@ def create_admin_app(
                 payload=payload,
                 created_by_user_id=requester,
                 execution_owner_user_id=owner,
+                retry_job_id=req.retry_job_id,
+                trigger="manual",
             )
+            current_job = await db.get_local_agent_job(job_id)
             return {
                 "job_id": job_id,
-                "status": "queued",
+                "status": current_job["status"],
+                "created_at": current_job["created_at"],
                 "coalesced": not created,
             }
         await db.insert_local_agent_job(

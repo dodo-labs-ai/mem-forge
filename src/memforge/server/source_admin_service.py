@@ -132,13 +132,12 @@ def _durable_sync_payload(run: Any) -> dict[str, Any]:
         run.lease_expires_at is None or run.lease_expires_at <= now
     ):
         status = "recovering"
-    elif status == "pending" and run.next_attempt_at is not None:
-        status = "recovering"
     return {
         "run_id": run.run_id,
         "status": status,
         "trigger": run.trigger,
         "force_full_sync": run.force_full_sync,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "finished_at": run.completed_at.isoformat() if run.completed_at else None,
         "next_attempt_at": (

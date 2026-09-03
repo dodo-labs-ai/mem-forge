@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass
 from time import perf_counter
 
-from memforge.llm.structured import StructuredLlmError
+from memforge.llm.structured import StructuredLlmError, structured_llm_metrics_scope
 from memforge.memory.evidence import RelationDirection
 from memforge.memory.relation_classifier import (
     MemoryPair,
@@ -102,6 +102,9 @@ class ReconciliationFailure:
     error_type: str
     reason_code: str
     error: str
+    operation: str | None = None
+    terminal_category: str | None = None
+    error_code: str | None = None
 
 
 class ReconciliationContractError(ValueError):
@@ -193,155 +196,155 @@ async def reconcile_memories(
 ) -> list[ReconcileOperation] | ReconciliationResult:
     """Classify a complete relation/support ledger and reduce it deterministically."""
 
-    started = perf_counter()
-    structured_llm_calls = 0
-    model_batch_count = 0
-    structured_llm_elapsed_seconds = 0.0
-    relation_pair_count = 0
-    relation_prompt_chars = 0
-    revision_proof_count = 0
-    revision_proof_failure_count = 0
+    with structured_llm_metrics_scope() as collector:
+        checkpoint = collector.checkpoint()
+        started = perf_counter()
+        relation_pair_count = 0
+        relation_prompt_chars = 0
+        revision_proof_count = 0
+        revision_proof_failure_count = 0
 
-    def metrics() -> ReconciliationMetrics:
-        return ReconciliationMetrics(
-            structured_llm_calls=structured_llm_calls,
-            model_batch_count=model_batch_count,
-            structured_llm_elapsed_ms=max(0, round(structured_llm_elapsed_seconds * 1000)),
-            reconciliation_elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
-            relation_pair_count=relation_pair_count,
-            relation_prompt_chars=relation_prompt_chars,
-            revision_proof_count=revision_proof_count,
-            revision_proof_failure_count=revision_proof_failure_count,
-        )
+        def metrics() -> ReconciliationMetrics:
+            actual = collector.summary(source_unit_elapsed_ms=0, since=checkpoint)
+            return ReconciliationMetrics(
+                structured_llm_calls=actual.logical_calls,
+                model_batch_count=actual.logical_calls,
+                structured_llm_elapsed_ms=actual.llm_elapsed_ms,
+                reconciliation_elapsed_ms=max(0, round((perf_counter() - started) * 1000)),
+                relation_pair_count=relation_pair_count,
+                relation_prompt_chars=relation_prompt_chars,
+                revision_proof_count=revision_proof_count,
+                revision_proof_failure_count=revision_proof_failure_count,
+            )
 
-    if not new_extractions and not existing_memories:
-        return _return_result([], metrics=metrics(), include_metadata=include_metadata)
-    if not existing_memories:
-        return _return_result(
-            [ReconcileOperation(action=ReconcileAction.ADD, memory=raw) for raw in new_extractions],
-            metrics=metrics(),
-            include_metadata=include_metadata,
-        )
+        if not new_extractions and not existing_memories:
+            return _return_result([], metrics=metrics(), include_metadata=include_metadata)
+        if not existing_memories:
+            return _return_result(
+                [ReconcileOperation(action=ReconcileAction.ADD, memory=raw) for raw in new_extractions],
+                metrics=metrics(),
+                include_metadata=include_metadata,
+            )
 
-    try:
-        classifier = StructuredMemoryPairClassifier(client=structured_llm_client, model=llm_model)
-        transient_candidates = tuple(_transient_candidate(index, raw) for index, raw in enumerate(new_extractions))
-        pairs = tuple(
-            MemoryPair(challenger=candidate, candidate=incumbent)
-            for candidate in transient_candidates
-            for incumbent in existing_memories
-        )
-        relation_started = perf_counter()
-        classification = await classifier.classify(pairs)
-        structured_llm_elapsed_seconds += perf_counter() - relation_started
-        structured_llm_calls += classification.llm_calls
-        model_batch_count += classification.llm_calls
-        relation_pair_count += len(pairs)
-        relation_prompt_chars += classification.prompt_chars
-        relation_entries = _bind_relation_entries(
-            classification.decisions,
-            candidate_count=len(new_extractions),
-            incumbents=existing_memories,
-        )
+        operation = "classify_memory_relations"
+        try:
+            classifier = StructuredMemoryPairClassifier(client=structured_llm_client, model=llm_model)
+            transient_candidates = tuple(_transient_candidate(index, raw) for index, raw in enumerate(new_extractions))
+            pairs = tuple(
+                MemoryPair(challenger=candidate, candidate=incumbent)
+                for candidate in transient_candidates
+                for incumbent in existing_memories
+            )
+            classification = await classifier.classify(pairs)
+            relation_pair_count += len(pairs)
+            relation_prompt_chars += classification.prompt_chars
+            relation_entries = _bind_relation_entries(
+                classification.decisions,
+                candidate_count=len(new_extractions),
+                incumbents=existing_memories,
+            )
 
-        audits, calls, elapsed = await _audit_incumbent_support(
-            incumbents=existing_memories,
-            structured_llm_client=structured_llm_client,
-            llm_model=llm_model,
-            doc_type=doc_type,
-            updated_document=updated_document,
-            update_mode=update_mode,
-            changed_hunks=changed_hunks,
-            update_plan_stats=update_plan_stats,
-        )
-        structured_llm_calls += calls
-        model_batch_count += calls
-        structured_llm_elapsed_seconds += elapsed
+            operation = "audit_incumbent_support"
+            audits, _calls, _elapsed = await _audit_incumbent_support(
+                incumbents=existing_memories,
+                structured_llm_client=structured_llm_client,
+                llm_model=llm_model,
+                doc_type=doc_type,
+                updated_document=updated_document,
+                update_mode=update_mode,
+                changed_hunks=changed_hunks,
+                update_plan_stats=update_plan_stats,
+            )
 
-        refiners_by_incumbent = _supported_revision_candidates(relation_entries, audits)
-        conditional_pairs = tuple(
-            MemoryPair(challenger=transient_candidates[left], candidate=transient_candidates[right])
-            for indices in refiners_by_incumbent.values()
-            if len(indices) > 1
-            for offset, left in enumerate(indices)
-            for right in indices[offset + 1 :]
-        )
-        if conditional_pairs:
-            conditional_started = perf_counter()
-            conditional = await classifier.classify(conditional_pairs)
-            structured_llm_elapsed_seconds += perf_counter() - conditional_started
-            structured_llm_calls += conditional.llm_calls
-            model_batch_count += conditional.llm_calls
-            relation_pair_count += len(conditional_pairs)
-            relation_prompt_chars += conditional.prompt_chars
-            if any(decision.relation_type is MemoryRelationType.CONTRADICTS for decision in conditional.decisions):
-                raise ReconciliationContractError(
-                    "non_unique_refinement_conflict",
-                    "multiple refinement candidates contain incompatible current assertions",
-                )
+            refiners_by_incumbent = _supported_revision_candidates(relation_entries, audits)
+            conditional_pairs = tuple(
+                MemoryPair(challenger=transient_candidates[left], candidate=transient_candidates[right])
+                for indices in refiners_by_incumbent.values()
+                if len(indices) > 1
+                for offset, left in enumerate(indices)
+                for right in indices[offset + 1 :]
+            )
+            if conditional_pairs:
+                operation = "classify_memory_relations"
+                conditional = await classifier.classify(conditional_pairs)
+                relation_pair_count += len(conditional_pairs)
+                relation_prompt_chars += conditional.prompt_chars
+                if any(decision.relation_type is MemoryRelationType.CONTRADICTS for decision in conditional.decisions):
+                    raise ReconciliationContractError(
+                        "non_unique_refinement_conflict",
+                        "multiple refinement candidates contain incompatible current assertions",
+                    )
 
-        proof_requests = [
-            (indices[0], incumbent_id)
-            for incumbent_id, indices in refiners_by_incumbent.items()
-            if len(indices) == 1
-        ]
-        proofs, calls, elapsed = await _prove_revision_compositions(
-            requests=proof_requests,
-            new_extractions=new_extractions,
-            incumbents={memory.id: memory for memory in existing_memories},
-            structured_llm_client=structured_llm_client,
-            llm_model=llm_model,
-        )
-        revision_proof_count = len(proofs)
-        revision_proof_failure_count = len(proof_requests) - len(proofs)
-        structured_llm_calls += calls
-        model_batch_count += calls
-        structured_llm_elapsed_seconds += elapsed
+            proof_requests = [
+                (indices[0], incumbent_id)
+                for incumbent_id, indices in refiners_by_incumbent.items()
+                if len(indices) == 1
+            ]
+            operation = "prove_revision_compositions"
+            proofs, _calls, _elapsed = await _prove_revision_compositions(
+                requests=proof_requests,
+                new_extractions=new_extractions,
+                incumbents={memory.id: memory for memory in existing_memories},
+                structured_llm_client=structured_llm_client,
+                llm_model=llm_model,
+            )
+            revision_proof_count = len(proofs)
+            revision_proof_failure_count = len(proof_requests) - len(proofs)
 
-        operations = reduce_relation_ledger(
-            new_extractions=new_extractions,
-            existing_memories=existing_memories,
-            relations=relation_entries,
-            support_audits=audits,
-            revision_proofs=proofs,
-        )
-        return _return_result(operations, metrics=metrics(), include_metadata=include_metadata)
-    except ReconciliationContractError as error:
-        logger.warning("Relation-first reconciliation failed closed: %s", error)
-        return _return_result(
-            [],
-            failure=ReconciliationFailure(
-                error_type="relation_first_error",
-                reason_code=error.reason_code,
-                error=str(error),
-            ),
-            metrics=metrics(),
-            include_metadata=include_metadata,
-        )
-    except (StructuredLlmError, MemoryPairClassificationError, KeyError, ValueError) as error:
-        logger.warning("Relation-first reconciliation failed closed: %s", error)
-        return _return_result(
-            [],
-            failure=ReconciliationFailure(
-                error_type="relation_first_error",
-                reason_code="relation_first_failed",
-                error=str(error),
-            ),
-            metrics=metrics(),
-            include_metadata=include_metadata,
-        )
-    except Exception as error:  # pragma: no cover - defensive provider boundary
-        logger.exception("Unexpected relation-first reconciliation failure")
-        return _return_result(
-            [],
-            failure=ReconciliationFailure(
-                error_type="unexpected_error",
-                reason_code="unexpected_reconciliation_failure",
-                error=str(error),
-            ),
-            metrics=metrics(),
-            include_metadata=include_metadata,
-        )
+            operation = "reduce_relation_ledger"
+            operations = reduce_relation_ledger(
+                new_extractions=new_extractions,
+                existing_memories=existing_memories,
+                relations=relation_entries,
+                support_audits=audits,
+                revision_proofs=proofs,
+            )
+            return _return_result(operations, metrics=metrics(), include_metadata=include_metadata)
+        except ReconciliationContractError as error:
+            logger.warning("Relation-first reconciliation failed closed: %s", error)
+            return _return_result(
+                [],
+                failure=ReconciliationFailure(
+                    error_type="relation_first_error",
+                    reason_code=error.reason_code,
+                    error=str(error),
+                    operation=operation,
+                    terminal_category=getattr(error, "terminal_category", None),
+                    error_code=getattr(error, "error_code", None),
+                ),
+                metrics=metrics(),
+                include_metadata=include_metadata,
+            )
+        except (StructuredLlmError, MemoryPairClassificationError, KeyError, ValueError) as error:
+            logger.warning("Relation-first reconciliation failed closed: %s", error)
+            return _return_result(
+                [],
+                failure=ReconciliationFailure(
+                    error_type="relation_first_error",
+                    reason_code="relation_first_failed",
+                    error=str(error),
+                    operation=operation,
+                    terminal_category=getattr(error, "terminal_category", None),
+                    error_code=getattr(error, "error_code", None),
+                ),
+                metrics=metrics(),
+                include_metadata=include_metadata,
+            )
+        except Exception as error:  # pragma: no cover - defensive provider boundary
+            logger.exception("Unexpected relation-first reconciliation failure")
+            return _return_result(
+                [],
+                failure=ReconciliationFailure(
+                    error_type="unexpected_error",
+                    reason_code="unexpected_reconciliation_failure",
+                    error=str(error),
+                    operation=operation,
+                    terminal_category=getattr(error, "terminal_category", None),
+                    error_code=getattr(error, "error_code", None),
+                ),
+                metrics=metrics(),
+                include_metadata=include_metadata,
+            )
 
 
 def reduce_relation_ledger(

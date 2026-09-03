@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
-import { AlertCircle, Info, Loader2, Lock, Pause, Pin, Play, RefreshCw, ShieldCheck, SlidersHorizontal } from "lucide-react";
+import { AlertCircle, Clock, Info, Loader2, Lock, Pause, Pin, Play, RefreshCw, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import type {
   AgentEvaluationSourceHealth,
   Source,
@@ -133,6 +133,8 @@ export function SourceRow({
     ? syncActivity
     : undefined;
   const isSourceBusy = sourceSyncActivityBlocksActions(actionableSyncActivity);
+  const canRetryWaiting = actionableSyncActivity?.state === "queued" && Boolean(actionableSyncActivity.retryTarget);
+  const isExecuting = isSourceBusy && actionableSyncActivity?.state !== "queued";
   const activityPolicy = actionableSyncActivity
     ? sourceSyncActivityPolicy(actionableSyncActivity)
     : null;
@@ -260,23 +262,25 @@ export function SourceRow({
           {capabilities.can_sync && !isManaged && (
             <Button
               type="button"
-              disabled={isSourceBusy || isDeleting || isPaused}
+              disabled={(isSourceBusy && !canRetryWaiting) || isDeleting || isPaused}
               onClick={onSync}
               title={isPaused ? pausedSyncHint : undefined}
               aria-label={
                 isPaused
                   ? pausedSyncHint
-                  : isSourceBusy
+                  : canRetryWaiting ? "Retry now" : isSourceBusy
                     ? activityPolicy?.busyAriaLabel
                     : sourceActionLayout.primary.sync.label
               }
             >
-              {isSourceBusy ? (
+              {isExecuting ? (
                 <Loader2 className="size-4 animate-spin" />
+              ) : isSourceBusy && !canRetryWaiting ? (
+                <Clock className="size-4" />
               ) : (
                 <RefreshCw className="size-4" />
               )}
-              {isSourceBusy ? activityPolicy?.busyActionLabel : sourceActionLayout.primary.sync.label}
+              {canRetryWaiting ? "Retry now" : isSourceBusy ? activityPolicy?.busyActionLabel : sourceActionLayout.primary.sync.label}
             </Button>
           )}
           {actionsMenu}

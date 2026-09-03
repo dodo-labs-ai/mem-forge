@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, Check, Loader2, RotateCw } from "lucide-react";
+import { AlertCircle, Check, Clock, Loader2, RotateCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { SourceSyncActivity } from "@/views/sources/sourceSyncActivity";
 import {
@@ -21,19 +21,20 @@ export function SourceSyncStatusCard({
 }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
-    if (!activity?.finishedAt) return;
+    if (!activity?.finishedAt && !activity?.nextAttemptAt) return;
     const id = window.setInterval(() => setNowMs(Date.now()), 1_000);
     return () => window.clearInterval(id);
-  }, [activity?.finishedAt]);
+  }, [activity?.finishedAt, activity?.nextAttemptAt]);
 
   if (!activity) return null;
   if (!sourceSyncActivityIsVisible(activity, nowMs)) return null;
 
   const presentation = presentSourceSyncActivity(activity, sourceName, itemLabel);
   const policy = sourceSyncActivityPolicy(activity);
-  const active = ["queued", "active", "recovering"].includes(activity.state);
+  const active = ["active", "recovering"].includes(activity.state);
+  const queued = activity.state === "queued";
   const failed = activity.state === "failed" || activity.state === "partial";
-  const Icon = active ? Loader2 : failed ? AlertCircle : Check;
+  const Icon = active ? Loader2 : queued ? Clock : failed ? AlertCircle : Check;
   const determinate = active && presentation.total != null && presentation.total > 0;
   const percentage = determinate
     ? Math.min(100, Math.round(((presentation.completed ?? 0) / presentation.total!) * 100))
@@ -56,9 +57,10 @@ export function SourceSyncStatusCard({
         <Icon className={cn("size-3.5 shrink-0", active && "animate-spin text-foreground")} />
         <span className={cn("shrink-0 font-medium", !failed && "text-foreground")}>{presentation.message}</span>
         {presentation.detail && <span className="min-w-0 truncate text-xs opacity-80">{presentation.detail}</span>}
-        {failed && policy.canRetry && onRetry && (
-          <button type="button" onClick={onRetry} className="ml-auto" aria-label="Retry sync">
+        {(failed || (queued && activity.retryTarget)) && policy.canRetry && onRetry && (
+          <button type="button" onClick={onRetry} className="ml-auto flex items-center gap-1" aria-label={queued ? "Retry now" : "Retry sync"}>
             <RotateCw className="size-3.5" />
+            {queued && "Retry now"}
           </button>
         )}
       </div>

@@ -4477,7 +4477,37 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
         evidence_quote="Payroll validation requires approval before release.",
         source_observation_id=description.id,
     )
-    client = _RecordingAddClient(incumbent.id)
+    responses = _RecordingAddClient(incumbent.id)
+    from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
+
+    async def provider(**kwargs):
+        prompt = kwargs["messages"][0]["content"]
+        response = (
+            await responses.classify_memory_relations(prompt)
+            if "<memory_pair_groups>" in prompt
+            else await responses.audit_incumbent_support(prompt)
+        )
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=response.model_dump_json()),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        )
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", provider)
+    monkeypatch.setattr("memforge.llm.structured.litellm.supports_response_schema", lambda **_: False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic/test",
+            base_url=None,
+            api_key=None,
+            timeout_s=1,
+            num_retries=0,
+        )
+    )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
@@ -4519,8 +4549,8 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
     assert sample["reconciliation_disjoint_keep_count"] == 0
     assert sample["reconciliation_llm_batch_count"] == 2
     assert sample["reconciliation_llm_call_count"] == 2
-    assert len(client.prompts) == 1
-    assert incumbent.content in client.prompts[0]
+    assert len(responses.prompts) == 1
+    assert incumbent.content in responses.prompts[0]
 
 
 @pytest.mark.asyncio
@@ -5123,13 +5153,9 @@ async def test_v2_deferred_plan_rolls_back_every_memory_in_source_unit(
         run_id="projection-v2-multi-memory-2",
         body="",
         prior=first.source_unit_revisions[0],
-        prior_observations={
-            first.observations[0].id: first.observation_revisions[0]
-        },
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
     )
-    source_support = await db.get_source_unit_support_unit_ids(
-        first.source_units[0].id
-    )
+    source_support = await db.get_source_unit_support_unit_ids(first.source_units[0].id)
     support_states = await db.get_active_memory_support_states(memory_ids)
     current_memories = {
         memory_id: await db.get_memory(memory_id)

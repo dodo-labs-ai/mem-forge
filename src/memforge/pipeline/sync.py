@@ -21,7 +21,7 @@ import threading
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -39,6 +39,7 @@ from memforge.llm.structured import (
     LiteLlmStructuredClient,
     StructuredLlmMetricsCollector,
     StructuredLlmImage,
+    structured_llm_metrics_scope,
 )
 from memforge.models import (
     ChangelogEntry,
@@ -553,6 +554,20 @@ def _source_filter_summary(gene: Gene, since: datetime | None) -> str | None:
 # ---------------------------------------------------------------------------
 # GeneSyncOrchestrator
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SourceUnitExecutionDiagnostics:
+    """Result of one diagnostic scope, never a durable lifecycle state."""
+
+    source_unit_id: str | None = None
+    status: str = "failed"
+    error_class: str | None = None
+
+    def bind_source_unit(self, source_unit_id: str) -> None:
+        if self.source_unit_id is not None and self.source_unit_id != source_unit_id:
+            raise ValueError("a diagnostic scope cannot span different Source Units")
+        self.source_unit_id = source_unit_id
 
 
 class GeneSyncOrchestrator:
@@ -1623,6 +1638,7 @@ class GeneSyncOrchestrator:
         for index, attempt in enumerate(attempts):
             doc_id = attempt.context.document.doc_id
             recovery_error: Exception | None = None
+            diagnostics = _SourceUnitExecutionDiagnostics(source_unit_id=attempt.source_unit_id)
             async with self._document_lifecycle_slot(
                 source_id,
                 doc_id,
@@ -1635,12 +1651,23 @@ class GeneSyncOrchestrator:
                     document_queue_wait_ms=document_queue_wait_ms,
                 )
                 try:
-                    lifecycle_stats = await self._resume_source_derivation_attempt(
-                        attempt=attempt,
+                    async with self._source_unit_diagnostics(
+                        diagnostics,
                         source_id=source_id,
-                        source_activity_epoch=source_activity_epoch,
-                        lifecycle_execution_owner_id=lifecycle_execution_owner_id,
-                    )
+                        run_id=run_id,
+                        doc_id=doc_id,
+                    ):
+                        lifecycle_stats = await self._resume_source_derivation_attempt(
+                            attempt=attempt,
+                            source_id=source_id,
+                            source_activity_epoch=source_activity_epoch,
+                            lifecycle_execution_owner_id=lifecycle_execution_owner_id,
+                            diagnostics=diagnostics,
+                        )
+                        if lifecycle_stats is not None:
+                            diagnostics.status = "committed"
+                        elif diagnostics.error_class is None:
+                            diagnostics.status = "skipped"
                 except Exception as exc:
                     recovery_error = exc
                     raise
@@ -1650,7 +1677,7 @@ class GeneSyncOrchestrator:
                         source_id=source_id,
                         run_id=run_id,
                         doc_id=doc_id,
-                        ok=recovery_error is None,
+                        ok=diagnostics.status != "failed",
                         error=recovery_error,
                     )
             if progress_callback:
@@ -1677,6 +1704,7 @@ class GeneSyncOrchestrator:
         source_id: str,
         source_activity_epoch: int | None,
         lifecycle_execution_owner_id: str | None,
+        diagnostics: _SourceUnitExecutionDiagnostics,
     ) -> dict | None:
         """Resume one derivation inside the process document admission."""
 
@@ -1721,6 +1749,7 @@ class GeneSyncOrchestrator:
             current_changed_ranges=context.current_changed_ranges,
         )
         if extraction.error_type:
+            diagnostics.error_class = extraction.error_type
             return None
         recovery_commit = plan_source_derivation_recovery_commit(
             stored_derivation_id=attempt.id,
@@ -1767,6 +1796,44 @@ class GeneSyncOrchestrator:
     # Private: _process_item
     # ==================================================================
 
+    @asynccontextmanager
+    async def _source_unit_diagnostics(
+        self,
+        diagnostics: _SourceUnitExecutionDiagnostics,
+        *,
+        source_id: str,
+        run_id: str | None,
+        doc_id: str,
+    ):
+        collector = StructuredLlmMetricsCollector()
+        started = asyncio.get_running_loop().time()
+        try:
+            with structured_llm_metrics_scope(collector):
+                yield diagnostics
+        except SourceUnitLifecycleDeferred:
+            diagnostics.status = "prepared"
+            raise
+        except BaseException as exc:
+            diagnostics.status = "failed"
+            diagnostics.error_class = type(exc).__name__
+            raise
+        finally:
+            if diagnostics.source_unit_id is not None:
+                try:
+                    await self._record_source_unit_llm_summary(
+                        collector=collector,
+                        source_unit_id=diagnostics.source_unit_id,
+                        source_id=source_id,
+                        run_id=run_id,
+                        doc_id=doc_id,
+                        source_unit_elapsed_ms=max(0, round((asyncio.get_running_loop().time() - started) * 1000)),
+                        ok=diagnostics.status != "failed",
+                        error_class=diagnostics.error_class,
+                        status=diagnostics.status,
+                    )
+                except Exception:
+                    logger.warning("Failed to record Source Unit LLM summary", exc_info=True)
+
     async def _process_item(
         self,
         gene: Gene,
@@ -1789,16 +1856,9 @@ class GeneSyncOrchestrator:
         doc_id = item.item_id
         self._memory_sample("document_wait_start", source_id=source_id, run_id=run_id, doc_id=doc_id)
         lifecycle_error: Exception | None = None
-        lifecycle_ok = False
-        source_unit_id: str | None = None
-        metrics_collector = StructuredLlmMetricsCollector() if self.structured_llm_client is not None else None
-
-        def bind_source_unit(candidate_source_unit_id: str) -> None:
-            nonlocal source_unit_id
-            source_unit_id = candidate_source_unit_id
+        diagnostics = _SourceUnitExecutionDiagnostics()
 
         async with self._document_lifecycle_slot(source_id, doc_id) as document_queue_wait_ms:
-            lifecycle_started = asyncio.get_running_loop().time()
             self._memory_sample(
                 "document_lifecycle_enter",
                 source_id=source_id,
@@ -1806,13 +1866,13 @@ class GeneSyncOrchestrator:
                 doc_id=doc_id,
                 document_queue_wait_ms=document_queue_wait_ms,
             )
-            metrics_scope = (
-                self.structured_llm_client.metrics_scope(metrics_collector)
-                if self.structured_llm_client is not None and metrics_collector is not None
-                else nullcontext()
-            )
             try:
-                with metrics_scope:
+                async with self._source_unit_diagnostics(
+                    diagnostics,
+                    source_id=source_id,
+                    run_id=run_id,
+                    doc_id=doc_id,
+                ):
                     result = await self._process_item_admitted(
                         gene=gene,
                         item=item,
@@ -1830,40 +1890,21 @@ class GeneSyncOrchestrator:
                         expected_source_activity_epoch=expected_source_activity_epoch,
                         lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                         lifecycle_attempt_count=lifecycle_attempt_count,
-                        source_unit_id_callback=bind_source_unit,
+                        source_unit_id_callback=(
+                            None
+                            if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT
+                            else diagnostics.bind_source_unit
+                        ),
                     )
-                lifecycle_ok = True
+                    diagnostics.status = (
+                        "skipped" if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT else "committed"
+                    )
                 return result
-            except SourceUnitLifecycleDeferred:
-                # Semantic work completed successfully.  The caller owns the
-                # bounded commit-only convergence and must not misclassify this
-                # as an LLM/extraction failure.
-                lifecycle_ok = True
-                raise
             except Exception as exc:
                 lifecycle_error = exc
                 raise
             finally:
-                if metrics_collector is not None and source_unit_id is not None:
-                    try:
-                        await self._record_source_unit_llm_summary(
-                            collector=metrics_collector,
-                            source_unit_id=source_unit_id,
-                            source_id=source_id,
-                            run_id=run_id,
-                            doc_id=doc_id,
-                            source_unit_elapsed_ms=max(
-                                0,
-                                round((asyncio.get_running_loop().time() - lifecycle_started) * 1000),
-                            ),
-                            ok=lifecycle_ok,
-                            error_class=(type(lifecycle_error).__name__ if lifecycle_error is not None else None),
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Failed to record Source Unit LLM summary",
-                            exc_info=True,
-                        )
+                lifecycle_ok = diagnostics.status != "failed"
                 self._memory_sample(
                     "document_lifecycle_exit",
                     source_id=source_id,
@@ -3378,12 +3419,14 @@ class GeneSyncOrchestrator:
         source_unit_elapsed_ms: int,
         ok: bool,
         error_class: str | None,
+        status: str | None = None,
     ) -> None:
         """Emit one content-free LLM aggregate for a completed Source Unit scope."""
 
         summary = collector.summary(
             source_unit_elapsed_ms=source_unit_elapsed_ms,
         )
+        outcome = status or ("committed" if ok else "failed")
         payload = {
             "event": "source_unit_llm_summary",
             "source_id": source_id,
@@ -3391,6 +3434,7 @@ class GeneSyncOrchestrator:
             "run_id": run_id,
             "doc_id": doc_id,
             "ok": ok,
+            "status": outcome,
             "error_class": error_class,
             **summary.to_payload(),
         }
@@ -3405,7 +3449,7 @@ class GeneSyncOrchestrator:
             return
         await self.memory_store.record_audit_event(
             "source_unit_llm_summary",
-            "committed" if ok else "failed",
+            outcome,
             context=self._memory_store_context(
                 run_id=run_id,
                 source_id=source_id,
@@ -3413,7 +3457,13 @@ class GeneSyncOrchestrator:
             ),
             doc_id=doc_id,
             source_id=source_id,
-            reason=("source_unit_lifecycle_completed" if ok else "source_unit_lifecycle_failed"),
+            reason="source_unit_lifecycle_"
+            + {
+                "committed": "completed",
+                "failed": "failed",
+                "skipped": "skipped",
+                "prepared": "deferred",
+            }[outcome],
             payload={
                 "source_unit_id": source_unit_id,
                 "error_class": error_class,

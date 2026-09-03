@@ -718,10 +718,7 @@ class MemoryEngine:
                         ReconcileOperation(
                             action=ReconcileAction.DELETE,
                             memory_id=operation.memory_id,
-                            reason=(
-                                "revised REQUIRED evidence could not be "
-                                "exactly re-anchored"
-                            ),
+                            reason=("revised REQUIRED evidence could not be exactly re-anchored"),
                             flag_for_review=True,
                         )
                     )
@@ -958,8 +955,7 @@ class MemoryEngine:
         )
         if undeclared_changes:
             raise ProjectedSupportInvariantError(
-                "prepared lifecycle Support topology changed outside declared "
-                f"blockers: {sorted(undeclared_changes)}"
+                f"prepared lifecycle Support topology changed outside declared blockers: {sorted(undeclared_changes)}"
             )
 
         incumbent_ids = tuple(sorted(inputs.incumbents))
@@ -1015,14 +1011,9 @@ class MemoryEngine:
                 else None
             ),
             all_active_support_unit_ids=(
-                all_support
-                if inputs.support_scope_version
-                is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-                else None
+                all_support if inputs.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2 else None
             ),
-            evidence_unit_ids_by_claim_hash=(
-                inputs.evidence_unit_ids_by_claim_hash
-            ),
+            evidence_unit_ids_by_claim_hash=(inputs.evidence_unit_ids_by_claim_hash),
             corroboration_targets_by_claim_hash=current_corroboration_targets,
             corroboration_proofs_by_claim_hash=(
                 inputs.corroboration_proofs_by_claim_hash
@@ -1452,8 +1443,7 @@ class MemoryEngine:
             )
             if result.failure is not None:
                 message = (
-                    "complete lifecycle reconciliation failed: "
-                    f"{result.failure.error_type}: {result.failure.error}"
+                    f"complete lifecycle reconciliation failed: {result.failure.error_type}: {result.failure.error}"
                 )
                 if lifecycle_execution_owner_id is None:
                     raise RuntimeError(message)
@@ -1469,6 +1459,9 @@ class MemoryEngine:
                     execution_owner_id=lifecycle_execution_owner_id,
                     outcome="failed",
                     reason_code=result.failure.reason_code,
+                    operation=result.failure.operation,
+                    terminal_category=result.failure.terminal_category,
+                    error_code=result.failure.error_code,
                     attempt_count=lifecycle_attempt_count,
                     duration_ms=max(0, round((perf_counter() - lifecycle_started) * 1000)),
                     incumbent_count=len(incumbents),

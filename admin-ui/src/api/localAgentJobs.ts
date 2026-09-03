@@ -10,6 +10,7 @@ interface CreateLocalAgentJobInput {
   sourceType: string;
   operation: string;
   payload?: Record<string, unknown>;
+  retryJobId?: string;
 }
 
 const LOCAL_AGENT_JOB_CONTROL_BASE_URL = "/api/cloud/local-agent";
@@ -19,12 +20,14 @@ export async function createLocalAgentJob({
   sourceType,
   operation,
   payload = {},
+  retryJobId,
 }: CreateLocalAgentJobInput): Promise<LocalAgentJobCreateResponse> {
   const response = await hostClient.post<LocalAgentJobCreateResponse>(localAgentUrl("/jobs"), {
     source_id: sourceId,
     source_type: sourceType,
     operation,
     payload,
+    ...(retryJobId ? { retry_job_id: retryJobId } : {}),
   });
   return response.data;
 }
