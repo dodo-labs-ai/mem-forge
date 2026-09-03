@@ -1218,6 +1218,155 @@ def test_local_agent_cloud_github_sync_pins_tree_and_body_to_one_commit(monkeypa
     assert push_call[1]["blob_sha"] == "blob-1"
 
 
+@pytest.mark.parametrize("failure", [None, "decode", "upload", "lease"])
+def test_local_agent_github_uploads_each_body_before_fetching_the_next(monkeypatch, failure):
+    events = []
+    manifest = []
+
+    class TransferClient(FakeToolClient):
+        def prepare_local_source_snapshot(self, **kwargs):
+            manifest.extend(kwargs["items"])
+            events.append("manifest")
+            return super().prepare_local_source_snapshot(**kwargs)
+
+        def push_github_repo_document(self, **kwargs):
+            events.append("upload:" + kwargs["relative_path"])
+            if kwargs["relative_path"] == "1.md":
+                if failure == "upload":
+                    return {"error": "temporary upload failure", "status_code": 503}
+                if failure == "lease":
+                    return {
+                        "error": "lease rejected",
+                        "status_code": 409,
+                        "detail": '{"detail":"local_agent_lease_not_current"}',
+                    }
+            return {"doc_id": kwargs["relative_path"], "document_hash": "receipt"}
+
+        def start_source_processing(self, **kwargs):
+            events.append("process")
+            return super().start_source_processing(**kwargs)
+
+    def github_run(cmd, *args, **kwargs):
+        endpoint = cmd[2]
+        if endpoint.endswith("/commits/main"):
+            data = {"sha": "commit-1", "commit": {"tree": {"sha": "tree-1"}}}
+        elif "/git/trees/tree-1" in endpoint:
+            data = {
+                "truncated": False,
+                "tree": [{"path": f"{n}.md", "type": "blob", "sha": f"blob-{n}", "size": 4} for n in range(3)],
+            }
+        else:
+            number = endpoint.rsplit("-", 1)[1]
+            events.append("read:" + number + ".md")
+            raw = b"\xff" if number == "1" and failure == "decode" else b"Text"
+            data = {
+                "sha": f"blob-{number}",
+                "content": base64.b64encode(raw).decode(),
+                "encoding": "base64",
+                "size": len(raw),
+            }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(data), stderr="")
+
+    monkeypatch.setattr(main, "ToolClient", TransferClient)
+    FakeToolClient.reset({})
+    monkeypatch.setattr(main.subprocess, "run", github_run)
+    job = {
+        "job_id": "laj-bounded-bodies",
+        "attempt_count": 1,
+        "workspace_id": "workspace-a",
+        "operation": "github_repo_sync",
+        "source_id": "src-github",
+        "payload": {"repo_url": "https://github.example.test/org/repo", "ref": "main", "include_extensions": ["md"]},
+    }
+    client = TransferClient(target=_cloud_test_client().target)
+    if failure == "lease":
+        with pytest.raises(CloudJobLeaseLost):
+            main._run_cloud_local_agent_job(job, client)
+        assert events == ["manifest", "read:0.md", "upload:0.md", "read:1.md", "upload:1.md"]
+        return
+
+    payload = main._run_cloud_local_agent_job(job, client)
+    expected = ["manifest", "read:0.md", "upload:0.md", "read:1.md"]
+    if failure != "decode":
+        expected.append("upload:1.md")
+    expected += ["read:2.md", "upload:2.md"]
+    if failure is None:
+        expected.append("process")
+    assert events == expected
+    assert len(manifest) == 3
+    assert payload["counts"] == {
+        "selected": 3,
+        "reused": 0,
+        "fetched": 2 if failure == "decode" else 3,
+        "pushed": 3 if failure is None else 2,
+        "failed": 0 if failure is None else 1,
+    }
+    assert (
+        payload["metrics"]["bytes_read"] == payload["metrics"]["bytes_uploaded"] == (8 if failure == "decode" else 12)
+    )
+
+
+def test_github_transfer_body_memory_does_not_grow_with_file_count(monkeypatch):
+    import gc
+    import tracemalloc
+
+    file_count = 2
+    body_bytes = 512 * 1024
+
+    class DiscardingClient(FakeToolClient):
+        def push_github_repo_document(self, **kwargs):
+            assert len(kwargs["markdown_body"]) == body_bytes
+            return {"doc_id": kwargs["relative_path"], "document_hash": "receipt"}
+
+    def github_run(cmd, *args, **kwargs):
+        endpoint = cmd[2]
+        if endpoint.endswith("/commits/main"):
+            data = {"sha": "commit-1", "commit": {"tree": {"sha": "tree-1"}}}
+        elif "/git/trees/tree-1" in endpoint:
+            data = {
+                "truncated": False,
+                "tree": [
+                    {"path": f"{n:02}.md", "type": "blob", "sha": f"blob-{n}", "size": body_bytes}
+                    for n in range(file_count)
+                ],
+            }
+        else:
+            data = {
+                "sha": endpoint.rsplit("/", 1)[1],
+                "content": base64.b64encode(b"x" * body_bytes).decode(),
+                "encoding": "base64",
+                "size": body_bytes,
+            }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(data), stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", github_run)
+    client = DiscardingClient(target=_cloud_test_client().target)
+    job = {
+        "job_id": "laj-memory",
+        "attempt_count": 1,
+        "workspace_id": "workspace-a",
+        "operation": "github_repo_sync",
+        "source_id": "src-github",
+        "payload": {"repo_url": "https://github.example.test/org/repo", "ref": "main"},
+    }
+    # Warm imports before comparing the same actual collection path at two sizes.
+    FakeToolClient.reset({})
+    main._run_cloud_local_agent_job(job, client)
+    peaks = []
+    for file_count in (2, 12):
+        FakeToolClient.reset({})
+        gc.collect()
+        tracemalloc.start()
+        try:
+            result = main._run_cloud_local_agent_job(job, client)
+            peaks.append(tracemalloc.get_traced_memory()[1])
+        finally:
+            tracemalloc.stop()
+        assert result["counts"]["pushed"] == file_count
+    # Ten extra bodies must not be retained; leave slack for manifest/receipts.
+    assert peaks[1] < peaks[0] + 2 * body_bytes, peaks
+
+
 def test_local_agent_cloud_github_sync_rejects_unproven_tree_completeness(monkeypatch):
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
     FakeToolClient.reset({})

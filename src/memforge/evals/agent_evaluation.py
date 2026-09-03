@@ -906,6 +906,9 @@ def bind_source_lifecycle_outcome(
     model_call_count: int,
     occurred_at: datetime | None = None,
     deployment_revision: str | None = None,
+    operation: str | None = None,
+    terminal_category: str | None = None,
+    error_code: str | None = None,
 ) -> AgentRuntimeBundle:
     """Bind one durable Source Unit lifecycle terminal result and assessment."""
 
@@ -976,16 +979,26 @@ def bind_source_lifecycle_outcome(
         "review_count": review_count,
         "model_call_count": model_call_count,
     }
+    payload.update(
+        {
+            name: value
+            for name, value in (
+                ("operation", operation),
+                ("terminal_category", terminal_category),
+                ("error_code", error_code),
+            )
+            if value is not None
+        }
+    )
     payload_hash = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     trace_id = runtime_execution_trace_id(execution_id)
     event = AgentRuntimeEvent(
-        **payload,
+        **{**payload, "operation": operation or "source_unit_lifecycle_reconciliation"},
         occurred_at=timestamp,
         payload_hash=payload_hash,
         trace_id=trace_id,
-        operation="source_unit_lifecycle_reconciliation",
     )
     label: AgentAssessmentLabel = "fail" if outcome == "failed" else "pass"
     assessment_id = _runtime_identity(

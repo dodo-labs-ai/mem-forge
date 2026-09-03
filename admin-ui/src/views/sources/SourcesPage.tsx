@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
 import { Files, Info, Loader2, LockKeyhole, MoreHorizontal, Pause, Pin, Play, Plus, RefreshCw, Search, ShieldCheck, Trash2, X } from "lucide-react";
-import { resourceClient } from "@/api/client";
+import { currentLocalAgentBaseUrl, resourceClient } from "@/api/client";
 import { createLocalAgentJob, getCurrentLocalAgentJobs, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
   AgentSessionCompleteness,
@@ -51,6 +51,8 @@ import { SourceRow } from "./SourceRow";
 import {
   selectSourceSyncActivity,
   sourceSyncActivityBlocksActions,
+  pendingSourceSyncHandoff,
+  type SourceSyncRetryTarget,
 } from "./sourceSyncActivity";
 import { organizeSourceGroups, type SourceListSortMode } from "./sourceListOrganization";
 import { localAgentSyncOperation } from "./localAgentSources";
@@ -111,7 +113,6 @@ const LOCAL_AGENT_TIMEOUT_MESSAGE =
 const LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE = "Configure a folder path before syncing this local source.";
 const LOCAL_AGENT_SYNC_FAILED_MESSAGE = "Local daemon could not sync this source.";
 const JIRA_SIGN_IN_FAILED_MESSAGE = "Jira sign-in failed.";
-const LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS = 30_000;
 const SOURCE_EVALUATION_STALE_MS = 60_000;
 
 function safeSourceErrorMessage(error: unknown): string | null {
@@ -129,29 +130,6 @@ function safeSourceErrorMessage(error: unknown): string | null {
   return null;
 }
 
-function localAgentJobErrorMessage(status: LocalAgentJobStatusResponse): string {
-  const result = status.result as { error?: unknown } | null;
-  const detail = typeof result?.error === "string" && result.error.trim()
-    ? result.error.trim()
-    : status.last_error?.trim();
-  if (!detail) return LOCAL_AGENT_SYNC_FAILED_MESSAGE;
-  return `${LOCAL_AGENT_SYNC_FAILED_MESSAGE} ${cleanLocalAgentJobError(detail)}`;
-}
-
-function cleanLocalAgentJobError(value: string): string {
-  const text = value.trim();
-  const normalized = text.toLowerCase();
-  if (normalized.includes("teams") && (
-    normalized.includes("session expired")
-    || normalized.includes("no teams session")
-    || normalized.includes("tokens")
-    || normalized.includes("sign in")
-  )) {
-    return "Sign in to Teams in Chrome, then retry sync.";
-  }
-  return text;
-}
-
 function jiraSignInJobErrorMessage(status: LocalAgentJobStatusResponse): string {
   const result = status.result as { error?: unknown } | null;
   const detail = typeof result?.error === "string" && result.error.trim()
@@ -163,8 +141,8 @@ function jiraSignInJobErrorMessage(status: LocalAgentJobStatusResponse): string 
 async function createLocalAgentSyncJob(
   source: Source,
   options: {
-    onStatus?: (status: LocalAgentJobStatusResponse) => void;
     forceFullSync?: boolean;
+    retryJobId?: string;
   },
 ): Promise<LocalAgentJobCreateResponse | null> {
   const operation = localAgentSyncOperation(source);
@@ -179,21 +157,8 @@ async function createLocalAgentSyncJob(
     sourceType: source.type,
     operation,
     payload: localAgentJobPayload(options.forceFullSync),
+    retryJobId: options.retryJobId,
   });
-  options.onStatus?.({
-    job_id: created.job_id,
-    operation,
-    status: "queued",
-    result: null,
-    last_error: null,
-  });
-  const status = await pollLocalAgentSyncJob(created.job_id, options);
-  if (status.status === "failed") {
-    if (status.last_error) {
-      console.warn("Local daemon sync failed", status.last_error);
-    }
-    throw new Error(localAgentJobErrorMessage(status));
-  }
   return created;
 }
 
@@ -218,8 +183,38 @@ function sourceItemLabel(source: Source): string {
   return SOURCE_ITEM_LABELS[source.id] ?? SOURCE_ITEM_LABELS[source.type] ?? "documents";
 }
 
+type SyncAdmissionReceipt = SourceSyncRetryTarget & { createdAt: string | null };
+
+function syncAdmissionReceipt(data: { job_id?: string; run_id?: string; status: string; created_at?: string | null }): SyncAdmissionReceipt | null {
+  if (!["queued", "leased", "pending", "running"].includes(data.status)) return null;
+  if (data.job_id) return { execution_kind: "local_agent_job", execution_id: data.job_id, createdAt: data.created_at ?? null };
+  if (data.run_id) return { execution_kind: "source_sync_run", execution_id: data.run_id, createdAt: data.created_at ?? null };
+  return null;
+}
+
+function awaitingSyncAdmission(
+  sourceId: string,
+  receipt: SyncAdmissionReceipt | null | undefined,
+  sources: Source[] | undefined,
+  jobs: LocalAgentJobStatusResponse[] | undefined,
+  terminalConfirmed = false,
+): boolean {
+  if (terminalConfirmed) return false;
+  if (receipt === undefined) return false;
+  if (receipt === null || sources === undefined) return true;
+  const source = sources.find((item) => item.id === sourceId);
+  if (!source) return false;
+  const job = jobs?.find((item) => item.source_id === sourceId);
+  const record = receipt.execution_kind === "local_agent_job" ? job : source.sync;
+  const recordId = receipt.execution_kind === "local_agent_job" ? job?.job_id : source.sync?.run_id;
+  if (recordId === receipt.execution_id) return false;
+  // Server-created timestamps let latest-record queries skip short executions.
+  return !(receipt.createdAt && record?.created_at && Date.parse(record.created_at) > Date.parse(receipt.createdAt));
+}
+
 export function SourcesPage() {
   const queryClient = useQueryClient();
+  const workspaceKey = currentLocalAgentBaseUrl();
   const navigate = useNavigate();
   const location = useLocation();
   const [addOpen, setAddOpen] = useState(false);
@@ -232,10 +227,14 @@ export function SourcesPage() {
   const [accessSource, setAccessSource] = useState<Source | null>(null);
   const [openMenuSourceId, setOpenMenuSourceId] = useState<string | null>(null);
   const [sourcePendingDelete, setSourcePendingDelete] = useState<Source | null>(null);
-  const [pendingSyncIds, setPendingSyncIds] = useState<Set<string>>(new Set());
-  const [localAgentJobBySource, setLocalAgentJobBySource] = useState<
-    Record<string, LocalAgentJobStatusResponse | undefined>
-  >({});
+  // Null means the request is in flight; a target is a real admission receipt
+  // awaiting the existing authoritative queries, never a synthetic job result.
+  const [pendingSyncAdmissions, setPendingSyncAdmissions] = useState<Map<string, SyncAdmissionReceipt | null>>(new Map());
+  const admissionQueryKey = (receipt: SyncAdmissionReceipt) => ["source-sync-admission", workspaceKey, receipt.execution_kind, receipt.execution_id];
+  const terminalAdmission = (receipt: SyncAdmissionReceipt | null | undefined): boolean => {
+    const status = receipt ? queryClient.getQueryData<{ status: string }>(admissionQueryKey(receipt))?.status : undefined;
+    return Boolean(status && !["pending", "running", "queued", "leased"].includes(status));
+  };
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
   const [pendingSubscriptionIds, setPendingSubscriptionIds] = useState<Set<string>>(
     () => new Set(),
@@ -257,29 +256,24 @@ export function SourcesPage() {
     return false;
   };
 
-  const setLocalAgentJob = (sourceId: string, job: LocalAgentJobStatusResponse) => {
-    setLocalAgentJobBySource((current) => ({ ...current, [sourceId]: job }));
-  };
-
-  const clearLocalAgentJob = (sourceId: string) => {
-    setLocalAgentJobBySource((current) => {
-      if (!current[sourceId]) return current;
-      const next = { ...current };
-      delete next[sourceId];
-      return next;
-    });
-  };
-
   const genesQuery = useQuery<GeneMetadata[]>({
     queryKey: ["genes"],
     queryFn: () => resourceClient.get("/genes").then((response) => response.data),
   });
 
   const sourcesQuery = useQuery<SourcesResponse | Source[]>({
-    queryKey: ["sources"],
+    queryKey: ["sources", workspaceKey],
     queryFn: () => resourceClient.get("/sources").then((response) => response.data),
     refetchInterval: (query) => {
       const sources = normalizeSources(query.state.data);
+      const jobs = queryClient.getQueryData<LocalAgentJobStatusResponse[]>(["currentLocalAgentJobs", workspaceKey]) ?? [];
+      if ([...pendingSyncAdmissions].some(([key, target]) => key.startsWith(`${workspaceKey}:`)
+        && target?.execution_kind === "source_sync_run"
+        && awaitingSyncAdmission(key.slice(workspaceKey.length + 1), target, query.state.data ? sources : undefined, jobs, terminalAdmission(target)))) return 2000;
+      if (jobs.some((job) => {
+        const source = sources.find((source) => source.id === job.source_id);
+        return source && pendingSourceSyncHandoff(job, source.sync);
+      })) return 2000;
       const terminal = new Set(["success", "partial", "failed"]);
       return sources.some((source) => {
         if (source.access_state === "changing" && source.access_transition?.status !== "failed") {
@@ -326,11 +320,49 @@ export function SourcesPage() {
   });
 
   const currentLocalJobsQuery = useQuery<LocalAgentJobStatusResponse[]>({
-    queryKey: ["currentLocalAgentJobs"],
+    queryKey: ["currentLocalAgentJobs", workspaceKey],
     queryFn: getCurrentLocalAgentJobs,
-    refetchInterval: (query) => query.state.data?.some((job) => ["queued", "leased"].includes(job.status)) ? 2_000 : false,
+    refetchInterval: (query) => query.state.status === "error"
+      || [...pendingSyncAdmissions].some(([key, target]) => key.startsWith(`${workspaceKey}:`)
+        && target?.execution_kind === "local_agent_job"
+        && awaitingSyncAdmission(key.slice(workspaceKey.length + 1), target, sourcesQuery.data ? normalizeSources(sourcesQuery.data) : undefined, query.state.data, terminalAdmission(target)))
+      || query.state.data?.some((job) => ["queued", "leased"].includes(job.status)) ? 2_000 : false,
   });
 
+  // Latest-record views can skip a short execution or contain equal creation
+  // timestamps. Only when those views are inconclusive, read the exact receipt.
+  const admissionQueries = useQueries({
+    queries: [...pendingSyncAdmissions].flatMap(([key, receipt]) => {
+      if (!key.startsWith(`${workspaceKey}:`) || !receipt) return [];
+      const sourceId = key.slice(workspaceKey.length + 1);
+      return [{
+        queryKey: admissionQueryKey(receipt),
+        enabled: awaitingSyncAdmission(sourceId, receipt, sourcesQuery.data ? normalizeSources(sourcesQuery.data) : undefined, currentLocalJobsQuery.data),
+        queryFn: async (): Promise<{ status: string }> => receipt.execution_kind === "local_agent_job"
+          ? getLocalAgentJob(receipt.execution_id)
+          : resourceClient.get<{ status: string }>(`/sources/${encodeURIComponent(sourceId)}/sync-runs/${encodeURIComponent(receipt.execution_id)}`).then((response) => response.data),
+        refetchInterval: (query: { state: { status: string; data: { status: string } | undefined } }) => query.state.status === "error"
+          || ["queued", "leased", "pending", "running"].includes(query.state.data?.status ?? "") ? 2000 : false,
+      }];
+    }),
+  });
+  const terminalAdmissionSignature = admissionQueries.map((query) => query.data?.status && !["queued", "leased", "pending", "running"].includes(query.data.status) ? query.dataUpdatedAt : "").join(":");
+  useEffect(() => {
+    if (terminalAdmissionSignature.replaceAll(":", "")) {
+      void queryClient.invalidateQueries({ queryKey: ["sources", workspaceKey] });
+      void queryClient.invalidateQueries({ queryKey: ["currentLocalAgentJobs", workspaceKey] });
+    }
+  }, [terminalAdmissionSignature, queryClient, workspaceKey]);
+
+  useEffect(() => {
+    if (currentLocalJobsQuery.data?.some((job) => ["succeeded", "failed"].includes(job.status))) {
+      void queryClient.invalidateQueries({ queryKey: ["sources", workspaceKey] });
+      void queryClient.invalidateQueries({ queryKey: ["stats"] });
+    }
+  }, [currentLocalJobsQuery.data, queryClient, workspaceKey]);
+
+  const currentJobQueryError = currentLocalJobsQuery.isError || admissionQueries.some((query) => query.isError)
+    ? "Unable to refresh sync status. Retrying does not change the job result." : null;
   const currentLocalJobBySource = Object.fromEntries(
     (currentLocalJobsQuery.data ?? [])
       .filter(
@@ -346,53 +378,44 @@ export function SourcesPage() {
   });
 
   const syncSource = useMutation({
-    mutationFn: async ({ source, forceFullSync = false }: { source: Source; forceFullSync?: boolean }) => {
+    onMutate: () => ({ workspaceKey }),
+    mutationFn: async ({ source, forceFullSync = false, retryTarget }: { source: Source; forceFullSync?: boolean; retryTarget?: SourceSyncRetryTarget }) => {
       const sourceId = source.id;
-      setPendingSyncIds((current) => new Set(current).add(sourceId));
+      setPendingSyncAdmissions((current) => new Map(current).set(`${workspaceKey}:${sourceId}`, null));
+      if (retryTarget?.execution_kind === "source_sync_run") {
+        return resourceClient.post(`/sources/${sourceId}/sync`, { retry_target: retryTarget });
+      }
       const localAgentJob = await createLocalAgentSyncJob(source, {
-        onStatus: (status) => setLocalAgentJob(sourceId, status),
-        forceFullSync,
+        forceFullSync, retryJobId: retryTarget?.execution_id,
       });
       if (localAgentJob) {
         return { data: localAgentJob };
       }
       return resourceClient.post(`/sources/${sourceId}/sync`, { force_full_sync: forceFullSync });
     },
-    onError: (error, variables) => {
-      setPendingSyncIds((current) => {
-        const next = new Set(current);
-        next.delete(variables.source.id);
+    onSuccess: (response, variables, context) => {
+      const target = syncAdmissionReceipt(response.data);
+      setPendingSyncAdmissions((current) => {
+        const next = new Map(current);
+        const key = `${context.workspaceKey}:${variables.source.id}`;
+        if (target) next.set(key, target); else next.delete(key);
         return next;
       });
-      if (localAgentSyncOperation(variables.source)) {
-        setLocalAgentJob(variables.source.id, {
-          job_id: `failed:${variables.source.id}`,
-          status: "failed",
-          result: { error: safeSourceErrorMessage(error) ?? LOCAL_AGENT_SYNC_FAILED_MESSAGE },
-          last_error: null,
-        });
-      }
+    },
+    onError: (error, variables, context) => {
+      setPendingSyncAdmissions((current) => {
+        const next = new Map(current);
+        next.delete(`${context?.workspaceKey}:${variables.source.id}`);
+        return next;
+      });
       handleAuthorityError(error, "Failed to start sync.");
     },
-    onSettled: async (_data, _error, variables) => {
-      if (!_error && localAgentSyncOperation(variables.source)) {
-        window.setTimeout(
-          () => clearLocalAgentJob(variables.source.id),
-          LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS,
-        );
-      } else if (!localAgentSyncOperation(variables.source)) {
-        clearLocalAgentJob(variables.source.id);
-      }
-      await Promise.all([
+    onSettled: () => {
+      void Promise.all([
         queryClient.invalidateQueries({ queryKey: ["sources"] }),
         queryClient.invalidateQueries({ queryKey: ["currentLocalAgentJobs"] }),
         queryClient.invalidateQueries({ queryKey: ["stats"] }),
       ]);
-      setPendingSyncIds((current) => {
-        const next = new Set(current);
-        next.delete(variables.source.id);
-        return next;
-      });
     },
   });
 
@@ -438,10 +461,10 @@ export function SourcesPage() {
   });
 
   const forceResyncSource = useMutation({
+    onMutate: () => ({ workspaceKey }),
     mutationFn: async (source: Source) => {
-      setPendingSyncIds((current) => new Set(current).add(source.id));
+      setPendingSyncAdmissions((current) => new Map(current).set(`${workspaceKey}:${source.id}`, null));
       const localAgentJob = await createLocalAgentSyncJob(source, {
-        onStatus: (status) => setLocalAgentJob(source.id, status),
         forceFullSync: true,
       });
       if (localAgentJob) {
@@ -449,40 +472,29 @@ export function SourcesPage() {
       }
       return resourceClient.post(getSourceActionEndpoint(source.id, "force-resync"));
     },
-    onError: (error, source) => {
-      setPendingSyncIds((current) => {
-        const next = new Set(current);
-        next.delete(source.id);
+    onSuccess: (response, source, context) => {
+      const target = syncAdmissionReceipt(response.data);
+      setPendingSyncAdmissions((current) => {
+        const next = new Map(current);
+        const key = `${context.workspaceKey}:${source.id}`;
+        if (target) next.set(key, target); else next.delete(key);
         return next;
       });
-      if (localAgentSyncOperation(source)) {
-        setLocalAgentJob(source.id, {
-          job_id: `failed:${source.id}`,
-          status: "failed",
-          result: { error: safeSourceErrorMessage(error) ?? LOCAL_AGENT_SYNC_FAILED_MESSAGE },
-          last_error: null,
-        });
-      }
+    },
+    onError: (error, source, context) => {
+      setPendingSyncAdmissions((current) => {
+        const next = new Map(current);
+        next.delete(`${context?.workspaceKey}:${source.id}`);
+        return next;
+      });
       handleAuthorityError(error, "Failed to start refresh.");
     },
-    onSettled: async (_data, _error, source) => {
-      if (!_error && localAgentSyncOperation(source)) {
-        window.setTimeout(
-          () => clearLocalAgentJob(source.id),
-          LOCAL_AGENT_TERMINAL_PROGRESS_RETENTION_MS,
-        );
-      } else if (!localAgentSyncOperation(source)) {
-        clearLocalAgentJob(source.id);
-      }
-      await Promise.all([
+    onSettled: () => {
+      void Promise.all([
         queryClient.invalidateQueries({ queryKey: ["sources"] }),
         queryClient.invalidateQueries({ queryKey: ["stats"] }),
+        queryClient.invalidateQueries({ queryKey: ["currentLocalAgentJobs", workspaceKey] }),
       ]);
-      setPendingSyncIds((current) => {
-        const next = new Set(current);
-        next.delete(source.id);
-        return next;
-      });
     },
   });
 
@@ -706,13 +718,13 @@ export function SourcesPage() {
             </span>
           )}
         </div>
-        {authorityMessage && (
+        {(authorityMessage || currentJobQueryError) && (
           <div
             role="status"
             aria-live="polite"
             className="flex items-start justify-between gap-3 border-b bg-amber-50/60 px-4 py-2 text-sm text-amber-900 dark:bg-amber-900/20 dark:text-amber-100"
           >
-            <span>{authorityMessage}</span>
+            <span>{authorityMessage || currentJobQueryError}</span>
             <Button
               type="button"
               size="icon-sm"
@@ -780,12 +792,12 @@ export function SourcesPage() {
                   onToggle={() => toggleGroup(group)}
                 >
                   {group.sources.map(({ source, memory_count }) => {
-                    const localAgentJob = localAgentJobBySource[source.id] ?? currentLocalJobBySource[source.id];
+                    const localAgentJob = currentLocalJobBySource[source.id];
                     const syncActivity = selectSourceSyncActivity({
                       sync: source.sync,
                       localJob: localAgentJob,
                       lifecycleMaintenance: source.lifecycle_maintenance,
-                      pending: pendingSyncIds.has(source.id),
+                      pending: awaitingSyncAdmission(source.id, pendingSyncAdmissions.get(`${workspaceKey}:${source.id}`), sources, currentLocalJobsQuery.data, terminalAdmission(pendingSyncAdmissions.get(`${workspaceKey}:${source.id}`))),
                     });
                     const isSourceBusy = sourceSyncActivityBlocksActions(syncActivity);
                     const isDeleting = deleteSource.isPending && sourcePendingDelete?.id === source.id;
@@ -835,7 +847,7 @@ export function SourcesPage() {
                         }}
                         onSync={() => {
                           if (!capabilities.can_sync || source.status === "paused") return;
-                          syncSource.mutate({ source });
+                          syncSource.mutate({ source, retryTarget: syncActivity?.retryTarget });
                         }}
                         onSignIn={
                           source.type === "jira"

@@ -682,26 +682,42 @@ def test_runbook_candidate_with_multiple_incumbents_falls_back_to_keep_and_add()
 
 
 @pytest.mark.asyncio
-async def test_support_audit_batches_all_incumbents_without_candidates() -> None:
+async def test_support_audit_batches_all_incumbents_without_candidates(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
+
     incumbents = [_memory(f"mem-{index:08d}", f"Stable claim {index}") for index in range(65)]
+    batch_sizes = []
 
-    class AuditClient:
-        def __init__(self) -> None:
-            self.batch_sizes: list[int] = []
+    async def provider(**kwargs):
+        prompt = kwargs["messages"][0]["content"]
+        incumbents_json = prompt.split("<incumbents>", 1)[1].split("</incumbents>", 1)[0]
+        size = len(json.loads(incumbents_json))
+        batch_sizes.append(size)
+        payload = IncumbentSupportAuditResponse(
+            decisions=[IncumbentSupportAuditDecision(supported=True) for _ in range(size)]
+        ).model_dump_json()
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=payload),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+        )
 
-        async def classify_memory_relations(self, prompt: str, **kwargs):
-            raise AssertionError(f"no candidate pairs expected: {prompt!r} {kwargs!r}")
-
-        async def audit_incumbent_support(self, prompt: str, **kwargs):
-            del kwargs
-            incumbents_json = prompt.split("<incumbents>", 1)[1].split("</incumbents>", 1)[0]
-            size = len(json.loads(incumbents_json))
-            self.batch_sizes.append(size)
-            return IncumbentSupportAuditResponse(
-                decisions=[IncumbentSupportAuditDecision(supported=True) for _ in range(size)]
-            )
-
-    client = AuditClient()
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", provider)
+    monkeypatch.setattr("memforge.llm.structured.litellm.supports_response_schema", lambda **_: False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic/test",
+            base_url=None,
+            api_key=None,
+            timeout_s=1,
+            num_retries=0,
+        )
+    )
     result = await reconcile_memories(
         new_extractions=[],
         existing_memories=incumbents,
@@ -712,7 +728,7 @@ async def test_support_audit_batches_all_incumbents_without_candidates() -> None
 
     assert isinstance(result, ReconciliationResult)
     assert result.failure is None
-    assert client.batch_sizes == [30, 30, 5]
+    assert batch_sizes == [30, 30, 5]
     assert result.metrics.structured_llm_calls == 3
     assert len(result.operations) == 65
 

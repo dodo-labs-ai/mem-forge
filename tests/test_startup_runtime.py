@@ -3009,6 +3009,7 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
                 run_id = "run-force-resync"
                 status = "pending"
                 coalesced = False
+                created_at = datetime(2026, 9, 3, tzinfo=timezone.utc)
 
             return Run()
 
@@ -3030,6 +3031,7 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
         "run_id": "run-force-resync",
         "status": "pending",
         "coalesced": False,
+        "created_at": "2026-09-03T00:00:00+00:00",
     }
     assert fake_sync_service.enqueued == [(source_id, "force", True)]
     assert await db.get_sync_state(source_id) is not None
@@ -3039,6 +3041,8 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
 
 @pytest.mark.asyncio
 async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_path):
+    from datetime import datetime, timezone
+
     from memforge.local_agent.source_contract import local_agent_source_config_revision
     from memforge.server.admin_api import create_admin_app
     from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
@@ -3089,6 +3093,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
                 run_id = "run-local-process"
                 status = "pending"
                 coalesced = False
+                created_at = datetime(2026, 9, 3, tzinfo=timezone.utc)
 
             return Run()
 
@@ -3134,6 +3139,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
         "run_id": "run-local-process",
         "status": "pending",
         "coalesced": False,
+        "created_at": "2026-09-03T00:00:00+00:00",
     }
     assert fake_sync_service.enqueued == [
         {

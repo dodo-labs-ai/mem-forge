@@ -1398,6 +1398,7 @@ class SyncService:
         input_snapshot_id: str | None = None,
         source_config_revision: str | None = None,
         predecessor_activity_id: str | None = None,
+        retry_run_id: str | None = None,
     ) -> SourceSyncRun:
         source = await self._ensure_source_can_sync(source_id)
         current_config_revision = (
@@ -1416,6 +1417,7 @@ class SyncService:
             input_snapshot_id=input_snapshot_id,
             source_config_revision=effective_config_revision,
             predecessor_activity_id=predecessor_activity_id,
+            retry_run_id=retry_run_id,
         )
 
     async def start_source(self, source_id: str, *, force_full_sync: bool = False) -> asyncio.Task:

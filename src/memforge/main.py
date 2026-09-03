@@ -2560,6 +2560,117 @@ def _run_local_agent_daemon(
         daemon_lock.close()
 
 
+@dataclass(frozen=True)
+class _GitHubTransferResult:
+    """Body-free receipt and byte accounting for one document transfer."""
+
+    receipt: dict[str, Any]
+    prepared_bytes: int | None = None
+    submitted_bytes: int | None = None
+
+
+def _push_github_source_entry(
+    entry: dict[str, Any],
+    *,
+    repo: dict[str, str],
+    ref: str,
+    source_id: str,
+    client: ToolClient,
+    sync_snapshot_id: str | None,
+    local_agent_job_id: str | None,
+    local_agent_attempt_count: int | None,
+    submitted_by: str | None,
+    on_body_ready: Callable[[], None],
+) -> _GitHubTransferResult:
+    """Own a single body's lifetime through validation and synchronous upload."""
+
+    relative_path = str(entry["relative_path"])
+    content_type = str(entry.get("content_type") or "text/plain")
+    blob_sha = str(entry.get("blob_sha") or "")
+    is_source_artifact = content_type in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES
+    try:
+        if github_content_type_is_binary(content_type) and not is_source_artifact:
+            raise click.ClickException(f"unsupported binary media type: {content_type}")
+        if is_source_artifact:
+            declared_size = entry.get("bytes")
+            if not isinstance(declared_size, int) or isinstance(declared_size, bool) or declared_size < 0:
+                raise click.ClickException("GitHub tree did not return a valid blob size")
+            if declared_size > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
+                raise click.ClickException("Source Artifact exceeds storage limit")
+        raw = _github_blob(repo, blob_sha, relative_path)
+        if is_source_artifact and len(raw) != declared_size:
+            raise click.ClickException("GitHub blob size changed after tree discovery")
+        text_body = "" if is_source_artifact else raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return _GitHubTransferResult({"relative_path": relative_path, "error": "invalid utf-8"})
+    except click.ClickException as exc:
+        return _GitHubTransferResult({"relative_path": relative_path, "error": str(exc)})
+
+    body_bytes = len(raw)
+    raw_hash = hashlib.sha256(raw).hexdigest()
+    on_body_ready()
+    artifact_input_hashes: list[str] = []
+    if is_source_artifact:
+        artifact_response = client.push_source_artifact(
+            source_id=source_id,
+            source_unit_key=relative_path,
+            provider_key=relative_path,
+            provider_revision=blob_sha,
+            parent_observation_type="file_content",
+            parent_provider_key="content",
+            filename=Path(relative_path).name,
+            media_type=content_type,
+            content=raw,
+            local_agent_job_id=local_agent_job_id,
+            local_agent_attempt_count=local_agent_attempt_count,
+        )
+        _raise_if_local_agent_lease_not_current(artifact_response)
+        input_hash = str(artifact_response.get("input_sha256") or "").strip()
+        if artifact_response.get("error") or len(input_hash) != 64:
+            return _GitHubTransferResult(
+                {
+                    "relative_path": relative_path,
+                    "error": artifact_response.get("error") or "Source Artifact upload failed",
+                    "detail": artifact_response.get("detail"),
+                    "status_code": artifact_response.get("status_code"),
+                },
+                prepared_bytes=body_bytes,
+            )
+        artifact_input_hashes.append(input_hash)
+    response = client.push_github_repo_document(
+        source_id=source_id,
+        repo_url=repo["repo_url"],
+        repo_ref=ref,
+        relative_path=relative_path,
+        markdown_body=text_body,
+        content_type=content_type,
+        title=relative_path if is_source_artifact else _github_title(text_body, relative_path),
+        raw_hash=raw_hash,
+        blob_sha=blob_sha,
+        sync_snapshot_id=sync_snapshot_id,
+        local_agent_job_id=local_agent_job_id,
+        local_agent_attempt_count=local_agent_attempt_count,
+        artifact_source_unit_key=relative_path if artifact_input_hashes else None,
+        artifact_input_hashes=artifact_input_hashes,
+        submitted_by=submitted_by,
+    )
+    _raise_if_local_agent_lease_not_current(response)
+    if response.get("error"):
+        receipt = {
+            "relative_path": relative_path,
+            "error": response["error"],
+            "detail": response.get("detail"),
+            "status_code": response.get("status_code"),
+        }
+    else:
+        receipt = {
+            "relative_path": relative_path,
+            "doc_id": response.get("doc_id"),
+            "document_hash": response.get("document_hash"),
+        }
+    return _GitHubTransferResult(receipt, prepared_bytes=body_bytes, submitted_bytes=body_bytes)
+
+
 def _push_github_profile_to_source(
     name: str,
     profile: dict[str, Any],
@@ -2607,9 +2718,7 @@ def _push_github_profile_to_source(
             repo_ref=ref,
             relative_path=relative_path,
         )
-        manifest_items.append(
-            {"doc_id": doc_id, "revision": revision, "change_kind": "upsert"}
-        )
+        manifest_items.append({"doc_id": doc_id, "revision": revision, "change_kind": "upsert"})
         entries_by_doc_id[doc_id] = entry
 
     required_doc_ids = set(entries_by_doc_id)
@@ -2656,196 +2765,58 @@ def _push_github_profile_to_source(
         3,
     )
 
-    entries_to_fetch = [
-        entry
-        for doc_id, entry in entries_by_doc_id.items()
-        if doc_id in required_doc_ids
-    ]
+    entries_to_fetch = [entry for doc_id, entry in entries_by_doc_id.items() if doc_id in required_doc_ids]
     pushed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
-    prepared: list[dict[str, Any]] = []
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(
-            phase="fetching",
-            completed=0,
-            total=len(entries_to_fetch),
-            unit="file",
-        ),
-    )
-    for index, entry in enumerate(entries_to_fetch, start=1):
-        relative_path = str(entry["relative_path"])
-        content_type = str(entry.get("content_type") or "text/plain")
-        is_binary = github_content_type_is_binary(content_type)
-        is_source_artifact = content_type in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES
-        try:
-            if is_binary and not is_source_artifact:
-                raise click.ClickException(f"unsupported binary media type: {content_type}")
-            if is_source_artifact:
-                declared_size = entry.get("bytes")
-                if not isinstance(declared_size, int) or isinstance(declared_size, bool) or declared_size < 0:
-                    raise click.ClickException("GitHub tree did not return a valid blob size")
-                if declared_size > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
-                    raise click.ClickException("Source Artifact exceeds storage limit")
-                prepared.append(
-                    {
-                        "relative_path": relative_path,
-                        "markdown_body": "",
-                        "content_type": content_type,
-                        "title": relative_path,
-                        "raw_hash": None,
-                        "blob_sha": str(entry.get("blob_sha") or ""),
-                        "body_bytes": declared_size,
-                        "source_artifact": True,
-                    }
-                )
-                continue
-            raw = _github_blob(repo, str(entry.get("blob_sha") or ""), relative_path)
-            text_body = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            failed.append({"relative_path": relative_path, "error": "invalid utf-8"})
-        except click.ClickException as exc:
-            failed.append({"relative_path": relative_path, "error": str(exc)})
-        else:
-            raw_hash = hashlib.sha256(raw).hexdigest()
-            prepared.append(
-                {
-                    "relative_path": relative_path,
-                    "markdown_body": text_body,
-                    "content_type": content_type,
-                    "title": _github_title(text_body, relative_path),
-                    "raw_hash": raw_hash,
-                    "blob_sha": str(entry.get("blob_sha") or ""),
-                    "body_bytes": len(raw),
-                    "source_artifact": False,
-                }
-            )
-        finally:
-            _report_local_agent_progress(
-                report_progress,
-                _sync_progress_snapshot(
-                    phase="fetching",
-                    completed=index,
-                    total=len(entries_to_fetch),
-                    unit="file",
-                    failed=len(failed),
-                ),
-            )
+    fetched_count = submitted_count = 0
+    read_body_bytes = uploaded_body_bytes = 0
 
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(
-            phase="uploading",
-            completed=0,
-            total=len(prepared),
-            unit="file",
-            failed=len(failed),
-        ),
-    )
-
-    uploaded_body_bytes = 0
-    for index, doc in enumerate(prepared, start=1):
-        uploaded_body_bytes += int(doc["body_bytes"])
-        artifact_input_hashes: list[str] = []
-        if bool(doc.get("source_artifact")):
-            try:
-                artifact_content = _github_blob(
-                    repo,
-                    str(doc["blob_sha"]),
-                    str(doc["relative_path"]),
-                )
-            except click.ClickException as exc:
-                failed.append({"relative_path": doc["relative_path"], "error": str(exc)})
-                continue
-            if len(artifact_content) != int(doc["body_bytes"]):
-                failed.append(
-                    {
-                        "relative_path": doc["relative_path"],
-                        "error": "GitHub blob size changed after tree discovery",
-                    }
-                )
-                continue
-            doc["raw_hash"] = hashlib.sha256(artifact_content).hexdigest()
-            artifact_response = client.push_source_artifact(
-                source_id=source_id,
-                source_unit_key=str(doc["relative_path"]),
-                provider_key=str(doc["relative_path"]),
-                provider_revision=str(doc["blob_sha"]),
-                parent_observation_type="file_content",
-                parent_provider_key="content",
-                filename=Path(str(doc["relative_path"])).name,
-                media_type=str(doc["content_type"]),
-                content=artifact_content,
-                local_agent_job_id=local_agent_job_id,
-                local_agent_attempt_count=local_agent_attempt_count,
-            )
-            _raise_if_local_agent_lease_not_current(artifact_response)
-            input_hash = str(artifact_response.get("input_sha256") or "").strip()
-            if artifact_response.get("error") or len(input_hash) != 64:
-                failed.append(
-                    {
-                        "relative_path": doc["relative_path"],
-                        "error": artifact_response.get("error") or "Source Artifact upload failed",
-                        "detail": artifact_response.get("detail"),
-                        "status_code": artifact_response.get("status_code"),
-                    }
-                )
-                _report_local_agent_progress(
-                    report_progress,
-                    _sync_progress_snapshot(
-                        phase="uploading",
-                        completed=index,
-                        total=len(prepared),
-                        unit="file",
-                        failed=len(failed),
-                    ),
-                )
-                continue
-            artifact_input_hashes.append(input_hash)
-        response = client.push_github_repo_document(
-            source_id=source_id,
-            repo_url=repo["repo_url"],
-            repo_ref=ref,
-            relative_path=str(doc["relative_path"]),
-            markdown_body=str(doc["markdown_body"]),
-            content_type=str(doc["content_type"]),
-            title=str(doc["title"]),
-            raw_hash=str(doc["raw_hash"]),
-            blob_sha=str(doc["blob_sha"]),
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=local_agent_job_id,
-            local_agent_attempt_count=local_agent_attempt_count,
-            artifact_source_unit_key=(str(doc["relative_path"]) if artifact_input_hashes else None),
-            artifact_input_hashes=artifact_input_hashes,
-            submitted_by=submitted_by,
-        )
-        _raise_if_local_agent_lease_not_current(response)
-        if isinstance(response, dict) and response.get("error"):
-            failed.append(
-                {
-                    "relative_path": doc["relative_path"],
-                    "error": response.get("error"),
-                    "detail": response.get("detail"),
-                    "status_code": response.get("status_code"),
-                }
-            )
-        else:
-            pushed.append(
-                {
-                    "relative_path": doc["relative_path"],
-                    "doc_id": response.get("doc_id"),
-                    "document_hash": response.get("document_hash"),
-                }
-            )
+    def report_transfer_phase(phase: str, completed: int) -> None:
         _report_local_agent_progress(
             report_progress,
             _sync_progress_snapshot(
-                phase="uploading",
-                completed=index,
-                total=len(prepared),
+                phase=phase,
+                completed=completed,
+                total=len(entries_to_fetch),
                 unit="file",
                 failed=len(failed),
             ),
+        )
+
+    report_transfer_phase("fetching", 0)
+    for index, entry in enumerate(entries_to_fetch, start=1):
+        if index > 1:
+            report_transfer_phase("fetching", index - 1)
+
+        def body_ready() -> None:
+            report_transfer_phase("fetching", index)
+            report_transfer_phase("uploading", index - 1)
+
+        transfer = _push_github_source_entry(
+            entry,
+            repo=repo,
+            ref=ref,
+            source_id=source_id,
+            client=client,
+            sync_snapshot_id=sync_snapshot_id,
+            local_agent_job_id=local_agent_job_id,
+            local_agent_attempt_count=local_agent_attempt_count,
+            submitted_by=submitted_by,
+            on_body_ready=body_ready,
+        )
+        if transfer.prepared_bytes is not None:
+            fetched_count += 1
+            read_body_bytes += transfer.prepared_bytes
+        if transfer.submitted_bytes is not None:
+            submitted_count += 1
+            uploaded_body_bytes += transfer.submitted_bytes
+        if transfer.receipt.get("error"):
+            failed.append(transfer.receipt)
+        else:
+            pushed.append(transfer.receipt)
+        report_transfer_phase(
+            "uploading" if transfer.prepared_bytes is not None else "fetching",
+            index,
         )
 
     payload = {
@@ -2856,7 +2827,7 @@ def _push_github_profile_to_source(
         "counts": {
             "selected": len(selected_entries),
             "reused": len(selected_entries) - len(entries_to_fetch),
-            "fetched": len(prepared),
+            "fetched": fetched_count,
             "pushed": len(pushed),
             "failed": len(failed),
         },
@@ -2864,9 +2835,9 @@ def _push_github_profile_to_source(
         "failed": failed,
         "metrics": {
             "manifest_items": len(manifest_items),
-            "full_bodies_read": len(prepared),
-            "full_bodies_uploaded": len(prepared),
-            "bytes_read": sum(int(doc["body_bytes"]) for doc in prepared),
+            "full_bodies_read": fetched_count,
+            "full_bodies_uploaded": submitted_count,
+            "bytes_read": read_body_bytes,
             "bytes_uploaded": uploaded_body_bytes,
             "comparison_latency_ms": comparison_latency_ms,
             "end_to_end_latency_ms": round(

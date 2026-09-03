@@ -8,6 +8,11 @@ import type {
 
 export type SourceSyncActivityKind = "sync" | "memory_maintenance";
 
+export interface SourceSyncRetryTarget {
+  execution_kind: "local_agent_job" | "source_sync_run";
+  execution_id: string;
+}
+
 export type SourceSyncActivityState =
   | "queued"
   | "active"
@@ -27,6 +32,8 @@ export interface SourceSyncActivity {
   startedAt?: string | null;
   updatedAt?: string | null;
   finishedAt?: string | null;
+  nextAttemptAt?: string | null;
+  retryTarget?: SourceSyncRetryTarget;
 }
 
 export interface SourceSyncPresentation {
@@ -59,6 +66,9 @@ export function sourceSyncActivityFromLocalJob(job: LocalAgentJobStatusResponse)
     startedAt: job.created_at,
     updatedAt: job.updated_at,
     finishedAt: job.finished_at,
+    nextAttemptAt: job.next_attempt_at,
+    retryTarget: job.status === "queued"
+      ? { execution_kind: "local_agent_job", execution_id: job.job_id } : undefined,
   };
 }
 
@@ -75,6 +85,9 @@ export function sourceSyncActivityFromStatus(sync: SyncStatus): SourceSyncActivi
     startedAt: sync.started_at,
     updatedAt: sync.progress_updated_at,
     finishedAt: sync.finished_at,
+    nextAttemptAt: sync.next_attempt_at,
+    retryTarget: sync.status === "pending" && sync.run_id
+      ? { execution_kind: "source_sync_run", execution_id: sync.run_id } : undefined,
   };
 }
 
@@ -108,11 +121,15 @@ export function selectSourceSyncActivity({
   if (lifecycleMaintenance && ["queued", "running"].includes(lifecycleMaintenance.status)) {
     return sourceSyncActivityFromLifecycleMaintenance(lifecycleMaintenance);
   }
+  if (pending && !["pending", "running", "recovering"].includes(sync?.status ?? "")
+    && !["queued", "leased"].includes(localJob?.status ?? "")) {
+    return { kind: "sync", state: "queued" };
+  }
   const handedOffRunId = localJob?.status === "succeeded"
     ? localJob.result?.source_sync_run_id?.trim()
     : undefined;
-  if (handedOffRunId) {
-    if (sync?.run_id === handedOffRunId) return sourceSyncActivityFromStatus(sync);
+  if (handedOffRunId && sync?.run_id === handedOffRunId) return sourceSyncActivityFromStatus(sync);
+  if (pendingSourceSyncHandoff(localJob, sync)) {
     return {
       kind: "sync",
       state: "active",
@@ -140,6 +157,17 @@ export function selectSourceSyncActivity({
       : undefined,
   ].filter((activity): activity is SourceSyncActivity => activity != null);
   return terminalActivities.sort((left, right) => activityTime(right) - activityTime(left))[0];
+}
+
+export function pendingSourceSyncHandoff(
+  job: LocalAgentJobStatusResponse | null | undefined,
+  sync: SyncStatus | null | undefined,
+): boolean {
+  const runId = job?.status === "succeeded" ? job.result?.source_sync_run_id?.trim() : undefined;
+  if (!runId || sync?.run_id === runId) return false;
+  // A newer authoritative run can replace the receipt in the latest-run view.
+  const createdAt = sync?.created_at || sync?.started_at;
+  return !(createdAt && job?.finished_at && new Date(createdAt).getTime() > new Date(job.finished_at).getTime());
 }
 
 function activityTime(activity: SourceSyncActivity): number {
@@ -175,11 +203,18 @@ export function sourceSyncActivityPolicy(
         canRetry: false,
       }
     : {
-        activeRowLabel: "Syncing now",
+        activeRowLabel: activity.state === "queued"
+          ? isWaitingForRetry(activity) ? "Waiting to retry" : "Waiting to sync"
+          : "Syncing now",
         busyActionLabel: "Syncing",
         busyAriaLabel: "Sync in progress",
         canRetry: true,
       };
+}
+
+function isWaitingForRetry(activity: SourceSyncActivity): boolean {
+  return activity.state === "queued" && Boolean(activity.nextAttemptAt)
+    && new Date(activity.nextAttemptAt!).getTime() > Date.now();
 }
 
 export function sourceSyncActivityIsVisible(
@@ -212,6 +247,16 @@ export function presentSourceSyncActivity(
     };
   }
   if (activity.state === "queued") {
+    if (isWaitingForRetry(activity)) {
+      return {
+        message: "Waiting to retry",
+        detail: `Next retry ${new Date(activity.nextAttemptAt!).toLocaleString()}`
+          + (activity.error?.message ? ` · ${safeFailureDetail(activity.error)}` : ""),
+      };
+    }
+    if (activity.retryTarget?.execution_kind === "local_agent_job") {
+      return { message: "Waiting for your device", detail: "Local sync queued" };
+    }
     return { message: "Waiting to sync", detail: "Queued" };
   }
   if (activity.state === "recovering") {

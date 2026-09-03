@@ -66,6 +66,26 @@ def _app(tmp_path: Path, database: Database, *, workspace_id: str = "default"):
     )
 
 
+def test_exact_sync_receipt_read_preserves_state_and_source_visibility(tmp_path):
+    database = _connect_database(tmp_path)
+    try:
+        with TestClient(_app(tmp_path, database)) as client:
+            source_id = client.post("/api/v1/sources", json=_confluence_payload(access_policy="private")).json()["id"]
+            run = asyncio.run(database.enqueue_source_sync_run(source_id=source_id))
+            url = f"/api/v1/sources/{source_id}/sync-runs/{run.run_id}"
+            before = asyncio.run(database.get_source_sync_run(run.run_id))
+            response = client.get(url)
+            assert response.status_code == 200, response.text
+            assert response.json() == {"run_id": run.run_id, "status": "pending"}
+            assert client.get(url, headers={"x-test-user": "other"}).status_code == 404
+            assert client.get(f"/api/v1/sources/{source_id}/sync-runs/missing").status_code == 404
+            assert asyncio.run(database.get_source_sync_run(run.run_id)) == before
+        with TestClient(_app(tmp_path, database, workspace_id="another")) as other_workspace:
+            assert other_workspace.get(url).status_code == 404
+    finally:
+        asyncio.run(database.close())
+
+
 def _confluence_payload(
     name: str = "Architecture Wiki",
     *,
