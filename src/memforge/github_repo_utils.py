@@ -6,6 +6,8 @@ import hashlib
 import base64
 import binascii
 import mimetypes
+import re
+from io import BytesIO
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -14,6 +16,66 @@ from memforge.models import slugify
 
 DEFAULT_INCLUDE_EXTENSIONS = "md, markdown, txt, adoc, rst"
 DEFAULT_INCLUDE_EXTENSION_LIST = ["md", "markdown", "txt", "adoc", "rst"]
+
+# Provider envelope, not a promise that arbitrary documents fit extraction memory.
+GITHUB_BLOB_MAX_BYTES = 100 * 1024 * 1024
+
+
+class GitHubBlobBuffer:
+    """Bound one raw transfer and verify its immutable identity before use."""
+
+    def __init__(
+        self, *, sha: str, size: object, label: str, content_length: object = None,
+    ) -> None:
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise ValueError(f"GitHub blob identity is invalid for {label}")
+        self.sha = sha
+        self.label = label
+        self.lengths: list[int] = []
+        for value in (size, content_length):
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"GitHub blob size is invalid for {label}")
+            if value > GITHUB_BLOB_MAX_BYTES:
+                raise ValueError(f"GitHub blob exceeds provider byte limit for {label}")
+            self.lengths.append(value)
+        if len(set(self.lengths)) > 1:
+            raise ValueError(f"GitHub blob size mismatch for {label}")
+        self.limit = min([GITHUB_BLOB_MAX_BYTES, *self.lengths])
+        self.buffer = BytesIO()
+
+    def write(self, chunk: bytes) -> None:
+        if self.buffer.tell() + len(chunk) > self.limit:
+            raise ValueError(f"GitHub blob exceeds declared size or provider byte limit for {self.label}")
+        self.buffer.write(chunk)
+
+    def finish(self) -> bytes:
+        size = self.buffer.tell()
+        if any(size != expected for expected in self.lengths):
+            raise ValueError(f"GitHub blob size mismatch for {self.label}")
+        digest = hashlib.sha1(f"blob {size}\0".encode("ascii"), usedforsecurity=False)
+        with self.buffer.getbuffer() as view:
+            digest.update(view)
+        if digest.hexdigest() != self.sha:
+            raise ValueError(f"GitHub blob hash mismatch for {self.label}")
+        return self.buffer.getvalue()
+
+
+def decode_github_text(raw: bytes, *, label: str) -> str:
+    """Decode supported source text without altering the provider's Evidence."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"GitHub file {label} is invalid UTF-8 at byte {exc.start}; "
+            "correct the source file encoding and commit a new revision."
+        ) from exc
+
+
+def validate_github_file_mode(mode: object, *, label: str) -> None:
+    if mode not in ("100644", "100755"):
+        raise ValueError(f"GitHub selected file {label} has unsupported file mode {mode!r}")
 
 
 def build_github_repo_doc_id(*, source_id: str, repo_url: str, repo_ref: str, relative_path: str) -> str:

@@ -2,6 +2,8 @@ import base64
 import hashlib
 import json
 import subprocess
+import sys
+from tempfile import TemporaryFile
 from pathlib import Path
 
 import click
@@ -868,6 +870,33 @@ def test_adapter_list_includes_markdown_kb_capability():
     assert {"type": "kb", "kind": "markdown"} in payload["data"]
 
 
+def _git_blob_sha(body):
+    return hashlib.sha1(b"blob " + str(len(body)).encode() + b"\0" + body).hexdigest()
+
+
+@pytest.fixture(autouse=True)
+def _github_raw_process_transport(monkeypatch):
+    """Expose existing provider fixtures through a real bounded stdout pipe."""
+    popen = subprocess.Popen
+
+    def raw_popen(cmd, **kwargs):
+        if cmd[:2] != ["gh", "api"]:
+            return popen(cmd, **kwargs)
+        assert "Accept: application/vnd.github.raw+json" in cmd
+        result = main.subprocess.run(cmd, env=kwargs["env"])
+        payload = json.loads(result.stdout)
+        raw = base64.b64decode(payload["content"])
+        with TemporaryFile() as body:
+            body.write(raw)
+            body.seek(0)
+            return popen(
+                [sys.executable, "-c", "import shutil,sys; shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)"],
+                stdin=body, **kwargs,
+            )
+
+    monkeypatch.setattr(main.subprocess, "Popen", raw_popen)
+
+
 def _fake_github_remote_run(cmd, *args, **kwargs):
     assert cmd[:2] == ["gh", "api"]
     assert kwargs["env"]["GH_HOST"] == "github.wdf.sap.corp"
@@ -878,11 +907,11 @@ def _fake_github_remote_run(cmd, *args, **kwargs):
         payload = {
             "truncated": False,
             "tree": [
-                {"path": "Payroll Processing V2/README.md", "type": "blob", "sha": "readme", "size": 30},
-                {"path": "Payroll Processing V2/Überblick.md", "type": "blob", "sha": "overview", "size": 20},
-                {"path": "Payroll Processing V2/images/Flow.puml", "type": "blob", "sha": "flow", "size": 10},
-                {"path": "Payroll Processing V2/images/ignored.png", "type": "blob", "sha": "png", "size": 5},
-                {"path": "Flexible Payroll/README.md", "type": "blob", "sha": "flex", "size": 25},
+                {"path": "Payroll Processing V2/README.md", "type": "blob", "mode": "100644", "sha": _git_blob_sha(b"# Payroll Processing V2\n\nBody"), "size": len(b"# Payroll Processing V2\n\nBody")},
+                {"path": "Payroll Processing V2/Überblick.md", "type": "blob", "mode": "100644", "sha": _git_blob_sha(b"# Payroll Processing V2\n\nBody"), "size": len(b"# Payroll Processing V2\n\nBody")},
+                {"path": "Payroll Processing V2/images/Flow.puml", "type": "blob", "mode": "100644", "sha": _git_blob_sha(b"# Payroll Processing V2\n\nBody"), "size": len(b"# Payroll Processing V2\n\nBody")},
+                {"path": "Payroll Processing V2/images/ignored.png", "type": "blob", "mode": "100644", "sha": "png", "size": 5},
+                {"path": "Flexible Payroll/README.md", "type": "blob", "mode": "100644", "sha": _git_blob_sha(b"# Payroll Processing V2\n\nBody"), "size": len(b"# Payroll Processing V2\n\nBody")},
             ]
         }
     elif "/git/blobs/" in endpoint:
@@ -1003,6 +1032,7 @@ def test_local_agent_cloud_github_sync_streams_selected_image_as_artifact(monkey
                     {
                         "path": "Payroll Processing V2/images/architecture.png",
                         "type": "blob",
+                        "mode": "100644",
                         "sha": "image-sha",
                         "size": len(image_bytes),
                     }
@@ -1064,6 +1094,7 @@ def test_local_agent_cloud_github_rejects_oversized_image_before_blob_download(m
                     {
                         "path": "docs/oversized.png",
                         "type": "blob",
+                        "mode": "100644",
                         "sha": "oversized-image-sha",
                         "size": main.MAX_SOURCE_ARTIFACT_STORAGE_BYTES + 1,
                     }
@@ -1108,6 +1139,7 @@ def test_local_agent_cloud_github_noop_uses_manifest_without_reading_or_uploadin
         {
             "relative_path": f"docs/file-{index:03d}.md",
             "blob_sha": f"blob-{index:03d}",
+            "file_mode": "100644",
             "content_type": "text/markdown",
         }
         for index in range(555)
@@ -1175,13 +1207,13 @@ def test_local_agent_cloud_github_sync_pins_tree_and_body_to_one_commit(monkeypa
             payload = {
                 "truncated": False,
                 "tree": [
-                    {"path": "README.md", "type": "blob", "sha": "blob-1", "size": 10}
+                    {"path": "README.md", "type": "blob", "mode": "100644", "sha": _git_blob_sha(b"# Pinned body"), "size": len(b"# Pinned body")}
                 ],
             }
-        elif endpoint.endswith("/git/blobs/blob-1"):
+        elif endpoint.endswith("/git/blobs/" + _git_blob_sha(b"# Pinned body")):
             raw = b"# Pinned body"
             payload = {
-                "sha": "blob-1",
+                "sha": _git_blob_sha(b"# Pinned body"),
                 "content": base64.b64encode(raw).decode(),
                 "encoding": "base64",
                 "size": len(raw),
@@ -1212,10 +1244,10 @@ def test_local_agent_cloud_github_sync_pins_tree_and_body_to_one_commit(monkeypa
     assert endpoints == [
         "repos/example/public-howtos/commits/main",
         "repos/example/public-howtos/git/trees/tree-1?recursive=1",
-        "repos/example/public-howtos/git/blobs/blob-1",
+        "repos/example/public-howtos/git/blobs/" + _git_blob_sha(b"# Pinned body"),
     ]
     [push_call] = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
-    assert push_call[1]["blob_sha"] == "blob-1"
+    assert push_call[1]["blob_sha"] == _git_blob_sha(b"# Pinned body")
 
 
 @pytest.mark.parametrize("failure", [None, "decode", "upload", "lease"])
@@ -1246,6 +1278,8 @@ def test_local_agent_github_uploads_each_body_before_fetching_the_next(monkeypat
             events.append("process")
             return super().start_source_processing(**kwargs)
 
+    bodies = [b"T0xt", b"\xff" if failure == "decode" else b"T1xt", b"T2xt"]
+
     def github_run(cmd, *args, **kwargs):
         endpoint = cmd[2]
         if endpoint.endswith("/commits/main"):
@@ -1253,14 +1287,14 @@ def test_local_agent_github_uploads_each_body_before_fetching_the_next(monkeypat
         elif "/git/trees/tree-1" in endpoint:
             data = {
                 "truncated": False,
-                "tree": [{"path": f"{n}.md", "type": "blob", "sha": f"blob-{n}", "size": 4} for n in range(3)],
+                "tree": [{"path": f"{n}.md", "type": "blob", "mode": "100644", "sha": _git_blob_sha(bodies[n]), "size": len(bodies[n])} for n in range(3)],
             }
         else:
-            number = endpoint.rsplit("-", 1)[1]
+            number = str([_git_blob_sha(body) for body in bodies].index(endpoint.rsplit("/", 1)[1]))
             events.append("read:" + number + ".md")
-            raw = b"\xff" if number == "1" and failure == "decode" else b"Text"
+            raw = bodies[int(number)]
             data = {
-                "sha": f"blob-{number}",
+                "sha": _git_blob_sha(raw),
                 "content": base64.b64encode(raw).decode(),
                 "encoding": "base64",
                 "size": len(raw),
@@ -1326,7 +1360,7 @@ def test_github_transfer_body_memory_does_not_grow_with_file_count(monkeypatch):
             data = {
                 "truncated": False,
                 "tree": [
-                    {"path": f"{n:02}.md", "type": "blob", "sha": f"blob-{n}", "size": body_bytes}
+                    {"path": f"{n:02}.md", "type": "blob", "mode": "100644", "sha": _git_blob_sha(b"x" * body_bytes), "size": body_bytes}
                     for n in range(file_count)
                 ],
             }
@@ -1405,12 +1439,12 @@ def test_local_agent_cloud_github_sync_reports_failed_paths_for_retry_diagnostic
     FakeToolClient.reset({"doc_id": "github-repo-doc", "document_hash": "hash"})
     monkeypatch.setattr(main.subprocess, "run", _fake_github_remote_run)
 
-    def github_blob(_repo, _blob_sha, relative_path):
+    def github_blob(_repo, _blob_sha, relative_path, *, size):
         if relative_path.endswith("Überblick.md"):
             raise click.ClickException("temporary GitHub API failure")
         return b"# Durable document\n\nBody"
 
-    monkeypatch.setattr(main, "_github_blob", github_blob)
+    monkeypatch.setattr(main, "_github_text_blob", github_blob)
 
     payload = main._run_cloud_local_agent_job(
         {

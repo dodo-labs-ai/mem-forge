@@ -27,7 +27,8 @@ from memforge.genes.local_markdown_gene import _parse_dt, _to_markdown
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSIONS,
     build_github_repo_doc_id,
-    decode_github_contents_payload,
+    GitHubBlobBuffer,
+    decode_github_text,
     github_content_type,
     github_content_type_is_binary,
     github_exclude_paths,
@@ -40,6 +41,7 @@ from memforge.github_repo_utils import (
     normalize_github_relative_path,
     parse_github_repo_url,
     validate_github_tree_payload,
+    validate_github_file_mode,
 )
 from memforge.models import (
     ConfigField,
@@ -243,7 +245,17 @@ class GitHubRepoGene(Gene):
         ref = str(self.config.get("ref") or "").strip()
         if not ref:
             ref = await self._default_branch(repo_ref)
-        entries = await self._repo_tree(repo_ref, ref)
+        commit_response = await self._client.get(f"{_repo_api_url(repo_ref)}/commits/{quote(ref, safe='')}")
+        commit_response.raise_for_status()
+        commit_payload = commit_response.json()
+        commit_payload = commit_payload if isinstance(commit_payload, dict) else {}
+        commit = commit_payload.get("commit")
+        tree = commit.get("tree") if isinstance(commit, dict) else None
+        commit_sha = str(commit_payload.get("sha") or "")
+        root_tree = str(tree.get("sha") or "") if isinstance(tree, dict) else ""
+        if not commit_sha or not root_tree:
+            raise RuntimeError("GitHub did not return an immutable commit and root tree for this collection")
+        entries = await self._repo_tree(repo_ref, root_tree)
         include_paths = github_include_paths(self.config)
         exclude_paths = github_exclude_paths(self.config)
         include_exts = github_include_extensions(self.config)
@@ -251,7 +263,7 @@ class GitHubRepoGene(Gene):
         selected = [
             entry
             for entry in entries
-            if entry.get("type") == "blob"
+            if entry.get("type") in {"blob", "commit"}
             and github_path_in_scope(str(entry.get("path") or ""), include_paths, exclude_paths)
             and github_extension_allowed(str(entry.get("path") or ""), include_exts)
         ]
@@ -285,8 +297,10 @@ class GitHubRepoGene(Gene):
                     "relative_path": path,
                     "blob_sha": blob_sha,
                     "blob_size": entry.get("size"),
+                    "file_mode": entry.get("mode"),
+                    "commit_sha": commit_sha,
+                    "root_tree_sha": root_tree,
                     "repo_blob_url": _blob_url(repo_ref, blob_sha),
-                    "repo_contents_url": _contents_url(repo_ref, path, ref),
                 },
             )
         self.attest_discovery_complete("github_recursive_tree_exhausted")
@@ -313,6 +327,10 @@ class GitHubRepoGene(Gene):
                 artifacts=source_artifacts_from_package(package),
             )
 
+        try:
+            validate_github_file_mode(item.extra.get("file_mode"), label=str(item.extra.get("relative_path")))
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
         if (
             github_content_type_is_binary(item.content_type)
             and item.content_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES
@@ -354,15 +372,26 @@ class GitHubRepoGene(Gene):
                 ),
             )
 
-        response = await self._client.get(str(item.extra["repo_contents_url"]))
-        response.raise_for_status()
-        payload = response.json()
         try:
-            raw = decode_github_contents_payload(
-                payload,
-                expected_sha=str(item.extra.get("blob_sha") or ""),
-                label=str(item.extra.get("relative_path") or item.item_id),
-            )
+            async with self._client.stream(
+                str(item.extra["repo_blob_url"]),
+                headers={"Accept": "application/vnd.github.raw+json", "Accept-Encoding": "identity"},
+            ) as response:
+                response.raise_for_status()
+                if response.headers.get("content-encoding", "identity").lower() != "identity":
+                    raise ValueError("GitHub raw blob returned unsupported content encoding")
+                length_header = response.headers.get("content-length")
+                if length_header is not None and not re.fullmatch(r"[0-9]+", str(length_header).strip()):
+                    raise ValueError("GitHub raw blob has an invalid transport length")
+                buffer = GitHubBlobBuffer(
+                    sha=str(item.extra.get("blob_sha") or ""),
+                    size=item.extra.get("blob_size"),
+                    content_length=int(length_header) if length_header is not None else None,
+                    label=str(item.extra.get("relative_path") or item.item_id),
+                )
+                async for chunk in _iter_response_chunks(response):
+                    buffer.write(chunk)
+                raw = buffer.finish()
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         return RawContent(
@@ -371,7 +400,7 @@ class GitHubRepoGene(Gene):
             content_type=item.content_type or "text/plain",
             authoritative_empty=not raw.strip(),
             empty_evidence=(
-                "github_contents_api_successful_empty_blob"
+                "github_raw_blob_verified_empty_file"
                 if not raw.strip()
                 else None
             ),
@@ -404,13 +433,14 @@ class GitHubRepoGene(Gene):
             )
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:
-        if raw.content_type == "application/json":
+        if raw.item.extra.get("package_uri") or raw.item.extra.get("package_path"):
             package = json.loads(raw.body.decode("utf-8"))
             markdown = _to_markdown(package.get("content_type") or "text/markdown", package.get("markdown") or "")
             semantics = _semantics_from_package(package)
             return NormalizedContent(item=raw.item, markdown_body=markdown, source_semantics=semantics)
 
-        markdown = _to_markdown(raw.content_type, raw.body.decode("utf-8", errors="replace"))
+        text = decode_github_text(raw.body, label=str(raw.item.extra.get("relative_path") or raw.item.item_id))
+        markdown = _to_markdown(raw.content_type, text)
         semantics = {
             "source_type": GITHUB_REPO_SOURCE_TYPE,
             "connection_mode": raw.item.extra.get("connection_mode"),
@@ -592,10 +622,6 @@ def _repo_api_url(ref: _RepoRef) -> str:
     if ref.host == "github.com":
         return f"https://api.github.com/repos/{quote(ref.owner, safe='')}/{quote(ref.repo, safe='')}"
     return f"{ref.origin}/api/v3/repos/{quote(ref.owner, safe='')}/{quote(ref.repo, safe='')}"
-
-
-def _contents_url(ref: _RepoRef, relative_path: str, repo_ref: str) -> str:
-    return f"{_repo_api_url(ref)}/contents/{quote(relative_path, safe='/')}?ref={quote(repo_ref, safe='')}"
 
 
 def _blob_url(ref: _RepoRef, blob_sha: str) -> str:
