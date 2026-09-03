@@ -7449,9 +7449,16 @@ async def test_private_relation_completion_rechecks_access_as_current_owner(
     assert await db.db.execute_fetchall("SELECT id FROM relation_runs") == []
 
 
+@pytest.mark.parametrize(
+    ("candidate_source_id", "candidate_source_type"),
+    [("src-other", "confluence"), ("src-managed-capture", "agent_session"),
+     ("user_memory", "user_memory"), ("user_correction", "user_correction")],
+)
 @pytest.mark.asyncio
 async def test_relation_discovery_persists_direction_after_lifecycle_commit(
     db: Database,
+    candidate_source_id: str,
+    candidate_source_type: str,
 ) -> None:
     projection = _projection(
         run_id="projection-relation-discovery",
@@ -7496,7 +7503,7 @@ async def test_relation_discovery_persists_direction_after_lifecycle_commit(
     await db.upsert_document(
         DocumentRecord(
             doc_id="other-doc",
-            source="src-other",
+            source=candidate_source_id,
             source_url="https://example.test/other-doc",
             title="Relation candidate",
             space_or_project="ENG",
@@ -7516,13 +7523,15 @@ async def test_relation_discovery_persists_direction_after_lifecycle_commit(
     await db.add_memory_source(
         candidate.id,
         "other-doc",
-        "confluence",
+        candidate_source_type,
         source_updated_at=now,
     )
 
+    candidates = _DeterministicRelationCandidates(candidate)
+    candidates.candidate_row = replace(candidates.candidate_row, source_id=candidate_source_id)
     result = await RelationDiscovery(
         store=db,
-        candidate_retriever=_DeterministicRelationCandidates(candidate),
+        candidate_retriever=candidates,
         pair_classifier=_DeterministicRefinementClassifier(),
     ).process_slice(worker_id="relation-worker")
 
@@ -7544,6 +7553,13 @@ async def test_relation_discovery_persists_direction_after_lifecycle_commit(
         (unit.id,),
     )
     assert relation_run["result_memory_id"] == challenger.id
+    [work] = await db.db.execute_fetchall("SELECT status FROM relation_discovery_work")
+    assert work["status"] == "completed"
+    assert (await db.get_memory(candidate.id)).status == "active"
+    assert (await db.get_memory(challenger.id)).status == "active"
+    source_ids = await db.get_memory_source_ids_many((candidate.id,))
+    expected_sources = () if candidate_source_type.startswith("user_") else (candidate_source_id,)
+    assert source_ids[candidate.id] == expected_sources
 
 
 @pytest.mark.asyncio
