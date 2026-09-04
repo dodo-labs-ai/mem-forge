@@ -18,7 +18,11 @@ from memforge.agent_knowledge import (
     AgentKnowledgePatchModelResponse,
     AgentKnowledgePatchProposal,
 )
-from memforge.memory.evidence import EvidencePartKind, EvidenceRole
+from memforge.memory.evidence import (
+    ActiveSupportEvidence,
+    EvidencePartKind,
+    EvidenceRole,
+)
 from memforge.models import DocumentRecord
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.extraction_contract import (
@@ -32,7 +36,10 @@ from memforge.pipeline.projection_context import (
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
     FragmentSelectionErrorCode,
+    RevalidatedSelectionError,
+    RevalidatedSelectionErrorCode,
     compile_projection_fragment_catalog,
+    resolve_revalidated_noop_selection,
     resolve_projected_agent_claim_fragment,
 )
 from memforge.source_derivation import (
@@ -43,6 +50,7 @@ from memforge.source_derivation import (
 )
 from memforge.storage.database import Database
 from memforge.source_projection import (
+    AnchorKind,
     DeltaAxis,
     EvidenceCoordinateSpace,
     EvidenceRepresentationProfile,
@@ -51,6 +59,7 @@ from memforge.source_projection import (
     SourceObservation,
     SourceObservationRevision,
     SourceProjection,
+    SourceAnchor,
     SourceUnit,
     SourceUnitRevision,
 )
@@ -333,6 +342,120 @@ def test_v9_well_formed_response_remains_byte_stable() -> None:
     response = ProjectionFragmentMemoryExtractionResponse.model_validate(payload)
 
     assert response.model_dump() == payload
+
+
+def test_noop_revalidation_presents_only_the_existing_evidence_unit_from_a_large_revision() -> None:
+    filler = tuple(
+        f"Unrelated historical paragraph {index}: " + ("x" * 180)
+        for index in range(700)
+    )
+    claim = "Approval requires two reviewers."
+    content = "\n\n".join((*filler[:350], "<div></div>", claim, *filler[350:]))
+    assert len(content) > 120_000
+    projection = _projection(primary_content=content)
+    current_revision = projection.observation_revisions[0]
+    claim_start = content.index(claim)
+    claim_end = claim_start + len(claim)
+    support = ActiveSupportEvidence(
+        memory_id="mem-approval",
+        source_id=projection.source_id,
+        reference_id="ref-primary",
+        evidence_unit_id="eu-approval",
+        role=EvidenceRole.PRIMARY,
+        anchor=SourceAnchor(
+            kind=AnchorKind.REVISION_RANGE,
+            observation_id=current_revision.observation_id,
+            observation_revision_id="rev-primary-previous",
+            range_start=claim_start,
+            range_end=claim_end,
+        ),
+        excerpt=claim,
+    )
+
+    selection = resolve_revalidated_noop_selection(
+        projection,
+        support=(support,),
+        access_context_hash="access-1",
+        current_primary_quote=claim,
+        current_required_quotes_by_reference_id={},
+    )
+
+    assert len(selection.parts) == 1
+    [primary] = selection.parts
+    assert primary.role is EvidenceRole.PRIMARY
+    assert primary.excerpt == claim
+    assert primary.anchor == SourceAnchor(
+        kind=AnchorKind.REVISION_RANGE,
+        observation_id=current_revision.observation_id,
+        observation_revision_id=current_revision.id,
+        range_start=claim_start,
+        range_end=claim_end,
+    )
+
+
+def test_noop_revalidation_keeps_the_presentation_limit_for_one_oversized_fragment() -> None:
+    claim = "x" * 120_001
+    projection = _projection(primary_content=claim)
+    current_revision = projection.observation_revisions[0]
+    support = ActiveSupportEvidence(
+        memory_id="mem-oversized",
+        source_id=projection.source_id,
+        reference_id="ref-primary",
+        evidence_unit_id="eu-oversized",
+        role=EvidenceRole.PRIMARY,
+        anchor=SourceAnchor(
+            kind=AnchorKind.REVISION_RANGE,
+            observation_id=current_revision.observation_id,
+            observation_revision_id="rev-primary-previous",
+            range_start=0,
+            range_end=len(claim),
+        ),
+        excerpt=claim,
+    )
+
+    with pytest.raises(RevalidatedSelectionError) as exc_info:
+        resolve_revalidated_noop_selection(
+            projection,
+            support=(support,),
+            access_context_hash="access-1",
+            current_primary_quote=claim,
+            current_required_quotes_by_reference_id={},
+        )
+
+    assert exc_info.value.code is RevalidatedSelectionErrorCode.UNPRESENTABLE
+
+
+def test_noop_revalidation_rejects_an_ambiguous_moved_fragment() -> None:
+    claim = "Approval requires two reviewers."
+    content = f"{claim}\n\nUnrelated paragraph.\n\n{claim}"
+    projection = _projection(primary_content=content)
+    current_revision = projection.observation_revisions[0]
+    support = ActiveSupportEvidence(
+        memory_id="mem-ambiguous",
+        source_id=projection.source_id,
+        reference_id="ref-primary",
+        evidence_unit_id="eu-ambiguous",
+        role=EvidenceRole.PRIMARY,
+        anchor=SourceAnchor(
+            kind=AnchorKind.REVISION_RANGE,
+            observation_id=current_revision.observation_id,
+            observation_revision_id="rev-primary-previous",
+            range_start=1,
+            range_end=len(claim) + 1,
+        ),
+        excerpt=claim,
+    )
+
+    with pytest.raises(RevalidatedSelectionError) as exc_info:
+        resolve_revalidated_noop_selection(
+            projection,
+            support=(support,),
+            access_context_hash="access-1",
+            current_primary_quote=claim,
+            current_required_quotes_by_reference_id={},
+        )
+
+    assert exc_info.value.code is RevalidatedSelectionErrorCode.AMBIGUOUS
 
 
 @pytest.mark.parametrize("json_text", [False, True])
