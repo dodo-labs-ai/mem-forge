@@ -4,21 +4,36 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from enum import Enum
+from typing import Mapping
 
 from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
     projection_extraction_contract,
 )
-from memforge.pipeline.evidence_fragments import plan_revision_structural_units
+from memforge.pipeline.evidence_fragments import (
+    StructuralUnit,
+    StructuralUnitTooLargeError,
+    canonical_nested_changed_raw_ranges,
+    canonical_record_field_ranges,
+    canonical_record_is_tombstoned,
+    plan_revision_structural_units,
+    revision_changed_structural_ranges,
+    revision_structural_ranges,
+)
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
     source_artifact_inference_eligibility,
 )
-from memforge.source_projection import SourceObservationRevision, SourceProjection
+from memforge.source_projection import (
+    SourceObservationRevision,
+    SourceProjection,
+    SourceUnitRevision,
+)
 
 
 LEGACY_PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 2
-PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 4
+PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,10 +65,277 @@ class _PrimarySegment:
     markdown: str
 
 
+class ProjectionEvidencePlanningFailureCode(str, Enum):
+    INCREMENTAL_BASE_UNAVAILABLE = "INCREMENTAL_BASE_UNAVAILABLE"
+    INCREMENTAL_AUTHORITY_UNMAPPABLE = "INCREMENTAL_AUTHORITY_UNMAPPABLE"
+    CANONICAL_FIELD_MAPPING_INVALID = "CANONICAL_FIELD_MAPPING_INVALID"
+    REPRESENTATION_PROFILE_UNSUPPORTED = "REPRESENTATION_PROFILE_UNSUPPORTED"
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionEvidencePlanningFailure:
+    code: ProjectionEvidencePlanningFailureCode
+    observation_id: str | None
+    observation_revision_id: str | None
+    representation_profile: str | None
+    changed_structure_count: int = 0
+    authorized_structure_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedSourceUnitSnapshot:
+    unit_revision: SourceUnitRevision
+    observation_revisions: tuple[SourceObservationRevision, ...]
+
+    def __post_init__(self) -> None:
+        revision_ids = {
+            revision.id for revision in self.observation_revisions
+        }
+        if revision_ids != set(self.unit_revision.observation_revision_ids):
+            raise ValueError(
+                "committed Source Unit snapshot requires complete Observation membership"
+            )
+
+    @property
+    def revisions_by_observation_id(
+        self,
+    ) -> Mapping[str, SourceObservationRevision]:
+        return {
+            revision.observation_id: revision
+            for revision in self.observation_revisions
+        }
+
+
+def plan_projection_evidence_work(
+    projection: SourceProjection,
+    *,
+    committed_base_snapshot: CommittedSourceUnitSnapshot | None = None,
+    reprocess_all_current_observations: bool,
+    extraction_contract_version: str = PROJECTION_EXTRACTION_CONTRACT_VERSION,
+) -> tuple[ProjectionExtractionBatch, ...] | ProjectionEvidencePlanningFailure:
+    """Plan current-work authority before presentation batching.
+
+    Provider adapters declare representation and change facts. This active
+    fragment-catalog seam compares the committed base and staged target through
+    representation-owned structure; Context and batch packing cannot widen it.
+    """
+
+    contract = projection_extraction_contract(extraction_contract_version)
+    selected_primary_ids = (
+        tuple(observation.id for observation in projection.observations)
+        if reprocess_all_current_observations
+        else None
+    )
+    if not contract.uses_fragment_catalog or reprocess_all_current_observations:
+        return plan_projection_extraction_batches(
+            projection,
+            primary_observation_ids=selected_primary_ids,
+            extraction_contract_version=extraction_contract_version,
+        )
+
+    delta = projection.deltas[0]
+    revisions = {
+        revision.observation_id: revision
+        for revision in projection.observation_revisions
+    }
+    if delta.previous_unit_revision_id is None:
+        tombstoned_ranges: dict[str, tuple[tuple[int, int], ...]] = {}
+        for observation_id in delta.added_observation_ids:
+            revision = revisions.get(observation_id)
+            if revision is None:
+                return ProjectionEvidencePlanningFailure(
+                    code=(
+                        ProjectionEvidencePlanningFailureCode.INCREMENTAL_AUTHORITY_UNMAPPABLE
+                    ),
+                    observation_id=observation_id,
+                    observation_revision_id=None,
+                    representation_profile=None,
+                )
+            profile = revision.evidence_profile
+            if profile is None or profile.name != "canonical-record":
+                continue
+            try:
+                tombstoned = canonical_record_is_tombstoned(revision)
+            except ValueError:
+                return ProjectionEvidencePlanningFailure(
+                    code=(
+                        ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID
+                    ),
+                    observation_id=observation_id,
+                    observation_revision_id=revision.id,
+                    representation_profile=profile.name,
+                )
+            if tombstoned:
+                tombstoned_ranges[observation_id] = ()
+        return plan_projection_extraction_batches(
+            projection,
+            primary_authority_ranges_by_observation_id=(
+                tombstoned_ranges if tombstoned_ranges else None
+            ),
+            extraction_contract_version=extraction_contract_version,
+        )
+
+    added_ids = set(delta.added_observation_ids)
+    exact_authority_ranges: dict[str, tuple[tuple[int, int], ...]] = {}
+    if (
+        committed_base_snapshot is None
+        or committed_base_snapshot.unit_revision.id
+        != delta.previous_unit_revision_id
+        or committed_base_snapshot.unit_revision.source_unit_id
+        != delta.source_unit_id
+    ):
+        first_changed = next(iter(delta.changed_anchors), None)
+        target_revision = (
+            revisions.get(first_changed.observation_id)
+            if first_changed is not None
+            else None
+        )
+        return ProjectionEvidencePlanningFailure(
+            code=(
+                ProjectionEvidencePlanningFailureCode.INCREMENTAL_BASE_UNAVAILABLE
+            ),
+            observation_id=(
+                target_revision.observation_id
+                if target_revision is not None
+                else None
+            ),
+            observation_revision_id=(
+                target_revision.id if target_revision is not None else None
+            ),
+            representation_profile=(
+                target_revision.evidence_profile.name
+                if target_revision is not None
+                and target_revision.evidence_profile is not None
+                else None
+            ),
+        )
+    base_revisions = committed_base_snapshot.revisions_by_observation_id
+    for anchor in delta.changed_anchors:
+        if anchor.observation_id in added_ids:
+            continue
+        revision = revisions.get(anchor.observation_id)
+        if revision is None:
+            return ProjectionEvidencePlanningFailure(
+                code=(
+                    ProjectionEvidencePlanningFailureCode.INCREMENTAL_AUTHORITY_UNMAPPABLE
+                ),
+                observation_id=anchor.observation_id,
+                observation_revision_id=anchor.observation_revision_id,
+                representation_profile=None,
+            )
+        profile = revision.evidence_profile
+        if profile is None:
+            return ProjectionEvidencePlanningFailure(
+                code=(
+                    ProjectionEvidencePlanningFailureCode.REPRESENTATION_PROFILE_UNSUPPORTED
+                ),
+                observation_id=revision.observation_id,
+                observation_revision_id=revision.id,
+                representation_profile=None,
+            )
+        if profile.name == "canonical-record":
+            base_revision = base_revisions.get(
+                anchor.observation_id
+            )
+            if base_revision is None:
+                return ProjectionEvidencePlanningFailure(
+                    code=(
+                        ProjectionEvidencePlanningFailureCode.INCREMENTAL_BASE_UNAVAILABLE
+                    ),
+                    observation_id=revision.observation_id,
+                    observation_revision_id=revision.id,
+                    representation_profile=profile.name,
+                )
+            try:
+                if canonical_record_is_tombstoned(revision):
+                    exact_authority_ranges[anchor.observation_id] = ()
+                    continue
+                base_fields = {
+                    item.descriptor.json_pointer: item
+                    for item in canonical_record_field_ranges(base_revision)
+                }
+                target_fields = canonical_record_field_ranges(revision)
+            except ValueError:
+                return ProjectionEvidencePlanningFailure(
+                    code=(
+                        ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID
+                    ),
+                    observation_id=revision.observation_id,
+                    observation_revision_id=revision.id,
+                    representation_profile=profile.name,
+                )
+            changed_ranges = []
+            for item in target_fields:
+                base_field = base_fields.get(item.descriptor.json_pointer)
+                if (
+                    base_field is not None
+                    and base_field.comparison_value == item.comparison_value
+                ):
+                    continue
+                if base_field is not None and item.descriptor.nested_profile:
+                    try:
+                        changed_ranges.extend(
+                            canonical_nested_changed_raw_ranges(base_field, item)
+                        )
+                    except ValueError:
+                        return ProjectionEvidencePlanningFailure(
+                            code=(
+                                ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID
+                            ),
+                            observation_id=revision.observation_id,
+                            observation_revision_id=revision.id,
+                            representation_profile=profile.name,
+                        )
+                else:
+                    changed_ranges.append((item.start, item.end))
+            exact_authority_ranges[anchor.observation_id] = tuple(changed_ranges)
+            continue
+        if profile.name not in {
+            "markdown-structural",
+            "plain-text",
+        }:
+            continue
+        base_revision = base_revisions.get(anchor.observation_id)
+        if base_revision is None:
+            return ProjectionEvidencePlanningFailure(
+                code=(
+                    ProjectionEvidencePlanningFailureCode.INCREMENTAL_BASE_UNAVAILABLE
+                ),
+                observation_id=revision.observation_id,
+                observation_revision_id=revision.id,
+                representation_profile=profile.name,
+            )
+        try:
+            mapped_ranges = revision_changed_structural_ranges(
+                base_revision,
+                revision,
+            )
+        except ValueError:
+            return ProjectionEvidencePlanningFailure(
+                code=(
+                    ProjectionEvidencePlanningFailureCode.INCREMENTAL_AUTHORITY_UNMAPPABLE
+                ),
+                observation_id=revision.observation_id,
+                observation_revision_id=revision.id,
+                representation_profile=profile.name,
+            )
+        exact_authority_ranges[anchor.observation_id] = mapped_ranges
+
+    return plan_projection_extraction_batches(
+        projection,
+        primary_authority_ranges_by_observation_id=exact_authority_ranges,
+        extraction_contract_version=extraction_contract_version,
+    )
+
+
 def plan_projection_extraction_batches(
     projection: SourceProjection,
     *,
     primary_observation_ids: tuple[str, ...] | None = None,
+    primary_authority_ranges_by_observation_id: Mapping[
+        str, tuple[tuple[int, int], ...]
+    ]
+    | None = None,
     max_primary_observations: int = 8,
     max_primary_chars: int = 30_000,
     max_context_chars: int = 20_000,
@@ -132,6 +414,18 @@ def plan_projection_extraction_batches(
     compiler_backed = projection_extraction_contract(
         extraction_contract_version
     ).uses_fragment_catalog
+    if primary_authority_ranges_by_observation_id is not None and not compiler_backed:
+        raise ValueError(
+            "exact Primary authority ranges require a fragment-catalog extraction contract"
+        )
+    if primary_authority_ranges_by_observation_id is not None:
+        unknown_authority_ids = set(primary_authority_ranges_by_observation_id) - set(
+            primary_ids
+        )
+        if unknown_authority_ids:
+            raise ValueError(
+                "Primary authority ranges must belong to selected current observations"
+            )
     authority_policy_version = (
         PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
         if compiler_backed
@@ -146,6 +440,11 @@ def plan_projection_extraction_batches(
             observations[observation_id].observation_type,
             revisions[observation_id],
             preserve_whole_authority=compiler_backed,
+            authorized_ranges=(
+                primary_authority_ranges_by_observation_id.get(observation_id)
+                if primary_authority_ranges_by_observation_id is not None
+                else None
+            ),
             max_chars=max_primary_chars,
             overlap_chars=primary_overlap_chars,
         )
@@ -399,6 +698,7 @@ def _primary_segments(
     revision: SourceObservationRevision,
     *,
     preserve_whole_authority: bool,
+    authorized_ranges: tuple[tuple[int, int], ...] | None,
     max_chars: int,
     overlap_chars: int,
 ) -> tuple[_PrimarySegment, ...]:
@@ -407,6 +707,55 @@ def _primary_segments(
     content = revision.content
     evidence_profile = revision.evidence_profile
     plain_header = f"### Observation {observation_id} ({observation_type})\n"
+    if authorized_ranges is not None:
+        if evidence_profile is None:
+            raise ValueError(
+                "exact text authority ranges require a range-addressable representation"
+            )
+        for start, end in authorized_ranges:
+            if start < 0 or end <= start or end > len(content):
+                raise ValueError("Primary authority contains an invalid target Revision range")
+        if evidence_profile.name == "canonical-record":
+            selected_units = tuple(
+                StructuralUnit(start=start, end=end)
+                for start, end in authorized_ranges
+            )
+        elif evidence_profile.name in {"markdown-structural", "plain-text"}:
+            selected_units = tuple(
+                unit
+                for unit in revision_structural_ranges(revision)
+                if any(
+                    start < unit.end and unit.start < end
+                    for start, end in authorized_ranges
+                )
+            )
+        else:
+            raise ValueError(
+                "exact authority ranges require a range-addressable representation"
+            )
+        segments = []
+        for unit in selected_units:
+            header = (
+                f"### Observation {observation_id} ({observation_type}) "
+                f"[characters {unit.start}:{unit.end}]\n"
+            )
+            content_budget = max_chars - len(header)
+            if unit.end - unit.start > content_budget:
+                raise StructuralUnitTooLargeError(
+                    revision_id=revision.id,
+                    start=unit.start,
+                    end=unit.end,
+                    budget=max(content_budget, 0),
+                )
+            segments.append(
+                _PrimarySegment(
+                    observation_id=observation_id,
+                    start=unit.start,
+                    end=unit.end,
+                    markdown=header + content[unit.start : unit.end],
+                )
+            )
+        return tuple(segments)
     if (
         preserve_whole_authority
         and evidence_profile is not None

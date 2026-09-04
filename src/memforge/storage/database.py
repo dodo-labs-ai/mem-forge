@@ -5962,6 +5962,9 @@ class Database:
     async def stage_source_derivation(
         self,
         manifest: SourceDerivationManifest,
+        *,
+        runtime_events: tuple[AgentRuntimeEvent, ...] = (),
+        agent_assessments: tuple[AgentAssessment, ...] = (),
     ) -> SourceDerivationAttempt:
         """Persist one immutable target projection and its batch manifest."""
 
@@ -5994,8 +5997,9 @@ class Database:
                             projection_identity_hash, context_payload_json,
                             context_payload_hash, context_identity_hash,
                             extraction_contract_version, status,
-                            created_at, updated_at, completed_at, applied_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+                            created_at, updated_at, completed_at, applied_at,
+                            terminal_reason_code
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
                         (
                             manifest.id,
                             manifest.source_id,
@@ -6013,6 +6017,7 @@ class Database:
                             now,
                             now,
                             now if initial_status == SOURCE_DERIVATION_COMPLETED else None,
+                            manifest.terminal_reason_code,
                         ),
                     )
                     for batch in manifest.batches:
@@ -6046,6 +6051,7 @@ class Database:
                         "projection_identity_hash": (manifest.projection_identity_hash),
                         "context_identity_hash": (manifest.context_identity_hash),
                         "extraction_contract_version": (manifest.extraction_contract_version),
+                        "terminal_reason_code": manifest.terminal_reason_code,
                     }
                     mismatched_columns = tuple(
                         column for column, value in immutable_values.items() if existing[column] != value
@@ -6082,6 +6088,8 @@ class Database:
                     ]
                     if actual_batches != expected_batches:
                         raise ValueError("Source derivation retry batch manifest mismatch")
+                await self._insert_agent_runtime_events_unlocked(runtime_events)
+                await self._insert_agent_assessments_unlocked(agent_assessments)
                 await self.db.commit()
                 return await self._source_derivation_attempt_unlocked(
                     str(existing["id"]) if existing is not None else manifest.id

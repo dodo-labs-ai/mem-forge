@@ -425,9 +425,16 @@ def test_catalog_resolves_one_primary_and_canonical_required_order() -> None:
         _batch(projection),
         access_context_hash="access-1",
     )
+    changed_capability = compile_projection_fragment_catalog(
+        projection,
+        _batch(projection),
+        access_context_hash="access-1",
+        inference_capability_hash="b" * 64,
+    )
     assert catalog.usable
     assert replay.digest == catalog.digest
     assert replay.model_payload() == catalog.model_payload()
+    assert changed_capability.digest != catalog.digest
 
     primary = next(
         item

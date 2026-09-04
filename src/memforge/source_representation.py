@@ -41,6 +41,7 @@ class EvidenceProfileBackfillReport:
 class CanonicalRecordField:
     json_pointer: str
     nested_profile: str | None = None
+    comparison_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.nested_profile not in {None, "markdown-structural", "plain-text"}:
@@ -52,6 +53,7 @@ class CanonicalRecordSchema:
     name: str
     version: int
     fields: tuple[CanonicalRecordField, ...]
+    tombstone_pointer: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,11 +96,29 @@ _CANONICAL_RECORD_SCHEMAS: Mapping[tuple[str, int], CanonicalRecordSchema] = {
         fields=(
             CanonicalRecordField("/summary"),
             CanonicalRecordField("/description", nested_profile="markdown-structural"),
-            CanonicalRecordField("/status"),
-            CanonicalRecordField("/priority"),
-            CanonicalRecordField("/assignee"),
+            CanonicalRecordField(
+                "/status",
+                comparison_keys=("id", "key", "name", "value"),
+            ),
+            CanonicalRecordField(
+                "/priority",
+                comparison_keys=("id", "key", "name", "value"),
+            ),
+            CanonicalRecordField(
+                "/assignee",
+                comparison_keys=(
+                    "accountId",
+                    "id",
+                    "key",
+                    "name",
+                    "displayName",
+                ),
+            ),
             CanonicalRecordField("/labels"),
-            CanonicalRecordField("/resolution"),
+            CanonicalRecordField(
+                "/resolution",
+                comparison_keys=("id", "key", "name", "value"),
+            ),
         ),
     ),
     ("jira-comment", 1): CanonicalRecordSchema(
@@ -115,8 +135,24 @@ _CANONICAL_RECORD_SCHEMAS: Mapping[tuple[str, int], CanonicalRecordSchema] = {
         name="teams-message",
         version=1,
         fields=(CanonicalRecordField("/content", nested_profile="markdown-structural"),),
+        tombstone_pointer="/deleted",
     ),
 }
+
+
+def canonical_field_comparison_value(
+    field: CanonicalRecordField,
+    value: object,
+) -> object:
+    """Return the schema-owned stable business value used for authority diff."""
+
+    if not field.comparison_keys or not isinstance(value, Mapping):
+        return value
+    return tuple(
+        (key, value[key])
+        for key in field.comparison_keys
+        if key in value
+    )
 
 
 def _representation_contract(profile: EvidenceRepresentationProfile) -> EvidenceRepresentationContract:

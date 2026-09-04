@@ -11,6 +11,7 @@ from memforge.pipeline.evidence_fragments import (
     EvidenceFragmentKind,
     FragmentCompilationErrorCode,
     compile_fragments,
+    revision_changed_structural_ranges,
 )
 from memforge.source_projection import (
     AnchorKind,
@@ -198,6 +199,23 @@ print("safe")
             item.raw_content_sha256
             == hashlib.sha256(content[item.anchor.range_start : item.anchor.range_end].encode()).hexdigest()
         )
+
+
+def test_markdown_move_under_another_heading_is_changed_authority() -> None:
+    base = _revision(
+        "# First\n\nShared rule.\n\n# Second\n\nOther rule.\n",
+        MARKDOWN_PROFILE,
+    )
+    target = _revision(
+        "# First\n\n# Second\n\nOther rule.\n\nShared rule.\n",
+        MARKDOWN_PROFILE,
+    )
+
+    ranges = revision_changed_structural_ranges(base, target)
+    changed_text = [target.content[start:end] for start, end in ranges]
+
+    assert "Shared rule." in changed_text
+    assert "Other rule." not in changed_text
 
 
 def test_commonmark_raw_html_compiles_duplicate_list_items_by_exact_offset() -> None:
@@ -579,6 +597,32 @@ def test_canonical_record_nested_markdown_maps_unicode_escape_to_raw_json() -> N
     assert fragment.presentation_text == "Rule 中 and **bold**."
     assert content[fragment.anchor.range_start : fragment.anchor.range_end] == r"Rule \u4e2d and **bold**."
     assert "attachments" not in fragment.presentation_text
+
+
+def test_canonical_record_accepts_exact_registered_field_authority() -> None:
+    content = '{"attachments":[{"name":"old.png"}],"body":"Current approval rule."}'
+    profile = _canonical_profile("jira-comment")
+    revision = _revision(content, profile)
+    field_start = content.index('"Current approval rule."')
+    field_end = field_start + len('"Current approval rule."')
+
+    catalog = compile_fragments(
+        revision,
+        (
+            _authority(
+                revision,
+                EvidenceRole.PRIMARY,
+                EvidenceRole.REQUIRED,
+                start=field_start,
+                end=field_end,
+            ),
+        ),
+    )
+
+    assert catalog.errors == ()
+    assert [fragment.presentation_text for fragment in catalog.fragments] == [
+        "Current approval rule."
+    ]
 
 
 def test_canonical_record_rejects_declared_text_with_wrong_runtime_type() -> None:

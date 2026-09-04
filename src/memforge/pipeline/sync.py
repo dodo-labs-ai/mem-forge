@@ -109,7 +109,11 @@ from memforge.pipeline.extraction_contract import (
 from memforge.pipeline.projection_fragments import (
     compile_projection_fragment_catalog,
 )
-from memforge.pipeline.projection_images import load_projection_images
+from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
+from memforge.pipeline.projection_images import (
+    load_projection_images,
+    projection_inference_capability_hash,
+)
 from memforge.source_access import memory_visibility_for_source_id
 from memforge.source_projection_config import canonical_projection_scope
 
@@ -2969,6 +2973,54 @@ class GeneSyncOrchestrator:
             project_key=derivation_context.project_key,
             repo_identifier=derivation_context.repo_identifier,
         )
+        inference_capability_hash = projection_inference_capability_hash()
+        delta = projection.deltas[0]
+        committed_base_snapshot = None
+        if derivation_context.reprocess_all_current_observations:
+            committed_base_unit_revision = (
+                await self.db.get_current_source_unit_revision(
+                    delta.source_unit_id
+                )
+            )
+            committed_base_observation_revisions = (
+                await self.db.get_current_source_observation_revisions(
+                    delta.source_unit_id
+                )
+            )
+            if committed_base_unit_revision is not None:
+                committed_base_snapshot = CommittedSourceUnitSnapshot(
+                    unit_revision=committed_base_unit_revision,
+                    observation_revisions=tuple(
+                        committed_base_observation_revisions.values()
+                    ),
+                )
+        elif delta.previous_unit_revision_id is not None:
+            committed_base_unit_revision = (
+                await self.db.get_current_source_unit_revision(
+                    delta.source_unit_id
+                )
+            )
+            if (
+                committed_base_unit_revision is None
+                or committed_base_unit_revision.id
+                != delta.previous_unit_revision_id
+            ):
+                # Let the shared planner persist a typed, fail-closed outcome.
+                # Raising here would turn a deterministic snapshot race into
+                # document-level retries without any durable diagnostic.
+                committed_base_snapshot = None
+            else:
+                committed_base_observation_revisions = (
+                    await self.db.get_current_source_observation_revisions(
+                        delta.source_unit_id
+                    )
+                )
+                committed_base_snapshot = CommittedSourceUnitSnapshot(
+                    unit_revision=committed_base_unit_revision,
+                    observation_revisions=tuple(
+                        committed_base_observation_revisions.values()
+                    ),
+                )
 
         async def extract_one(batch):
             if isinstance(batch, DiffGuidedExtractionBatch):
@@ -3027,6 +3079,7 @@ class GeneSyncOrchestrator:
                         projection,
                         batch,
                         access_context_hash=access_context_hash,
+                        inference_capability_hash=inference_capability_hash,
                         supplied_artifact_observation_ids=tuple(
                             image.source_observation_id for image in batch_images
                         ),
@@ -3078,6 +3131,9 @@ class GeneSyncOrchestrator:
                 extract_batch=extract_one,
                 max_concurrent=self._source_parallelism_limit(),
                 extraction_contract_version=extraction_contract_version,
+                committed_base_snapshot=committed_base_snapshot,
+                access_context_hash=access_context_hash,
+                inference_capability_hash=inference_capability_hash,
             )
         )
         result.extraction.derivation_id = result.derivation.id
