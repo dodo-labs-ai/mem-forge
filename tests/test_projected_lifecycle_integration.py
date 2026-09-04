@@ -114,7 +114,6 @@ from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
 )
 from memforge.pipeline.projection_fragments import (
-    FragmentSelectionError,
     FragmentSelectionErrorCode,
     SupportRevalidationLimitation,
     SupportRevalidationLimitationCode,
@@ -1852,6 +1851,45 @@ class _DuplicateRequiredSelectorClient(_SupportValidatingNoopClient):
         response = await super().validate_memory_support(prompt, **kwargs)
         [required] = response.required_evidence
         return response.model_copy(update={"required_evidence": [required, required]})
+
+
+class _InvalidThenValidSupportClient(_NoopClient):
+    def __init__(self, memory_id: str) -> None:
+        super().__init__(memory_id)
+        self.validation_prompts: list[str] = []
+
+    async def validate_memory_support(self, prompt: str, **kwargs):
+        del kwargs
+        self.validation_prompts.append(prompt)
+        payload = json.loads(
+            prompt.split("<case_json>\n", 1)[1].split(
+                "\n</case_json>",
+                1,
+            )[0]
+        )
+        if len(self.validation_prompts) == 2:
+            correction = json.loads(
+                prompt.split("<selection_correction>\n", 1)[1].split(
+                    "\n</selection_correction>",
+                    1,
+                )[0]
+            )
+            assert correction["previous_error"] == "unknown_ref"
+            assert correction["allowed_primary_refs"] == [
+                item["ref"] for item in payload["primary_candidates"]
+            ]
+            assert correction["required"] == []
+        primary_ref = (
+            "f999999"
+            if len(self.validation_prompts) == 1
+            else payload["primary_candidates"][0]["ref"]
+        )
+        return MemorySupportValidationResponse(
+            supported=True,
+            primary_ref=primary_ref,
+            required_evidence=[],
+            reason="The current Fragment still entails the claim.",
+        )
 
 
 def test_lifecycle_access_identity_treats_project_as_relevance_only() -> None:
@@ -4324,6 +4362,54 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
 
 
 @pytest.mark.asyncio
+async def test_incremental_noop_repairs_one_invalid_fragment_selection_in_place(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-primary-selection-repair-1",
+        body="A7 is removed.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first)
+    await db.enable_lifecycle_gate("src-1")
+    second = _projection(
+        run_id="projection-primary-selection-repair-2",
+        body="The A7 slot remains excluded.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
+    )
+    client = _InvalidThenValidSupportClient(incumbent.id)
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=client,
+    )
+
+    stats = await engine.prepare_and_commit_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=second.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="primary wording changed",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["noop"] == 1
+    assert stats["support_revalidation_work_item_count"] == 1
+    assert stats["support_revalidation_model_call_count"] == 2
+    assert len(client.validation_prompts) == 2
+    assert "<selection_correction>" not in client.validation_prompts[0]
+    assert "<selection_correction>" in client.validation_prompts[1]
+
+
+@pytest.mark.asyncio
 async def test_v2_noop_revalidation_uses_bounded_fragment_refs_for_large_revision(
     db: Database,
 ) -> None:
@@ -4400,7 +4486,7 @@ async def test_v2_noop_revalidation_uses_bounded_fragment_refs_for_large_revisio
 
 
 @pytest.mark.asyncio
-async def test_incremental_noop_unknown_fragment_ref_is_retryable_without_review(
+async def test_incremental_noop_exhausted_fragment_repair_stops_document_retry_without_review(
     db: Database,
 ) -> None:
     first = _projection(
@@ -4444,14 +4530,22 @@ async def test_incremental_noop_unknown_fragment_ref_is_retryable_without_review
             lifecycle_execution_owner_id="sync-invalid-fragment-ref:lease-1",
         )
 
-    assert raised.value.retryable is True
-    assert isinstance(raised.value.__cause__, FragmentSelectionError)
+    assert raised.value.retryable is False
+    assert raised.value.__cause__ is not None
+    assert getattr(raised.value.__cause__, "code") is FragmentSelectionErrorCode.UNKNOWN_REF
     assert raised.value.runtime_bundle.event.reason_code == "support_revalidation_failed"
-    assert raised.value.runtime_bundle.event.model_call_count == 1
+    assert raised.value.runtime_bundle.event.terminal_category == "invalid_response"
+    assert raised.value.runtime_bundle.event.error_code == "unknown_ref"
+    assert raised.value.runtime_bundle.event.model_call_count == 2
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
     assert await db.get_active_memory_support_reference_ids(incumbent.id)
     assert await db.list_lifecycle_reviews("src-1") == []
+    current_revision = await db.get_current_source_unit_revision(
+        first.source_units[0].id
+    )
+    assert current_revision is not None
+    assert current_revision.id == first.source_unit_revisions[0].id
 
 
 @pytest.mark.asyncio
@@ -5084,7 +5178,7 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
 
 
 @pytest.mark.asyncio
-async def test_noop_duplicate_required_selector_is_retryable_without_review(
+async def test_noop_exhausted_duplicate_selector_repair_stops_document_retry_without_review(
     db: Database,
 ) -> None:
     await _set_fixture_source_type(db, "jira")
@@ -5129,9 +5223,13 @@ async def test_noop_duplicate_required_selector_is_retryable_without_review(
             lifecycle_execution_owner_id="sync-duplicate-selector:lease-1",
         )
 
-    assert raised.value.retryable is True
-    assert isinstance(raised.value.__cause__, FragmentSelectionError)
+    assert raised.value.retryable is False
+    assert raised.value.__cause__ is not None
     assert raised.value.__cause__.code is FragmentSelectionErrorCode.INVALID_SELECTION
+    assert raised.value.runtime_bundle.event.reason_code == "support_revalidation_failed"
+    assert raised.value.runtime_bundle.event.terminal_category == "invalid_response"
+    assert raised.value.runtime_bundle.event.error_code == "invalid_selection"
+    assert raised.value.runtime_bundle.event.model_call_count == 2
     assert await db.list_lifecycle_reviews("src-1") == []
 
 
