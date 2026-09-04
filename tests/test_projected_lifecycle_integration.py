@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
+import asyncio
 import hashlib
+import json
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -2425,6 +2426,131 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
     )
     assert events == [runtime_bundle.event]
     assert assessments == [runtime_bundle.assessment]
+
+
+@pytest.mark.asyncio
+async def test_atomic_projection_lifecycle_fences_other_sqlite_writers_before_base_check(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _projection(
+        run_id="projection-derivation-fence-1",
+        body="A7 is removed.",
+    )
+    await db.record_source_projection(first)
+    second = _projection(
+        run_id="projection-derivation-fence-2",
+        body="A7 remains removed.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    document = await db.get_document("confluence-123")
+    assert document is not None
+    staged_document = replace(
+        document,
+        content_hash=content_hash("A7 remains removed."),
+    )
+    context = SourceUnitDerivationContext(
+        document=staged_document,
+        doc_type="confluence",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="A7 remains removed.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=None,
+        user_id=None,
+        source_activity_epoch=None,
+    )
+    attempt = await db.stage_source_derivation(
+        source_derivation_manifest(second, (), context=context)
+    )
+    delta = second.deltas[0]
+    plan = build_lifecycle_plan(
+        plan_id="plan-derivation-fence",
+        scope=ReconciliationScope(
+            id="scope-derivation-fence",
+            source_id="src-1",
+            source_unit_id=delta.source_unit_id,
+            base_unit_revision_id=delta.previous_unit_revision_id,
+            target_unit_revision_id=delta.current_unit_revision_id,
+        ),
+        gate_state=LifecycleGateState.GATED,
+        operations=(),
+        incumbents={},
+        source_support_reference_ids={},
+        all_active_support_reference_ids={},
+        support_set_hashes={},
+        observation_revision_ids=tuple(
+            revision.id for revision in second.observation_revisions
+        ),
+        new_evidence_reference_ids=(),
+        defaults=NewMemoryDefaults(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+            doc_id="confluence-123",
+            source_type="confluence",
+            access_context_hash="workspace-eng",
+        ),
+    )
+
+    reached_projection_write = asyncio.Event()
+    allow_projection_write = asyncio.Event()
+    original_record_source_projection = db.record_source_projection
+
+    async def pause_after_base_check(*args, **kwargs) -> None:
+        reached_projection_write.set()
+        await allow_projection_write.wait()
+        await original_record_source_projection(*args, **kwargs)
+
+    monkeypatch.setattr(db, "record_source_projection", pause_after_base_check)
+    competing = Database(db.db_path)
+    await competing.connect()
+    apply_task = asyncio.create_task(
+        db.apply_source_projection_lifecycle(
+            second,
+            plan,
+            document=staged_document,
+            derivation_id=attempt.id,
+            derivation_context_identity_hash=attempt.context_identity_hash,
+        )
+    )
+    competing_task: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(reached_projection_write.wait(), timeout=1)
+
+        async def competing_source_write() -> None:
+            await competing.db.execute(
+                "UPDATE sources SET status = status WHERE id = ?",
+                ("src-1",),
+            )
+            await competing.db.commit()
+
+        competing_task = asyncio.create_task(competing_source_write())
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(competing_task), timeout=0.2)
+
+        allow_projection_write.set()
+        await apply_task
+        await competing_task
+    finally:
+        allow_projection_write.set()
+        if not apply_task.done():
+            await asyncio.gather(apply_task, return_exceptions=True)
+        if competing_task is not None and not competing_task.done():
+            await asyncio.gather(competing_task, return_exceptions=True)
+        await competing.close()
+
+    [committed_attempt] = await db.list_source_derivation_attempts(
+        source_id="src-1"
+    )
+    assert committed_attempt.status == "applied"
 
 
 @pytest.mark.asyncio

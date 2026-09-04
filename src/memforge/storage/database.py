@@ -6542,6 +6542,14 @@ class Database:
             ),
         )
 
+    async def _acquire_source_writer_fence_unlocked(self, source_id: str) -> None:
+        """Serialize SQLite source writers before reading mutable projection state."""
+
+        await self.db.execute(
+            "UPDATE sources SET status = status WHERE id = ?",
+            (source_id,),
+        )
+
     async def record_source_projection(
         self,
         projection: SourceProjection,
@@ -6563,11 +6571,10 @@ class Database:
         transaction_lock = self._write_lock if _manage_transaction else nullcontext()
         async with transaction_lock:
             try:
-                # First write acquires SQLite's cross-process writer fence for
-                # this transaction before any projection snapshot is read.
-                await self.db.execute(
-                    "UPDATE sources SET status = status WHERE id = ?",
-                    (projection.source_id,),
+                # Acquire SQLite's cross-process writer fence before reading
+                # any mutable projection snapshot.
+                await self._acquire_source_writer_fence_unlocked(
+                    projection.source_id
                 )
                 async with self.db.execute(
                     "SELECT type, activity_epoch FROM sources WHERE id = ?",
@@ -10393,6 +10400,11 @@ class Database:
                 raise ValueError("runtime bundle and projected lifecycle outcome do not match")
         async with self._write_lock:
             try:
+                # The derivation base check and lifecycle apply must observe one
+                # serialized Source snapshot across SQLite processes.
+                await self._acquire_source_writer_fence_unlocked(
+                    projection.source_id
+                )
                 if derivation_id is not None:
                     if document is None:
                         raise ValueError("Source derivation lifecycle commit requires its staged Document")
