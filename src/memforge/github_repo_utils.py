@@ -6,7 +6,9 @@ import hashlib
 import base64
 import binascii
 import mimetypes
+import posixpath
 import re
+from dataclasses import dataclass
 from io import BytesIO
 from collections.abc import Mapping
 from typing import Any
@@ -19,6 +21,111 @@ DEFAULT_INCLUDE_EXTENSION_LIST = ["md", "markdown", "txt", "adoc", "rst"]
 
 # Provider envelope, not a promise that arbitrary documents fit extraction memory.
 GITHUB_BLOB_MAX_BYTES = 100 * 1024 * 1024
+GITHUB_REGULAR_FILE_MODES = frozenset({"100644", "100755"})
+GITHUB_SYMLINK_MODE = "120000"
+GITHUB_SYMLINK_MAX_HOPS = 40
+
+
+@dataclass(frozen=True)
+class GitHubSymlinkRead:
+    path: str
+    blob_sha: str
+    blob_size: object
+
+
+@dataclass(frozen=True)
+class GitHubResolvedTreeEntry:
+    logical_path: str
+    content_entry: dict[str, Any]
+    logical_file_mode: object
+    symlink_chain: tuple[dict[str, str], ...] = ()
+    resolved_relative_path: str | None = None
+
+
+class GitHubTreeEntryResolver:
+    """Resolve one selected Git tree entry independently of its transport."""
+
+    def __init__(
+        self,
+        entry: Mapping[str, Any],
+        *,
+        entries_by_path: Mapping[str, Mapping[str, Any]],
+        exclude_paths: list[str],
+    ) -> None:
+        self.logical_path = normalize_github_relative_path(str(entry.get("path") or "")).rstrip("/")
+        self.logical_file_mode = entry.get("mode")
+        self._is_symlink = self.logical_file_mode == GITHUB_SYMLINK_MODE
+        self._entries_by_path = entries_by_path
+        self._exclude_paths = exclude_paths
+        self._current_path = self.logical_path
+        self._current_entry = dict(entry)
+        self._visited: set[str] = set()
+        self._pending: GitHubSymlinkRead | None = None
+        self._symlink_chain: list[dict[str, str]] = []
+
+    def next_symlink_read(self) -> GitHubSymlinkRead | None:
+        if self._current_entry.get("mode") != GITHUB_SYMLINK_MODE:
+            return None
+        if self._pending is not None:
+            return self._pending
+        if self._current_entry.get("type") != "blob":
+            raise ValueError(f"GitHub symlink {self.logical_path} is not represented by a blob")
+        if len(self._symlink_chain) >= GITHUB_SYMLINK_MAX_HOPS:
+            raise ValueError(
+                f"GitHub symlink {self.logical_path} exceeds {GITHUB_SYMLINK_MAX_HOPS} resolution hops"
+            )
+        if self._current_path in self._visited:
+            raise ValueError(f"GitHub symlink cycle detected at {self._current_path}")
+        self._visited.add(self._current_path)
+        self._pending = GitHubSymlinkRead(
+            path=self._current_path,
+            blob_sha=str(self._current_entry.get("sha") or ""),
+            blob_size=self._current_entry.get("size"),
+        )
+        return self._pending
+
+    def accept_symlink_target(self, raw_target: bytes) -> None:
+        if self._pending is None:
+            raise ValueError("GitHub symlink resolver has no pending target read")
+        target_path = github_symlink_target_path(link_path=self._pending.path, raw_target=raw_target)
+        if github_path_is_excluded(target_path, self._exclude_paths):
+            raise ValueError(
+                f"GitHub symlink {self.logical_path} resolves into an explicitly excluded path"
+            )
+        target_entry = self._entries_by_path.get(target_path)
+        if target_entry is None:
+            raise ValueError(f"GitHub symlink {self.logical_path} has a missing target {target_path}")
+        self._symlink_chain.append({
+            "path": self._pending.path,
+            "blob_sha": self._pending.blob_sha,
+            "target_path": target_path,
+        })
+        self._current_path = target_path
+        self._current_entry = dict(target_entry)
+        self._pending = None
+
+    def result(self) -> GitHubResolvedTreeEntry:
+        if self._current_entry.get("mode") == GITHUB_SYMLINK_MODE:
+            raise ValueError(f"GitHub symlink {self.logical_path} is not fully resolved")
+        try:
+            validate_github_file_mode(self._current_entry.get("mode"), label=self._current_path)
+        except ValueError as exc:
+            if not self._is_symlink:
+                raise
+            raise ValueError(
+                f"GitHub symlink {self.logical_path} resolves to an unsupported target: {exc}"
+            ) from exc
+        if self._current_entry.get("type") != "blob":
+            if not self._is_symlink:
+                raise ValueError(f"GitHub selected file {self.logical_path} is not a regular blob")
+            raise ValueError(f"GitHub symlink {self.logical_path} does not resolve to a regular blob")
+        return GitHubResolvedTreeEntry(
+            logical_path=self.logical_path,
+            content_entry=self._current_entry,
+            logical_file_mode=self.logical_file_mode,
+            symlink_chain=tuple(dict(item) for item in self._symlink_chain),
+            resolved_relative_path=(self._current_path if self._is_symlink else None),
+        )
 
 
 class GitHubBlobBuffer:
@@ -74,8 +181,113 @@ def decode_github_text(raw: bytes, *, label: str) -> str:
 
 
 def validate_github_file_mode(mode: object, *, label: str) -> None:
-    if mode not in ("100644", "100755"):
+    if mode not in GITHUB_REGULAR_FILE_MODES:
         raise ValueError(f"GitHub selected file {label} has unsupported file mode {mode!r}")
+
+
+def github_symlink_target_path(*, link_path: str, raw_target: bytes) -> str:
+    """Resolve one Git symlink target as a repository-relative path."""
+
+    try:
+        target = raw_target.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"GitHub symlink {link_path} has a non-UTF-8 target") from exc
+    if (
+        not target
+        or target != target.strip()
+        or any(character in target for character in ("\x00", "\r", "\n", "\\"))
+    ):
+        raise ValueError(f"GitHub symlink {link_path} has an invalid target")
+    if target.startswith("/"):
+        raise ValueError(f"GitHub symlink {link_path} has an absolute target")
+
+    joined = posixpath.normpath(posixpath.join(posixpath.dirname(link_path), target))
+    if joined in {"", ".", ".."} or joined.startswith("../"):
+        raise ValueError(f"GitHub symlink {link_path} escapes the repository")
+    return normalize_github_relative_path(joined).rstrip("/")
+
+
+def github_path_is_excluded(relative_path: str, exclude_paths: list[str]) -> bool:
+    """Return whether an explicit configured exclusion covers a path."""
+
+    path = normalize_github_relative_path(relative_path).rstrip("/")
+    return any(
+        path == scope.rstrip("/") or path.startswith(scope.rstrip("/") + "/")
+        for scope in exclude_paths
+    )
+
+
+def validate_github_symlink_audit_locator(
+    *,
+    logical_path: str,
+    symlink_chain: list[dict[str, str]] | None,
+    resolved_relative_path: str | None,
+    exclude_paths: list[str],
+) -> tuple[list[dict[str, str]], str | None]:
+    """Validate and canonicalize daemon-supplied symlink audit metadata."""
+
+    raw_chain = [dict(item) for item in (symlink_chain or [])]
+    if not raw_chain and resolved_relative_path is None:
+        return [], None
+    if not raw_chain or not resolved_relative_path:
+        raise ValueError("GitHub symlink identity is incomplete")
+    if len(raw_chain) > GITHUB_SYMLINK_MAX_HOPS:
+        raise ValueError("GitHub symlink chain exceeds the supported resolution limit")
+
+    raw_resolved_path = str(resolved_relative_path)
+    if (
+        raw_resolved_path.startswith("/")
+        or raw_resolved_path != raw_resolved_path.strip()
+        or "\\" in raw_resolved_path
+    ):
+        raise ValueError("resolved_relative_path must be repository-relative")
+    resolved_path = normalize_github_relative_path(raw_resolved_path).rstrip("/")
+    if github_path_is_excluded(resolved_path, exclude_paths):
+        raise ValueError("resolved_relative_path is explicitly excluded from the source scope")
+
+    expected_path = normalize_github_relative_path(logical_path).rstrip("/")
+    visited_paths: set[str] = set()
+    canonical_chain: list[dict[str, str]] = []
+    for link in raw_chain:
+        raw_link_path = str(link.get("path") or "")
+        raw_target_path = str(link.get("target_path") or "")
+        link_sha = str(link.get("blob_sha") or "")
+        if (
+            raw_link_path.startswith("/")
+            or raw_target_path.startswith("/")
+            or raw_link_path != raw_link_path.strip()
+            or raw_target_path != raw_target_path.strip()
+            or "\\" in raw_link_path
+            or "\\" in raw_target_path
+        ):
+            raise ValueError("GitHub symlink chain paths must be repository-relative")
+        link_path = normalize_github_relative_path(raw_link_path).rstrip("/")
+        target_path = normalize_github_relative_path(raw_target_path).rstrip("/")
+        if link_path != expected_path:
+            raise ValueError("GitHub symlink chain is not contiguous")
+        if link_path in visited_paths:
+            raise ValueError("GitHub symlink chain is cyclic")
+        visited_paths.add(link_path)
+        if target_path in visited_paths:
+            raise ValueError("GitHub symlink chain is cyclic")
+        if not re.fullmatch(r"[0-9a-f]{40}", link_sha):
+            raise ValueError("GitHub symlink chain contains an invalid blob identity")
+        if github_path_is_excluded(target_path, exclude_paths):
+            raise ValueError("GitHub symlink chain enters an explicitly excluded path")
+        expected_path = target_path
+        canonical_chain.append({
+            "path": link_path,
+            "blob_sha": link_sha,
+            "target_path": target_path,
+        })
+    if expected_path != resolved_path:
+        raise ValueError("GitHub symlink chain does not end at resolved_relative_path")
+    if (
+        github_content_type_is_binary(github_content_type(logical_path))
+        or github_content_type_is_binary(github_content_type(resolved_path))
+    ):
+        raise ValueError("GitHub symlinked binary Artifacts are unsupported")
+    return canonical_chain, resolved_path
 
 
 def build_github_repo_doc_id(*, source_id: str, repo_url: str, repo_ref: str, relative_path: str) -> str:
@@ -239,7 +451,9 @@ def validate_github_tree_payload(payload: object, *, label: str) -> list[dict[st
     if not isinstance(payload, Mapping):
         raise ValueError(f"{label} tree response must be an object")
     if payload.get("truncated") is not False:
-        raise ValueError(f"{label} tree response did not attest truncated=false")
+        raise ValueError(
+            f"{label} tree response did not prove complete because it did not attest truncated=false"
+        )
     tree = payload.get("tree")
     if not isinstance(tree, list):
         raise ValueError(f"{label} tree response is missing a tree list")

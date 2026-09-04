@@ -261,6 +261,8 @@ class ToolClient:
         title: str | None = None,
         raw_hash: str | None = None,
         blob_sha: str | None = None,
+        symlink_chain: list[dict[str, str]] | None = None,
+        resolved_relative_path: str | None = None,
         sync_snapshot_id: str | None = None,
         local_agent_job_id: str | None = None,
         local_agent_attempt_count: int | None = None,
@@ -286,6 +288,10 @@ class ToolClient:
             body["raw_hash"] = raw_hash
         if blob_sha is not None:
             body["blob_sha"] = blob_sha
+        if symlink_chain:
+            body["symlink_chain"] = [dict(item) for item in symlink_chain]
+        if resolved_relative_path is not None:
+            body["resolved_relative_path"] = resolved_relative_path
         if sync_snapshot_id is not None:
             body["sync_snapshot_id"] = sync_snapshot_id
         if local_agent_job_id is not None:

@@ -226,16 +226,222 @@ async def test_raw_bytes_verified_but_mixed_encoding_is_not_repaired(cloud_colle
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["120000", None, "160000"])
+@pytest.mark.parametrize("mode", [None, "160000"])
 async def test_selected_non_regular_files_are_not_treated_as_text(cloud_collection, mode):
     gene, session = cloud_collection
     session.mode = mode
     if mode == "160000":
         session.entry_type = "commit"
-    item = [item async for item in gene.discover()][0]
     with pytest.raises(RuntimeError, match="unsupported file mode"):
-        await gene.fetch(item)
+        [item async for item in gene.discover()]
 
+
+@pytest.mark.asyncio
+async def test_malformed_symlink_tree_entry_fails_instead_of_disappearing(cloud_collection):
+    gene, session = cloud_collection
+    session.mode = "120000"
+    session.entry_type = "tree"
+    with pytest.raises(RuntimeError, match="not represented by a blob"):
+        [item async for item in gene.discover()]
+
+
+@pytest.mark.asyncio
+async def test_cloud_collection_resolves_selected_text_symlink_at_pinned_tree(monkeypatch):
+    link_target = b"docs/CONTRIBUTIONS.md"
+    link_sha = hashlib.sha1(
+        b"blob " + str(len(link_target)).encode() + b"\0" + link_target
+    ).hexdigest()
+    target_body = b"# Contributions\n\nUse reviewed changes.\n"
+    target_sha = hashlib.sha1(
+        b"blob " + str(len(target_body)).encode() + b"\0" + target_body
+    ).hexdigest()
+
+    class SymlinkSession(RepositorySession):
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if "/commits/main" in url:
+                return Response({"sha": "commit-one", "commit": {"tree": {"sha": "tree-one"}}})
+            if "/git/trees/" in url:
+                return Response({"truncated": False, "tree": [
+                    {"path": "README.md", "type": "blob", "mode": "120000",
+                     "sha": link_sha, "size": len(link_target)},
+                    {"path": "docs/CONTRIBUTIONS.md", "type": "blob", "mode": "100644",
+                     "sha": target_sha, "size": len(target_body)},
+                ]})
+            if url.endswith("/git/blobs/" + link_sha):
+                return Response(body=link_target)
+            if url.endswith("/git/blobs/" + target_sha):
+                return Response(body=target_body)
+            raise AssertionError(url)
+
+    session = SymlinkSession()
+    monkeypatch.setattr("memforge.genes.github_repo_gene.requests.Session", lambda: session)
+    gene = GitHubRepoGene(
+        config={"connection_mode": "cloud_pull", "repo_url": "https://github.com/example/repo", "ref": "main"},
+        source_id="src-test",
+    )
+
+    items = [item async for item in gene.discover()]
+    readme = next(item for item in items if item.extra["relative_path"] == "README.md")
+    raw = await gene.fetch(readme)
+    normalized = await gene.normalize(raw)
+
+    assert readme.version == target_sha
+    assert readme.extra["blob_sha"] == target_sha
+    assert readme.extra["resolved_relative_path"] == "docs/CONTRIBUTIONS.md"
+    assert readme.extra["symlink_chain"] == [{
+        "path": "README.md", "blob_sha": link_sha, "target_path": "docs/CONTRIBUTIONS.md",
+    }]
+    assert raw.body == target_body
+    assert normalized.source_semantics["relative_path"] == "README.md"
+    assert normalized.source_semantics["resolved_relative_path"] == "docs/CONTRIBUTIONS.md"
+
+
+@pytest.mark.asyncio
+async def test_cloud_collection_rejects_text_symlink_to_binary_target(monkeypatch):
+    link_target = b"assets/photo.png"
+    link_sha = hashlib.sha1(
+        b"blob " + str(len(link_target)).encode() + b"\0" + link_target
+    ).hexdigest()
+
+    class BinaryTargetSession(RepositorySession):
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if "/commits/main" in url:
+                return Response({"sha": "commit-one", "commit": {"tree": {"sha": "tree-one"}}})
+            if "/git/trees/" in url:
+                return Response({"truncated": False, "tree": [
+                    {"path": "README.md", "type": "blob", "mode": "120000",
+                     "sha": link_sha, "size": len(link_target)},
+                    {"path": "assets/photo.png", "type": "blob", "mode": "100644",
+                     "sha": "b" * 40, "size": 8},
+                ]})
+            if url.endswith("/git/blobs/" + link_sha):
+                return Response(body=link_target)
+            raise AssertionError(url)
+
+    session = BinaryTargetSession()
+    monkeypatch.setattr("memforge.genes.github_repo_gene.requests.Session", lambda: session)
+    gene = GitHubRepoGene(
+        config={"connection_mode": "cloud_pull", "repo_url": "https://github.com/example/repo", "ref": "main"},
+        source_id="src-test",
+    )
+
+    with pytest.raises(RuntimeError, match="binary Artifact"):
+        [item async for item in gene.discover()]
+
+
+def test_daemon_collection_resolves_selected_text_symlink_with_cloud_parity(monkeypatch):
+    link_target = b"docs/CONTRIBUTIONS.md"
+    link_sha = hashlib.sha1(
+        b"blob " + str(len(link_target)).encode() + b"\0" + link_target
+    ).hexdigest()
+    target_body = b"# Contributions\n\nUse reviewed changes.\n"
+    target_sha = hashlib.sha1(
+        b"blob " + str(len(target_body)).encode() + b"\0" + target_body
+    ).hexdigest()
+    real_popen = subprocess.Popen
+
+    def metadata(cmd, **kwargs):
+        endpoint = cmd[2]
+        if "/commits/main" in endpoint:
+            payload = {"sha": "commit-one", "commit": {"tree": {"sha": "tree-one"}}}
+        elif "/git/trees/" in endpoint:
+            payload = {"truncated": False, "tree": [
+                {"path": "README.md", "type": "blob", "mode": "120000",
+                 "sha": link_sha, "size": len(link_target)},
+                {"path": "docs/CONTRIBUTIONS.md", "type": "blob", "mode": "100644",
+                 "sha": target_sha, "size": len(target_body)},
+            ]}
+        else:
+            raise AssertionError(endpoint)
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    def raw_process(cmd, **kwargs):
+        if cmd[2].endswith("/git/blobs/" + link_sha):
+            body = link_target
+        elif cmd[2].endswith("/git/blobs/" + target_sha):
+            body = target_body
+        else:
+            raise AssertionError(cmd[2])
+        with TemporaryFile() as input_file:
+            input_file.write(body)
+            input_file.seek(0)
+            return real_popen(
+                [sys.executable, "-c", "import shutil,sys; shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)"],
+                stdin=input_file,
+                **kwargs,
+            )
+
+    monkeypatch.setattr(main.subprocess, "run", metadata)
+    monkeypatch.setattr(main.subprocess, "Popen", raw_process)
+    FakeToolClient.reset({"doc_id": "doc", "document_hash": "hash"})
+
+    result = main._run_cloud_local_agent_job({
+        "job_id": "laj-symlink", "attempt_count": 1, "workspace_id": "workspace-a",
+        "operation": "github_repo_sync", "source_id": "src-test",
+        "payload": {"repo_url": "https://github.com/example/repo", "ref": "main"},
+    }, _cloud_test_client())
+
+    assert result["counts"] == {"selected": 2, "reused": 0, "fetched": 2, "pushed": 2, "failed": 0}
+    call = next(
+        call for call in FakeToolClient.calls
+        if call[0] == "push_github_repo_document" and call[1]["relative_path"] == "README.md"
+    )
+    assert call[1]["markdown_body"] == target_body.decode()
+    assert call[1]["blob_sha"] == target_sha
+    assert call[1]["resolved_relative_path"] == "docs/CONTRIBUTIONS.md"
+    assert call[1]["symlink_chain"] == [{
+        "path": "README.md", "blob_sha": link_sha, "target_path": "docs/CONTRIBUTIONS.md",
+    }]
+
+
+def test_daemon_collection_rejects_text_symlink_to_binary_before_manifest(monkeypatch):
+    link_target = b"assets/photo.png"
+    link_sha = hashlib.sha1(
+        b"blob " + str(len(link_target)).encode() + b"\0" + link_target
+    ).hexdigest()
+    real_popen = subprocess.Popen
+
+    def metadata(cmd, **kwargs):
+        endpoint = cmd[2]
+        if "/commits/main" in endpoint:
+            payload = {"sha": "commit-one", "commit": {"tree": {"sha": "tree-one"}}}
+        elif "/git/trees/" in endpoint:
+            payload = {"truncated": False, "tree": [
+                {"path": "README.md", "type": "blob", "mode": "120000",
+                 "sha": link_sha, "size": len(link_target)},
+                {"path": "assets/photo.png", "type": "blob", "mode": "100644",
+                 "sha": "b" * 40, "size": 8},
+            ]}
+        else:
+            raise AssertionError(endpoint)
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    def raw_process(cmd, **kwargs):
+        assert cmd[2].endswith("/git/blobs/" + link_sha)
+        with TemporaryFile() as input_file:
+            input_file.write(link_target)
+            input_file.seek(0)
+            return real_popen(
+                [sys.executable, "-c", "import shutil,sys; shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)"],
+                stdin=input_file,
+                **kwargs,
+            )
+
+    monkeypatch.setattr(main.subprocess, "run", metadata)
+    monkeypatch.setattr(main.subprocess, "Popen", raw_process)
+    FakeToolClient.reset({})
+    with pytest.raises(main.click.ClickException, match="binary Artifact"):
+        main._run_cloud_local_agent_job({
+            "job_id": "laj-binary-link", "attempt_count": 1, "workspace_id": "workspace-a",
+            "operation": "github_repo_sync", "source_id": "src-test",
+            "payload": {"repo_url": "https://github.com/example/repo", "ref": "main"},
+        }, _cloud_test_client())
+    assert not any(
+        call[0] in {"prepare_local_source_snapshot", "start_source_processing"}
+        for call in FakeToolClient.calls
+    )
 
 @pytest.mark.asyncio
 async def test_stream_stops_before_buffering_more_than_declared_size(cloud_collection):
@@ -340,6 +546,28 @@ def test_daemon_selected_gitlink_is_not_an_empty_complete_snapshot(monkeypatch):
     with pytest.raises(main.click.ClickException, match="unsupported file mode"):
         main._run_cloud_local_agent_job({
             "job_id": "laj-gitlink", "attempt_count": 1, "workspace_id": "workspace-a",
+            "operation": "github_repo_sync", "source_id": "src-test",
+            "payload": {"repo_url": "https://github.com/example/repo", "ref": "main",
+                        "include_paths": ["README.md"]},
+        }, _cloud_test_client())
+    assert not any(call[0] in {"prepare_local_source_snapshot", "start_source_processing"}
+                   for call in FakeToolClient.calls)
+
+
+def test_daemon_malformed_symlink_is_not_an_empty_complete_snapshot(monkeypatch):
+    session = RepositorySession()
+    session.mode = "120000"
+    session.entry_type = "tree"
+
+    def metadata(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(
+            session.get("https://api.github.com/" + cmd[2]).json()), stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", metadata)
+    FakeToolClient.reset({})
+    with pytest.raises(main.click.ClickException, match="not represented by a blob"):
+        main._run_cloud_local_agent_job({
+            "job_id": "laj-malformed-symlink", "attempt_count": 1, "workspace_id": "workspace-a",
             "operation": "github_repo_sync", "source_id": "src-test",
             "payload": {"repo_url": "https://github.com/example/repo", "ref": "main",
                         "include_paths": ["README.md"]},

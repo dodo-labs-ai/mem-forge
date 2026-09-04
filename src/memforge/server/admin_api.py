@@ -1478,6 +1478,8 @@ class LocalSourcePackageRequest(BaseModel):
     repo_url: str | None = None
     repo_ref: str | None = None
     blob_sha: str | None = None
+    symlink_chain: list[dict[str, str]] = Field(default_factory=list)
+    resolved_relative_path: str | None = None
     issue_key: str | None = None
     conversation_id: str | None = None
     root_message_id: str | None = None
@@ -7460,6 +7462,8 @@ def create_admin_app(
                     title=req.title,
                     raw_hash=req.raw_hash,
                     blob_sha=req.blob_sha,
+                    symlink_chain=req.symlink_chain,
+                    resolved_relative_path=req.resolved_relative_path,
                     submitted_by=req.submitted_by,
                     submitted_at=req.submitted_at,
                     document_store=artifact_store,

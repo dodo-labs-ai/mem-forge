@@ -36,6 +36,7 @@ from memforge.github_repo_utils import (
     github_path_in_scope,
     normalize_github_relative_path,
     parse_github_repo_url,
+    validate_github_symlink_audit_locator,
 )
 from memforge.local_agent.document_identity import (
     build_jira_doc_id,
@@ -388,6 +389,8 @@ async def submit_github_repo_document(
     title: str | None = None,
     raw_hash: str | None = None,
     blob_sha: str | None = None,
+    symlink_chain: list[dict[str, str]] | None = None,
+    resolved_relative_path: str | None = None,
     submitted_by: str | None = None,
     submitted_at: str | None = None,
     document_store: DocumentStore | None = None,
@@ -424,6 +427,12 @@ async def submit_github_repo_document(
     include_extensions = github_include_extensions(source_config)
     if not github_extension_allowed(relative, include_extensions):
         raise ValueError("relative_path extension is outside the source's configured include_extensions")
+    link_chain, resolved_path = validate_github_symlink_audit_locator(
+        logical_path=relative,
+        symlink_chain=symlink_chain,
+        resolved_relative_path=resolved_relative_path,
+        exclude_paths=exclude_paths,
+    )
     repo = _repo_parts(configured_repo)
     source_artifacts = list(source_artifacts or [])
     artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
@@ -470,6 +479,11 @@ async def submit_github_repo_document(
                 f"max_files={max_files} packages in this collection"
             )
 
+    symlink_metadata = (
+        {"symlink_chain": link_chain, "resolved_relative_path": resolved_path}
+        if link_chain
+        else {}
+    )
     package = {
         "package_kind": GITHUB_REPO_PACKAGE_KIND,
         "content_role": GITHUB_REPO_CONTENT_ROLE,
@@ -487,6 +501,7 @@ async def submit_github_repo_document(
         "relative_path": relative,
         "file_identity_contract": "repository_path",
         "blob_sha": blob_sha,
+        **symlink_metadata,
         "content_type": content_type,
         "raw_hash": raw_hash,
         "submitted_at": submitted_at,
@@ -528,6 +543,7 @@ async def submit_github_repo_document(
                 "relative_path": relative,
                 "file_identity_contract": "repository_path",
                 "blob_sha": blob_sha,
+                **symlink_metadata,
                 "content_type": content_type,
                 "raw_hash": raw_hash,
             },
