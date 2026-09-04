@@ -616,6 +616,28 @@ def test_deterministic_evaluator_only_judges_supported_runtime_contracts() -> No
     assert evaluate_runtime_events(events) == assessments
 
 
+def test_deterministic_evaluator_classifies_authority_planning_failure() -> None:
+    [event] = _events(
+        QualitySignal(
+            "evidence_authority_planning",
+            "failed",
+            "INCREMENTAL_BASE_UNAVAILABLE",
+        )
+    )
+
+    [assessment] = evaluate_runtime_events((event,))
+
+    assert (
+        assessment.criterion,
+        assessment.label,
+        assessment.reason_code,
+    ) == (
+        "evidence_authority_planning",
+        "fail",
+        "INCREMENTAL_BASE_UNAVAILABLE",
+    )
+
+
 def test_v9_evidence_evaluation_distinguishes_selection_outcome_taxonomy() -> None:
     events = _events(
         QualitySignal(

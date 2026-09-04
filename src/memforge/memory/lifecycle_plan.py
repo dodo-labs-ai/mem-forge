@@ -33,6 +33,10 @@ class ProjectedSupportInvariantError(ValueError):
     """A deterministic fail-closed projected Support postcondition failure."""
 
 
+class AuthorityPlanStaleError(ProjectedSupportInvariantError):
+    """The Source Unit changed after Evidence authority was planned."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectedLifecycleBlocker:
     """One stale cross-Unit Support consumed by a prepared Plan."""
