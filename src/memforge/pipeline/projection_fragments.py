@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Mapping
+from typing import Mapping, MutableMapping
 
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
@@ -31,6 +32,7 @@ from memforge.pipeline.evidence_fragments import (
     EvidenceFragmentKind,
     FragmentCompilationError,
     FragmentCompilationErrorCode,
+    RevisionFragmentIndex,
     build_revision_fragment_index,
     compile_fragments,
 )
@@ -80,6 +82,9 @@ class RevalidatedSelectionError(ValueError):
         self.code = code
 
 
+SUPPORT_REVALIDATION_MAX_CANDIDATES_PER_PART = 16
+
+
 def group_revalidated_support_unit(
     support: tuple[ActiveSupportEvidence, ...],
 ) -> tuple[ActiveSupportEvidence, ...]:
@@ -101,6 +106,321 @@ def group_revalidated_support_unit(
     return tuple(next(iter(grouped.values())))
 
 
+@dataclass(frozen=True, slots=True)
+class SupportRevalidationWorkset:
+    """One complete Evidence Unit's bounded current-fragment choices."""
+
+    fragments_by_ref: Mapping[str, EvidenceFragment]
+    payload_by_ref: Mapping[str, Mapping[str, object]]
+    primary_reference_id: str
+    primary_refs: tuple[str, ...]
+    required_refs_by_selector: Mapping[str, tuple[str, ...]]
+    required_reference_id_by_selector: Mapping[str, str]
+
+    def model_payload(self) -> Mapping[str, object]:
+        return {
+            "primary_candidates": tuple(self.payload_by_ref[reference] for reference in self.primary_refs),
+            "required": tuple(
+                {
+                    "selector": selector,
+                    "candidates": tuple(self.payload_by_ref[reference] for reference in references),
+                }
+                for selector, references in self.required_refs_by_selector.items()
+            ),
+        }
+
+    def resolve_model_selection(
+        self,
+        *,
+        primary_ref: str | None,
+        required_refs_by_selector: Mapping[str, str],
+    ) -> "SupportRevalidationSelection":
+        if primary_ref not in self.primary_refs:
+            raise FragmentSelectionError(
+                FragmentSelectionErrorCode.UNKNOWN_REF,
+                "support validation selected an unknown Primary Fragment",
+            )
+        if set(required_refs_by_selector) != set(self.required_refs_by_selector):
+            raise FragmentSelectionError(
+                FragmentSelectionErrorCode.INVALID_SELECTION,
+                "support validation did not select every Required Evidence part",
+            )
+        selected_refs = [primary_ref]
+        selected_by_reference_id = {self.primary_reference_id: self.fragments_by_ref[primary_ref]}
+        for selector, allowed in self.required_refs_by_selector.items():
+            selected_ref = required_refs_by_selector[selector]
+            if selected_ref not in allowed:
+                raise FragmentSelectionError(
+                    FragmentSelectionErrorCode.UNKNOWN_REF,
+                    "support validation selected an unknown Required Fragment",
+                )
+            selected_refs.append(selected_ref)
+            selected_by_reference_id[self.required_reference_id_by_selector[selector]] = self.fragments_by_ref[
+                selected_ref
+            ]
+        if len(set(selected_refs)) != len(selected_refs):
+            raise FragmentSelectionError(
+                FragmentSelectionErrorCode.DUPLICATE_REF,
+                "support validation selected one Fragment for distinct Evidence parts",
+            )
+        return SupportRevalidationSelection(
+            primary=self.fragments_by_ref[primary_ref],
+            fragments_by_evidence_reference_id=selected_by_reference_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SupportRevalidationSelection:
+    """Exact current Fragments selected for every prior Evidence part."""
+
+    primary: EvidenceFragment
+    fragments_by_evidence_reference_id: Mapping[str, EvidenceFragment]
+
+
+def prepare_support_revalidation_workset(
+    projection: SourceProjection,
+    *,
+    support: tuple[ActiveSupportEvidence, ...],
+    required_selector_by_reference_id: Mapping[str, str],
+    revision_indexes_by_id: MutableMapping[str, RevisionFragmentIndex],
+    memory_claim: str,
+) -> SupportRevalidationWorkset:
+    """Prepare bounded candidates without exposing complete Revisions."""
+
+    support = group_revalidated_support_unit(support)
+    revisions = {revision.observation_id: revision for revision in projection.observation_revisions}
+    ordered_support = tuple(
+        sorted(
+            support,
+            key=lambda item: (
+                item.role is not EvidenceRole.PRIMARY,
+                item.reference_id,
+            ),
+        )
+    )
+    candidates_by_reference_id: dict[str, tuple[EvidenceFragment, ...]] = {}
+    indexes_by_observation_id: dict[str, RevisionFragmentIndex] = {}
+    for item in ordered_support:
+        revision = revisions.get(item.anchor.observation_id)
+        if revision is None:
+            raise RevalidatedSelectionError(
+                RevalidatedSelectionErrorCode.UNPRESENTABLE,
+                "NOOP revalidation Evidence is unavailable",
+            )
+        index = revision_indexes_by_id.get(revision.id)
+        if index is None:
+            index = build_revision_fragment_index(revision)
+            revision_indexes_by_id[revision.id] = index
+        if any(error.fatal for error in index.errors):
+            codes = ",".join(sorted({error.code.value for error in index.errors}))
+            raise RuntimeError(f"NOOP revalidation compiler contract failed: {codes or 'unindexable_revision'}")
+        candidates = _revalidation_fragment_candidates(
+            index.fragments,
+            prior=item,
+            memory_claim=memory_claim,
+        )
+        if not candidates:
+            raise RevalidatedSelectionError(
+                RevalidatedSelectionErrorCode.UNPRESENTABLE,
+                "NOOP revalidation Evidence has no bounded current candidate",
+            )
+        candidates_by_reference_id[item.reference_id] = candidates
+        indexes_by_observation_id[item.anchor.observation_id] = index
+
+    unique_fragments: dict[tuple[object, ...], EvidenceFragment] = {}
+    for candidates in candidates_by_reference_id.values():
+        for fragment in candidates:
+            unique_fragments[_fragment_identity(fragment)] = fragment
+    ordered_fragments = tuple(sorted(unique_fragments.values(), key=_fragment_sort_key))
+    if (
+        len(ordered_fragments) > DEFAULT_MAX_FRAGMENTS
+        or sum(len(item.presentation_text) for item in ordered_fragments) > DEFAULT_MAX_PRESENTATION_CHARS
+    ):
+        raise RuntimeError("NOOP revalidation bounded candidate workset exceeds its explicit limits")
+    reference_by_identity = {
+        _fragment_identity(fragment): f"f{index:06d}" for index, fragment in enumerate(ordered_fragments, start=1)
+    }
+    fragments_by_ref = {reference_by_identity[_fragment_identity(fragment)]: fragment for fragment in ordered_fragments}
+    payload_by_ref: dict[str, Mapping[str, object]] = {}
+    for reference, fragment in fragments_by_ref.items():
+        index = indexes_by_observation_id[fragment.anchor.observation_id]
+        payload_by_ref[reference] = _revalidation_candidate_payload(
+            reference,
+            fragment,
+            index.fragments,
+        )
+    primary = tuple(item for item in ordered_support if item.role is EvidenceRole.PRIMARY)
+    if len(primary) != 1:
+        raise ValueError("NOOP revalidation requires exactly one Primary")
+    primary_refs = tuple(
+        reference_by_identity[_fragment_identity(fragment)]
+        for fragment in candidates_by_reference_id[primary[0].reference_id]
+    )
+    required_refs_by_selector = {
+        required_selector_by_reference_id[item.reference_id]: tuple(
+            reference_by_identity[_fragment_identity(fragment)]
+            for fragment in candidates_by_reference_id[item.reference_id]
+        )
+        for item in ordered_support
+        if item.role is EvidenceRole.REQUIRED
+    }
+    _reject_indistinguishable_revalidation_candidates(
+        primary_refs,
+        payload_by_ref=payload_by_ref,
+    )
+    for references in required_refs_by_selector.values():
+        _reject_indistinguishable_revalidation_candidates(
+            references,
+            payload_by_ref=payload_by_ref,
+        )
+    return SupportRevalidationWorkset(
+        fragments_by_ref=fragments_by_ref,
+        payload_by_ref=payload_by_ref,
+        primary_reference_id=primary[0].reference_id,
+        primary_refs=primary_refs,
+        required_refs_by_selector=required_refs_by_selector,
+        required_reference_id_by_selector={
+            selector: reference_id for reference_id, selector in required_selector_by_reference_id.items()
+        },
+    )
+
+
+def _revalidation_fragment_candidates(
+    fragments: tuple[EvidenceFragment, ...],
+    *,
+    prior: ActiveSupportEvidence,
+    memory_claim: str,
+) -> tuple[EvidenceFragment, ...]:
+    candidates = tuple(
+        fragment
+        for fragment in fragments
+        if fragment.anchor.observation_id == prior.anchor.observation_id
+        and (prior.role is not EvidenceRole.PRIMARY or fragment.primary_eligible)
+    )
+    if prior.role is EvidenceRole.PRIMARY:
+        exact_claim = tuple(
+            fragment
+            for fragment in candidates
+            if memory_claim
+            and (fragment.presentation_text == memory_claim or memory_claim in fragment.presentation_text)
+        )
+        if exact_claim:
+            return exact_claim
+    exact_text = tuple(
+        fragment for fragment in candidates if prior.excerpt and fragment.presentation_text == prior.excerpt
+    )
+    if exact_text:
+        return exact_text
+    if prior.anchor.kind is AnchorKind.REVISION_RANGE:
+        assert prior.anchor.range_start is not None
+        assert prior.anchor.range_end is not None
+        overlapping = tuple(
+            fragment
+            for fragment in candidates
+            if fragment.anchor.range_start is not None
+            and fragment.anchor.range_end is not None
+            and prior.anchor.range_start < fragment.anchor.range_end
+            and fragment.anchor.range_start < prior.anchor.range_end
+        )
+        if overlapping:
+            return overlapping
+        if len(candidates) == 1:
+            return candidates
+        return ()
+    if (
+        len(candidates) <= SUPPORT_REVALIDATION_MAX_CANDIDATES_PER_PART
+        and sum(len(item.presentation_text) for item in candidates) <= DEFAULT_MAX_PRESENTATION_CHARS
+    ):
+        return candidates
+    query_terms = _revalidation_terms(
+        memory_claim if prior.role is EvidenceRole.PRIMARY else (prior.excerpt or memory_claim)
+    )
+    ranked = sorted(
+        candidates,
+        key=lambda fragment: (
+            -len(query_terms.intersection(_revalidation_terms(fragment.presentation_text))),
+            len(fragment.presentation_text),
+            _fragment_sort_key(fragment),
+        ),
+    )
+    return tuple(
+        fragment
+        for fragment in ranked[:SUPPORT_REVALIDATION_MAX_CANDIDATES_PER_PART]
+        if query_terms.intersection(_revalidation_terms(fragment.presentation_text))
+    )
+
+
+def _revalidation_terms(value: str) -> frozenset[str]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    terms: list[str] = []
+    current: list[str] = []
+    for character in normalized:
+        if character.isalnum() or character in {"-", "_"}:
+            current.append(character)
+            continue
+        if current:
+            terms.append("".join(current))
+            current.clear()
+    if current:
+        terms.append("".join(current))
+    return frozenset(term for term in terms if len(term) > 1)
+
+
+def _reject_indistinguishable_revalidation_candidates(
+    references: tuple[str, ...],
+    *,
+    payload_by_ref: Mapping[str, Mapping[str, object]],
+) -> None:
+    if len(references) < 2:
+        return
+    identities = {
+        tuple(
+            sorted(
+                (key, json.dumps(value, sort_keys=True))
+                for key, value in payload_by_ref[reference].items()
+                if key != "ref"
+            )
+        )
+        for reference in references
+    }
+    if len(identities) == 1:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.AMBIGUOUS,
+            "NOOP revalidation candidates are semantically indistinguishable",
+        )
+
+
+def _revalidation_candidate_payload(
+    reference: str,
+    fragment: EvidenceFragment,
+    fragments: tuple[EvidenceFragment, ...],
+) -> Mapping[str, object]:
+    ordered = tuple(sorted(fragments, key=_fragment_sort_key))
+    index = ordered.index(fragment)
+    heading = next(
+        (candidate for candidate in reversed(ordered[:index]) if candidate.fragment_type.endswith("heading")),
+        None,
+    )
+    return {
+        "ref": reference,
+        "kind": fragment.kind.value,
+        "type": fragment.fragment_type,
+        "text": fragment.presentation_text,
+        "structural_context": (heading.presentation_text[-500:] if heading is not None else ""),
+    }
+
+
+def _fragment_identity(fragment: EvidenceFragment) -> tuple[object, ...]:
+    return (
+        fragment.anchor.observation_id,
+        fragment.anchor.observation_revision_id,
+        fragment.anchor.kind,
+        fragment.anchor.range_start,
+        fragment.anchor.range_end,
+        fragment.raw_content_sha256,
+    )
+
+
 def resolve_revalidated_noop_selection(
     projection: SourceProjection,
     *,
@@ -108,6 +428,16 @@ def resolve_revalidated_noop_selection(
     access_context_hash: str,
     current_primary_quote: str,
     current_required_quotes_by_reference_id: Mapping[str, str],
+    selected_fragments_by_reference_id: Mapping[
+        str,
+        EvidenceFragment,
+    ]
+    | None = None,
+    revision_indexes_by_id: MutableMapping[
+        str,
+        RevisionFragmentIndex,
+    ]
+    | None = None,
 ) -> ResolvedEvidenceSelection:
     """Resolve one complete current v2 Unit through the shared catalog seam."""
 
@@ -136,6 +466,8 @@ def resolve_revalidated_noop_selection(
     ranges_by_observation: dict[str, list[EvidenceCandidateRange]] = {}
     selected_fragment_identities: set[tuple[object, ...]] = set()
     indexes_by_observation: dict[str, tuple[EvidenceFragment, ...]] = {}
+    selected_current = selected_fragments_by_reference_id or {}
+    shared_indexes = revision_indexes_by_id if revision_indexes_by_id is not None else {}
     for item in ordered_support:
         revision = revisions.get(item.anchor.observation_id)
         if revision is None:
@@ -145,7 +477,10 @@ def resolve_revalidated_noop_selection(
             )
         indexed_fragments = indexes_by_observation.get(revision.observation_id)
         if indexed_fragments is None:
-            index = build_revision_fragment_index(revision)
+            index = shared_indexes.get(revision.id)
+            if index is None:
+                index = build_revision_fragment_index(revision)
+                shared_indexes[revision.id] = index
             if any(error.fatal for error in index.errors):
                 codes = ",".join(
                     sorted({error.code.value for error in index.errors})
@@ -161,19 +496,27 @@ def resolve_revalidated_noop_selection(
                 )
             indexed_fragments = index.fragments
             indexes_by_observation[revision.observation_id] = indexed_fragments
-        expected = (
-            current_primary_quote
-            if item.role is EvidenceRole.PRIMARY
-            else current_required_quotes_by_reference_id.get(
-                item.reference_id,
-                item.excerpt or "",
+        fragment = selected_current.get(item.reference_id)
+        if fragment is None:
+            expected = (
+                current_primary_quote
+                if item.role is EvidenceRole.PRIMARY
+                else current_required_quotes_by_reference_id.get(
+                    item.reference_id,
+                    item.excerpt or "",
+                )
             )
-        )
-        fragment = _unique_revalidation_fragment(
-            indexed_fragments,
-            prior=item,
-            expected=expected,
-        )
+            fragment = _unique_revalidation_fragment(
+                indexed_fragments,
+                prior=item,
+                expected=expected,
+            )
+        elif (
+            fragment.anchor.observation_id != item.anchor.observation_id
+            or fragment.anchor.observation_revision_id != revision.id
+            or (item.role is EvidenceRole.PRIMARY and not fragment.primary_eligible)
+        ):
+            raise RuntimeError("NOOP revalidation selected a Fragment outside its current Evidence part")
         fragment_identity = (
             fragment.anchor.observation_id,
             fragment.anchor.observation_revision_id,
@@ -262,19 +605,30 @@ def resolve_revalidated_noop_selection(
     required_refs: list[str] = []
     selected_refs: set[str] = set()
     for item in ordered_support:
-        expected = (
-            current_primary_quote
-            if item.role is EvidenceRole.PRIMARY
-            else current_required_quotes_by_reference_id.get(
-                item.reference_id,
-                item.excerpt or "",
+        selected_fragment = selected_current.get(item.reference_id)
+        if selected_fragment is None:
+            expected = (
+                current_primary_quote
+                if item.role is EvidenceRole.PRIMARY
+                else current_required_quotes_by_reference_id.get(
+                    item.reference_id,
+                    item.excerpt or "",
+                )
             )
-        )
-        fragment = _unique_revalidation_fragment(
-            catalog.fragments,
-            prior=item,
-            expected=expected,
-        )
+            fragment = _unique_revalidation_fragment(
+                catalog.fragments,
+                prior=item,
+                expected=expected,
+            )
+        else:
+            exact = tuple(
+                fragment
+                for fragment in catalog.fragments
+                if _fragment_identity(fragment) == _fragment_identity(selected_fragment)
+            )
+            if len(exact) != 1:
+                raise RuntimeError("NOOP revalidation compiled selection lost its exact Fragment")
+            fragment = exact[0]
         if fragment.reference in selected_refs:
             raise RevalidatedSelectionError(
                 RevalidatedSelectionErrorCode.AMBIGUOUS,

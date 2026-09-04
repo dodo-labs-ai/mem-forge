@@ -39,6 +39,7 @@ from memforge.pipeline.projection_fragments import (
     RevalidatedSelectionError,
     RevalidatedSelectionErrorCode,
     compile_projection_fragment_catalog,
+    prepare_support_revalidation_workset,
     resolve_revalidated_noop_selection,
     resolve_projected_agent_claim_fragment,
 )
@@ -825,6 +826,90 @@ def test_representation_policy_keeps_binary_whole_and_plain_text_range_addressab
     assert [
         fragment.anchor.kind.value for fragment in binary_catalog.fragments
     ] == ["whole_observation"]
+
+
+def test_support_revalidation_workset_reuses_the_shared_representation_compilers() -> None:
+    canonical = _canonical_projection(
+        observation_type="comment",
+        content=json.dumps(
+            {"body": "Decision: retain A7 for regular payroll."},
+            separators=(",", ":"),
+        ),
+    )
+    [canonical_revision] = canonical.observation_revisions
+    plain_base = _canonical_projection(
+        observation_type="comment",
+        content="Decision: retain A7 for regular payroll.",
+    )
+    [plain_revision] = plain_base.observation_revisions
+    plain = replace(
+        plain_base,
+        observation_revisions=(replace(plain_revision, evidence_profile=PLAIN_TEXT_PROFILE),),
+    )
+    [binary_observation] = plain_base.observations
+    binary = replace(
+        plain_base,
+        observations=(replace(binary_observation, observation_type="binary_artifact"),),
+        observation_revisions=(
+            replace(
+                plain_revision,
+                content="",
+                evidence_profile=BINARY_ARTIFACT_PROFILE,
+                metadata={
+                    "source_artifact": {
+                        "inference_eligible": True,
+                        "sha256": "a" * 64,
+                        "media_type": "image/png",
+                        "size_bytes": 1,
+                    }
+                },
+            ),
+        ),
+    )
+
+    for projection in (canonical, plain, binary):
+        [revision] = projection.observation_revisions
+        support = ActiveSupportEvidence(
+            memory_id="mem-a7",
+            source_id=projection.source_id,
+            reference_id="ref-primary",
+            evidence_unit_id="eu-a7",
+            role=EvidenceRole.PRIMARY,
+            anchor=SourceAnchor(
+                kind=(
+                    AnchorKind.WHOLE_OBSERVATION
+                    if revision.evidence_profile
+                    and revision.evidence_profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
+                    else AnchorKind.REVISION_RANGE
+                ),
+                observation_id=revision.observation_id,
+                observation_revision_id=f"{revision.id}-previous",
+                range_start=(
+                    None
+                    if revision.evidence_profile
+                    and revision.evidence_profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
+                    else 0
+                ),
+                range_end=(
+                    None
+                    if revision.evidence_profile
+                    and revision.evidence_profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
+                    else len(revision.content)
+                ),
+            ),
+            excerpt=(revision.content or None),
+        )
+
+        workset = prepare_support_revalidation_workset(
+            projection,
+            support=(support,),
+            required_selector_by_reference_id={},
+            revision_indexes_by_id={},
+            memory_claim="A7 remains a regular-payroll decision.",
+        )
+
+        assert workset.primary_refs
+        assert all(reference.startswith("f") for reference in workset.primary_refs)
 
 
 def test_large_canonical_fragment_fails_with_capacity_error_without_raw_slicing() -> None:

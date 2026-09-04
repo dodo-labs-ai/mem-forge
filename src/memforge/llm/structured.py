@@ -506,22 +506,22 @@ class MemoryRelationResponse(StructuredResponseModel):
 
 
 class MemorySupportValidationRequiredEvidence(StructuredResponseModel):
-    """One exact current Required quote selected during revalidation."""
+    """One application-issued current Required Fragment selection."""
 
     model_config = ConfigDict(extra="forbid")
 
     selector: str = Field(pattern=r"^r\d{6}$")
-    evidence_quote: str = Field(min_length=1, max_length=4000)
+    evidence_ref: str = Field(pattern=r"^f\d{6}$")
 
 
 class MemorySupportValidationResponse(StructuredResponseModel):
-    """Schema proving whether revised dependencies still support a claim."""
+    """Semantic decision plus application-issued current Fragment selections."""
 
     model_config = ConfigDict(extra="ignore")
 
     supported: bool
     reason: str = Field(default="", max_length=1000)
-    evidence_quote: str = Field(default="", max_length=4000)
+    primary_ref: str | None = Field(default=None, pattern=r"^f\d{6}$")
     required_evidence: list[MemorySupportValidationRequiredEvidence] = Field(
         default_factory=list,
         max_length=32,
