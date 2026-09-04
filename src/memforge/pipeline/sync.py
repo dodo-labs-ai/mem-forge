@@ -173,6 +173,48 @@ class ExtractionAdmission:
     active_multimodal: int
 
 
+@dataclass(frozen=True, slots=True)
+class _SourceDerivationRecovery:
+    """Per-Unit recovery results shared by counting and deferred convergence."""
+
+    results: tuple[dict[str, Any], ...]
+
+    @property
+    def completed_results(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            result
+            for result in self.results
+            if result.get("deferred_lifecycle") is None
+        )
+
+    @property
+    def deferred_results(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            result
+            for result in self.results
+            if result.get("deferred_lifecycle") is not None
+        )
+
+    @property
+    def processed(self) -> int:
+        return sum(bool(result["processed"]) for result in self.results)
+
+    @property
+    def updated(self) -> int:
+        return sum(bool(result["updated"]) for result in self.results)
+
+    @property
+    def memories_extracted(self) -> int:
+        return sum(int(result["memories_extracted"]) for result in self.results)
+
+    @property
+    def memories_corroborated(self) -> int:
+        return sum(
+            int(result["memories_corroborated"])
+            for result in self.results
+        )
+
+
 class ExtractionWorkPool:
     """Work-conserving fair pool for app-wide heavy extraction work."""
 
@@ -797,6 +839,8 @@ class GeneSyncOrchestrator:
         reused_projection_count = 0
         total_item_count = 0
         failure_retryable = True
+        recovered_completed_results: tuple[dict[str, Any], ...] = ()
+        recovered_deferred_results: tuple[dict[str, Any], ...] = ()
 
         try:
             if execution_mode is SourceSyncMode.NORMAL:
@@ -807,9 +851,8 @@ class GeneSyncOrchestrator:
                     lifecycle_execution_owner_id=durable_cycle_id,
                     progress_callback=progress_callback,
                 )
-                docs_updated += recovered["updated"]
-                memories_extracted += recovered["memories_extracted"]
-                memories_corroborated += recovered["memories_corroborated"]
+                recovered_completed_results = recovered.completed_results
+                recovered_deferred_results = recovered.deferred_results
 
             # ----------------------------------------------------------
             # Step 0: Authenticate
@@ -970,6 +1013,19 @@ class GeneSyncOrchestrator:
             docs_updated_counter = 0
             memories_extracted_counter = 0
             item_semaphore = asyncio.Semaphore(self._document_parallelism_limit())
+            recovered_targets_by_doc_id: dict[str, frozenset[tuple[str, str]]] = {}
+            for recovered_result in recovered_deferred_results:
+                recovered_doc_id = str(recovered_result["doc_id"])
+                existing_targets = recovered_targets_by_doc_id.get(
+                    recovered_doc_id,
+                    frozenset(),
+                )
+                recovered_targets_by_doc_id[recovered_doc_id] = existing_targets | {
+                    (
+                        str(recovered_result["source_unit_id"]),
+                        str(recovered_result["target_unit_revision_id"]),
+                    )
+                }
 
             async def _process_one(item: ContentItem) -> dict:
                 """Process a single item with retry logic and error isolation."""
@@ -985,11 +1041,22 @@ class GeneSyncOrchestrator:
                     "preflight_observation_ids": (),
                     "runtime_bundle": None,
                     "source_unit_id": None,
+                    "provider_target_unit_revision_id": None,
                     "deferred_lifecycle": None,
+                    "recovered_deferred_target": None,
                     "doc_id": item.item_id,
                     "title": item.title,
                 }
                 document_completed = False
+
+                def on_item_target(
+                    source_unit_id: str,
+                    target_unit_revision_id: str,
+                ) -> None:
+                    stats["source_unit_id"] = source_unit_id
+                    stats["provider_target_unit_revision_id"] = (
+                        target_unit_revision_id
+                    )
 
                 def on_item_progress(progress: dict) -> None:
                     nonlocal document_completed, progress_counter
@@ -1046,8 +1113,18 @@ class GeneSyncOrchestrator:
                                 expected_source_activity_epoch=source_activity_epoch,
                                 lifecycle_execution_owner_id=durable_cycle_id,
                                 lifecycle_attempt_count=attempt,
+                                source_unit_target_callback=on_item_target,
+                                recovered_deferred_targets=(
+                                    recovered_targets_by_doc_id.get(
+                                        item.item_id,
+                                        frozenset(),
+                                    )
+                                ),
                             )
-                            stats["processed"] = True
+                            recovered_target = item_stats.get(
+                                "recovered_deferred_target"
+                            )
+                            stats["processed"] = recovered_target is None
                             stats["updated"] = item_stats.get("updated", False)
                             stats["memories_extracted"] = item_stats.get(
                                 "memories_extracted",
@@ -1064,6 +1141,9 @@ class GeneSyncOrchestrator:
                             )
                             stats["source_unit_id"] = item_stats.get(
                                 "source_unit_id"
+                            )
+                            stats["recovered_deferred_target"] = (
+                                recovered_target
                             )
                             last_error = None
                         except SourceUnitLifecycleDeferred as exc:
@@ -1172,17 +1252,70 @@ class GeneSyncOrchestrator:
                 await asyncio.gather(*item_tasks, return_exceptions=True)
                 raise
 
-            deferred_results = [
+            # A successful recovery has already applied this target, so exact
+            # provider rediscovery follows the projected no-op path without
+            # semantic work. Retain the recovery outcome as the single source
+            # of terminal counts instead of replacing it with that no-op.
+            completed_recovery_targets = {
+                (
+                    str(result["source_unit_id"]),
+                    str(result["target_unit_revision_id"]),
+                )
+                for result in recovered_completed_results
+            }
+            provider_results = [
                 result
                 for result in results
+                if result.get("recovered_deferred_target") is None
+                and (
+                    str(result.get("source_unit_id") or ""),
+                    str(
+                        result.get("provider_target_unit_revision_id")
+                        or ""
+                    ),
+                )
+                not in completed_recovery_targets
+            ]
+            provider_source_unit_ids = {
+                str(result["source_unit_id"])
+                for result in provider_results
+                if result.get("source_unit_id")
+            }
+            recovered_results = [
+                *recovered_completed_results,
+                *recovered_deferred_results,
+            ]
+            recovered_results_for_run = [
+                result
+                for result in recovered_results
+                if str(result["source_unit_id"])
+                not in provider_source_unit_ids
+            ]
+            for recovered_result in recovered_deferred_results:
+                if (
+                    str(recovered_result["source_unit_id"])
+                    not in provider_source_unit_ids
+                ):
+                    continue
+                await self.db.supersede_source_derivation(
+                    str(recovered_result["derivation_id"]),
+                    reason_code=DERIVATION_INPUT_SUPERSEDED,
+                )
+            effective_results = [
+                *recovered_results_for_run,
+                *provider_results,
+            ]
+            deferred_results = [
+                result
+                for result in effective_results
                 if result.get("deferred_lifecycle") is not None
             ]
             deferred_result_ids = {id(result) for result in deferred_results}
 
-            # Aggregate completed normal work first. Deferred work is not a
+            # Aggregate completed work after recovery/provider selection. Deferred work is not a
             # failure and must not prevent authoritative tombstones that may
             # heal its blocker later in this same Source run.
-            for r in results:
+            for r in effective_results:
                 if id(r) in deferred_result_ids:
                     continue
                 if r["processed"]:
@@ -1274,7 +1407,7 @@ class GeneSyncOrchestrator:
                 )
 
             await self._converge_deferred_projected_lifecycle(
-                results,
+                effective_results,
                 additional_source_unit_ids=tombstoned_source_unit_ids,
             )
             for result in deferred_results:
@@ -1568,15 +1701,10 @@ class GeneSyncOrchestrator:
         run_id: str,
         lifecycle_execution_owner_id: str | None = None,
         progress_callback: Callable[[dict], None] | None = None,
-    ) -> dict[str, int]:
+    ) -> _SourceDerivationRecovery:
         """Resume durable Source Unit work before reading the provider."""
 
-        stats = {
-            "processed": 0,
-            "updated": 0,
-            "memories_extracted": 0,
-            "memories_corroborated": 0,
-        }
+        results: list[dict[str, Any]] = []
         attempts = await self.db.list_source_derivation_attempts(
             source_id=source_id,
             statuses=(
@@ -1672,6 +1800,26 @@ class GeneSyncOrchestrator:
                             diagnostics.status = "committed"
                         elif diagnostics.error_class is None:
                             diagnostics.status = "skipped"
+                except SourceUnitLifecycleDeferred as exc:
+                    results.append(
+                        {
+                            "processed": False,
+                            "updated": False,
+                            "memories_extracted": 0,
+                            "memories_corroborated": 0,
+                            "failed": False,
+                            "runtime_bundle": exc.runtime_bundle,
+                            "source_unit_id": exc.handle.source_unit_id,
+                            "target_unit_revision_id": (
+                                attempt.target_unit_revision_id
+                            ),
+                            "derivation_id": attempt.id,
+                            "deferred_lifecycle": exc,
+                            "doc_id": doc_id,
+                            "title": attempt.context.document.title,
+                        }
+                    )
+                    lifecycle_stats = None
                 except Exception as exc:
                     recovery_error = exc
                     raise
@@ -1695,11 +1843,29 @@ class GeneSyncOrchestrator:
                 )
             if lifecycle_stats is None:
                 continue
-            stats["processed"] += 1
-            stats["updated"] += 1
-            stats["memories_extracted"] += int(lifecycle_stats.get("added", 0))
-            stats["memories_corroborated"] += int(lifecycle_stats.get("updated", 0))
-        return stats
+            results.append(
+                {
+                    "processed": True,
+                    "updated": True,
+                    "memories_extracted": int(
+                        lifecycle_stats.get("added", 0)
+                    ),
+                    "memories_corroborated": int(
+                        lifecycle_stats.get("updated", 0)
+                    ),
+                    "failed": False,
+                    "runtime_bundle": None,
+                    "source_unit_id": attempt.source_unit_id,
+                    "target_unit_revision_id": (
+                        attempt.target_unit_revision_id
+                    ),
+                    "derivation_id": attempt.id,
+                    "deferred_lifecycle": None,
+                    "doc_id": doc_id,
+                    "title": attempt.context.document.title,
+                }
+            )
+        return _SourceDerivationRecovery(results=tuple(results))
 
     async def _resume_source_derivation_attempt(
         self,
@@ -1857,6 +2023,8 @@ class GeneSyncOrchestrator:
         expected_source_activity_epoch: int | None = None,
         lifecycle_execution_owner_id: str | None = None,
         lifecycle_attempt_count: int = 1,
+        source_unit_target_callback: Callable[[str, str], None] | None = None,
+        recovered_deferred_targets: frozenset[tuple[str, str]] = frozenset(),
     ) -> dict:
         doc_id = item.item_id
         self._memory_sample("document_wait_start", source_id=source_id, run_id=run_id, doc_id=doc_id)
@@ -1895,15 +2063,22 @@ class GeneSyncOrchestrator:
                         expected_source_activity_epoch=expected_source_activity_epoch,
                         lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                         lifecycle_attempt_count=lifecycle_attempt_count,
+                        source_unit_target_callback=source_unit_target_callback,
+                        recovered_deferred_targets=recovered_deferred_targets,
                         source_unit_id_callback=(
                             None
                             if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT
                             else diagnostics.bind_source_unit
                         ),
                     )
-                    diagnostics.status = (
-                        "skipped" if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT else "committed"
-                    )
+                    if result.get("recovered_deferred_target") is not None:
+                        diagnostics.status = "prepared"
+                    else:
+                        diagnostics.status = (
+                            "skipped"
+                            if execution_mode is SourceSyncMode.REBASELINE_PREFLIGHT
+                            else "committed"
+                        )
                 return result
             except Exception as exc:
                 lifecycle_error = exc
@@ -1948,6 +2123,8 @@ class GeneSyncOrchestrator:
         source_unit_id_callback: Callable[[str], None] | None = None,
         lifecycle_execution_owner_id: str | None = None,
         lifecycle_attempt_count: int = 1,
+        source_unit_target_callback: Callable[[str, str], None] | None = None,
+        recovered_deferred_targets: frozenset[tuple[str, str]] = frozenset(),
     ) -> dict:
         """Process a single content item through the full pipeline.
 
@@ -1974,6 +2151,8 @@ class GeneSyncOrchestrator:
             "memory_supports_added": 0,
             "memory_supports_updated": 0,
             "memory_supports_removed": 0,
+            "source_unit_id": None,
+            "recovered_deferred_target": None,
         }
 
         # ------------------------------------------------------------------
@@ -2195,6 +2374,35 @@ class GeneSyncOrchestrator:
         if source_unit_id_callback is not None:
             source_unit_id_callback(source_unit.id)
         stats["source_unit_id"] = source_unit.id
+
+        current_target = (
+            source_unit.id,
+            projection_probe.source_unit_revisions[0].id,
+        )
+        if source_unit_target_callback is not None:
+            source_unit_target_callback(*current_target)
+        if current_target in recovered_deferred_targets:
+            stats["recovered_deferred_target"] = current_target
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "processing",
+                        "event": "document_processed",
+                        "title": item.title,
+                    }
+                )
+            logger.info(
+                "Reused prepared lifecycle intent for unchanged Source Unit target %s (%s)",
+                source_unit.id,
+                current_target[1],
+            )
+            return stats
+        if recovered_deferred_targets:
+            logger.info(
+                "Provider target %s supersedes prepared lifecycle target(s) %s",
+                current_target,
+                sorted(recovered_deferred_targets),
+            )
 
         projection_run_id = f"{run_id or 'direct'}:{source_unit.id}:{projection_probe.source_unit_revisions[0].id}"
         async with self._db_lock:
