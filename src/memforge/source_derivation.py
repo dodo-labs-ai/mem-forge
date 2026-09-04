@@ -193,6 +193,14 @@ class SourceDerivationAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceDerivationStage:
+    """Atomic staging result distinguishing first creation from exact replay."""
+
+    attempt: SourceDerivationAttempt
+    created: bool
+
+
+@dataclass(frozen=True, slots=True)
 class SourceUnitDerivationContext:
     document: DocumentRecord
     doc_type: str
@@ -244,7 +252,9 @@ class SourceDerivationStore(Protocol):
         *,
         runtime_events: tuple[AgentRuntimeEvent, ...] = (),
         agent_assessments: tuple[AgentAssessment, ...] = (),
-    ) -> SourceDerivationAttempt: ...
+    ) -> SourceDerivationStage:
+        """Create once with audit facts, or validate and return an exact replay."""
+        ...
 
     async def get_completed_source_derivation_batch_results(
         self,
@@ -527,19 +537,20 @@ class SourceUnitDeriver:
                 observation_revision_ids=revision_by_observation,
             )
             assessments = evaluate_runtime_events(events)
-            derivation = await self._store.stage_source_derivation(
+            stage = await self._store.stage_source_derivation(
                 manifest,
                 runtime_events=events,
                 agent_assessments=assessments,
             )
-            publish_runtime_events(self._runtime_event_trace_sink, events)
-            publish_agent_assessments(
-                self._agent_assessment_sink,
-                assessments,
-                events,
-            )
+            if stage.created:
+                publish_runtime_events(self._runtime_event_trace_sink, events)
+                publish_agent_assessments(
+                    self._agent_assessment_sink,
+                    assessments,
+                    events,
+                )
             return SourceUnitDerivationResult(
-                derivation=derivation,
+                derivation=stage.attempt,
                 extraction=_planning_failure_extraction(planned_work),
                 reused_batch_count=0,
                 executed_batch_count=0,
@@ -556,7 +567,7 @@ class SourceUnitDeriver:
                 _authority_base_unit_revision_id(request)
             ),
         )
-        derivation = await self._store.stage_source_derivation(manifest)
+        derivation = (await self._store.stage_source_derivation(manifest)).attempt
         completed_results = await self._store.get_completed_source_derivation_batch_results(
             derivation_id=derivation.id,
         )
@@ -656,7 +667,7 @@ class SourceUnitDeriver:
             extract_and_persist,
             max_concurrent=request.max_concurrent,
         )
-        derivation = await self._store.stage_source_derivation(manifest)
+        derivation = (await self._store.stage_source_derivation(manifest)).attempt
         new_results_by_batch_id = {
             batch.id: result
             for batch, result in zip(
