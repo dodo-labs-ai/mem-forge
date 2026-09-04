@@ -34,6 +34,9 @@ from memforge.pipeline.evidence_fragments import (
     compile_fragments,
 )
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
+from memforge.pipeline.projection_images import (
+    projection_inference_capability_hash,
+)
 from memforge.source_projection import (
     AnchorKind,
     EvidenceCoordinateSpace,
@@ -537,6 +540,7 @@ def compile_projection_fragment_catalog(
     batch: ProjectionExtractionBatch,
     *,
     access_context_hash: str,
+    inference_capability_hash: str | None = None,
     supplied_artifact_observation_ids: tuple[str, ...] = (),
     max_fragments: int = DEFAULT_MAX_FRAGMENTS,
     max_presentation_chars: int = DEFAULT_MAX_PRESENTATION_CHARS,
@@ -547,6 +551,9 @@ def compile_projection_fragment_catalog(
         raise ValueError("projection Fragment catalog requires exactly one Source Unit revision")
     if not access_context_hash:
         raise ValueError("projection Fragment catalog requires an access context hash")
+    resolved_inference_capability_hash = (
+        inference_capability_hash or projection_inference_capability_hash()
+    )
     if max_fragments <= 0 or max_presentation_chars <= 0:
         raise ValueError("projection Fragment catalog limits must be positive")
 
@@ -635,7 +642,12 @@ def compile_projection_fragment_catalog(
     return _compose_projection_fragment_catalog(
         projection=projection,
         access_context_hash=access_context_hash,
-        catalog_identity={"batch_id": batch.id},
+        catalog_identity={
+            "batch_id": batch.id,
+            "inference_capability_hash": (
+                resolved_inference_capability_hash
+            ),
+        },
         compiled_fragments=compiled_fragments,
         errors=errors,
         component_digests=component_digests,

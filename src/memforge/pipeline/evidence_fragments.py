@@ -11,6 +11,7 @@ import html
 import json
 import re
 from bisect import bisect_right
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from html.parser import HTMLParser
@@ -29,13 +30,17 @@ from memforge.source_projection import (
     SourceObservationRevision,
 )
 from memforge.source_representation import (
+    MARKDOWN_STRUCTURAL_PROFILE,
+    PLAIN_TEXT_PROFILE,
+    CanonicalRecordField,
     CanonicalRecordSchema,
     EvidenceRepresentationContract,
+    canonical_field_comparison_value,
     representation_contract_for_profile,
 )
 
 
-COMPILER_CONTRACT_VERSION = 2
+COMPILER_CONTRACT_VERSION = 3
 DEFAULT_MAX_FRAGMENTS = 2_048
 DEFAULT_MAX_PRESENTATION_CHARS = 120_000
 _SUPPORTING_ROLES = frozenset({EvidenceRole.PRIMARY, EvidenceRole.REQUIRED})
@@ -82,6 +87,18 @@ class StructuralUnit:
     end: int
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalFieldRange:
+    """One registered canonical field in immutable raw-Revision coordinates."""
+
+    descriptor: CanonicalRecordField
+    start: int
+    end: int
+    value: object
+    comparison_value: object
+    string_boundaries: tuple[int, ...] | None = None
+
+
 class StructuralUnitTooLargeError(ValueError):
     """One complete structure cannot fit the configured presentation budget."""
 
@@ -106,20 +123,9 @@ def plan_revision_structural_units(
 
     if max_content_chars < 1:
         raise ValueError("structural planning budget must be positive")
-    profile = revision.evidence_profile
-    if (
-        profile is None
-        or profile.requires_whole_observation_authority
-        or profile.name not in {"markdown-structural", "plain-text"}
-    ):
-        return (StructuralUnit(0, len(revision.content)),)
-    protected = (
-        _markdown_protected_ranges(revision.content)
-        if profile.name == "markdown-structural"
-        else _paragraph_ranges(revision.content)
+    protected = tuple(
+        (unit.start, unit.end) for unit in revision_structural_ranges(revision)
     )
-    if not protected and revision.content:
-        protected = ((0, len(revision.content)),)
     packed: list[StructuralUnit] = []
     current_start: int | None = None
     current_end: int | None = None
@@ -143,6 +149,110 @@ def plan_revision_structural_units(
     if current_start is not None and current_end is not None:
         packed.append(StructuralUnit(current_start, current_end))
     return tuple(packed)
+
+
+def revision_structural_ranges(
+    revision: SourceObservationRevision,
+) -> tuple[StructuralUnit, ...]:
+    """Return the smallest representation-owned ranges safe for authority.
+
+    Presentation packing may combine adjacent units later, but it must never
+    use that packing decision to widen Primary authority.
+    """
+
+    profile = revision.evidence_profile
+    if (
+        profile is None
+        or profile.requires_whole_observation_authority
+        or profile.name not in {"markdown-structural", "plain-text"}
+    ):
+        return (
+            (StructuralUnit(0, len(revision.content)),)
+            if revision.content
+            else ()
+        )
+    protected = (
+        _markdown_protected_ranges(revision.content)
+        if profile.name == "markdown-structural"
+        else _paragraph_ranges(revision.content)
+    )
+    if not protected and revision.content:
+        protected = ((0, len(revision.content)),)
+    return tuple(StructuralUnit(start, end) for start, end in protected)
+
+
+def revision_changed_structural_ranges(
+    base: SourceObservationRevision,
+    target: SourceObservationRevision,
+) -> tuple[tuple[int, int], ...]:
+    """Return target structures not provably unchanged from the committed base."""
+
+    if (
+        base.observation_id != target.observation_id
+        or base.evidence_profile != target.evidence_profile
+        or target.evidence_profile is None
+        or target.evidence_profile.name
+        not in {"markdown-structural", "plain-text"}
+    ):
+        raise ValueError("range-addressable Revision pair has incompatible identity")
+    base_units = revision_structural_ranges(base)
+    target_units = revision_structural_ranges(target)
+    remaining_unchanged = Counter(
+        _revision_structural_identities(base, base_units)
+    )
+    changed = []
+    target_identities = _revision_structural_identities(target, target_units)
+    for unit, identity in zip(target_units, target_identities, strict=True):
+        if remaining_unchanged[identity] > 0:
+            remaining_unchanged[identity] -= 1
+            continue
+        changed.append((unit.start, unit.end))
+    return tuple(changed)
+
+
+def _revision_structural_identities(
+    revision: SourceObservationRevision,
+    units: tuple[StructuralUnit, ...],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Bind Markdown structures to their deterministic heading ancestry."""
+
+    profile = revision.evidence_profile
+    if profile is None or profile.name != "markdown-structural":
+        return tuple(
+            (revision.content[unit.start : unit.end], ()) for unit in units
+        )
+    tokens = _markdown_parser().disable("inline").parse(revision.content)
+    line_starts = _line_starts(revision.content)
+    headings: dict[int, tuple[int, str]] = {}
+    for token in tokens:
+        if token.type != "heading_open" or token.map is None:
+            continue
+        start, end = _token_range(
+            revision.content,
+            line_starts,
+            token.map[0],
+            token.map[1],
+        )
+        level = int(token.tag.removeprefix("h"))
+        headings[start] = (level, revision.content[start:end])
+    path: list[str] = []
+    identities = []
+    for unit in units:
+        identities.append(
+            (
+                revision.content[unit.start : unit.end],
+                tuple(path),
+            )
+        )
+        heading = headings.get(unit.start)
+        if heading is None:
+            continue
+        level, heading_text = heading
+        del path[level - 1 :]
+        while len(path) < level - 1:
+            path.append("")
+        path.append(heading_text)
+    return tuple(identities)
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,15 +597,6 @@ def _compile_canonical_record_profile(
     contract: EvidenceRepresentationContract,
     authority_ranges: tuple[EvidenceCandidateRange, ...],
 ) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
-    if any(item.anchor.kind is not AnchorKind.WHOLE_OBSERVATION for item in authority_ranges):
-        return (), (
-            _error(
-                revision,
-                FragmentCompilationErrorCode.INVALID_AUTHORITY_RANGE,
-                "canonical records require whole-Observation authority before field compilation",
-                fatal=True,
-            ),
-        )
     schema = contract.canonical_schema
     assert isinstance(schema, CanonicalRecordSchema)
     try:
@@ -512,88 +613,97 @@ def _compile_canonical_record_profile(
 
     candidates: list[_FragmentCandidate] = []
     errors: list[FragmentCompilationError] = []
-    for authority in authority_ranges:
-        for descriptor in schema.fields:
-            node = document.nodes.get(descriptor.json_pointer)
-            if node is None or node.value is None:
-                continue
-            if descriptor.nested_profile is None:
-                candidates.append(
-                    _text_candidate(
-                        revision.content,
-                        "canonical-field",
-                        node.start,
-                        node.end,
-                        authority.eligible_roles,
-                        _canonical_value_presentation(node.value),
-                    )
+    for descriptor in schema.fields:
+        node = document.nodes.get(descriptor.json_pointer)
+        if node is None or node.value is None:
+            continue
+        if descriptor.nested_profile is None:
+            candidates.append(
+                _text_candidate(
+                    revision.content,
+                    "canonical-field",
+                    node.start,
+                    node.end,
+                    _SUPPORTING_ROLES,
+                    _canonical_value_presentation(node.value),
                 )
-                continue
-            if not isinstance(node.value, str) or node.string_boundaries is None:
-                errors.append(
-                    _error(
-                        revision,
-                        FragmentCompilationErrorCode.SCHEMA_MISMATCH,
-                        f"canonical field {descriptor.json_pointer or '/'} is not declared text",
-                        start=node.start,
-                        end=node.end,
-                    )
-                )
-                continue
-            if descriptor.nested_profile == "plain-text":
-                nested = tuple(
-                    _FragmentCandidate(
-                        kind=EvidenceFragmentKind.TEXT,
-                        fragment_type="plain-paragraph",
-                        start=start,
-                        end=end,
-                        eligible_roles=authority.eligible_roles,
-                        presentation_text=node.value[start:end],
-                    )
-                    for start, end in _paragraph_ranges(node.value)
-                )
-                nested_errors: tuple[FragmentCompilationError, ...] = ()
-            else:
-                nested, nested_errors = _markdown_candidates(
+            )
+            continue
+        if not isinstance(node.value, str) or node.string_boundaries is None:
+            errors.append(
+                _error(
                     revision,
-                    node.value,
-                    base=0,
-                    roles=authority.eligible_roles,
+                    FragmentCompilationErrorCode.SCHEMA_MISMATCH,
+                    f"canonical field {descriptor.json_pointer or '/'} is not declared text",
+                    start=node.start,
+                    end=node.end,
                 )
-            for candidate in nested:
-                assert candidate.start is not None and candidate.end is not None
-                raw_start = node.string_boundaries[candidate.start]
-                raw_end = node.string_boundaries[candidate.end]
-                candidates.append(
-                    _text_candidate(
-                        revision.content,
-                        f"canonical-{candidate.fragment_type}",
-                        raw_start,
-                        raw_end,
-                        candidate.eligible_roles,
-                        candidate.presentation_text,
-                    )
+            )
+            continue
+        if descriptor.nested_profile == "plain-text":
+            nested = tuple(
+                _FragmentCandidate(
+                    kind=EvidenceFragmentKind.TEXT,
+                    fragment_type="plain-paragraph",
+                    start=start,
+                    end=end,
+                    eligible_roles=_SUPPORTING_ROLES,
+                    presentation_text=node.value[start:end],
                 )
-            for nested_error in nested_errors:
-                raw_start = (
-                    node.string_boundaries[nested_error.range_start]
-                    if nested_error.range_start is not None
-                    else node.start
+                for start, end in _paragraph_ranges(node.value)
+            )
+            nested_errors: tuple[FragmentCompilationError, ...] = ()
+        else:
+            nested, nested_errors = _markdown_candidates(
+                revision,
+                node.value,
+                base=0,
+                roles=_SUPPORTING_ROLES,
+            )
+        for candidate in nested:
+            assert candidate.start is not None and candidate.end is not None
+            raw_start = node.string_boundaries[candidate.start]
+            raw_end = node.string_boundaries[candidate.end]
+            candidates.append(
+                _text_candidate(
+                    revision.content,
+                    f"canonical-{candidate.fragment_type}",
+                    raw_start,
+                    raw_end,
+                    candidate.eligible_roles,
+                    candidate.presentation_text,
                 )
-                raw_end = (
-                    node.string_boundaries[nested_error.range_end] if nested_error.range_end is not None else node.end
+            )
+        for nested_error in nested_errors:
+            raw_start = (
+                node.string_boundaries[nested_error.range_start]
+                if nested_error.range_start is not None
+                else node.start
+            )
+            raw_end = (
+                node.string_boundaries[nested_error.range_end]
+                if nested_error.range_end is not None
+                else node.end
+            )
+            errors.append(
+                _error(
+                    revision,
+                    nested_error.code,
+                    nested_error.message,
+                    start=raw_start,
+                    end=raw_end,
+                    fatal=nested_error.fatal,
                 )
-                errors.append(
-                    _error(
-                        revision,
-                        nested_error.code,
-                        nested_error.message,
-                        start=raw_start,
-                        end=raw_end,
-                        fatal=nested_error.fatal,
-                    )
-                )
-    return tuple(candidates), tuple(errors)
+            )
+    bound, authority_errors = _bind_candidates_to_authority(
+        revision,
+        tuple(candidates),
+        authority_ranges,
+    )
+    return bound, (
+        *_errors_inside_authority(tuple(errors), authority_ranges, revision.content),
+        *authority_errors,
+    )
 
 
 _ProfileCompiler = Callable[
@@ -1184,6 +1294,101 @@ class _JsonDocument:
         if end != len(source):
             raise ValueError("canonical record contains trailing data")
         return cls(value=value, nodes=dict(scanner.nodes))
+
+
+def canonical_record_field_ranges(
+    revision: SourceObservationRevision,
+) -> tuple[CanonicalFieldRange, ...]:
+    """Index registered canonical fields using the compiler's exact parser."""
+
+    contract = representation_contract_for_profile(revision.evidence_profile)
+    if contract is None or contract.canonical_schema is None:
+        raise ValueError("Revision does not declare a registered canonical-record schema")
+    document = _JsonDocument.parse(revision.content)
+    indexed = []
+    for descriptor in contract.canonical_schema.fields:
+        node = document.nodes.get(descriptor.json_pointer)
+        if node is None or node.value is None:
+            continue
+        indexed.append(
+            CanonicalFieldRange(
+                descriptor=descriptor,
+                start=node.start,
+                end=node.end,
+                value=node.value,
+                comparison_value=canonical_field_comparison_value(
+                    descriptor,
+                    node.value,
+                ),
+                string_boundaries=node.string_boundaries,
+            )
+        )
+    return tuple(indexed)
+
+
+def canonical_record_is_tombstoned(revision: SourceObservationRevision) -> bool:
+    """Return the registered non-selectable target tombstone state."""
+
+    contract = representation_contract_for_profile(revision.evidence_profile)
+    if contract is None or contract.canonical_schema is None:
+        raise ValueError("Revision does not declare a registered canonical-record schema")
+    pointer = contract.canonical_schema.tombstone_pointer
+    if pointer is None:
+        return False
+    document = _JsonDocument.parse(revision.content)
+    node = document.nodes.get(pointer)
+    return (
+        node is not None
+        and node.value is not None
+        and node.value != ""
+        and node.value is not False
+    )
+
+
+def canonical_nested_changed_raw_ranges(
+    base: CanonicalFieldRange,
+    target: CanonicalFieldRange,
+) -> tuple[tuple[int, int], ...]:
+    """Map changed nested text structures back to exact canonical JSON ranges."""
+
+    nested_profile = target.descriptor.nested_profile
+    if (
+        nested_profile is None
+        or nested_profile != base.descriptor.nested_profile
+        or not isinstance(base.value, str)
+        or not isinstance(target.value, str)
+        or target.string_boundaries is None
+    ):
+        raise ValueError("canonical nested text field cannot be mapped exactly")
+    nested_evidence_profile = (
+        MARKDOWN_STRUCTURAL_PROFILE
+        if nested_profile == "markdown-structural"
+        else PLAIN_TEXT_PROFILE
+    )
+    base_revision = SourceObservationRevision(
+        id="canonical-nested-base",
+        observation_id="canonical-nested",
+        semantic_hash="canonical-nested-base",
+        content=base.value,
+        evidence_profile=nested_evidence_profile,
+    )
+    target_revision = SourceObservationRevision(
+        id="canonical-nested-target",
+        observation_id="canonical-nested",
+        semantic_hash="canonical-nested-target",
+        content=target.value,
+        evidence_profile=nested_evidence_profile,
+    )
+    return tuple(
+        (
+            target.string_boundaries[start],
+            target.string_boundaries[end],
+        )
+        for start, end in revision_changed_structural_ranges(
+            base_revision,
+            target_revision,
+        )
+    )
 
 
 class _JsonScanner:

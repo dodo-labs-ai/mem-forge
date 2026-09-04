@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Collection
 
 from memforge.llm.structured_images import StructuredLlmImage
@@ -20,6 +21,24 @@ class ProjectionImageLoadError(ValueError):
     def __init__(self, *, error_code: str) -> None:
         super().__init__(error_code)
         self.error_code = error_code
+
+
+PROJECTION_IMAGE_INFERENCE_CAPABILITY_VERSION = 1
+
+
+def projection_inference_capability_hash() -> str:
+    """Identify the exact binary input contract used by projection extraction."""
+
+    payload = {
+        "version": PROJECTION_IMAGE_INFERENCE_CAPABILITY_VERSION,
+        "media_types": ("image/gif", "image/jpeg", "image/png", "image/webp"),
+        "max_batch_bytes": MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 def projection_inference_image_observation_ids(

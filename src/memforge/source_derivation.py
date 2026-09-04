@@ -49,8 +49,11 @@ from memforge.pipeline.document_units import (
     unitize_markdown,
 )
 from memforge.pipeline.projection_context import (
+    CommittedSourceUnitSnapshot,
+    ProjectionEvidencePlanningFailure,
     ProjectionExtractionBatch,
     observation_is_inference_eligible,
+    plan_projection_evidence_work,
     plan_projection_extraction_batches,
 )
 from memforge.source_artifacts import SourceArtifactSummary
@@ -147,6 +150,7 @@ class SourceDerivationManifest:
     context_identity_hash: str
     extraction_contract_version: str
     batches: tuple[SourceDerivationBatchManifest, ...]
+    terminal_reason_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +236,9 @@ class SourceDerivationStore(Protocol):
     async def stage_source_derivation(
         self,
         manifest: SourceDerivationManifest,
+        *,
+        runtime_events: tuple[AgentRuntimeEvent, ...] = (),
+        agent_assessments: tuple[AgentAssessment, ...] = (),
     ) -> SourceDerivationAttempt: ...
 
     async def get_completed_source_derivation_batch_results(
@@ -274,6 +281,9 @@ class SourceUnitDerivationRequest:
     ]
     max_concurrent: int
     extraction_contract_version: str = PROJECTION_EXTRACTION_CONTRACT_VERSION
+    committed_base_snapshot: CommittedSourceUnitSnapshot | None = None
+    access_context_hash: str | None = None
+    inference_capability_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,16 +320,12 @@ class SourceUnitDeriver:
         self,
         request: SourceUnitDerivationRequest,
     ) -> SourceUnitDerivationResult:
-        batches = (
-            plan_projection_extraction_batches(
+        planned_work = (
+            plan_projection_evidence_work(
                 request.projection,
-                primary_observation_ids=(
-                    tuple(
-                        observation.id
-                        for observation in request.projection.observations
-                    )
-                    if request.context.reprocess_all_current_observations
-                    else None
+                committed_base_snapshot=request.committed_base_snapshot,
+                reprocess_all_current_observations=(
+                    request.context.reprocess_all_current_observations
                 ),
                 extraction_contract_version=request.extraction_contract_version,
             )
@@ -328,11 +334,88 @@ class SourceUnitDeriver:
             ).uses_fragment_catalog
             else self._plan_work(request.projection, request.context)
         )
+        evidence_work_identity_hash = _evidence_work_identity_hash(
+            access_context_hash=request.access_context_hash,
+            inference_capability_hash=request.inference_capability_hash,
+        )
+        if isinstance(planned_work, ProjectionEvidencePlanningFailure):
+            manifest = source_derivation_manifest(
+                request.projection,
+                (),
+                context=request.context,
+                extraction_contract_version=request.extraction_contract_version,
+                terminal_reason_code=planned_work.code.value,
+                evidence_work_identity_hash=evidence_work_identity_hash,
+            )
+            revision_by_observation = {
+                revision.observation_id: revision.id
+                for revision in request.projection.observation_revisions
+            }
+            events = bind_quality_signals(
+                (
+                    QualitySignal(
+                        event_name="evidence_authority_planning",
+                        outcome="failed",
+                        reason_code=planned_work.code.value,
+                        error_code=planned_work.code.value,
+                        candidate_count=planned_work.authorized_structure_count,
+                        rejected_count=planned_work.changed_structure_count,
+                        observation_id=planned_work.observation_id,
+                        observation_revision_id=(
+                            planned_work.observation_revision_id
+                        ),
+                    ),
+                ),
+                source_id=request.projection.source_id,
+                source_type=request.projection.source_type,
+                doc_id=request.context.document.doc_id,
+                source_unit_id=manifest.source_unit_id,
+                target_unit_revision_id=manifest.target_unit_revision_id,
+                projection_run_id=request.projection.run_id,
+                derivation_id=manifest.id,
+                batch_id="authority-planning",
+                batch_attempt=1,
+                extraction_contract_version=request.extraction_contract_version,
+                occurred_at=datetime.now().astimezone(),
+                deployment_revision=current_deployment_revision(),
+                observation_revision_ids=revision_by_observation,
+            )
+            assessments = evaluate_runtime_events(events)
+            derivation = await self._store.stage_source_derivation(
+                manifest,
+                runtime_events=events,
+                agent_assessments=assessments,
+            )
+            publish_runtime_events(self._runtime_event_trace_sink, events)
+            publish_agent_assessments(
+                self._agent_assessment_sink,
+                assessments,
+                events,
+            )
+            return SourceUnitDerivationResult(
+                derivation=derivation,
+                extraction=MemoryExtractionResult(
+                    error_type="evidence_authority_planning_failed",
+                    error="Evidence authority planning failed closed.",
+                    metadata={
+                        "safe_error_code": planned_work.code.value,
+                        "llm_invoked": False,
+                        "lifecycle_mutation_skipped": True,
+                        "representation_profile": (
+                            planned_work.representation_profile
+                        ),
+                    },
+                ),
+                reused_batch_count=0,
+                executed_batch_count=0,
+            )
+        batches = planned_work
         manifest = source_derivation_manifest(
             request.projection,
             batches,
             context=request.context,
             extraction_contract_version=request.extraction_contract_version,
+            evidence_work_identity_hash=evidence_work_identity_hash,
         )
         derivation = await self._store.stage_source_derivation(manifest)
         completed_results = await self._store.get_completed_source_derivation_batch_results(
@@ -513,15 +596,12 @@ async def replay_source_unit_derivation(
     events, or write Source/Memory lifecycle state.
     """
 
-    batches = (
-        plan_projection_extraction_batches(
+    planned_work = (
+        plan_projection_evidence_work(
             request.projection,
-            primary_observation_ids=(
-                tuple(
-                    observation.id for observation in request.projection.observations
-                )
-                if request.context.reprocess_all_current_observations
-                else None
+            committed_base_snapshot=request.committed_base_snapshot,
+            reprocess_all_current_observations=(
+                request.context.reprocess_all_current_observations
             ),
             extraction_contract_version=request.extraction_contract_version,
         )
@@ -530,6 +610,18 @@ async def replay_source_unit_derivation(
         ).uses_fragment_catalog
         else plan_source_derivation_work(request.projection, request.context)
     )
+    if isinstance(planned_work, ProjectionEvidencePlanningFailure):
+        return MemoryExtractionResult(
+            error_type="evidence_authority_planning_failed",
+            error="Evidence authority planning failed closed.",
+            metadata={
+                "safe_error_code": planned_work.code.value,
+                "offline_replay": True,
+                "llm_invoked": False,
+                "lifecycle_mutation_skipped": True,
+            },
+        )
+    batches = planned_work
     results = await collect_bounded(
         batches,
         request.extract_batch,
@@ -716,6 +808,8 @@ def source_derivation_manifest(
     *,
     context: SourceUnitDerivationContext,
     extraction_contract_version: str = SOURCE_DERIVATION_CONTRACT_VERSION,
+    terminal_reason_code: str | None = None,
+    evidence_work_identity_hash: str | None = None,
 ) -> SourceDerivationManifest:
     """Build one stable manifest for an immutable target Source Unit revision."""
 
@@ -741,6 +835,7 @@ def source_derivation_manifest(
                 target_revision_id=target_revision_id,
                 extraction_contract_version=extraction_contract_version,
                 batch=batch,
+                evidence_work_identity_hash=evidence_work_identity_hash,
             ),
             primary_observation_ids=batch.primary_observation_ids,
         )
@@ -755,6 +850,8 @@ def source_derivation_manifest(
         "context_identity_hash": context_identity_hash,
         "extraction_contract_version": extraction_contract_version,
         "batch_input_hashes": [item.input_payload_hash for item in manifest_batches],
+        "terminal_reason_code": terminal_reason_code,
+        "evidence_work_identity_hash": evidence_work_identity_hash,
     }
     derivation_id = "sdrv-" + hashlib.sha256(_canonical_json(identity_payload).encode("utf-8")).hexdigest()[:32]
     return SourceDerivationManifest(
@@ -771,6 +868,7 @@ def source_derivation_manifest(
         context_identity_hash=context_identity_hash,
         extraction_contract_version=extraction_contract_version,
         batches=manifest_batches,
+        terminal_reason_code=terminal_reason_code,
     )
 
 
@@ -1040,16 +1138,41 @@ def _safe_derivation_diagnostic(
     return normalized
 
 
+def _evidence_work_identity_hash(
+    *,
+    access_context_hash: str | None,
+    inference_capability_hash: str | None,
+) -> str | None:
+    """Bind reusable v9 work to its access and binary inference contracts."""
+
+    if access_context_hash is None and inference_capability_hash is None:
+        return None
+    if not access_context_hash or not inference_capability_hash:
+        raise ValueError(
+            "Evidence work identity requires access and inference capability hashes"
+        )
+    return hashlib.sha256(
+        _canonical_json(
+            {
+                "access_context_hash": access_context_hash,
+                "inference_capability_hash": inference_capability_hash,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _batch_input_payload_hash(
     *,
     target_revision_id: str,
     extraction_contract_version: str,
     batch: SourceDerivationBatch,
+    evidence_work_identity_hash: str | None = None,
 ) -> str:
     if isinstance(batch, DiffGuidedExtractionBatch):
         payload = {
             "target_unit_revision_id": target_revision_id,
             "extraction_contract_version": extraction_contract_version,
+            "evidence_work_identity_hash": evidence_work_identity_hash,
             "batch_id": batch.id,
             "work_kind": batch.kind,
             "primary_observation_ids": list(batch.primary_observation_ids),
@@ -1062,6 +1185,7 @@ def _batch_input_payload_hash(
         payload = {
             "target_unit_revision_id": target_revision_id,
             "extraction_contract_version": extraction_contract_version,
+            "evidence_work_identity_hash": evidence_work_identity_hash,
             "batch_id": batch.id,
             "work_kind": batch.kind,
             "primary_observation_ids": list(batch.primary_observation_ids),
@@ -1074,9 +1198,18 @@ def _batch_input_payload_hash(
     payload = {
         "target_unit_revision_id": target_revision_id,
         "extraction_contract_version": extraction_contract_version,
+        "evidence_work_identity_hash": evidence_work_identity_hash,
         "batch_id": batch.id,
         "authority_policy_version": batch.authority_policy_version,
         "primary_observation_ids": list(batch.primary_observation_ids),
+        "primary_authority_spans": [
+            {
+                "observation_id": observation_id,
+                "range_start": start,
+                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            }
+            for observation_id, start, content in batch.primary_authority_spans
+        ],
         "primary_content_sha256": hashlib.sha256(batch.primary_markdown.encode("utf-8")).hexdigest(),
         "context_observation_ids": list(batch.context_observation_ids),
         "context_content_sha256": hashlib.sha256(batch.context_markdown.encode("utf-8")).hexdigest(),
