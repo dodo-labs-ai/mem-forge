@@ -1105,6 +1105,152 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
         asyncio.run(database.close())
 
 
+def test_github_repo_symlink_push_preserves_logical_identity_and_audit_locator(tmp_path):
+    from memforge.genes.github_repo_gene import GitHubRepoGene
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_github_repo_source(client)["id"]
+            response = client.post(
+                f"/api/v1/sources/{source_id}/adapter/packages",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/README.md",
+                    "markdown_body": "# Contributions\n\nUse reviewed changes.",
+                    "content_type": "text/markdown",
+                    "blob_sha": "b" * 40,
+                    "symlink_chain": [{
+                        "path": "Payroll Processing/README.md",
+                        "blob_sha": "a" * 40,
+                        "target_path": "docs/CONTRIBUTIONS.md",
+                    }],
+                    "resolved_relative_path": "docs/CONTRIBUTIONS.md",
+                    "process_now": False,
+                },
+            )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        package = json.loads(Path(body["package_uri"]).read_text())
+        assert package["doc_id"] == build_github_repo_doc_id(
+            source_id=source_id,
+            repo_url="https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+            repo_ref="main",
+            relative_path="Payroll Processing/README.md",
+        )
+        assert package["blob_sha"] == "b" * 40
+        assert package["resolved_relative_path"] == "docs/CONTRIBUTIONS.md"
+        assert package["symlink_chain"] == [{
+            "path": "Payroll Processing/README.md",
+            "blob_sha": "a" * 40,
+            "target_path": "docs/CONTRIBUTIONS.md",
+        }]
+
+        source = asyncio.run(database.get_source(source_id))
+        projected = _project_source_inputs(database, source)
+        gene = GitHubRepoGene(projected["config"], source_id)
+        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
+
+        async def _normalize_package():
+            await gene.authenticate()
+            [item] = [item async for item in gene.discover(None)]
+            return await gene.normalize(await gene.fetch(item))
+
+        normalized = asyncio.run(_normalize_package())
+        assert normalized.source_semantics["relative_path"] == "Payroll Processing/README.md"
+        assert normalized.source_semantics["resolved_relative_path"] == "docs/CONTRIBUTIONS.md"
+        assert normalized.source_semantics["logical_file_mode"] == "120000"
+    finally:
+        asyncio.run(database.close())
+
+
+@pytest.mark.parametrize(
+    ("resolved_path", "exclude_paths", "message"),
+    [
+        ("/docs/CONTRIBUTIONS.md", [], "repository-relative"),
+        ("docs/CONTRIBUTIONS.md ", [], "repository-relative"),
+        ("docs/CONTRIBUTIONS.md", ["docs"], "explicitly excluded"),
+        ("assets/photo.png", [], "binary Artifacts"),
+        ("Payroll Processing/README.md", [], "cyclic"),
+    ],
+)
+def test_github_repo_symlink_push_rejects_unsafe_audit_locator(
+    tmp_path, resolved_path, exclude_paths, message,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_github_repo_source(client, exclude_paths=exclude_paths)["id"]
+            response = client.post(
+                f"/api/v1/sources/{source_id}/adapter/packages",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/README.md",
+                    "markdown_body": "# Contributions",
+                    "content_type": "text/markdown",
+                    "blob_sha": "b" * 40,
+                    "symlink_chain": [{
+                        "path": "Payroll Processing/README.md",
+                        "blob_sha": "a" * 40,
+                        "target_path": resolved_path,
+                    }],
+                    "resolved_relative_path": resolved_path,
+                    "process_now": False,
+                },
+            )
+        assert response.status_code == 400, response.text
+        assert message in response.json()["detail"]
+    finally:
+        asyncio.run(database.close())
+
+
+@pytest.mark.parametrize(
+    ("symlink_chain", "resolved_relative_path"),
+    [
+        ([{"path": "Payroll Processing/README.md", "blob_sha": "a" * 40,
+           "target_path": "docs/a.md"}], None),
+        ([], "docs/a.md"),
+    ],
+)
+def test_github_repo_symlink_push_rejects_incomplete_audit_locator(
+    tmp_path, symlink_chain, resolved_relative_path,
+):
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        with LeaseAwareTestClient(app) as client:
+            source_id = _create_github_repo_source(client)["id"]
+            response = client.post(
+                f"/api/v1/sources/{source_id}/adapter/packages",
+                json={
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": "Payroll Processing/README.md",
+                    "markdown_body": "# A",
+                    "blob_sha": "b" * 40,
+                    "symlink_chain": symlink_chain,
+                    "resolved_relative_path": resolved_relative_path,
+                    "process_now": False,
+                },
+            )
+        assert response.status_code == 400, response.text
+        assert "identity is incomplete" in response.json()["detail"]
+    finally:
+        asyncio.run(database.close())
+
+
 def test_github_repo_local_push_materializes_binary_artifact_input(tmp_path):
     from memforge.genes.github_repo_gene import GitHubRepoGene
     from memforge.server.admin_api import create_admin_app

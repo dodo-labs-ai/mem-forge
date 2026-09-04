@@ -37,7 +37,10 @@ from memforge.capability_discovery import discover_target
 from memforge.config import DEFAULT_SEARCH_TOP_K, AppConfig, load_config
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSION_LIST,
+    GITHUB_SYMLINK_MODE,
     GitHubBlobBuffer,
+    GitHubResolvedTreeEntry,
+    GitHubTreeEntryResolver,
     build_github_repo_doc_id,
     decode_github_base64_content,
     decode_github_text,
@@ -48,8 +51,10 @@ from memforge.github_repo_utils import (
     github_include_extensions,
     github_include_paths,
     github_path_in_scope,
+    normalize_github_relative_path,
     parse_github_repo_url,
     validate_github_file_mode,
+    validate_github_tree_payload,
 )
 from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPickerUnavailable, pick_folder
 from memforge.local_agent.document_identity import (
@@ -517,14 +522,10 @@ def _github_tree(repo: dict[str, str], tree_sha: str) -> list[dict[str, Any]]:
         repo,
         f"repos/{repo['owner']}/{repo['repo']}/git/trees/{quote(tree_sha, safe='')}?recursive=1",
     )
-    if payload.get("truncated") is not False:
-        raise click.ClickException(
-            "GitHub tree response did not prove complete; retry when the provider can return a complete tree."
-        )
-    tree = payload.get("tree")
-    if not isinstance(tree, list):
-        raise click.ClickException("GitHub tree response did not contain a tree collection.")
-    return tree
+    try:
+        return validate_github_tree_payload(payload, label="GitHub repository")
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _github_blob(repo: dict[str, str], blob_sha: str, relative_path: str) -> bytes:
@@ -621,6 +622,34 @@ def _github_title(markdown_body: str, fallback: str) -> str:
     return fallback
 
 
+def _resolve_github_profile_entry(
+    repo: dict[str, str],
+    entry: dict[str, Any],
+    *,
+    entries_by_path: dict[str, dict[str, Any]],
+    exclude_paths: list[str],
+) -> GitHubResolvedTreeEntry:
+    """Bind one logical GitHub path to its immutable regular content blob."""
+
+    resolver = GitHubTreeEntryResolver(
+        entry,
+        entries_by_path=entries_by_path,
+        exclude_paths=exclude_paths,
+    )
+    try:
+        while link := resolver.next_symlink_read():
+            raw_target = _github_text_blob(
+                repo,
+                link.blob_sha,
+                link.path,
+                size=link.blob_size,
+            )
+            resolver.accept_symlink_target(raw_target)
+        return resolver.result()
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | None) -> dict[str, Any]:
     repo, ref, include_paths, exclude_paths, include_extensions = _resolve_github_profile(name, profile)
     snapshot = _resolve_github_collection_snapshot(repo, ref)
@@ -628,8 +657,15 @@ def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | 
     extension_counts: dict[str, int] = {}
     items: list[dict[str, Any]] = []
     tree = _github_tree(repo, snapshot.root_tree_sha)
+    entries_by_path = {
+        normalize_github_relative_path(str(entry.get("path") or "")).rstrip("/"): entry
+        for entry in tree
+    }
     for entry in tree:
-        if entry.get("type") not in {"blob", "commit"}:
+        if (
+            entry.get("type") not in {"blob", "commit"}
+            and entry.get("mode") != GITHUB_SYMLINK_MODE
+        ):
             continue
         relative_path = str(entry.get("path") or "")
         if not github_path_in_scope(relative_path, include_paths, exclude_paths):
@@ -643,13 +679,35 @@ def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | 
             continue
         counts["included"] += 1
         if limit is None or len(items) < limit:
+            resolved = _resolve_github_profile_entry(
+                repo,
+                entry,
+                entries_by_path=entries_by_path,
+                exclude_paths=exclude_paths,
+            )
+            content_entry = resolved.content_entry
+            content_type = github_content_type(relative_path)
+            resolved_content_type = github_content_type(
+                resolved.resolved_relative_path or relative_path
+            )
+            if resolved.symlink_chain and (
+                github_content_type_is_binary(content_type)
+                or github_content_type_is_binary(resolved_content_type)
+            ):
+                raise click.ClickException(
+                    f"GitHub symlink {relative_path} selects a binary Artifact; "
+                    "symlinked Artifacts are unsupported"
+                )
             items.append(
                 {
-                    "relative_path": relative_path,
-                    "blob_sha": entry.get("sha"),
-                    "bytes": entry.get("size"),
-                    "file_mode": entry.get("mode"),
-                    "content_type": github_content_type(relative_path),
+                    "relative_path": resolved.logical_path,
+                    "blob_sha": content_entry.get("sha"),
+                    "bytes": content_entry.get("size"),
+                    "file_mode": content_entry.get("mode"),
+                    "logical_file_mode": resolved.logical_file_mode,
+                    "symlink_chain": [dict(item) for item in resolved.symlink_chain],
+                    "resolved_relative_path": resolved.resolved_relative_path,
+                    "content_type": content_type,
                 }
             )
     payload = {
@@ -2701,6 +2759,14 @@ def _push_github_source_entry(
         title=relative_path if is_source_artifact else _github_title(text_body, relative_path),
         raw_hash=raw_hash,
         blob_sha=blob_sha,
+        symlink_chain=(
+            [dict(item) for item in entry.get("symlink_chain", [])]
+            if isinstance(entry.get("symlink_chain"), list)
+            else None
+        ),
+        resolved_relative_path=(
+            str(entry.get("resolved_relative_path") or "").strip() or None
+        ),
         sync_snapshot_id=sync_snapshot_id,
         local_agent_job_id=local_agent_job_id,
         local_agent_attempt_count=local_agent_attempt_count,

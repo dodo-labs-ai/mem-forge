@@ -26,8 +26,11 @@ from memforge.genes.local_adapter_packages import (
 from memforge.genes.local_markdown_gene import _parse_dt, _to_markdown
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSIONS,
+    GITHUB_SYMLINK_MODE,
     build_github_repo_doc_id,
     GitHubBlobBuffer,
+    GitHubResolvedTreeEntry,
+    GitHubTreeEntryResolver,
     decode_github_text,
     github_content_type,
     github_content_type_is_binary,
@@ -263,15 +266,38 @@ class GitHubRepoGene(Gene):
         selected = [
             entry
             for entry in entries
-            if entry.get("type") in {"blob", "commit"}
+            if (
+                entry.get("type") in {"blob", "commit"}
+                or entry.get("mode") == GITHUB_SYMLINK_MODE
+            )
             and github_path_in_scope(str(entry.get("path") or ""), include_paths, exclude_paths)
             and github_extension_allowed(str(entry.get("path") or ""), include_exts)
         ]
         if len(selected) > max_files:
             raise RuntimeError(f"GitHub Repository discovery matched {len(selected)} files, exceeding max_files={max_files}")
+        entries_by_path = {
+            normalize_github_relative_path(str(entry.get("path") or "")).rstrip("/"): entry
+            for entry in entries
+        }
         for entry in selected:
-            path = normalize_github_relative_path(str(entry.get("path") or ""))
-            blob_sha = str(entry.get("sha") or "")
+            resolved = await self._resolve_repo_entry(
+                repo_ref,
+                entry,
+                entries_by_path=entries_by_path,
+                exclude_paths=exclude_paths,
+            )
+            path = resolved.logical_path
+            content_entry = resolved.content_entry
+            blob_sha = str(content_entry.get("sha") or "")
+            content_type = github_content_type(path)
+            resolved_content_type = github_content_type(resolved.resolved_relative_path or path)
+            if resolved.symlink_chain and (
+                github_content_type_is_binary(content_type)
+                or github_content_type_is_binary(resolved_content_type)
+            ):
+                raise RuntimeError(
+                    f"GitHub symlink {path} selects a binary Artifact; symlinked Artifacts are unsupported"
+                )
             yield ContentItem(
                 item_id=build_github_repo_doc_id(
                     source_id=self.source_id,
@@ -282,7 +308,7 @@ class GitHubRepoGene(Gene):
                 title=_title_from_path(path),
                 source_url=_file_url(repo_ref, ref, path),
                 last_modified=datetime.now(timezone.utc),
-                content_type=github_content_type(path),
+                content_type=content_type,
                 version=blob_sha,
                 space_or_project=f"{repo_ref.owner}/{repo_ref.repo}",
                 labels=["github_repo"],
@@ -296,8 +322,11 @@ class GitHubRepoGene(Gene):
                     "repo_ref": ref,
                     "relative_path": path,
                     "blob_sha": blob_sha,
-                    "blob_size": entry.get("size"),
-                    "file_mode": entry.get("mode"),
+                    "blob_size": content_entry.get("size"),
+                    "file_mode": content_entry.get("mode"),
+                    "logical_file_mode": entry.get("mode"),
+                    "symlink_chain": [dict(item) for item in resolved.symlink_chain],
+                    "resolved_relative_path": resolved.resolved_relative_path,
                     "commit_sha": commit_sha,
                     "root_tree_sha": root_tree,
                     "repo_blob_url": _blob_url(repo_ref, blob_sha),
@@ -373,25 +402,12 @@ class GitHubRepoGene(Gene):
             )
 
         try:
-            async with self._client.stream(
-                str(item.extra["repo_blob_url"]),
-                headers={"Accept": "application/vnd.github.raw+json", "Accept-Encoding": "identity"},
-            ) as response:
-                response.raise_for_status()
-                if response.headers.get("content-encoding", "identity").lower() != "identity":
-                    raise ValueError("GitHub raw blob returned unsupported content encoding")
-                length_header = response.headers.get("content-length")
-                if length_header is not None and not re.fullmatch(r"[0-9]+", str(length_header).strip()):
-                    raise ValueError("GitHub raw blob has an invalid transport length")
-                buffer = GitHubBlobBuffer(
-                    sha=str(item.extra.get("blob_sha") or ""),
-                    size=item.extra.get("blob_size"),
-                    content_length=int(length_header) if length_header is not None else None,
-                    label=str(item.extra.get("relative_path") or item.item_id),
-                )
-                async for chunk in _iter_response_chunks(response):
-                    buffer.write(chunk)
-                raw = buffer.finish()
+            raw = await self._read_text_blob(
+                blob_url=str(item.extra["repo_blob_url"]),
+                blob_sha=str(item.extra.get("blob_sha") or ""),
+                blob_size=item.extra.get("blob_size"),
+                label=str(item.extra.get("relative_path") or item.item_id),
+            )
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         return RawContent(
@@ -455,7 +471,67 @@ class GitHubRepoGene(Gene):
             "content_type": raw.item.content_type,
             "canonical_url": raw.item.source_url,
         }
+        if raw.item.extra.get("logical_file_mode") == GITHUB_SYMLINK_MODE:
+            semantics.update({
+                "logical_file_mode": GITHUB_SYMLINK_MODE,
+                "symlink_chain": raw.item.extra.get("symlink_chain"),
+                "resolved_relative_path": raw.item.extra.get("resolved_relative_path"),
+            })
         return NormalizedContent(item=raw.item, markdown_body=markdown, source_semantics=semantics)
+
+    async def _resolve_repo_entry(
+        self,
+        repo_ref: _RepoRef,
+        entry: dict,
+        *,
+        entries_by_path: dict[str, dict],
+        exclude_paths: list[str],
+    ) -> GitHubResolvedTreeEntry:
+        resolver = GitHubTreeEntryResolver(
+            entry,
+            entries_by_path=entries_by_path,
+            exclude_paths=exclude_paths,
+        )
+        try:
+            while link := resolver.next_symlink_read():
+                raw_target = await self._read_text_blob(
+                    blob_url=_blob_url(repo_ref, link.blob_sha),
+                    blob_sha=link.blob_sha,
+                    blob_size=link.blob_size,
+                    label=link.path,
+                )
+                resolver.accept_symlink_target(raw_target)
+            return resolver.result()
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    async def _read_text_blob(
+        self,
+        *,
+        blob_url: str,
+        blob_sha: str,
+        blob_size: object,
+        label: str,
+    ) -> bytes:
+        async with self._client.stream(
+            blob_url,
+            headers={"Accept": "application/vnd.github.raw+json", "Accept-Encoding": "identity"},
+        ) as response:
+            response.raise_for_status()
+            if response.headers.get("content-encoding", "identity").lower() != "identity":
+                raise ValueError("GitHub raw blob returned unsupported content encoding")
+            length_header = response.headers.get("content-length")
+            if length_header is not None and not re.fullmatch(r"[0-9]+", str(length_header).strip()):
+                raise ValueError("GitHub raw blob has an invalid transport length")
+            buffer = GitHubBlobBuffer(
+                sha=blob_sha,
+                size=blob_size,
+                content_length=int(length_header) if length_header is not None else None,
+                label=label,
+            )
+            async for chunk in _iter_response_chunks(response):
+                buffer.write(chunk)
+            return buffer.finish()
 
     async def _default_branch(self, ref: _RepoRef) -> str:
         response = await self._client.get(_repo_api_url(ref))
@@ -676,7 +752,7 @@ def _package_matches_config(package: dict, config: dict) -> bool:
 
 
 def _semantics_from_package(package: dict) -> dict:
-    return {
+    semantics = {
         "source_type": GITHUB_REPO_SOURCE_TYPE,
         "connection_mode": CONNECTION_MODE_LOCAL_PUSH,
         "repo_url": package.get("repo_url"),
@@ -690,6 +766,13 @@ def _semantics_from_package(package: dict) -> dict:
         "content_type": package.get("content_type"),
         "canonical_url": package.get("source_url"),
     }
+    if package.get("symlink_chain"):
+        semantics.update({
+            "logical_file_mode": GITHUB_SYMLINK_MODE,
+            "symlink_chain": package.get("symlink_chain"),
+            "resolved_relative_path": package.get("resolved_relative_path"),
+        })
+    return semantics
 
 
 def _validated_repo_identifier(repo_url: str) -> str:
