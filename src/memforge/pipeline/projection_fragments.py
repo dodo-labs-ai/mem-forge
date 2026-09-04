@@ -82,7 +82,28 @@ class RevalidatedSelectionError(ValueError):
         self.code = code
 
 
+class SupportRevalidationLimitationCode(str, Enum):
+    UNSUPPORTED_REPRESENTATION = "unsupported_representation"
+    COMPILER_FAILURE = "compiler_failure"
+    CAPACITY_EXCEEDED = "capacity_exceeded"
+
+
+class SupportRevalidationLimitation(RuntimeError):
+    """A product-processing limitation requiring operational attention."""
+
+    def __init__(
+        self,
+        code: SupportRevalidationLimitationCode,
+        message: str,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 SUPPORT_REVALIDATION_MAX_CANDIDATES_PER_PART = 16
+SUPPORT_REVALIDATION_BASE_OUTPUT_TOKENS = 512
+SUPPORT_REVALIDATION_REQUIRED_OUTPUT_TOKENS = 32
+SUPPORT_REVALIDATION_MAX_OUTPUT_TOKENS = 32_768
 
 
 def group_revalidated_support_unit(
@@ -128,6 +149,19 @@ class SupportRevalidationWorkset:
                 for selector, references in self.required_refs_by_selector.items()
             ),
         }
+
+    def model_max_output_tokens(self) -> int:
+        required = len(self.required_refs_by_selector)
+        requested = (
+            SUPPORT_REVALIDATION_BASE_OUTPUT_TOKENS
+            + required * SUPPORT_REVALIDATION_REQUIRED_OUTPUT_TOKENS
+        )
+        if requested > SUPPORT_REVALIDATION_MAX_OUTPUT_TOKENS:
+            raise SupportRevalidationLimitation(
+                SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
+                "NOOP revalidation complete Required selection exceeds the supported output budget",
+            )
+        return requested
 
     def resolve_model_selection(
         self,
@@ -213,11 +247,20 @@ def prepare_support_revalidation_workset(
             revision_indexes_by_id[revision.id] = index
         if any(error.fatal for error in index.errors):
             codes = ",".join(sorted({error.code.value for error in index.errors}))
-            raise RuntimeError(f"NOOP revalidation compiler contract failed: {codes or 'unindexable_revision'}")
+            raise SupportRevalidationLimitation(
+                _revalidation_limitation_code(index.errors),
+                f"NOOP revalidation compiler contract failed: {codes or 'unindexable_revision'}",
+            )
+        provider_correspondence_proven = _has_current_provider_correspondence(
+            projection,
+            prior=item,
+            current_revision_id=revision.id,
+        )
         candidates = _revalidation_fragment_candidates(
             index.fragments,
             prior=item,
             memory_claim=memory_claim,
+            provider_correspondence_proven=provider_correspondence_proven,
         )
         if not candidates:
             raise RevalidatedSelectionError(
@@ -236,7 +279,10 @@ def prepare_support_revalidation_workset(
         len(ordered_fragments) > DEFAULT_MAX_FRAGMENTS
         or sum(len(item.presentation_text) for item in ordered_fragments) > DEFAULT_MAX_PRESENTATION_CHARS
     ):
-        raise RuntimeError("NOOP revalidation bounded candidate workset exceeds its explicit limits")
+        raise SupportRevalidationLimitation(
+            SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
+            "NOOP revalidation bounded candidate workset exceeds its explicit limits",
+        )
     reference_by_identity = {
         _fragment_identity(fragment): f"f{index:06d}" for index, fragment in enumerate(ordered_fragments, start=1)
     }
@@ -290,6 +336,7 @@ def _revalidation_fragment_candidates(
     *,
     prior: ActiveSupportEvidence,
     memory_claim: str,
+    provider_correspondence_proven: bool,
 ) -> tuple[EvidenceFragment, ...]:
     candidates = tuple(
         fragment
@@ -297,6 +344,25 @@ def _revalidation_fragment_candidates(
         if fragment.anchor.observation_id == prior.anchor.observation_id
         and (prior.role is not EvidenceRole.PRIMARY or fragment.primary_eligible)
     )
+    if (
+        prior.anchor.kind is AnchorKind.STABLE_FRAGMENT
+        and not provider_correspondence_proven
+    ):
+        return ()
+    exact_digest = tuple(
+        fragment
+        for fragment in candidates
+        if (
+            prior.raw_content_sha256
+            and fragment.raw_content_sha256 == prior.raw_content_sha256
+        )
+        or (
+            prior.presentation_sha256
+            and fragment.presentation_sha256 == prior.presentation_sha256
+        )
+    )
+    if exact_digest:
+        return exact_digest
     if prior.role is EvidenceRole.PRIMARY:
         exact_claim = tuple(
             fragment
@@ -348,6 +414,50 @@ def _revalidation_fragment_candidates(
         for fragment in ranked[:SUPPORT_REVALIDATION_MAX_CANDIDATES_PER_PART]
         if query_terms.intersection(_revalidation_terms(fragment.presentation_text))
     )
+
+
+def _has_current_provider_correspondence(
+    projection: SourceProjection,
+    *,
+    prior: ActiveSupportEvidence,
+    current_revision_id: str,
+) -> bool:
+    """Return whether provider metadata maps prior Evidence to this Revision."""
+
+    if prior.anchor.kind is not AnchorKind.STABLE_FRAGMENT:
+        return True
+    assert prior.anchor.fragment_id is not None
+    if prior.anchor.observation_revision_id == current_revision_id:
+        return True
+    matches = {
+        mapping.current_fragment_id
+        for delta in projection.deltas
+        for mapping in delta.fragment_mappings
+        if mapping.observation_id == prior.anchor.observation_id
+        and mapping.previous_revision_id
+        == prior.anchor.observation_revision_id
+        and mapping.current_revision_id == current_revision_id
+        and mapping.previous_fragment_id == prior.anchor.fragment_id
+    }
+    if len(matches) > 1:
+        raise RevalidatedSelectionError(
+            RevalidatedSelectionErrorCode.AMBIGUOUS,
+            "NOOP revalidation provider Fragment mapping is ambiguous",
+        )
+    if not matches:
+        return False
+    return True
+
+
+def _revalidation_limitation_code(
+    errors: tuple[FragmentCompilationError, ...],
+) -> SupportRevalidationLimitationCode:
+    codes = {error.code for error in errors}
+    if FragmentCompilationErrorCode.CATALOG_TOO_LARGE in codes:
+        return SupportRevalidationLimitationCode.CAPACITY_EXCEEDED
+    if FragmentCompilationErrorCode.UNSUPPORTED_PROFILE in codes:
+        return SupportRevalidationLimitationCode.UNSUPPORTED_REPRESENTATION
+    return SupportRevalidationLimitationCode.COMPILER_FAILURE
 
 
 def _revalidation_terms(value: str) -> frozenset[str]:
@@ -485,7 +595,8 @@ def resolve_revalidated_noop_selection(
                 codes = ",".join(
                     sorted({error.code.value for error in index.errors})
                 )
-                raise RuntimeError(
+                raise SupportRevalidationLimitation(
+                    _revalidation_limitation_code(index.errors),
                     "NOOP revalidation compiler contract failed: "
                     f"{codes or 'unindexable_revision'}"
                 )
@@ -517,14 +628,7 @@ def resolve_revalidated_noop_selection(
             or (item.role is EvidenceRole.PRIMARY and not fragment.primary_eligible)
         ):
             raise RuntimeError("NOOP revalidation selected a Fragment outside its current Evidence part")
-        fragment_identity = (
-            fragment.anchor.observation_id,
-            fragment.anchor.observation_revision_id,
-            fragment.anchor.kind,
-            fragment.anchor.range_start,
-            fragment.anchor.range_end,
-            fragment.raw_content_sha256,
-        )
+        fragment_identity = _fragment_identity(fragment)
         if fragment_identity in selected_fragment_identities:
             raise RevalidatedSelectionError(
                 RevalidatedSelectionErrorCode.AMBIGUOUS,
@@ -584,10 +688,7 @@ def resolve_revalidated_noop_selection(
         max_presentation_chars=DEFAULT_MAX_PRESENTATION_CHARS,
     )
     if not catalog.usable:
-        expected_codes = {
-            FragmentCompilationErrorCode.NO_SELECTABLE_CONTENT,
-            FragmentCompilationErrorCode.CATALOG_TOO_LARGE,
-        }
+        expected_codes = {FragmentCompilationErrorCode.NO_SELECTABLE_CONTENT}
         if catalog.errors and all(
             error.code in expected_codes for error in catalog.errors
         ):
@@ -596,7 +697,8 @@ def resolve_revalidated_noop_selection(
                 "NOOP revalidation Evidence is not presentable",
             )
         codes = ",".join(sorted({error.code.value for error in catalog.errors}))
-        raise RuntimeError(
+        raise SupportRevalidationLimitation(
+            _revalidation_limitation_code(catalog.errors),
             "NOOP revalidation compiler contract failed: "
             f"{codes or 'empty_catalog'}"
         )

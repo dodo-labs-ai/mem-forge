@@ -68,7 +68,6 @@ def test_text_memory_schema_requires_transient_evidence_block_authority() -> Non
                 ]
             }
         )
-
     response = MemoryExtractionResponse.model_validate(
         {
             "memories": [
@@ -101,6 +100,26 @@ def test_text_memory_schema_requires_transient_evidence_block_authority() -> Non
                     ]
                 }
             )
+
+
+def test_support_validation_schema_preserves_complete_required_coverage() -> None:
+    required = [
+        {
+            "selector": f"r{index:06d}",
+            "evidence_ref": f"f{index + 1:06d}",
+        }
+        for index in range(1, 34)
+    ]
+
+    response = MemorySupportValidationResponse.model_validate(
+        {
+            "supported": True,
+            "primary_ref": "f000001",
+            "required_evidence": required,
+        }
+    )
+
+    assert len(response.required_evidence) == 33
 
 
 def test_projection_memory_schema_rejects_missing_authority() -> None:

@@ -63,6 +63,8 @@ from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
     FragmentSelectionErrorCode,
     RevalidatedSelectionError,
+    SupportRevalidationLimitation,
+    SupportRevalidationLimitationCode,
     group_revalidated_support_unit,
     prepare_support_revalidation_workset,
     resolve_revalidated_noop_selection,
@@ -507,6 +509,7 @@ class MemoryEngine:
         metrics = revalidation_stats if revalidation_stats is not None else {}
         for key in (
             "support_revalidation_work_item_count",
+            "support_revalidation_model_call_count",
             "support_revalidation_revision_index_count",
             "support_revalidation_prompt_chars",
             "support_revalidation_auto_rebind_count",
@@ -673,9 +676,11 @@ class MemoryEngine:
                 )
                 metrics["support_revalidation_work_item_count"] += 1
                 metrics["support_revalidation_prompt_chars"] += len(prompt)
+                max_output_tokens = workset.model_max_output_tokens()
+                metrics["support_revalidation_model_call_count"] += 1
                 validation = await validator(
                     prompt,
-                    max_tokens=512,
+                    max_tokens=max_output_tokens,
                     model=self.llm_model,
                 )
                 support_validation = {
@@ -837,10 +842,26 @@ class MemoryEngine:
             ):
                 raise
             delta = projection.deltas[0]
+            support_limitation_reason = (
+                {
+                    SupportRevalidationLimitationCode.UNSUPPORTED_REPRESENTATION: (
+                        "support_revalidation_unsupported_representation"
+                    ),
+                    SupportRevalidationLimitationCode.COMPILER_FAILURE: (
+                        "support_revalidation_compiler_failure"
+                    ),
+                    SupportRevalidationLimitationCode.CAPACITY_EXCEEDED: (
+                        "support_revalidation_capacity_exceeded"
+                    ),
+                }[exc.code]
+                if isinstance(exc, SupportRevalidationLimitation)
+                else None
+            )
             reason_code = (
                 "authority_plan_stale"
                 if isinstance(exc, AuthorityPlanStaleError)
-                else {
+                else support_limitation_reason
+                or {
                     "candidate_admission": "candidate_admission_failed",
                     "reconciliation": "reconciliation_failed",
                     "support_revalidation": "support_revalidation_failed",
@@ -875,7 +896,13 @@ class MemoryEngine:
             raise SourceUnitLifecycleExecutionError(
                 str(exc),
                 bundle,
-                retryable=not isinstance(exc, ProjectedSupportInvariantError),
+                retryable=not isinstance(
+                    exc,
+                    (
+                        ProjectedSupportInvariantError,
+                        SupportRevalidationLimitation,
+                    ),
+                ),
             ) from exc
 
     async def _materialize_prepared_projected_plan(
@@ -1292,6 +1319,7 @@ class MemoryEngine:
             "vector_delivery_pending": 0,
             "relation_discovery_enqueued": 0,
             "support_revalidation_work_item_count": 0,
+            "support_revalidation_model_call_count": 0,
             "support_revalidation_revision_index_count": 0,
             "support_revalidation_prompt_chars": 0,
             "support_revalidation_auto_rebind_count": 0,
@@ -1569,7 +1597,7 @@ class MemoryEngine:
         )
         incumbents_by_id = {memory.id: memory for memory in incumbents}
         _runtime_context.stage = "support_revalidation"
-        revalidation_calls_before = stats["support_revalidation_work_item_count"]
+        revalidation_calls_before = stats["support_revalidation_model_call_count"]
         try:
             operations = await self._rebind_noop_evidence_to_current_revision(
                 operations=operations,
@@ -1582,7 +1610,7 @@ class MemoryEngine:
             )
         finally:
             _runtime_context.model_call_count += (
-                stats["support_revalidation_work_item_count"] - revalidation_calls_before
+                stats["support_revalidation_model_call_count"] - revalidation_calls_before
             )
         _runtime_context.stage = "plan_construction"
         corroboration_targets: dict[str, Memory] = {}
@@ -1828,7 +1856,7 @@ class MemoryEngine:
             model_call_count=(
                 candidate_ledger.structured_llm_calls
                 + structured_llm_call_count
-                + int(stats["support_revalidation_work_item_count"])
+                + int(stats["support_revalidation_model_call_count"])
                 + entity_resolution.metrics.structured_llm_calls
                 + identity_resolution.metrics.llm_calls
             ),

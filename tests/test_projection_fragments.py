@@ -38,6 +38,8 @@ from memforge.pipeline.projection_fragments import (
     FragmentSelectionErrorCode,
     RevalidatedSelectionError,
     RevalidatedSelectionErrorCode,
+    SupportRevalidationLimitation,
+    SupportRevalidationLimitationCode,
     compile_projection_fragment_catalog,
     prepare_support_revalidation_workset,
     resolve_revalidated_noop_selection,
@@ -55,6 +57,7 @@ from memforge.source_projection import (
     DeltaAxis,
     EvidenceCoordinateSpace,
     EvidenceRepresentationProfile,
+    FragmentMapping,
     ProjectionCoverage,
     RevisionDelta,
     SourceObservation,
@@ -394,6 +397,201 @@ def test_noop_revalidation_presents_only_the_existing_evidence_unit_from_a_large
     )
 
 
+def test_support_revalidation_prefers_persisted_digest_over_stale_range_overlap() -> None:
+    stale = "Approval requires one reviewer."
+    current = "Approval requires two reviewers."
+    content = f"{stale}\n\n{current}"
+    base = _projection(primary_content=content)
+    revision, context_revision = base.observation_revisions
+    projection = replace(
+        base,
+        observation_revisions=(
+            replace(revision, evidence_profile=PLAIN_TEXT_PROFILE),
+            context_revision,
+        ),
+    )
+    digest = hashlib.sha256(current.encode()).hexdigest()
+    support = ActiveSupportEvidence(
+        memory_id="mem-approval",
+        source_id=projection.source_id,
+        reference_id="ref-primary",
+        evidence_unit_id="eu-approval",
+        role=EvidenceRole.PRIMARY,
+        anchor=SourceAnchor(
+            kind=AnchorKind.REVISION_RANGE,
+            observation_id=revision.observation_id,
+            observation_revision_id="rev-primary-previous",
+            range_start=0,
+            range_end=len(stale),
+        ),
+        excerpt=None,
+        raw_content_sha256=digest,
+        presentation_sha256=digest,
+    )
+
+    workset = prepare_support_revalidation_workset(
+        projection,
+        support=(support,),
+        required_selector_by_reference_id={},
+        revision_indexes_by_id={},
+        memory_claim="Two-person approval remains mandatory.",
+    )
+
+    assert len(workset.primary_refs) == 1
+    selected = workset.fragments_by_ref[workset.primary_refs[0]]
+    assert selected.presentation_text == current
+    assert selected.anchor.range_start == content.index(current)
+
+
+def test_stable_fragment_revalidation_requires_provider_correspondence() -> None:
+    current = "Approval requires two reviewers."
+    base = _projection(primary_content=current)
+    revision, context_revision = base.observation_revisions
+    [delta] = base.deltas
+    projection = replace(
+        base,
+        observation_revisions=(
+            replace(revision, evidence_profile=PLAIN_TEXT_PROFILE),
+            context_revision,
+        ),
+        deltas=(
+            replace(
+                delta,
+                previous_unit_revision_id="unit-revision-previous",
+                added_observation_ids=(),
+                fragment_mappings=(
+                    FragmentMapping(
+                        observation_id=revision.observation_id,
+                        previous_revision_id="rev-primary-previous",
+                        current_revision_id=revision.id,
+                        previous_fragment_id="approval-old",
+                        current_fragment_id="approval-current",
+                    ),
+                ),
+            ),
+        ),
+    )
+    digest = hashlib.sha256(current.encode()).hexdigest()
+    support = ActiveSupportEvidence(
+        memory_id="mem-approval",
+        source_id=projection.source_id,
+        reference_id="ref-primary",
+        evidence_unit_id="eu-approval",
+        role=EvidenceRole.PRIMARY,
+        anchor=SourceAnchor(
+            kind=AnchorKind.STABLE_FRAGMENT,
+            observation_id=revision.observation_id,
+            observation_revision_id="rev-primary-previous",
+            fragment_id="approval-old",
+        ),
+        excerpt=current,
+        raw_content_sha256=digest,
+        presentation_sha256=digest,
+    )
+
+    workset = prepare_support_revalidation_workset(
+        projection,
+        support=(support,),
+        required_selector_by_reference_id={},
+        revision_indexes_by_id={},
+        memory_claim=current,
+    )
+    model_selection = workset.resolve_model_selection(
+        primary_ref=workset.primary_refs[0],
+        required_refs_by_selector={},
+    )
+    resolved = resolve_revalidated_noop_selection(
+        projection,
+        support=(support,),
+        access_context_hash="access-1",
+        current_primary_quote=current,
+        current_required_quotes_by_reference_id={},
+        selected_fragments_by_reference_id=(
+            model_selection.fragments_by_evidence_reference_id
+        ),
+    )
+    assert resolved.parts[0].anchor.kind is AnchorKind.REVISION_RANGE
+    assert resolved.parts[0].anchor.observation_revision_id == revision.id
+
+    without_mapping = replace(
+        projection,
+        deltas=(replace(projection.deltas[0], fragment_mappings=()),),
+    )
+    with pytest.raises(RevalidatedSelectionError) as exc_info:
+        prepare_support_revalidation_workset(
+            without_mapping,
+            support=(support,),
+            required_selector_by_reference_id={},
+            revision_indexes_by_id={},
+            memory_claim=current,
+        )
+    assert exc_info.value.code is RevalidatedSelectionErrorCode.UNPRESENTABLE
+
+
+def test_support_revalidation_preserves_more_than_32_required_parts() -> None:
+    paragraphs = tuple(
+        ["Approval requires two reviewers."]
+        + [f"Required policy condition {index}." for index in range(1, 34)]
+    )
+    content = "\n\n".join(paragraphs)
+    base = _projection(primary_content=content)
+    revision, context_revision = base.observation_revisions
+    projection = replace(
+        base,
+        observation_revisions=(
+            replace(revision, evidence_profile=PLAIN_TEXT_PROFILE),
+            context_revision,
+        ),
+    )
+    support = []
+    offset = 0
+    for index, paragraph in enumerate(paragraphs):
+        digest = hashlib.sha256(paragraph.encode()).hexdigest()
+        support.append(
+            ActiveSupportEvidence(
+                memory_id="mem-complete-policy",
+                source_id=projection.source_id,
+                reference_id=f"ref-{index:02d}",
+                evidence_unit_id="eu-complete-policy",
+                role=EvidenceRole.PRIMARY if index == 0 else EvidenceRole.REQUIRED,
+                anchor=SourceAnchor(
+                    kind=AnchorKind.REVISION_RANGE,
+                    observation_id=revision.observation_id,
+                    observation_revision_id="rev-primary-previous",
+                    range_start=offset,
+                    range_end=offset + len(paragraph),
+                ),
+                excerpt=paragraph,
+                raw_content_sha256=digest,
+                presentation_sha256=digest,
+            )
+        )
+        offset += len(paragraph) + 2
+    selectors = {
+        item.reference_id: f"r{index:06d}"
+        for index, item in enumerate(support[1:], start=1)
+    }
+
+    workset = prepare_support_revalidation_workset(
+        projection,
+        support=tuple(support),
+        required_selector_by_reference_id=selectors,
+        revision_indexes_by_id={},
+        memory_claim=paragraphs[0],
+    )
+    selection = workset.resolve_model_selection(
+        primary_ref=workset.primary_refs[0],
+        required_refs_by_selector={
+            selector: references[0]
+            for selector, references in workset.required_refs_by_selector.items()
+        },
+    )
+
+    assert len(workset.required_refs_by_selector) == 33
+    assert workset.model_max_output_tokens() > 512
+    assert len(selection.fragments_by_evidence_reference_id) == 34
+
+
 def test_noop_revalidation_keeps_the_presentation_limit_for_one_oversized_fragment() -> None:
     claim = "x" * 120_001
     projection = _projection(primary_content=claim)
@@ -414,7 +612,7 @@ def test_noop_revalidation_keeps_the_presentation_limit_for_one_oversized_fragme
         excerpt=claim,
     )
 
-    with pytest.raises(RevalidatedSelectionError) as exc_info:
+    with pytest.raises(SupportRevalidationLimitation) as exc_info:
         resolve_revalidated_noop_selection(
             projection,
             support=(support,),
@@ -423,7 +621,10 @@ def test_noop_revalidation_keeps_the_presentation_limit_for_one_oversized_fragme
             current_required_quotes_by_reference_id={},
         )
 
-    assert exc_info.value.code is RevalidatedSelectionErrorCode.UNPRESENTABLE
+    assert (
+        exc_info.value.code
+        is SupportRevalidationLimitationCode.CAPACITY_EXCEEDED
+    )
 
 
 def test_noop_revalidation_rejects_an_ambiguous_moved_fragment() -> None:
@@ -910,6 +1111,206 @@ def test_support_revalidation_workset_reuses_the_shared_representation_compilers
 
         assert workset.primary_refs
         assert all(reference.startswith("f") for reference in workset.primary_refs)
+
+
+@pytest.mark.parametrize(
+    ("label", "profile", "primary_content", "required_content", "primary_text", "required_text"),
+    (
+        (
+            "markdown",
+            MARKDOWN_PROFILE,
+            "# Decision\n\nPrimary approval rule.",
+            "# Constraint\n\nRequired payroll scope.",
+            "Primary approval rule.",
+            "Required payroll scope.",
+        ),
+        (
+            "plain",
+            PLAIN_TEXT_PROFILE,
+            "Primary approval rule.",
+            "Required payroll scope.",
+            "Primary approval rule.",
+            "Required payroll scope.",
+        ),
+        (
+            "canonical",
+            representation_profile_for_observation_contract(
+                source_type="jira",
+                observation_type="comment",
+            ),
+            json.dumps({"body": "Primary approval rule."}, separators=(",", ":")),
+            json.dumps({"body": "Required payroll scope."}, separators=(",", ":")),
+            "Primary approval rule.",
+            "Required payroll scope.",
+        ),
+    ),
+)
+def test_text_revalidation_profiles_preserve_exact_complete_unit_coordinates(
+    label,
+    profile,
+    primary_content,
+    required_content,
+    primary_text,
+    required_text,
+) -> None:
+    assert profile is not None
+    base = _projection(
+        primary_content=primary_content,
+        context_content=required_content,
+    )
+    primary_revision, required_revision = base.observation_revisions
+    projection = replace(
+        base,
+        run_id=f"run-{label}",
+        observation_revisions=(
+            replace(primary_revision, evidence_profile=profile),
+            replace(required_revision, evidence_profile=profile),
+        ),
+    )
+    support = (
+        ActiveSupportEvidence(
+            memory_id=f"mem-{label}",
+            source_id=projection.source_id,
+            reference_id="ref-primary",
+            evidence_unit_id=f"eu-{label}",
+            role=EvidenceRole.PRIMARY,
+            anchor=SourceAnchor(
+                kind=AnchorKind.REVISION_RANGE,
+                observation_id=primary_revision.observation_id,
+                observation_revision_id="rev-primary-previous",
+                range_start=0,
+                range_end=len(primary_content),
+            ),
+            excerpt=primary_text,
+        ),
+        ActiveSupportEvidence(
+            memory_id=f"mem-{label}",
+            source_id=projection.source_id,
+            reference_id="ref-required",
+            evidence_unit_id=f"eu-{label}",
+            role=EvidenceRole.REQUIRED,
+            anchor=SourceAnchor(
+                kind=AnchorKind.REVISION_RANGE,
+                observation_id=required_revision.observation_id,
+                observation_revision_id="rev-required-previous",
+                range_start=0,
+                range_end=len(required_content),
+            ),
+            excerpt=required_text,
+        ),
+    )
+    workset = prepare_support_revalidation_workset(
+        projection,
+        support=support,
+        required_selector_by_reference_id={"ref-required": "r000001"},
+        revision_indexes_by_id={},
+        memory_claim=primary_text,
+    )
+    model_selection = workset.resolve_model_selection(
+        primary_ref=workset.primary_refs[0],
+        required_refs_by_selector={
+            "r000001": workset.required_refs_by_selector["r000001"][0]
+        },
+    )
+    resolved = resolve_revalidated_noop_selection(
+        projection,
+        support=support,
+        access_context_hash=f"access-{label}",
+        current_primary_quote=primary_text,
+        current_required_quotes_by_reference_id={"ref-required": required_text},
+        selected_fragments_by_reference_id=(
+            model_selection.fragments_by_evidence_reference_id
+        ),
+    )
+
+    assert [part.role for part in resolved.parts] == [
+        EvidenceRole.PRIMARY,
+        EvidenceRole.REQUIRED,
+    ]
+    assert {part.anchor.observation_revision_id for part in resolved.parts} == {
+        primary_revision.id,
+        required_revision.id,
+    }
+    assert all(part.anchor.kind is AnchorKind.REVISION_RANGE for part in resolved.parts)
+    assert {part.excerpt for part in resolved.parts} == {primary_text, required_text}
+    assert all(len(part.raw_content_sha256) == 64 for part in resolved.parts)
+
+
+def test_binary_revalidation_preserves_exact_complete_unit_coordinates() -> None:
+    base = _projection(primary_content="", context_content="")
+    revisions = tuple(
+        replace(
+            revision,
+            evidence_profile=BINARY_ARTIFACT_PROFILE,
+            metadata={
+                "source_artifact": {
+                    "inference_eligible": True,
+                    "sha256": character * 64,
+                    "media_type": "image/png",
+                    "size_bytes": 1,
+                }
+            },
+        )
+        for revision, character in zip(
+            base.observation_revisions,
+            ("a", "b"),
+            strict=True,
+        )
+    )
+    projection = replace(base, observation_revisions=revisions)
+    support = tuple(
+        ActiveSupportEvidence(
+            memory_id="mem-binary",
+            source_id=projection.source_id,
+            reference_id=f"ref-{role.value}",
+            evidence_unit_id="eu-binary",
+            role=role,
+            anchor=SourceAnchor(
+                kind=AnchorKind.WHOLE_OBSERVATION,
+                observation_id=revision.observation_id,
+                observation_revision_id=f"{revision.id}-previous",
+            ),
+            excerpt=None,
+            raw_content_sha256=character * 64,
+            presentation_sha256=hashlib.sha256(b"").hexdigest(),
+        )
+        for revision, character, role in zip(
+            revisions,
+            ("a", "b"),
+            (EvidenceRole.PRIMARY, EvidenceRole.REQUIRED),
+            strict=True,
+        )
+    )
+    workset = prepare_support_revalidation_workset(
+        projection,
+        support=support,
+        required_selector_by_reference_id={"ref-required": "r000001"},
+        revision_indexes_by_id={},
+        memory_claim="The current artifacts jointly support the claim.",
+    )
+    model_selection = workset.resolve_model_selection(
+        primary_ref=workset.primary_refs[0],
+        required_refs_by_selector={
+            "r000001": workset.required_refs_by_selector["r000001"][0]
+        },
+    )
+    resolved = resolve_revalidated_noop_selection(
+        projection,
+        support=support,
+        access_context_hash="access-binary",
+        current_primary_quote="",
+        current_required_quotes_by_reference_id={"ref-required": ""},
+        selected_fragments_by_reference_id=(
+            model_selection.fragments_by_evidence_reference_id
+        ),
+    )
+
+    assert [part.role for part in resolved.parts] == [
+        EvidenceRole.PRIMARY,
+        EvidenceRole.REQUIRED,
+    ]
+    assert all(part.anchor.kind is AnchorKind.WHOLE_OBSERVATION for part in resolved.parts)
+    assert all(part.excerpt is None for part in resolved.parts)
 
 
 def test_large_canonical_fragment_fails_with_capacity_error_without_raw_slicing() -> None:
