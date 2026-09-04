@@ -1117,6 +1117,8 @@ async def test_v2_deriver_stages_projection_extraction_v9_without_ingestion_repl
             extract_batch=extract,
             max_concurrent=1,
             extraction_contract_version="projection-extraction-v9",
+            access_context_hash="access-support-v2",
+            inference_capability_hash="inference-support-v2",
         )
     )
     assert len(seen_batches) == 1

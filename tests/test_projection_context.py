@@ -21,6 +21,7 @@ from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_V9
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import (
     CommittedSourceUnitSnapshot,
+    ProjectionEvidencePlanningFailure,
     plan_projection_evidence_work,
     plan_projection_extraction_batches,
 )
@@ -839,6 +840,48 @@ def test_v9_rejects_one_structural_unit_larger_than_the_batch_budget() -> None:
             max_primary_chars=500,
             extraction_contract_version=PROJECTION_EXTRACTION_V9,
         )
+
+
+def test_v9_incremental_oversized_structure_returns_typed_planning_failure() -> None:
+    initial_body = "# Decision\n\n```text\nsmall\n```\n"
+    target_body = "# Decision\n\n```text\n" + ("x" * 90_000) + "\n```\n"
+    initial = _confluence_projection(initial_body)
+    target_item = ContentItem(
+        item_id="confluence-42",
+        title="Large design",
+        source_url="https://confluence.example.test/pages/42",
+        last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        version="8",
+        extra={"page_id": "42", "space_key": "ENG"},
+    )
+    target = project_source_item(
+        source_id="src-c",
+        source_type="confluence",
+        run_id="run-c-oversized-incremental",
+        item=target_item,
+        raw=RawContent(
+            item=target_item,
+            body=target_body.encode(),
+            content_type="text/html",
+        ),
+        normalized=NormalizedContent(item=target_item, markdown_body=target_body),
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in initial.observation_revisions
+        },
+    )
+
+    result = plan_projection_evidence_work(
+        target,
+        committed_base_snapshot=_committed_snapshot(initial),
+        reprocess_all_current_observations=False,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+
+    assert isinstance(result, ProjectionEvidencePlanningFailure)
+    assert result.code.value == "STRUCTURAL_UNIT_TOO_LARGE"
+    assert result.representation_profile == "markdown-structural"
 
 
 def test_v9_structure_planning_keeps_commonmark_protectors_complete() -> None:

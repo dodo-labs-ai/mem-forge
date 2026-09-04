@@ -48,6 +48,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
     LifecyclePlan,
     ProjectedLifecycleDeferredError,
+    AuthorityPlanStaleError,
     ProjectedSupportInvariantError,
     ReconciliationScope,
 )
@@ -805,6 +806,7 @@ class MemoryEngine:
         document: DocumentRecord | None = None,
         derivation_id: str | None = None,
         derivation_reprocess_all_current_observations: bool = False,
+        derivation_reprocess_operation_id: str | None = None,
         expected_source_activity_epoch: int | None = None,
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
         lifecycle_execution_owner_id: str | None = None,
@@ -833,6 +835,9 @@ class MemoryEngine:
                 derivation_reprocess_all_current_observations=(
                     derivation_reprocess_all_current_observations
                 ),
+                derivation_reprocess_operation_id=(
+                    derivation_reprocess_operation_id
+                ),
                 expected_source_activity_epoch=expected_source_activity_epoch,
                 current_changed_ranges=current_changed_ranges,
                 lifecycle_execution_owner_id=lifecycle_execution_owner_id,
@@ -849,12 +854,16 @@ class MemoryEngine:
             ):
                 raise
             delta = projection.deltas[0]
-            reason_code = {
+            reason_code = (
+                "authority_plan_stale"
+                if isinstance(exc, AuthorityPlanStaleError)
+                else {
                 "candidate_admission": "candidate_admission_failed",
                 "reconciliation": "reconciliation_failed",
                 "plan_construction": "lifecycle_plan_construction_failed",
                 "lifecycle_commit": "lifecycle_commit_failed",
-            }.get(runtime_context.stage, "lifecycle_execution_failed")
+                }.get(runtime_context.stage, "lifecycle_execution_failed")
+            )
             bundle = bind_source_lifecycle_outcome(
                 source_id=projection.source_id,
                 source_type=projection.source_type,
@@ -1126,7 +1135,11 @@ class MemoryEngine:
                 plan,
                 lifecycle_attempt_count=lifecycle_attempt_count,
                 outcome="failed",
-                reason_code="lifecycle_commit_failed",
+                reason_code=(
+                    "authority_plan_stale"
+                    if isinstance(exc, AuthorityPlanStaleError)
+                    else "lifecycle_commit_failed"
+                ),
             )
             assert failure_bundle is not None
             raise SourceUnitLifecycleExecutionError(
@@ -1251,6 +1264,7 @@ class MemoryEngine:
         document: DocumentRecord | None = None,
         derivation_id: str | None = None,
         derivation_reprocess_all_current_observations: bool = False,
+        derivation_reprocess_operation_id: str | None = None,
         expected_source_activity_epoch: int | None = None,
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
         lifecycle_execution_owner_id: str | None = None,
@@ -1763,6 +1777,9 @@ class MemoryEngine:
                     current_changed_ranges=current_changed_ranges,
                     reprocess_all_current_observations=(
                         derivation_reprocess_all_current_observations
+                    ),
+                    reprocess_operation_id=(
+                        derivation_reprocess_operation_id
                     ),
                 )
             )

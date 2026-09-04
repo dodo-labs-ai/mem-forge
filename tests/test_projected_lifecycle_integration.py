@@ -54,6 +54,7 @@ from memforge.memory.evidence import (
     SupportScopeVersion,
 )
 from memforge.memory.lifecycle_plan import (
+    AuthorityPlanStaleError,
     CoverageProof,
     CutoverFindingReason,
     CutoverFindingStatus,
@@ -2291,6 +2292,35 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
             access_context_hash="workspace-eng",
         ),
     )
+
+    # Another writer advancing the Unit after planning must not be hidden by
+    # record_source_projection() advancing it to the target before validation.
+    concurrent = _projection(
+        run_id="projection-derivation-atomic-concurrent",
+        body="A7 was removed by another writer.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    await db.record_source_projection(concurrent)
+    with pytest.raises(AuthorityPlanStaleError, match="authority plan is stale"):
+        await db.apply_source_projection_lifecycle(
+            second,
+            plan,
+            document=staged_document,
+            derivation_id=attempt.id,
+            derivation_context_identity_hash=(attempt.context_identity_hash),
+        )
+    await db.db.execute(
+        "UPDATE source_units SET current_revision_id = ? WHERE id = ?",
+        (
+            first.source_unit_revisions[0].id,
+            first.source_units[0].id,
+        ),
+    )
+    await db.db.commit()
 
     with pytest.raises(
         ValueError,

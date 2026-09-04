@@ -135,6 +135,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
     LifecycleMutationType,
     LifecyclePlan,
+    AuthorityPlanStaleError,
     ProjectedSupportInvariantError,
     ProjectedLifecycleBlocker,
     ProjectedLifecycleDeferredError,
@@ -1150,6 +1151,7 @@ CREATE TABLE IF NOT EXISTS source_derivation_attempts (
         status IN ('pending', 'retryable_failure', 'completed', 'applied', 'superseded')
     ),
     terminal_reason_code        TEXT,
+    authority_plan_identity_json TEXT,
     created_at                  TEXT NOT NULL,
     updated_at                  TEXT NOT NULL,
     completed_at                TEXT,
@@ -4296,6 +4298,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "Persist local-agent retry due time",
         ["ALTER TABLE local_agent_jobs ADD COLUMN next_attempt_at TEXT"],
     ),
+    (
+        92,
+        "Persist Source derivation authority-plan identity",
+        [
+            "ALTER TABLE source_derivation_attempts ADD COLUMN authority_plan_identity_json TEXT",
+        ],
+    ),
 ]
 
 
@@ -5978,6 +5987,15 @@ class Database:
             sort_keys=True,
             separators=(",", ":"),
         )
+        authority_plan_identity_json = (
+            json.dumps(
+                manifest.authority_plan_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if manifest.authority_plan_identity is not None
+            else None
+        )
         now = _now_iso()
         initial_status = SOURCE_DERIVATION_COMPLETED if not manifest.batches else SOURCE_DERIVATION_PENDING
         async with self._write_lock:
@@ -5998,8 +6016,9 @@ class Database:
                             context_payload_hash, context_identity_hash,
                             extraction_contract_version, status,
                             created_at, updated_at, completed_at, applied_at,
-                            terminal_reason_code
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
+                            terminal_reason_code,
+                            authority_plan_identity_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
                         (
                             manifest.id,
                             manifest.source_id,
@@ -6018,6 +6037,7 @@ class Database:
                             now,
                             now if initial_status == SOURCE_DERIVATION_COMPLETED else None,
                             manifest.terminal_reason_code,
+                            authority_plan_identity_json,
                         ),
                     )
                     for batch in manifest.batches:
@@ -6052,6 +6072,9 @@ class Database:
                         "context_identity_hash": (manifest.context_identity_hash),
                         "extraction_contract_version": (manifest.extraction_contract_version),
                         "terminal_reason_code": manifest.terminal_reason_code,
+                        "authority_plan_identity_json": (
+                            authority_plan_identity_json
+                        ),
                     }
                     mismatched_columns = tuple(
                         column for column, value in immutable_values.items() if existing[column] != value
@@ -6417,6 +6440,11 @@ class Database:
             terminal_reason_code=(
                 str(row["terminal_reason_code"])
                 if row["terminal_reason_code"] is not None
+                else None
+            ),
+            authority_plan_identity=(
+                json.loads(row["authority_plan_identity_json"])
+                if row["authority_plan_identity_json"] is not None
                 else None
             ),
             batches=tuple(batches),
@@ -10372,6 +10400,7 @@ class Database:
                         raise ValueError("Source derivation lifecycle commit requires its context identity")
                     async with self.db.execute(
                         """SELECT source_id, source_unit_id,
+                                  base_unit_revision_id,
                                   target_unit_revision_id, status,
                                   projection_identity_hash,
                                   context_payload_json,
@@ -10407,6 +10436,20 @@ class Database:
                         staged_context.document
                     ) != source_derivation_document_identity_hash(document):
                         raise ValueError("Source derivation Document identity mismatch")
+                    async with self.db.execute(
+                        "SELECT current_revision_id FROM source_units WHERE id = ?",
+                        (delta.source_unit_id,),
+                    ) as cursor:
+                        current_unit = await cursor.fetchone()
+                    current_revision_id = (
+                        current_unit["current_revision_id"]
+                        if current_unit is not None
+                        else None
+                    )
+                    if current_revision_id != derivation["base_unit_revision_id"]:
+                        raise AuthorityPlanStaleError(
+                            "authority plan is stale: Source Unit base revision changed"
+                        )
                 if document is not None:
                     await self._assert_document_source_writable_unlocked(
                         document.source,

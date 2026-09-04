@@ -1791,6 +1791,7 @@ class GeneSyncOrchestrator:
             derivation_reprocess_all_current_observations=(
                 context.reprocess_all_current_observations
             ),
+            derivation_reprocess_operation_id=context.reprocess_operation_id,
             expected_source_activity_epoch=source_activity_epoch,
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
             lifecycle_attempt_count=1,
@@ -2554,6 +2555,7 @@ class GeneSyncOrchestrator:
             source_activity_epoch=expected_source_activity_epoch,
             current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
             reprocess_all_current_observations=force_reprocess,
+            reprocess_operation_id=(run_id if force_reprocess else None),
         )
         # Extraction owns the only document-content model call. Historical
         # cross-document/cross-source discovery remains post-commit Relation
@@ -2626,6 +2628,9 @@ class GeneSyncOrchestrator:
             derivation_id=extraction_result.derivation_id,
             derivation_reprocess_all_current_observations=(
                 derivation_context.reprocess_all_current_observations
+            ),
+            derivation_reprocess_operation_id=(
+                derivation_context.reprocess_operation_id
             ),
             expected_source_activity_epoch=expected_source_activity_epoch,
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
@@ -2974,53 +2979,12 @@ class GeneSyncOrchestrator:
             repo_identifier=derivation_context.repo_identifier,
         )
         inference_capability_hash = projection_inference_capability_hash()
-        delta = projection.deltas[0]
-        committed_base_snapshot = None
-        if derivation_context.reprocess_all_current_observations:
-            committed_base_unit_revision = (
-                await self.db.get_current_source_unit_revision(
-                    delta.source_unit_id
-                )
-            )
-            committed_base_observation_revisions = (
-                await self.db.get_current_source_observation_revisions(
-                    delta.source_unit_id
-                )
-            )
-            if committed_base_unit_revision is not None:
-                committed_base_snapshot = CommittedSourceUnitSnapshot(
-                    unit_revision=committed_base_unit_revision,
-                    observation_revisions=tuple(
-                        committed_base_observation_revisions.values()
-                    ),
-                )
-        elif delta.previous_unit_revision_id is not None:
-            committed_base_unit_revision = (
-                await self.db.get_current_source_unit_revision(
-                    delta.source_unit_id
-                )
-            )
-            if (
-                committed_base_unit_revision is None
-                or committed_base_unit_revision.id
-                != delta.previous_unit_revision_id
-            ):
-                # Let the shared planner persist a typed, fail-closed outcome.
-                # Raising here would turn a deterministic snapshot race into
-                # document-level retries without any durable diagnostic.
-                committed_base_snapshot = None
-            else:
-                committed_base_observation_revisions = (
-                    await self.db.get_current_source_observation_revisions(
-                        delta.source_unit_id
-                    )
-                )
-                committed_base_snapshot = CommittedSourceUnitSnapshot(
-                    unit_revision=committed_base_unit_revision,
-                    observation_revisions=tuple(
-                        committed_base_observation_revisions.values()
-                    ),
-                )
+        committed_base_snapshot = await self._committed_base_snapshot_for(
+            projection,
+            reprocess_all_current_observations=(
+                derivation_context.reprocess_all_current_observations
+            ),
+        )
 
         async def extract_one(batch):
             if isinstance(batch, DiffGuidedExtractionBatch):
@@ -3147,6 +3111,42 @@ class GeneSyncOrchestrator:
             ),
         }
         return result.extraction
+
+    async def _committed_base_snapshot_for(
+        self,
+        projection: SourceProjection,
+        *,
+        reprocess_all_current_observations: bool,
+    ) -> CommittedSourceUnitSnapshot | None:
+        """Load one complete committed base; the planner owns mismatch policy."""
+
+        delta = projection.deltas[0]
+        if (
+            delta.previous_unit_revision_id is None
+            and not reprocess_all_current_observations
+        ):
+            return None
+        unit_revision = await self.db.get_current_source_unit_revision(
+            delta.source_unit_id
+        )
+        if unit_revision is None:
+            return None
+        if (
+            not reprocess_all_current_observations
+            and unit_revision.id != delta.previous_unit_revision_id
+        ):
+            # The planner persists the typed mismatch instead of turning a
+            # deterministic snapshot race into document-level retries.
+            return None
+        observation_revisions = (
+            await self.db.get_current_source_observation_revisions(
+                delta.source_unit_id
+            )
+        )
+        return CommittedSourceUnitSnapshot(
+            unit_revision=unit_revision,
+            observation_revisions=tuple(observation_revisions.values()),
+        )
 
     def _projection_images(
         self,

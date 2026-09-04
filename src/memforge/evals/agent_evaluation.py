@@ -89,6 +89,8 @@ class QualitySignal:
     json_error_column: int | None = None
     candidate_count: int | None = None
     rejected_count: int | None = None
+    mutation_count: int | None = None
+    model_call_count: int | None = None
     occurrence_count: int = 1
 
     def __post_init__(self) -> None:
@@ -139,6 +141,8 @@ class QualitySignal:
             "json_error_column",
             "candidate_count",
             "rejected_count",
+            "mutation_count",
+            "model_call_count",
         ):
             value = getattr(self, name)
             if value is not None and value < 0:
@@ -762,6 +766,7 @@ def bind_quality_signals(
     batch_id: str,
     batch_attempt: int,
     extraction_contract_version: str,
+    base_unit_revision_id: str | None = None,
     occurred_at: datetime | None = None,
     deployment_revision: str | None = None,
     trace_context: RuntimeTraceContext | None = None,
@@ -784,17 +789,20 @@ def bind_quality_signals(
         span_id="0" * 16,
         trace_flags=None,
     )
+    operation_identity = {
+        "source_id": source_id,
+        "source_unit_id": source_unit_id,
+        "target_unit_revision_id": target_unit_revision_id,
+        "projection_run_id": projection_run_id,
+        "derivation_id": derivation_id,
+        "batch_id": batch_id,
+        "contract_version": extraction_contract_version,
+    }
+    if base_unit_revision_id is not None:
+        operation_identity["base_unit_revision_id"] = base_unit_revision_id
     operation_input_hash = hashlib.sha256(
         json.dumps(
-            {
-                "source_id": source_id,
-                "source_unit_id": source_unit_id,
-                "target_unit_revision_id": target_unit_revision_id,
-                "projection_run_id": projection_run_id,
-                "derivation_id": derivation_id,
-                "batch_id": batch_id,
-                "contract_version": extraction_contract_version,
-            },
+            operation_identity,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -822,13 +830,17 @@ def bind_quality_signals(
             revision_id = observation_revision_ids.get(signal.observation_id)
             if revision_id is not None:
                 signal = replace(signal, observation_revision_id=revision_id)
+        signal_identity = asdict(signal)
+        for optional_count in ("mutation_count", "model_call_count"):
+            if signal_identity[optional_count] is None:
+                signal_identity.pop(optional_count)
         identity = {
             "schema_version": AGENT_RUNTIME_EVENT_SCHEMA_VERSION,
             "derivation_id": derivation_id,
             "batch_id": batch_id,
             "batch_attempt": batch_attempt,
             "index": index,
-            "signal": asdict(signal),
+            "signal": signal_identity,
         }
         digest = hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -864,6 +876,7 @@ def bind_quality_signals(
                 source_type=source_type,
                 doc_id=doc_id,
                 source_unit_id=source_unit_id,
+                base_unit_revision_id=base_unit_revision_id,
                 target_unit_revision_id=target_unit_revision_id,
                 projection_run_id=projection_run_id,
                 derivation_id=derivation_id,
@@ -1066,6 +1079,11 @@ def evaluate_runtime_events(
 def _deterministic_assessment_decision(
     event: AgentRuntimeEvent,
 ) -> tuple[str, AgentAssessmentLabel] | None:
+    if event.event_name == "evidence_authority_planning":
+        return (
+            "evidence_authority_planning",
+            "fail" if event.outcome == "failed" else "pass",
+        )
     if event.event_name == "source_unit_lifecycle_outcome":
         return (
             "source_unit_lifecycle_completion",

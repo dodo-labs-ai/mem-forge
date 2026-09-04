@@ -3196,6 +3196,9 @@ class NoopMemoryEngine:
                             "derivation_reprocess_all_current_observations",
                             False,
                         ),
+                        reprocess_operation_id=kwargs.get(
+                            "derivation_reprocess_operation_id"
+                        ),
                     )
                 )
                 if kwargs.get("derivation_id") is not None

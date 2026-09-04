@@ -26,6 +26,7 @@ from memforge.source_artifacts import (
     source_artifact_inference_eligibility,
 )
 from memforge.source_projection import (
+    RevisionDelta,
     SourceObservationRevision,
     SourceProjection,
     SourceUnitRevision,
@@ -69,7 +70,10 @@ class ProjectionEvidencePlanningFailureCode(str, Enum):
     INCREMENTAL_BASE_UNAVAILABLE = "INCREMENTAL_BASE_UNAVAILABLE"
     INCREMENTAL_AUTHORITY_UNMAPPABLE = "INCREMENTAL_AUTHORITY_UNMAPPABLE"
     CANONICAL_FIELD_MAPPING_INVALID = "CANONICAL_FIELD_MAPPING_INVALID"
+    EVIDENCE_WORK_IDENTITY_INCOMPLETE = "EVIDENCE_WORK_IDENTITY_INCOMPLETE"
     REPRESENTATION_PROFILE_UNSUPPORTED = "REPRESENTATION_PROFILE_UNSUPPORTED"
+    REPROCESS_AUTHORIZATION_MISSING = "REPROCESS_AUTHORIZATION_MISSING"
+    STRUCTURAL_UNIT_TOO_LARGE = "STRUCTURAL_UNIT_TOO_LARGE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,23 +125,41 @@ def plan_projection_evidence_work(
     """
 
     contract = projection_extraction_contract(extraction_contract_version)
+    delta = projection.deltas[0]
+    revisions = {
+        revision.observation_id: revision
+        for revision in projection.observation_revisions
+    }
     selected_primary_ids = (
         tuple(observation.id for observation in projection.observations)
         if reprocess_all_current_observations
         else None
     )
     if not contract.uses_fragment_catalog or reprocess_all_current_observations:
-        return plan_projection_extraction_batches(
+        if not contract.uses_fragment_catalog:
+            return plan_projection_extraction_batches(
+                projection,
+                primary_observation_ids=selected_primary_ids,
+                extraction_contract_version=extraction_contract_version,
+            )
+        if (
+            delta.previous_unit_revision_id is not None
+            and (
+                committed_base_snapshot is None
+                or committed_base_snapshot.unit_revision.id
+                != delta.previous_unit_revision_id
+                or committed_base_snapshot.unit_revision.source_unit_id
+                != delta.source_unit_id
+            )
+        ):
+            return _incremental_base_failure(delta, revisions)
+        return _plan_projection_extraction_batches_or_failure(
             projection,
             primary_observation_ids=selected_primary_ids,
+            primary_authority_ranges_by_observation_id=None,
             extraction_contract_version=extraction_contract_version,
         )
 
-    delta = projection.deltas[0]
-    revisions = {
-        revision.observation_id: revision
-        for revision in projection.observation_revisions
-    }
     if delta.previous_unit_revision_id is None:
         tombstoned_ranges: dict[str, tuple[tuple[int, int], ...]] = {}
         for observation_id in delta.added_observation_ids:
@@ -167,7 +189,7 @@ def plan_projection_evidence_work(
                 )
             if tombstoned:
                 tombstoned_ranges[observation_id] = ()
-        return plan_projection_extraction_batches(
+        return _plan_projection_extraction_batches_or_failure(
             projection,
             primary_authority_ranges_by_observation_id=(
                 tombstoned_ranges if tombstoned_ranges else None
@@ -184,31 +206,7 @@ def plan_projection_evidence_work(
         or committed_base_snapshot.unit_revision.source_unit_id
         != delta.source_unit_id
     ):
-        first_changed = next(iter(delta.changed_anchors), None)
-        target_revision = (
-            revisions.get(first_changed.observation_id)
-            if first_changed is not None
-            else None
-        )
-        return ProjectionEvidencePlanningFailure(
-            code=(
-                ProjectionEvidencePlanningFailureCode.INCREMENTAL_BASE_UNAVAILABLE
-            ),
-            observation_id=(
-                target_revision.observation_id
-                if target_revision is not None
-                else None
-            ),
-            observation_revision_id=(
-                target_revision.id if target_revision is not None else None
-            ),
-            representation_profile=(
-                target_revision.evidence_profile.name
-                if target_revision is not None
-                and target_revision.evidence_profile is not None
-                else None
-            ),
-        )
+        return _incremental_base_failure(delta, revisions)
     base_revisions = committed_base_snapshot.revisions_by_observation_id
     for anchor in delta.changed_anchors:
         if anchor.observation_id in added_ids:
@@ -321,10 +319,82 @@ def plan_projection_evidence_work(
             )
         exact_authority_ranges[anchor.observation_id] = mapped_ranges
 
-    return plan_projection_extraction_batches(
+    return _plan_projection_extraction_batches_or_failure(
         projection,
         primary_authority_ranges_by_observation_id=exact_authority_ranges,
         extraction_contract_version=extraction_contract_version,
+    )
+
+
+def _plan_projection_extraction_batches_or_failure(
+    projection: SourceProjection,
+    *,
+    primary_observation_ids: tuple[str, ...] | None = None,
+    primary_authority_ranges_by_observation_id: Mapping[
+        str, tuple[tuple[int, int], ...]
+    ]
+    | None,
+    extraction_contract_version: str,
+) -> tuple[ProjectionExtractionBatch, ...] | ProjectionEvidencePlanningFailure:
+    """Keep deterministic presentation limits inside the typed planner contract."""
+
+    try:
+        return plan_projection_extraction_batches(
+            projection,
+            primary_observation_ids=primary_observation_ids,
+            primary_authority_ranges_by_observation_id=(
+                primary_authority_ranges_by_observation_id
+            ),
+            extraction_contract_version=extraction_contract_version,
+        )
+    except StructuralUnitTooLargeError as exc:
+        revision = next(
+            (
+                candidate
+                for candidate in projection.observation_revisions
+                if candidate.id == exc.revision_id
+            ),
+            None,
+        )
+        return ProjectionEvidencePlanningFailure(
+            code=ProjectionEvidencePlanningFailureCode.STRUCTURAL_UNIT_TOO_LARGE,
+            observation_id=(revision.observation_id if revision is not None else None),
+            observation_revision_id=exc.revision_id,
+            representation_profile=(
+                revision.evidence_profile.name
+                if revision is not None and revision.evidence_profile is not None
+                else None
+            ),
+            changed_structure_count=1,
+        )
+
+
+def _incremental_base_failure(
+    delta: RevisionDelta,
+    revisions: Mapping[str, SourceObservationRevision],
+) -> ProjectionEvidencePlanningFailure:
+    first_changed = next(iter(delta.changed_anchors), None)
+    target_revision = (
+        revisions.get(first_changed.observation_id)
+        if first_changed is not None
+        else None
+    )
+    return ProjectionEvidencePlanningFailure(
+        code=ProjectionEvidencePlanningFailureCode.INCREMENTAL_BASE_UNAVAILABLE,
+        observation_id=(
+            target_revision.observation_id
+            if target_revision is not None
+            else None
+        ),
+        observation_revision_id=(
+            target_revision.id if target_revision is not None else None
+        ),
+        representation_profile=(
+            target_revision.evidence_profile.name
+            if target_revision is not None
+            and target_revision.evidence_profile is not None
+            else None
+        ),
     )
 
 
