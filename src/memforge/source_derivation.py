@@ -50,7 +50,9 @@ from memforge.pipeline.document_units import (
 )
 from memforge.pipeline.projection_context import (
     CommittedSourceUnitSnapshot,
+    PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
     ProjectionEvidencePlanningFailure,
+    ProjectionEvidencePlanningFailureCode,
     ProjectionExtractionBatch,
     observation_is_inference_eligible,
     plan_projection_evidence_work,
@@ -151,6 +153,7 @@ class SourceDerivationManifest:
     extraction_contract_version: str
     batches: tuple[SourceDerivationBatchManifest, ...]
     terminal_reason_code: str | None = None
+    authority_plan_identity: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +185,7 @@ class SourceDerivationAttempt:
     extraction_contract_version: str
     status: str
     terminal_reason_code: str | None
+    authority_plan_identity: Mapping[str, object] | None
     batches: tuple[SourceDerivationBatchRecord, ...]
     created_at: str
     updated_at: str
@@ -203,6 +207,7 @@ class SourceUnitDerivationContext:
     source_activity_epoch: int | None
     current_changed_ranges: tuple[tuple[int, int], ...] = ()
     reprocess_all_current_observations: bool = False
+    reprocess_operation_id: str | None = None
     work_strategy: Literal["auto", "structural"] = "auto"
 
 
@@ -294,6 +299,138 @@ class SourceUnitDerivationResult:
     executed_batch_count: int
 
 
+def _plan_source_unit_derivation_work(
+    request: SourceUnitDerivationRequest,
+    *,
+    legacy_planner: Callable[
+        [SourceProjection, SourceUnitDerivationContext],
+        tuple[SourceDerivationBatch, ...],
+    ],
+) -> tuple[SourceDerivationBatch, ...] | ProjectionEvidencePlanningFailure:
+    """Select the active planner once for production and offline replay."""
+
+    contract = projection_extraction_contract(
+        request.extraction_contract_version
+    )
+    if not contract.uses_fragment_catalog:
+        return legacy_planner(request.projection, request.context)
+    if not request.access_context_hash or not request.inference_capability_hash:
+        return ProjectionEvidencePlanningFailure(
+            code=(
+                ProjectionEvidencePlanningFailureCode.EVIDENCE_WORK_IDENTITY_INCOMPLETE
+            ),
+            observation_id=None,
+            observation_revision_id=None,
+            representation_profile=None,
+        )
+    if (
+        request.context.reprocess_all_current_observations
+        and not request.context.reprocess_operation_id
+    ):
+        return ProjectionEvidencePlanningFailure(
+            code=(
+                ProjectionEvidencePlanningFailureCode.REPROCESS_AUTHORIZATION_MISSING
+            ),
+            observation_id=None,
+            observation_revision_id=None,
+            representation_profile=None,
+        )
+    return plan_projection_evidence_work(
+        request.projection,
+        committed_base_snapshot=request.committed_base_snapshot,
+        reprocess_all_current_observations=(
+            request.context.reprocess_all_current_observations
+        ),
+        extraction_contract_version=request.extraction_contract_version,
+    )
+
+
+def _planning_failure_extraction(
+    failure: ProjectionEvidencePlanningFailure,
+    *,
+    offline_replay: bool = False,
+) -> MemoryExtractionResult:
+    metadata: dict[str, object] = {
+        "safe_error_code": failure.code.value,
+        "llm_invoked": False,
+        "lifecycle_mutation_skipped": True,
+        "representation_profile": failure.representation_profile,
+    }
+    if offline_replay:
+        metadata["offline_replay"] = True
+    return MemoryExtractionResult(
+        error_type="evidence_authority_planning_failed",
+        error="Evidence authority planning failed closed.",
+        metadata=metadata,
+    )
+
+
+def _authority_plan_identity(
+    request: SourceUnitDerivationRequest,
+) -> Mapping[str, object] | None:
+    if not projection_extraction_contract(
+        request.extraction_contract_version
+    ).uses_fragment_catalog:
+        return None
+    delta = request.projection.deltas[0]
+    transition = (
+        "reprocess"
+        if request.context.reprocess_all_current_observations
+        else (
+            "initial"
+            if delta.previous_unit_revision_id is None
+            else "incremental"
+        )
+    )
+    profiles = []
+    for revision in sorted(
+        request.projection.observation_revisions,
+        key=lambda item: (item.observation_id, item.id),
+    ):
+        profile = revision.evidence_profile
+        profiles.append(
+            {
+                "observation_id": revision.observation_id,
+                "name": profile.name if profile is not None else None,
+                "version": profile.version if profile is not None else None,
+                "coordinate_space": (
+                    profile.coordinate_space.value
+                    if profile is not None
+                    else None
+                ),
+                "schema_name": profile.schema_name if profile is not None else None,
+                "schema_version": (
+                    profile.schema_version if profile is not None else None
+                ),
+            }
+        )
+    return {
+        "transition": transition,
+        "base_unit_revision_id": _authority_base_unit_revision_id(request),
+        "target_unit_revision_id": delta.current_unit_revision_id,
+        "representation_profiles": profiles,
+        "access_context_hash": request.access_context_hash,
+        "source_activity_epoch": request.context.source_activity_epoch,
+        "inference_capability_hash": request.inference_capability_hash,
+        "authority_policy_version": (
+            PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
+        ),
+        "extraction_contract_version": request.extraction_contract_version,
+        "reprocess_operation_id": request.context.reprocess_operation_id,
+    }
+
+
+def _authority_base_unit_revision_id(
+    request: SourceUnitDerivationRequest,
+) -> str | None:
+    if (
+        request.context.reprocess_all_current_observations
+        and request.committed_base_snapshot is not None
+    ):
+        return request.committed_base_snapshot.unit_revision.id
+    return request.projection.deltas[0].previous_unit_revision_id
+
+
 class SourceUnitDeriver:
     """Own durable, idempotent derivation for one immutable Source Unit target."""
 
@@ -320,23 +457,20 @@ class SourceUnitDeriver:
         self,
         request: SourceUnitDerivationRequest,
     ) -> SourceUnitDerivationResult:
-        planned_work = (
-            plan_projection_evidence_work(
-                request.projection,
-                committed_base_snapshot=request.committed_base_snapshot,
-                reprocess_all_current_observations=(
-                    request.context.reprocess_all_current_observations
-                ),
-                extraction_contract_version=request.extraction_contract_version,
-            )
-            if projection_extraction_contract(
-                request.extraction_contract_version
-            ).uses_fragment_catalog
-            else self._plan_work(request.projection, request.context)
+        planned_work = _plan_source_unit_derivation_work(
+            request,
+            legacy_planner=self._plan_work,
         )
-        evidence_work_identity_hash = _evidence_work_identity_hash(
-            access_context_hash=request.access_context_hash,
-            inference_capability_hash=request.inference_capability_hash,
+        authority_plan_identity = _authority_plan_identity(request)
+        evidence_work_identity_hash = (
+            None
+            if isinstance(planned_work, ProjectionEvidencePlanningFailure)
+            and planned_work.code
+            is ProjectionEvidencePlanningFailureCode.EVIDENCE_WORK_IDENTITY_INCOMPLETE
+            else _evidence_work_identity_hash(
+                access_context_hash=request.access_context_hash,
+                inference_capability_hash=request.inference_capability_hash,
+            )
         )
         if isinstance(planned_work, ProjectionEvidencePlanningFailure):
             manifest = source_derivation_manifest(
@@ -346,6 +480,10 @@ class SourceUnitDeriver:
                 extraction_contract_version=request.extraction_contract_version,
                 terminal_reason_code=planned_work.code.value,
                 evidence_work_identity_hash=evidence_work_identity_hash,
+                authority_plan_identity=authority_plan_identity,
+                committed_base_unit_revision_id=(
+                    _authority_base_unit_revision_id(request)
+                ),
             )
             revision_by_observation = {
                 revision.observation_id: revision.id
@@ -358,6 +496,13 @@ class SourceUnitDeriver:
                         outcome="failed",
                         reason_code=planned_work.code.value,
                         error_code=planned_work.code.value,
+                        operation=(
+                            str(authority_plan_identity["transition"])
+                            if authority_plan_identity is not None
+                            else None
+                        ),
+                        model_call_count=0,
+                        mutation_count=0,
                         candidate_count=planned_work.authorized_structure_count,
                         rejected_count=planned_work.changed_structure_count,
                         observation_id=planned_work.observation_id,
@@ -376,6 +521,7 @@ class SourceUnitDeriver:
                 batch_id="authority-planning",
                 batch_attempt=1,
                 extraction_contract_version=request.extraction_contract_version,
+                base_unit_revision_id=manifest.base_unit_revision_id,
                 occurred_at=datetime.now().astimezone(),
                 deployment_revision=current_deployment_revision(),
                 observation_revision_ids=revision_by_observation,
@@ -394,18 +540,7 @@ class SourceUnitDeriver:
             )
             return SourceUnitDerivationResult(
                 derivation=derivation,
-                extraction=MemoryExtractionResult(
-                    error_type="evidence_authority_planning_failed",
-                    error="Evidence authority planning failed closed.",
-                    metadata={
-                        "safe_error_code": planned_work.code.value,
-                        "llm_invoked": False,
-                        "lifecycle_mutation_skipped": True,
-                        "representation_profile": (
-                            planned_work.representation_profile
-                        ),
-                    },
-                ),
+                extraction=_planning_failure_extraction(planned_work),
                 reused_batch_count=0,
                 executed_batch_count=0,
             )
@@ -416,6 +551,10 @@ class SourceUnitDeriver:
             context=request.context,
             extraction_contract_version=request.extraction_contract_version,
             evidence_work_identity_hash=evidence_work_identity_hash,
+            authority_plan_identity=authority_plan_identity,
+            committed_base_unit_revision_id=(
+                _authority_base_unit_revision_id(request)
+            ),
         )
         derivation = await self._store.stage_source_derivation(manifest)
         completed_results = await self._store.get_completed_source_derivation_batch_results(
@@ -596,30 +735,14 @@ async def replay_source_unit_derivation(
     events, or write Source/Memory lifecycle state.
     """
 
-    planned_work = (
-        plan_projection_evidence_work(
-            request.projection,
-            committed_base_snapshot=request.committed_base_snapshot,
-            reprocess_all_current_observations=(
-                request.context.reprocess_all_current_observations
-            ),
-            extraction_contract_version=request.extraction_contract_version,
-        )
-        if projection_extraction_contract(
-            request.extraction_contract_version
-        ).uses_fragment_catalog
-        else plan_source_derivation_work(request.projection, request.context)
+    planned_work = _plan_source_unit_derivation_work(
+        request,
+        legacy_planner=plan_source_derivation_work,
     )
     if isinstance(planned_work, ProjectionEvidencePlanningFailure):
-        return MemoryExtractionResult(
-            error_type="evidence_authority_planning_failed",
-            error="Evidence authority planning failed closed.",
-            metadata={
-                "safe_error_code": planned_work.code.value,
-                "offline_replay": True,
-                "llm_invoked": False,
-                "lifecycle_mutation_skipped": True,
-            },
+        return _planning_failure_extraction(
+            planned_work,
+            offline_replay=True,
         )
     batches = planned_work
     results = await collect_bounded(
@@ -810,12 +933,19 @@ def source_derivation_manifest(
     extraction_contract_version: str = SOURCE_DERIVATION_CONTRACT_VERSION,
     terminal_reason_code: str | None = None,
     evidence_work_identity_hash: str | None = None,
+    authority_plan_identity: Mapping[str, object] | None = None,
+    committed_base_unit_revision_id: str | None = None,
 ) -> SourceDerivationManifest:
     """Build one stable manifest for an immutable target Source Unit revision."""
 
     if len(projection.deltas) != 1 or len(projection.source_unit_revisions) != 1:
         raise ValueError("Source derivation requires exactly one Source Unit revision")
     delta = projection.deltas[0]
+    resolved_base_unit_revision_id = (
+        committed_base_unit_revision_id
+        if committed_base_unit_revision_id is not None
+        else delta.previous_unit_revision_id
+    )
     target_revision_id = delta.current_unit_revision_id
     if not target_revision_id:
         raise ValueError("Source derivation requires a target Source Unit revision")
@@ -844,7 +974,7 @@ def source_derivation_manifest(
     identity_payload = {
         "source_id": projection.source_id,
         "source_unit_id": delta.source_unit_id,
-        "base_unit_revision_id": delta.previous_unit_revision_id,
+        "base_unit_revision_id": resolved_base_unit_revision_id,
         "target_unit_revision_id": target_revision_id,
         "projection_identity_hash": projection_identity_hash,
         "context_identity_hash": context_identity_hash,
@@ -852,13 +982,14 @@ def source_derivation_manifest(
         "batch_input_hashes": [item.input_payload_hash for item in manifest_batches],
         "terminal_reason_code": terminal_reason_code,
         "evidence_work_identity_hash": evidence_work_identity_hash,
+        "authority_plan_identity": authority_plan_identity,
     }
     derivation_id = "sdrv-" + hashlib.sha256(_canonical_json(identity_payload).encode("utf-8")).hexdigest()[:32]
     return SourceDerivationManifest(
         id=derivation_id,
         source_id=projection.source_id,
         source_unit_id=delta.source_unit_id,
-        base_unit_revision_id=delta.previous_unit_revision_id,
+        base_unit_revision_id=resolved_base_unit_revision_id,
         target_unit_revision_id=target_revision_id,
         projection_payload=projection_payload,
         projection_payload_hash=projection_payload_hash,
@@ -869,6 +1000,7 @@ def source_derivation_manifest(
         extraction_contract_version=extraction_contract_version,
         batches=manifest_batches,
         terminal_reason_code=terminal_reason_code,
+        authority_plan_identity=authority_plan_identity,
     )
 
 
@@ -891,6 +1023,7 @@ def source_unit_derivation_context_to_payload(
         "reprocess_all_current_observations": (
             context.reprocess_all_current_observations
         ),
+        "reprocess_operation_id": context.reprocess_operation_id,
         "work_strategy": context.work_strategy,
     }
 
@@ -1008,6 +1141,9 @@ def source_unit_derivation_context_from_payload(
         ),
         reprocess_all_current_observations=bool(
             payload.get("reprocess_all_current_observations", False)
+        ),
+        reprocess_operation_id=_optional_string(
+            payload.get("reprocess_operation_id")
         ),
         work_strategy=(
             "structural"
@@ -1417,6 +1553,9 @@ def _derivation_context_identity_payload(
         "reprocess_all_current_observations": context_payload.get(
             "reprocess_all_current_observations",
             False,
+        ),
+        "reprocess_operation_id": context_payload.get(
+            "reprocess_operation_id"
         ),
     }
 
