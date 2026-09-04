@@ -335,6 +335,20 @@ class EvidenceFragmentCatalog:
 
 
 @dataclass(frozen=True, slots=True)
+class RevisionFragmentIndex:
+    """Complete local Fragment index for deterministic revision remapping.
+
+    Unlike a model-facing catalog, this index has no presentation budget and
+    must never be serialized into a prompt. Callers select exact Fragments from
+    it before compiling a bounded catalog through ``compile_fragments``.
+    """
+
+    observation_revision_id: str
+    fragments: tuple[EvidenceFragment, ...]
+    errors: tuple[FragmentCompilationError, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _FragmentCandidate:
     kind: EvidenceFragmentKind
     fragment_type: str
@@ -381,31 +395,12 @@ def compile_fragments(
     if max_fragments <= 0 or max_presentation_chars <= 0:
         raise ValueError("Fragment catalog limits must be positive")
 
-    range_error = _validate_authority_ranges(revision, profile, authority_ranges)
-    if range_error is not None:
-        return _catalog_from_candidates(
-            revision,
-            profile,
-            authority_ranges,
-            (),
-            (range_error,),
-            max_fragments=max_fragments,
-            max_presentation_chars=max_presentation_chars,
-        )
-
-    compiler = _PROFILE_COMPILERS.get((profile.name, profile.version))
-    if compiler is None:
-        return _fatal_catalog(
-            revision,
-            profile,
-            authority_ranges,
-            FragmentCompilationErrorCode.UNSUPPORTED_PROFILE,
-            f"unsupported Evidence Representation Profile: {profile.name}/{profile.version}",
-            max_fragments=max_fragments,
-            max_presentation_chars=max_presentation_chars,
-        )
-
-    candidates, errors = compiler(revision, contract, authority_ranges)
+    candidates, errors = _compile_authorized_candidates(
+        revision,
+        profile,
+        contract,
+        authority_ranges,
+    )
     return _catalog_from_candidates(
         revision,
         profile,
@@ -717,6 +712,99 @@ _PROFILE_COMPILERS: Mapping[tuple[str, int], _ProfileCompiler] = {
     ("plain-text", 1): _compile_plain_text_profile,
     ("binary-artifact", 1): _compile_binary_artifact_profile,
 }
+
+
+def build_revision_fragment_index(
+    revision: SourceObservationRevision,
+) -> RevisionFragmentIndex:
+    """Index one complete Revision without creating a model presentation."""
+
+    profile = revision.evidence_profile
+    contract = representation_contract_for_profile(profile)
+    if contract is None:
+        return RevisionFragmentIndex(
+            observation_revision_id=revision.id,
+            fragments=(),
+            errors=(
+                _error(
+                    revision,
+                    FragmentCompilationErrorCode.UNSUPPORTED_PROFILE,
+                    "Observation Revision lacks a supported Evidence Representation Profile",
+                    fatal=True,
+                ),
+            ),
+        )
+    authority = EvidenceCandidateRange(
+        anchor=SourceAnchor(
+            kind=(
+                AnchorKind.WHOLE_OBSERVATION
+                if profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
+                else AnchorKind.REVISION_RANGE
+            ),
+            observation_id=revision.observation_id,
+            observation_revision_id=revision.id,
+            range_start=(
+                None
+                if profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
+                else 0
+            ),
+            range_end=(
+                None
+                if profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
+                else len(revision.content)
+            ),
+        ),
+        primary_eligible=True,
+    )
+    authority_ranges = (authority,)
+    candidates, errors = _compile_authorized_candidates(
+        revision,
+        profile,
+        contract,
+        authority_ranges,
+    )
+    ordered = tuple(sorted(candidates, key=_candidate_sort_key))
+    overlap_error = _candidate_overlap_error(revision, ordered)
+    if overlap_error is not None:
+        errors = (*errors, overlap_error)
+        ordered = ()
+    fragments = (
+        ()
+        if any(error.fatal for error in errors)
+        else tuple(
+            _materialize_fragment(revision, candidate, index)
+            for index, candidate in enumerate(ordered, start=1)
+        )
+    )
+    return RevisionFragmentIndex(
+        observation_revision_id=revision.id,
+        fragments=fragments,
+        errors=tuple(sorted(errors, key=_error_sort_key)),
+    )
+
+
+def _compile_authorized_candidates(
+    revision: SourceObservationRevision,
+    profile: EvidenceRepresentationProfile,
+    contract: EvidenceRepresentationContract,
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
+) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
+    """Run the one profile compiler path shared by catalogs and local indexes."""
+
+    range_error = _validate_authority_ranges(revision, profile, authority_ranges)
+    if range_error is not None:
+        return (), (range_error,)
+    compiler = _PROFILE_COMPILERS.get((profile.name, profile.version))
+    if compiler is None:
+        return (), (
+            _error(
+                revision,
+                FragmentCompilationErrorCode.UNSUPPORTED_PROFILE,
+                f"unsupported Evidence Representation Profile: {profile.name}/{profile.version}",
+                fatal=True,
+            ),
+        )
+    return compiler(revision, contract, authority_ranges)
 
 
 def _markdown_protected_ranges(text: str) -> tuple[tuple[int, int], ...]:
