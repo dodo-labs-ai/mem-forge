@@ -111,6 +111,10 @@ from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
 )
+from memforge.pipeline.projection_fragments import (
+    FragmentSelectionError,
+    FragmentSelectionErrorCode,
+)
 from memforge.pipeline.source_projection_adapters import (
     project_source_item,
     project_source_unit_tombstone,
@@ -1735,28 +1739,52 @@ class _SupportValidatingNoopClient(_NoopClient):
         self.validation_calls += 1
         assert '"memory_claim"' in prompt
         assert "A7 is retained for regular payroll." in prompt or "A7 is removed." in prompt
-        payload = json.loads(
-            prompt.split("<case_json>\n", 1)[1].split("\n</case_json>", 1)[0]
-        )
+        payload = json.loads(prompt.split("<case_json>\n", 1)[1].split("\n</case_json>", 1)[0])
+        primary_candidates = payload["primary_candidates"]
+        primary_ref = None
+        if self.supported:
+            primary_ref = next(
+                (
+                    item["ref"]
+                    for item in primary_candidates
+                    if not self.evidence_quote or self.evidence_quote in item["text"]
+                ),
+                "f999999",
+            )
+        required_evidence = []
+        if self.supported:
+            unused_quotes = list(self.required_evidence_quotes)
+            for item in payload["required"]:
+                selected_ref = "f999999"
+                if unused_quotes:
+                    for quote in tuple(unused_quotes):
+                        selected = next(
+                            (candidate["ref"] for candidate in item["candidates"] if quote in candidate["text"]),
+                            None,
+                        )
+                        if selected is not None:
+                            selected_ref = selected
+                            unused_quotes.remove(quote)
+                            break
+                else:
+                    selected_ref = next(
+                        (
+                            candidate["ref"]
+                            for candidate in item["candidates"]
+                            if not self.required_evidence_quote or self.required_evidence_quote in candidate["text"]
+                        ),
+                        "f999999",
+                    )
+                required_evidence.append(
+                    MemorySupportValidationRequiredEvidence(
+                        selector=item["selector"],
+                        evidence_ref=selected_ref,
+                    )
+                )
         return MemorySupportValidationResponse(
             supported=self.supported,
-            evidence_quote=self.evidence_quote,
-            required_evidence=[
-                MemorySupportValidationRequiredEvidence(
-                    selector=item["selector"],
-                    evidence_quote=quote,
-                )
-                for item, quote in zip(
-                    payload["required"],
-                    self.required_evidence_quotes
-                    or tuple(
-                        self.required_evidence_quote
-                        for _item in payload["required"]
-                    ),
-                    strict=True,
-                )
-                if quote
-            ],
+            primary_ref=primary_ref,
+            required_evidence=required_evidence,
             reason=(
                 "The applicability remains regular payroll."
                 if self.supported
@@ -1772,6 +1800,54 @@ class _UnavailableSupportValidatingNoopClient(_NoopClient):
             "structured LLM returned an invalid response",
             error_code="ValidationError",
         )
+
+
+class _FragmentSelectingSupportClient(_NoopClient):
+    def __init__(self) -> None:
+        super().__init__("multiple-incumbents")
+        self.validation_prompts: list[str] = []
+
+    async def audit_incumbent_support(self, prompt: str, **kwargs):
+        del kwargs
+        incumbents_json = prompt.split("<incumbents>", 1)[1].split(
+            "</incumbents>",
+            1,
+        )[0]
+        return _audit_response(
+            *(
+                IncumbentSupportAuditDecision(
+                    supported=True,
+                    reason="The exact claim remains supported.",
+                )
+                for _ in json.loads(incumbents_json)
+            )
+        )
+
+    async def validate_memory_support(self, prompt: str, **kwargs):
+        del kwargs
+        self.validation_prompts.append(prompt)
+        payload = json.loads(
+            prompt.split("<case_json>\n", 1)[1].split(
+                "\n</case_json>",
+                1,
+            )[0]
+        )
+        [candidate] = payload["primary_candidates"]
+        return MemorySupportValidationResponse.model_validate(
+            {
+                "supported": True,
+                "reason": "The selected current Fragment still entails the claim.",
+                "primary_ref": candidate["ref"],
+                "required_evidence": [],
+            }
+        )
+
+
+class _DuplicateRequiredSelectorClient(_SupportValidatingNoopClient):
+    async def validate_memory_support(self, prompt: str, **kwargs):
+        response = await super().validate_memory_support(prompt, **kwargs)
+        [required] = response.required_evidence
+        return response.model_copy(update={"required_evidence": [required, required]})
 
 
 def test_lifecycle_access_identity_treats_project_as_relevance_only() -> None:
@@ -1851,6 +1927,76 @@ async def _seed_incumbent_support(
             ),
         )
     )[0]
+    await db.upsert_memory_support_assertion(
+        MemorySupportAssertion(
+            id=f"support-{memory_id}",
+            memory_id=incumbent.id,
+            evidence_reference_id=reference.id or "",
+            source_id="src-1",
+            access_context_hash=access_context_hash,
+        )
+    )
+    return incumbent
+
+
+async def _seed_exact_incumbent_support(
+    db: Database,
+    *,
+    projection: SourceProjection,
+    memory_id: str,
+    memory_content: str,
+    access_context_hash: str = "workspace-eng",
+) -> Memory:
+    incumbent = Memory(
+        id=memory_id,
+        memory_type="decision",
+        content=memory_content,
+        content_hash=content_hash(memory_content),
+    )
+    await db.insert_memory(incumbent)
+    await db.add_memory_source(
+        incumbent.id,
+        "confluence-123",
+        "confluence",
+        memory_content,
+        source_updated_at=None,
+    )
+    observation = projection.observations[0]
+    revision = projection.observation_revisions[0]
+    start = revision.content.index(memory_content)
+    unit = EvidenceUnit(
+        id=f"eu-{memory_id}",
+        source_id="src-1",
+        doc_id="confluence-123",
+        doc_revision_id=projection.source_unit_revisions[0].id,
+        source_type="confluence",
+        source_anchor=observation.id,
+        source_lineage_id=projection.source_units[0].id,
+        project_key="ENG",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier=None,
+        content=memory_content,
+        excerpt=memory_content,
+        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        access_context_hash=access_context_hash,
+    )
+    await db.upsert_evidence_unit(unit)
+    [reference] = await db.record_evidence_references(
+        unit.id,
+        (
+            EvidenceReference(
+                role=EvidenceRole.PRIMARY,
+                anchor=SourceAnchor(
+                    kind=AnchorKind.REVISION_RANGE,
+                    observation_id=observation.id,
+                    observation_revision_id=revision.id,
+                    range_start=start,
+                    range_end=start + len(memory_content),
+                ),
+            ),
+        ),
+    )
     await db.upsert_memory_support_assertion(
         MemorySupportAssertion(
             id=f"support-{memory_id}",
@@ -4174,7 +4320,82 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
 
 
 @pytest.mark.asyncio
-async def test_incremental_noop_inexact_current_quote_creates_review(
+async def test_v2_noop_revalidation_uses_bounded_fragment_refs_for_large_revision(
+    db: Database,
+) -> None:
+    first = _projection(
+        run_id="projection-bounded-support-1",
+        body="A7 remains excluded.\n\nB8 requires approval.",
+    )
+    await db.record_source_projection(first)
+    first_memory = await _seed_exact_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-a7",
+        memory_content="A7 remains excluded.",
+    )
+    second_memory = await _seed_exact_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-b8",
+        memory_content="B8 requires approval.",
+    )
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=cutover.id,
+        owner_id="test-bounded-support-revalidation",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    old_support = {
+        first_memory.id: await db.get_active_memory_support_unit_ids(first_memory.id),
+        second_memory.id: await db.get_active_memory_support_unit_ids(second_memory.id),
+    }
+    unrelated_marker = "UNRELATED-HISTORICAL-CONTENT-MUST-NOT-ENTER-PROMPT"
+    filler = f"{unrelated_marker} " + ("x" * 130_000)
+    second = _projection(
+        run_id="projection-bounded-support-2",
+        body=f"A7 remains excluded.\n\n{filler}\n\nB8 requires approval.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
+    )
+    client = _FragmentSelectingSupportClient()
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=client,
+    )
+
+    stats = await engine.prepare_and_commit_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=second.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="unrelated historical appendix added",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+    )
+
+    assert stats["noop"] == 2
+    assert stats["support_revalidation_work_item_count"] == 2
+    assert stats["support_revalidation_revision_index_count"] == 1
+    assert stats["support_revalidation_auto_rebind_count"] == 2
+    assert len(client.validation_prompts) == 2
+    assert all(unrelated_marker not in prompt for prompt in client.validation_prompts)
+    assert all('"primary_candidates"' in prompt for prompt in client.validation_prompts)
+    for memory in (first_memory, second_memory):
+        current_support = await db.get_active_memory_support_unit_ids(memory.id)
+        assert current_support
+        assert set(current_support).isdisjoint(old_support[memory.id])
+
+
+@pytest.mark.asyncio
+async def test_incremental_noop_unknown_fragment_ref_is_retryable_without_review(
     db: Database,
 ) -> None:
     first = _projection(
@@ -4202,28 +4423,34 @@ async def test_incremental_noop_inexact_current_quote_creates_review(
         ),
     )
 
-    stats = await engine.prepare_and_commit_projected_lifecycle(
-        projection=second,
-        doc_id="confluence-123",
-        raw_memories=[],
-        doc_type="design-doc",
-        project_key="ENG",
-        repo_identifier=None,
-        document_content=second.observation_revisions[0].content,
-        update_mode="diff_guided",
-        changed_hunks="primary wording changed",
-        update_plan_stats=None,
-        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
-    )
+    with pytest.raises(SourceUnitLifecycleExecutionError) as raised:
+        await engine.prepare_and_commit_projected_lifecycle(
+            projection=second,
+            doc_id="confluence-123",
+            raw_memories=[],
+            doc_type="design-doc",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content=second.observation_revisions[0].content,
+            update_mode="diff_guided",
+            changed_hunks="primary wording changed",
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+            lifecycle_execution_owner_id="sync-invalid-fragment-ref:lease-1",
+        )
 
-    assert stats["pending_review"] == 1
+    assert raised.value.retryable is True
+    assert isinstance(raised.value.__cause__, FragmentSelectionError)
+    assert raised.value.runtime_bundle.event.reason_code == "support_revalidation_failed"
+    assert raised.value.runtime_bundle.event.model_call_count == 1
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
     assert await db.get_active_memory_support_reference_ids(incumbent.id)
+    assert await db.list_lifecycle_reviews("src-1") == []
 
 
 @pytest.mark.asyncio
-async def test_incremental_noop_unavailable_support_validation_creates_review(
+async def test_incremental_noop_unavailable_support_validation_is_retryable_without_review(
     db: Database,
 ) -> None:
     first = _projection(
@@ -4249,24 +4476,31 @@ async def test_incremental_noop_unavailable_support_validation_creates_review(
         ),
     )
 
-    stats = await engine.prepare_and_commit_projected_lifecycle(
-        projection=second,
-        doc_id="confluence-123",
-        raw_memories=[],
-        doc_type="design-doc",
-        project_key="ENG",
-        repo_identifier=None,
-        document_content=second.observation_revisions[0].content,
-        update_mode="diff_guided",
-        changed_hunks="primary wording changed",
-        update_plan_stats=None,
-        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
-    )
+    with pytest.raises(SourceUnitLifecycleExecutionError) as raised:
+        await engine.prepare_and_commit_projected_lifecycle(
+            projection=second,
+            doc_id="confluence-123",
+            raw_memories=[],
+            doc_type="design-doc",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content=second.observation_revisions[0].content,
+            update_mode="diff_guided",
+            changed_hunks="primary wording changed",
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+            lifecycle_execution_owner_id="sync-validation-unavailable:lease-1",
+        )
 
-    assert stats["pending_review"] == 1
+    assert raised.value.retryable is True
+    assert isinstance(raised.value.__cause__, StructuredLlmError)
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
     assert await db.get_active_memory_support_reference_ids(incumbent.id)
+    assert await db.list_lifecycle_reviews("src-1") == []
+    current_revision = await db.get_current_source_unit_revision(first.source_units[0].id)
+    assert current_revision is not None
+    assert current_revision.id == first.source_unit_revisions[0].id
 
 
 @pytest.mark.asyncio
@@ -4845,6 +5079,58 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
 
 
 @pytest.mark.asyncio
+async def test_noop_duplicate_required_selector_is_retryable_without_review(
+    db: Database,
+) -> None:
+    await _set_fixture_source_type(db, "jira")
+    first = _jira_projection(
+        run_id="projection-jira-duplicate-selector-1",
+        description="A7 applies only to regular payroll.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_jira_required_incumbent(db, first)
+    await db.enable_lifecycle_gate("src-1")
+    second = _jira_projection(
+        run_id="projection-jira-duplicate-selector-2",
+        description="A7 remains limited to regular payroll runs.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={item.observation_id: item for item in first.observation_revisions},
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_DuplicateRequiredSelectorClient(
+            incumbent.id,
+            supported=True,
+            required_evidence_quote=("A7 remains limited to regular payroll runs."),
+        ),
+    )
+
+    with pytest.raises(SourceUnitLifecycleExecutionError) as raised:
+        await engine.prepare_and_commit_projected_lifecycle(
+            projection=second,
+            doc_id="confluence-123",
+            raw_memories=[],
+            doc_type="ticket",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content="PAY-12",
+            update_mode="diff_guided",
+            changed_hunks="description wording clarified",
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+            lifecycle_execution_owner_id="sync-duplicate-selector:lease-1",
+        )
+
+    assert raised.value.retryable is True
+    assert isinstance(raised.value.__cause__, FragmentSelectionError)
+    assert raised.value.__cause__.code is FragmentSelectionErrorCode.INVALID_SELECTION
+    assert await db.list_lifecycle_reviews("src-1") == []
+
+
+@pytest.mark.asyncio
 async def test_v2_noop_revalidates_revised_required_jira_description(
     db: Database,
 ) -> None:
@@ -4935,7 +5221,7 @@ async def test_v2_noop_revalidates_revised_required_jira_description(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_ambiguous_current_required_fragment_stages_review(
+async def test_v2_noop_uses_canonical_field_type_to_resolve_duplicate_text(
     db: Database,
 ) -> None:
     await _set_fixture_source_type(db, "jira")
@@ -4997,15 +5283,74 @@ async def test_v2_noop_ambiguous_current_required_fragment_stages_review(
         source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
     )
 
+    assert stats["noop"] == 1
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    assert current_support
+    assert set(current_support).isdisjoint(old_support)
+    assert await db.list_lifecycle_reviews("src-1") == []
+
+
+@pytest.mark.asyncio
+async def test_v2_noop_indistinguishable_current_fragments_stage_review(
+    db: Database,
+) -> None:
+    claim = "A7 remains excluded."
+    first = _projection(
+        run_id="projection-v2-indistinguishable-1",
+        body=f"# Rules\n{claim}",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_exact_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-indistinguishable",
+        memory_content=claim,
+    )
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=cutover.id,
+        owner_id="test-v2-indistinguishable",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    second = _projection(
+        run_id="projection-v2-indistinguishable-2",
+        body=f"# Rules\n{claim}\n\n{claim}",
+        prior=first.source_unit_revisions[0],
+        prior_observations={first.observations[0].id: first.observation_revisions[0]},
+    )
+    client = _FragmentSelectingSupportClient()
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=client,
+    )
+
+    stats = await engine.prepare_and_commit_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=second.observation_revisions[0].content,
+        update_mode="diff_guided",
+        changed_hunks="duplicate identical rule added under one heading",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+    )
+
     assert stats["pending_review"] == 1
     assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
+    assert client.validation_prompts == []
     [review] = await db.list_lifecycle_reviews("src-1")
-    assert review.status is LifecycleReviewStatus.PENDING
     assert review.reason.endswith(": ambiguous")
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_unpresentable_current_fragment_stages_review(
+async def test_v2_noop_semantically_unsupported_current_fragment_stages_review(
     db: Database,
 ) -> None:
     access_context_hash = lifecycle_access_context_hash(
@@ -5046,8 +5391,7 @@ async def test_v2_noop_unpresentable_current_fragment_stages_review(
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SupportValidatingNoopClient(
             incumbent.id,
-            supported=True,
-            evidence_quote="<!-- no selectable current claim -->",
+            supported=False,
         ),
     )
 
@@ -5069,7 +5413,7 @@ async def test_v2_noop_unpresentable_current_fragment_stages_review(
     assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
     [review] = await db.list_lifecycle_reviews("src-1")
     assert review.status is LifecycleReviewStatus.PENDING
-    assert review.reason.endswith(": unpresentable")
+    assert review.reason.startswith("revised REQUIRED evidence no longer validates claim:")
 
 
 @pytest.mark.asyncio
@@ -5096,8 +5440,7 @@ async def test_v2_pending_review_ignores_unrelated_stale_cross_unit_support(
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SupportValidatingNoopClient(
             scenario.incumbent.id,
-            supported=True,
-            evidence_quote="<!-- no selectable current claim -->",
+            supported=False,
         ),
     )
 
@@ -5127,7 +5470,7 @@ async def test_v2_pending_review_ignores_unrelated_stale_cross_unit_support(
     assert current.id == second.source_unit_revisions[0].id
     [review] = await db.list_lifecycle_reviews("src-1")
     assert review.status is LifecycleReviewStatus.PENDING
-    assert review.reason.endswith(": unpresentable")
+    assert review.reason.startswith("revised REQUIRED evidence no longer validates claim:")
 
 
 @pytest.mark.asyncio
