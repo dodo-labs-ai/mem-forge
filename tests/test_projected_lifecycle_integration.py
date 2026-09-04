@@ -3803,9 +3803,18 @@ async def test_v2_incremental_noop_rebinds_complete_unit_to_current_revision(
     )
     await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    historical_context = "\n\n".join(
+        f"Unchanged historical paragraph {index}: " + ("x" * 180)
+        for index in range(700)
+    )
+    current_body = (
+        f"{historical_context}\n\n<div></div>\n\n"
+        "A7 is removed.\nNew deployment note."
+    )
+    assert len(current_body) > 120_000
     second = _projection(
         run_id="projection-v2-incremental-keep-2",
-        body="A7 is removed.\nNew deployment note.",
+        body=current_body,
         prior=first.source_unit_revisions[0],
         prior_observations={first.observations[0].id: first.observation_revisions[0]},
     )

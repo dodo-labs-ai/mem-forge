@@ -31,6 +31,7 @@ from memforge.pipeline.evidence_fragments import (
     EvidenceFragmentKind,
     FragmentCompilationError,
     FragmentCompilationErrorCode,
+    build_revision_fragment_index,
     compile_fragments,
 )
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
@@ -132,7 +133,9 @@ def resolve_revalidated_noop_selection(
         revision.observation_id: revision
         for revision in projection.observation_revisions
     }
-    ranges_by_observation: dict[str, EvidenceCandidateRange] = {}
+    ranges_by_observation: dict[str, list[EvidenceCandidateRange]] = {}
+    selected_fragment_identities: set[tuple[object, ...]] = set()
+    indexes_by_observation: dict[str, tuple[EvidenceFragment, ...]] = {}
     for item in ordered_support:
         revision = revisions.get(item.anchor.observation_id)
         if revision is None:
@@ -140,13 +143,56 @@ def resolve_revalidated_noop_selection(
                 RevalidatedSelectionErrorCode.UNPRESENTABLE,
                 "NOOP revalidation Evidence is unavailable",
             )
-        previous = ranges_by_observation.get(revision.observation_id)
-        ranges_by_observation[revision.observation_id] = EvidenceCandidateRange(
-            anchor=_revalidation_candidate_anchor(revision),
-            primary_eligible=(
-                item.role is EvidenceRole.PRIMARY
-                or bool(previous and previous.primary_eligible)
-            ),
+        indexed_fragments = indexes_by_observation.get(revision.observation_id)
+        if indexed_fragments is None:
+            index = build_revision_fragment_index(revision)
+            if any(error.fatal for error in index.errors):
+                codes = ",".join(
+                    sorted({error.code.value for error in index.errors})
+                )
+                raise RuntimeError(
+                    "NOOP revalidation compiler contract failed: "
+                    f"{codes or 'unindexable_revision'}"
+                )
+            if not index.fragments:
+                raise RevalidatedSelectionError(
+                    RevalidatedSelectionErrorCode.UNPRESENTABLE,
+                    "NOOP revalidation Evidence Revision is not indexable",
+                )
+            indexed_fragments = index.fragments
+            indexes_by_observation[revision.observation_id] = indexed_fragments
+        expected = (
+            current_primary_quote
+            if item.role is EvidenceRole.PRIMARY
+            else current_required_quotes_by_reference_id.get(
+                item.reference_id,
+                item.excerpt or "",
+            )
+        )
+        fragment = _unique_revalidation_fragment(
+            indexed_fragments,
+            prior=item,
+            expected=expected,
+        )
+        fragment_identity = (
+            fragment.anchor.observation_id,
+            fragment.anchor.observation_revision_id,
+            fragment.anchor.kind,
+            fragment.anchor.range_start,
+            fragment.anchor.range_end,
+            fragment.raw_content_sha256,
+        )
+        if fragment_identity in selected_fragment_identities:
+            raise RevalidatedSelectionError(
+                RevalidatedSelectionErrorCode.AMBIGUOUS,
+                "NOOP revalidation collapsed distinct Evidence parts",
+            )
+        selected_fragment_identities.add(fragment_identity)
+        ranges_by_observation.setdefault(revision.observation_id, []).append(
+            EvidenceCandidateRange(
+                anchor=fragment.anchor,
+                primary_eligible=item.role is EvidenceRole.PRIMARY,
+            )
         )
 
     compiled_fragments: list[EvidenceFragment] = []
@@ -159,11 +205,11 @@ def resolve_revalidated_noop_selection(
         key=lambda value: revisions[value].id,
     ):
         revision = revisions[observation_id]
-        candidate_range = ranges_by_observation[observation_id]
+        candidate_ranges = tuple(ranges_by_observation[observation_id])
         authority_payload.extend(
-            _authority_payload(revision, (candidate_range,))
+            _authority_payload(revision, candidate_ranges)
         )
-        compiled = compile_fragments(revision, (candidate_range,))
+        compiled = compile_fragments(revision, candidate_ranges)
         compiled_fragments.extend(compiled.fragments)
         errors.extend(compiled.errors)
         component_digests.append(compiled.digest)
@@ -313,28 +359,6 @@ def _unique_revalidation_fragment(
     raise RevalidatedSelectionError(
         RevalidatedSelectionErrorCode.UNPRESENTABLE,
         "NOOP revalidation Evidence does not resolve to one current Fragment",
-    )
-
-
-def _revalidation_candidate_anchor(
-    revision: SourceObservationRevision,
-) -> SourceAnchor:
-    profile = revision.evidence_profile
-    whole_authority = (
-        profile is None
-        or profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
-        or profile.name == "canonical-record"
-    )
-    return SourceAnchor(
-        kind=(
-            AnchorKind.WHOLE_OBSERVATION
-            if whole_authority
-            else AnchorKind.REVISION_RANGE
-        ),
-        observation_id=revision.observation_id,
-        observation_revision_id=revision.id,
-        range_start=None if whole_authority else 0,
-        range_end=None if whole_authority else len(revision.content),
     )
 
 
