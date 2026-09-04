@@ -410,6 +410,7 @@ async def test_v9_reprocess_without_operation_identity_fails_before_llm(
 @pytest.mark.asyncio
 async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
     db: Database,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_id = "source-unmappable-authority"
     await db.upsert_source(
@@ -489,32 +490,57 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
         extractor_called = True
         return MemoryExtractionResult(memories=[])
 
-    result = await SourceUnitDeriver(db).derive(
-        SourceUnitDerivationRequest(
-            projection=target,
-            context=SourceUnitDerivationContext(
-                document=document,
-                doc_type="document",
-                project_key=None,
-                repo_identifier=None,
-                document_content="content that cannot map to the target Revision",
-                update_mode="diff_guided",
-                changed_hunks="@@ changed @@",
-                update_plan_stats=None,
-                source_updated_at=now.isoformat(),
-                user_id=None,
-                source_activity_epoch=1,
-                current_changed_ranges=((0, 7),),
-            ),
-            extract_batch=extract,
-            max_concurrent=1,
-            extraction_contract_version=PROJECTION_EXTRACTION_V9,
-            access_context_hash="access-unmappable-authority",
-            inference_capability_hash="inference-unmappable-authority",
-        )
+    request = SourceUnitDerivationRequest(
+        projection=target,
+        context=SourceUnitDerivationContext(
+            document=document,
+            doc_type="document",
+            project_key=None,
+            repo_identifier=None,
+            document_content="content that cannot map to the target Revision",
+            update_mode="diff_guided",
+            changed_hunks="@@ changed @@",
+            update_plan_stats=None,
+            source_updated_at=now.isoformat(),
+            user_id=None,
+            source_activity_epoch=1,
+            current_changed_ranges=((0, 7),),
+        ),
+        extract_batch=extract,
+        max_concurrent=1,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+        access_context_hash="access-unmappable-authority",
+        inference_capability_hash="inference-unmappable-authority",
     )
+    published_events: list[tuple] = []
+    published_assessments: list[tuple] = []
+
+    class RuntimeSink:
+        def publish(self, events):
+            published_events.append(events)
+
+    class AssessmentSink:
+        def publish(self, assessments, events):
+            published_assessments.append((assessments, events))
+
+    deriver = SourceUnitDeriver(
+        db,
+        runtime_event_trace_sink=RuntimeSink(),
+        agent_assessment_sink=AssessmentSink(),
+    )
+    monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "deployment-a")
+
+    result = await deriver.derive(request)
+
+    monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "deployment-b")
+    replay = await deriver.derive(request)
 
     assert extractor_called is False
+    assert replay.derivation == result.derivation
+    assert len(published_events) == 1
+    assert published_events[0][0].deployment_revision == "deployment-a"
+    assert len(published_assessments) == 1
+    assert published_assessments[0][1] == published_events[0]
     assert result.extraction.error_type == "evidence_authority_planning_failed"
     assert result.derivation.status == "completed"
     assert (
@@ -545,7 +571,7 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
     rows = await db.db.execute_fetchall(
         """SELECT event_name, outcome, reason_code,
                   base_unit_revision_id, operation,
-                  model_call_count, mutation_count
+                  model_call_count, mutation_count, deployment_revision
            FROM agent_runtime_events"""
     )
     assert [tuple(row) for row in rows] == [
@@ -557,6 +583,7 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
             "incremental",
             0,
             0,
+            "deployment-a",
         )
     ]
     assessment_rows = await db.db.execute_fetchall(

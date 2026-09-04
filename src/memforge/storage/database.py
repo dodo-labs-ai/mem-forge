@@ -221,6 +221,7 @@ from memforge.source_derivation import (
     SourceDerivationAttempt,
     SourceDerivationBatchRecord,
     SourceDerivationManifest,
+    SourceDerivationStage,
     memory_extraction_output_payload,
     memory_extraction_result_from_output_payload,
     output_payload_hash,
@@ -5974,8 +5975,8 @@ class Database:
         *,
         runtime_events: tuple[AgentRuntimeEvent, ...] = (),
         agent_assessments: tuple[AgentAssessment, ...] = (),
-    ) -> SourceDerivationAttempt:
-        """Persist one immutable target projection and its batch manifest."""
+    ) -> SourceDerivationStage:
+        """Create one immutable derivation, or validate and return its exact replay."""
 
         projection_payload_json = json.dumps(
             manifest.projection_payload,
@@ -6062,6 +6063,8 @@ class Database:
                                 now,
                             ),
                         )
+                    await self._insert_agent_runtime_events_unlocked(runtime_events)
+                    await self._insert_agent_assessments_unlocked(agent_assessments)
                 else:
                     immutable_values = {
                         "source_id": manifest.source_id,
@@ -6111,11 +6114,13 @@ class Database:
                     ]
                     if actual_batches != expected_batches:
                         raise ValueError("Source derivation retry batch manifest mismatch")
-                await self._insert_agent_runtime_events_unlocked(runtime_events)
-                await self._insert_agent_assessments_unlocked(agent_assessments)
                 await self.db.commit()
-                return await self._source_derivation_attempt_unlocked(
+                attempt = await self._source_derivation_attempt_unlocked(
                     str(existing["id"]) if existing is not None else manifest.id
+                )
+                return SourceDerivationStage(
+                    attempt=attempt,
+                    created=existing is None,
                 )
             except Exception:
                 await self.db.rollback()

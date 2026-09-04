@@ -5645,16 +5645,18 @@ async def test_sync_supersedes_completed_derivation_when_its_lifecycle_plan_is_a
     assert first.last_sync_status == "success"
     [applied] = await db.list_source_derivation_attempts(source_id=source_id)
     assert applied.status == "applied"
-    stale = await db.stage_source_derivation(
-        source_derivation_manifest(
-            applied.projection,
-            (),
-            context=replace(
-                applied.context,
-                user_id="stale-completed-attempt",
-            ),
+    stale = (
+        await db.stage_source_derivation(
+            source_derivation_manifest(
+                applied.projection,
+                (),
+                context=replace(
+                    applied.context,
+                    user_id="stale-completed-attempt",
+                ),
+            )
         )
-    )
+    ).attempt
     assert stale.id != applied.id
     assert stale.status == "completed"
 
