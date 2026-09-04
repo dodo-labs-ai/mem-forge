@@ -109,7 +109,11 @@ from memforge.pipeline.extraction_contract import (
 from memforge.pipeline.projection_fragments import (
     compile_projection_fragment_catalog,
 )
-from memforge.pipeline.projection_images import load_projection_images
+from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
+from memforge.pipeline.projection_images import (
+    load_projection_images,
+    projection_inference_capability_hash,
+)
 from memforge.source_access import memory_visibility_for_source_id
 from memforge.source_projection_config import canonical_projection_scope
 
@@ -1787,6 +1791,7 @@ class GeneSyncOrchestrator:
             derivation_reprocess_all_current_observations=(
                 context.reprocess_all_current_observations
             ),
+            derivation_reprocess_operation_id=context.reprocess_operation_id,
             expected_source_activity_epoch=source_activity_epoch,
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
             lifecycle_attempt_count=1,
@@ -2550,6 +2555,7 @@ class GeneSyncOrchestrator:
             source_activity_epoch=expected_source_activity_epoch,
             current_changed_ranges=(update_plan.current_changed_ranges if update_plan is not None else ()),
             reprocess_all_current_observations=force_reprocess,
+            reprocess_operation_id=(run_id if force_reprocess else None),
         )
         # Extraction owns the only document-content model call. Historical
         # cross-document/cross-source discovery remains post-commit Relation
@@ -2622,6 +2628,9 @@ class GeneSyncOrchestrator:
             derivation_id=extraction_result.derivation_id,
             derivation_reprocess_all_current_observations=(
                 derivation_context.reprocess_all_current_observations
+            ),
+            derivation_reprocess_operation_id=(
+                derivation_context.reprocess_operation_id
             ),
             expected_source_activity_epoch=expected_source_activity_epoch,
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
@@ -2969,6 +2978,13 @@ class GeneSyncOrchestrator:
             project_key=derivation_context.project_key,
             repo_identifier=derivation_context.repo_identifier,
         )
+        inference_capability_hash = projection_inference_capability_hash()
+        committed_base_snapshot = await self._committed_base_snapshot_for(
+            projection,
+            reprocess_all_current_observations=(
+                derivation_context.reprocess_all_current_observations
+            ),
+        )
 
         async def extract_one(batch):
             if isinstance(batch, DiffGuidedExtractionBatch):
@@ -3027,6 +3043,7 @@ class GeneSyncOrchestrator:
                         projection,
                         batch,
                         access_context_hash=access_context_hash,
+                        inference_capability_hash=inference_capability_hash,
                         supplied_artifact_observation_ids=tuple(
                             image.source_observation_id for image in batch_images
                         ),
@@ -3078,6 +3095,9 @@ class GeneSyncOrchestrator:
                 extract_batch=extract_one,
                 max_concurrent=self._source_parallelism_limit(),
                 extraction_contract_version=extraction_contract_version,
+                committed_base_snapshot=committed_base_snapshot,
+                access_context_hash=access_context_hash,
+                inference_capability_hash=inference_capability_hash,
             )
         )
         result.extraction.derivation_id = result.derivation.id
@@ -3091,6 +3111,42 @@ class GeneSyncOrchestrator:
             ),
         }
         return result.extraction
+
+    async def _committed_base_snapshot_for(
+        self,
+        projection: SourceProjection,
+        *,
+        reprocess_all_current_observations: bool,
+    ) -> CommittedSourceUnitSnapshot | None:
+        """Load one complete committed base; the planner owns mismatch policy."""
+
+        delta = projection.deltas[0]
+        if (
+            delta.previous_unit_revision_id is None
+            and not reprocess_all_current_observations
+        ):
+            return None
+        unit_revision = await self.db.get_current_source_unit_revision(
+            delta.source_unit_id
+        )
+        if unit_revision is None:
+            return None
+        if (
+            not reprocess_all_current_observations
+            and unit_revision.id != delta.previous_unit_revision_id
+        ):
+            # The planner persists the typed mismatch instead of turning a
+            # deterministic snapshot race into document-level retries.
+            return None
+        observation_revisions = (
+            await self.db.get_current_source_observation_revisions(
+                delta.source_unit_id
+            )
+        )
+        return CommittedSourceUnitSnapshot(
+            unit_revision=unit_revision,
+            observation_revisions=tuple(observation_revisions.values()),
+        )
 
     def _projection_images(
         self,

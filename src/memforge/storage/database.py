@@ -135,6 +135,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
     LifecycleMutationType,
     LifecyclePlan,
+    AuthorityPlanStaleError,
     ProjectedSupportInvariantError,
     ProjectedLifecycleBlocker,
     ProjectedLifecycleDeferredError,
@@ -1150,6 +1151,7 @@ CREATE TABLE IF NOT EXISTS source_derivation_attempts (
         status IN ('pending', 'retryable_failure', 'completed', 'applied', 'superseded')
     ),
     terminal_reason_code        TEXT,
+    authority_plan_identity_json TEXT,
     created_at                  TEXT NOT NULL,
     updated_at                  TEXT NOT NULL,
     completed_at                TEXT,
@@ -4296,6 +4298,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "Persist local-agent retry due time",
         ["ALTER TABLE local_agent_jobs ADD COLUMN next_attempt_at TEXT"],
     ),
+    (
+        92,
+        "Persist Source derivation authority-plan identity",
+        [
+            "ALTER TABLE source_derivation_attempts ADD COLUMN authority_plan_identity_json TEXT",
+        ],
+    ),
 ]
 
 
@@ -5962,6 +5971,9 @@ class Database:
     async def stage_source_derivation(
         self,
         manifest: SourceDerivationManifest,
+        *,
+        runtime_events: tuple[AgentRuntimeEvent, ...] = (),
+        agent_assessments: tuple[AgentAssessment, ...] = (),
     ) -> SourceDerivationAttempt:
         """Persist one immutable target projection and its batch manifest."""
 
@@ -5974,6 +5986,15 @@ class Database:
             manifest.context_payload,
             sort_keys=True,
             separators=(",", ":"),
+        )
+        authority_plan_identity_json = (
+            json.dumps(
+                manifest.authority_plan_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if manifest.authority_plan_identity is not None
+            else None
         )
         now = _now_iso()
         initial_status = SOURCE_DERIVATION_COMPLETED if not manifest.batches else SOURCE_DERIVATION_PENDING
@@ -5994,8 +6015,10 @@ class Database:
                             projection_identity_hash, context_payload_json,
                             context_payload_hash, context_identity_hash,
                             extraction_contract_version, status,
-                            created_at, updated_at, completed_at, applied_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+                            created_at, updated_at, completed_at, applied_at,
+                            terminal_reason_code,
+                            authority_plan_identity_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
                         (
                             manifest.id,
                             manifest.source_id,
@@ -6013,6 +6036,8 @@ class Database:
                             now,
                             now,
                             now if initial_status == SOURCE_DERIVATION_COMPLETED else None,
+                            manifest.terminal_reason_code,
+                            authority_plan_identity_json,
                         ),
                     )
                     for batch in manifest.batches:
@@ -6046,6 +6071,10 @@ class Database:
                         "projection_identity_hash": (manifest.projection_identity_hash),
                         "context_identity_hash": (manifest.context_identity_hash),
                         "extraction_contract_version": (manifest.extraction_contract_version),
+                        "terminal_reason_code": manifest.terminal_reason_code,
+                        "authority_plan_identity_json": (
+                            authority_plan_identity_json
+                        ),
                     }
                     mismatched_columns = tuple(
                         column for column, value in immutable_values.items() if existing[column] != value
@@ -6082,6 +6111,8 @@ class Database:
                     ]
                     if actual_batches != expected_batches:
                         raise ValueError("Source derivation retry batch manifest mismatch")
+                await self._insert_agent_runtime_events_unlocked(runtime_events)
+                await self._insert_agent_assessments_unlocked(agent_assessments)
                 await self.db.commit()
                 return await self._source_derivation_attempt_unlocked(
                     str(existing["id"]) if existing is not None else manifest.id
@@ -6411,6 +6442,11 @@ class Database:
                 if row["terminal_reason_code"] is not None
                 else None
             ),
+            authority_plan_identity=(
+                json.loads(row["authority_plan_identity_json"])
+                if row["authority_plan_identity_json"] is not None
+                else None
+            ),
             batches=tuple(batches),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
@@ -6506,6 +6542,14 @@ class Database:
             ),
         )
 
+    async def _acquire_source_writer_fence_unlocked(self, source_id: str) -> None:
+        """Serialize SQLite source writers before reading mutable projection state."""
+
+        await self.db.execute(
+            "UPDATE sources SET status = status WHERE id = ?",
+            (source_id,),
+        )
+
     async def record_source_projection(
         self,
         projection: SourceProjection,
@@ -6527,11 +6571,10 @@ class Database:
         transaction_lock = self._write_lock if _manage_transaction else nullcontext()
         async with transaction_lock:
             try:
-                # First write acquires SQLite's cross-process writer fence for
-                # this transaction before any projection snapshot is read.
-                await self.db.execute(
-                    "UPDATE sources SET status = status WHERE id = ?",
-                    (projection.source_id,),
+                # Acquire SQLite's cross-process writer fence before reading
+                # any mutable projection snapshot.
+                await self._acquire_source_writer_fence_unlocked(
+                    projection.source_id
                 )
                 async with self.db.execute(
                     "SELECT type, activity_epoch FROM sources WHERE id = ?",
@@ -10357,6 +10400,11 @@ class Database:
                 raise ValueError("runtime bundle and projected lifecycle outcome do not match")
         async with self._write_lock:
             try:
+                # The derivation base check and lifecycle apply must observe one
+                # serialized Source snapshot across SQLite processes.
+                await self._acquire_source_writer_fence_unlocked(
+                    projection.source_id
+                )
                 if derivation_id is not None:
                     if document is None:
                         raise ValueError("Source derivation lifecycle commit requires its staged Document")
@@ -10364,6 +10412,7 @@ class Database:
                         raise ValueError("Source derivation lifecycle commit requires its context identity")
                     async with self.db.execute(
                         """SELECT source_id, source_unit_id,
+                                  base_unit_revision_id,
                                   target_unit_revision_id, status,
                                   projection_identity_hash,
                                   context_payload_json,
@@ -10399,6 +10448,20 @@ class Database:
                         staged_context.document
                     ) != source_derivation_document_identity_hash(document):
                         raise ValueError("Source derivation Document identity mismatch")
+                    async with self.db.execute(
+                        "SELECT current_revision_id FROM source_units WHERE id = ?",
+                        (delta.source_unit_id,),
+                    ) as cursor:
+                        current_unit = await cursor.fetchone()
+                    current_revision_id = (
+                        current_unit["current_revision_id"]
+                        if current_unit is not None
+                        else None
+                    )
+                    if current_revision_id != derivation["base_unit_revision_id"]:
+                        raise AuthorityPlanStaleError(
+                            "authority plan is stale: Source Unit base revision changed"
+                        )
                 if document is not None:
                     await self._assert_document_source_writable_unlocked(
                         document.source,

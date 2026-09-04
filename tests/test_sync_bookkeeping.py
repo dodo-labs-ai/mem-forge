@@ -32,7 +32,10 @@ from memforge.memory.engine import (
     SourceUnitLifecycleExecutionError,
 )
 from memforge.memory.evidence import SupportScopeVersion
-from memforge.memory.lifecycle_planner import lifecycle_plan_id
+from memforge.memory.lifecycle_planner import (
+    lifecycle_access_context_hash,
+    lifecycle_plan_id,
+)
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
@@ -62,6 +65,9 @@ from memforge.models import (
 )
 from memforge.pipeline.sync_memory import MemorySample, SyncMemoryObserver
 from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.pipeline.projection_images import (
+    projection_inference_capability_hash,
+)
 from memforge.source_projection import (
     ProjectionScopeAttestation,
     ProjectionScopeTransition,
@@ -3190,6 +3196,9 @@ class NoopMemoryEngine:
                             "derivation_reprocess_all_current_observations",
                             False,
                         ),
+                        reprocess_operation_id=kwargs.get(
+                            "derivation_reprocess_operation_id"
+                        ),
                     )
                 )
                 if kwargs.get("derivation_id") is not None
@@ -5438,6 +5447,15 @@ async def _stage_completed_v9_recovery_attempt(
             extract_batch=extract,
             max_concurrent=1,
             extraction_contract_version=PROJECTION_EXTRACTION_V9,
+            access_context_hash=lifecycle_access_context_hash(
+                visibility="workspace",
+                owner_user_id=None,
+                project_key=None,
+                repo_identifier=None,
+            ),
+            inference_capability_hash=(
+                projection_inference_capability_hash()
+            ),
         )
     )
 

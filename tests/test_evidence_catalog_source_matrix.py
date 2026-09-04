@@ -9,7 +9,14 @@ import pytest
 from memforge.llm.structured import MemoryCandidate, MemoryExtractionResponse
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.memory_extractor import MemoryExtractor
-from memforge.pipeline.projection_context import plan_projection_extraction_batches
+from memforge.pipeline.projection_context import (
+    CommittedSourceUnitSnapshot,
+    plan_projection_evidence_work,
+    plan_projection_extraction_batches,
+)
+from memforge.pipeline.projection_fragments import (
+    compile_projection_fragment_catalog,
+)
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 from memforge.pipeline.source_projection_adapters import (
     BUILTIN_SPECIALIZED_SOURCE_TYPES,
@@ -33,6 +40,80 @@ TEXTUAL_BUILTIN_SOURCE_TYPES = (
 
 def test_source_matrix_covers_every_builtin_textual_source_type() -> None:
     assert set(TEXTUAL_BUILTIN_SOURCE_TYPES) == set(BUILTIN_SPECIALIZED_SOURCE_TYPES)
+
+
+@pytest.mark.parametrize(
+    "source_type",
+    [*TEXTUAL_BUILTIN_SOURCE_TYPES, "extension_document"],
+)
+def test_active_v9_source_matrix_uses_exact_current_incremental_authority(
+    source_type: str,
+) -> None:
+    source_id = f"src-v9-{source_type}"
+    first_item, first_raw, first_normalized, target_type = _projection_inputs(
+        source_type,
+        OLD_RULE,
+        version="1",
+    )
+    first = project_source_item(
+        source_id=source_id,
+        source_type=source_type,
+        run_id="run-v9-1",
+        item=first_item,
+        raw=first_raw,
+        normalized=first_normalized,
+    )
+    second_item, second_raw, second_normalized, _ = _projection_inputs(
+        source_type,
+        CURRENT_RULE,
+        version="2",
+    )
+    second = project_source_item(
+        source_id=source_id,
+        source_type=source_type,
+        run_id="run-v9-2",
+        item=second_item,
+        raw=second_raw,
+        normalized=second_normalized,
+        prior_unit_revision=first.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in first.observation_revisions
+        },
+    )
+    target_observation_id = next(
+        observation.id
+        for observation in second.observations
+        if observation.observation_type == target_type
+    )
+
+    batches = plan_projection_evidence_work(
+        second,
+        committed_base_snapshot=CommittedSourceUnitSnapshot(
+            unit_revision=first.source_unit_revisions[0],
+            observation_revisions=first.observation_revisions,
+        ),
+        reprocess_all_current_observations=False,
+    )
+
+    assert isinstance(batches, tuple)
+    batch = next(
+        item
+        for item in batches
+        if target_observation_id in item.primary_observation_ids
+    )
+    catalog = compile_projection_fragment_catalog(
+        second,
+        batch,
+        access_context_hash="workspace",
+    )
+    primary_text = "\n".join(
+        fragment.presentation_text
+        for fragment in catalog.fragments
+        if fragment.primary_eligible
+    )
+    assert CURRENT_RULE in primary_text
+    assert OLD_RULE not in primary_text
 
 
 def _projection_inputs(

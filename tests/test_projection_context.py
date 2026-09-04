@@ -19,7 +19,12 @@ from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.evidence_catalog import EvidenceAuthoritySpan, EvidenceCatalog
 from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_V9
 from memforge.pipeline.memory_extractor import MemoryExtractor
-from memforge.pipeline.projection_context import plan_projection_extraction_batches
+from memforge.pipeline.projection_context import (
+    CommittedSourceUnitSnapshot,
+    ProjectionEvidencePlanningFailure,
+    plan_projection_evidence_work,
+    plan_projection_extraction_batches,
+)
 from memforge.pipeline.projection_fragments import compile_projection_fragment_catalog
 from memforge.pipeline.evidence_fragments import StructuralUnitTooLargeError
 from memforge.pipeline.source_projection_adapters import project_source_item
@@ -55,6 +60,13 @@ def _evidence_block_id(batch, observation_id: str) -> str:
     ]
     assert len(matches) == 1
     return matches[0]
+
+
+def _committed_snapshot(projection) -> CommittedSourceUnitSnapshot:
+    return CommittedSourceUnitSnapshot(
+        unit_revision=projection.source_unit_revisions[0],
+        observation_revisions=projection.observation_revisions,
+    )
 
 
 def _jira_projection(comment_count: int = 3):
@@ -332,8 +344,8 @@ def test_projection_batch_records_authority_segmentation_policy_identity() -> No
 
     assert legacy_batch.authority_policy_version == 2
     assert legacy_batch.id == "xbatch-838f89fac7f4082c"
-    assert v9_batch.authority_policy_version == 4
-    assert v9_batch.id == "xbatch-fd04fcaa54e35c3f"
+    assert v9_batch.authority_policy_version == 5
+    assert v9_batch.id == "xbatch-907c4a188b1d37bf"
 
 
 def test_many_images_use_bounded_multimodal_batches_without_losing_artifacts() -> None:
@@ -533,6 +545,256 @@ def test_default_large_page_batches_bound_primary_output_pressure() -> None:
     }
 
 
+def test_v9_incremental_markdown_authorizes_only_changed_complete_structures() -> None:
+    initial_body = """# Historical decision
+
+Keep the existing approval rule.
+
+# Current update
+
+The rollout starts on Monday.
+"""
+    target_body = initial_body.replace(
+        "The rollout starts on Monday.",
+        "The rollout starts on Tuesday.",
+    )
+    initial = _confluence_projection(initial_body)
+    target = project_source_item(
+        source_id="src-c",
+        source_type="confluence",
+        run_id="run-c-incremental",
+        item=replace(
+            ContentItem(
+                item_id="confluence-42",
+                title="Large design",
+                source_url="https://confluence.example.test/pages/42",
+                last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
+                version="7",
+                extra={"page_id": "42", "space_key": "ENG"},
+            ),
+            version="8",
+        ),
+        raw=RawContent(
+            item=ContentItem(
+                item_id="confluence-42",
+                title="Large design",
+                source_url="https://confluence.example.test/pages/42",
+                last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+                version="8",
+                extra={"page_id": "42", "space_key": "ENG"},
+            ),
+            body=target_body.encode(),
+            content_type="text/html",
+        ),
+        normalized=NormalizedContent(
+            item=ContentItem(
+                item_id="confluence-42",
+                title="Large design",
+                source_url="https://confluence.example.test/pages/42",
+                last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+                version="8",
+                extra={"page_id": "42", "space_key": "ENG"},
+            ),
+            markdown_body=target_body,
+        ),
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in initial.observation_revisions
+        },
+    )
+    batches = plan_projection_evidence_work(
+        target,
+        committed_base_snapshot=_committed_snapshot(initial),
+        reprocess_all_current_observations=False,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    catalogs = [
+        compile_projection_fragment_catalog(
+            target,
+            batch,
+            access_context_hash="incremental-authority",
+        )
+        for batch in batches
+    ]
+    primary_text = "\n".join(
+        fragment.presentation_text
+        for catalog in catalogs
+        for fragment in catalog.fragments
+        if fragment.primary_eligible
+    )
+
+    assert "The rollout starts on Tuesday." in primary_text
+    assert "Keep the existing approval rule." not in primary_text
+
+
+def test_v9_incremental_canonical_record_authorizes_only_changed_registered_field() -> None:
+    import json
+
+    initial = _jira_projection(0)
+    item = ContentItem(
+        item_id="jira-PAY-12",
+        title="Payroll",
+        source_url="https://jira.example.test/browse/PAY-12",
+        last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        version="3",
+        extra={"issue_key": "PAY-12"},
+    )
+    payload = {
+        "id": "10012",
+        "key": "PAY-12",
+        "fields": {
+            "summary": "Payroll",
+            "description": "A7 processing requires approval",
+            "status": None,
+            "priority": None,
+            "assignee": None,
+            "labels": [],
+            "resolution": None,
+            "updated": "2026-07-16T00:00:00Z",
+        },
+        "_comments": [],
+        "_comments_included": True,
+        "_comments_total": 0,
+        "changelog": {"startAt": 0, "histories": [], "total": 0},
+    }
+    target = project_source_item(
+        source_id="src-j",
+        source_type="jira",
+        run_id="run-j-field-update",
+        item=item,
+        raw=RawContent(
+            item=item,
+            body=json.dumps(payload).encode(),
+            content_type="application/json",
+        ),
+        normalized=NormalizedContent(item=item, markdown_body="normalized Jira"),
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in initial.observation_revisions
+        },
+    )
+
+    batches = plan_projection_evidence_work(
+        target,
+        committed_base_snapshot=_committed_snapshot(initial),
+        reprocess_all_current_observations=False,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    catalogs = [
+        compile_projection_fragment_catalog(
+            target,
+            batch,
+            access_context_hash="canonical-field-authority",
+        )
+        for batch in batches
+    ]
+    primary_text = [
+        fragment.presentation_text
+        for catalog in catalogs
+        for fragment in catalog.fragments
+        if fragment.primary_eligible
+    ]
+
+    assert primary_text == ["A7 processing requires approval"]
+
+
+def test_v9_incremental_nested_canonical_text_keeps_unchanged_paragraph_non_primary() -> None:
+    initial = _teams_projection(
+        (
+            "Historical context remains.\n\nRollout starts Monday.",
+            "Independent message.",
+        )
+    )
+    target = _teams_projection(
+        (
+            "Historical context remains.\n\nRollout starts Tuesday.",
+            "Independent message.",
+        ),
+        run_id="run-teams-nested-update",
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in initial.observation_revisions
+        },
+    )
+
+    batches = plan_projection_evidence_work(
+        target,
+        committed_base_snapshot=_committed_snapshot(initial),
+        reprocess_all_current_observations=False,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    catalogs = [
+        compile_projection_fragment_catalog(
+            target,
+            batch,
+            access_context_hash="nested-canonical-authority",
+        )
+        for batch in batches
+    ]
+    primary_text = "\n".join(
+        fragment.presentation_text
+        for catalog in catalogs
+        for fragment in catalog.fragments
+        if fragment.primary_eligible
+    )
+
+    assert "Rollout starts Tuesday." in primary_text
+    assert "Historical context remains." not in primary_text
+
+
+def test_v9_initial_tombstoned_message_has_no_primary_work() -> None:
+    import json
+
+    item = ContentItem(
+        item_id="teams-window-deleted",
+        title="Deleted window",
+        source_url="https://teams.example.test/conversations/conv-1",
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        version="1",
+        extra={
+            "conversation_id": "conv-1",
+            "window_id": "window-deleted",
+            "root_message_id": "msg-deleted",
+        },
+    )
+    payload = {
+        "messages": [
+            {
+                "id": "msg-deleted",
+                "content": "Obsolete decision.",
+                "deletedDateTime": "2026-07-15T10:00:00Z",
+                "time": "2026-07-15T09:00:00Z",
+            }
+        ]
+    }
+    projection = project_source_item(
+        source_id="src-teams",
+        source_type="teams",
+        run_id="run-teams-deleted-initial",
+        item=item,
+        raw=RawContent(
+            item=item,
+            body=json.dumps(payload).encode(),
+            content_type="application/json",
+        ),
+        normalized=NormalizedContent(
+            item=item,
+            markdown_body="normalized Teams window",
+        ),
+    )
+
+    batches = plan_projection_evidence_work(
+        projection,
+        reprocess_all_current_observations=False,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+
+    assert batches == ()
+
+
 def test_v9_batches_keep_one_crossing_markdown_structure_complete() -> None:
     prefix = ("Short paragraph.\n\n" * 3_100)
     code_block = "```text\n" + ("x" * 12_000) + "\n```\n"
@@ -578,6 +840,48 @@ def test_v9_rejects_one_structural_unit_larger_than_the_batch_budget() -> None:
             max_primary_chars=500,
             extraction_contract_version=PROJECTION_EXTRACTION_V9,
         )
+
+
+def test_v9_incremental_oversized_structure_returns_typed_planning_failure() -> None:
+    initial_body = "# Decision\n\n```text\nsmall\n```\n"
+    target_body = "# Decision\n\n```text\n" + ("x" * 90_000) + "\n```\n"
+    initial = _confluence_projection(initial_body)
+    target_item = ContentItem(
+        item_id="confluence-42",
+        title="Large design",
+        source_url="https://confluence.example.test/pages/42",
+        last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        version="8",
+        extra={"page_id": "42", "space_key": "ENG"},
+    )
+    target = project_source_item(
+        source_id="src-c",
+        source_type="confluence",
+        run_id="run-c-oversized-incremental",
+        item=target_item,
+        raw=RawContent(
+            item=target_item,
+            body=target_body.encode(),
+            content_type="text/html",
+        ),
+        normalized=NormalizedContent(item=target_item, markdown_body=target_body),
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision
+            for revision in initial.observation_revisions
+        },
+    )
+
+    result = plan_projection_evidence_work(
+        target,
+        committed_base_snapshot=_committed_snapshot(initial),
+        reprocess_all_current_observations=False,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+
+    assert isinstance(result, ProjectionEvidencePlanningFailure)
+    assert result.code.value == "STRUCTURAL_UNIT_TOO_LARGE"
+    assert result.representation_profile == "markdown-structural"
 
 
 def test_v9_structure_planning_keeps_commonmark_protectors_complete() -> None:
