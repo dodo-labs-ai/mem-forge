@@ -271,6 +271,8 @@ class ActiveSupportEvidence:
     role: EvidenceRole
     anchor: SourceAnchor
     excerpt: str | None
+    raw_content_sha256: str | None = None
+    presentation_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

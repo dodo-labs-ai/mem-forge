@@ -10139,6 +10139,7 @@ class Database:
                            er.anchor_kind, er.observation_id,
                            er.observation_revision_id, er.fragment_id,
                            er.range_start, er.range_end,
+                           er.raw_content_sha256, er.presentation_sha256,
                            COALESCE(er.excerpt, eu.excerpt) AS excerpt
                     FROM memory_support_assertions msa
                     JOIN evidence_references er ON er.id = msa.evidence_reference_id
@@ -10166,6 +10167,16 @@ class Database:
                             range_end=row["range_end"],
                         ),
                         excerpt=row["excerpt"],
+                        raw_content_sha256=(
+                            str(row["raw_content_sha256"])
+                            if row["raw_content_sha256"] is not None
+                            else None
+                        ),
+                        presentation_sha256=(
+                            str(row["presentation_sha256"])
+                            if row["presentation_sha256"] is not None
+                            else None
+                        ),
                     )
                 )
         return {memory_id: tuple(grouped[memory_id]) for memory_id in ids}
@@ -10179,8 +10190,12 @@ class Database:
         grouped: dict[str, list[ActiveSupportEvidence]] = {
             memory_id: [] for memory_id in memory_ids
         }
-        for offset in range(0, len(memory_ids), STORAGE_BIND_CHUNK_SIZE):
-            chunk = memory_ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+        chunk_size = max(
+            1,
+            STORAGE_BIND_CHUNK_SIZE - (1 if source_id is not None else 0),
+        )
+        for offset in range(0, len(memory_ids), chunk_size):
+            chunk = memory_ids[offset : offset + chunk_size]
             placeholders = ", ".join("?" for _ in chunk)
             params: list[object] = list(chunk)
             source_clause = ""
@@ -10192,6 +10207,7 @@ class Database:
                            er.id AS reference_id, er.role, er.anchor_kind,
                            er.observation_id, er.observation_revision_id,
                            er.fragment_id, er.range_start, er.range_end,
+                           er.raw_content_sha256, er.presentation_sha256,
                            er.excerpt
                     FROM memory_unit_support_assertions msa
                     JOIN evidence_references er
@@ -10234,6 +10250,16 @@ class Database:
                         excerpt=(
                             str(row["excerpt"])
                             if row["excerpt"] is not None
+                            else None
+                        ),
+                        raw_content_sha256=(
+                            str(row["raw_content_sha256"])
+                            if row["raw_content_sha256"] is not None
+                            else None
+                        ),
+                        presentation_sha256=(
+                            str(row["presentation_sha256"])
+                            if row["presentation_sha256"] is not None
                             else None
                         ),
                     )

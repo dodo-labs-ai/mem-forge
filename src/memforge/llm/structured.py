@@ -524,7 +524,6 @@ class MemorySupportValidationResponse(StructuredResponseModel):
     primary_ref: str | None = Field(default=None, pattern=r"^f\d{6}$")
     required_evidence: list[MemorySupportValidationRequiredEvidence] = Field(
         default_factory=list,
-        max_length=32,
     )
 
 

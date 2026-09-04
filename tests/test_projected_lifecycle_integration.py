@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 
+import memforge.memory.engine as memory_engine_module
+
 from memforge.llm.structured import (
     CandidateLedgerDecision,
     CandidateLedgerResponse,
@@ -114,6 +116,8 @@ from memforge.pipeline.projection_context import (
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
     FragmentSelectionErrorCode,
+    SupportRevalidationLimitation,
+    SupportRevalidationLimitationCode,
 )
 from memforge.pipeline.source_projection_adapters import (
     project_source_item,
@@ -4383,6 +4387,7 @@ async def test_v2_noop_revalidation_uses_bounded_fragment_refs_for_large_revisio
 
     assert stats["noop"] == 2
     assert stats["support_revalidation_work_item_count"] == 2
+    assert stats["support_revalidation_model_call_count"] == 2
     assert stats["support_revalidation_revision_index_count"] == 1
     assert stats["support_revalidation_auto_rebind_count"] == 2
     assert len(client.validation_prompts) == 2
@@ -6138,6 +6143,12 @@ async def test_v2_noop_resolves_decoded_canonical_quotes_to_raw_json_ranges(
         ]
         assert "\\n" in raw_slice
         assert '\\"A7\\"' in raw_slice
+        assert item.raw_content_sha256 == hashlib.sha256(
+            raw_slice.encode()
+        ).hexdigest()
+        assert item.presentation_sha256 == hashlib.sha256(
+            item.excerpt.encode()
+        ).hexdigest()
 
 
 @pytest.mark.asyncio
@@ -6200,7 +6211,7 @@ async def test_v2_noop_propagates_representation_compiler_contract_failure(
         ),
     )
 
-    with pytest.raises(RuntimeError, match="revalidation compiler contract"):
+    with pytest.raises(SourceUnitLifecycleExecutionError) as failure:
         await engine.prepare_and_commit_projected_lifecycle(
             projection=second,
             doc_id="confluence-123",
@@ -6220,8 +6231,121 @@ async def test_v2_noop_propagates_representation_compiler_contract_failure(
                 36,
                 tzinfo=timezone.utc,
             ),
+            lifecycle_execution_owner_id="sync-unsupported-profile:lease-1",
         )
 
+    assert failure.value.retryable is False
+    assert (
+        failure.value.runtime_bundle.event.reason_code
+        == "support_revalidation_unsupported_representation"
+    )
+    assert await db.get_active_memory_support_unit_ids(incumbent.id)
+    assert await db.list_lifecycle_reviews("src-1") == []
+
+
+@pytest.mark.parametrize(
+    ("limitation_code", "reason_code"),
+    [
+        (
+            SupportRevalidationLimitationCode.COMPILER_FAILURE,
+            "support_revalidation_compiler_failure",
+        ),
+        (
+            SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
+            "support_revalidation_capacity_exceeded",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_v2_noop_propagates_bounded_revalidation_operational_limitation(
+    db: Database,
+    monkeypatch,
+    limitation_code: SupportRevalidationLimitationCode,
+    reason_code: str,
+) -> None:
+    access_context_hash = lifecycle_access_context_hash(
+        visibility="workspace",
+        owner_user_id=None,
+        project_key="ENG",
+        repo_identifier=None,
+    )
+    first = _projection(
+        run_id=f"projection-v2-{limitation_code.value}-1",
+        body="A7 is removed.\nOld deployment note.",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db,
+        projection=first,
+        access_context_hash=access_context_hash,
+    )
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=cutover.id,
+        owner_id=f"test-v2-{limitation_code.value}",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    second = _projection(
+        run_id=f"projection-v2-{limitation_code.value}-2",
+        body="A7 is removed.\nNew deployment note.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={
+            first.observations[0].id: first.observation_revisions[0]
+        },
+    )
+    client = _SupportValidatingNoopClient(
+        incumbent.id,
+        supported=True,
+        evidence_quote="A7 is removed.",
+    )
+
+    def raise_limitation(*args, **kwargs):
+        del args, kwargs
+        raise SupportRevalidationLimitation(
+            limitation_code,
+            "bounded support revalidation cannot be prepared",
+        )
+
+    monkeypatch.setattr(
+        memory_engine_module,
+        "prepare_support_revalidation_workset",
+        raise_limitation,
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=client,
+    )
+
+    with pytest.raises(SourceUnitLifecycleExecutionError) as failure:
+        await engine.prepare_and_commit_projected_lifecycle(
+            projection=second,
+            doc_id="confluence-123",
+            raw_memories=[],
+            doc_type="design-doc",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content=second.observation_revisions[0].content,
+            update_mode="diff_guided",
+            changed_hunks="bounded support changed",
+            update_plan_stats=None,
+            source_updated_at=datetime(
+                2026,
+                7,
+                15,
+                10,
+                36,
+                tzinfo=timezone.utc,
+            ),
+            lifecycle_execution_owner_id=f"sync-{limitation_code.value}:lease-1",
+        )
+
+    assert failure.value.retryable is False
+    assert failure.value.runtime_bundle.event.reason_code == reason_code
+    assert failure.value.runtime_bundle.event.model_call_count == 0
+    assert client.validation_calls == 0
     assert await db.get_active_memory_support_unit_ids(incumbent.id)
     assert await db.list_lifecycle_reviews("src-1") == []
 
