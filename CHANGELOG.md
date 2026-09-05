@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.59 - 2026-09-05
+
+- Publish the Codex and Claude Code plugins with grouped `get_memory.evidence[]`
+  provenance. Source links, original-document locators, Evidence excerpts, and
+  Artifact locators survive response compaction.
+- Upgrade existing plugin installations and reload their MCP connections when
+  using a service that returns grouped Evidence. Earlier release tags still
+  read the removed flat `sources[]` and `evidence_artifacts[]` fields.
+
 ## 0.1.0 - Unreleased
 
 - Breaking: `get_memory` now exposes provenance only through grouped
