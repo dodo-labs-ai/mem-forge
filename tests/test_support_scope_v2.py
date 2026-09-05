@@ -425,6 +425,110 @@ async def test_report_gates_invalid_unit_revision_lineage_before_cutover_apply(d
 
 
 @pytest.mark.asyncio
+async def test_cutover_keeps_active_non_current_support_legacy_limited(db) -> None:
+    memory_id, unit_id, source_id, _access_hash = (
+        await _seed_complete_legacy_support(db)
+    )
+    now = datetime(2026, 8, 28, 8, 0, tzinfo=timezone.utc).isoformat()
+    current_text = "Release now requires three reviewers."
+    await db.db.execute(
+        """INSERT INTO source_observation_revisions (
+               id, observation_id, semantic_hash, content, metadata_json,
+               observed_at, profile_name, profile_version, coordinate_space,
+               created_at
+           ) VALUES ('obsrev-primary-2', 'obs-primary', ?, ?, '{}', ?,
+                     'markdown-structural', 1, 'unicode-scalar', ?)""",
+        (hashlib.sha256(current_text.encode()).hexdigest(), current_text, now, now),
+    )
+    await db.db.execute(
+        "UPDATE source_observations SET current_revision_id = 'obsrev-primary-2' "
+        "WHERE id = 'obs-primary'"
+    )
+    await db.db.execute(
+        """INSERT INTO source_unit_revisions (
+               id, source_unit_id, semantic_hash, access_hash,
+               observation_revision_ids_json, observed_at, created_at
+           ) VALUES ('unitrev-2', 'unit-1', 'unit-hash-2', 'access-1', ?, ?, ?)""",
+        (json.dumps(["obsrev-primary-2", "obsrev-required"]), now, now),
+    )
+    await db.db.execute(
+        "UPDATE source_units SET current_revision_id = 'unitrev-2' "
+        "WHERE id = 'unit-1'"
+    )
+    await db.db.commit()
+
+    report = await db.report_support_scope_cutover()
+
+    assert report.eligible_group_count == 0
+    assert report.ineligible_group_count == 1
+    assert report.findings[0].reason_codes == (
+        "active_support_revision_non_current",
+    )
+
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=report.id,
+        owner_id="non-current-cutover",
+    )
+
+    assert await db.get_active_memory_support_unit_ids(memory_id) == ()
+    [source_row] = await db.db.execute_fetchall(
+        "SELECT support_kind FROM memory_sources WHERE memory_id = ?",
+        (memory_id,),
+    )
+    assert source_row["support_kind"] == "legacy_limited"
+    evidence_unit = await db.get_evidence_unit(unit_id)
+    assert evidence_unit is not None
+    assert evidence_unit.evidence_provenance.value == "legacy_limited"
+
+
+@pytest.mark.asyncio
+async def test_cutover_preserves_inactive_non_current_support_as_history(db) -> None:
+    memory_id, _unit_id, _source_id, _access_hash = (
+        await _seed_complete_legacy_support(db)
+    )
+    now = datetime(2026, 8, 28, 8, 0, tzinfo=timezone.utc).isoformat()
+    await db.db.execute(
+        "UPDATE memory_support_assertions SET active = 0, removed_at = ?",
+        (now,),
+    )
+    await db.db.execute(
+        """INSERT INTO source_observation_revisions (
+               id, observation_id, semantic_hash, content, metadata_json,
+               observed_at, profile_name, profile_version, coordinate_space,
+               created_at
+           ) VALUES ('obsrev-primary-2', 'obs-primary', 'current-hash',
+                     'Release now requires three reviewers.', '{}', ?,
+                     'markdown-structural', 1, 'unicode-scalar', ?)""",
+        (now, now),
+    )
+    await db.db.execute(
+        "UPDATE source_observations SET current_revision_id = 'obsrev-primary-2' "
+        "WHERE id = 'obs-primary'"
+    )
+    await db.db.commit()
+
+    report = await db.report_support_scope_cutover()
+
+    assert report.eligible_group_count == 1
+    assert report.inactive_eligible_group_count == 1
+    assert report.ineligible_group_count == 0
+
+    await db.apply_support_scope_v2_cutover(
+        expected_report_id=report.id,
+        owner_id="inactive-history-cutover",
+    )
+
+    [support] = await db.db.execute_fetchall(
+        """SELECT active, removed_at
+             FROM memory_unit_support_assertions
+            WHERE memory_id = ?""",
+        (memory_id,),
+    )
+    assert support["active"] == 0
+    assert support["removed_at"] == now
+
+
+@pytest.mark.asyncio
 async def test_v2_lifecycle_removes_one_complete_unit_then_retires_last_support(db) -> None:
     memory_id, unit_id, source_id, access_hash = await _seed_complete_legacy_support(db)
     report = await db.report_support_scope_cutover()

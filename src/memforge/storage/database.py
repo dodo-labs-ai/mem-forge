@@ -9160,6 +9160,8 @@ class Database:
             if int(row["missing_removed_count"] or 0):
                 reasons.append("removal_time_missing")
             active = int(row["active_count"] or 0) == int(row["support_row_count"] or 0)
+            if active and int(row["non_current_reference_count"] or 0):
+                reasons.append("active_support_revision_non_current")
             snapshot_groups.append(
                 {
                     "memory_id": str(row["memory_id"]),
@@ -9167,6 +9169,9 @@ class Database:
                     "source_id": str(row["source_id"]),
                     "access_context_hash": str(row["access_context_hash"]),
                     "support_row_count": int(row["support_row_count"] or 0),
+                    "non_current_reference_count": int(
+                        row["non_current_reference_count"] or 0
+                    ),
                     "active": active,
                     "earliest_created_at": row["earliest_created_at"],
                     "latest_removed_at": row["latest_removed_at"],
@@ -9233,6 +9238,11 @@ class Database:
                       COUNT(*) AS support_row_count,
                       COUNT(DISTINCT msa.active) AS active_state_count,
                       SUM(CASE WHEN msa.active = 1 THEN 1 ELSE 0 END) AS active_count,
+                      SUM(CASE WHEN so.id IS NULL
+                                    OR so.current_revision_id IS NULL
+                                    OR er.observation_revision_id != so.current_revision_id
+                               THEN 1 ELSE 0 END)
+                          AS non_current_reference_count,
                       SUM(CASE WHEN msa.created_at IS NULL OR msa.created_at = '' THEN 1 ELSE 0 END)
                           AS missing_created_count,
                       SUM(CASE WHEN msa.active = 0 AND (
@@ -9244,6 +9254,7 @@ class Database:
                  LEFT JOIN evidence_references er ON er.id = msa.evidence_reference_id
                  LEFT JOIN evidence_units eu ON eu.id = er.evidence_unit_id
                  LEFT JOIN source_unit_revisions sur ON sur.id = eu.doc_revision_id
+                 LEFT JOIN source_observations so ON so.id = er.observation_id
                 {where}
                 GROUP BY msa.memory_id, er.evidence_unit_id, msa.source_id,
                          msa.access_context_hash, eu.source_id, eu.access_context_hash,
