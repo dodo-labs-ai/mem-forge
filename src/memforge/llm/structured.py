@@ -511,12 +511,26 @@ class MemoryRelationResponse(StructuredResponseModel):
 
 
 class RevisionAssessment(StructuredResponseModel):
-    """Independent conditions for a complete, lossless claim revision."""
+    """Conditions for revising the incumbent with the current challenger."""
 
-    same_memory_identity: bool
-    preserves_incumbent_truth: bool
-    candidate_is_canonical_composite: bool
-    current_evidence_entails_candidate: bool
+    same_knowledge_item: bool = Field(description=(
+        "The challenger continues the same independently maintained fact, rule or decision "
+        "about the same subject and concern. This is continuity through revision, not "
+        "semantic equivalence: a compatible additional requirement can keep this identity."
+    ))
+    preserves_incumbent_truth: bool = Field(description=(
+        "The challenger entails every assertion of the incumbent, including its population, "
+        "time, modality and explicit sufficiency or exclusivity."
+    ))
+    challenger_is_complete_current_claim: bool = Field(description=(
+        "The NEW challenger itself states the entire current proposition, including the "
+        "preserved old requirement and added detail, without synthesizing missing text. "
+        "Adding a requirement does not by itself make a current claim incomplete."
+    ))
+    current_evidence_entails_challenger: bool = Field(description=(
+        "The supplied current Primary AND Required Evidence entail the NEW challenger "
+        "in full, not merely the weaker incumbent."
+    ))
 
 
 class ClaimRevisionDecision(StructuredResponseModel):
