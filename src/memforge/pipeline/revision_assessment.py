@@ -34,7 +34,7 @@ from memforge.pipeline.projection_fragments import (
 )
 from memforge.source_projection import SourceObservationRevision, SourceProjection
 
-REVISION_SUPPORT_CONTRACT = "revision-support-v1"
+REVISION_SUPPORT_CONTRACT = "revision-support-v2"
 REVISION_INPUT_POLICY = "revision-input-v1"
 
 
@@ -57,7 +57,15 @@ it, including new exceptions far from its prior Evidence. Historical Evidence
 is previous support, not current authority. In delta mode, unchanged parts of
 previous valid support may be retained, subject to ALL supplied changes.
 Return supported only if the original meaning, scope, time and modality remain
-entailed. Select one current primary_ref and zero or more required_refs forming
+entailed. This is directional entailment, not equivalence or completeness of
+all requirements: a stronger requirement for the SAME population can still
+entail an earlier necessary requirement. Do not infer "sufficient", "only",
+"exactly", or "no other conditions" when the old claim does not say that.
+Conversely, a new requirement can invalidate an explicit sufficiency claim;
+a rule for only a subset does not establish a prior universal rule. Preserve
+explicit quantifiers and necessary versus sufficient modality. A counterexample
+within the old scope invalidates its universal claim, even if other cases remain
+unchanged. Select one current primary_ref and zero or more required_refs forming
 ONE complete Evidence Unit. Required may split, merge, grow or shrink; there is
 no one-to-one old/new selector requirement. They cannot hide a change to the
 claim's meaning. Use only current catalog refs, including retained current refs.
