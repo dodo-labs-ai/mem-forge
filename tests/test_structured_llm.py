@@ -1102,6 +1102,8 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
 ):
     calls: list[dict[str, object]] = []
     payloads = {
+        "RevisionSupportResponse": '{"status":"unsupported"}',
+        "ClaimRevisionResponse": '{"decisions":[]}',
         "SourceSupportResponse": '{"decisions":[]}',
             "MemoryExtractionResponse": '{"memories":[]}',
             "ProjectionMemoryExtractionResponse": '{"memories":[]}',
@@ -1140,6 +1142,8 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         )
     )
     operations = {
+        "assess_revision_support": lambda: client.assess_revision_support("prompt"),
+        "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
         "verify_source_support": lambda: client.verify_source_support("prompt"),
         "extract_memories": lambda: client.extract_memories("prompt", max_tokens=512),
             "extract_projection_memories": lambda: client.extract_projection_memories(
@@ -2320,3 +2324,28 @@ async def test_litellm_structured_client_disables_nested_litellm_retries(monkeyp
     # The adapter owns one exact logical retry budget; allowing LiteLLM to
     # retry again would multiply both the deadline and attempt telemetry.
     assert calls[0]["num_retries"] == 0
+
+
+def test_revision_input_budget_counts_complete_schema_and_output_reserve(monkeypatch):
+    from memforge.llm.structured import RevisionSupportResponse
+    client = LiteLlmStructuredClient(StructuredLlmConfig(model='openai/test', base_url=None, api_key=None, timeout_s=1,
+        max_input_tokens=10000, context_window_tokens=10000, max_output_tokens=5000, input_budget_fraction=0.8))
+    monkeypatch.setattr('memforge.llm.structured.litellm.get_model_info', lambda *a, **kw: {})
+    messages = []
+    def count(**kwargs):
+        messages.append(kwargs['messages'])
+        return 4000
+    monkeypatch.setattr('memforge.llm.structured.litellm.token_counter', count)
+    assert client.request_fits('source claim', response_format=RevisionSupportResponse, max_tokens=1000)
+    assert not client.request_fits('source claim', response_format=RevisionSupportResponse, max_tokens=5000)
+    assert 'required_refs' in str(messages)
+
+
+def test_revision_input_policy_identity_changes_with_budget_or_provider_limits(monkeypatch):
+    from dataclasses import replace
+    config = StructuredLlmConfig(model='openai/test', base_url=None, api_key=None, timeout_s=1)
+    monkeypatch.setattr('memforge.llm.structured.litellm.get_model_info', lambda *a, **kw: {})
+    original = LiteLlmStructuredClient(config).input_policy_identity
+    assert LiteLlmStructuredClient(replace(config, input_budget_fraction=0.7)).input_policy_identity != original
+    monkeypatch.setattr('memforge.llm.structured.litellm.get_model_info', lambda *a, **kw: {'max_input_tokens': 8192})
+    assert LiteLlmStructuredClient(config).input_policy_identity != original

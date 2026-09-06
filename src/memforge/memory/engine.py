@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+
+from memforge.llm.structured import StructuredLlmError
 import logging
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from time import perf_counter
@@ -35,7 +37,6 @@ from memforge.memory.candidate_ledger import (
 from memforge.memory.entity_resolver import EntityResolver
 from memforge.memory.evidence import (
     EvidenceReference,
-    EvidenceRole,
     EvidenceUnit,
     SupportScopeVersion,
 )
@@ -60,18 +61,9 @@ from memforge.memory.lifecycle_planner import (
 )
 from memforge.memory.quality import classify_memory_candidate
 from memforge.pipeline.projection_fragments import (
-    FragmentSelectionError,
-    FragmentSelectionErrorCode,
-    RevalidatedSelectionError,
-    SupportRevalidationSelection,
     SupportRevalidationLimitation,
     SupportRevalidationLimitationCode,
-    SupportRevalidationWorkset,
-    group_revalidated_support_unit,
-    prepare_support_revalidation_workset,
-    resolve_revalidated_noop_selection,
 )
-from memforge.pipeline.evidence_fragments import RevisionFragmentIndex
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.relation_classifier import (
     MEMORY_PAIR_CLASSIFIER_VERSION,
@@ -113,66 +105,6 @@ __all__ = [
     "SourceUnitLifecycleDeferred",
     "SourceUnitLifecycleExecutionError",
 ]
-
-
-MEMORY_SUPPORT_VALIDATION_PROMPT = """Determine whether the current evidence still supports the exact Memory claim.
-Return supported=true only when the claim's truth conditions remain entailed by the current
-Primary Fragment and every current Required Fragment. A change in scope, subject,
-condition, polarity, or applicability means supported=false.
-When supported=true, select exactly one supplied primary_candidates ref as primary_ref.
-Return required_evidence with every supplied selector exactly once and select exactly one
-of that selector's supplied candidate refs as evidence_ref. Preserve distinct selectors
-even when multiple Required items share one Observation. Never invent, copy, or transform
-a Fragment ref. When supported=false, return no Primary or Required selections.
-
-<case_json>
-{case_json}
-</case_json>
-"""
-
-SUPPORT_REVALIDATION_SELECTION_CORRECTION_ATTEMPTS = 1
-
-
-class _SupportRevalidationSelectionFailure(RuntimeError):
-    """Engine-local terminal failure after bounded selector correction."""
-
-    def __init__(
-        self,
-        code: FragmentSelectionErrorCode,
-        message: str,
-    ) -> None:
-        super().__init__(message)
-        self.code = code
-
-
-def _support_revalidation_correction_prompt(
-    prompt: str,
-    *,
-    workset: SupportRevalidationWorkset,
-    error: FragmentSelectionError,
-) -> str:
-    """Bind one selector correction to the same immutable workset."""
-
-    selection_contract = {
-        "previous_error": error.code.value,
-        "allowed_primary_refs": list(workset.primary_refs),
-        "required": [
-            {
-                "selector": selector,
-                "allowed_refs": list(references),
-            }
-            for selector, references in workset.required_refs_by_selector.items()
-        ],
-    }
-    return (
-        f"{prompt}\n"
-        "The previous response passed the static response schema but violated the exact "
-        "selection contract below. Return the complete semantic decision again using only "
-        "these supplied selectors and Fragment refs. Do not change or invent a ref.\n"
-        "<selection_correction>\n"
-        f"{json.dumps(selection_contract, sort_keys=True, separators=(',', ':'))}\n"
-        "</selection_correction>\n"
-    )
 
 
 class SourceUnitLifecycleExecutionError(RuntimeError):
@@ -335,10 +267,12 @@ class MemoryEngine:
         structured_llm_client: Any = None,
         llm_model: str = "claude-sonnet-4-20250514",
         runtime_event_trace_sink: RuntimeEventTraceSink | None = None,
+        document_store: Any = None,
     ) -> None:
         self.cross_document_candidates = cross_document_candidates
         self.db = db
         self.memory_store = memory_store
+        self.document_store = document_store
         self.structured_llm_client = structured_llm_client
         self.llm_model = llm_model
         self.runtime_event_trace_sink = runtime_event_trace_sink or NoOpRuntimeEventTraceSink()
@@ -529,347 +463,6 @@ class MemoryEngine:
             if protected_source_observation_ids.intersection(observation_ids)
         )
 
-    async def _validate_support_revalidation_workset(
-        self,
-        *,
-        validator: Any,
-        prompt: str,
-        workset: SupportRevalidationWorkset,
-        metrics: MutableMapping[str, int],
-    ) -> tuple[Any, SupportRevalidationSelection | None]:
-        """Resolve one workset without replaying the surrounding lifecycle work."""
-
-        current_prompt = prompt
-        max_output_tokens = workset.model_max_output_tokens()
-        total_attempts = 1 + SUPPORT_REVALIDATION_SELECTION_CORRECTION_ATTEMPTS
-        last_error: FragmentSelectionError | None = None
-        for attempt in range(total_attempts):
-            metrics["support_revalidation_prompt_chars"] += len(current_prompt)
-            metrics["support_revalidation_model_call_count"] += 1
-            validation = await validator(
-                current_prompt,
-                max_tokens=max_output_tokens,
-                model=self.llm_model,
-            )
-            if not validation.supported:
-                return validation, None
-            try:
-                returned_required_by_selector = {
-                    item.selector: item.evidence_ref
-                    for item in validation.required_evidence
-                }
-                if len(returned_required_by_selector) != len(
-                    validation.required_evidence
-                ):
-                    raise FragmentSelectionError(
-                        FragmentSelectionErrorCode.INVALID_SELECTION,
-                        "support validation returned duplicate Required selectors",
-                    )
-                return validation, workset.resolve_model_selection(
-                    primary_ref=validation.primary_ref,
-                    required_refs_by_selector=returned_required_by_selector,
-                )
-            except FragmentSelectionError as exc:
-                last_error = exc
-                if attempt + 1 >= total_attempts:
-                    break
-                current_prompt = _support_revalidation_correction_prompt(
-                    prompt,
-                    workset=workset,
-                    error=exc,
-                )
-        if last_error is None:  # pragma: no cover - loop always validates once
-            raise RuntimeError("support validation ended without a selection result")
-        raise _SupportRevalidationSelectionFailure(
-            last_error.code,
-            "support validation exhausted bounded Fragment selection correction",
-        ) from last_error
-
-    async def _rebind_noop_evidence_to_current_revision(
-        self,
-        *,
-        operations: tuple[ReconcileOperation, ...],
-        incumbents: dict[str, Memory],
-        unit_support: Mapping[str, tuple[str, ...]],
-        projection: SourceProjection,
-        access_context_hash: str,
-        revalidation_stats: MutableMapping[str, int] | None = None,
-        protected_memory_ids: frozenset[str] = frozenset(),
-    ) -> tuple[ReconcileOperation, ...]:
-        """Carry an exact, still-present claim forward without re-extracting it.
-
-        Incremental extraction intentionally sees only changed ranges. A NOOP
-        for an incumbent therefore may not contain a new candidate. If its
-        supporting Observation was revised, prove the old exact excerpt still
-        exists in that same stable Observation and stage a current-revision
-        reference. Missing or ambiguous evidence fails closed through the
-        existing lifecycle Review gate rather than failing the whole Source
-        Unit.
-        """
-
-        current_revisions = {revision.observation_id: revision for revision in projection.observation_revisions}
-        metrics = revalidation_stats if revalidation_stats is not None else {}
-        for key in (
-            "support_revalidation_work_item_count",
-            "support_revalidation_model_call_count",
-            "support_revalidation_revision_index_count",
-            "support_revalidation_prompt_chars",
-            "support_revalidation_auto_rebind_count",
-        ):
-            metrics.setdefault(key, 0)
-        revision_indexes_by_id: dict[str, RevisionFragmentIndex] = {}
-        v2 = await self.db.get_support_scope_version() is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-        rebound: list[ReconcileOperation] = []
-        for operation in operations:
-            if (
-                operation.action is not ReconcileAction.NOOP
-                or operation.memory_id is None
-                or operation.memory is not None
-                or operation.memory_id in protected_memory_ids
-            ):
-                rebound.append(operation)
-                continue
-            source_support = await self.db.get_active_memory_support_evidence(
-                operation.memory_id,
-                source_id=projection.source_id,
-            )
-            scoped_reference_ids = frozenset(unit_support.get(operation.memory_id, ()))
-            support = tuple(
-                item
-                for item in source_support
-                if (
-                    item.evidence_unit_id in scoped_reference_ids
-                    if v2
-                    else item.reference_id in scoped_reference_ids
-                )
-            )
-            missing_dependencies = [item for item in support if item.anchor.observation_id not in current_revisions]
-            if missing_dependencies and projection.coverage.proves_absence:
-                rebound.append(
-                    ReconcileOperation(
-                        action=ReconcileAction.DELETE,
-                        memory_id=operation.memory_id,
-                        reason=("current Source Projection removed an exact supporting Observation"),
-                        flag_for_review=True,
-                    )
-                )
-                continue
-            stale = [
-                item
-                for item in support
-                if item.anchor.observation_id in current_revisions
-                and current_revisions[item.anchor.observation_id].id != item.anchor.observation_revision_id
-            ]
-            if not stale:
-                rebound.append(operation)
-                continue
-            if v2:
-                try:
-                    support = group_revalidated_support_unit(support)
-                except RevalidatedSelectionError as exc:
-                    rebound.append(
-                        ReconcileOperation(
-                            action=ReconcileAction.DELETE,
-                            memory_id=operation.memory_id,
-                            reason=(
-                                "revised Evidence Unit could not be exactly "
-                                "recompiled from the current Source Projection: "
-                                f"{exc.code.value}"
-                            ),
-                            flag_for_review=True,
-                        )
-                    )
-                    continue
-            primary = [item for item in support if item.role is EvidenceRole.PRIMARY]
-            if len(primary) != 1:
-                raise RuntimeError(f"NOOP incumbent lacks exactly one PRIMARY dependency: {operation.memory_id}")
-            selected = primary[0]
-            primary_needs_validation = selected in stale and (
-                v2
-                or not selected.excerpt
-                or selected.excerpt
-                not in current_revisions[
-                    selected.anchor.observation_id
-                ].content
-            )
-            required_observation_ids = sorted(
-                {item.anchor.observation_id for item in support if item.role is EvidenceRole.REQUIRED}
-            )
-            incumbent = incumbents[operation.memory_id]
-            stale_required = [item for item in stale if item.role is EvidenceRole.REQUIRED]
-            ordered_required = tuple(
-                sorted(
-                    (
-                        item
-                        for item in support
-                        if item.role is EvidenceRole.REQUIRED
-                    ),
-                    key=lambda item: item.reference_id,
-                )
-            )
-            required_selector_by_reference_id = {
-                item.reference_id: f"r{index:06d}"
-                for index, item in enumerate(ordered_required, start=1)
-            }
-            support_validation: dict[str, object] = {}
-            current_primary_quote = selected.excerpt or ""
-            current_required_quotes_by_reference_id = {
-                item.reference_id: item.excerpt or ""
-                for item in ordered_required
-            }
-            if primary_needs_validation or stale_required:
-                try:
-                    workset = prepare_support_revalidation_workset(
-                        projection,
-                        support=support,
-                        required_selector_by_reference_id=(required_selector_by_reference_id),
-                        revision_indexes_by_id=revision_indexes_by_id,
-                        memory_claim=incumbent.content,
-                    )
-                except RevalidatedSelectionError as exc:
-                    rebound.append(
-                        ReconcileOperation(
-                            action=ReconcileAction.DELETE,
-                            memory_id=operation.memory_id,
-                            reason=(
-                                f"revised Evidence Unit could not be bounded to current Fragments: {exc.code.value}"
-                            ),
-                            flag_for_review=True,
-                        )
-                    )
-                    continue
-                validator = getattr(
-                    self.structured_llm_client,
-                    "validate_memory_support",
-                    None,
-                )
-                if validator is None:
-                    raise RuntimeError(f"revised evidence needs structured semantic validation: {operation.memory_id}")
-                current_primary = current_revisions.get(selected.anchor.observation_id)
-                if current_primary is None:
-                    raise RuntimeError(
-                        f"NOOP incumbent current PRIMARY observation is unavailable: {operation.memory_id}"
-                    )
-                workset_payload = workset.model_payload()
-                required_candidates = {
-                    str(item["selector"]): item["candidates"] for item in workset_payload["required"]
-                }
-                prompt = MEMORY_SUPPORT_VALIDATION_PROMPT.format(
-                    case_json=json.dumps(
-                        {
-                            "memory_claim": incumbent.content,
-                            "previous_primary_quote": selected.excerpt,
-                            "primary_candidates": workset_payload["primary_candidates"],
-                            "required": [
-                                {
-                                    "selector": (required_selector_by_reference_id[item.reference_id]),
-                                    "observation_id": item.anchor.observation_id,
-                                    "previous_quote": item.excerpt,
-                                    "candidates": required_candidates[
-                                        required_selector_by_reference_id[item.reference_id]
-                                    ],
-                                }
-                                for item in ordered_required
-                            ],
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    )
-                )
-                metrics["support_revalidation_work_item_count"] += 1
-                validation, model_selection = (
-                    await self._validate_support_revalidation_workset(
-                        validator=validator,
-                        prompt=prompt,
-                        workset=workset,
-                        metrics=metrics,
-                    )
-                )
-                support_validation = {
-                    "method": "structured_classifier",
-                    "model": self.llm_model,
-                    "supported": bool(validation.supported),
-                    "reason": validation.reason,
-                    "primary_observation_id": selected.anchor.observation_id,
-                    "required_observation_ids": sorted(item.anchor.observation_id for item in stale_required),
-                }
-                if not validation.supported:
-                    rebound.append(
-                        ReconcileOperation(
-                            action=ReconcileAction.DELETE,
-                            memory_id=operation.memory_id,
-                            reason=(f"revised REQUIRED evidence no longer validates claim: {validation.reason}"),
-                            flag_for_review=True,
-                        )
-                    )
-                    continue
-                if model_selection is None:  # pragma: no cover - guarded by supported result
-                    raise _SupportRevalidationSelectionFailure(
-                        FragmentSelectionErrorCode.INVALID_SELECTION,
-                        "supported validation did not resolve a Fragment selection",
-                    )
-                current_primary_quote = model_selection.primary.presentation_text
-                current_required_quotes_by_reference_id.update(
-                    {
-                        reference_id: fragment.presentation_text
-                        for reference_id, fragment in (model_selection.fragments_by_evidence_reference_id.items())
-                        if reference_id != workset.primary_reference_id
-                    }
-                )
-                metrics["support_revalidation_auto_rebind_count"] += 1
-            else:
-                model_selection = None
-            resolved_selection = None
-            if v2:
-                try:
-                    resolved_selection = resolve_revalidated_noop_selection(
-                        projection,
-                        support=support,
-                        access_context_hash=access_context_hash,
-                        current_primary_quote=current_primary_quote,
-                        current_required_quotes_by_reference_id=(current_required_quotes_by_reference_id),
-                        selected_fragments_by_reference_id=(
-                            model_selection.fragments_by_evidence_reference_id if model_selection is not None else None
-                        ),
-                        revision_indexes_by_id=revision_indexes_by_id,
-                    )
-                except RevalidatedSelectionError as exc:
-                    rebound.append(
-                        ReconcileOperation(
-                            action=ReconcileAction.DELETE,
-                            memory_id=operation.memory_id,
-                            reason=(
-                                "revised Evidence Unit could not be exactly "
-                                "recompiled from the current Source Projection: "
-                                f"{exc.code.value}"
-                            ),
-                            flag_for_review=True,
-                        )
-                    )
-                    continue
-            rebound.append(
-                ReconcileOperation(
-                    action=operation.action,
-                    memory_id=operation.memory_id,
-                    memory=RawMemory(
-                        content=incumbent.content,
-                        memory_type=incumbent.memory_type,
-                        confidence=incumbent.confidence,
-                        extraction_context=current_primary_quote,
-                        evidence_quote=current_primary_quote,
-                        evidence_anchor="revalidated_noop",
-                        source_observation_id=selected.anchor.observation_id,
-                        required_source_observation_ids=required_observation_ids,
-                        resolved_evidence_selection=resolved_selection,
-                        support_validation=support_validation,
-                    ),
-                    reason=operation.reason,
-                    flag_for_review=operation.flag_for_review,
-                )
-            )
-        metrics["support_revalidation_revision_index_count"] = len(revision_indexes_by_id)
-        return tuple(rebound)
-
     async def prepare_and_commit_projected_lifecycle(
         self,
         *,
@@ -937,6 +530,8 @@ class MemoryEngine:
             ):
                 raise
             delta = projection.deltas[0]
+            from memforge.pipeline.reconciler import ReconciliationContractError
+
             support_limitation_reason = (
                 {
                     SupportRevalidationLimitationCode.UNSUPPORTED_REPRESENTATION: (
@@ -956,6 +551,7 @@ class MemoryEngine:
                 "authority_plan_stale"
                 if isinstance(exc, AuthorityPlanStaleError)
                 else support_limitation_reason
+                or (exc.reason_code if isinstance(exc, ReconciliationContractError) else None)
                 or {
                     "candidate_admission": "candidate_admission_failed",
                     "reconciliation": "reconciliation_failed",
@@ -987,15 +583,15 @@ class MemoryEngine:
                 review_count=0,
                 model_call_count=runtime_context.model_call_count,
                 deployment_revision=current_deployment_revision(),
+                operation="assess_revision_support" if runtime_context.stage == "support_revalidation" else None,
                 terminal_category=(
                     "invalid_response"
-                    if isinstance(exc, _SupportRevalidationSelectionFailure)
-                    else None
+                    if isinstance(exc, ReconciliationContractError)
+                    else (exc.terminal_category if isinstance(exc, StructuredLlmError) else None)
                 ),
                 error_code=(
-                    exc.code.value
-                    if isinstance(exc, _SupportRevalidationSelectionFailure)
-                    else None
+                    (exc.reason_code if isinstance(exc, ReconciliationContractError) else
+                          exc.error_code if isinstance(exc, StructuredLlmError) else None)
                 ),
             )
             raise SourceUnitLifecycleExecutionError(
@@ -1006,9 +602,9 @@ class MemoryEngine:
                     (
                         ProjectedSupportInvariantError,
                         SupportRevalidationLimitation,
-                        _SupportRevalidationSelectionFailure,
+                        ReconciliationContractError,
                     ),
-                ),
+                ) and getattr(exc, "retryable", True) and not (isinstance(exc, StructuredLlmError) and exc.terminal_category == "invalid_response"),
             ) from exc
 
     async def _materialize_prepared_projected_plan(
@@ -1465,6 +1061,7 @@ class MemoryEngine:
             changed_hunks=changed_hunks,
             update_plan_stats=update_plan_stats,
             llm_model=self.llm_model,
+            input_policy_identity=getattr(self.structured_llm_client, "input_policy_identity", None),
         )
         _runtime_context.operation_input_hash = operation_input_hash
         _runtime_context.incumbent_count = len(incumbents)
@@ -1500,22 +1097,30 @@ class MemoryEngine:
             protected_source_observation_ids=frozenset(protected_source_observation_ids),
         )
         incumbent_impacts: dict[str, ImpactResult] = {}
-        needs_incumbent_impacts = projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION or (
-            not filtered_memories and bool(document_content.strip())
-        )
-        if needs_incumbent_impacts:
+        if projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION:
             incumbent_impacts = await self._projected_incumbent_impacts(
                 projection=projection,
                 incumbent_ids=frozenset(memory.id for memory in incumbents),
                 unit_support=unit_support,
             )
+        visibility, owner_user_id = await memory_visibility_for_source_id(self.db, source_id=projection.source_id)
+        if visibility == "private" and user_id is not None and user_id != owner_user_id:
+            raise PermissionError("private projected lifecycle actor does not own the document")
+        access_context_hash = lifecycle_access_context_hash(
+            visibility=visibility, owner_user_id=owner_user_id,
+            project_key=project_key, repo_identifier=repo_identifier,
+        )
+        support_audits = []
+        assessed_evidence: dict[str, list[RawMemory]] = {}
+        assessment_image_loader = None
         model_incumbent_count = 0
         deterministic_disjoint_keep_count = 0
         model_batch_count = 0
         structured_llm_call_count = 0
         structured_llm_elapsed_ms = 0
         bounded_reconciliation_elapsed_ms = 0
-        if not document_content.strip() and not filtered_memories:
+        from memforge.pipeline.projection_images import projection_inference_image_observation_ids
+        if not document_content.strip() and not filtered_memories and not projection_inference_image_observation_ids(projection):
             operations = tuple(
                 ReconcileOperation(
                     action=ReconcileAction.DELETE,
@@ -1530,13 +1135,7 @@ class MemoryEngine:
                 for memory in sorted(incumbents, key=lambda item: item.id)
             )
         else:
-            deterministic_disjoint_ids = (
-                frozenset(
-                    memory_id for memory_id, impact in incumbent_impacts.items() if impact is ImpactResult.DISJOINT
-                )
-                if not filtered_memories
-                else frozenset()
-            )
+            deterministic_disjoint_ids = frozenset()
             model_incumbents = [
                 memory
                 for memory in incumbents
@@ -1546,6 +1145,80 @@ class MemoryEngine:
             deterministic_disjoint_keep_count = len(deterministic_disjoint_ids)
             if model_incumbents and not self.structured_llm_client:
                 raise RuntimeError("complete lifecycle reconciliation requires an LLM client")
+            if model_incumbents:
+                from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+                from memforge.pipeline.projection_images import load_projection_images, projection_inference_image_observation_ids
+                from memforge.pipeline.reconciler import SupportAuditEntry, ReconciliationContractError
+
+                def assessment_image_loader(ids):
+                    if self.document_store is None:
+                        raise SupportRevalidationLimitation(
+                            SupportRevalidationLimitationCode.UNSUPPORTED_REPRESENTATION,
+                            "revision assessment requires the Artifact store",
+                        )
+                    return load_projection_images(
+                        projection=projection, observation_ids=ids, document_store=self.document_store,
+                    )
+                base = await self.db.get_current_source_unit_projection(scope.source_unit_id)
+                if base is not None and base.source_unit_revisions[0].id not in {scope.base_unit_revision_id, scope.target_unit_revision_id}:
+                    raise AuthorityPlanStaleError("revision assessment base changed")
+                assessment_context = RevisionAssessmentContext(
+                    projection=projection, base=base, access_context_hash=access_context_hash, image_loader=assessment_image_loader,
+                )
+                contexts_by_revision = {base.source_unit_revisions[0].id: assessment_context} if base else {}
+                evidence_by_memory = await self.db.get_active_memory_support_evidence_many(
+                    tuple(memory.id for memory in model_incumbents), source_id=projection.source_id,
+                )
+                for memory in model_incumbents:
+                    groups: dict[str, list] = {}
+                    for item in evidence_by_memory.get(memory.id, ()):
+                        scoped_id = item.evidence_unit_id if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2 else item.reference_id
+                        if scoped_id in unit_support.get(memory.id, ()):
+                            groups.setdefault(item.evidence_unit_id, []).append(item)
+                    if not groups:
+                        raise ReconciliationContractError("revision_support_missing", "incumbent has no complete scoped support")
+                    results = []
+                    for evidence_unit_id, support in groups.items():
+                        unit = await self.db.get_evidence_unit(evidence_unit_id)
+                        context = assessment_context
+                        if unit and unit.doc_revision_id and (base is None or unit.doc_revision_id != base.source_unit_revisions[0].id):
+                            context = contexts_by_revision.get(unit.doc_revision_id)
+                            if context is None:
+                                historical = await self.db.get_source_projection(unit.extractor_run_id) if unit.extractor_run_id else None
+                                if historical is not None and (
+                                    historical.source_id != projection.source_id
+                                    or len(historical.source_unit_revisions) != 1
+                                    or historical.source_unit_revisions[0].source_unit_id != scope.source_unit_id
+                                    or historical.source_unit_revisions[0].id != unit.doc_revision_id
+                                ):
+                                    raise ReconciliationContractError("revision_support_baseline_invalid", "Support baseline provenance does not match")
+                                context = RevisionAssessmentContext(
+                                    projection=projection, base=historical, access_context_hash=access_context_hash,
+                                    image_loader=assessment_image_loader, indexes=assessment_context.indexes,
+                                )
+                                contexts_by_revision[unit.doc_revision_id] = context
+                        calls_before, chars_before = context.model_calls, context.prompt_chars
+                        stats["support_revalidation_work_item_count"] += 1
+                        try:
+                            _runtime_context.stage = "support_revalidation"
+                            assessed = await context.assess(
+                                memory=memory, support=tuple(support), client=self.structured_llm_client, model=self.llm_model,
+                            )
+                        finally:
+                            calls = context.model_calls - calls_before
+                            stats["support_revalidation_model_call_count"] += calls
+                            stats["support_revalidation_prompt_chars"] += context.prompt_chars - chars_before
+                            _runtime_context.model_call_count += calls
+                        results.append(assessed)
+                        stats["support_revalidation_auto_rebind_count"] += int(assessed.supported)
+                    current = [result.memory for result in results if result.supported and result.memory is not None]
+                    assessed_evidence[memory.id] = current
+                    support_audits.append(SupportAuditEntry(
+                        incumbent_id=memory.id, supported=bool(current),
+                        reason="; ".join(dict.fromkeys(result.reason for result in results)),
+                    ))
+                stats["support_revalidation_revision_index_count"] = len(assessment_context.indexes)
+            _runtime_context.stage = "reconciliation"
             result = await reconcile_memories(
                 new_extractions=filtered_memories,
                 existing_memories=model_incumbents,
@@ -1557,6 +1230,8 @@ class MemoryEngine:
                 changed_hunks=changed_hunks,
                 update_plan_stats=update_plan_stats,
                 include_metadata=True,
+                support_audits=support_audits,
+                image_loader=assessment_image_loader,
             )
             if not isinstance(result, ReconciliationResult):
                 raise TypeError("metadata reconciliation must return ReconciliationResult")
@@ -1604,21 +1279,15 @@ class MemoryEngine:
                     relation_pair_count=result.metrics.relation_pair_count,
                     mutation_count=0,
                     review_count=0,
-                    model_call_count=(
-                        candidate_ledger.structured_llm_calls
-                        + result.metrics.structured_llm_calls
-                    ),
+                    model_call_count=_runtime_context.model_call_count,
                     deployment_revision=current_deployment_revision(),
                 )
-                raise SourceUnitLifecycleExecutionError(message, failure_bundle)
-            operations = tuple(result.operations) + tuple(
-                ReconcileOperation(
-                    action=ReconcileAction.NOOP,
-                    memory_id=memory_id,
-                    reason=("Revision Delta proves the incumbent evidence is disjoint"),
+                raise SourceUnitLifecycleExecutionError(
+                    message, failure_bundle,
+                    retryable=result.failure.terminal_category in {"provider_error", "deadline_exceeded"},
+                    commit_attempted=False,
                 )
-                for memory_id in sorted(deterministic_disjoint_ids)
-            )
+            operations = tuple(result.operations)
             operations += tuple(
                 ReconcileOperation(
                     action=ReconcileAction.DELETE,
@@ -1689,35 +1358,13 @@ class MemoryEngine:
                     "complete lifecycle reconciliation produced an unsafe Memory candidate: "
                     f"{quality.skip_reason or 'quality_rejected'}"
                 )
-        visibility, owner_user_id = await memory_visibility_for_source_id(
-            self.db,
-            source_id=projection.source_id,
-        )
-        if visibility == "private" and user_id is not None and user_id != owner_user_id:
-            raise PermissionError("private projected lifecycle actor does not own the document")
-        access_context_hash = lifecycle_access_context_hash(
-            visibility=visibility,
-            owner_user_id=owner_user_id,
-            project_key=project_key,
-            repo_identifier=repo_identifier,
-        )
         incumbents_by_id = {memory.id: memory for memory in incumbents}
-        _runtime_context.stage = "support_revalidation"
-        revalidation_calls_before = stats["support_revalidation_model_call_count"]
-        try:
-            operations = await self._rebind_noop_evidence_to_current_revision(
-                operations=operations,
-                incumbents=incumbents_by_id,
-                unit_support=unit_support,
-                projection=projection,
-                access_context_hash=access_context_hash,
-                revalidation_stats=stats,
-                protected_memory_ids=derivation_protected_ids,
-            )
-        finally:
-            _runtime_context.model_call_count += (
-                stats["support_revalidation_model_call_count"] - revalidation_calls_before
-            )
+        operations = tuple(
+            replace(operation, memory=assessed_evidence[operation.memory_id][0])
+            if operation.action is ReconcileAction.NOOP and assessed_evidence.get(operation.memory_id)
+            else operation
+            for operation in operations
+        )
         _runtime_context.stage = "plan_construction"
         corroboration_targets: dict[str, Memory] = {}
         corroboration_proofs: dict[str, dict[str, object]] = {}
@@ -1835,6 +1482,9 @@ class MemoryEngine:
             corroboration_proofs[claim_hash] = dict(equivalence_proof)
             attached_target_ids.append(target.id)
         evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
+        for operation in operations:
+            if operation.action is ReconcileAction.NOOP:
+                evidence_memories.extend(assessed_evidence.get(operation.memory_id, [])[1:])
         projected_evidence = build_projected_claim_evidence(
             projection=projection,
             raw_memories=evidence_memories,
@@ -2315,10 +1965,13 @@ def _source_lifecycle_operation_input_hash(
     changed_hunks: str | None,
     update_plan_stats: Mapping[str, Any] | None,
     llm_model: str,
+    input_policy_identity: str | None = None,
 ) -> str:
     """Digest the exact reconciliation manifest without persisting source content."""
 
     manifest = {
+        "semantic_contract": "revision-support-v1/claim-revision-v1/revision-input-v1",
+        "input_policy_identity": input_policy_identity,
         "projection_identity_hash": source_derivation_projection_identity_hash(projection),
         "candidates": [
             {

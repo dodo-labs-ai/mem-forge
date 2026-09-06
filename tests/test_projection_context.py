@@ -745,7 +745,8 @@ def test_v9_incremental_nested_canonical_text_keeps_unchanged_paragraph_non_prim
     assert "Historical context remains." not in primary_text
 
 
-def test_v9_initial_tombstoned_message_has_no_primary_work() -> None:
+@pytest.mark.parametrize("reprocess", [False, True])
+def test_v9_initial_tombstoned_message_has_no_primary_work(reprocess) -> None:
     import json
 
     item = ContentItem(
@@ -788,7 +789,7 @@ def test_v9_initial_tombstoned_message_has_no_primary_work() -> None:
 
     batches = plan_projection_evidence_work(
         projection,
-        reprocess_all_current_observations=False,
+        reprocess_all_current_observations=reprocess,
         extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
 

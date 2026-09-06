@@ -422,6 +422,7 @@ def _authority_plan_identity(
         "access_context_hash": request.access_context_hash,
         "source_activity_epoch": request.context.source_activity_epoch,
         "inference_capability_hash": request.inference_capability_hash,
+        "semantic_input_policy": "revision-input-v1",
         "authority_policy_version": (
             PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
         ),

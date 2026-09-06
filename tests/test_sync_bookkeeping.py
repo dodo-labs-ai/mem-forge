@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from memforge.pipeline.revision_assessment import revision_inference_capability_hash
+
 import asyncio
 import gc
 import hashlib
@@ -65,9 +67,6 @@ from memforge.models import (
 )
 from memforge.pipeline.sync_memory import MemorySample, SyncMemoryObserver
 from memforge.pipeline.source_projection_adapters import project_source_item
-from memforge.pipeline.projection_images import (
-    projection_inference_capability_hash,
-)
 from memforge.source_projection import (
     ProjectionScopeAttestation,
     ProjectionScopeTransition,
@@ -5437,6 +5436,7 @@ async def _stage_completed_v9_recovery_attempt(
     db: Database,
     *,
     source_id: str,
+    client=None,
 ) -> SourceDerivationAttempt:
     await db.upsert_source(
         id=source_id,
@@ -5527,7 +5527,7 @@ async def _stage_completed_v9_recovery_attempt(
                 repo_identifier=None,
             ),
             inference_capability_hash=(
-                projection_inference_capability_hash()
+                revision_inference_capability_hash(client)
             ),
         )
     )
@@ -12490,7 +12490,6 @@ async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fail
 @pytest.mark.parametrize("failure_mode", ["provider_error", "invalid_response", "deadline_exceeded"])
 async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: Database, monkeypatch, failure_mode):
     source_id = "src-recovery-llm-summary"
-    attempt = await _stage_completed_v9_recovery_attempt(db, source_id=source_id)
 
     async def unavailable(**kwargs):
         if failure_mode == "invalid_response":
@@ -12518,6 +12517,8 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
             num_retries=0,
         )
     )
+
+    attempt = await _stage_completed_v9_recovery_attempt(db, source_id=source_id, client=client)
 
     class AuditingEngine(NoopMemoryEngine):
         async def prepare_and_commit_projected_lifecycle(self, **kwargs):

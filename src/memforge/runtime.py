@@ -137,6 +137,11 @@ class EffectiveLlmConfig:
     embedding_base_url: str
     embedding_api_key: str
 
+    max_input_tokens: int = 32768
+    context_window_tokens: int = 65536
+    max_output_tokens: int = 32768
+    input_budget_fraction: float = 0.8
+
 
 @dataclass
 class SyncRuntime:
@@ -280,6 +285,10 @@ class DefaultRuntimeProvider:
                 api_key=llm.enrichment_api_key or None,
                 timeout_s=llm.request_timeout_s,
                 max_concurrent=max_concurrent,
+                max_input_tokens=llm.max_input_tokens,
+                context_window_tokens=llm.context_window_tokens,
+                max_output_tokens=llm.max_output_tokens,
+                input_budget_fraction=llm.input_budget_fraction,
             )
         )
 
@@ -387,6 +396,10 @@ async def get_effective_llm_config(db: "Database", config: AppConfig) -> Effecti
         enrichment_base_url=value("enrichment_base_url", config.llm.enrichment_base_url),
         enrichment_api_key=value("enrichment_api_key", config.llm.enrichment_api_key),
         request_timeout_s=config.llm.request_timeout_s,
+        max_input_tokens=config.llm.max_input_tokens,
+        context_window_tokens=config.llm.context_window_tokens,
+        max_output_tokens=config.llm.max_output_tokens,
+        input_budget_fraction=config.llm.input_budget_fraction,
         embedding_model=value("embedding_model", config.llm.embedding_model),
         embedding_base_url=value("embedding_base_url", config.llm.embedding_base_url),
         embedding_api_key=value("embedding_api_key", config.llm.embedding_api_key),
@@ -677,6 +690,7 @@ def _build_default_sync_runtime(
             vector=adapters.vector,
         ),
         db=db,
+        document_store=doc_store,
         memory_store=memory_store,
         embed_cfg=embed_cfg,
         structured_llm_client=structured_llm_client,

@@ -548,6 +548,7 @@ async def test_missing_v9_authority_base_is_durable_and_skips_the_llm(
         == "INCREMENTAL_BASE_UNAVAILABLE"
     )
     assert result.derivation.authority_plan_identity == {
+        "semantic_input_policy": "revision-input-v1",
         "access_context_hash": "access-unmappable-authority",
         "authority_policy_version": 5,
         "base_unit_revision_id": initial.source_unit_revisions[0].id,

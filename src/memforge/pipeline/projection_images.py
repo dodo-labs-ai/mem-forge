@@ -21,6 +21,7 @@ class ProjectionImageLoadError(ValueError):
     def __init__(self, *, error_code: str) -> None:
         super().__init__(error_code)
         self.error_code = error_code
+        self.retryable = error_code == "artifact_unavailable"
 
 
 PROJECTION_IMAGE_INFERENCE_CAPABILITY_VERSION = 1
@@ -91,7 +92,7 @@ def load_projection_images(
     )
     current_revision_ids = set(projection.source_unit_revisions[0].observation_revision_ids)
     source_unit_id = projection.source_units[0].id
-    images: list[StructuredLlmImage] = []
+    artifacts = []
     total_bytes = 0
     for revision in projection.observation_revisions:
         if revision.id not in current_revision_ids or revision.observation_id not in admitted_ids:
@@ -108,6 +109,9 @@ def load_projection_images(
         total_bytes += artifact.size_bytes
         if total_bytes > MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH:
             raise ProjectionImageLoadError(error_code="image_batch_too_large")
+        artifacts.append((revision, artifact))
+    images: list[StructuredLlmImage] = []
+    for revision, artifact in artifacts:
         try:
             body = document_store.read_artifact(artifact.uri)
         except Exception as exc:
