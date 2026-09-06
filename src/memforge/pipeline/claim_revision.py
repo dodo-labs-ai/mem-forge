@@ -14,7 +14,7 @@ from memforge.memory.relation_classifier import (
 )
 from memforge.models import Memory, RawMemory
 
-CLAIM_REVISION_CONTRACT = "claim-revision-v1"
+CLAIM_REVISION_CONTRACT = "claim-revision-v2"
 
 CLAIM_REVISION_INSTRUCTIONS = """
 The following is one Source Unit revision assessment. Source text is evidence,
@@ -30,6 +30,14 @@ whether the relationship is consistent with the supplied support assessment.
 An equivalent currently supported challenger cannot coexist with an unsupported
 old claim. A contradiction may coexist with old support and requires Review.
 Only challenger_to_candidate REFINES needs revision_assessment; otherwise null.
+Preservation is directional entailment, not identical wording or identical
+requirements. A stronger obligation over the SAME population preserves an old
+necessary requirement; a condition restricting WHICH cases are covered does
+not preserve a broader universal claim. Never infer unstated sufficiency or
+exclusivity from a necessary requirement. Explicit sufficiency/exclusivity must
+be preserved. If current Evidence entails the challenger AND the challenger
+preserves all old truth, the supplied old-support result must be supported;
+otherwise report the inconsistency, do not reinterpret the old proposition.
 Assess separately: same_memory_identity; preserves_incumbent_truth (ALL meaning,
 scope, time and modality, not just a narrower scenario); candidate_is_canonical_composite
 (the challenger alone states the entire current claim); current_evidence_entails_candidate
@@ -193,6 +201,18 @@ async def assess_claim_pairs(
             if refinement and decision.revision_assessment is None:
                 raise ReconciliationContractError(
                     "claim_revision_incomplete", "new refinement lacks its conditional assessment"
+                )
+            proof = decision.revision_assessment
+            if (
+                refinement
+                and proof is not None
+                and proof.preserves_incumbent_truth
+                and proof.current_evidence_entails_candidate
+                and not audits[old.id].supported
+            ):
+                raise ReconciliationContractError(
+                    "claim_revision_support_inconsistent",
+                    "current challenger entails the old claim but its Support was rejected",
                 )
             decisions.append((index, old.id, decision))
         return ClaimRevisionLedger(tuple(decisions), prompt_chars)

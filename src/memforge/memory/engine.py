@@ -1969,8 +1969,12 @@ def _source_lifecycle_operation_input_hash(
 ) -> str:
     """Digest the exact reconciliation manifest without persisting source content."""
 
+    from memforge.pipeline.claim_revision import CLAIM_REVISION_CONTRACT
+    from memforge.pipeline.revision_assessment import REVISION_SUPPORT_CONTRACT, REVISION_INPUT_POLICY
+
     manifest = {
-        "semantic_contract": "revision-support-v1/claim-revision-v1/revision-input-v1",
+        "semantic_contract": "/".join((REVISION_SUPPORT_CONTRACT, CLAIM_REVISION_CONTRACT,
+                                       REVISION_INPUT_POLICY, MEMORY_PAIR_CLASSIFIER_VERSION)),
         "input_policy_identity": input_policy_identity,
         "projection_identity_hash": source_derivation_projection_identity_hash(projection),
         "candidates": [

@@ -42,7 +42,7 @@ class MemoryRelationType(str, Enum):
     UNRELATED = "unrelated"
 
 
-MEMORY_PAIR_CLASSIFIER_VERSION = "memory-relation-v2"
+MEMORY_PAIR_CLASSIFIER_VERSION = "memory-relation-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,12 +139,17 @@ classification direction must be symmetric. Labels never imply authority,
 recency, preference, or permission to mutate either Memory.
 
 Before returning CONTRADICTS, prove that the claims concern the same subject and
-the same operational scope, including system, environment, repository, project,
-document lineage, time, and modality when those facts are present. Set
+an overlapping operational scope, including system, environment, repository,
+project, time, and modality when those facts are present. State the overlap
+explicitly: a universal rule includes its subsets, so an incompatible exception
+within that subset can contradict the universal rule. REFINES requires compatible
+assertions; a narrower scope alone cannot make incompatible values compatible.
+Different document lineage alone does not prove different operational subjects.
+Set
 same_subject_and_scope=true only after that proof and state the two mutually
 incompatible assertions in incompatible_assertions. If the claims concern
-different systems, environments, templates, examples, time periods, or scopes,
-return UNRELATED or REFINES as appropriate. For every non-CONTRADICTS decision,
+different systems, environments, templates, examples, time periods, or disjoint
+scopes, return UNRELATED or REFINES as appropriate. For every non-CONTRADICTS decision,
 incompatible_assertions must be an empty string.
 
 Compare the proposition rather than presentation alone, but preserve material

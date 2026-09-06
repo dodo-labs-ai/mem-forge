@@ -150,3 +150,39 @@ async def test_single_pair_does_not_require_large_model_output_window():
     )
     assert result.failure is None and client.calls == 1
     assert max(requested) <= 8192
+
+
+@pytest.mark.asyncio
+async def test_refinement_entailment_chain_cannot_override_rejected_old_support():
+    client = Client("refines", "challenger_to_candidate", eligibility=True)
+    result = await reconcile_memories(
+        new_extractions=[candidate()],
+        existing_memories=[memory()],
+        doc_type="policy",
+        structured_llm_client=client,
+        support_audits=[SupportAuditEntry("memory", False)],
+        include_metadata=True,
+    )
+    assert result.failure is not None and not result.operations
+    assert client.calls == 1
+
+
+def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeypatch):
+    from memforge.memory.engine import _source_lifecycle_operation_input_hash
+    import memforge.pipeline.revision_assessment as assessment
+
+    _, target = revisions("Two reviewers required.\n", "Two reviewers from distinct teams required.\n")
+    inputs = dict(
+        projection=target,
+        candidates=[candidate()],
+        incumbents=[memory()],
+        support_hashes={"memory": "support"},
+        gate_state="enabled",
+        update_mode="incremental",
+        changed_hunks=None,
+        update_plan_stats=None,
+        llm_model="test",
+    )
+    before = _source_lifecycle_operation_input_hash(**inputs)
+    monkeypatch.setattr(assessment, "REVISION_SUPPORT_CONTRACT", "a-future-semantic-contract")
+    assert _source_lifecycle_operation_input_hash(**inputs) != before
