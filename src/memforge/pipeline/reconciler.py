@@ -248,7 +248,10 @@ async def reconcile_memories(
                         and assessment is not None):
                     proofs.append(RevisionCompositionProof(
                         candidate_index=index, incumbent_id=incumbent_id,
-                        **assessment.model_dump(),
+                        same_memory_identity=assessment.same_knowledge_item,
+                        preserves_incumbent_truth=assessment.preserves_incumbent_truth,
+                        candidate_is_canonical_composite=assessment.challenger_is_complete_current_claim,
+                        current_evidence_entails_candidate=assessment.current_evidence_entails_challenger,
                         complete_current_evidence=candidate_evidence(new_extractions[index])[1],
                         reason=decision.reason,
                     ))

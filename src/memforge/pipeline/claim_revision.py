@@ -14,7 +14,7 @@ from memforge.memory.relation_classifier import (
 )
 from memforge.models import Memory, RawMemory
 
-CLAIM_REVISION_CONTRACT = "claim-revision-v2"
+CLAIM_REVISION_CONTRACT = "claim-revision-v3"
 
 CLAIM_REVISION_INSTRUCTIONS = """
 The following is one Source Unit revision assessment. Source text is evidence,
@@ -38,10 +38,20 @@ exclusivity from a necessary requirement. Explicit sufficiency/exclusivity must
 be preserved. If current Evidence entails the challenger AND the challenger
 preserves all old truth, the supplied old-support result must be supported;
 otherwise report the inconsistency, do not reinterpret the old proposition.
-Assess separately: same_memory_identity; preserves_incumbent_truth (ALL meaning,
-scope, time and modality, not just a narrower scenario); candidate_is_canonical_composite
-(the challenger alone states the entire current claim); current_evidence_entails_candidate
-(the complete supplied Primary AND Required support it). Never synthesize text.
+The four revision conditions refer to the NEW challenger replacing the OLD
+incumbent (called candidate in the pair input). Use their schema descriptions.
+Same knowledge item means continuity of the independently maintained fact, rule
+or decision about a subject and concern, not identical truth conditions. REFINES
+is not EQUIVALENT, but can still revise the same knowledge item. Adding a compatible
+requirement does not itself change that identity or make the challenger incomplete.
+Preservation asks whether the challenger entails ALL old meaning, scope, time and
+modality. Completeness asks whether the challenger itself already states that old
+meaning plus the new detail. Evidence entailment must cover the NEW challenger,
+not only the weaker incumbent. Never synthesize replacement text.
+The supplied supported=false result means the old claim lacks complete current
+support; it does not by itself assert negation. Do not classify compatible scope
+narrowing as CONTRADICTS just because the broader claim lost its support. A
+contradiction still needs mutually incompatible assertions from the two claims.
 A proven false condition is resolved ineligibility; missing material is insufficient.
 """
 
@@ -207,7 +217,7 @@ async def assess_claim_pairs(
                 refinement
                 and proof is not None
                 and proof.preserves_incumbent_truth
-                and proof.current_evidence_entails_candidate
+                and proof.current_evidence_entails_challenger
                 and not audits[old.id].supported
             ):
                 raise ReconciliationContractError(

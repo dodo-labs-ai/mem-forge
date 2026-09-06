@@ -55,16 +55,19 @@ class RevisionClientFixture:
                     status="resolved",
                     consistent_with_support=True,
                     relation=MemoryRelationAssessment.model_validate(relation.model_dump(exclude={"pair_index"})),
-                    revision_assessment=RevisionAssessment.model_validate(
-                        proofs[relation.pair_index].model_dump(exclude={"pair_index", "reason"})
+                    revision_assessment=RevisionAssessment(
+                        same_knowledge_item=proofs[relation.pair_index].same_memory_identity,
+                        preserves_incumbent_truth=proofs[relation.pair_index].preserves_incumbent_truth,
+                        challenger_is_complete_current_claim=proofs[relation.pair_index].candidate_is_canonical_composite,
+                        current_evidence_entails_challenger=proofs[relation.pair_index].current_evidence_entails_candidate,
                     )
                     if relation.pair_index in proofs
                     else (
                         RevisionAssessment(
-                            same_memory_identity=False,
+                            same_knowledge_item=False,
                             preserves_incumbent_truth=False,
-                            candidate_is_canonical_composite=False,
-                            current_evidence_entails_candidate=False,
+                            challenger_is_complete_current_claim=False,
+                            current_evidence_entails_challenger=False,
                         )
                         if not hasattr(self, "prove_revision_compositions")
                         and relation.classification == "refines"

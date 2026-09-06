@@ -40,10 +40,10 @@ class Client:
                 incompatible_assertions="Two versus one reviewer" if self.classification == "contradicts" else "",
             ),
             revision_assessment=RevisionAssessment(
-                same_memory_identity=True,
+                same_knowledge_item=True,
                 preserves_incumbent_truth=self.eligibility,
-                candidate_is_canonical_composite=True,
-                current_evidence_entails_candidate=True,
+                challenger_is_complete_current_claim=True,
+                current_evidence_entails_challenger=True,
             )
             if self.classification == "refines" and self.direction == "challenger_to_candidate"
             else None,
@@ -167,9 +167,10 @@ async def test_refinement_entailment_chain_cannot_override_rejected_old_support(
     assert client.calls == 1
 
 
-def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeypatch):
+@pytest.mark.parametrize("stage", ["support", "claim"])
+def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeypatch, stage):
     from memforge.memory.engine import _source_lifecycle_operation_input_hash
-    import memforge.pipeline.revision_assessment as assessment
+    from memforge.pipeline import revision_assessment, claim_revision
 
     _, target = revisions("Two reviewers required.\n", "Two reviewers from distinct teams required.\n")
     inputs = dict(
@@ -184,5 +185,35 @@ def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeyp
         llm_model="test",
     )
     before = _source_lifecycle_operation_input_hash(**inputs)
-    monkeypatch.setattr(assessment, "REVISION_SUPPORT_CONTRACT", "a-future-semantic-contract")
+    module, field = (
+        (revision_assessment, "REVISION_SUPPORT_CONTRACT")
+        if stage == "support"
+        else (claim_revision, "CLAIM_REVISION_CONTRACT")
+    )
+    monkeypatch.setattr(module, field, "a-future-semantic-contract")
     assert _source_lifecycle_operation_input_hash(**inputs) != before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("condition", [
+    "same_knowledge_item", "challenger_is_complete_current_claim", "current_evidence_entails_challenger",
+])
+async def test_revision_conditions_map_independently_to_the_lifecycle_gate(condition):
+    client = Client("refines", "challenger_to_candidate")
+    original = client.assess_claim_revisions
+
+    async def assess(*args, **kwargs):
+        response = await original(*args, **kwargs)
+        proof = response.decisions[0].revision_assessment
+        response.decisions[0].revision_assessment = proof.model_copy(update={condition: False})
+        return response
+
+    client.assess_claim_revisions = assess
+    result = await reconcile_memories(
+        new_extractions=[candidate()], existing_memories=[memory()], doc_type="policy",
+        structured_llm_client=client, support_audits=[SupportAuditEntry("memory", True)],
+        include_metadata=True,
+    )
+    assert result.failure is None
+    assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
+    assert client.calls == 1
