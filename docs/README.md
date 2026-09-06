@@ -26,7 +26,7 @@ read each document's status and current-versus-target comparison.
 | Memory, Support, lifecycle actions and Review meanings | [Document Memory Lifecycle](design/document-memory-lifecycle.md) |
 | Current extraction/catalog/selector contract | [Source-Agnostic Memory Extraction](design/source-agnostic-memory-extraction.md) |
 | Representation-specific incremental Primary algorithm | [Incremental Primary authority](design/representation-scoped-incremental-primary-authority.md) |
-| New support/claim assessment orchestration, pending implementation | [ADR 0034](adr/0034-unify-incremental-support-and-claim-assessment.md) |
+| Unified support/claim assessment orchestration | [ADR 0034](adr/0034-unify-incremental-support-and-claim-assessment.md) |
 | Historical large-document incident and unapproved Review options | [Large-document recovery analysis](design/large-document-reconciliation-recovery.md) |
 | Managed agent-session entrypoint | [Agent-session flow](design/agent-session-saas-plugin-flow.md) |
 

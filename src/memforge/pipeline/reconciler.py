@@ -67,34 +67,6 @@ Return exactly one ordered decision for every listed incumbent.
 <incumbents>{incumbents}</incumbents>
 """
 
-REVISION_COMPOSITION_PROMPT = """Decide whether each exact REFINES pair may become one automatic Memory revision.
-
-This proof is stricter than REFINES. Return true for all four booleans only when:
-1. both texts are successive materializations of the same durable Memory identity;
-2. the challenger preserves every durable truth carried by the incumbent while
-   adding a compatible material detail (it does not merely narrow the old claim);
-3. the challenger text itself is a complete canonical current claim, so it can
-   be stored verbatim without model-written merging or historical narration.
-4. the supplied exact current Primary Evidence excerpt entails the whole
-   challenger claim, including the incumbent truth and the added detail.
-
-Memory type and validity bounds are part of the claim. A change in modality or
-validity must be justified as part of the same identity and truth-preservation
-proof; otherwise return false.
-
-If current Primary Evidence is empty, supports only the added detail, or the
-claim depends on Required Evidence that is not supplied, set
-current_evidence_entails_candidate=false.
-
-Return false when the challenger is a sibling scenario, a narrower independent
-claim, or would need text from the incumbent copied into a synthesized merge.
-Do not return lifecycle actions or rewritten content. Return every pair_index
-exactly once.
-
-<refinement_pairs>{pairs_json}</refinement_pairs>
-"""
-
-
 @dataclass(frozen=True, slots=True)
 class ReconciliationFailure:
     """Failure metadata for a reconciliation that produced no safe ledger."""
@@ -193,6 +165,9 @@ async def reconcile_memories(
     changed_hunks: str | None = None,
     update_plan_stats: dict | None = None,
     include_metadata: bool = False,
+    support_audits: list[SupportAuditEntry] | None = None,
+    images: tuple = (),
+    image_loader=None,
 ) -> list[ReconcileOperation] | ReconciliationResult:
     """Classify a complete relation/support ledger and reduce it deterministically."""
 
@@ -235,26 +210,49 @@ async def reconcile_memories(
                 for candidate in transient_candidates
                 for incumbent in existing_memories
             )
-            classification = await classifier.classify(pairs)
-            relation_pair_count += len(pairs)
-            relation_prompt_chars += classification.prompt_chars
-            relation_entries = _bind_relation_entries(
-                classification.decisions,
-                candidate_count=len(new_extractions),
-                incumbents=existing_memories,
-            )
+            from memforge.pipeline.claim_revision import assess_claim_pairs, candidate_evidence
 
-            operation = "audit_incumbent_support"
-            audits, _calls, _elapsed = await _audit_incumbent_support(
-                incumbents=existing_memories,
-                structured_llm_client=structured_llm_client,
-                llm_model=llm_model,
-                doc_type=doc_type,
-                updated_document=updated_document,
-                update_mode=update_mode,
-                changed_hunks=changed_hunks,
-                update_plan_stats=update_plan_stats,
+            operation = "assess_revision_support"
+            if support_audits is None:
+                audits, _calls, _elapsed = await _audit_incumbent_support(
+                    incumbents=existing_memories,
+                    structured_llm_client=structured_llm_client,
+                    llm_model=llm_model, doc_type=doc_type,
+                    updated_document=updated_document, update_mode=update_mode,
+                    changed_hunks=changed_hunks, update_plan_stats=update_plan_stats,
+                )
+            else:
+                audits = support_audits
+            if {entry.incumbent_id for entry in audits} != {old.id for old in existing_memories}:
+                raise ReconciliationContractError("support_ledger_incomplete", "missing exact incumbent assessment")
+            operation = "assess_claim_revisions"
+            assessed = await assess_claim_pairs(
+                candidates=new_extractions, incumbents=existing_memories,
+                support_audits=audits, client=structured_llm_client,
+                model=llm_model, images=images, image_loader=image_loader,
             )
+            relation_pair_count += len(pairs)
+            relation_prompt_chars += assessed.prompt_chars
+            relation_entries = []
+            proofs = []
+            for index, incumbent_id, decision in assessed.decisions:
+                relation = decision.relation
+                relation_entries.append(RelationLedgerEntry(
+                    candidate_index=index, incumbent_id=incumbent_id,
+                    relation_type=MemoryRelationType(relation.classification),
+                    direction=RelationDirection(relation.direction), reason=relation.reason,
+                ))
+                assessment = decision.revision_assessment
+                if (relation.classification == "refines"
+                        and relation.direction == "challenger_to_candidate"
+                        and assessment is not None):
+                    proofs.append(RevisionCompositionProof(
+                        candidate_index=index, incumbent_id=incumbent_id,
+                        **assessment.model_dump(),
+                        complete_current_evidence=candidate_evidence(new_extractions[index])[1],
+                        reason=decision.reason,
+                    ))
+            revision_proof_count = len(proofs)
 
             refiners_by_incumbent = _supported_revision_candidates(relation_entries, audits)
             conditional_pairs = tuple(
@@ -274,22 +272,6 @@ async def reconcile_memories(
                         "non_unique_refinement_conflict",
                         "multiple refinement candidates contain incompatible current assertions",
                     )
-
-            proof_requests = [
-                (indices[0], incumbent_id)
-                for incumbent_id, indices in refiners_by_incumbent.items()
-                if len(indices) == 1
-            ]
-            operation = "prove_revision_compositions"
-            proofs, _calls, _elapsed = await _prove_revision_compositions(
-                requests=proof_requests,
-                new_extractions=new_extractions,
-                incumbents={memory.id: memory for memory in existing_memories},
-                structured_llm_client=structured_llm_client,
-                llm_model=llm_model,
-            )
-            revision_proof_count = len(proofs)
-            revision_proof_failure_count = len(proof_requests) - len(proofs)
 
             operation = "reduce_relation_ledger"
             operations = reduce_relation_ledger(
@@ -541,9 +523,9 @@ async def _audit_incumbent_support(
         prompt = INCUMBENT_SUPPORT_AUDIT_PROMPT.format(
             update_mode=update_mode,
             diff_stats=json.dumps(update_plan_stats or {}, ensure_ascii=False),
-            changed_hunks=(changed_hunks or "")[:40_000],
+            changed_hunks=changed_hunks or "",
             doc_type=doc_type,
-            updated_document=(updated_document or "")[:100_000],
+            updated_document=updated_document or "",
             incumbents=json.dumps(
                 [
                     {"request_position": index, "content": memory.content, "memory_type": memory.memory_type}
@@ -593,115 +575,6 @@ def _supported_revision_candidates(
         ):
             grouped.setdefault(entry.incumbent_id, []).append(entry.candidate_index)
     return {memory_id: tuple(sorted(indices)) for memory_id, indices in grouped.items()}
-
-
-async def _prove_revision_compositions(
-    *,
-    requests: list[tuple[int, str]],
-    new_extractions: list[RawMemory],
-    incumbents: dict[str, Memory],
-    structured_llm_client,
-    llm_model: str,
-) -> tuple[list[RevisionCompositionProof], int, float]:
-    if not requests:
-        return [], 0, 0.0
-    method = getattr(structured_llm_client, "prove_revision_compositions", None)
-    if not callable(method):
-        return [], 0, 0.0
-    proofs: list[RevisionCompositionProof] = []
-    calls = 0
-    elapsed = 0.0
-    for offset in range(0, len(requests), REVISION_COMPOSITION_BATCH_SIZE):
-        batch = requests[offset : offset + REVISION_COMPOSITION_BATCH_SIZE]
-        prompt = REVISION_COMPOSITION_PROMPT.format(
-            pairs_json=json.dumps(
-                [
-                    {
-                        "pair_index": pair_index,
-                        "incumbent": {
-                            "content": incumbents[incumbent_id].content,
-                            "memory_type": incumbents[incumbent_id].memory_type,
-                            "valid_from": (
-                                incumbents[incumbent_id].valid_from.isoformat()
-                                if incumbents[incumbent_id].valid_from
-                                else None
-                            ),
-                            "valid_until": (
-                                incumbents[incumbent_id].valid_until.isoformat()
-                                if incumbents[incumbent_id].valid_until
-                                else None
-                            ),
-                        },
-                        "challenger": {
-                            "content": new_extractions[candidate_index].content,
-                            "memory_type": new_extractions[candidate_index].memory_type,
-                            "valid_from": new_extractions[candidate_index].valid_from,
-                            "valid_until": new_extractions[candidate_index].valid_until,
-                        },
-                        "current_primary_evidence_excerpt": (
-                            new_extractions[candidate_index].evidence_quote or ""
-                        ),
-                        "required_evidence_count": len(
-                            new_extractions[candidate_index].required_source_observation_ids
-                        ),
-                    }
-                    for pair_index, (candidate_index, incumbent_id) in enumerate(batch)
-                ],
-                ensure_ascii=False,
-            )
-        )
-        by_index = None
-        for attempt in range(RECONCILIATION_BATCH_VALIDATION_ATTEMPTS):
-            calls += 1
-            call_started = perf_counter()
-            try:
-                response = await method(prompt, max_tokens=4096, model=llm_model)
-            except Exception as error:  # proof failure is a non-destructive fallback
-                logger.warning(
-                    "Revision composition proof failed; falling back to KEEP + ADD: %s",
-                    error,
-                )
-                break
-            finally:
-                elapsed += perf_counter() - call_started
-            candidate_by_index = {decision.pair_index: decision for decision in response.decisions}
-            if (
-                len(candidate_by_index) == len(response.decisions) == len(batch)
-                and set(candidate_by_index) == set(range(len(batch)))
-            ):
-                by_index = candidate_by_index
-                break
-            if attempt + 1 == RECONCILIATION_BATCH_VALIDATION_ATTEMPTS:
-                logger.warning(
-                    "Revision composition coverage invalid; falling back to KEEP + ADD"
-                )
-                break
-            prompt += "\nReturn every requested pair_index exactly once; the previous ledger was incomplete."
-        if by_index is None:
-            continue
-        for pair_index, (candidate_index, incumbent_id) in enumerate(batch):
-            raw = new_extractions[candidate_index]
-            decision = by_index[pair_index]
-            proofs.append(
-                RevisionCompositionProof(
-                    candidate_index=candidate_index,
-                    incumbent_id=incumbent_id,
-                    same_memory_identity=decision.same_memory_identity,
-                    preserves_incumbent_truth=decision.preserves_incumbent_truth,
-                    candidate_is_canonical_composite=decision.candidate_is_canonical_composite,
-                    current_evidence_entails_candidate=(
-                        decision.current_evidence_entails_candidate
-                    ),
-                    complete_current_evidence=bool(
-                        raw.source_observation_id
-                        and raw.evidence_resolved_from_block
-                        and (raw.evidence_quote or "").strip()
-                        and not raw.required_source_observation_ids
-                    ),
-                    reason=decision.reason,
-                )
-            )
-    return proofs, calls, elapsed
 
 
 def _return_result(

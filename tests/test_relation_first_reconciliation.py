@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 
+from tests.revision_client_fixture import RevisionClientFixture
+
 import pytest
 
 from memforge.llm.structured import (
@@ -89,7 +91,7 @@ async def test_supported_incumbent_and_unrelated_case25_keep_and_add() -> None:
         evidence_anchor="projection_batch",
     )
 
-    class RelationFirstClient:
+    class RelationFirstClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
             return MemoryRelationResponse(
@@ -148,7 +150,7 @@ async def test_additive_refinement_with_complete_current_evidence_is_revision() 
         evidence_resolved_from_block=True,
     )
 
-    class RevisionClient:
+    class RevisionClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
             return MemoryRelationResponse(
@@ -172,7 +174,7 @@ async def test_additive_refinement_with_complete_current_evidence_is_revision() 
 
         async def prove_revision_compositions(self, prompt: str, **kwargs):
             del kwargs
-            assert '"memory_type": "fact"' in prompt
+            assert '"type": "fact"' in prompt
             assert '"valid_from": null' in prompt
             return RevisionCompositionResponse(
                 decisions=[
@@ -206,7 +208,7 @@ async def test_additive_refinement_with_complete_current_evidence_is_revision() 
 
 
 @pytest.mark.asyncio
-async def test_revision_proof_failure_falls_back_to_keep_and_add() -> None:
+async def test_revision_response_failure_cannot_fall_back_to_add() -> None:
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
     refinement = RawMemory(
         content="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
@@ -217,7 +219,7 @@ async def test_revision_proof_failure_falls_back_to_keep_and_add() -> None:
         source_observation_id="obs-timeout",
     )
 
-    class ProofFailureClient:
+    class ProofFailureClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
             return _single_refines_response()
@@ -241,13 +243,8 @@ async def test_revision_proof_failure_falls_back_to_keep_and_add() -> None:
     )
 
     assert isinstance(result, ReconciliationResult)
-    assert result.failure is None
-    assert result.metrics.revision_proof_count == 0
-    assert result.metrics.revision_proof_failure_count == 1
-    assert [operation.action for operation in result.operations] == [
-        ReconcileAction.ADD,
-        ReconcileAction.NOOP,
-    ]
+    assert result.failure is not None
+    assert result.operations == []
 
 
 @pytest.mark.asyncio
@@ -262,7 +259,7 @@ async def test_revision_evidence_that_supports_only_added_detail_falls_back() ->
         source_observation_id="obs-timeout",
     )
 
-    class IncompleteEvidenceClient:
+    class IncompleteEvidenceClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
             return _single_refines_response()
@@ -275,7 +272,7 @@ async def test_revision_evidence_that_supports_only_added_detail_falls_back() ->
 
         async def prove_revision_compositions(self, prompt: str, **kwargs):
             del kwargs
-            assert '"current_primary_evidence_excerpt": "Configurable with CLIENT_TIMEOUT."' in prompt
+            assert '"excerpt": "Configurable with CLIENT_TIMEOUT."' in prompt
             return RevisionCompositionResponse(
                 decisions=[
                     RevisionCompositionDecision(
@@ -306,7 +303,7 @@ async def test_revision_evidence_that_supports_only_added_detail_falls_back() ->
 
 
 @pytest.mark.asyncio
-async def test_incomplete_revision_proof_coverage_retries_then_falls_back() -> None:
+async def test_missing_conditional_assessment_fails_closed() -> None:
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
     refinement = RawMemory(
         content="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
@@ -317,7 +314,7 @@ async def test_incomplete_revision_proof_coverage_retries_then_falls_back() -> N
         source_observation_id="obs-timeout",
     )
 
-    class IncompleteProofClient:
+    class IncompleteProofClient(RevisionClientFixture):
         def __init__(self) -> None:
             self.proof_calls = 0
 
@@ -346,13 +343,9 @@ async def test_incomplete_revision_proof_coverage_retries_then_falls_back() -> N
     )
 
     assert isinstance(result, ReconciliationResult)
-    assert result.failure is None
-    assert client.proof_calls == 2
-    assert result.metrics.revision_proof_failure_count == 1
-    assert [operation.action for operation in result.operations] == [
-        ReconcileAction.ADD,
-        ReconcileAction.NOOP,
-    ]
+    assert result.failure is not None
+    assert result.operations == []
+    assert client.proof_calls == 1
 
 
 @pytest.mark.asyncio
@@ -368,7 +361,7 @@ async def test_unprovided_required_evidence_blocks_revision() -> None:
         required_source_observation_ids=["obs-config-scope"],
     )
 
-    class RequiredEvidenceClient:
+    class RequiredEvidenceClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
             return _single_refines_response()
@@ -381,7 +374,7 @@ async def test_unprovided_required_evidence_blocks_revision() -> None:
 
         async def prove_revision_compositions(self, prompt: str, **kwargs):
             del kwargs
-            assert '"required_evidence_count": 1' in prompt
+            assert '"current_evidence": []' in prompt
             return RevisionCompositionResponse(
                 decisions=[
                     RevisionCompositionDecision(
@@ -735,7 +728,7 @@ async def test_support_audit_batches_all_incumbents_without_candidates(monkeypat
 
 @pytest.mark.asyncio
 async def test_incomplete_relation_ledger_retries_then_fails_closed() -> None:
-    class IncompleteClient:
+    class IncompleteClient(RevisionClientFixture):
         def __init__(self) -> None:
             self.calls = 0
 
@@ -751,6 +744,7 @@ async def test_incomplete_relation_ledger_retries_then_fails_closed() -> None:
         doc_type="design",
         structured_llm_client=client,
         include_metadata=True,
+        support_audits=[SupportAuditEntry(incumbent_id="mem-old", supported=True)],
     )
 
     assert isinstance(result, ReconciliationResult)
@@ -761,7 +755,7 @@ async def test_incomplete_relation_ledger_retries_then_fails_closed() -> None:
 
 @pytest.mark.asyncio
 async def test_relation_provider_failure_fails_closed_with_incumbents() -> None:
-    class FailingClient:
+    class FailingClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
             del prompt, kwargs
             raise StructuredLlmError("structured unavailable")

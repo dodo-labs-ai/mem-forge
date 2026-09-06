@@ -7,6 +7,7 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+
 import pytest
 
 from memforge.llm.structured import (
@@ -15,8 +16,8 @@ from memforge.llm.structured import (
     StructuredLlmMetricsCollector,
 )
 from memforge.models import RawMemory
-from memforge.pipeline.reconciler import reconcile_memories
-from tests.test_relation_first_reconciliation import _memory, _relations_from_prompt
+from memforge.pipeline.reconciler import reconcile_memories, SupportAuditEntry
+from tests.test_relation_first_reconciliation import _memory
 from tests.test_projected_lifecycle_integration import (
     db as db,
     _projection,
@@ -79,8 +80,8 @@ async def test_mandatory_provider_failure_preserves_support_and_revision_without
             lifecycle_execution_owner_id="diagnostics:attempt:1",
         )
     event = caught.value.runtime_bundle.event
-    assert event.reason_code == "relation_first_failed"
-    assert event.operation == "audit_incumbent_support"
+    assert event.reason_code == "support_revalidation_failed"
+    assert event.operation == "assess_revision_support"
     assert event.model_call_count == 1
     assert event.error_code == "TimeoutError"
     assert event.terminal_category == "provider_error"
@@ -102,7 +103,10 @@ async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypa
             raise TimeoutError("provider secret detail must not be persisted")
         prompt = kwargs["messages"][0]["content"]
         if stage == "classification":
-            payload = _relations_from_prompt(prompt).model_dump_json()
+            pairs = json.loads(prompt.split("<memory_pair_groups>\n")[1].split("\n</memory_pair_groups>")[0])
+            payload = json.dumps({"decisions": [{"pair_index": pair["pair_index"], "status": "resolved",
+                "relation": {"classification": "unrelated", "direction": "symmetric",
+                             "same_subject_and_scope": False, "incompatible_assertions": ""}, "consistent_with_support": True} for group in pairs for pair in group["candidates"]]})
         else:
             incumbents = json.loads(prompt.split("<incumbents>")[1].split("</incumbents>")[0])
             payload = json.dumps({"decisions": [{"supported": True} for _ in incumbents]})
@@ -136,6 +140,7 @@ async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypa
             doc_type="design",
             structured_llm_client=client,
             include_metadata=True,
+            support_audits=[SupportAuditEntry(f"mem-{i}", True) for i in range(65)] if stage == "classification" else None,
         )
     assert len(calls) == 2
     assert result.operations == []
@@ -144,7 +149,7 @@ async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypa
     assert unit.summary(source_unit_elapsed_ms=1).logical_calls == 2
     assert result.failure.terminal_category == "provider_error"
     assert result.failure.error_code == "TimeoutError"
-    assert result.failure.operation in {"classify_memory_relations", "audit_incumbent_support"}
+    assert result.failure.operation in {"assess_claim_revisions", "assess_revision_support"}
     assert "provider secret" not in result.failure.error
 
 
@@ -221,6 +226,7 @@ async def test_failed_parallel_batch_counts_cancelled_provider_sibling(monkeypat
             doc_type="design",
             structured_llm_client=client,
             include_metadata=True,
+            support_audits=[SupportAuditEntry(f"mem-{i}", True) for i in range(65)],
         )
     summary = unit.summary(source_unit_elapsed_ms=1)
     assert started == 2

@@ -465,12 +465,11 @@ class RevisionCompositionResponse(StructuredResponseModel):
     decisions: list[RevisionCompositionDecision]
 
 
-class MemoryRelationDecision(StructuredResponseModel):
-    """One exact pair classification with explicit refinement direction."""
+class MemoryRelationAssessment(StructuredResponseModel):
+    """A semantic relationship with its applicable direction and conflict proof."""
 
     model_config = ConfigDict(extra="ignore")
 
-    pair_index: int = Field(ge=0)
     classification: Literal["equivalent", "refines", "contradicts", "unrelated"]
     direction: Literal[
         "symmetric",
@@ -482,7 +481,7 @@ class MemoryRelationDecision(StructuredResponseModel):
     reason: str = Field(default="", max_length=1000)
 
     @model_validator(mode="after")
-    def _validate_direction(self) -> MemoryRelationDecision:
+    def _validate_direction(self) -> MemoryRelationAssessment:
         directional = self.classification == "refines"
         if directional == (self.direction == "symmetric"):
             raise ValueError("REFINES must be directional and other relations symmetric")
@@ -497,12 +496,51 @@ class MemoryRelationDecision(StructuredResponseModel):
         return self
 
 
+class MemoryRelationDecision(MemoryRelationAssessment):
+    """Bind a relationship to one application-issued pair slot."""
+
+    pair_index: int = Field(ge=0)
+
+
 class MemoryRelationResponse(StructuredResponseModel):
     """Schema for a complete batch of exact Memory-pair decisions."""
 
     model_config = ConfigDict(extra="ignore")
 
     decisions: list[MemoryRelationDecision]
+
+
+class RevisionAssessment(StructuredResponseModel):
+    """Independent conditions for a complete, lossless claim revision."""
+
+    same_memory_identity: bool
+    preserves_incumbent_truth: bool
+    candidate_is_canonical_composite: bool
+    current_evidence_entails_candidate: bool
+
+
+class ClaimRevisionDecision(StructuredResponseModel):
+    """One fixed pair slot, including explicit unresolved and inapplicable results."""
+
+    pair_index: int = Field(ge=0)
+    status: Literal["resolved", "insufficient"]
+    relation: MemoryRelationAssessment | None = None
+    revision_assessment: RevisionAssessment | None = None
+    consistent_with_support: bool | None = None
+    reason: str = Field(default="", max_length=1000)
+
+
+class ClaimRevisionResponse(StructuredResponseModel):
+    decisions: list[ClaimRevisionDecision]
+
+
+class RevisionSupportResponse(StructuredResponseModel):
+    """Fixed-claim judgment and a complete current selection, with variable Required."""
+
+    status: Literal["supported", "unsupported", "insufficient"]
+    primary_ref: str | None = None
+    required_refs: list[str] = Field(default_factory=list)
+    reason: str = Field(default="", max_length=1000)
 
 
 class MemorySupportValidationRequiredEvidence(StructuredResponseModel):
@@ -607,6 +645,12 @@ class StructuredLlmConfig:
     # configured by the deployment adapter, carry the complete prompt as one
     # placeholder value so template-like source text remains data.
     prompt_template_variable: str | None = None
+    # Gateway aliases may not exist in the model registry. These explicit,
+    # conservative limits also let deployments lower a provider's capacity.
+    max_input_tokens: int = 32_768
+    context_window_tokens: int = 65_536
+    max_output_tokens: int = 32_768
+    input_budget_fraction: float = 0.8
 
 
 @dataclass(frozen=True)
@@ -894,6 +938,23 @@ class _StructuredCallState:
 
 
 class SourceSupportStructuredClient(Protocol):
+    @property
+    def input_policy_identity(self) -> str: ...
+
+    def request_fits(self, prompt: str, *, response_format: type[BaseModel],
+                     max_tokens: int, model: str | None = None,
+                     images: tuple[StructuredLlmImage, ...] = ()) -> bool: ...
+
+    async def assess_revision_support(
+        self, prompt: str, *, max_tokens: int = 4096,
+        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
+    ) -> RevisionSupportResponse: ...
+
+    async def assess_claim_revisions(
+        self, prompt: str, *, max_tokens: int = 32_768,
+        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
+    ) -> ClaimRevisionResponse: ...
+
     async def verify_source_support(
         self,
         prompt: str,
@@ -1652,6 +1713,55 @@ class LiteLlmStructuredClient:
 
         return max(1, int(self.config.max_concurrent))
 
+    @property
+    def input_policy_identity(self) -> str:
+        model_name = litellm_model_name(self.config.model)
+        try:
+            info = litellm.get_model_info(model_name)
+        except Exception:
+            info = {}
+        payload = {
+            "version": "revision-input-v1", "model": model_name,
+            "input": self.config.max_input_tokens, "context": self.config.context_window_tokens,
+            "output": self.config.max_output_tokens, "fraction": self.config.input_budget_fraction,
+            "registry": {key: info.get(key) for key in ("max_input_tokens", "max_output_tokens", "context_window")},
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def request_fits(
+        self, prompt: str, *, response_format: type[BaseModel],
+        max_tokens: int, model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> bool:
+        """Budget the complete semantic input, including schema and image transport."""
+
+        model_name = litellm_model_name(model or self.config.model)
+        limit = self.config.max_input_tokens
+        context_limit = self.config.context_window_tokens
+        output_limit = self.config.max_output_tokens
+        try:
+            info = litellm.get_model_info(model_name)
+        except Exception:
+            info = {}
+        if info.get("max_input_tokens"):
+            limit = min(limit, int(info["max_input_tokens"]))
+            # Registry input limits are conservatively treated as the combined
+            # window when no separate provider context-window field is present.
+            context_limit = min(context_limit, int(info.get("context_window") or info["max_input_tokens"]))
+        if info.get("max_output_tokens"):
+            output_limit = min(output_limit, int(info["max_output_tokens"]))
+        if max_tokens > output_limit:
+            return False
+        fraction = self.config.input_budget_fraction
+        if limit < 1 or not 0 < fraction <= 1:
+            raise ValueError("invalid structured input budget")
+        # Include the larger JSON-text schema path and a bounded repair reserve.
+        material = prompt + "\n" + json.dumps(response_format.model_json_schema())
+        messages = [{"role": "user", "content": _structured_user_content(material, images)}]
+        estimate = litellm.token_counter(model=model_name, messages=messages)
+        available_input = min(limit, context_limit - max_tokens)
+        return estimate + 1024 <= int(available_input * fraction)
+
     @contextmanager
     def metrics_scope(
         self,
@@ -1673,6 +1783,24 @@ class LiteLlmStructuredClient:
             response_format=SourceSupportResponse,
             max_tokens=4096,
             model=model,
+        )
+
+    async def assess_revision_support(
+        self, prompt: str, *, max_tokens: int = 4096,
+        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
+    ) -> RevisionSupportResponse:
+        return await self._call_schema(
+            prompt=prompt, response_format=RevisionSupportResponse,
+            max_tokens=max_tokens, model=model, images=images,
+        )
+
+    async def assess_claim_revisions(
+        self, prompt: str, *, max_tokens: int = 32_768,
+        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
+    ) -> ClaimRevisionResponse:
+        return await self._call_schema(
+            prompt=prompt, response_format=ClaimRevisionResponse,
+            max_tokens=max_tokens, model=model, images=images,
         )
 
     async def extract_memories(

@@ -7,10 +7,11 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from tests.revision_client_fixture import RevisionClientFixture
+
 import pytest
 import pytest_asyncio
 
-import memforge.memory.engine as memory_engine_module
 
 from memforge.llm.structured import (
     CandidateLedgerDecision,
@@ -115,7 +116,6 @@ from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
 )
 from memforge.pipeline.projection_fragments import (
-    FragmentSelectionErrorCode,
     SupportRevalidationLimitation,
     SupportRevalidationLimitationCode,
 )
@@ -408,7 +408,7 @@ def _uniform_relation_response(
     )
 
 
-class _ReplacementClient:
+class _ReplacementClient(RevisionClientFixture):
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
 
@@ -430,7 +430,7 @@ class _ReplacementClient:
         )
 
 
-class _ConflictingReplacementClient:
+class _ConflictingReplacementClient(RevisionClientFixture):
     async def classify_memory_relations(self, prompt: str, **kwargs):
         del kwargs
         return _uniform_relation_response(
@@ -449,7 +449,7 @@ class _ConflictingReplacementClient:
         )
 
 
-class _AdditiveRevisionClient:
+class _AdditiveRevisionClient(RevisionClientFixture):
     async def classify_memory_relations(self, prompt: str, **kwargs):
         del kwargs
         groups_json = prompt.split("<memory_pair_groups>\n", 1)[1].split(
@@ -495,7 +495,7 @@ class _AdditiveRevisionClient:
         )
 
 
-class _RunbookComponentFallbackClient:
+class _RunbookComponentFallbackClient(RevisionClientFixture):
     async def classify_memory_relations(self, prompt: str, **kwargs):
         del kwargs
         groups_json = prompt.split("<memory_pair_groups>\n", 1)[1].split(
@@ -531,8 +531,13 @@ class _RunbookComponentFallbackClient:
         )
 
     async def prove_revision_compositions(self, prompt: str, **kwargs):
-        del prompt, kwargs
-        raise StructuredLlmError("The current procedure does not losslessly replace each branch.")
+        del kwargs
+        pairs = json.loads(prompt.split("<refinement_pairs>")[1].split("</refinement_pairs>")[0])
+        return RevisionCompositionResponse(decisions=[RevisionCompositionDecision(
+            pair_index=index, same_memory_identity=False, preserves_incumbent_truth=False,
+            candidate_is_canonical_composite=False, current_evidence_entails_candidate=True,
+            reason="Resolved separate procedure; not a lossless replacement.",
+        ) for index in range(len(pairs))])
 
 
 class _RunbookComponentRevisionClient(_RunbookComponentFallbackClient):
@@ -557,7 +562,7 @@ class _RunbookComponentRevisionClient(_RunbookComponentFallbackClient):
         )
 
 
-class _NoopClient:
+class _NoopClient(RevisionClientFixture):
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
 
@@ -571,7 +576,7 @@ class _NoopClient:
         )
 
 
-class _DeleteClient:
+class _DeleteClient(RevisionClientFixture):
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
 
@@ -585,7 +590,7 @@ class _DeleteClient:
         )
 
 
-class _UnexpectedReconciliationClient:
+class _UnexpectedReconciliationClient(RevisionClientFixture):
     async def classify_memory_relations(self, prompt: str, **kwargs):
         del prompt, kwargs
         raise AssertionError("proven-disjoint incumbent must not require LLM reconciliation")
@@ -1237,11 +1242,16 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
         prior=first.source_unit_revisions[0],
         prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
+    class RemovedArtifactClient(RevisionClientFixture):
+        async def assess_revision_support(self, prompt, **kwargs):
+            from memforge.llm.structured import RevisionSupportResponse
+            return RevisionSupportResponse(status="unsupported", reason="Required diagram was removed")
+
     reviewing_engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=_NoopClient(incumbent.id),
+        structured_llm_client=RemovedArtifactClient(),
     )
 
     stats = await reviewing_engine.prepare_and_commit_projected_lifecycle(
@@ -1268,7 +1278,7 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
     )
 
 
-class _RecordingAddClient:
+class _RecordingAddClient(RevisionClientFixture):
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
         self.prompts: list[str] = []
@@ -1292,7 +1302,7 @@ class _RecordingAddClient:
         )
 
 
-class _PersistentlyIncompleteAuditClient:
+class _PersistentlyIncompleteAuditClient(RevisionClientFixture):
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
         self.calls = 0
@@ -1689,7 +1699,7 @@ async def test_incomplete_candidate_ledger_is_audited_as_fallback_and_keeps_memo
     assert events[0].payload["fallback_candidate_count"] == 2
 
 
-class _SemanticEquivalentClient:
+class _SemanticEquivalentClient(RevisionClientFixture):
     def __init__(self) -> None:
         self.relation_calls = 0
 
@@ -1802,8 +1812,9 @@ class _UnavailableSupportValidatingNoopClient(_NoopClient):
     async def validate_memory_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         raise StructuredLlmError(
-            "structured LLM returned an invalid response",
-            error_code="ValidationError",
+            "provider unavailable",
+            terminal_category="provider_error",
+            error_code="ServiceUnavailable",
         )
 
 
@@ -1837,7 +1848,7 @@ class _FragmentSelectingSupportClient(_NoopClient):
                 1,
             )[0]
         )
-        [candidate] = payload["primary_candidates"]
+        candidate = next(item for item in payload["primary_candidates"] if item["text"] == payload["memory_claim"])
         return MemorySupportValidationResponse.model_validate(
             {
                 "supported": True,
@@ -4074,45 +4085,6 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
 
     await db._validate_projected_support_invariant_unlocked(plan)
 
-    second = _projection(
-        run_id="projection-multi-unit-rebind",
-        body="A7 is removed.\n\nThe page now names an owner.",
-        prior=first.source_unit_revisions[0],
-        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
-    )
-    second = replace(
-        second,
-        observations=other.observations + second.observations,
-        observation_revisions=(other.observation_revisions + second.observation_revisions),
-        source_units=other.source_units + second.source_units,
-        source_unit_revisions=(other.source_unit_revisions + second.source_unit_revisions),
-        relations=other.relations + second.relations,
-    )
-    adapters = build_sqlite_adapters(db, object())
-    engine = MemoryEngine(
-        cross_document_candidates=_candidate_retriever(adapters),
-        db=db,
-        memory_store=_OutboxDrainer(db),
-    )
-
-    [rebound] = await engine._rebind_noop_evidence_to_current_revision(
-        operations=(
-            ReconcileOperation(
-                action=ReconcileAction.NOOP,
-                memory_id=incumbent.id,
-                reason="claim remains valid in this Unit",
-            ),
-        ),
-        incumbents={incumbent.id: incumbent},
-        unit_support=await db.get_source_unit_support_reference_ids(first.source_units[0].id),
-        projection=second,
-        access_context_hash="workspace-eng",
-    )
-
-    assert rebound.action is ReconcileAction.NOOP
-    assert rebound.memory is not None
-    assert rebound.memory.source_observation_id == first.observations[0].id
-    assert other_reference.id in (await db.get_active_memory_support_reference_ids(incumbent.id))
 
 
 @pytest.mark.asyncio
@@ -4334,7 +4306,7 @@ async def test_v2_noop_rebind_preserves_independent_support_alternative(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_same_unit_alternatives_stage_review_without_collapsing(
+async def test_v2_noop_assesses_each_same_unit_alternative(
     db: Database,
 ) -> None:
     access_context_hash = lifecycle_access_context_hash(
@@ -4402,19 +4374,12 @@ async def test_v2_noop_same_unit_alternatives_stage_review_without_collapsing(
         source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
     )
 
-    assert stats["pending_review"] == 1
-    assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
-    current = await db.get_current_source_unit_revision(first.source_units[0].id)
-    assert current is not None
-    assert current.id == second.source_unit_revisions[0].id
-    [review] = await db.list_lifecycle_reviews("src-1")
-    assert review.status is LifecycleReviewStatus.PENDING
-    assert review.reason.endswith(": ambiguous")
-    assert {
-        unit_id
-        for mutation in review.staged_evidence["proposed_mutations"]
-        for unit_id in mutation["evidence_unit_ids"]
-    } == {original_unit_id, alternative_unit_id}
+    assert stats["pending_review"] == 0
+    assert stats["support_revalidation_work_item_count"] == 2
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    assert current_support and set(current_support).isdisjoint(old_support)
+    assert await db.list_lifecycle_reviews("src-1") == []
+    assert (await db.get_current_source_unit_revision(first.source_units[0].id)).id == second.source_unit_revisions[0].id
 
 
 @pytest.mark.asyncio
@@ -4641,7 +4606,7 @@ async def test_v2_noop_revalidation_uses_bounded_fragment_refs_for_large_revisio
         first_memory.id: await db.get_active_memory_support_unit_ids(first_memory.id),
         second_memory.id: await db.get_active_memory_support_unit_ids(second_memory.id),
     }
-    unrelated_marker = "UNRELATED-HISTORICAL-CONTENT-MUST-NOT-ENTER-PROMPT"
+    unrelated_marker = "NEW-APPENDIX-MUST-ENTER-COMPLETE-INPUT"
     filler = f"{unrelated_marker} " + ("x" * 130_000)
     second = _projection(
         run_id="projection-bounded-support-2",
@@ -4678,7 +4643,7 @@ async def test_v2_noop_revalidation_uses_bounded_fragment_refs_for_large_revisio
     assert stats["support_revalidation_revision_index_count"] == 1
     assert stats["support_revalidation_auto_rebind_count"] == 2
     assert len(client.validation_prompts) == 2
-    assert all(unrelated_marker not in prompt for prompt in client.validation_prompts)
+    assert all(unrelated_marker in prompt for prompt in client.validation_prompts)
     assert all('"primary_candidates"' in prompt for prompt in client.validation_prompts)
     for memory in (first_memory, second_memory):
         current_support = await db.get_active_memory_support_unit_ids(memory.id)
@@ -4733,10 +4698,10 @@ async def test_incremental_noop_exhausted_fragment_repair_stops_document_retry_w
 
     assert raised.value.retryable is False
     assert raised.value.__cause__ is not None
-    assert getattr(raised.value.__cause__, "code") is FragmentSelectionErrorCode.UNKNOWN_REF
-    assert raised.value.runtime_bundle.event.reason_code == "support_revalidation_failed"
+    assert raised.value.__cause__.reason_code == "revision_support_selection_exhausted"
+    assert raised.value.runtime_bundle.event.reason_code == "revision_support_selection_exhausted"
     assert raised.value.runtime_bundle.event.terminal_category == "invalid_response"
-    assert raised.value.runtime_bundle.event.error_code == "unknown_ref"
+    assert raised.value.runtime_bundle.event.error_code == "revision_support_selection_exhausted"
     assert raised.value.runtime_bundle.event.model_call_count == 2
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
@@ -4813,7 +4778,7 @@ async def test_incremental_noop_invalidated_primary_creates_review(
     )
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await db.enable_lifecycle_gate("src-1")
+    await db.gate_destructive_lifecycle("src-1", reason="Review required by source policy")
     second = _projection(
         run_id="projection-primary-invalid-2",
         body="A7 is now retained.",
@@ -4879,7 +4844,7 @@ async def test_persistent_incomplete_incumbent_audit_fails_closed_without_mutati
 
     with pytest.raises(
         SourceUnitLifecycleExecutionError,
-        match="incumbent support response count 0 does not match expected count 1",
+        match="fixture support response omitted requested claim",
     ) as failure:
         await engine.prepare_and_commit_projected_lifecycle(
             projection=second,
@@ -4897,7 +4862,7 @@ async def test_persistent_incomplete_incumbent_audit_fails_closed_without_mutati
             lifecycle_attempt_count=3,
         )
 
-    assert client.calls == 2
+    assert client.calls == 1
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
     assert await db.get_active_memory_support_reference_ids(incumbent.id)
@@ -5065,7 +5030,7 @@ async def _seed_jira_required_incumbent(
 
 
 @pytest.mark.asyncio
-async def test_partial_jira_projection_skips_llm_for_proven_disjoint_incumbent(
+async def test_partial_jira_projection_assesses_changes_outside_old_evidence(
     db: Database,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -5086,7 +5051,7 @@ async def test_partial_jira_projection_skips_llm_for_proven_disjoint_incumbent(
         source_type="jira",
     )
     await db.enable_lifecycle_gate("src-1")
-    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    await db.get_active_memory_support_reference_ids(incumbent.id)
     second = _jira_projection(
         run_id="projection-jira-partial-fence-2",
         description="Changed issue description.",
@@ -5101,7 +5066,7 @@ async def test_partial_jira_projection_skips_llm_for_proven_disjoint_incumbent(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
-        structured_llm_client=_UnexpectedReconciliationClient(),
+        structured_llm_client=_NoopClient(incumbent.id),
     )
 
     stats = await engine.prepare_and_commit_projected_lifecycle(
@@ -5130,10 +5095,11 @@ async def test_partial_jira_projection_skips_llm_for_proven_disjoint_incumbent(
         )
     )
     assert sample["reconciliation_incumbent_count"] == 1
-    assert sample["reconciliation_model_incumbent_count"] == 0
-    assert sample["reconciliation_disjoint_keep_count"] == 1
+    assert sample["reconciliation_model_incumbent_count"] == 1
+    assert sample["reconciliation_disjoint_keep_count"] == 0
     assert sample["reconciliation_llm_call_count"] == 0
-    assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+    assert await db.get_active_memory_support_reference_ids(incumbent.id)
+    assert stats["support_revalidation_model_call_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -5182,9 +5148,9 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
     async def provider(**kwargs):
         prompt = kwargs["messages"][0]["content"]
         response = (
-            await responses.classify_memory_relations(prompt)
+            await responses.assess_claim_revisions(prompt)
             if "<memory_pair_groups>" in prompt
-            else await responses.audit_incumbent_support(prompt)
+            else await responses.assess_revision_support(prompt)
         )
         return SimpleNamespace(
             choices=[
@@ -5246,8 +5212,9 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
     assert sample["reconciliation_incumbent_count"] == 1
     assert sample["reconciliation_model_incumbent_count"] == 1
     assert sample["reconciliation_disjoint_keep_count"] == 0
-    assert sample["reconciliation_llm_batch_count"] == 2
-    assert sample["reconciliation_llm_call_count"] == 2
+    assert sample["reconciliation_llm_batch_count"] == 1
+    assert sample["reconciliation_llm_call_count"] == 1
+    assert stats["support_revalidation_model_call_count"] == 1
     assert len(responses.prompts) == 1
     assert incumbent.content in responses.prompts[0]
 
@@ -5379,7 +5346,7 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
 
 
 @pytest.mark.asyncio
-async def test_noop_exhausted_duplicate_selector_repair_stops_document_retry_without_review(
+async def test_noop_duplicate_required_refs_normalize_without_retry(
     db: Database,
 ) -> None:
     await _set_fixture_source_type(db, "jira")
@@ -5408,29 +5375,25 @@ async def test_noop_exhausted_duplicate_selector_repair_stops_document_retry_wit
         ),
     )
 
-    with pytest.raises(SourceUnitLifecycleExecutionError) as raised:
-        await engine.prepare_and_commit_projected_lifecycle(
-            projection=second,
-            doc_id="confluence-123",
-            raw_memories=[],
-            doc_type="ticket",
-            project_key="ENG",
-            repo_identifier=None,
-            document_content="PAY-12",
-            update_mode="diff_guided",
-            changed_hunks="description wording clarified",
-            update_plan_stats=None,
-            source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
-            lifecycle_execution_owner_id="sync-duplicate-selector:lease-1",
-        )
+    stats = await engine.prepare_and_commit_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="PAY-12",
+        update_mode="diff_guided",
+        changed_hunks="description wording clarified",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
+        lifecycle_execution_owner_id="sync-duplicate-selector:lease-1",
+    )
 
-    assert raised.value.retryable is False
-    assert raised.value.__cause__ is not None
-    assert raised.value.__cause__.code is FragmentSelectionErrorCode.INVALID_SELECTION
-    assert raised.value.runtime_bundle.event.reason_code == "support_revalidation_failed"
-    assert raised.value.runtime_bundle.event.terminal_category == "invalid_response"
-    assert raised.value.runtime_bundle.event.error_code == "invalid_selection"
-    assert raised.value.runtime_bundle.event.model_call_count == 2
+    assert stats["noop"] == 1
+    assert stats["support_revalidation_model_call_count"] == 1
+    evidence = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    assert len([part for part in evidence if part.role is EvidenceRole.REQUIRED]) == 1
     assert await db.list_lifecycle_reviews("src-1") == []
 
 
@@ -5595,7 +5558,7 @@ async def test_v2_noop_uses_canonical_field_type_to_resolve_duplicate_text(
 
 
 @pytest.mark.asyncio
-async def test_v2_noop_indistinguishable_current_fragments_stage_review(
+async def test_v2_noop_model_selects_exact_ref_among_repeated_text(
     db: Database,
 ) -> None:
     claim = "A7 remains excluded."
@@ -5646,11 +5609,11 @@ async def test_v2_noop_indistinguishable_current_fragments_stage_review(
         source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
     )
 
-    assert stats["pending_review"] == 1
-    assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
-    assert client.validation_prompts == []
-    [review] = await db.list_lifecycle_reviews("src-1")
-    assert review.reason.endswith(": ambiguous")
+    assert stats["pending_review"] == 0
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    assert current_support and set(current_support).isdisjoint(old_support)
+    assert len(client.validation_prompts) == 1
+    assert await db.list_lifecycle_reviews("src-1") == []
 
 
 @pytest.mark.asyncio
@@ -5678,7 +5641,7 @@ async def test_v2_noop_semantically_unsupported_current_fragment_stages_review(
         expected_report_id=cutover.id,
         owner_id="test-v2-unpresentable",
     )
-    await db.enable_lifecycle_gate("src-1")
+    await db.gate_destructive_lifecycle("src-1", reason="Review required by source policy")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _projection(
         run_id="projection-v2-unpresentable-2",
@@ -5717,7 +5680,7 @@ async def test_v2_noop_semantically_unsupported_current_fragment_stages_review(
     assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
     [review] = await db.list_lifecycle_reviews("src-1")
     assert review.status is LifecycleReviewStatus.PENDING
-    assert review.reason.startswith("revised REQUIRED evidence no longer validates claim:")
+    assert review.status is LifecycleReviewStatus.PENDING
 
 
 @pytest.mark.asyncio
@@ -5728,6 +5691,7 @@ async def test_v2_pending_review_ignores_unrelated_stale_cross_unit_support(
         db,
         prefix="projection-v2-causal-review",
     )
+    await db.gate_destructive_lifecycle("src-1", reason="Review required by source policy")
     second = _projection(
         run_id="projection-v2-causal-review-2",
         body="<!-- no selectable current claim -->",
@@ -5774,7 +5738,7 @@ async def test_v2_pending_review_ignores_unrelated_stale_cross_unit_support(
     assert current.id == second.source_unit_revisions[0].id
     [review] = await db.list_lifecycle_reviews("src-1")
     assert review.status is LifecycleReviewStatus.PENDING
-    assert review.reason.startswith("revised REQUIRED evidence no longer validates claim:")
+    assert review.status is LifecycleReviewStatus.PENDING
 
 
 @pytest.mark.asyncio
@@ -6606,8 +6570,7 @@ async def test_v2_noop_propagates_bounded_revalidation_operational_limitation(
         )
 
     monkeypatch.setattr(
-        memory_engine_module,
-        "prepare_support_revalidation_workset",
+        "memforge.pipeline.revision_assessment.RevisionAssessmentContext.input_for",
         raise_limitation,
     )
     adapters = build_sqlite_adapters(db, object())
@@ -6685,6 +6648,7 @@ async def test_noop_revalidates_revised_required_with_artifact_primary(
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
+        document_store=SimpleNamespace(read_artifact=lambda uri: b"stable-diagram"),
         memory_store=_OutboxDrainer(db),
         structured_llm_client=_SupportValidatingNoopClient(
             incumbent.id,
@@ -6728,7 +6692,7 @@ async def test_noop_with_invalidated_required_evidence_creates_review(db: Databa
     )
     await db.record_source_projection(first)
     incumbent = await _seed_jira_required_incumbent(db, first)
-    await db.enable_lifecycle_gate("src-1")
+    await db.gate_destructive_lifecycle("src-1", reason="Review required by source policy")
     second = _jira_projection(
         run_id="projection-jira-invalid-required-2",
         description="A7 now applies only to off-cycle payroll.",

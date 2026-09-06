@@ -112,7 +112,6 @@ from memforge.pipeline.projection_fragments import (
 from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
 from memforge.pipeline.projection_images import (
     load_projection_images,
-    projection_inference_capability_hash,
 )
 from memforge.source_access import memory_visibility_for_source_id
 from memforge.source_projection_config import canonical_projection_scope
@@ -3186,13 +3185,27 @@ class GeneSyncOrchestrator:
             project_key=derivation_context.project_key,
             repo_identifier=derivation_context.repo_identifier,
         )
-        inference_capability_hash = projection_inference_capability_hash()
+        from memforge.pipeline.revision_assessment import revision_inference_capability_hash
+        inference_capability_hash = revision_inference_capability_hash(
+            self.structured_llm_client, extraction_model=getattr(self.memory_extractor, "model", None),
+            extraction_max_tokens=getattr(self.memory_extractor, "max_tokens", None),
+        )
         committed_base_snapshot = await self._committed_base_snapshot_for(
             projection,
             reprocess_all_current_observations=(
                 derivation_context.reprocess_all_current_observations
             ),
         )
+
+        revision_context = None
+        if active_contract.uses_fragment_catalog and projection.deltas[0].previous_unit_revision_id:
+            from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+            base_projection = await self.db.get_current_source_unit_projection(projection.source_units[0].id)
+            revision_context = RevisionAssessmentContext(
+                projection=projection, base=base_projection,
+                access_context_hash=access_context_hash,
+                image_loader=lambda ids: self._projection_images(projection=projection, observation_ids=ids),
+            )
 
         async def extract_one(batch):
             if isinstance(batch, DiffGuidedExtractionBatch):
@@ -3240,7 +3253,11 @@ class GeneSyncOrchestrator:
             )
             async with self._heavy_work_slot(
                 source_id,
-                multimodal=input_binary_bytes > 0,
+                # Context expansion may turn a text batch into an image request.
+                # Reserve existing image admission before any possible byte reads.
+                multimodal=input_binary_bytes > 0 or bool(revision_context and any(
+                    fragment.kind.value == "artifact" for fragment in revision_context.full_fragments
+                )),
             ) as admission:
                 batch_images = self._projection_images(
                     projection=projection,
@@ -3262,6 +3279,7 @@ class GeneSyncOrchestrator:
                         doc_type=doc_type,
                         context_markdown=batch.context_markdown,
                         images=batch_images,
+                        revision_context=revision_context,
                     )
                 else:
                     result = await self.memory_extractor.extract_projection_batch_memories(
@@ -3270,11 +3288,12 @@ class GeneSyncOrchestrator:
                         doc_type=doc_type,
                         images=batch_images,
                     )
+                input_binary_bytes = (result.metadata or {}).get("image_bytes", input_binary_bytes)
                 result.metadata = {
                     **(result.metadata or {}),
                     "extraction_queue_wait_ms": admission.queue_wait_ms,
                     "input_binary_bytes": input_binary_bytes,
-                    "multimodal_calls": int(admission.multimodal),
+                    "multimodal_calls": int(input_binary_bytes > 0),
                     "max_active_multimodal": admission.active_multimodal,
                 }
                 revisions = {

@@ -91,6 +91,8 @@ class SupportRevalidationLimitationCode(str, Enum):
 class SupportRevalidationLimitation(RuntimeError):
     """A product-processing limitation requiring operational attention."""
 
+    retryable = False
+
     def __init__(
         self,
         code: SupportRevalidationLimitationCode,

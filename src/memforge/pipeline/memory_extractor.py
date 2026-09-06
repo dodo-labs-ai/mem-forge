@@ -13,6 +13,7 @@ from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
 from memforge.evals.agent_evaluation import QualitySignal, record_quality_signal
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
+    ProjectionFragmentMemoryExtractionResponse,
     StructuredLlmConfig,
     StructuredLlmError,
     StructuredLlmImage,
@@ -652,13 +653,9 @@ class MemoryExtractor:
         doc_type: str = "unknown",
         context_markdown: str = "",
         images: tuple[StructuredLlmImage, ...] = (),
+        revision_context=None,
     ) -> MemoryExtractionResult:
-        """Run the disabled v9 selector path and resolve every ref immediately.
-
-        This method is deliberately not selected by the v1 Support runtime.  It
-        is the tested schema/compiler/resolver seam that the v2 cutover can
-        activate atomically without persisting transient Fragment refs.
-        """
+        """Select exact current Evidence within this work's Primary authority."""
 
         if not self.structured_llm_client:
             return MemoryExtractionResult(
@@ -699,21 +696,45 @@ class MemoryExtractor:
                 error="Structured client does not implement projection-extraction-v9",
             )
 
-        prompt = PROJECTION_FRAGMENT_EXTRACTION_PROMPT.format(
-            source_type=source_type,
-            doc_type=doc_type,
-            catalog_digest=catalog.digest,
-            fragment_catalog=json.dumps(
-                catalog.model_payload(),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            context_observations=context_markdown[:PROJECTION_CONTEXT_CHAR_CAP],
-        )
+        def make_prompt(selected_catalog, mode):
+            payload = (revision_context.model_payload(selected_catalog) if revision_context is not None
+                       else selected_catalog.model_payload())
+            return PROJECTION_FRAGMENT_EXTRACTION_PROMPT.format(
+                source_type=source_type, doc_type=doc_type, catalog_digest=selected_catalog.digest,
+                fragment_catalog=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                context_observations=(json.dumps({"input_mode": mode, "removed_historical": revision_context.delta()[1]}, ensure_ascii=False)
+                                      if mode == "delta" else context_markdown),
+            )
+
+        input_mode = "authorized_work"
+        prompt = make_prompt(catalog, input_mode)
+        if revision_context is not None:
+            selected = revision_context.extraction_catalog(catalog, "full")
+            full_prompt = make_prompt(selected, "full")
+            selected_images = revision_context.fitting_images(
+                selected, full_prompt, client=self.structured_llm_client,
+                response_format=ProjectionFragmentMemoryExtractionResponse,
+                max_tokens=self.max_tokens, model=self.model,
+            )
+            if selected_images is not None:
+                catalog, prompt, input_mode = selected, full_prompt, "full"
+            else:
+                catalog = revision_context.extraction_catalog(catalog, "delta")
+                prompt, input_mode = make_prompt(catalog, "delta"), "delta"
+                selected_images = revision_context.fitting_images(
+                    catalog, prompt, client=self.structured_llm_client,
+                    response_format=ProjectionFragmentMemoryExtractionResponse,
+                    max_tokens=self.max_tokens, model=self.model,
+                )
+            if selected_images is None:
+                return MemoryExtractionResult(error_type="evidence_catalog_unusable",
+                                              error="complete revision input exceeds configured capacity",
+                                              metadata={"catalog_error_codes": ["catalog_too_large"]})
+            images = selected_images
         started = perf_counter()
         metrics = {
             "structured_llm_calls": 1,
+            "input_mode": input_mode,
             "extraction_model": self.model,
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "prompt_chars": len(prompt),

@@ -161,39 +161,8 @@ def plan_projection_evidence_work(
         )
 
     if delta.previous_unit_revision_id is None:
-        tombstoned_ranges: dict[str, tuple[tuple[int, int], ...]] = {}
-        for observation_id in delta.added_observation_ids:
-            revision = revisions.get(observation_id)
-            if revision is None:
-                return ProjectionEvidencePlanningFailure(
-                    code=(
-                        ProjectionEvidencePlanningFailureCode.INCREMENTAL_AUTHORITY_UNMAPPABLE
-                    ),
-                    observation_id=observation_id,
-                    observation_revision_id=None,
-                    representation_profile=None,
-                )
-            profile = revision.evidence_profile
-            if profile is None or profile.name != "canonical-record":
-                continue
-            try:
-                tombstoned = canonical_record_is_tombstoned(revision)
-            except ValueError:
-                return ProjectionEvidencePlanningFailure(
-                    code=(
-                        ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID
-                    ),
-                    observation_id=observation_id,
-                    observation_revision_id=revision.id,
-                    representation_profile=profile.name,
-                )
-            if tombstoned:
-                tombstoned_ranges[observation_id] = ()
         return _plan_projection_extraction_batches_or_failure(
-            projection,
-            primary_authority_ranges_by_observation_id=(
-                tombstoned_ranges if tombstoned_ranges else None
-            ),
+            projection, primary_authority_ranges_by_observation_id=None,
             extraction_contract_version=extraction_contract_version,
         )
 
@@ -337,6 +306,22 @@ def _plan_projection_extraction_batches_or_failure(
     extraction_contract_version: str,
 ) -> tuple[ProjectionExtractionBatch, ...] | ProjectionEvidencePlanningFailure:
     """Keep deterministic presentation limits inside the typed planner contract."""
+
+    authority = dict(primary_authority_ranges_by_observation_id or {})
+    for revision in projection.observation_revisions:
+        profile = revision.evidence_profile
+        if profile is None or profile.name != "canonical-record":
+            continue
+        try:
+            if canonical_record_is_tombstoned(revision):
+                authority[revision.observation_id] = ()
+        except ValueError:
+            return ProjectionEvidencePlanningFailure(
+                code=ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID,
+                observation_id=revision.observation_id, observation_revision_id=revision.id,
+                representation_profile=profile.name,
+            )
+    primary_authority_ranges_by_observation_id = authority or None
 
     try:
         return plan_projection_extraction_batches(
