@@ -270,6 +270,8 @@ PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic kno
 
 <source_type>{source_type}</source_type>
 <doc_type>{doc_type}</doc_type>
+Catalog rows are [ref, exact source text, optional metadata]. Headings are ordinary selectable Fragments.
+Structural groups describe ancestry, not additional Evidence. When a heading defines claim scope, select its current ref as Required.
 Only the following application-owned Evidence Fragments may support a Memory:
 <evidence_fragment_catalog digest="{catalog_digest}">
 {fragment_catalog}
@@ -645,6 +647,16 @@ class MemoryExtractor:
             },
         )
 
+    @staticmethod
+    def projection_fragment_prompt(catalog, *, source_type, doc_type, context_markdown="", revision_context=None, mode="authorized_work"):
+        payload = revision_context.model_payload(catalog) if revision_context is not None else catalog.model_payload()
+        return PROJECTION_FRAGMENT_EXTRACTION_PROMPT.format(
+            source_type=source_type, doc_type=doc_type, catalog_digest=catalog.digest,
+            fragment_catalog=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            context_observations=(json.dumps({"input_mode": mode, "removed_historical": revision_context.delta()[1]}, ensure_ascii=False, separators=(",", ":"))
+                                  if mode == "delta" else context_markdown),
+        )
+
     async def extract_projection_fragment_memories(
         self,
         catalog: ProjectionFragmentCatalog,
@@ -654,6 +666,7 @@ class MemoryExtractor:
         context_markdown: str = "",
         images: tuple[StructuredLlmImage, ...] = (),
         revision_context=None,
+        prepared_prompt: str | None = None,
     ) -> MemoryExtractionResult:
         """Select exact current Evidence within this work's Primary authority."""
 
@@ -697,18 +710,12 @@ class MemoryExtractor:
             )
 
         def make_prompt(selected_catalog, mode):
-            payload = (revision_context.model_payload(selected_catalog) if revision_context is not None
-                       else selected_catalog.model_payload())
-            return PROJECTION_FRAGMENT_EXTRACTION_PROMPT.format(
-                source_type=source_type, doc_type=doc_type, catalog_digest=selected_catalog.digest,
-                fragment_catalog=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-                context_observations=(json.dumps({"input_mode": mode, "removed_historical": revision_context.delta()[1]}, ensure_ascii=False)
-                                      if mode == "delta" else context_markdown),
-            )
+            return self.projection_fragment_prompt(selected_catalog, source_type=source_type, doc_type=doc_type,
+                context_markdown=context_markdown, revision_context=revision_context, mode=mode)
 
         input_mode = "authorized_work"
-        prompt = make_prompt(catalog, input_mode)
-        if revision_context is not None:
+        prompt = prepared_prompt or make_prompt(catalog, input_mode)
+        if revision_context is not None and prepared_prompt is None:
             selected = revision_context.extraction_catalog(catalog, "full")
             full_prompt = make_prompt(selected, "full")
             selected_images = revision_context.fitting_images(
@@ -731,6 +738,9 @@ class MemoryExtractor:
                                               error="complete revision input exceeds configured capacity",
                                               metadata={"catalog_error_codes": ["catalog_too_large"]})
             images = selected_images
+        if not self.structured_llm_client.request_fits(prompt, response_format=ProjectionFragmentMemoryExtractionResponse,
+            max_tokens=self.max_tokens, model=self.model, images=images):
+            return MemoryExtractionResult(error_type="input_capacity_exceeded", error="planned extraction request exceeds configured capability")
         started = perf_counter()
         metrics = {
             "structured_llm_calls": 1,

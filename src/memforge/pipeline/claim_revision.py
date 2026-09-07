@@ -100,7 +100,7 @@ async def assess_claim_pairs(
     images: tuple = (),
     image_loader=None,
 ) -> ClaimRevisionLedger:
-    """Retain the existing 64-pair computation boundary and complete pair coverage."""
+    """Budget complete pair requests inside the existing concurrency boundary."""
     from memforge.pipeline.reconciler import ReconciliationContractError
 
     audits = {item.incumbent_id: item for item in support_audits}
@@ -144,16 +144,36 @@ async def assess_claim_pairs(
             for part in item["current_evidence"]
             if part.get("kind") == "artifact"
         }
-        batch_images = (
-            image_loader(image_ids)
-            if image_loader is not None and image_ids
-            else tuple(image for image in images if image.source_observation_id in image_ids)
-        )
+
+        async def subdivide():
+            if len(batch) == 1:
+                raise ReconciliationContractError(
+                    "claim_revision_capacity_exceeded", "one complete claim assessment exceeds input capacity"
+                )
+            middle = len(batch) // 2
+            left = await assess_batch(batch[:middle])
+            right = await assess_batch(batch[middle:])
+            return ClaimRevisionLedger(left.decisions + right.decisions, left.prompt_chars + right.prompt_chars)
+
+        from memforge.pipeline.projection_images import ProjectionImageLoadError
+
+        try:
+            batch_images = (
+                image_loader(image_ids)
+                if image_loader is not None and image_ids
+                else tuple(image for image in images if image.source_observation_id in image_ids)
+            )
+        except ProjectionImageLoadError as error:
+            if error.error_code == "image_batch_too_large":
+                return await subdivide()
+            raise
         if image_ids != {image.source_observation_id for image in batch_images}:
             raise ReconciliationContractError(
                 "claim_revision_artifact_unavailable", "current Artifact evidence bytes are required"
             )
-        prompt = MEMORY_RELATION_PROMPT.format(groups_json=json.dumps(payload, ensure_ascii=False))
+        prompt = MEMORY_RELATION_PROMPT.format(
+            groups_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        )
         prompt += CLAIM_REVISION_INSTRUCTIONS
         current_prompt = prompt
         response = None
@@ -164,10 +184,9 @@ async def assess_claim_pairs(
                 max_tokens=max_output_tokens,
                 model=model,
                 images=batch_images,
+                reserve_correction=not attempt,
             ):
-                raise ReconciliationContractError(
-                    "claim_revision_capacity_exceeded", "complete claim assessment exceeds input capacity"
-                )
+                return await subdivide()
             prompt_chars += len(current_prompt)
             response = await client.assess_claim_revisions(
                 current_prompt,

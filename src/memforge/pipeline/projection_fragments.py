@@ -837,29 +837,21 @@ class ProjectionFragmentCatalog:
     def usable(self) -> bool:
         return bool(self.fragments) and not any(error.fatal for error in self.errors)
 
-    def model_payload(self) -> Mapping[str, tuple[Mapping[str, object], ...]]:
-        primary_candidates: list[Mapping[str, object]] = []
-        required_only_candidates: list[Mapping[str, object]] = []
+    def model_payload(self) -> Mapping[str, tuple[tuple[object, ...], ...]]:
+        """Present exact text and selectable refs; provenance stays in this catalog."""
+
+        primary: list[tuple[object, ...]] = []
+        required: list[tuple[object, ...]] = []
         for fragment in self.fragments:
-            payload = {
-                "ref": fragment.reference,
-                "kind": fragment.kind.value,
-                "type": fragment.fragment_type,
-                "text": fragment.presentation_text,
-                **(
-                    {"image_source_observation_id": fragment.anchor.observation_id}
-                    if fragment.kind is EvidenceFragmentKind.ARTIFACT
-                    else {}
-                ),
-            }
-            (
-                primary_candidates
-                if fragment.primary_eligible
-                else required_only_candidates
-            ).append(payload)
+            row: tuple[object, ...] = (fragment.reference, fragment.presentation_text)
+            if (fragment.fragment_type.startswith("html-") and fragment.fragment_type != "html-p") or fragment.fragment_type.startswith("canonical-"):
+                row += ({"format": fragment.fragment_type},)
+            if fragment.kind is EvidenceFragmentKind.ARTIFACT:
+                row += ({"image_source_observation_id": fragment.anchor.observation_id},)
+            (primary if fragment.primary_eligible else required).append(row)
         return {
-            "primary_candidates": tuple(primary_candidates),
-            "required_only_candidates": tuple(required_only_candidates),
+            "primary_candidates": tuple(primary),
+            "required_only_candidates": tuple(required),
         }
 
     def selection_fingerprint(

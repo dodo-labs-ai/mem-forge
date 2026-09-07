@@ -34,6 +34,7 @@ from memforge.llm.structured import (
     OfflineSemanticJudgeResponse,
     ProjectionFragmentMemoryExtractionResponse,
     ProjectionMemoryExtractionResponse,
+    RevisionSupportResponse,
     RevisionCompositionDecision,
     RevisionCompositionResponse,
     RerankResponse,
@@ -226,6 +227,13 @@ class ChoiceMessage:
 class Choice:
     def __init__(self, content: str | None) -> None:
         self.message = ChoiceMessage(content)
+
+
+@pytest.fixture(autouse=True)
+def fixture_model_capacity(monkeypatch):
+    monkeypatch.setattr("memforge.llm.structured.litellm.get_model_info", lambda *args, **kwargs: {
+        "max_input_tokens": 200000, "max_output_tokens": 64000,
+    })
 
 
 class CompletionResponse:
@@ -1142,6 +1150,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         )
     )
     operations = {
+        "evaluate_revision_work": lambda: client.evaluate_revision_work("prompt", response_format=RevisionSupportResponse, max_tokens=512),
         "assess_revision_support": lambda: client.assess_revision_support("prompt"),
         "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
         "verify_source_support": lambda: client.verify_source_support("prompt"),
@@ -1190,7 +1199,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
     assert [
         call["response_format"]["json_schema"]["name"]
         for call in calls
-    ] == list(payloads)
+    ] == ["RevisionSupportResponse", *payloads]
     assert all("output_config" not in call for call in calls)
 
 
@@ -2343,9 +2352,49 @@ def test_revision_input_budget_counts_complete_schema_and_output_reserve(monkeyp
 
 def test_revision_input_policy_identity_changes_with_budget_or_provider_limits(monkeypatch):
     from dataclasses import replace
-    config = StructuredLlmConfig(model='openai/test', base_url=None, api_key=None, timeout_s=1)
+    config = StructuredLlmConfig(model='openai/test', base_url=None, api_key=None, timeout_s=1, max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768)
     monkeypatch.setattr('memforge.llm.structured.litellm.get_model_info', lambda *a, **kw: {})
     original = LiteLlmStructuredClient(config).input_policy_identity
     assert LiteLlmStructuredClient(replace(config, input_budget_fraction=0.7)).input_policy_identity != original
     monkeypatch.setattr('memforge.llm.structured.litellm.get_model_info', lambda *a, **kw: {'max_input_tokens': 8192})
     assert LiteLlmStructuredClient(config).input_policy_identity != original
+
+
+def test_request_budget_freezes_capability_per_effective_model(monkeypatch):
+    from memforge.llm.structured import RevisionSupportResponse, _json_text_prompt
+    lookups = []
+    def info(model):
+        lookups.append(model)
+        return {"max_input_tokens": 12000 if model.endswith("small") else 24000, "max_output_tokens": 4000}
+    monkeypatch.setattr("memforge.llm.structured.litellm.get_model_info", info)
+    client = LiteLlmStructuredClient(StructuredLlmConfig(model="openai/small", base_url=None, api_key=None, timeout_s=1))
+    first = client.input_policy_identity_for("openai/small")
+    assert client.input_policy_identity_for("openai/large") != first
+    assert client.input_policy_identity_for("openai/small") == first
+    assert len(lookups) == 2
+    messages = []
+    monkeypatch.setattr("memforge.llm.structured.litellm.token_counter", lambda **kw: messages.append(kw) or 100)
+    client.request_tokens("literal {input}", response_format=RevisionSupportResponse, model="openai/large")
+    assert messages[0]["messages"][0]["content"] == _json_text_prompt("literal {input}", RevisionSupportResponse)
+    assert messages[0]["model"].endswith("large")
+
+
+def test_known_model_uses_sdk_capacity_without_unrequested_app_cap(monkeypatch):
+    client = LiteLlmStructuredClient(StructuredLlmConfig(model='openai/known', base_url=None, api_key=None, timeout_s=1))
+    assert client.request_budget().input_limit == 200000
+    assert client.request_budget().output_limit == 64000
+
+
+def test_unknown_route_requires_explicit_capacity(monkeypatch):
+    monkeypatch.setattr('memforge.llm.structured.litellm.get_model_info', lambda *args, **kwargs: {})
+    client = LiteLlmStructuredClient(StructuredLlmConfig(model='gateway/unknown', base_url=None, api_key=None, timeout_s=1))
+    with pytest.raises(ValueError, match='configure MEMFORGE_LLM_MAX_INPUT_TOKENS'):
+        client.request_budget()
+
+
+def test_correction_consumes_its_existing_reserve(monkeypatch):
+    client = LiteLlmStructuredClient(StructuredLlmConfig(model='openai/known', base_url=None, api_key=None, timeout_s=1,
+        max_input_tokens=10000, context_window_tokens=20000, max_output_tokens=1000))
+    monkeypatch.setattr('memforge.llm.structured.litellm.token_counter', lambda **kwargs: 7500)
+    assert not client.request_fits('correction', response_format=RevisionSupportResponse, max_tokens=1000)
+    assert client.request_fits('correction', response_format=RevisionSupportResponse, max_tokens=1000, reserve_correction=False)

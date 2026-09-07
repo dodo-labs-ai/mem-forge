@@ -58,9 +58,9 @@ class LlmConfig:
     enrichment_max_tokens: int = DEFAULT_ENRICHMENT_MAX_TOKENS
     memory_extraction_max_tokens: int = DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
     enrichment_max_concurrent: int = 3
-    max_input_tokens: int = 32768
-    context_window_tokens: int = 65536
-    max_output_tokens: int = 32768
+    max_input_tokens: int | None = None
+    context_window_tokens: int | None = None
+    max_output_tokens: int | None = None
     input_budget_fraction: float = 0.8
     request_timeout_s: float = 300.0
     llm_calls_per_minute: int = 30
@@ -165,8 +165,9 @@ class AppConfig:
             or self.llm.memory_extraction_max_tokens
         )
         for name in ("max_input_tokens", "context_window_tokens", "max_output_tokens"):
-            value = int(os.environ.get(f"MEMFORGE_LLM_{name.upper()}") or getattr(self.llm, name))
-            if value < 1:
+            raw_value = os.environ.get(f"MEMFORGE_LLM_{name.upper()}") or getattr(self.llm, name)
+            value = int(raw_value) if raw_value is not None else None
+            if value is not None and value < 1:
                 raise ValueError(f"llm.{name} must be positive")
             setattr(self.llm, name, value)
         self.llm.input_budget_fraction = float(os.environ.get("MEMFORGE_LLM_INPUT_BUDGET_FRACTION") or self.llm.input_budget_fraction)

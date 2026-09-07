@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from enum import Enum
-from typing import Mapping
+from typing import Mapping, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from memforge.pipeline.projection_fragments import ProjectionFragmentCatalog
 
 from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
@@ -56,6 +59,8 @@ class ProjectionExtractionBatch:
     primary_authority_spans: tuple[tuple[str, int, str], ...] = ()
     candidate_context_observation_ids: tuple[str, ...] | None = None
     candidate_context_image_bytes: int = 0
+    prepared_catalog: ProjectionFragmentCatalog | None = None
+    prepared_prompt: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

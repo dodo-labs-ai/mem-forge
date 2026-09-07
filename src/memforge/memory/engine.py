@@ -153,6 +153,7 @@ class _PreparedProjectedLifecycleCommit:
     document: "DocumentRecord | None"
     derivation_id: str | None
     derivation_context_identity_hash: str | None
+    required_derivation_work_ids: tuple[str, ...]
     expected_source_activity_epoch: int | None
     base_stats: Mapping[str, int]
     corroboration_target_ids: frozenset[str]
@@ -814,6 +815,7 @@ class MemoryEngine:
                 derivation_context_identity_hash=(
                     prepared.derivation_context_identity_hash
                 ),
+                required_derivation_work_ids=prepared.required_derivation_work_ids,
                 expected_source_activity_epoch=(
                     prepared.expected_source_activity_epoch
                 ),
@@ -1113,6 +1115,7 @@ class MemoryEngine:
         support_audits = []
         assessed_evidence: dict[str, list[RawMemory]] = {}
         assessment_image_loader = None
+        required_derivation_work_ids = ()
         model_incumbent_count = 0
         deterministic_disjoint_keep_count = 0
         model_batch_count = 0
@@ -1169,6 +1172,9 @@ class MemoryEngine:
                 evidence_by_memory = await self.db.get_active_memory_support_evidence_many(
                     tuple(memory.id for memory in model_incumbents), source_id=projection.source_id,
                 )
+                from memforge.pipeline.revision_work import RevisionWorkExecutor, SupportWorkItem
+                work_items = []
+                work_by_memory = {}
                 for memory in model_incumbents:
                     groups: dict[str, list] = {}
                     for item in evidence_by_memory.get(memory.id, ()):
@@ -1177,7 +1183,7 @@ class MemoryEngine:
                             groups.setdefault(item.evidence_unit_id, []).append(item)
                     if not groups:
                         raise ReconciliationContractError("revision_support_missing", "incumbent has no complete scoped support")
-                    results = []
+                    work_by_memory[memory.id] = []
                     for evidence_unit_id, support in groups.items():
                         plan_ids = {item.validation_plan_id for item in support}
                         baseline_ids = {item.validation_unit_revision_id for item in support}
@@ -1205,21 +1211,30 @@ class MemoryEngine:
                                 image_loader=assessment_image_loader, indexes=assessment_context.indexes,
                             )
                             contexts_by_revision[baseline_id] = context
-                        calls_before, chars_before = context.model_calls, context.prompt_chars
-                        stats["support_revalidation_work_item_count"] += 1
-                        try:
-                            _runtime_context.stage = "support_revalidation"
-                            assessed = await context.assess(
-                                memory=memory, support=tuple(support), client=self.structured_llm_client, model=self.llm_model,
-                            )
-                        finally:
-                            calls = context.model_calls - calls_before
-                            stats["support_revalidation_model_call_count"] += calls
-                            stats["support_revalidation_prompt_chars"] += context.prompt_chars - chars_before
-                            _runtime_context.model_call_count += calls
-                        results.append(assessed)
-                        stats["support_revalidation_auto_rebind_count"] += int(assessed.supported)
+                        work_id = f"w{len(work_items):06d}"
+                        work_items.append(SupportWorkItem(work_id, memory, tuple(support), context))
+                        work_by_memory[memory.id].append(work_id)
+                evaluator = RevisionWorkExecutor(client=self.structured_llm_client, model=self.llm_model,
+                                                 store=self.db, derivation_id=derivation_id)
+                stats["support_revalidation_work_item_count"] += len(work_items)
+                try:
+                    _runtime_context.stage = "support_revalidation"
+                    assessed = await evaluator.assess_many(work_items)
+                finally:
+                    stats["support_revalidation_model_call_count"] += evaluator.calls
+                    stats["support_revalidation_prompt_chars"] += evaluator.prompt_chars
+                    stats["support_revalidation_reused_work_count"] = evaluator.reused
+                    stats["support_revalidation_scan_request_count"] = evaluator.stage_counts["support_scan"]
+                    stats["support_revalidation_reduction_request_count"] = evaluator.stage_counts["support_reduce"]
+                    stats["support_revalidation_final_request_count"] = evaluator.stage_counts["support_finalize"]
+                    stats["support_revalidation_covered_source_claim_pairs"] = evaluator.covered_source_claim_pairs
+                    stats["support_revalidation_max_reduction_depth"] = evaluator.max_reduction_depth
+                    _runtime_context.model_call_count += evaluator.calls
+                required_derivation_work_ids = tuple(evaluator.final_work_ids) if derivation_id else ()
+                for memory in model_incumbents:
+                    results = [assessed[work_id] for work_id in work_by_memory[memory.id]]
                     current = [result.memory for result in results if result.supported and result.memory is not None]
+                    stats["support_revalidation_auto_rebind_count"] += len(current)
                     assessed_evidence[memory.id] = current
                     support_audits.append(SupportAuditEntry(
                         incumbent_id=memory.id, supported=bool(current),
@@ -1605,6 +1620,7 @@ class MemoryEngine:
             document=document,
             derivation_id=derivation_id,
             derivation_context_identity_hash=derivation_context_identity_hash,
+            required_derivation_work_ids=required_derivation_work_ids,
             expected_source_activity_epoch=expected_source_activity_epoch,
             base_stats=dict(stats),
             corroboration_target_ids=frozenset(attached_target_ids),
