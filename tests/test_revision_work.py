@@ -1,24 +1,20 @@
+"""Transport and lifecycle contracts; fixture judgments are not model-accuracy evidence."""
+
 import json
 from dataclasses import replace
 
 import pytest
 
 from memforge.pipeline.revision_work import RevisionWorkExecutor, SupportWorkItem
-from memforge.llm.structured import (
-    RevisionScanResponse as ScanResponse,
-    RevisionScanResult as ScanResult,
-    RevisionScanFinding as Finding,
-    RevisionFinalResponse as FinalResponse,
-    RevisionFinalResult as FinalResult,
-)
+from memforge.llm.structured import SupportAssessmentResponse, SupportAssessmentResult
 from tests.test_revision_assessment import revisions, old_support, memory
 
 
 class Client:
-    def __init__(self, limit=4000):
+    def __init__(self, limit=8000):
         self.limit = limit
         self.prompts = []
-        self.fail_next_scan = False
+        self.fail_at = None
 
     def request_fits(self, prompt, *, max_tokens, reserve_correction=True, **kwargs):
         return len(prompt) + max_tokens // 8 <= self.limit - (256 if reserve_correction else 0)
@@ -30,40 +26,38 @@ class Client:
         return f"fixture-{self.limit}-{model}"
 
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+        assert response_format is SupportAssessmentResponse
         self.prompts.append(prompt)
-        tag = "scan" if response_format is ScanResponse else "final"
-        payload = json.loads(prompt.split(f"<{tag}>")[1].split(f"</{tag}>")[0])
-        rows = payload["current"]["primary_candidates"]
-        if response_format is ScanResponse:
-            if self.fail_next_scan and len(self.prompts) > 1:
-                self.fail_next_scan = False
-                raise TimeoutError("fixture timeout")
-            findings = [
-                Finding(kind="scope" if "Cedar" in row[1] else "support", refs=[row[0]], explanation=row[1])
-                for row in rows
-                if "reviewers" in row[1] or "Cedar" in row[1]
-            ]
-            return ScanResponse(
-                results=[
-                    ScanResult(work_id=claim["work_id"], observations_found=findings, no_local_effect=not findings)
-                    for claim in payload["claims"]
-                ]
+        if self.fail_at == len(self.prompts):
+            self.fail_at = None
+            raise TimeoutError("fixture interruption")
+        payload = json.loads(prompt.split("<assessment>")[1].split("</assessment>")[0])
+        rows = payload["current"]["primary_candidates"] + payload["current"]["required_only_candidates"]
+        previous = {r["work_id"]: r for r in payload["previous_state"]}
+        results = []
+        for claim in payload["claims"]:
+            state = SupportAssessmentResult.model_validate(previous[claim["work_id"]])
+            facts = list(state.considerations)
+            for ref, text, *_ in rows:
+                if any(term in text for term in ("Cedar", "Alder", "Birch")):
+                    if text not in facts:
+                        facts.append(text)
+                    if ref not in state.context_refs:
+                        state.context_refs.append(ref)
+                if "Two reviewers approve US releases." == text.strip():
+                    state.primary_ref = ref
+            state.considerations = facts
+            combined = " ".join(facts)
+            exception = ("Cedar uses one reviewer" in combined and "Cedar means US" in combined) or all(
+                part in combined for part in ("Alder releases need not", "Alder refers to Birch", "Birch refers to US")
             )
-        text = "\n".join(row[1] for row in rows)
-        assert "summaries are navigation" in prompt
-        unsupported = "Cedar means US" in text and "Cedar uses one reviewer" in text
-        primary = next((row[0] for row in rows if "reviewers" in row[1]), None)
-        return FinalResponse(
-            results=[
-                FinalResult(
-                    work_id=claim["work_id"],
-                    status="unsupported" if unsupported or primary is None else "supported",
-                    primary_ref=primary,
-                    reason="fixture joint decision",
-                )
-                for claim in payload["claims"]
-            ]
-        )
+            if exception:
+                state.status = "unsupported"
+            elif state.status != "unsupported":
+                state.status = "supported" if state.primary_ref else "insufficient"
+            state.reason = "Cumulative fixture judgment; fixed rule and exceptions remain distinct from compliance."
+            results.append(state)
+        return SupportAssessmentResponse(results=results)
 
 
 class Store:
@@ -88,106 +82,127 @@ def work_items(text, count=1):
     ]
 
 
+def payload(prompt):
+    return json.loads(prompt.split("<assessment>")[1].split("</assessment>")[0])
+
+
 @pytest.mark.asyncio
-async def test_small_source_multiple_claims_share_one_final_call():
-    client = Client(limit=15000)
+async def test_small_delta_shares_one_direct_request_and_program_completion():
+    client, store = Client(limit=16000), Store()
     items = work_items("Two reviewers approve US releases.\n", 3)
-    executor = RevisionWorkExecutor(client=client, model="fixture")
-    result = await executor.assess_many(items)
-    assert len(client.prompts) == 1
-    assert len(result) == 3 and all(value.supported for value in result.values())
+    executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
+    results = await executor.assess_many(items)
+    assert len(client.prompts) == 1 and len(results) == 3
+    assert all(r.supported for r in results.values())
+    assert payload(client.prompts[0])["input_mode"] == "delta"
+    receipts = [w for w in store.works.values() if w.kind == "support_finalize"]
+    assert len(receipts) == 1 and receipts[0].manifest["completion"] == "program"
+    assert receipts[0].manifest["dependencies"] and executor.calls == 1
     assert all(
-        value.memory.resolved_evidence_selection.parts[0].anchor.observation_revision_id == "rev-primary-v2"
-        for value in result.values()
+        r.memory.resolved_evidence_selection.parts[0].anchor.observation_revision_id == "rev-primary-v2"
+        for r in results.values()
     )
 
 
 @pytest.mark.asyncio
-async def test_large_source_scans_all_chunks_and_jointly_explains_distant_exception():
-    text = (
-        "Two reviewers approve US releases.\n\nCedar uses one reviewer.\n\n"
-        + "\n\n".join(f"Unrelated section {i}: a routine operational note." for i in range(100))
-        + "\n\nCedar means US releases.\n"
+async def test_small_change_never_sends_unchanged_document_even_when_it_fits():
+    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+
+    body = "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Unchanged unrelated note {i}." for i in range(100))
+    base, current = revisions(body, body + "\n\nNew unrelated execution record.")
+    item = SupportWorkItem(
+        "w0",
+        memory(),
+        old_support(base),
+        RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope"),
     )
+    client = Client(limit=100000)
+    await RevisionWorkExecutor(client=client, model="fixture").assess_many([item])
+    assert len(client.prompts) == 1
+    assert "New unrelated execution record" in client.prompts[0]
+    assert "Unchanged unrelated note 99" not in client.prompts[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_cross_batch_exception_survives_later_unrelated_and_rule_text(reverse):
+    pieces = ["Cedar uses one reviewer.", "Cedar means US releases.", "Two reviewers approve US releases."]
+    if reverse:
+        pieces.reverse()
+    filler = "\n\n".join(f"Routine execution note {i}: maintain settings." for i in range(100))
+    text = ("\n\n" + filler + "\n\n").join(pieces)
     client = Client()
+    items = work_items(text, 3)
     executor = RevisionWorkExecutor(client=client, model="fixture")
-    result = await executor.assess_many(work_items(text, 2))
-    assert all(not value.supported for value in result.values())
-    assert sum("<scan>" in prompt for prompt in client.prompts) > 2
-    assert all(client.request_fits(prompt, max_tokens=512) for prompt in client.prompts)
-    for prompt in client.prompts:
-        if "<final>" in prompt:
-            assert "Cedar uses one reviewer" in prompt and "Cedar means US" in prompt
+    results = await executor.assess_many(items)
+    assert all(not r.supported for r in results.values())
+    assert len(client.prompts) > 2
+    assert all("<scan>" not in p and "<reduce>" not in p and "<final>" not in p for p in client.prompts)
+    for work_id in results:
+        spans = [
+            payload(p)["coverage"] for p in client.prompts if any(c["work_id"] == work_id for c in payload(p)["claims"])
+        ]
+        assert spans[0]["processed_before"] == 0
+        assert spans[-1]["complete_after_batch"]
+        assert all(a["processed_before"] + a["batch_size"] == b["processed_before"] for a, b in zip(spans, spans[1:]))
+    assert any(len(payload(p)["claims"]) > 1 for p in client.prompts)
 
 
 @pytest.mark.asyncio
-async def test_retry_reuses_completed_scan_siblings():
-    text = "Two reviewers approve US releases.\n\n" + "\n\n".join(
-        f"Unrelated item {i}: still ordinary explanatory text." for i in range(80)
-    )
-    items = work_items(text)
-    client = Client()
-    client.fail_next_scan = True
-    store = Store()
-    first = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
+async def test_retry_reuses_completed_assessments_without_replaying_their_model_calls():
+    items = work_items("Two reviewers approve US releases.\n\n" + "\n\n".join(f"Routine note {i}." for i in range(350)))
+    client, store = Client(), Store()
+    client.fail_at = 2
+    executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
     with pytest.raises(TimeoutError):
-        await first.assess_many(items)
-    completed = {key for key, work in store.works.items() if work.status == "completed"}
-    assert completed
-    second = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
-    assert (await second.assess_many(items))["w0"].supported
-    assert second.reused == len(completed)
-    assert second.final_work_ids
+        await executor.assess_many(items)
+    done = {w.id: w.result_hash for w in store.works.values() if w.status == "completed"}
+    assert done and not executor.final_work_ids
+    retry = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
+    assert (await retry.assess_many(items))["w0"].supported
+    assert retry.reused == len(done)
+    assert all(store.works["root", key].result_hash == value for key, value in done.items())
 
 
 @pytest.mark.asyncio
-async def test_incomplete_scan_gets_one_correction_and_never_reaches_final():
-    from memforge.pipeline.reconciler import ReconciliationContractError
+async def test_unknown_selector_gets_one_local_correction_not_a_completed_receipt():
+    class InvalidClient(Client):
+        async def evaluate_revision_work(self, prompt, **kwargs):
+            result = await super().evaluate_revision_work(prompt, **kwargs)
+            result.results[0].primary_ref = "not-supplied"
+            return result
 
-    class EmptyClient(Client):
-        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-            self.prompts.append(prompt)
-            assert response_format is ScanResponse
-            payload = json.loads(prompt.split("<scan>")[1].split("</scan>")[0])
-            return ScanResponse(results=[ScanResult(work_id=c["work_id"]) for c in payload["claims"]])
-
-    client = EmptyClient()
+    client = InvalidClient()
     executor = RevisionWorkExecutor(client=client, model="fixture")
-    text = "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Note {i} has no change." for i in range(200))
-    with pytest.raises(ReconciliationContractError, match="correction exhausted"):
-        await executor.assess_many(work_items(text))
-    assert len(client.prompts) == 2
+    with pytest.raises(Exception, match="bounded assessment correction exhausted"):
+        await executor.assess_many(work_items("Two reviewers approve US releases."))
+    assert len(client.prompts) == 2 and "Correction:" in client.prompts[-1]
     assert not executor.final_work_ids
 
 
 @pytest.mark.asyncio
-async def test_final_restores_exact_heading_even_when_scan_only_selects_paragraph():
-    text = "# US releases\n\nTwo reviewers approve US releases.\n\n" + "\n\n".join(
-        f"Routine note {i}." for i in range(200)
+async def test_unknown_baseline_uses_full_batches_without_inheriting_historical_evidence():
+    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+
+    items = work_items("Two reviewers approve US releases.\n\n" + "\n\n".join(f"Routine note {i}." for i in range(300)))
+    old = items[0]
+    context = RevisionAssessmentContext(projection=old.context.projection, base=None, access_context_hash="scope")
+    item = replace(
+        old,
+        context=context,
+        support=tuple(replace(p, excerpt="huge historical material " * 10000) for p in old.support),
     )
     client = Client()
-    result = await RevisionWorkExecutor(client=client, model="fixture").assess_many(work_items(text))
-    assert result["w0"].supported
-    final_prompt = next(prompt for prompt in client.prompts if "<final>" in prompt)
-    payload = json.loads(final_prompt.split("<final>")[1].split("</final>")[0])
-    rows = payload["current"]["primary_candidates"] + payload["current"]["required_only_candidates"]
-    assert any(row[1].strip() == "# US releases" for row in rows)
-    assert all("US releases" not in f["explanation"] or "reviewers" in f["explanation"] for f in payload["findings"])
+    result = await RevisionWorkExecutor(client=client, model="fixture").assess_many([item])
+    assert result["w0"].supported and len(client.prompts) > 1
+    assert all(payload(p)["input_mode"] == "full" and "historical_evidence" not in payload(p) for p in client.prompts)
+    assert payload(client.prompts[0])["previous_state"][0]["status"] == "insufficient"
 
 
 @pytest.mark.asyncio
-async def test_shared_old_evidence_is_sent_once_but_supports_stay_separate():
-    client = Client(limit=15000)
-    await RevisionWorkExecutor(client=client, model="fixture").assess_many(
-        work_items("Two reviewers approve US releases.\n", 3)
-    )
-    payload = json.loads(client.prompts[0].split("<final>")[1].split("</final>")[0])
-    assert len(payload["historical_evidence"]) == 1
-    assert all("ref" not in row for row in payload["historical_evidence"])
-    assert all(group["parts"][0] == {"role": "primary", "historical_index": 0}
-               for group in payload["previous_evidence"])
-    assert len(payload["previous_evidence"]) == 3
-    assert len({group["work_id"] for group in payload["previous_evidence"]}) == 3
+async def test_harmless_long_reason_does_not_fail_schema_validation():
+    row = SupportAssessmentResult(work_id="w0", status="insufficient", reason="Explanation " * 300)
+    assert len(row.reason) > 1000
 
 
 def test_previous_evidence_uses_current_ref_only_for_exact_current_anchor_and_text():
@@ -207,218 +222,96 @@ def test_previous_evidence_uses_current_ref_only_for_exact_current_anchor_and_te
 
 
 @pytest.mark.asyncio
-async def test_reduction_accounts_for_all_findings_before_final():
-    from memforge.llm.structured import RevisionReductionResponse, RevisionReductionDisposition
+async def test_growing_shared_state_splits_only_unprocessed_tail_and_resumes():
+    class GrowingClient(Client):
+        def request_fits(self, prompt, **kwargs):
+            data = payload(prompt)
+            states = data["previous_state"]
+            if len(states) > 1 and any(len(s["reason"]) > 1000 for s in states):
+                return False
+            if data["coverage"]["batch_size"] > 12:
+                return False
+            return super().request_fits(prompt, **kwargs)
 
-    class ReductionClient(Client):
-        def __init__(self):
-            super().__init__(limit=7000)
-            self.reduced_ids = []
-
-        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-            if response_format is RevisionReductionResponse:
-                self.prompts.append(prompt)
-                payload = json.loads(prompt.split("<reduce>")[1].split("</reduce>")[0])
-                rows = payload["current"]["primary_candidates"] + payload["current"]["required_only_candidates"]
-                selected = {row[0] for row in rows if "reviewers" in row[1]}
-                self.reduced_ids.extend(f["finding_id"] for f in payload["findings"])
-                return RevisionReductionResponse(
-                    dispositions=[
-                        RevisionReductionDisposition(
-                            finding_id=f["finding_id"],
-                            retained_refs=[ref for ref in f["refs"] if ref in selected],
-                            explanation="Other material is an unrelated operational note.",
-                        )
-                        for f in payload["findings"]
-                    ],
-                    summary="Only the approval rule supports this claim.",
-                    needs_context=[],
-                )
-            response = await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
-            if response_format is ScanResponse:
-                payload = json.loads(prompt.split("<scan>")[1].split("</scan>")[0])
-                for result in response.results:
-                    result.observations_found = [
-                        Finding(
-                            kind="support",
-                            refs=[row[0]],
-                            explanation="Inspect this potentially relevant operational note. " * 6,
-                        )
-                        for row in payload["current"]["primary_candidates"]
-                    ]
-                    result.no_local_effect = False
-            return response
-
-    client = ReductionClient()
-    text = "Two reviewers approve US releases.\n\n" + "\n\n".join(
-        f"Unrelated operational note {i}: maintain the routine settings." for i in range(100)
-    )
-    result = await RevisionWorkExecutor(client=client, model="fixture").assess_many(work_items(text))
-    assert result["w0"].supported
-    assert len(client.reduced_ids) >= 101
-    assert "<final>" in client.prompts[-1]
-
-
-@pytest.mark.asyncio
-async def test_large_source_and_many_claims_share_scan_requests():
-    client = Client(limit=6500)
-    text = "Two reviewers approve US releases.\n\n" + "\n\n".join(
-        f"Routine operational guidance {i}." for i in range(200)
-    )
-    executor = RevisionWorkExecutor(client=client, model="fixture")
-    result = await executor.assess_many(work_items(text, 8))
-    scans = [json.loads(p.split("<scan>")[1].split("</scan>")[0]) for p in client.prompts if "<scan>" in p]
-    assert any(len(scan["claims"]) > 1 for scan in scans)
-    assert len(result) == 8 and all(item.supported for item in result.values())
-    expected_units = len(executor._range(work_items(text, 8)).catalog.fragments)
-    assert executor.covered_source_claim_pairs == expected_units * 8
-
-
-@pytest.mark.asyncio
-async def test_oversized_historical_evidence_uses_complete_current_full_scan():
-    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-
-    old = "Two reviewers approve US releases. " + "Historical explanatory background. " * 500
-    new = "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Current routine note {i}." for i in range(200))
-    base, current = revisions(old, new)
-    context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
-    item = SupportWorkItem("w0", memory(), old_support(base), context)
-    client = Client(limit=6000)
-    result = await RevisionWorkExecutor(client=client, model="fixture").assess_many([item])
-    assert result["w0"].supported
-    scans = [json.loads(p.split("<scan>")[1].split("</scan>")[0]) for p in client.prompts if "<scan>" in p]
-    assert len(scans) > 1
-    assert all(scan["input_mode"] == "full" and "historical_evidence" not in scan for scan in scans)
-    assert any("Current routine note 199" in p for p in client.prompts)
-
-
-@pytest.mark.asyncio
-async def test_different_baselines_share_current_full_when_total_delta_cost_is_higher():
-    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-
-    current_text = "Two reviewers approve US releases.\n\n" + "\n\n".join(
-        f"Current operational note {i}: the process is stable." for i in range(80)
-    )
-    items = []
-    for index in range(3):
-        base, current = revisions(
-            f"Two reviewers approve US releases.\n\nOld baseline {index}: historical policy.\n", current_text
-        )
-        primary = replace(base.observation_revisions[0], id=f"old-revision-{index}")
-        unit = replace(base.source_unit_revisions[0], id=f"old-unit-{index}",
-                       observation_revision_ids=(primary.id, "rev-context"))
-        base = replace(base, observation_revisions=(primary, base.observation_revisions[1]),
-                       source_unit_revisions=(unit,),
-                       deltas=(replace(base.deltas[0], current_unit_revision_id=unit.id),))
-        context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
-        items.append(SupportWorkItem(f"w{index}", replace(memory(), id=f"m{index}"), old_support(base), context))
-    client = Client(limit=6500)
-    executor = RevisionWorkExecutor(client=client, model="fixture")
-    results = await executor.assess_many(items)
-    scans = [json.loads(p.split("<scan>")[1].split("</scan>")[0]) for p in client.prompts if "<scan>" in p]
-    assert scans and all(p["input_mode"] == "full" for p in scans)
-    assert any(len(p["claims"]) > 1 for p in scans)
-    assert len(results) == 3 and all(r.supported for r in results.values())
-    for item in items:
-        seen = {row[1] for p in scans if any(c["work_id"] == item.id for c in p["claims"])
-                for row in p["current"]["primary_candidates"]}
-        assert {f.presentation_text for f in item.context.full_fragments} <= seen
-
-
-def test_validated_baseline_can_be_newer_than_immutable_evidence_provenance():
-    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-
-    old = "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Stable note {i}." for i in range(120))
-    base, current = revisions(old, old + "\n\nOne new routine note.\n")
-    context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
-    part = old_support(base)[0]
-    part = replace(part, anchor=replace(part.anchor, observation_revision_id="original-v1"),
-                   validation_plan_id="validated-later", validation_unit_revision_id=base.source_unit_revisions[0].id)
-    item = SupportWorkItem("w0", memory(), (part,), context)
-    executor = RevisionWorkExecutor(client=Client(), model="fixture")
-    assert executor._range([item]).mode == "delta"
-    changed = replace(item, support=(replace(part, validation_plan_id="different-plan"),))
-    assert executor._identity([item]) != executor._identity([changed])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('bad_ref', ['e0', 'p999999', 'quoted source text ' * 2000, '重复文本' * 20])
-async def test_scan_correction_identifies_invalid_ref_without_widening_evidence_scope(bad_ref):
-    class RepairClient(Client):
-        sent_invalid = False
-
-        def request_fits(self, prompt, *, max_tokens, reserve_correction=True, **kwargs):
-            return len(prompt) + max_tokens // 8 <= self.limit - (1024 if reserve_correction else 0)
-
-        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-            result = await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
-            if response_format is ScanResponse and not self.sent_invalid:
-                self.sent_invalid = True
-                result.results[0].observations_found = [Finding(kind='support', refs=[bad_ref] + ([f'{i}' + bad_ref[1:] for i in range(8)] if bad_ref.startswith('重复') else []), explanation='fixture')]
-                result.results[0].no_local_effect = False
-            elif 'Correction:' in prompt:
-                diagnostic = prompt.split('Correction:')[1]
-                if not bad_ref.startswith('重复'):
-                    assert (bad_ref if len(bad_ref) <= 80 else f'<invalid ref: {len(bad_ref)} chars>') in diagnostic
-                assert len(diagnostic) < 1024
-                if len(bad_ref) > 80:
-                    assert bad_ref not in diagnostic
-                assert 'historical_evidence is not selectable' in prompt
+        async def evaluate_revision_work(self, prompt, **kwargs):
+            result = await super().evaluate_revision_work(prompt, **kwargs)
+            for r in result.results:
+                r.reason = "Important cumulative interpretation. " * 45
             return result
 
-    client = RepairClient(limit=5000)
-    text = 'Two reviewers approve US releases.\n\n' + '\n\n'.join(f'Routine process note {i}.' for i in range(150))
-    executor = RevisionWorkExecutor(client=client, model='fixture')
-    result = await executor.assess_many(work_items(text))
-    assert client.sent_invalid and sum('Correction:' in p for p in client.prompts) == 1
-    assert result['w0'].supported
-    assert all(part.anchor.observation_revision_id != 'rev-primary'
-               for part in result['w0'].memory.resolved_evidence_selection.parts)
+    items = work_items(
+        "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Routine note {i}." for i in range(70)), 2
+    )
+    store, client = Store(), GrowingClient(limit=20000)
+    client.fail_at = 3
+    executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
+    with pytest.raises(TimeoutError):
+        await executor.assess_many(items)
+    first = payload(client.prompts[0])
+    assert len(first["claims"]) == 2
+    prefix = first["coverage"]["batch_size"]
+    retry_client = GrowingClient(limit=20000)
+    retry = RevisionWorkExecutor(client=retry_client, model="fixture", store=store, derivation_id="root")
+    assert all(r.supported for r in (await retry.assess_many(items)).values())
+    assert retry.reused >= 2
+    assert all(payload(p)["coverage"]["processed_before"] >= prefix for p in retry_client.prompts)
+    assert all(len(payload(p)["claims"]) == 1 for p in client.prompts[1:] + retry_client.prompts)
+    receipts = [w for w in store.works.values() if w.kind == "support_finalize"]
+    assert len(receipts) == 2
+    assert receipts[0].manifest["dependencies"][0] == receipts[1].manifest["dependencies"][0]
+
+
+def test_output_budget_counts_same_refs_per_claim_and_existing_state():
+    import litellm
+
+    items = work_items("Two reviewers approve US releases.", 32)
+    executor = RevisionWorkExecutor(client=Client(), model="gpt-4o")
+    refs = [f"p{i:06d}" for i in range(300)]
+    response = SupportAssessmentResponse(
+        results=[
+            SupportAssessmentResult(
+                work_id=i.id,
+                status="supported",
+                primary_ref=refs[0],
+                required_refs=refs[1:],
+                context_refs=refs,
+            )
+            for i in items
+        ]
+    )
+    minimum = litellm.token_counter(model="gpt-4o", text=response.model_dump_json())
+    assert executor._output(items, 300) >= minimum
+    assert executor._output(items, 300, response.results) > executor._output(items, 300)
+
+
+def test_deleted_historical_refs_are_budgeted_for_each_claim():
+    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+
+    previous = "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Deleted condition {i}." for i in range(250))
+    base, target = revisions(previous, "Two reviewers approve US releases.")
+    context = RevisionAssessmentContext(projection=target, base=base, access_context_hash="scope")
+    items = [SupportWorkItem(f"w{i}", replace(memory(), id=f"m{i}"), old_support(base), context) for i in range(3)]
+    executor = RevisionWorkExecutor(client=Client(limit=100000), model="gpt-4o")
+    scope = executor._range(items)
+    states = {i.id: executor._initial(scope, i) for i in items}
+    units = [("historical", part) for part in scope.removed]
+    _, catalog, budget = executor._request(scope, units, items, states, 0, len(units))
+    assert len(units) >= 250
+    assert budget == executor._output(items, len(units) + len(catalog.fragments), states.values())
+    assert budget > executor._output(items, len(catalog.fragments), states.values())
 
 
 @pytest.mark.asyncio
-async def test_deep_reduction_can_return_hundreds_of_refs_without_truncation():
-    import litellm
-    from memforge.llm.structured import RevisionReductionResponse
+async def test_optional_history_cannot_block_current_full_structure():
+    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 
-    item = work_items("\n\n".join(f"Operational requirement {i}." for i in range(500)))[0]
-
-    class RefHeavyClient(Client):
-        def __init__(self):
-            super().__init__(limit=1_000_000)
-            self.checked_outputs = []
-            self.emitted = None
-
-        def request_fits(self, prompt, *, response_format, max_tokens, **kwargs):
-            if response_format is FinalResponse:
-                return self.emitted is not None
-            self.checked_outputs.append(max_tokens)
-            return super().request_fits(prompt, max_tokens=max_tokens, **kwargs)
-
-        async def evaluate_revision_work(self, prompt, *, response_format, max_tokens, **kwargs):
-            assert response_format is RevisionReductionResponse
-            payload = json.loads(prompt.split("<reduce>")[1].split("</reduce>")[0])
-            response = RevisionReductionResponse(
-                dispositions=[{
-                    "finding_id": f["finding_id"], "retained_refs": f["refs"],
-                    "explanation": "Each exact requirement remains necessary for the combined proof.",
-                } for f in payload["findings"]],
-                summary="Preserve the complete proof.", needs_context=[],
-            )
-            actual = litellm.token_counter(model="openai/gpt-4o", text=response.model_dump_json(indent=2))
-            assert actual > 1024  # The previous per-node budget truncates even this small explanation.
-            assert actual < max_tokens
-            assert self.checked_outputs[-1] == max_tokens
-            self.emitted = response
-            return response
-
-    client = RefHeavyClient()
-    executor = RevisionWorkExecutor(client=client, model="openai/gpt-4o")
-    scope = executor._full_range([item])
-    refs = [f.reference for f in scope.catalog.fragments]
-    finding = {"refs": refs, "explanation": "Repeated scan explanation. " * 300}
-    catalog, reduced, _, parents = await executor._prepare_final(scope, item, [finding], [], [])
-    assert {f.reference for f in catalog.fragments} == set(refs)
-    assert reduced[0]["refs"] == refs
-    assert parents[0].manifest["output"] > 1024
-    assert parents[0].status == "completed"
+    item = work_items("Two reviewers approve US releases.\n\n" + "A normal current paragraph. " * 110)[0]
+    item = replace(
+        item,
+        support=tuple(replace(p, excerpt="historical background " * 190) for p in item.support),
+        context=RevisionAssessmentContext(projection=item.context.projection, base=None, access_context_hash="scope"),
+    )
+    client = Client(limit=10000)
+    result = await RevisionWorkExecutor(client=client, model="fixture").assess_many([item])
+    assert result[item.id].supported
+    assert any("historical_evidence" not in payload(p) for p in client.prompts)
