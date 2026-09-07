@@ -107,7 +107,8 @@ class RevisionWorkExecutor:
                 "memory_id": item.memory.id,
                 "claim": item.claim_payload(),
                 "support": [
-                    (part.evidence_unit_id, part.reference_id, part.anchor.observation_revision_id)
+                    (part.evidence_unit_id, part.reference_id, part.anchor.observation_revision_id,
+                     part.validation_plan_id, part.validation_unit_revision_id)
                     for part in item.support
                 ],
             }
@@ -430,9 +431,11 @@ class RevisionWorkExecutor:
         ):
             return full
         # Delta is valid only for this complete Support baseline, never the most recent sync by default.
+        # The caller resolves the baseline from the successful Support Plan.
+        # Evidence creation revisions can be older than that validated snapshot.
         if any(
-            part.anchor.observation_id not in context.previous
-            or context.previous[part.anchor.observation_id].id != part.anchor.observation_revision_id
+            part.validation_unit_revision_id is not None
+            and part.validation_unit_revision_id != context.base.source_unit_revisions[0].id
             for item in items
             for part in item.support
         ):
