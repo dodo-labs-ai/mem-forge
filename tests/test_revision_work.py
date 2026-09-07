@@ -374,3 +374,51 @@ async def test_scan_correction_identifies_invalid_ref_without_widening_evidence_
     assert result['w0'].supported
     assert all(part.anchor.observation_revision_id != 'rev-primary'
                for part in result['w0'].memory.resolved_evidence_selection.parts)
+
+
+@pytest.mark.asyncio
+async def test_deep_reduction_can_return_hundreds_of_refs_without_truncation():
+    import litellm
+    from memforge.llm.structured import RevisionReductionResponse
+
+    item = work_items("\n\n".join(f"Operational requirement {i}." for i in range(500)))[0]
+
+    class RefHeavyClient(Client):
+        def __init__(self):
+            super().__init__(limit=1_000_000)
+            self.checked_outputs = []
+            self.emitted = None
+
+        def request_fits(self, prompt, *, response_format, max_tokens, **kwargs):
+            if response_format is FinalResponse:
+                return self.emitted is not None
+            self.checked_outputs.append(max_tokens)
+            return super().request_fits(prompt, max_tokens=max_tokens, **kwargs)
+
+        async def evaluate_revision_work(self, prompt, *, response_format, max_tokens, **kwargs):
+            assert response_format is RevisionReductionResponse
+            payload = json.loads(prompt.split("<reduce>")[1].split("</reduce>")[0])
+            response = RevisionReductionResponse(
+                dispositions=[{
+                    "finding_id": f["finding_id"], "retained_refs": f["refs"],
+                    "explanation": "Each exact requirement remains necessary for the combined proof.",
+                } for f in payload["findings"]],
+                summary="Preserve the complete proof.", needs_context=[],
+            )
+            actual = litellm.token_counter(model="openai/gpt-4o", text=response.model_dump_json(indent=2))
+            assert actual > 1024  # The previous per-node budget truncates even this small explanation.
+            assert actual < max_tokens
+            assert self.checked_outputs[-1] == max_tokens
+            self.emitted = response
+            return response
+
+    client = RefHeavyClient()
+    executor = RevisionWorkExecutor(client=client, model="openai/gpt-4o")
+    scope = executor._full_range([item])
+    refs = [f.reference for f in scope.catalog.fragments]
+    finding = {"refs": refs, "explanation": "Repeated scan explanation. " * 300}
+    catalog, reduced, _, parents = await executor._prepare_final(scope, item, [finding], [], [])
+    assert {f.reference for f in catalog.fragments} == set(refs)
+    assert reduced[0]["refs"] == refs
+    assert parents[0].manifest["output"] > 1024
+    assert parents[0].status == "completed"
