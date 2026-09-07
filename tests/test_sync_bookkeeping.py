@@ -5516,11 +5516,28 @@ async def _stage_completed_v9_recovery_attempt(
     async def extract(_batch):
         return MemoryExtractionResult(memories=[])
 
+    from memforge.pipeline.extraction_requests import plan_fragment_requests
+    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+    from memforge.pipeline.projection_fragments import compile_projection_fragment_catalog
+    access_hash = lifecycle_access_context_hash(visibility="workspace", owner_user_id=None, project_key=None, repo_identifier=None)
+    assessment = RevisionAssessmentContext(projection=projection, base=None, access_context_hash=access_hash)
+    capability = revision_inference_capability_hash(client, extraction_model="fixture", extraction_max_tokens=8192)
+    async def prepare_batches(batches):
+        prepared = []
+        for batch in batches:
+            catalog = compile_projection_fragment_catalog(projection, batch, access_context_hash=access_hash,
+                inference_capability_hash=capability, max_fragments=len(assessment.full_fragments),
+                max_presentation_chars=sum(len(f.presentation_text) for f in assessment.full_fragments))
+            prepared.extend(plan_fragment_requests(batch, catalog, context=assessment,
+                extractor=ProjectionFragmentRecordingExtractor(), source_type="github_repo", doc_type="document"))
+        return tuple(prepared)
+
     staged = await SourceUnitDeriver(db).derive(
         SourceUnitDerivationRequest(
             projection=projection,
             context=context,
             extract_batch=extract,
+            prepare_batches=prepare_batches,
             max_concurrent=1,
             extraction_contract_version=PROJECTION_EXTRACTION_V9,
             access_context_hash=lifecycle_access_context_hash(
@@ -5530,7 +5547,7 @@ async def _stage_completed_v9_recovery_attempt(
                 repo_identifier=None,
             ),
             inference_capability_hash=(
-                revision_inference_capability_hash(client)
+                capability
             ),
         )
     )
@@ -12514,6 +12531,7 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic/test",
+            max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768,
             base_url=None,
             api_key=None,
             timeout_s=0.02 if failure_mode == "deadline_exceeded" else 1.0,

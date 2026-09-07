@@ -5168,6 +5168,7 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic/test",
+            max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768,
             base_url=None,
             api_key=None,
             timeout_s=1,

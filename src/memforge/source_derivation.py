@@ -12,6 +12,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal, Protocol
 
+from memforge.derivation_work import DerivationWorkStore
 from memforge.models import DocumentRecord, MemoryExtractionResult, RawMemory
 from memforge.memory.evidence import (
     EvidencePartKind,
@@ -245,7 +246,6 @@ class StructuralExtractionBatch:
 SourceDerivationBatch = ProjectionExtractionBatch | DiffGuidedExtractionBatch | StructuralExtractionBatch
 
 
-from memforge.derivation_work import DerivationWorkStore
 
 
 class SourceDerivationStore(DerivationWorkStore, Protocol):

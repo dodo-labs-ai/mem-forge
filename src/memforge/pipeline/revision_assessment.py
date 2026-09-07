@@ -177,6 +177,24 @@ class RevisionAssessmentContext:
                     (unit.start, unit.end, identity[1]) for unit, identity in zip(units, identities, strict=True)
                 )
 
+    def ancestor_fragments(self, fragments):
+        """Exact current heading Evidence, using the existing structural ancestry."""
+        selected = {}
+        for fragment in fragments:
+            anchor = fragment.anchor
+            headings = next((headings for start, end, headings in self.structural_context.get(
+                anchor.observation_revision_id, ()) if start <= (anchor.range_start or 0) < end), ())
+            for heading in headings:
+                matches = (candidate for candidate in self.full_fragments
+                           if candidate.anchor.observation_revision_id == anchor.observation_revision_id
+                           and candidate.fragment_type == "markdown-heading"
+                           and candidate.presentation_text.strip() == heading.strip()
+                           and (candidate.anchor.range_start or 0) <= (anchor.range_start or 0))
+                nearest = max(matches, key=lambda candidate: candidate.anchor.range_start or 0, default=None)
+                if nearest is not None:
+                    selected[nearest.anchor] = nearest
+        return tuple(selected.values())
+
     def images_for(self, catalog):
         ids = {f.anchor.observation_id for f in catalog.fragments if f.kind.value == "artifact"}
         if not ids:

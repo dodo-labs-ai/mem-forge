@@ -195,9 +195,14 @@ def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("condition", [
-    "same_knowledge_item", "challenger_is_complete_current_claim", "current_evidence_entails_challenger",
-])
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "same_knowledge_item",
+        "challenger_is_complete_current_claim",
+        "current_evidence_entails_challenger",
+    ],
+)
 async def test_revision_conditions_map_independently_to_the_lifecycle_gate(condition):
     client = Client("refines", "challenger_to_candidate")
     original = client.assess_claim_revisions
@@ -210,10 +215,57 @@ async def test_revision_conditions_map_independently_to_the_lifecycle_gate(condi
 
     client.assess_claim_revisions = assess
     result = await reconcile_memories(
-        new_extractions=[candidate()], existing_memories=[memory()], doc_type="policy",
-        structured_llm_client=client, support_audits=[SupportAuditEntry("memory", True)],
+        new_extractions=[candidate()],
+        existing_memories=[memory()],
+        doc_type="policy",
+        structured_llm_client=client,
+        support_audits=[SupportAuditEntry("memory", True)],
         include_metadata=True,
     )
     assert result.failure is None
     assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
     assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_large_pair_group_subdivides_without_losing_pairs():
+    import json
+    from dataclasses import replace
+    from memforge.pipeline.claim_revision import assess_claim_pairs
+
+    class BudgetClient(Client):
+        def request_fits(self, prompt, **kwargs):
+            return prompt.count('"pair_index":') <= 2
+
+        async def assess_claim_revisions(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            groups = json.loads(prompt.split("<memory_pair_groups>")[1].split("</memory_pair_groups>")[0])
+            return ClaimRevisionResponse(
+                decisions=[
+                    ClaimRevisionDecision(
+                        pair_index=item["pair_index"],
+                        status="resolved",
+                        consistent_with_support=True,
+                        relation=MemoryRelationAssessment(
+                            classification="unrelated",
+                            direction="symmetric",
+                            same_subject_and_scope=False,
+                            incompatible_assertions="",
+                        ),
+                    )
+                    for group in groups
+                    for item in group["candidates"]
+                ]
+            )
+
+    client = BudgetClient("unrelated")
+    olds = [replace(memory(), id=f"memory-{i}") for i in range(5)]
+    result = await assess_claim_pairs(
+        candidates=[candidate()],
+        incumbents=olds,
+        support_audits=[SupportAuditEntry(old.id, True) for old in olds],
+        client=client,
+        model="fixture",
+    )
+    assert {(index, old_id) for index, old_id, _ in result.decisions} == {(0, old.id) for old in olds}
+    assert len(client.prompts) == 3

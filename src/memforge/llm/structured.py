@@ -660,7 +660,7 @@ class StructuredLlmConfig:
     # placeholder value so template-like source text remains data.
     prompt_template_variable: str | None = None
     # Gateway aliases may not exist in the model registry. These explicit,
-    # conservative limits also let deployments lower a provider's capacity.
+    # limits let deployments lower known capacity or configure unknown aliases.
     max_input_tokens: int | None = None
     context_window_tokens: int | None = None
     max_output_tokens: int | None = None
@@ -957,7 +957,7 @@ class SourceSupportStructuredClient(Protocol):
 
     def request_fits(self, prompt: str, *, response_format: type[BaseModel],
                      max_tokens: int, model: str | None = None,
-                     images: tuple[StructuredLlmImage, ...] = ()) -> bool: ...
+                     images: tuple[StructuredLlmImage, ...] = (), reserve_correction: bool = True) -> bool: ...
 
     def input_policy_identity_for(self, model: str | None = None) -> str: ...
 
@@ -1114,6 +1114,43 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> AgentSessionAuthorityResponse:
         """Return semantic authority decisions for candidate user evidence."""
+
+
+class RevisionScanFinding(BaseModel):
+    kind: Literal["support", "counterexample", "scope", "dependency"]
+    refs: list[str]
+    explanation: str
+
+
+class RevisionScanResult(BaseModel):
+    work_id: str
+    observations_found: list[RevisionScanFinding] = Field(default_factory=list)
+    no_local_effect: bool = False
+    needs_context: list[str] = Field(default_factory=list)
+
+
+class RevisionScanResponse(BaseModel):
+    results: list[RevisionScanResult]
+
+
+class RevisionFinalResult(RevisionSupportResponse):
+    work_id: str
+
+
+class RevisionFinalResponse(BaseModel):
+    results: list[RevisionFinalResult]
+
+
+class RevisionReductionDisposition(BaseModel):
+    finding_id: str
+    retained_refs: list[str]
+    explanation: str
+
+
+class RevisionReductionResponse(BaseModel):
+    dispositions: list[RevisionReductionDisposition]
+    summary: str
+    needs_context: list[str]
 
 
 class StructuredLlmError(RuntimeError):
@@ -1765,14 +1802,14 @@ class LiteLlmStructuredClient:
     def request_fits(
         self, prompt: str, *, response_format: type[BaseModel],
         max_tokens: int, model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
+        images: tuple[StructuredLlmImage, ...] = (), reserve_correction: bool = True,
     ) -> bool:
         budget = self.request_budget(model)
-        if budget.available_input(max_tokens) < 0:
+        if budget.available_input(max_tokens, reserve_correction=reserve_correction) < 0:
             return False
         return budget.fits(self.request_tokens(
             prompt, response_format=response_format, model=model, images=images,
-        ), max_tokens)
+        ), max_tokens, reserve_correction=reserve_correction)
 
     @contextmanager
     def metrics_scope(
@@ -2325,6 +2362,19 @@ class LiteLlmStructuredClient:
                 validation_source=validation_source,
             )
         )
+        if response_format in {
+            ProjectionFragmentMemoryExtractionResponse, RevisionSupportResponse, ClaimRevisionResponse,
+            RevisionScanResponse, RevisionFinalResponse, RevisionReductionResponse,
+        }:
+            # Count the expanded template value and fallback repair diagnostics;
+            # provider placeholders must never make a large source look tiny.
+            material = _json_text_prompt(prompt, response_format) if native_schema else request_prompt
+            counted_messages = [{"role": "user", "content": _structured_user_content(material, images)}]
+            budget = self.request_budget(model_name)
+            tokens = litellm.token_counter(model=model_name, messages=counted_messages)
+            if not budget.fits(tokens, max_tokens, reserve_correction=False):
+                raise StructuredLlmError("complete structured request exceeds configured capacity",
+                                         error_code="input_capacity_exceeded")
         messages = [{"role": "user", "content": _structured_user_content(request_prompt, images)}]
         provider_kwargs: dict[str, Any] = {}
         prompt_template_variable = self.config.prompt_template_variable
