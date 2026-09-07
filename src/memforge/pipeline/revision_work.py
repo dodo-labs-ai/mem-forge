@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import math
+
+import litellm
 
 
 from memforge.pipeline.bounded_work import collect_bounded
-from memforge.llm.structured import structured_llm_max_concurrent
+from memforge.llm.structured import litellm_model_name, structured_llm_max_concurrent
 from memforge.derivation_work import DerivationWork, DerivationWorkStore, payload_hash
 from memforge.llm.structured import (
     RevisionScanResponse as ScanResponse,
@@ -147,6 +150,24 @@ class RevisionWorkExecutor:
     def _scan_output(items, fragments):
         # Scan rows contain explanations and dependency names, not just selectors.
         return max(512, len(items) * (512 + 96 * fragments))
+
+    def _reduction_output(self, findings, needs_context):
+        # A deep reduction node can carry hundreds of refs. Node count alone
+        # cannot budget even the JSON required to preserve those references.
+        skeleton = ReductionResponse(
+            dispositions=[
+                {"finding_id": finding["finding_id"],
+                 "retained_refs": list(dict.fromkeys(finding.get("refs", []))),
+                 "explanation": ""}
+                for finding in findings
+            ],
+            summary="",
+            needs_context=list(dict.fromkeys(needs_context)),
+        ).model_dump_json(indent=2)
+        tokens = litellm.token_counter(model=litellm_model_name(self.model), text=skeleton)
+        # Allow formatting/tokenizer variance, explanations and new dependency
+        # names without forcing the reducer to discard refs to fit its output.
+        return max(1024, len(findings) * 256, math.ceil(tokens * 1.25) + len(findings) * 128 + 512)
 
     @staticmethod
     def _subset(catalog, refs):
@@ -823,7 +844,8 @@ class RevisionWorkExecutor:
                     trial = batch + [finding]
                     trial_prompt, trial_catalog = reduction_input(trial)
                     if not self._fits_catalog(
-                        scope, trial_catalog, trial_prompt, ReductionResponse, max(1024, len(trial) * 256)
+                        scope, trial_catalog, trial_prompt, ReductionResponse,
+                        self._reduction_output(trial, needs_context),
                     ):
                         break
                     batch = trial
@@ -846,7 +868,7 @@ class RevisionWorkExecutor:
                     "support_reduce",
                     reduce_prompt,
                     ReductionResponse,
-                    max(1024, len(batch) * 256),
+                    self._reduction_output(batch, needs_context),
                     identity=[scope.catalog.digest, self._identity([item]), depth, offset],
                     dependencies=parents,
                     images=scope.context.images_for(reduce_catalog),
