@@ -28,9 +28,9 @@ class RevisionClientFixture:
         return len(prompt)
 
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-        from memforge.llm.structured import RevisionFinalResponse as FinalResponse, RevisionFinalResult as FinalResult
+        from memforge.llm.structured import SupportAssessmentResponse as FinalResponse, SupportAssessmentResult as FinalResult
         assert response_format is FinalResponse
-        payload = json.loads(prompt.split("<final>", 1)[1].split("</final>", 1)[0])
+        payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
         results = []
         groups = [{**group, **payload["current"].get("observations", {}).get(group.get("source"), {})} for group in payload["current"]["structural_groups"]]
         for claim in payload["claims"]:

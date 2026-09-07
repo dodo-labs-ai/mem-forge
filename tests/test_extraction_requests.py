@@ -58,3 +58,20 @@ def test_current_full_read_never_authorizes_unchanged_fragments():
     assert [f.presentation_text.strip() for f in request.prepared_catalog.fragments if f.primary_eligible] == [
         "New approval rule."
     ]
+
+
+def test_incremental_extraction_does_not_expand_to_full_current_catalog():
+    projection = _projection(
+        primary_content="# US payroll\n\nOld unrelated details.\n\nNew approval rule.\n", context_content="Country: US.\n"
+    )
+    context = RevisionAssessmentContext(projection=projection, base=projection, access_context_hash="scope")
+    batch = _batch(projection)
+    authorized = context.catalog(tuple(f for f in context.full_fragments if "New approval" in f.presentation_text))
+    extractor = MemoryExtractor(model="fixture", structured_llm_client=Client(limit=30000))
+    [request] = plan_fragment_requests(
+        batch, authorized, context=context, extractor=extractor, source_type="confluence", doc_type="document"
+    )
+    text = [f.presentation_text for f in request.prepared_catalog.fragments]
+    assert any("New approval" in t for t in text)
+    assert any("# US payroll" in t for t in text)
+    assert all("Old unrelated" not in t for t in text)

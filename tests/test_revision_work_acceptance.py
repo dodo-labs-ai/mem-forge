@@ -1,142 +1,58 @@
-"""Program coverage probes; fixture judgments do not measure model accuracy."""
+"""Integration coverage with fixture model judgments; not model-accuracy evidence."""
 
 import json
-
 import pytest
-
-from memforge.llm.structured import (
-    RevisionFinalResponse,
-    RevisionFinalResult,
-    RevisionReductionResponse,
-    RevisionReductionDisposition,
-    RevisionScanResponse,
-    RevisionScanFinding,
-)
+from memforge.llm.structured import SupportAssessmentResponse, SupportAssessmentResult
 from memforge.pipeline.revision_work import RevisionWorkExecutor
 from memforge.storage.database import Database
 from tests.test_derivation_work import prepare_database
-from tests.test_revision_work import Client, work_items
-
-
-class DependencyClient(Client):
-    def __init__(self, failure=None):
-        super().__init__(limit=7000)
-        self.failure = failure
-        self.reductions = 0
-        self.scan_rows = []
-
-    async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-        tag = {RevisionScanResponse: "scan", RevisionReductionResponse: "reduce", RevisionFinalResponse: "final"}[
-            response_format
-        ]
-        payload = json.loads(prompt.split(f"<{tag}>")[1].split(f"</{tag}>")[0])
-        rows = payload["current"]["primary_candidates"] + payload["current"]["required_only_candidates"]
-        if tag == "reduce":
-            self.reductions += 1
-        if self.failure == tag and (tag != "reduce" or self.reductions == 2):
-            self.failure = None
-            raise TimeoutError(f"fixture {tag} interruption")
-        if tag == "scan":
-            self.scan_rows.append([r[1] for r in rows])
-            result = await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
-            for item in result.results:
-                item.observations_found = [
-                    RevisionScanFinding(kind="scope", refs=[r[0]], explanation="Potential scope or dependency. " * 10)
-                    for r in rows
-                ]
-                item.no_local_effect = False
-            return result
-        self.prompts.append(prompt)
-        if tag == "reduce":
-            retained = {
-                r[0]
-                for r in rows
-                if any(word in r[1] for word in ("reviewers", "Alder", "Birch"))
-                or any(isinstance(m, dict) and "image_source_observation_id" in m for m in r[2:])
-            }
-            return RevisionReductionResponse(
-                dispositions=[
-                    RevisionReductionDisposition(
-                        finding_id=f["finding_id"],
-                        retained_refs=[r for r in f["refs"] if r in retained],
-                        explanation="Retain the rule, exception and named definitions; other notes are unrelated.",
-                    )
-                    for f in payload["findings"]
-                ],
-                summary="Read the exact retained exception and definition chain.",
-                needs_context=[],
-            )
-        text = "\n".join(r[1] for r in rows)
-        assert "Alder releases need not have two reviewers." in text
-        assert "Alder refers to Birch." in text
-        assert "Birch refers to US releases." in text
-        return RevisionFinalResponse(
-            results=[
-                RevisionFinalResult(
-                    work_id=c["work_id"],
-                    status="unsupported",
-                    reason="The complete definition chain makes the exception apply to US releases.",
-                )
-                for c in payload["claims"]
-            ]
-        )
+from tests.test_revision_work import Client, work_items, payload
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "reduce", "final"])
-async def test_three_range_dependency_survives_reduction_and_sqlite_resume(tmp_path, failure):
-    sections = [
+@pytest.mark.parametrize("failure", [None, 3])
+async def test_three_range_dependency_and_sqlite_resume(tmp_path, failure):
+    pieces = [
         "Two reviewers approve US releases.",
         "Alder releases need not have two reviewers.",
         "Alder refers to Birch.",
         "Birch refers to US releases.",
     ]
-    text = "\n\n".join(
-        section + "\n\n" + "\n\n".join(f"Routine note {i}-{j}: maintain ordinary settings." for j in range(100))
-        for i, section in enumerate(sections)
-    )
-    items = work_items(text)
+    filler = "\n\n".join(f"Routine note {i}: maintain settings." for i in range(140))
+    items = work_items(("\n\n" + filler + "\n\n").join(pieces))
     path = tmp_path / "dependencies.db"
     db, root = await prepare_database(path, items[0].context.projection)
-    client = DependencyClient(failure)
+    client = Client()
+    client.fail_at = failure
     executor = RevisionWorkExecutor(client=client, model="fixture", store=db, derivation_id=root.id)
     try:
         if failure:
-            with pytest.raises(TimeoutError, match=failure):
+            with pytest.raises(TimeoutError):
                 await executor.assess_many(items)
-            rows = await db.db.execute_fetchall(
-                "SELECT work_id,payload_json FROM source_derivation_work WHERE derivation_id = ? AND json_extract(payload_json, '$.status') = 'completed'",
-                (root.id,),
-            )
-            completed = {r["work_id"]: json.loads(r["payload_json"])["result_hash"] for r in rows}
-            assert completed
             await db.close()
             db = Database(str(path))
             await db.connect()
             executor = RevisionWorkExecutor(client=client, model="fixture", store=db, derivation_id=root.id)
-        results = await executor.assess_many(items)
-        assert not results["w0"].supported
-        assert client.reductions > 0 and executor.final_work_ids
-        # The dependency spans at least three independently scanned ranges.
-        chain_ranges = {
-            i for i, rows in enumerate(client.scan_rows) if any(s in row for s in sections[1:] for row in rows)
-        }
-        assert len(chain_ranges) >= 3
+        result = await executor.assess_many(items)
+        assert not result["w0"].supported
+        assert executor.final_work_ids
         if failure:
-            assert executor.reused == len(completed)
-            for key, expected_hash in completed.items():
-                row = await db.db.execute_fetchall(
-                    "SELECT payload_json FROM source_derivation_work WHERE derivation_id = ? AND work_id = ?",
-                    (root.id, key),
-                )
-                assert json.loads(row[0]["payload_json"])["result_hash"] == expected_hash
+            assert executor.reused == failure - 1
         assert await db.get_current_source_unit_revision(root.source_unit_id) is None
+        rows = await db.db.execute_fetchall(
+            "SELECT payload_json FROM source_derivation_work WHERE derivation_id=?", (root.id,)
+        )
+        works = [json.loads(r["payload_json"]) for r in rows]
+        receipt = next(w for w in works if w["kind"] == "support_finalize")
+        assert receipt["manifest"]["completion"] == "program"
+        assert all(w["kind"] in {"support_assess", "support_finalize"} for w in works)
+        assert len(receipt["manifest"]["dependencies"]) >= 3
     finally:
         await db.close()
 
 
 @pytest.mark.asyncio
-async def test_artifact_bytes_follow_refs_through_scan_reduction_and_final():
+async def test_artifact_bytes_bound_to_first_assessment_and_carried_refs():
     from types import SimpleNamespace
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
     from memforge.pipeline.projection_images import load_projection_images
@@ -178,15 +94,13 @@ async def test_artifact_bytes_follow_refs_through_scan_reduction_and_final():
         ),
     )
 
-    class ArtifactClient(DependencyClient):
+    class ArtifactClient(Client):
         image_stages = set()
 
         async def evaluate_revision_work(self, prompt, *, response_format, images=(), **kwargs):
-            tag = {RevisionScanResponse: "scan", RevisionReductionResponse: "reduce", RevisionFinalResponse: "final"}[
-                response_format
-            ]
-            payload = json.loads(prompt.split(f"<{tag}>")[1].split(f"</{tag}>")[0])
-            rows = payload["current"]["primary_candidates"] + payload["current"]["required_only_candidates"]
+            tag = "assessment"
+            data = payload(prompt)
+            rows = data["current"]["primary_candidates"] + data["current"]["required_only_candidates"]
             image_rows = [
                 r for r in rows if any(isinstance(m, dict) and "image_source_observation_id" in m for m in r[2:])
             ]
@@ -197,17 +111,16 @@ async def test_artifact_bytes_follow_refs_through_scan_reduction_and_final():
                 assert {image.source_observation_id for image in images} == {
                     r[-1]["image_source_observation_id"] for r in image_rows
                 }
-            if tag == "final":
-                assert image_rows
-                return RevisionFinalResponse(
+            if image_rows:
+                return SupportAssessmentResponse(
                     results=[
-                        RevisionFinalResult(
+                        SupportAssessmentResult(
                             work_id=c["work_id"],
                             status="supported",
                             primary_ref=image_rows[0][0],
                             reason="Fixture judgment based on the current diagram.",
                         )
-                        for c in payload["claims"]
+                        for c in data["claims"]
                     ]
                 )
             return await super().evaluate_revision_work(
@@ -219,7 +132,7 @@ async def test_artifact_bytes_follow_refs_through_scan_reduction_and_final():
         [SupportWorkItem("w0", memory(), old_support(base), context)]
     )
     assert result["w0"].supported
-    assert client.image_stages == {"scan", "reduce", "final"}
+    assert client.image_stages == {"assessment"}
     assert reads and all(uri.endswith("diagram-2.png") for uri in reads)
     parts = result["w0"].memory.resolved_evidence_selection.parts
     assert parts[0].anchor == next(f.anchor for f in context.full_fragments if f.kind.value == "artifact")
@@ -227,7 +140,7 @@ async def test_artifact_bytes_follow_refs_through_scan_reduction_and_final():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drift", ["epoch", "memory"])
-async def test_completed_scans_cannot_commit_after_concurrent_state_change(tmp_path, drift):
+async def test_completed_assessments_cannot_commit_after_concurrent_state_change(tmp_path, drift):
     from memforge.memory.lifecycle_plan import (
         LifecyclePlan,
         ReconciliationScope,
@@ -283,7 +196,7 @@ async def test_completed_scans_cannot_commit_after_concurrent_state_change(tmp_p
         version = _lifecycle_memory_version(rows[0])
         executor = RevisionWorkExecutor(client=Client(), model="fixture", store=db, derivation_id=root.id)
         await executor.assess_many(items)
-        assert executor.final_work_ids and executor.stage_counts["support_scan"] > 1
+        assert executor.final_work_ids and executor.stage_counts["support_assess"] > 1
         if drift == "epoch":
             await db.db.execute(
                 "UPDATE sources SET activity_epoch = activity_epoch + 1 WHERE id = ?", (root.source_id,)
@@ -324,69 +237,3 @@ async def test_completed_scans_cannot_commit_after_concurrent_state_change(tmp_p
         assert not await db.db.execute_fetchall("SELECT id FROM lifecycle_plans WHERE id = ?", (plan.id,))
     finally:
         await db.close()
-
-
-@pytest.mark.asyncio
-async def test_scan_admission_is_bounded_drains_inflight_and_preserves_serial_identity():
-    import asyncio
-    from tests.test_revision_work import Store
-
-    class ConcurrentClient(Client):
-        max_concurrent = 2
-
-        def __init__(self, fail=False):
-            super().__init__(limit=5000)
-            self.fail = fail
-            self.active = self.peak = 0
-            self.started = []
-            self.two_started = asyncio.Event()
-
-        def request_fits(self, prompt, *, response_format=None, **kwargs):
-            if response_format is RevisionScanResponse:
-                data = json.loads(prompt.split("<scan>")[1].split("</scan>")[0])
-                if len(data["claims"]) > 1:
-                    return False
-            return super().request_fits(prompt, **kwargs)
-
-        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-            if response_format is not RevisionScanResponse:
-                return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
-            data = json.loads(prompt.split("<scan>")[1].split("</scan>")[0])
-            work_id = data["claims"][0]["work_id"]
-            self.started.append(work_id)
-            self.active += 1
-            self.peak = max(self.peak, self.active)
-            if self.active == 2:
-                self.two_started.set()
-            try:
-                if self.fail and work_id == "w0":
-                    await self.two_started.wait()
-                    self.fail = False
-                    raise TimeoutError("first sibling failed")
-                await asyncio.sleep(0)
-                return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
-            finally:
-                self.active -= 1
-
-    text = "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Routine operational note {i}." for i in range(200))
-    items = work_items(text, 4)
-    store = Store()
-    client = ConcurrentClient(fail=True)
-    first = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
-    with pytest.raises(TimeoutError, match="first sibling"):
-        await first.assess_many(items)
-    assert client.peak == 2 and client.active == 0
-    assert client.started == ["w0", "w1"]
-    assert sorted(work.status for work in store.works.values()) == ["completed", "retryable_failure"]
-    assert not first.final_work_ids
-    retry = RevisionWorkExecutor(client=ConcurrentClient(), model="fixture", store=store, derivation_id="root")
-    assert all(result.supported for result in (await retry.assess_many(items)).values())
-    assert retry.reused == 1
-    serial_store = Store()
-    serial_client = ConcurrentClient()
-    serial_client.max_concurrent = 1
-    serial = RevisionWorkExecutor(client=serial_client, model="fixture", store=serial_store, derivation_id="root")
-    await serial.assess_many(items)
-    assert {key: work.result_hash for key, work in store.works.items()} == {
-        key: work.result_hash for key, work in serial_store.works.items()
-    }
