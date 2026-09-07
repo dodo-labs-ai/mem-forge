@@ -1526,6 +1526,9 @@ async def test_prompt_requires_empty_output_when_only_required_only_context_has_
     prompts: list[str] = []
 
     class Client:
+        def request_fits(self, prompt, **kwargs):
+            return True
+
         async def extract_projection_fragment_memories(self, prompt: str, **kwargs):
             del kwargs
             prompts.append(prompt)
@@ -1847,6 +1850,9 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
     artifact = next(item for item in catalog.fragments if item.kind.value == "artifact")
 
     class Client:
+        def request_fits(self, prompt, **kwargs):
+            return True
+
         async def extract_projection_fragment_memories(self, prompt: str, **kwargs):
             return ProjectionFragmentMemoryExtractionResponse.model_validate(
                 {
@@ -1962,6 +1968,9 @@ async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> 
     )
 
     class Client:
+        def request_fits(self, prompt, **kwargs):
+            return True
+
         async def extract_projection_fragment_memories(self, prompt: str, **kwargs):
             assert "evidence_quote" not in prompt
             return ProjectionFragmentMemoryExtractionResponse(
@@ -2060,3 +2069,14 @@ def test_compact_catalog_preserves_exact_text_authority_and_internal_provenance(
     primary = next(f for f in catalog.fragments if f.primary_eligible)
     result = catalog.resolve_selection(primary_ref=primary.reference)
     assert result.parts[0].anchor == primary.anchor
+
+
+@pytest.mark.parametrize("tag", ["h2", "pre", "blockquote"])
+def test_compact_catalog_retains_html_semantics_after_tag_stripping(tag):
+    projection = _projection()
+    catalog = compile_projection_fragment_catalog(projection, _batch(projection), access_context_hash="access-1")
+    fragment = replace(catalog.fragments[0], fragment_type=f"html-{tag}", presentation_text="US payroll")
+    catalog = replace(catalog, fragments=(fragment,))
+    row = next(row for group in catalog.model_payload().values() for row in group)
+    assert row == (fragment.reference, "US payroll", {"format": f"html-{tag}"})
+    assert catalog.fragments[0].anchor == fragment.anchor

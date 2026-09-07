@@ -755,6 +755,9 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
     )
 
     class Client:
+        def request_fits(self, *args, **kwargs):
+            return True
+
         async def extract_projection_fragment_memories(self, prompt: str, **kwargs):
             return ProjectionFragmentMemoryExtractionResponse(
                 memories=[
@@ -891,6 +894,9 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
     )
 
     class UpdatedClient:
+        def request_fits(self, *args, **kwargs):
+            return True
+
         async def extract_projection_fragment_memories(self, prompt: str, **kwargs):
             return ProjectionFragmentMemoryExtractionResponse(
                 memories=[

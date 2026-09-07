@@ -27,12 +27,19 @@ class RequestBudget:
             info = litellm.get_model_info(model)
         except Exception:
             info = {}
+        def limit(name, metadata):
+            configured = getattr(config, name)
+            values = [int(value) for value in (configured, metadata) if value is not None]
+            if not values:
+                raise ValueError(f"Model {model} has no {name} metadata; configure MEMFORGE_LLM_{name.upper()} for this route")
+            return min(values)
+
         known = bool(info.get("max_input_tokens"))
         if not known:
-            logger.warning("request_budget_metadata_unavailable model=%s using_operator_caps=true", model)
-        input_limit = min(config.max_input_tokens, int(info.get("max_input_tokens") or config.max_input_tokens))
-        context_limit = min(config.context_window_tokens, int(info.get("context_window") or info.get("max_input_tokens") or config.context_window_tokens))
-        output_limit = min(config.max_output_tokens, int(info.get("max_output_tokens") or config.max_output_tokens))
+            logger.warning("request_budget_metadata_unavailable model=%s using_explicit_operator_caps=true", model)
+        input_limit = limit("max_input_tokens", info.get("max_input_tokens"))
+        context_limit = limit("context_window_tokens", info.get("context_window") or info.get("max_input_tokens"))
+        output_limit = limit("max_output_tokens", info.get("max_output_tokens"))
         if min(input_limit, context_limit, output_limit) < 1 or not 0 < config.input_budget_fraction <= 1:
             raise ValueError("invalid structured request capacity")
         return cls(model, input_limit, context_limit, output_limit, config.input_budget_fraction,

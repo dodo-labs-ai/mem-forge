@@ -43,7 +43,7 @@ def revision_inference_capability_hash(client, *, extraction_model=None, extract
 
     payload = {
         "images": projection_inference_capability_hash(),
-        "revision_input": getattr(client, "input_policy_identity", None),
+        "revision_input": client.input_policy_identity_for(extraction_model) if client is not None else None,
         "extraction_model": extraction_model,
         "extraction_max_tokens": extraction_max_tokens,
     }
@@ -167,6 +167,8 @@ class RevisionAssessmentContext:
         self.full_fragments = tuple(f for revision in self.current.values() for f in self.index(revision).fragments)
         self._delta = None
         self.structural_context = {}
+        self.canonical_fields = {revision.id: canonical_record_field_ranges(revision) for revision in self.current.values()
+                                 if revision.evidence_profile and revision.evidence_profile.name == "canonical-record"}
         for revision in self.current.values():
             if revision.evidence_profile and revision.evidence_profile.name == "markdown-structural":
                 units = revision_structural_ranges(revision)
@@ -206,7 +208,7 @@ class RevisionAssessmentContext:
 
     def model_payload(self, catalog):
         payload = dict(catalog.model_payload())
-        groups: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
+        groups: dict[tuple[str, str, tuple[str, ...], str | None], list[str]] = {}
         for fragment in catalog.fragments:
             anchor = fragment.anchor
             headings = next(
@@ -214,14 +216,22 @@ class RevisionAssessmentContext:
                     anchor.observation_revision_id, ()
                 ) if start <= (anchor.range_start or 0) < end), ()
             )
-            key = (anchor.observation_id, anchor.observation_revision_id, tuple(headings))
+            field = next((field.descriptor.json_pointer for field in self.canonical_fields.get(anchor.observation_revision_id, ())
+                          if field.start <= (anchor.range_start or 0) and (anchor.range_end or 0) <= field.end), None)
+            key = (anchor.observation_id, anchor.observation_revision_id, tuple(headings), field)
             groups.setdefault(key, []).append(fragment.reference)
         # Ancestor text is supplementary structure. The original heading Fragment
         # remains selectable in its authorized role; groups never create Evidence.
+        aliases = {key: f"o{index}" for index, key in enumerate(dict.fromkeys(
+            (observation, revision) for observation, revision, _, _ in groups
+        ))}
+        payload["observations"] = {alias: {"observation_id": observation, "revision_id": revision}
+                                   for (observation, revision), alias in aliases.items()}
         payload["structural_groups"] = tuple(
-            {"observation_id": observation, "revision_id": revision,
-             "heading_context": headings, "refs": refs}
-            for (observation, revision, headings), refs in groups.items()
+            {"source": aliases[observation, revision], "refs": refs,
+             **({"heading_context": headings} if headings else {}),
+             **({"field": field} if field is not None else {})}
+            for (observation, revision, headings, field), refs in groups.items()
         )
         return payload
 

@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence
 
 import aiosqlite
 
+from memforge.derivation_work import DerivationWork
 from memforge.evals.agent_evaluation import AgentRuntimeBundle
 from memforge.memory.audit import MemoryAuditEvent, MemoryAuditLogger
 from memforge.memory.evidence import (
@@ -1095,6 +1096,12 @@ class SqliteRelationalStore:
     ) -> dict[str, tuple[str, ...]]:
         return dict(await self._db.get_source_unit_support_unit_ids(source_unit_id))
 
+    async def stage_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork:
+        return await self._db.stage_derivation_work(derivation_id=derivation_id, work=work)
+
+    async def record_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork:
+        return await self._db.record_derivation_work(derivation_id=derivation_id, work=work)
+
     async def apply_source_projection_lifecycle(
         self,
         projection: SourceProjection,
@@ -1103,6 +1110,7 @@ class SqliteRelationalStore:
         document: DocumentRecord | None = None,
         derivation_id: str | None = None,
         derivation_context_identity_hash: str | None = None,
+        required_derivation_work_ids: tuple[str, ...] = (),
         expected_source_activity_epoch: int | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None:
@@ -1112,6 +1120,7 @@ class SqliteRelationalStore:
             document=document,
             derivation_id=derivation_id,
             derivation_context_identity_hash=(derivation_context_identity_hash),
+            required_derivation_work_ids=required_derivation_work_ids,
             expected_source_activity_epoch=expected_source_activity_epoch,
             runtime_bundle=runtime_bundle,
         )

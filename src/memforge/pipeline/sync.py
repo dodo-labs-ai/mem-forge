@@ -3207,6 +3207,32 @@ class GeneSyncOrchestrator:
                 image_loader=lambda ids: self._projection_images(projection=projection, observation_ids=ids),
             )
 
+        if active_contract.uses_fragment_catalog and revision_context is None:
+            from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+            revision_context = RevisionAssessmentContext(projection=projection, base=None,
+                access_context_hash=access_context_hash,
+                image_loader=lambda ids: self._projection_images(projection=projection, observation_ids=ids))
+
+        async def prepare_batches(batches):
+            from memforge.pipeline.extraction_requests import plan_fragment_requests
+            from memforge.pipeline.projection_images import projection_inference_image_observation_ids
+            planned = []
+            for batch in batches:
+                catalog = compile_projection_fragment_catalog(projection, batch, access_context_hash=access_context_hash,
+                    inference_capability_hash=inference_capability_hash,
+                    supplied_artifact_observation_ids=tuple(sorted(set(projection_inference_image_observation_ids(projection)) &
+                        (set(batch.primary_observation_ids) | set(batch.context_observation_ids if batch.candidate_context_observation_ids is None else batch.candidate_context_observation_ids)))),
+                    # This is an internal authority catalog. The complete request,
+                    # including metadata and output, is budgeted by the planner.
+                    max_fragments=max(1, len(revision_context.full_fragments)),
+                    max_presentation_chars=max(1, sum(len(f.presentation_text) for f in revision_context.full_fragments)))
+                if not catalog.usable:
+                    planned.append(batch)
+                    continue
+                planned.extend(plan_fragment_requests(batch, catalog, context=revision_context,
+                    extractor=self.memory_extractor, source_type=source_type, doc_type=doc_type))
+            return tuple(planned)
+
         async def extract_one(batch):
             if isinstance(batch, DiffGuidedExtractionBatch):
                 async with self._heavy_work_slot(source_id):
@@ -3248,6 +3274,8 @@ class GeneSyncOrchestrator:
                 if batch.candidate_context_observation_ids is None
                 else batch.candidate_context_observation_ids
             )
+            if batch.prepared_catalog is not None:
+                supplied_observation_ids = {f.anchor.observation_id for f in batch.prepared_catalog.fragments if f.kind.value == "artifact"}
             input_binary_bytes = (
                 batch.primary_image_bytes + batch.candidate_context_image_bytes
             )
@@ -3264,7 +3292,7 @@ class GeneSyncOrchestrator:
                     observation_ids=supplied_observation_ids,
                 )
                 if active_contract.uses_fragment_catalog:
-                    catalog = compile_projection_fragment_catalog(
+                    catalog = batch.prepared_catalog or compile_projection_fragment_catalog(
                         projection,
                         batch,
                         access_context_hash=access_context_hash,
@@ -3280,6 +3308,7 @@ class GeneSyncOrchestrator:
                         context_markdown=batch.context_markdown,
                         images=batch_images,
                         revision_context=revision_context,
+                        prepared_prompt=batch.prepared_prompt,
                     )
                 else:
                     result = await self.memory_extractor.extract_projection_batch_memories(
@@ -3320,6 +3349,7 @@ class GeneSyncOrchestrator:
                 projection=projection,
                 context=derivation_context,
                 extract_batch=extract_one,
+                prepare_batches=prepare_batches if active_contract.uses_fragment_catalog else None,
                 max_concurrent=self._source_parallelism_limit(),
                 extraction_contract_version=extraction_contract_version,
                 committed_base_snapshot=committed_base_snapshot,

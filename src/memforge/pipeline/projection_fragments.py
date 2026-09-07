@@ -844,6 +844,8 @@ class ProjectionFragmentCatalog:
         required: list[tuple[object, ...]] = []
         for fragment in self.fragments:
             row: tuple[object, ...] = (fragment.reference, fragment.presentation_text)
+            if (fragment.fragment_type.startswith("html-") and fragment.fragment_type != "html-p") or fragment.fragment_type.startswith("canonical-"):
+                row += ({"format": fragment.fragment_type},)
             if fragment.kind is EvidenceFragmentKind.ARTIFACT:
                 row += ({"image_source_observation_id": fragment.anchor.observation_id},)
             (primary if fragment.primary_eligible else required).append(row)

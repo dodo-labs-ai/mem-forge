@@ -661,9 +661,9 @@ class StructuredLlmConfig:
     prompt_template_variable: str | None = None
     # Gateway aliases may not exist in the model registry. These explicit,
     # conservative limits also let deployments lower a provider's capacity.
-    max_input_tokens: int = 32_768
-    context_window_tokens: int = 65_536
-    max_output_tokens: int = 32_768
+    max_input_tokens: int | None = None
+    context_window_tokens: int | None = None
+    max_output_tokens: int | None = None
     input_budget_fraction: float = 0.8
 
 
@@ -958,6 +958,15 @@ class SourceSupportStructuredClient(Protocol):
     def request_fits(self, prompt: str, *, response_format: type[BaseModel],
                      max_tokens: int, model: str | None = None,
                      images: tuple[StructuredLlmImage, ...] = ()) -> bool: ...
+
+    def input_policy_identity_for(self, model: str | None = None) -> str: ...
+
+    def request_tokens(self, prompt: str, *, response_format: type[BaseModel], model: str | None = None,
+                       images: tuple[StructuredLlmImage, ...] = ()) -> int: ...
+
+    async def evaluate_revision_work(self, prompt: str, *, response_format: type[BaseModel],
+                                    max_tokens: int, model: str | None = None,
+                                    images: tuple[StructuredLlmImage, ...] = ()): ...
 
     async def assess_revision_support(
         self, prompt: str, *, max_tokens: int = 4096,
@@ -1787,6 +1796,10 @@ class LiteLlmStructuredClient:
             max_tokens=4096,
             model=model,
         )
+
+    async def evaluate_revision_work(self, prompt, *, response_format, max_tokens, model=None, images=()):
+        return await self._call_schema(prompt=prompt, response_format=response_format,
+                                       max_tokens=max_tokens, model=model, images=images)
 
     async def assess_revision_support(
         self, prompt: str, *, max_tokens: int = 4096,
