@@ -2349,3 +2349,22 @@ def test_revision_input_policy_identity_changes_with_budget_or_provider_limits(m
     assert LiteLlmStructuredClient(replace(config, input_budget_fraction=0.7)).input_policy_identity != original
     monkeypatch.setattr('memforge.llm.structured.litellm.get_model_info', lambda *a, **kw: {'max_input_tokens': 8192})
     assert LiteLlmStructuredClient(config).input_policy_identity != original
+
+
+def test_request_budget_freezes_capability_per_effective_model(monkeypatch):
+    from memforge.llm.structured import RevisionSupportResponse, _json_text_prompt
+    lookups = []
+    def info(model):
+        lookups.append(model)
+        return {"max_input_tokens": 12000 if model.endswith("small") else 24000, "max_output_tokens": 4000}
+    monkeypatch.setattr("memforge.llm.structured.litellm.get_model_info", info)
+    client = LiteLlmStructuredClient(StructuredLlmConfig(model="openai/small", base_url=None, api_key=None, timeout_s=1))
+    first = client.input_policy_identity_for("openai/small")
+    assert client.input_policy_identity_for("openai/large") != first
+    assert client.input_policy_identity_for("openai/small") == first
+    assert len(lookups) == 2
+    messages = []
+    monkeypatch.setattr("memforge.llm.structured.litellm.token_counter", lambda **kw: messages.append(kw) or 100)
+    client.request_tokens("literal {input}", response_format=RevisionSupportResponse, model="openai/large")
+    assert messages[0]["messages"][0]["content"] == _json_text_prompt("literal {input}", RevisionSupportResponse)
+    assert messages[0]["model"].endswith("large")

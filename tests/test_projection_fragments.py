@@ -1426,7 +1426,7 @@ def test_bounded_context_is_required_selectable_but_never_primary_eligible() -> 
     )
     model_payload = catalog.model_payload()
     payload_by_ref = {
-        item["ref"]: item
+        item[0]: item
         for group in model_payload.values()
         for item in group
     }
@@ -1435,8 +1435,8 @@ def test_bounded_context_is_required_selectable_but_never_primary_eligible() -> 
         for fragment in catalog.fragments
     }
 
-    assert payload_by_observation["obs-primary"]["ref"].startswith("p")
-    assert payload_by_observation["obs-context"]["ref"].startswith("r")
+    assert payload_by_observation["obs-primary"][0].startswith("p")
+    assert payload_by_observation["obs-context"][0].startswith("r")
     assert all(
         "eligible_roles" not in payload
         for group in model_payload.values()
@@ -1491,11 +1491,11 @@ def test_model_catalog_separates_primary_capable_from_required_only_refs() -> No
     assert payload["primary_candidates"]
     assert payload["required_only_candidates"]
     assert all(
-        item["ref"].startswith("p")
+        item[0].startswith("p")
         for item in payload["primary_candidates"]
     )
     assert all(
-        item["ref"].startswith("r")
+        item[0].startswith("r")
         for item in payload["required_only_candidates"]
     )
     assert all(
@@ -1780,10 +1780,10 @@ def test_inspected_artifact_uses_same_ref_shape_as_text_required() -> None:
     artifact_payload = next(
         item
         for item in catalog.model_payload()["required_only_candidates"]
-        if item["kind"] == "artifact"
+        if len(item) == 3
     )
-    assert artifact_payload["ref"] == artifact.reference
-    assert artifact_payload["image_source_observation_id"] == "obs-context"
+    assert artifact_payload[0] == artifact.reference
+    assert artifact_payload[2]["image_source_observation_id"] == "obs-context"
     assert "diagram.png" not in str(artifact_payload)
 
     selection = catalog.resolve_selection(
@@ -2037,3 +2037,26 @@ async def test_contract_cutover_supersedes_only_incomplete_v8_derivations(db) ->
     assert by_id["sdrv-pending"]["terminal_reason_code"] == "CONTRACT_SUPERSEDED"
     assert by_id["sdrv-complete"]["status"] == "completed"
     assert by_id["sdrv-complete"]["terminal_reason_code"] is None
+
+
+def test_compact_catalog_preserves_exact_text_authority_and_internal_provenance():
+    import json
+    projection = _projection()
+    catalog = compile_projection_fragment_catalog(projection, _batch(projection), access_context_hash="access-1")
+    payload = catalog.model_payload()
+    rows = [row for group in payload.values() for row in group]
+    by_ref = {row[0]: row for row in rows}
+    legacy = {role: [] for role in payload}
+    for fragment in catalog.fragments:
+        role = "primary_candidates" if fragment.primary_eligible else "required_only_candidates"
+        assert by_ref[fragment.reference][1] == fragment.presentation_text
+        assert by_ref[fragment.reference] in payload[role]
+        legacy[role].append({"ref": fragment.reference, "kind": fragment.kind.value,
+                             "type": fragment.fragment_type, "text": fragment.presentation_text})
+    compact_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    legacy_text = json.dumps(legacy, ensure_ascii=False, separators=(",", ":"))
+    assert len(compact_text) < len(legacy_text)
+    assert '"kind"' not in compact_text and '"type"' not in compact_text
+    primary = next(f for f in catalog.fragments if f.primary_eligible)
+    result = catalog.resolve_selection(primary_ref=primary.reference)
+    assert result.parts[0].anchor == primary.anchor

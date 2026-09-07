@@ -1720,6 +1720,7 @@ class LiteLlmStructuredClient:
     ) -> None:
         self.config = config
         self._telemetry_sink = telemetry_sink
+        self._request_budgets = {}
 
     @property
     def max_concurrent(self) -> int:
@@ -1727,54 +1728,42 @@ class LiteLlmStructuredClient:
 
         return max(1, int(self.config.max_concurrent))
 
+    def request_budget(self, model: str | None = None):
+        from memforge.llm.request_budget import RequestBudget
+
+        name = litellm_model_name(model or self.config.model)
+        if name not in self._request_budgets:
+            self._request_budgets[name] = RequestBudget.resolve(name, self.config)
+        return self._request_budgets[name]
+
     @property
     def input_policy_identity(self) -> str:
-        model_name = litellm_model_name(self.config.model)
-        try:
-            info = litellm.get_model_info(model_name)
-        except Exception:
-            info = {}
-        payload = {
-            "version": "revision-input-v1", "model": model_name,
-            "input": self.config.max_input_tokens, "context": self.config.context_window_tokens,
-            "output": self.config.max_output_tokens, "fraction": self.config.input_budget_fraction,
-            "registry": {key: info.get(key) for key in ("max_input_tokens", "max_output_tokens", "context_window")},
-        }
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        return self.input_policy_identity_for()
+
+    def input_policy_identity_for(self, model: str | None = None) -> str:
+        return self.request_budget(model).identity
+
+    def request_tokens(
+        self, prompt: str, *, response_format: type[BaseModel],
+        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
+    ) -> int:
+        """Count the schema fallback transport, including its real instructions."""
+        name = litellm_model_name(model or self.config.model)
+        material = _json_text_prompt(prompt, response_format)
+        messages = [{"role": "user", "content": _structured_user_content(material, images)}]
+        return litellm.token_counter(model=name, messages=messages)
 
     def request_fits(
         self, prompt: str, *, response_format: type[BaseModel],
         max_tokens: int, model: str | None = None,
         images: tuple[StructuredLlmImage, ...] = (),
     ) -> bool:
-        """Budget the complete semantic input, including schema and image transport."""
-
-        model_name = litellm_model_name(model or self.config.model)
-        limit = self.config.max_input_tokens
-        context_limit = self.config.context_window_tokens
-        output_limit = self.config.max_output_tokens
-        try:
-            info = litellm.get_model_info(model_name)
-        except Exception:
-            info = {}
-        if info.get("max_input_tokens"):
-            limit = min(limit, int(info["max_input_tokens"]))
-            # Registry input limits are conservatively treated as the combined
-            # window when no separate provider context-window field is present.
-            context_limit = min(context_limit, int(info.get("context_window") or info["max_input_tokens"]))
-        if info.get("max_output_tokens"):
-            output_limit = min(output_limit, int(info["max_output_tokens"]))
-        if max_tokens > output_limit:
+        budget = self.request_budget(model)
+        if budget.available_input(max_tokens) < 0:
             return False
-        fraction = self.config.input_budget_fraction
-        if limit < 1 or not 0 < fraction <= 1:
-            raise ValueError("invalid structured input budget")
-        # Include the larger JSON-text schema path and a bounded repair reserve.
-        material = prompt + "\n" + json.dumps(response_format.model_json_schema())
-        messages = [{"role": "user", "content": _structured_user_content(material, images)}]
-        estimate = litellm.token_counter(model=model_name, messages=messages)
-        available_input = min(limit, context_limit - max_tokens)
-        return estimate + 1024 <= int(available_input * fraction)
+        return budget.fits(self.request_tokens(
+            prompt, response_format=response_format, model=model, images=images,
+        ), max_tokens)
 
     @contextmanager
     def metrics_scope(
