@@ -11,11 +11,16 @@ from memforge.pipeline.projection_images import ProjectionImageLoadError
 
 def plan_fragment_requests(batch, catalog, *, context, extractor, source_type, doc_type):
     def prompt(selected):
+        # Omit only context proven present by exact current Fragment identity.
+        context_ids = set(batch.context_observation_ids)
+        context_fragments = {f.anchor for f in context.full_fragments if f.anchor.observation_id in context_ids}
+        represented_ids = {f.anchor.observation_id for f in context.full_fragments if f.anchor in context_fragments}
+        covered = context_ids <= represented_ids and context_fragments <= {f.anchor for f in selected.fragments}
         return MemoryExtractor.projection_fragment_prompt(
             selected,
             source_type=source_type,
             doc_type=doc_type,
-            context_markdown=batch.context_markdown,
+            context_markdown="" if covered else batch.context_markdown,
             revision_context=context,
             mode="authorized_work",
         )
@@ -39,28 +44,8 @@ def plan_fragment_requests(batch, catalog, *, context, extractor, source_type, d
 
     def materialize(primary):
         selected = {f.anchor: f for f in catalog.fragments if not f.primary_eligible}
-        for fragment in primary:
-            anchor = fragment.anchor
-            headings = next(
-                (
-                    headings
-                    for start, end, headings in context.structural_context.get(anchor.observation_revision_id, ())
-                    if start <= (anchor.range_start or 0) < end
-                ),
-                (),
-            )
-            for heading in headings:
-                matches = [
-                    f
-                    for f in context.full_fragments
-                    if f.anchor.observation_revision_id == anchor.observation_revision_id
-                    and f.fragment_type == "markdown-heading"
-                    and f.presentation_text.strip() == heading.strip()
-                    and (f.anchor.range_start or 0) <= (anchor.range_start or 0)
-                ]
-                if matches:
-                    nearest = max(matches, key=lambda f: f.anchor.range_start or 0)
-                    selected[nearest.anchor] = replace(nearest, primary_eligible=False)
+        for ancestor in context.ancestor_fragments(primary):
+            selected[ancestor.anchor] = replace(ancestor, primary_eligible=False)
         selected.update({f.anchor: f for f in primary})
         return context.catalog(tuple(selected.values()))
 

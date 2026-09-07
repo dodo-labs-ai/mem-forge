@@ -184,6 +184,7 @@ async def assess_claim_pairs(
                 max_tokens=max_output_tokens,
                 model=model,
                 images=batch_images,
+                reserve_correction=not attempt,
             ):
                 return await subdivide()
             prompt_chars += len(current_prompt)

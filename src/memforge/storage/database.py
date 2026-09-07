@@ -10481,6 +10481,8 @@ class Database:
     ) -> None:
         """Advance Source Projection and Memory lifecycle in one transaction."""
 
+        if required_derivation_work_ids and derivation_id is None:
+            raise ValueError("assessment work requires its derivation root at commit")
         if projection.source_id != plan.scope.source_id:
             raise ValueError("projection and lifecycle plan belong to different sources")
         if document is not None and document.source != projection.source_id:

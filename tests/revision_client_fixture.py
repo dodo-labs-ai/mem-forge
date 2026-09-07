@@ -28,14 +28,20 @@ class RevisionClientFixture:
         return len(prompt)
 
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-        from memforge.pipeline.revision_work import FinalResponse, FinalResult
+        from memforge.llm.structured import RevisionFinalResponse as FinalResponse, RevisionFinalResult as FinalResult
         assert response_format is FinalResponse
         payload = json.loads(prompt.split("<final>", 1)[1].split("</final>", 1)[0])
         results = []
-        rows = [*payload["current"]["primary_candidates"], *payload["current"]["required_only_candidates"]]
         groups = [{**group, **payload["current"].get("observations", {}).get(group.get("source"), {})} for group in payload["current"]["structural_groups"]]
         for claim in payload["claims"]:
             previous = next((group["parts"] for group in payload.get("previous_evidence", []) if group["work_id"] == claim["work_id"]), None)
+            if previous is not None:
+                history = {part["ref"]: part for part in payload.get("historical_evidence", [])}
+                sources = {ref: group for group in groups for ref in group["refs"]}
+                for row in [*payload["current"]["primary_candidates"], *payload["current"]["required_only_candidates"]]:
+                    history[row[0]] = {"ref": row[0], "excerpt": row[1],
+                                       "observation_id": sources[row[0]]["observation_id"], "revision_id": sources[row[0]]["revision_id"]}
+                previous = [{**history[part["ref"]], "role": part["role"]} for part in previous]
             if previous is None:
                 previous = [{"role": "primary", "excerpt": claim["claim"],
                              "observation_id": groups[0]["observation_id"], "revision_id": groups[0]["revision_id"]}]

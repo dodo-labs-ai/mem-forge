@@ -3217,20 +3217,23 @@ class GeneSyncOrchestrator:
             from memforge.pipeline.extraction_requests import plan_fragment_requests
             from memforge.pipeline.projection_images import projection_inference_image_observation_ids
             planned = []
-            for batch in batches:
-                catalog = compile_projection_fragment_catalog(projection, batch, access_context_hash=access_context_hash,
-                    inference_capability_hash=inference_capability_hash,
-                    supplied_artifact_observation_ids=tuple(sorted(set(projection_inference_image_observation_ids(projection)) &
-                        (set(batch.primary_observation_ids) | set(batch.context_observation_ids if batch.candidate_context_observation_ids is None else batch.candidate_context_observation_ids)))),
-                    # This is an internal authority catalog. The complete request,
-                    # including metadata and output, is budgeted by the planner.
-                    max_fragments=max(1, len(revision_context.full_fragments)),
-                    max_presentation_chars=max(1, sum(len(f.presentation_text) for f in revision_context.full_fragments)))
-                if not catalog.usable:
-                    planned.append(batch)
-                    continue
-                planned.extend(plan_fragment_requests(batch, catalog, context=revision_context,
-                    extractor=self.memory_extractor, source_type=source_type, doc_type=doc_type))
+            async with self._heavy_work_slot(source_id, multimodal=any(
+                fragment.kind.value == "artifact" for fragment in revision_context.full_fragments
+            )):
+                for batch in batches:
+                    catalog = compile_projection_fragment_catalog(projection, batch, access_context_hash=access_context_hash,
+                        inference_capability_hash=inference_capability_hash,
+                        supplied_artifact_observation_ids=tuple(sorted(set(projection_inference_image_observation_ids(projection)) &
+                            (set(batch.primary_observation_ids) | set(batch.context_observation_ids if batch.candidate_context_observation_ids is None else batch.candidate_context_observation_ids)))),
+                        # This is an internal authority catalog. The complete request,
+                        # including metadata and output, is budgeted by the planner.
+                        max_fragments=max(1, len(revision_context.full_fragments)),
+                        max_presentation_chars=max(1, sum(len(f.presentation_text) for f in revision_context.full_fragments)))
+                    if not catalog.usable:
+                        planned.append(batch)
+                        continue
+                    planned.extend(plan_fragment_requests(batch, catalog, context=revision_context,
+                        extractor=self.memory_extractor, source_type=source_type, doc_type=doc_type))
             return tuple(planned)
 
         async def extract_one(batch):

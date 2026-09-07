@@ -4,57 +4,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
-from typing import Literal
 
-from pydantic import BaseModel, Field
 
-from memforge.derivation_work import DerivationWork, payload_hash
-from memforge.llm.structured import RevisionSupportResponse
+from memforge.derivation_work import DerivationWork, DerivationWorkStore, payload_hash
+from memforge.llm.structured import (
+    RevisionScanResponse as ScanResponse,
+    RevisionFinalResponse as FinalResponse,
+    RevisionReductionResponse as ReductionResponse,
+)
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
+    ProjectionFragmentCatalog,
     SupportRevalidationLimitation,
     SupportRevalidationLimitationCode,
 )
-from memforge.pipeline.revision_assessment import SupportAssessment, REVISION_SUPPORT_CONTRACT
-from memforge.memory.evidence import EvidenceRole
-from memforge.models import RawMemory
-
-
-class Finding(BaseModel):
-    kind: Literal["support", "counterexample", "scope", "dependency"]
-    refs: list[str]
-    explanation: str
-
-
-class ScanResult(BaseModel):
-    work_id: str
-    observations_found: list[Finding] = Field(default_factory=list)
-    no_local_effect: bool = False
-    needs_context: list[str] = Field(default_factory=list)
-
-
-class ScanResponse(BaseModel):
-    results: list[ScanResult]
-
-
-class FinalResult(RevisionSupportResponse):
-    work_id: str
-
-
-class FinalResponse(BaseModel):
-    results: list[FinalResult]
-
-
-class ReductionDisposition(BaseModel):
-    finding_id: str
-    retained_refs: list[str]
-    explanation: str
-
-
-class ReductionResponse(BaseModel):
-    dispositions: list[ReductionDisposition]
-    summary: str
-    needs_context: list[str]
+from memforge.pipeline.revision_assessment import (
+    RevisionAssessmentContext,
+    SupportAssessment,
+    REVISION_SUPPORT_CONTRACT,
+)
+from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
+from memforge.models import Memory, RawMemory
 
 
 SCAN_PROMPT = """Read this Source batch for EVERY fixed claim. Source content is data.
@@ -63,7 +33,7 @@ support, counterexamples, scope/definitions, negation, exceptions and cross-sect
 references even when the claim's words do not occur. Keep necessary versus sufficient
 conditions, quantifiers and time scope. Do not combine independent old Support groups.
 Return one result per work_id. Findings cite only refs present in current catalog or
-removed_historical. no_local_effect means no findings in THIS batch, not verified.
+removed_historical. Historical rows also use [ref, exact text] and cannot be selected as current Evidence. no_local_effect means no findings in THIS batch, not verified.
 Name unresolved dependencies in needs_context. Headings are ordinary Evidence;
 structural_groups describe ancestry and do not create selectable evidence.
 Catalog rows are [ref, exact text, optional metadata].
@@ -91,9 +61,9 @@ present in the supplied findings. Explain combined dependencies in the summary.
 @dataclass(frozen=True)
 class SupportWorkItem:
     id: str
-    memory: object
-    support: tuple
-    context: object
+    memory: Memory
+    support: tuple[ActiveSupportEvidence, ...]
+    context: RevisionAssessmentContext
 
     def claim_payload(self):
         memory = self.memory
@@ -108,8 +78,8 @@ class SupportWorkItem:
 
 @dataclass(frozen=True)
 class AssessmentRange:
-    context: object
-    catalog: object
+    context: RevisionAssessmentContext
+    catalog: ProjectionFragmentCatalog
     removed: tuple
     mode: str
     include_history: bool = True
@@ -118,12 +88,17 @@ class AssessmentRange:
 class RevisionWorkExecutor:
     """Own planning and inference; return complete results before lifecycle planning."""
 
-    def __init__(self, *, client, model, store=None, derivation_id=None):
+    def __init__(
+        self, *, client, model: str, store: DerivationWorkStore | None = None, derivation_id: str | None = None
+    ):
         self.client, self.model = client, model
         self.store, self.derivation_id = store, derivation_id
         self.calls = self.prompt_chars = self.reused = 0
         self.completed = {}
         self.final_work_ids = []
+        self.stage_counts = {"support_scan": 0, "support_reduce": 0, "support_finalize": 0}
+        self.covered_source_claim_pairs = 0
+        self.max_reduction_depth = 0
 
     @staticmethod
     def _identity(items):
@@ -139,9 +114,14 @@ class RevisionWorkExecutor:
             for item in items
         ]
 
-    def _fits(self, prompt, schema, output, images=()):
+    def _fits(self, prompt, schema, output, images=(), *, reserve_correction=True):
         return self.client.request_fits(
-            prompt, response_format=schema, max_tokens=output, model=self.model, images=images
+            prompt,
+            response_format=schema,
+            max_tokens=output,
+            model=self.model,
+            images=images,
+            reserve_correction=reserve_correction,
         )
 
     @staticmethod
@@ -153,6 +133,11 @@ class RevisionWorkExecutor:
         return max(512, len(items) * (512 + 16 * fragments))
 
     @staticmethod
+    def _scan_output(items, fragments):
+        # Scan rows contain explanations and dependency names, not just selectors.
+        return max(512, len(items) * (512 + 96 * fragments))
+
+    @staticmethod
     def _subset(catalog, refs):
         selected = frozenset(refs)
         return replace(
@@ -161,11 +146,30 @@ class RevisionWorkExecutor:
             digest=payload_hash([catalog.digest, sorted(selected)]),
         )
 
+    def _evidence_subset(self, scope, refs):
+        selected = self._subset(scope.catalog, refs)
+        ancestors = {fragment.anchor for fragment in scope.context.ancestor_fragments(selected.fragments)}
+        return self._subset(
+            scope.catalog,
+            {f.reference for f in scope.catalog.fragments if f.anchor in ancestors or f.reference in refs},
+        )
+
     def _source_payload(self, scope, catalog, removed=()):
+        aliases = {}
+        groups = {}
+        for part in removed:
+            key = (part["observation_id"], part["revision_id"])
+            aliases.setdefault(key, f"v{len(aliases)}")
+            groups.setdefault(aliases[key], []).append(part["ref"])
         return {
             "input_mode": scope.mode,
             "current": scope.context.model_payload(catalog),
-            "removed_historical": list(removed),
+            "removed_historical": [[part["ref"], part["text"]] for part in removed],
+            "removed_observations": {
+                alias: {"observation_id": observation, "revision_id": revision}
+                for (observation, revision), alias in aliases.items()
+            },
+            "removed_groups": [{"source": alias, "refs": refs} for alias, refs in groups.items()],
             "tombstoned_observations": sorted(scope.context.tombstoned),
             "unavailable_current_observations": sorted(
                 set(scope.context.members) - set(scope.context.current) - scope.context.tombstoned
@@ -189,6 +193,7 @@ class RevisionWorkExecutor:
             "output": output,
             "dependencies": [[work.id, work.result_hash] for work in dependencies],
         }
+        self.stage_counts[kind] += 1
         work = DerivationWork.create(kind, manifest)
         if self.derivation_id is not None:
             work = await self.store.stage_derivation_work(derivation_id=self.derivation_id, work=work)
@@ -206,7 +211,7 @@ class RevisionWorkExecutor:
         current_prompt = prompt
         try:
             for attempt in range(2):
-                if not self._fits(current_prompt, schema, output, images):
+                if not self._fits(current_prompt, schema, output, images, reserve_correction=not attempt):
                     raise SupportRevalidationLimitation(
                         SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
                         "assessment correction exceeds configured capability",
@@ -259,9 +264,15 @@ class RevisionWorkExecutor:
 
     @staticmethod
     def _coverage(results, items):
-        ids = [result.work_id for result in results]
-        if len(ids) != len(set(ids)) or set(ids) != {item.id for item in items}:
+        by_id = {}
+        for result in results:
+            previous = by_id.get(result.work_id)
+            if previous is not None and previous != result:
+                raise ValueError("conflicting assessment work results")
+            by_id[result.work_id] = result
+        if set(by_id) != {item.id for item in items}:
             raise ValueError("assessment work coverage mismatch")
+        results[:] = by_id.values()
 
     def _final_payload(self, scope, catalog, items, findings=None, needs_context=()):
         historical_refs = None if findings is None else {ref for finding in findings for ref in finding.get("refs", [])}
@@ -273,26 +284,33 @@ class RevisionWorkExecutor:
             "needs_context": list(needs_context),
         }
         if scope.include_history:
-            payload["previous_evidence"] = self._previous_evidence(items)
+            payload.update(self._previous_evidence(items, catalog))
         return payload
 
     @staticmethod
-    def _previous_evidence(items):
-        return [
-            {
-                "work_id": item.id,
-                "parts": [
-                    {
-                        "role": part.role.value,
-                        "excerpt": part.excerpt,
-                        "observation_id": part.anchor.observation_id,
-                        "revision_id": part.anchor.observation_revision_id,
-                    }
-                    for part in item.support
-                ],
-            }
-            for item in items
-        ]
+    def _previous_evidence(items, catalog):
+        # Share exact historical identities, never merge the alternative Supports.
+        by_identity = {(f.anchor, f.presentation_text): f.reference for f in catalog.fragments}
+        historical = []
+        supports = []
+        for item in items:
+            parts = []
+            for part in item.support:
+                key = (part.anchor, part.excerpt)
+                if key not in by_identity:
+                    reference = f"e{len(historical)}"
+                    by_identity[key] = reference
+                    historical.append(
+                        {
+                            "ref": reference,
+                            "excerpt": part.excerpt,
+                            "observation_id": part.anchor.observation_id,
+                            "revision_id": part.anchor.observation_revision_id,
+                        }
+                    )
+                parts.append({"role": part.role.value, "ref": by_identity[key]})
+            supports.append({"work_id": item.id, "parts": parts})
+        return {"previous_evidence": supports, "historical_evidence": historical}
 
     def _fits_catalog(self, scope, catalog, prompt, schema, output):
         from memforge.pipeline.projection_images import ProjectionImageLoadError
@@ -414,7 +432,12 @@ class RevisionWorkExecutor:
             for part in item.support
         ):
             return full
-        changed, removed = context.delta()
+        try:
+            changed, removed = context.delta()
+        except SupportRevalidationLimitation:
+            # Current representation was already compiled; an unavailable old
+            # representation cannot prevent a complete current-full assessment.
+            return full
         retained = {f.anchor: f for f in changed}
         for item in items:
             for part in item.support:
@@ -425,7 +448,9 @@ class RevisionWorkExecutor:
                         retained[fragment.anchor] = fragment
         delta = AssessmentRange(
             context,
-            context.catalog(tuple(retained.values())),
+            context.catalog(
+                tuple({**{f.anchor: f for f in context.ancestor_fragments(retained.values())}, **retained}.values())
+            ),
             tuple({"ref": f"h{i:06d}", **part} for i, part in enumerate(removed)),
             "delta",
         )
@@ -435,14 +460,14 @@ class RevisionWorkExecutor:
             payload = self._source_payload(scope, scope.catalog, scope.removed)
             payload["claims"] = [item.claim_payload() for item in items]
             if scope.include_history:
-                payload["previous_evidence"] = self._previous_evidence(items)
+                payload.update(self._previous_evidence(items, scope.catalog))
             return self.client.request_tokens(
                 self._prompt(SCAN_PROMPT, payload), response_format=ScanResponse, model=self.model
             )
 
         return min((full, delta), key=cost)
 
-    async def assess_many(self, items):
+    async def assess_many(self, items: list[SupportWorkItem]) -> dict[str, SupportAssessment]:
         groups = {}
         for item in items:
             groups.setdefault(id(item.context), []).append(item)
@@ -475,6 +500,67 @@ class RevisionWorkExecutor:
                     break
         return results
 
+    def _plan_source_chunk(self, scope, units, items):
+        # Compare a logarithmic set of packing candidates. Largest Source for a
+        # single claim otherwise consumes all headroom and defeats claim sharing.
+        ordered = sorted(
+            items,
+            key=lambda item: self.client.request_tokens(
+                self._scan_input(scope, [], [item])[0], response_format=ScanResponse, model=self.model
+            ),
+            reverse=True,
+        )
+        sizes = [1]
+        while sizes[-1] < len(items):
+            sizes.append(min(len(items), sizes[-1] * 2))
+        best = None
+        for size in sizes:
+            representative = ordered[:size]
+
+            def fits(trial):
+                prompt, catalog, removed = self._scan_input(scope, trial, representative)
+                return self._fits_catalog(
+                    scope,
+                    catalog,
+                    prompt,
+                    ScanResponse,
+                    self._scan_output(representative, len(catalog.fragments) + len(removed)),
+                )
+
+            chunk = self._prefix(units, fits)
+            if not chunk:
+                continue
+            prompt, catalog, removed = self._scan_input(scope, chunk, representative)
+            copies = ((len(units) + len(chunk) - 1) // len(chunk)) * ((len(items) + size - 1) // size)
+            estimated_cost = copies * (
+                self.client.request_tokens(
+                    prompt, response_format=ScanResponse, model=self.model, images=scope.context.images_for(catalog)
+                )
+                + self._scan_output(representative, len(catalog.fragments) + len(removed))
+            )
+            candidate = (estimated_cost, copies, -len(chunk), chunk)
+            if best is None or candidate[:3] < best[:3]:
+                best = candidate
+        if best is None:
+            return []
+
+        # The heuristic is not authority: every actual single claim must fit the
+        # fixed range before any sibling runs; group packing is checked again.
+        def all_fit(trial):
+            for item in items:
+                prompt, catalog, removed = self._scan_input(scope, trial, [item])
+                if not self._fits_catalog(
+                    scope,
+                    catalog,
+                    prompt,
+                    ScanResponse,
+                    self._scan_output([item], len(catalog.fragments) + len(removed)),
+                ):
+                    return False
+            return True
+
+        return best[3] if all_fit(best[3]) else self._prefix(best[3], all_fit)
+
     async def _scan(self, scope, items):
         units = [("current", f) for f in scope.catalog.fragments] + [("historical", part) for part in scope.removed]
         findings = {item.id: [] for item in items}
@@ -483,16 +569,13 @@ class RevisionWorkExecutor:
         coverage = {item.id: set() for item in items}
         position = 0
         while position < len(units):
-            # Fix one Source range, then pack claims against its complete serialized request.
-            def fits_source(trial):
-                for item in items:
-                    prompt, cat, _ = self._scan_input(scope, trial, [item])
-                    if not self._fits_catalog(scope, cat, prompt, ScanResponse, self._output([item], len(trial))):
-                        return False
-                return True
-
-            chunk = self._prefix(units[position:], fits_source)
+            chunk = self._plan_source_chunk(scope, units[position:], items)
             if not chunk:
+                if scope.include_history:
+                    full = AssessmentRange(
+                        scope.context, scope.context.catalog(scope.context.full_fragments), (), "full", False
+                    )
+                    return await self._scan(full, items)
                 raise SupportRevalidationLimitation(
                     SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
                     "one Source structure exceeds configured assessment capability",
@@ -503,7 +586,11 @@ class RevisionWorkExecutor:
                 for item in items[start:]:
                     prompt, cat, removed = self._scan_input(scope, chunk, batch + [item])
                     if not self._fits_catalog(
-                        scope, cat, prompt, ScanResponse, self._output(batch + [item], len(chunk))
+                        scope,
+                        cat,
+                        prompt,
+                        ScanResponse,
+                        self._scan_output(batch + [item], len(cat.fragments) + len(removed)),
                     ):
                         break
                     batch.append(item)
@@ -515,6 +602,8 @@ class RevisionWorkExecutor:
                 def validate(response):
                     self._coverage(response.results, batch)
                     for result in response.results:
+                        if not (result.observations_found or result.no_local_effect or result.needs_context):
+                            raise ValueError("scan result omitted its assessment")
                         if result.no_local_effect and result.observations_found:
                             raise ValueError("local scan status contradicts findings")
                         if any(not set(finding.refs) <= allowed for finding in result.observations_found):
@@ -524,7 +613,7 @@ class RevisionWorkExecutor:
                     "support_scan",
                     prompt,
                     ScanResponse,
-                    self._output(batch, len(chunk)),
+                    self._scan_output(batch, len(cat.fragments) + len(removed)),
                     identity=[scope.catalog.digest, position, len(chunk), self._identity(batch)],
                     images=scope.context.images_for(cat),
                     validate=validate,
@@ -539,22 +628,55 @@ class RevisionWorkExecutor:
         expected = set(range(len(units)))
         if any(seen != expected for seen in coverage.values()):
             raise ValueError("Source × claim scan coverage incomplete")
-        output = {}
+        self.covered_source_claim_pairs += len(expected) * len(items)
+        prepared = []
         for item in items:
-            output.update(await self._synthesize(scope, item, findings[item.id], unresolved[item.id], parents[item.id]))
+            catalog, selected, needs, dependencies = await self._prepare_final(
+                scope, item, findings[item.id], unresolved[item.id], parents[item.id]
+            )
+            prepared.append((item, catalog, selected, needs, dependencies))
+        output = {}
+        while prepared:
+            packed = []
+
+            def final_input(group):
+                selected_refs = {f.reference for _, cat, _, _, _ in group for f in cat.fragments}
+                cat = self._subset(scope.catalog, selected_refs)
+                claims = [item for item, _, _, _, _ in group]
+                selected = [{**finding, "work_id": item.id} for item, _, facts, _, _ in group for finding in facts]
+                needs = [{"work_id": item.id, "dependencies": values} for item, _, _, values, _ in group if values]
+                deps = tuple({work.id: work for _, _, _, _, works in group for work in works}.values())
+                return cat, claims, selected, needs, deps
+
+            for entry in prepared:
+                cat, claims, selected, needs, deps = final_input(packed + [entry])
+                prompt = self._prompt(FINAL_PROMPT, self._final_payload(scope, cat, claims, selected, needs))
+                if not self._fits_catalog(scope, cat, prompt, FinalResponse, self._output(claims, len(cat.fragments))):
+                    break
+                packed.append(entry)
+            if not packed:
+                # The single-item preparation uses exactly the same work labels.
+                raise SupportRevalidationLimitation(
+                    SupportRevalidationLimitationCode.CAPACITY_EXCEEDED, "prepared final request exceeds capability"
+                )
+            cat, claims, selected, needs, deps = final_input(packed)
+            output.update(
+                await self._finalize(scope, cat, claims, findings=selected, needs_context=needs, dependencies=deps)
+            )
+            prepared = prepared[len(packed) :]
         return output
 
     def _scan_input(self, scope, units, items):
         refs = [unit.reference for kind, unit in units if kind == "current"]
-        catalog = self._subset(scope.catalog, refs)
+        catalog = self._evidence_subset(scope, refs)
         removed = [unit for kind, unit in units if kind == "historical"]
         payload = {**self._source_payload(scope, catalog, removed), "claims": [item.claim_payload() for item in items]}
         if scope.include_history:
             # Each independent old Support is explicit; large history chooses full revalidation.
-            payload["previous_evidence"] = self._previous_evidence(items)
+            payload.update(self._previous_evidence(items, catalog))
         return self._prompt(SCAN_PROMPT, payload), catalog, removed
 
-    async def _synthesize(self, scope, item, findings, needs_context, parents):
+    async def _prepare_final(self, scope, item, findings, needs_context, parents):
         current = {f.reference: f for f in scope.catalog.fragments}
         retained = {
             f.reference
@@ -566,19 +688,20 @@ class RevisionWorkExecutor:
         findings = [{"finding_id": f"n{i}", **finding} for i, finding in enumerate(findings)]
         for depth in range(8):
             refs = retained | {ref for finding in findings for ref in finding.get("refs", []) if ref in current}
-            catalog = self._subset(scope.catalog, refs)
-            prompt = self._prompt(FINAL_PROMPT, self._final_payload(scope, catalog, [item], findings, needs_context))
+            catalog = self._evidence_subset(scope, refs)
+            labeled = [{**finding, "work_id": item.id} for finding in findings]
+            needs = [{"work_id": item.id, "dependencies": needs_context}] if needs_context else []
+            prompt = self._prompt(FINAL_PROMPT, self._final_payload(scope, catalog, [item], labeled, needs))
             if self._fits_catalog(scope, catalog, prompt, FinalResponse, self._output([item], len(catalog.fragments))):
-                return await self._finalize(
-                    scope, catalog, [item], findings=findings, needs_context=needs_context, dependencies=parents
-                )
+                return catalog, findings, needs_context, parents
+            self.max_reduction_depth = max(self.max_reduction_depth, depth + 1)
             reduced = []
             next_parents = []
             offset = 0
 
             def reduction_input(trial):
                 selected_refs = {ref for finding in trial for ref in finding.get("refs", [])}
-                selected_catalog = self._subset(scope.catalog, selected_refs)
+                selected_catalog = self._evidence_subset(scope, selected_refs)
                 payload = {
                     "claim": item.claim_payload(),
                     "findings": trial,

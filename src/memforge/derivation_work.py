@@ -7,7 +7,7 @@ import hashlib
 import json
 from typing import Any, Literal, Mapping, Protocol
 
-WorkKind = Literal["extract", "support_scan", "support_reduce", "support_finalize"]
+WorkKind = Literal["support_scan", "support_reduce", "support_finalize"]
 
 
 def payload_hash(payload: Any) -> str:
@@ -29,7 +29,7 @@ class DerivationWork:
 
     @classmethod
     def create(cls, kind: WorkKind, manifest: Mapping[str, Any]):
-        identity = {**manifest, "kind": kind}
+        identity = json.loads(json.dumps({**manifest, "kind": kind}, ensure_ascii=False))
         return cls("work-" + payload_hash(identity), kind, identity)
 
     def to_payload(self):

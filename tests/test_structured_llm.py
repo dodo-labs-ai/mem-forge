@@ -229,6 +229,13 @@ class Choice:
         self.message = ChoiceMessage(content)
 
 
+@pytest.fixture(autouse=True)
+def fixture_model_capacity(monkeypatch):
+    monkeypatch.setattr("memforge.llm.structured.litellm.get_model_info", lambda *args, **kwargs: {
+        "max_input_tokens": 200000, "max_output_tokens": 64000,
+    })
+
+
 class CompletionResponse:
     def __init__(self, content: str | None) -> None:
         self.choices = [Choice(content)]
@@ -2370,3 +2377,24 @@ def test_request_budget_freezes_capability_per_effective_model(monkeypatch):
     client.request_tokens("literal {input}", response_format=RevisionSupportResponse, model="openai/large")
     assert messages[0]["messages"][0]["content"] == _json_text_prompt("literal {input}", RevisionSupportResponse)
     assert messages[0]["model"].endswith("large")
+
+
+def test_known_model_uses_sdk_capacity_without_unrequested_app_cap(monkeypatch):
+    client = LiteLlmStructuredClient(StructuredLlmConfig(model='openai/known', base_url=None, api_key=None, timeout_s=1))
+    assert client.request_budget().input_limit == 200000
+    assert client.request_budget().output_limit == 64000
+
+
+def test_unknown_route_requires_explicit_capacity(monkeypatch):
+    monkeypatch.setattr('memforge.llm.structured.litellm.get_model_info', lambda *args, **kwargs: {})
+    client = LiteLlmStructuredClient(StructuredLlmConfig(model='gateway/unknown', base_url=None, api_key=None, timeout_s=1))
+    with pytest.raises(ValueError, match='configure MEMFORGE_LLM_MAX_INPUT_TOKENS'):
+        client.request_budget()
+
+
+def test_correction_consumes_its_existing_reserve(monkeypatch):
+    client = LiteLlmStructuredClient(StructuredLlmConfig(model='openai/known', base_url=None, api_key=None, timeout_s=1,
+        max_input_tokens=10000, context_window_tokens=20000, max_output_tokens=1000))
+    monkeypatch.setattr('memforge.llm.structured.litellm.token_counter', lambda **kwargs: 7500)
+    assert not client.request_fits('correction', response_format=RevisionSupportResponse, max_tokens=1000)
+    assert client.request_fits('correction', response_format=RevisionSupportResponse, max_tokens=1000, reserve_correction=False)
