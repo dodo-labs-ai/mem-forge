@@ -14,6 +14,7 @@ from memforge.llm.structured import (
 )
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
+    FragmentSelectionErrorCode,
     ProjectionFragmentCatalog,
     SupportRevalidationLimitation,
     SupportRevalidationLimitationCode,
@@ -234,10 +235,12 @@ class RevisionWorkExecutor:
                             if isinstance(error, FragmentSelectionError)
                             else "revision_support_response_incomplete"
                         )
-                        raise ReconciliationContractError(code, "bounded assessment correction exhausted") from error
+                        raise ReconciliationContractError(code, f"bounded assessment correction exhausted: {error}") from error
                     current_prompt = (
                         prompt
-                        + "\nCorrection: include each requested work/finding ID exactly once; use only supplied refs and return complete current Evidence for supported claims."
+                        + "\nCorrection: " + str(error)
+                        + ". Return all requested IDs once. Scan refs: current catalog or removed_historical only; "
+                        "historical_evidence is not selectable. Supported finals need current Evidence."
                     )
             work = replace(
                 work,
@@ -669,8 +672,14 @@ class RevisionWorkExecutor:
                             raise ValueError("scan result omitted its assessment")
                         if result.no_local_effect and result.observations_found:
                             raise ValueError("local scan status contradicts findings")
-                        if any(not set(finding.refs) <= allowed for finding in result.observations_found):
-                            raise ValueError("scan selected unknown evidence")
+                        invalid = sorted({ref for finding in result.observations_found for ref in finding.refs} - allowed)
+                        if invalid:
+                            raise FragmentSelectionError(
+                                FragmentSelectionErrorCode.UNKNOWN_REF,
+                                f"scan {result.work_id} used unknown refs "
+                                + json.dumps([ref if len(ref) <= 80 else f"<invalid ref: {len(ref)} chars>" for ref in invalid[:8]])[:512]
+                                + (f" ({len(invalid)} invalid refs total)" if len(invalid) > 8 else ""),
+                            )
 
                 response, work = await self._call(
                     "support_scan",
