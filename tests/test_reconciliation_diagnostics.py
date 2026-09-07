@@ -40,6 +40,7 @@ async def test_mandatory_provider_failure_preserves_support_and_revision_without
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic/test",
+            max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768,
             base_url=None,
             api_key=None,
             timeout_s=1,
@@ -125,6 +126,7 @@ async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypa
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic/test",
+            max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768,
             base_url=None,
             api_key=None,
             timeout_s=1,
@@ -211,6 +213,7 @@ async def test_failed_parallel_batch_counts_cancelled_provider_sibling(monkeypat
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic/test",
+            max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768,
             base_url=None,
             api_key=None,
             timeout_s=5,
