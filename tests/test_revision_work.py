@@ -271,3 +271,36 @@ async def test_oversized_historical_evidence_uses_complete_current_full_scan():
     assert len(scans) > 1
     assert all(scan["input_mode"] == "full" and "historical_evidence" not in scan for scan in scans)
     assert any("Current routine note 199" in p for p in client.prompts)
+
+
+@pytest.mark.asyncio
+async def test_different_baselines_share_current_full_when_total_delta_cost_is_higher():
+    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+
+    current_text = "Two reviewers approve US releases.\n\n" + "\n\n".join(
+        f"Current operational note {i}: the process is stable." for i in range(80)
+    )
+    items = []
+    for index in range(3):
+        base, current = revisions(
+            f"Two reviewers approve US releases.\n\nOld baseline {index}: historical policy.\n", current_text
+        )
+        primary = replace(base.observation_revisions[0], id=f"old-revision-{index}")
+        unit = replace(base.source_unit_revisions[0], id=f"old-unit-{index}",
+                       observation_revision_ids=(primary.id, "rev-context"))
+        base = replace(base, observation_revisions=(primary, base.observation_revisions[1]),
+                       source_unit_revisions=(unit,),
+                       deltas=(replace(base.deltas[0], current_unit_revision_id=unit.id),))
+        context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
+        items.append(SupportWorkItem(f"w{index}", replace(memory(), id=f"m{index}"), old_support(base), context))
+    client = Client(limit=6500)
+    executor = RevisionWorkExecutor(client=client, model="fixture")
+    results = await executor.assess_many(items)
+    scans = [json.loads(p.split("<scan>")[1].split("</scan>")[0]) for p in client.prompts if "<scan>" in p]
+    assert scans and all(p["input_mode"] == "full" for p in scans)
+    assert any(len(p["claims"]) > 1 for p in scans)
+    assert len(results) == 3 and all(r.supported for r in results.values())
+    for item in items:
+        seen = {row[1] for p in scans if any(c["work_id"] == item.id for c in p["claims"])
+                for row in p["current"]["primary_candidates"]}
+        assert {f.presentation_text for f in item.context.full_fragments} <= seen

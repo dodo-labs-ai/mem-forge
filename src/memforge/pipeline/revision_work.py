@@ -408,7 +408,7 @@ class RevisionWorkExecutor:
             )
         return results
 
-    def _range(self, items):
+    def _full_range(self, items):
         context = items[0].context
         full = AssessmentRange(context, context.catalog(context.full_fragments), (), "full")
         empty = self._subset(full.catalog, ())
@@ -417,6 +417,11 @@ class RevisionWorkExecutor:
             if not self._fits(history_prompt, FinalResponse, 1024):
                 full = replace(full, include_history=False)
                 break
+        return full
+
+    def _range(self, items):
+        context = items[0].context
+        full = self._full_range(items)
         if context.base is None:
             return full
         prompt = self._prompt(FINAL_PROMPT, self._final_payload(full, full.catalog, items[:1]))
@@ -455,30 +460,85 @@ class RevisionWorkExecutor:
             "delta",
         )
 
-        # Compare serialized semantic inputs, not offsets or raw character counts.
-        def cost(scope):
-            payload = self._source_payload(scope, scope.catalog, scope.removed)
-            payload["claims"] = [item.claim_payload() for item in items]
-            if scope.include_history:
-                payload.update(self._previous_evidence(items, scope.catalog))
-            return self.client.request_tokens(
-                self._prompt(SCAN_PROMPT, payload), response_format=ScanResponse, model=self.model
-            )
+        return min((full, delta), key=lambda scope: self._estimated_range_cost(scope, items))
 
-        return min((full, delta), key=cost)
+    def _estimated_range_cost(self, scope, items):
+        """Estimate transport cost using bounded packing, never semantic coverage.
+
+        Sample one actual Source chunk and scale its packed request costs. Final
+        synthesis after scanning is conservatively charged once per claim; actual
+        execution independently budgets and verifies every request and range.
+        """
+        remaining = list(items)
+        cost = 0
+        while remaining:
+            direct = []
+            for item in remaining:
+                trial = direct + [item]
+                prompt = self._prompt(FINAL_PROMPT, self._final_payload(scope, scope.catalog, trial))
+                output = self._output(trial, len(scope.catalog.fragments))
+                if not self._fits_catalog(scope, scope.catalog, prompt, FinalResponse, output):
+                    break
+                direct = trial
+            if not direct:
+                break
+            prompt = self._prompt(FINAL_PROMPT, self._final_payload(scope, scope.catalog, direct))
+            cost += self.client.request_tokens(
+                prompt, response_format=FinalResponse, model=self.model, images=scope.context.images_for(scope.catalog)
+            ) + self._output(direct, len(scope.catalog.fragments))
+            remaining = remaining[len(direct):]
+        if not remaining:
+            return cost
+        units = [("current", f) for f in scope.catalog.fragments] + [("historical", p) for p in scope.removed]
+        chunk = self._plan_source_chunk(scope, units, remaining)
+        if not chunk:
+            return float("inf")
+        copies = (len(units) + len(chunk) - 1) // len(chunk)
+        while remaining:
+            batch = []
+            for item in remaining:
+                trial = batch + [item]
+                prompt, catalog, removed = self._scan_input(scope, chunk, trial)
+                output = self._scan_output(trial, len(catalog.fragments) + len(removed))
+                if not self._fits_catalog(scope, catalog, prompt, ScanResponse, output):
+                    break
+                batch = trial
+            if not batch:
+                return float("inf")
+            prompt, catalog, removed = self._scan_input(scope, chunk, batch)
+            cost += copies * (
+                self.client.request_tokens(
+                    prompt, response_format=ScanResponse, model=self.model, images=scope.context.images_for(catalog)
+                ) + self._scan_output(batch, len(catalog.fragments) + len(removed))
+            )
+            # A fixed final-call allowance avoids treating scans as the whole job.
+            cost += sum(self._output([item], len(scope.catalog.fragments)) for item in batch)
+            remaining = remaining[len(batch):]
+        return cost
 
     async def assess_many(self, items: list[SupportWorkItem]) -> dict[str, SupportAssessment]:
         groups = {}
         for item in items:
             groups.setdefault(id(item.context), []).append(item)
         results = {}
-        planned = {}
+        targets = {}
         for group in groups.values():
-            scope = self._range(group)
-            key = (scope.mode, scope.catalog.digest, payload_hash(scope.removed), scope.include_history)
-            if key not in planned:
-                planned[key] = (scope, [])
-            planned[key][1].extend(group)
+            full = self._full_range(group)
+            key = (full.catalog.digest, full.context.access_context_hash)
+            targets.setdefault(key, []).append((self._range(group), group))
+        planned = {}
+        for alternatives in targets.values():
+            all_items = [item for _, group in alternatives for item in group]
+            shared_full = self._full_range(all_items)
+            if len(alternatives) > 1 and self._estimated_range_cost(shared_full, all_items) <= sum(
+                self._estimated_range_cost(scope, group) for scope, group in alternatives
+            ):
+                alternatives = [(shared_full, all_items)]
+            for scope, group in alternatives:
+                key = (scope.mode, scope.catalog.digest, payload_hash(scope.removed), scope.include_history)
+                if key not in planned:
+                    planned[key] = (scope, [])
+                planned[key][1].extend(group)
         for scope, group in planned.values():
             # Keep small inputs on a single final call and pack as many claims as fit.
             remaining = list(group)
