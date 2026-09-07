@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from tests.revision_client_fixture import RevisionClientFixture
 
 import pytest
-from memforge.pipeline.revision_work import FinalResponse
+from memforge.llm.structured import SupportAssessmentResponse
 import pytest_asyncio
 
 
@@ -5151,7 +5151,7 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
         response = (
             await responses.assess_claim_revisions(prompt)
             if "<memory_pair_groups>" in prompt
-            else await responses.evaluate_revision_work(prompt, response_format=FinalResponse)
+            else await responses.evaluate_revision_work(prompt, response_format=SupportAssessmentResponse)
         )
         return SimpleNamespace(
             choices=[

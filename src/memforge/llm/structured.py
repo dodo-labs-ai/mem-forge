@@ -1116,41 +1116,18 @@ class SourceSupportStructuredClient(Protocol):
         """Return semantic authority decisions for candidate user evidence."""
 
 
-class RevisionScanFinding(BaseModel):
-    kind: Literal["support", "counterexample", "scope", "dependency"]
-    refs: list[str]
-    explanation: str
+class SupportAssessmentResult(RevisionSupportResponse):
+    """Cumulative fixed-claim judgment over the processed revision range."""
 
-
-class RevisionScanResult(BaseModel):
     work_id: str
-    observations_found: list[RevisionScanFinding] = Field(default_factory=list)
-    no_local_effect: bool = False
+    reason: str = ""
+    considerations: list[str] = Field(default_factory=list)
+    context_refs: list[str] = Field(default_factory=list)
     needs_context: list[str] = Field(default_factory=list)
 
 
-class RevisionScanResponse(BaseModel):
-    results: list[RevisionScanResult]
-
-
-class RevisionFinalResult(RevisionSupportResponse):
-    work_id: str
-
-
-class RevisionFinalResponse(BaseModel):
-    results: list[RevisionFinalResult]
-
-
-class RevisionReductionDisposition(BaseModel):
-    finding_id: str
-    retained_refs: list[str]
-    explanation: str
-
-
-class RevisionReductionResponse(BaseModel):
-    dispositions: list[RevisionReductionDisposition]
-    summary: str
-    needs_context: list[str]
+class SupportAssessmentResponse(BaseModel):
+    results: list[SupportAssessmentResult]
 
 
 class StructuredLlmError(RuntimeError):
@@ -2364,7 +2341,7 @@ class LiteLlmStructuredClient:
         )
         if response_format in {
             ProjectionFragmentMemoryExtractionResponse, RevisionSupportResponse, ClaimRevisionResponse,
-            RevisionScanResponse, RevisionFinalResponse, RevisionReductionResponse,
+            SupportAssessmentResponse,
         }:
             # Count the expanded template value and fallback repair diagnostics;
             # provider placeholders must never make a large source look tiny.
