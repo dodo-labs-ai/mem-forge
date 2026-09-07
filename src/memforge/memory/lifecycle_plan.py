@@ -428,6 +428,32 @@ def plan_requires_complete_current_support(
     )
 
 
+def plan_skips_support_revalidation(
+    plan: "LifecyclePlan", memory_id: str, *, source_unit_id: str, support_id: str,
+) -> bool:
+    """Allow only the exact preserved old Support of this Unit's skipped KEEP.
+
+    A new attachment still needs current Evidence, even when its target Memory
+    was skipped. The Plan's existing Support-set stale guard protects the
+    snapshot from which the planner obtained these IDs.
+    """
+    if source_unit_id != plan.scope.source_unit_id:
+        return False
+    if any(
+        mutation.memory_id == memory_id
+        and mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
+        and support_id in (*mutation.evidence_reference_ids, *mutation.evidence_unit_ids)
+        for mutation in plan.mutations
+    ):
+        return False
+    return any(
+        decision.memory_id == memory_id
+        and decision.disposition is IncumbentDisposition.KEEP
+        and support_id in decision.skipped_support_ids
+        for decision in plan.coverage_proof.incumbent_decisions
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ReconciliationScope:
     """Atomic planning boundary, normally one changed Source Unit."""
@@ -448,8 +474,14 @@ class IncumbentDecision:
     replacement_memory_id: str | None = None
     authority: IncumbentAuthority = IncumbentAuthority.CURRENT_SOURCE_SUPPORT
     authority_actor_id: str | None = None
+    skipped_support_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.skipped_support_ids and (
+            self.disposition is not IncumbentDisposition.KEEP
+            or self.authority is not IncumbentAuthority.CURRENT_SOURCE_SUPPORT
+        ):
+            raise ValueError("skipped Support revalidation requires Source-scoped KEEP")
         if self.disposition is IncumbentDisposition.SUPERSEDE and not self.replacement_memory_id:
             raise ValueError("supersede decision requires replacement_memory_id")
         if self.authority is IncumbentAuthority.CURRENT_SOURCE_SUPPORT:
@@ -540,7 +572,25 @@ class LifecyclePlan:
         ):
             raise ValueError("destructive mutation rejected by lifecycle gate")
         incumbents = set(self.coverage_proof.mandatory_incumbent_ids)
+        skipped_ids = {
+            decision.memory_id for decision in self.coverage_proof.incumbent_decisions
+            if decision.skipped_support_ids
+        }
+        if any(
+            mutation.memory_id in skipped_ids and mutation.mutation_type in DESTRUCTIVE_MUTATIONS
+            for mutation in self.mutations
+        ):
+            raise ValueError("skipped Support revalidation cannot authorize destructive mutations")
         for decision in self.coverage_proof.incumbent_decisions:
+            if decision.skipped_support_ids and any(
+                mutation.memory_id == decision.memory_id
+                and mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
+                and set(decision.skipped_support_ids).intersection(
+                    (*mutation.evidence_reference_ids, *mutation.evidence_unit_ids)
+                )
+                for mutation in self.mutations
+            ):
+                raise ValueError("skipped Support revalidation cannot advance preserved assertions")
             if decision.authority is not IncumbentAuthority.MAINTENANCE_OPERATOR:
                 continue
             target_mutations = tuple(
@@ -730,6 +780,7 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
                     "disposition": item.disposition.value,
                     "reason": item.reason,
                     "replacement_memory_id": item.replacement_memory_id,
+                    **({"skipped_support_ids": list(item.skipped_support_ids)} if item.skipped_support_ids else {}),
                     **(
                         {
                             "authority": item.authority.value,

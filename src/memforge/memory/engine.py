@@ -1113,6 +1113,7 @@ class MemoryEngine:
             project_key=project_key, repo_identifier=repo_identifier,
         )
         support_audits = []
+        skipped_revalidation: dict[str, str] = {}
         assessed_evidence: dict[str, list[RawMemory]] = {}
         assessment_image_loader = None
         required_derivation_work_ids = ()
@@ -1231,6 +1232,11 @@ class MemoryEngine:
                 required_derivation_work_ids = tuple(evaluator.final_work_ids) if derivation_id else ()
                 for memory in model_incumbents:
                     results = [assessed[work_id] for work_id in work_by_memory[memory.id]]
+                    if any(result.supported is None for result in results):
+                        skipped_revalidation[memory.id] = "; ".join(
+                            dict.fromkeys(result.reason for result in results if result.supported is None)
+                        )
+                        continue
                     current = [result.memory for result in results if result.supported and result.memory is not None]
                     stats["support_revalidation_auto_rebind_count"] += len(current)
                     assessed_evidence[memory.id] = current
@@ -1242,7 +1248,7 @@ class MemoryEngine:
             _runtime_context.stage = "reconciliation"
             result = await reconcile_memories(
                 new_extractions=filtered_memories,
-                existing_memories=model_incumbents,
+                existing_memories=[memory for memory in model_incumbents if memory.id not in skipped_revalidation],
                 doc_type=doc_type,
                 structured_llm_client=self.structured_llm_client,
                 llm_model=self.llm_model,
@@ -1308,7 +1314,16 @@ class MemoryEngine:
                     retryable=result.failure.terminal_category in {"provider_error", "deadline_exceeded"},
                     commit_attempted=False,
                 )
-            operations = tuple(result.operations)
+            stats["support_revalidation_skipped_memory_count"] = len(skipped_revalidation)
+            operations = tuple(result.operations) + tuple(
+                ReconcileOperation(
+                    action=ReconcileAction.NOOP,
+                    memory_id=memory_id,
+                    reason=reason or "Support revalidation insufficient; preserve existing evidence",
+                    support_revalidation_skipped=True,
+                )
+                for memory_id, reason in skipped_revalidation.items()
+            )
             operations += tuple(
                 ReconcileOperation(
                     action=ReconcileAction.DELETE,
@@ -1444,7 +1459,7 @@ class MemoryEngine:
                         content_hash(operation.memory.content.strip()),
                         (),
                     ),
-                    excluded_memory_ids=frozenset(incumbents_by_id),
+                    excluded_memory_ids=frozenset(incumbents_by_id).difference(skipped_revalidation),
                 )
             )
         identity_resolution = await self.identity_resolver.resolve(tuple(identity_requests))

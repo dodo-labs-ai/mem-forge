@@ -295,3 +295,41 @@ def test_plan_rejects_mutation_for_memory_outside_incumbent_ledger() -> None:
 
     with pytest.raises(ValueError, match="outside mandatory incumbent ledger"):
         plan.validate()
+
+
+def test_skipped_support_is_exact_scoped_keep_and_never_authorizes_new_attachment():
+    from dataclasses import replace
+    from memforge.memory.lifecycle_plan import lifecycle_plan_to_payload, plan_skips_support_revalidation
+
+    plan = LifecyclePlan(
+        id="skip-plan", scope=_scope(), gate_state=LifecycleGateState.GATED,
+        coverage_proof=_proof(
+            IncumbentDecision("mem-a", IncumbentDisposition.KEEP, "insufficient", skipped_support_ids=("eref-old",)),
+            IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "supported"),
+        ), stale_guard=_guard(), mutations=(),
+    )
+    plan.validate()
+    def skipped(candidate, memory_id="mem-a", unit="unit-1", support="eref-old"):
+        return plan_skips_support_revalidation(candidate, memory_id, source_unit_id=unit, support_id=support)
+    assert skipped(plan)
+    assert not skipped(plan, memory_id="mem-b")
+    assert not skipped(plan, unit="other-unit")
+    assert not skipped(plan, support="eref-new")
+    decisions = lifecycle_plan_to_payload(plan)["coverage_proof"]["incumbent_decisions"]
+    assert decisions[0]["skipped_support_ids"] == ["eref-old"]
+    assert "skipped_support_ids" not in decisions[1]
+    attached = replace(plan, mutations=(LifecycleMutation(
+        LifecycleMutationType.ATTACH_SUPPORT, memory_id="mem-a", source_id="src-1",
+        evidence_reference_ids=("eref-old",),
+    ),))
+    assert not skipped(attached)
+    with pytest.raises(ValueError, match="cannot advance preserved assertions"):
+        attached.validate()
+    destructive = replace(plan, gate_state=LifecycleGateState.ENABLED, mutations=(LifecycleMutation(
+        LifecycleMutationType.REMOVE_SUPPORT, memory_id="mem-a", source_id="src-1",
+        evidence_reference_ids=("eref-old",),
+    ),))
+    with pytest.raises(ValueError, match="cannot authorize destructive"):
+        destructive.validate()
+    with pytest.raises(ValueError, match="Source-scoped KEEP"):
+        IncumbentDecision("mem-a", IncumbentDisposition.REMOVE_SUPPORT, "insufficient", skipped_support_ids=("eref-old",))

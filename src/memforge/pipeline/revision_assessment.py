@@ -81,7 +81,8 @@ from independent old Evidence Units or from another Source Unit.
 
 @dataclass(frozen=True)
 class SupportAssessment:
-    supported: bool
+    # None preserves the existing claim without certifying current support.
+    supported: bool | None
     reason: str
     memory: RawMemory | None
     input_mode: str
