@@ -7,7 +7,7 @@ import hashlib
 import json
 from typing import Any, Literal, Mapping, Protocol
 
-WorkKind = Literal["support_scan", "support_reduce", "support_finalize"]
+WorkKind = Literal["support_assess", "support_scan", "support_reduce", "support_finalize"]
 
 
 def payload_hash(payload: Any) -> str:

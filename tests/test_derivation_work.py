@@ -125,7 +125,7 @@ async def test_executor_resumes_from_actual_sqlite_roundtrip(tmp_path):
     path = tmp_path / "executor.db"
     db, root = await prepare_database(path, items[0].context.projection)
     client = Client()
-    client.fail_next_scan = True
+    client.fail_at = 2
     first = RevisionWorkExecutor(client=client, model="fixture", store=db, derivation_id=root.id)
     try:
         with pytest.raises(TimeoutError):

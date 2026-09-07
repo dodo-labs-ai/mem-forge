@@ -1222,14 +1222,12 @@ class MemoryEngine:
                     assessed = await evaluator.assess_many(work_items)
                 finally:
                     stats["support_revalidation_model_call_count"] += evaluator.calls
+                    stats["support_revalidation_assessment_request_count"] = evaluator.stage_counts["support_assess"]
                     stats["support_revalidation_prompt_chars"] += evaluator.prompt_chars
                     stats["support_revalidation_reused_work_count"] = evaluator.reused
-                    stats["support_revalidation_scan_request_count"] = evaluator.stage_counts["support_scan"]
-                    stats["support_revalidation_reduction_request_count"] = evaluator.stage_counts["support_reduce"]
-                    stats["support_revalidation_final_request_count"] = evaluator.stage_counts["support_finalize"]
                     stats["support_revalidation_covered_source_claim_pairs"] = evaluator.covered_source_claim_pairs
-                    stats["support_revalidation_max_reduction_depth"] = evaluator.max_reduction_depth
                     _runtime_context.model_call_count += evaluator.calls
+                stats["support_revalidation_completion_count"] = len(evaluator.final_work_ids)
                 required_derivation_work_ids = tuple(evaluator.final_work_ids) if derivation_id else ()
                 for memory in model_incumbents:
                     results = [assessed[work_id] for work_id in work_by_memory[memory.id]]

@@ -49,11 +49,11 @@ def plan_fragment_requests(batch, catalog, *, context, extractor, source_type, d
         selected.update({f.anchor: f for f in primary})
         return context.catalog(tuple(selected.values()))
 
-    # Reading current full context never gives old fragments new Primary authority.
-    full = context.extraction_catalog(catalog, "full")
-    if fits(full):
-        return (replace(batch, prepared_catalog=full, prepared_prompt=prompt(full)),)
     primary = [f for f in catalog.fragments if f.primary_eligible]
+    selected = (context.extraction_catalog(catalog, "full") if context.base is None
+                else materialize(primary))
+    if fits(selected):
+        return (replace(batch, prepared_catalog=selected, prepared_prompt=prompt(selected)),)
     if not primary:
         return (replace(batch, prepared_catalog=catalog, prepared_prompt=prompt(catalog)),)
     result = []
