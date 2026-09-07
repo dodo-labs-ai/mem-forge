@@ -191,6 +191,13 @@ def build_lifecycle_plan(
             else {"evidence_reference_ids": ids}
         )
 
+    def scoped_support_ids(memory_id: str) -> tuple[str, ...]:
+        return (
+            (source_support_unit_ids or {}).get(memory_id, ())
+            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+            else source_support_reference_ids.get(memory_id, ())
+        )
+
     def memory_creation_mutations(raw: RawMemory) -> tuple[str, tuple[LifecycleMutation, ...]]:
         memory_id = _new_memory_id(scope.id, raw)
         support_ids = support_ids_for(raw)
@@ -245,6 +252,14 @@ def build_lifecycle_plan(
         support_ids = support_ids_for(operation.memory)
         if not support_ids:
             raise ValueError("corroborated Memory candidate lacks support-granting evidence")
+        incumbent_operation = by_incumbent.get(target.id)
+        if incumbent_operation is not None and incumbent_operation.support_revalidation_skipped:
+            # Corroboration may reuse the identity, but cannot revalidate an old
+            # assertion by upserting its same Evidence ID under the new Plan.
+            preserved = set(scoped_support_ids(target.id))
+            support_ids = tuple(support_id for support_id in support_ids if support_id not in preserved)
+            if not support_ids:
+                continue
         reactivation_mutations: tuple[LifecycleMutation, ...] = ()
         if target.status == "retired":
             if target.retirement_reason != "source_rebaseline":
@@ -286,11 +301,7 @@ def build_lifecycle_plan(
 
     for memory_id in incumbent_ids:
         operation = by_incumbent[memory_id]
-        current_source_support = (
-            (source_support_unit_ids or {}).get(memory_id, ())
-            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else source_support_reference_ids.get(memory_id, ())
-        )
+        current_source_support = scoped_support_ids(memory_id)
         all_support = (
             (all_active_support_unit_ids or {}).get(memory_id, ())
             if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
@@ -298,6 +309,10 @@ def build_lifecycle_plan(
         )
         external_support = set(all_support).difference(current_source_support)
 
+        if operation.support_revalidation_skipped and (
+            operation.action is not ReconcileAction.NOOP or operation.memory is not None
+        ):
+            raise ValueError("skipped Support revalidation requires a bare NOOP")
         if operation.action is ReconcileAction.NOOP:
             support_ids = support_ids_for(operation.memory) if operation.memory is not None else ()
             proposed_mutations: list[LifecycleMutation] = []
@@ -341,7 +356,10 @@ def build_lifecycle_plan(
                     )
                 )
                 continue
-            decisions.append(IncumbentDecision(memory_id, IncumbentDisposition.KEEP, operation.reason or "kept"))
+            decisions.append(IncumbentDecision(
+                memory_id, IncumbentDisposition.KEEP, operation.reason or "kept",
+                skipped_support_ids=tuple(current_source_support) if operation.support_revalidation_skipped else (),
+            ))
             mutations.extend(proposed_mutations)
             continue
 

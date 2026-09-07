@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import pytest
 
+from memforge.memory.evidence import SupportScopeVersion
 from memforge.memory.lifecycle_plan import (
     IncumbentAuthority,
     IncumbentAuthorityGrant,
@@ -486,3 +487,63 @@ def test_planner_rejects_incomplete_incumbent_ledger() -> None:
             new_evidence_reference_ids=("eref-new",),
             defaults=_defaults(),
         )
+
+
+@pytest.mark.parametrize("version", list(SupportScopeVersion))
+@pytest.mark.parametrize(
+    "candidate_support_ids, expected_attached",
+    [
+        (("support-old",), ()),
+        (("support-old", "support-new"), ("support-new",)),
+    ],
+)
+def test_skipped_corroboration_reuses_identity_without_reattaching_preserved_support(
+    version, candidate_support_ids, expected_attached,
+) -> None:
+    old = _memory()
+    candidate = RawMemory(
+        content=old.content, memory_type=old.memory_type, evidence_quote=old.content,
+    )
+    v2 = version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+    plan = build_lifecycle_plan(
+        plan_id="plan-skipped-corroboration",
+        scope=_scope(),
+        gate_state=LifecycleGateState.ENABLED,
+        operations=(
+            ReconcileOperation(action=ReconcileAction.ADD, memory=candidate),
+            ReconcileOperation(
+                action=ReconcileAction.NOOP, memory_id=old.id,
+                reason="Support assessment insufficient", support_revalidation_skipped=True,
+            ),
+        ),
+        incumbents={old.id: old},
+        source_support_reference_ids={} if v2 else {old.id: ("support-old",)},
+        all_active_support_reference_ids={} if v2 else {old.id: ("support-old",)},
+        source_support_unit_ids={old.id: ("support-old",)} if v2 else None,
+        all_active_support_unit_ids={old.id: ("support-old",)} if v2 else None,
+        support_scope_version=version,
+        support_set_hashes={old.id: "original-support-hash"},
+        observation_revision_ids=("obsrev-2",),
+        new_evidence_reference_ids=() if v2 else candidate_support_ids,
+        new_evidence_unit_ids=candidate_support_ids if v2 else (),
+        corroboration_targets_by_claim_hash={content_hash(candidate.content): old},
+        corroboration_proofs_by_claim_hash={content_hash(candidate.content): {"method": "exact_content"}},
+        defaults=_defaults(),
+    )
+
+    [decision] = plan.coverage_proof.incumbent_decisions
+    assert decision.memory_id == old.id
+    assert decision.disposition.value == "keep"
+    assert decision.skipped_support_ids == ("support-old",)
+    assert plan.stale_guard.support_set_hashes[old.id] == "original-support-hash"
+    if not expected_attached:
+        assert plan.mutations == ()
+    else:
+        assert [mutation.mutation_type for mutation in plan.mutations] == [
+            LifecycleMutationType.ATTACH_SUPPORT,
+            LifecycleMutationType.REFRESH_MEMORY_INDEX,
+        ]
+        attachment = plan.mutations[0]
+        assert attachment.memory_id == old.id
+        assert (attachment.evidence_unit_ids if v2 else attachment.evidence_reference_ids) == expected_attached
+    assert plan.relation_discovery_requests == ()

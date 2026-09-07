@@ -314,3 +314,26 @@ async def test_optional_history_cannot_block_current_full_structure():
     result = await RevisionWorkExecutor(client=client, model="fixture").assess_many([item])
     assert result[item.id].supported
     assert any("historical_evidence" not in payload(p) for p in client.prompts)
+
+
+@pytest.mark.asyncio
+async def test_insufficient_is_preserved_in_complete_receipt_without_current_evidence():
+    class InsufficientClient(Client):
+        async def evaluate_revision_work(self, prompt, **kwargs):
+            result = await super().evaluate_revision_work(prompt, **kwargs)
+            result.results[0].status = "insufficient"
+            result.results[0].reason = "Cannot establish the remaining condition"
+            return result
+
+    client, store = InsufficientClient(limit=16000), Store()
+    executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
+    results = await executor.assess_many(work_items("Two reviewers approve US releases.\n", 2))
+    assert results["w0"].supported is None
+    assert results["w0"].memory is None
+    assert results["w1"].supported is True
+    assert len(client.prompts) == 1
+    assert len(executor.final_work_ids) == 1
+    receipt = store.works["root", executor.final_work_ids[0]]
+    assert receipt.status == "completed"
+    assert receipt.result["results"][0]["status"] == "insufficient"
+    assert receipt.manifest["coverage"]["work_ids"] == ["w0", "w1"]

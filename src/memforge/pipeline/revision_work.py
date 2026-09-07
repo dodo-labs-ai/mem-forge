@@ -576,10 +576,6 @@ class RevisionWorkExecutor:
         results = {}
         by_id = {item.id: item for item in items}
         for result in decisions:
-            if result.status == "insufficient":
-                from memforge.pipeline.reconciler import ReconciliationContractError
-
-                raise ReconciliationContractError("revision_support_insufficient", "fixed-claim support is unresolved")
             raw = None
             if result.status == "supported":
                 selection = catalog.resolve_selection(
@@ -615,6 +611,7 @@ class RevisionWorkExecutor:
                     },
                 )
             results[result.work_id] = SupportAssessment(
-                result.status == "supported", result.reason, raw, scope.mode, 0, 0
+                None if result.status == "insufficient" else result.status == "supported",
+                result.reason, raw, scope.mode, 0, 0
             )
         return results
