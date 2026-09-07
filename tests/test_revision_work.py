@@ -37,16 +37,13 @@ class Client:
         results = []
         for claim in payload["claims"]:
             state = SupportAssessmentResult.model_validate(previous[claim["work_id"]])
-            facts = list(state.considerations)
+            facts = [state.reason]
             for ref, text, *_ in rows:
                 if any(term in text for term in ("Cedar", "Alder", "Birch")):
                     if text not in facts:
                         facts.append(text)
-                    if ref not in state.context_refs:
-                        state.context_refs.append(ref)
                 if "Two reviewers approve US releases." == text.strip():
                     state.primary_ref = ref
-            state.considerations = facts
             combined = " ".join(facts)
             exception = ("Cedar uses one reviewer" in combined and "Cedar means US" in combined) or all(
                 part in combined for part in ("Alder releases need not", "Alder refers to Birch", "Birch refers to US")
@@ -55,7 +52,7 @@ class Client:
                 state.status = "unsupported"
             elif state.status != "unsupported":
                 state.status = "supported" if state.primary_ref else "insufficient"
-            state.reason = "Cumulative fixture judgment; fixed rule and exceptions remain distinct from compliance."
+            state.reason = " ".join(facts)
             results.append(state)
         return SupportAssessmentResponse(results=results)
 
@@ -95,6 +92,9 @@ async def test_small_delta_shares_one_direct_request_and_program_completion():
     assert len(client.prompts) == 1 and len(results) == 3
     assert all(r.supported for r in results.values())
     assert payload(client.prompts[0])["input_mode"] == "delta"
+    assert set(payload(client.prompts[0])["previous_state"][0]) == {
+        "work_id", "status", "reason", "primary_ref", "required_refs"
+    }
     receipts = [w for w in store.works.values() if w.kind == "support_finalize"]
     assert len(receipts) == 1 and receipts[0].manifest["completion"] == "program"
     assert receipts[0].manifest["dependencies"] and executor.calls == 1
@@ -274,7 +274,6 @@ def test_output_budget_counts_same_refs_per_claim_and_existing_state():
                 status="supported",
                 primary_ref=refs[0],
                 required_refs=refs[1:],
-                context_refs=refs,
             )
             for i in items
         ]
@@ -284,7 +283,7 @@ def test_output_budget_counts_same_refs_per_claim_and_existing_state():
     assert executor._output(items, 300, response.results) > executor._output(items, 300)
 
 
-def test_deleted_historical_refs_are_budgeted_for_each_claim():
+def test_deleted_text_counts_as_input_but_never_as_selectable_output_refs():
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 
     previous = "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Deleted condition {i}." for i in range(250))
@@ -295,10 +294,10 @@ def test_deleted_historical_refs_are_budgeted_for_each_claim():
     scope = executor._range(items)
     states = {i.id: executor._initial(scope, i) for i in items}
     units = [("historical", part) for part in scope.removed]
-    _, catalog, budget = executor._request(scope, units, items, states, 0, len(units))
+    prompt, catalog, budget = executor._request(scope, units, items, states, 0, len(units))
     assert len(units) >= 250
-    assert budget == executor._output(items, len(units) + len(catalog.fragments), states.values())
-    assert budget > executor._output(items, len(catalog.fragments), states.values())
+    assert "Deleted condition 249" in prompt
+    assert budget == executor._output(items, len(catalog.fragments), states.values())
 
 
 @pytest.mark.asyncio

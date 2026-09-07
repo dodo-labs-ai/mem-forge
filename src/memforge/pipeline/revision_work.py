@@ -35,21 +35,18 @@ remaining in force is different from whether examples have complied with it or c
 Missing test results, failures and future work do not by themselves revoke a requirement.
 A stronger obligation can preserve an older necessary obligation; do not invent 'only'.
 
-Return the UPDATED CUMULATIVE judgment for each work_id, covering previous batches AND
-this batch. Keep earlier counterexamples, conditions and unresolved dependencies unless
-this batch resolves them. A later unrelated passage or repeated rule cannot erase an
-exception. Record only decision-relevant considerations and context_refs; do not collect
-every related example or execution detail. Keep unique partial premises needed by later
-batches, including changed definitions even when the claim's words do not appear.
+Return the updated judgment for each work_id using this batch and previous_state.
+Keep reason brief: the conclusion and its decisive basis, not a running list of facts
+or missing context. Prior judgments may be corrected; they are not authoritative facts.
+An unrelated passage alone does not invalidate earlier support or an identified exception.
 
 In delta mode the old independent Support was valid at baseline. Judge the effect of
 changes; inherit its proven-current parts when unaffected. Removed historical content is
 explanation, never current Evidence. In full mode only historical_evidence / previous_evidence from OLD source revisions
 are unproven. previous_state is different: it records this SAME TARGET revision already
 read in earlier batches. Its selected current Evidence refs remain current and selectable in BOTH modes,
-even when their text is absent from this batch. Historical context refs remain historical,
-never Primary or Required Evidence. Carry forward those judgments and refs;
-change them only when supplied material changes the conclusion. A new batch is additional
+even when their text is absent from this batch. Historical refs never become Primary or
+Required Evidence. A new batch is additional
 current text, not a replacement catalog. Do not restart full-mode proof from zero. Lack of proof in a partial batch is insufficient,
 not unsupported. After the complete range, loss of current support can be unsupported;
 missing material interpretation or an unresolved dependency remains insufficient.
@@ -57,10 +54,10 @@ missing material interpretation or an unresolved dependency remains insufficient
 Use supported, unsupported or insufficient. A supported judgment selects ONE complete
 current Evidence Unit via primary_ref and required_refs. A partial judgment may retain
 partial current refs while waiting for further material. Select refs only from this
-catalog or previous_state for that work_id; context_refs may also cite removed_historical.
+catalog or previous_state for that work_id. Never select removed_historical refs.
 Previous states are compact cumulative judgments grounded in earlier supplied material;
 they are not new Evidence. Their refs keep their original exact source identities.
-Keep concise cumulative reasons and decision-relevant considerations, not per-row prose.
+Do not request additional reading or collect a cross-batch context inventory.
 Headings and table headers are ordinary selectable Evidence when they establish scope.
 Do not mix independent Supports or mistake unrelated changes for permission to extract.
 <assessment>{payload}</assessment>"""
@@ -147,8 +144,8 @@ class RevisionWorkExecutor:
             text=json.dumps([state.model_dump(mode="json") for state in states], ensure_ascii=False),
         )
         # Each claim can select the same new refs. Reserve their representation
-        # per claim and enough room to preserve existing cumulative reasoning.
-        return max(1024, len(items) * (768 + 32 * fragments) + math.ceil(state_tokens * 1.25))
+        # per claim, plus a short reason and the previously selected references.
+        return max(1024, len(items) * (384 + 16 * fragments) + math.ceil(state_tokens * 1.25))
 
     @staticmethod
     def _subset(catalog, refs):
@@ -370,9 +367,7 @@ class RevisionWorkExecutor:
 
     @staticmethod
     def _state_refs(state):
-        return (
-            set(state.required_refs) | set(state.context_refs) | ({state.primary_ref} if state.primary_ref else set())
-        )
+        return set(state.required_refs) | ({state.primary_ref} if state.primary_ref else set())
 
     def _initial(self, scope, item):
         by_anchor = {f.anchor: f for f in scope.catalog.fragments}
@@ -421,7 +416,7 @@ class RevisionWorkExecutor:
         prompt, catalog = self._input(scope, units, items, states, position, total)
         output = self._output(
             items,
-            len(catalog.fragments) + sum(kind == "historical" for kind, _ in units),
+            len(catalog.fragments),
             [states[i.id] for i in items],
         )
         if (
@@ -502,7 +497,6 @@ class RevisionWorkExecutor:
                 )
             prompt, catalog, output = self._request(scope, chunk, group, states, position, len(units))
             current = {f.reference for f in catalog.fragments}
-            historical = {u["ref"] for kind, u in chunk if kind == "historical"}
             prior = {i.id: self._state_refs(states[i.id]) for i in group}
             all_current = {f.reference for f in scope.catalog.fragments}
 
@@ -514,10 +508,6 @@ class RevisionWorkExecutor:
                     if not selected <= allowed & all_current:
                         raise FragmentSelectionError(
                             FragmentSelectionErrorCode.UNKNOWN_REF, "assessment selected unavailable current Evidence"
-                        )
-                    if not set(r.context_refs) <= allowed | historical:
-                        raise FragmentSelectionError(
-                            FragmentSelectionErrorCode.UNKNOWN_REF, "assessment selected unavailable context"
                         )
                     if r.status == "supported":
                         scope.catalog.resolve_selection(
@@ -586,7 +576,7 @@ class RevisionWorkExecutor:
         results = {}
         by_id = {item.id: item for item in items}
         for result in decisions:
-            if result.status == "insufficient" or result.needs_context:
+            if result.status == "insufficient":
                 from memforge.pipeline.reconciler import ReconciliationContractError
 
                 raise ReconciliationContractError("revision_support_insufficient", "fixed-claim support is unresolved")
