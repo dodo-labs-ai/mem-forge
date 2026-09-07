@@ -320,3 +320,37 @@ def test_validated_baseline_can_be_newer_than_immutable_evidence_provenance():
     assert executor._range([item]).mode == "delta"
     changed = replace(item, support=(replace(part, validation_plan_id="different-plan"),))
     assert executor._identity([item]) != executor._identity([changed])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad_ref', ['e0', 'p999999', 'quoted source text ' * 2000])
+async def test_scan_correction_identifies_invalid_ref_without_widening_evidence_scope(bad_ref):
+    class RepairClient(Client):
+        sent_invalid = False
+
+        def request_fits(self, prompt, *, max_tokens, reserve_correction=True, **kwargs):
+            return len(prompt) + max_tokens // 8 <= self.limit - (1024 if reserve_correction else 0)
+
+        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            result = await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
+            if response_format is ScanResponse and not self.sent_invalid:
+                self.sent_invalid = True
+                result.results[0].observations_found = [Finding(kind='support', refs=[bad_ref], explanation='fixture')]
+                result.results[0].no_local_effect = False
+            elif 'Correction:' in prompt:
+                diagnostic = prompt.split('Correction:')[1]
+                assert (bad_ref if len(bad_ref) <= 80 else f'<invalid ref: {len(bad_ref)} chars>') in diagnostic
+                assert len(diagnostic) < 1024
+                if len(bad_ref) > 80:
+                    assert bad_ref not in diagnostic
+                assert 'historical_evidence is not selectable' in prompt
+            return result
+
+    client = RepairClient(limit=5000)
+    text = 'Two reviewers approve US releases.\n\n' + '\n\n'.join(f'Routine process note {i}.' for i in range(150))
+    executor = RevisionWorkExecutor(client=client, model='fixture')
+    result = await executor.assess_many(work_items(text))
+    assert client.sent_invalid and sum('Correction:' in p for p in client.prompts) == 1
+    assert result['w0'].supported
+    assert all(part.anchor.observation_revision_id != 'rev-primary'
+               for part in result['w0'].memory.resolved_evidence_selection.parts)
