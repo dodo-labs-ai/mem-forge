@@ -273,6 +273,8 @@ class ActiveSupportEvidence:
     excerpt: str | None
     raw_content_sha256: str | None = None
     presentation_sha256: str | None = None
+    validation_plan_id: str | None = None
+    validation_unit_revision_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

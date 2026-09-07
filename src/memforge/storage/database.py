@@ -1279,6 +1279,7 @@ CREATE TABLE IF NOT EXISTS memory_unit_support_assertions (
     active              INTEGER NOT NULL DEFAULT 1,
     created_at          TEXT NOT NULL,
     removed_at          TEXT,
+    validation_plan_id  TEXT REFERENCES lifecycle_plans(id),
     UNIQUE (memory_id, evidence_unit_id)
 );
 CREATE INDEX IF NOT EXISTS idx_memory_unit_support_assertions_active
@@ -4314,7 +4315,12 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE source_derivation_attempts ADD COLUMN authority_plan_identity_json TEXT",
         ],
     ),
-    (93, "Persist typed Source derivation inference stages", ["""CREATE TABLE IF NOT EXISTS source_derivation_work (
+    (
+        93,
+        "Associate successful Support validation with its Lifecycle Plan",
+        ["ALTER TABLE memory_unit_support_assertions ADD COLUMN validation_plan_id TEXT REFERENCES lifecycle_plans(id)"],
+    ),
+    (94, "Persist typed Source derivation inference stages", ["""CREATE TABLE IF NOT EXISTS source_derivation_work (
     derivation_id TEXT NOT NULL REFERENCES source_derivation_attempts(id) ON DELETE CASCADE,
     work_id TEXT NOT NULL,
     payload_json TEXT NOT NULL,
@@ -7194,6 +7200,12 @@ class Database:
         source_unit_id: str,
     ) -> SourceProjection | None:
         """Rehydrate one exact stored-current Unit without contacting its provider."""
+        return await self.get_source_unit_revision_projection(source_unit_id, None)
+
+    async def get_source_unit_revision_projection(
+        self, source_unit_id: str, revision_id: str | None,
+    ) -> SourceProjection | None:
+        """Read an immutable Unit manifest and its exact stored members."""
 
         async with self.db.execute(
             """SELECT su.*, s.type AS source_type
@@ -7203,23 +7215,46 @@ class Database:
             (source_unit_id,),
         ) as cursor:
             unit_row = await cursor.fetchone()
-        if unit_row is None or not unit_row["current_revision_id"]:
+        if unit_row is None:
             return None
-        unit_revision = await self.get_current_source_unit_revision(source_unit_id)
-        if unit_revision is None:
+        read_current = revision_id is None
+        revision_id = revision_id or unit_row["current_revision_id"]
+        async with self.db.execute(
+            "SELECT * FROM source_unit_revisions WHERE id = ? AND source_unit_id = ?",
+            (revision_id, source_unit_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
             return None
-        observation_rows = await self.db.execute_fetchall(
-            """SELECT so.*, sor.id AS revision_id, sor.semantic_hash AS revision_semantic_hash,
-                      sor.content, sor.metadata_json, sor.observed_at,
-                      sor.profile_name, sor.profile_version, sor.coordinate_space,
-                      sor.representation_schema_name,
-                      sor.representation_schema_version
-                 FROM source_observations so
-                 JOIN source_observation_revisions sor ON sor.id = so.current_revision_id
-                WHERE so.source_unit_id = ?
-                ORDER BY so.id""",
-            (source_unit_id,),
+        unit_revision = SourceUnitRevision(
+            id=row["id"], source_unit_id=row["source_unit_id"], semantic_hash=row["semantic_hash"],
+            observation_revision_ids=tuple(json.loads(row["observation_revision_ids_json"])),
+            location_hash=row["location_hash"], membership_hash=row["membership_hash"],
+            access_hash=row["access_hash"], observed_at=row["observed_at"],
         )
+        if read_current:
+            current_rows = await self.db.execute_fetchall(
+                "SELECT current_revision_id FROM source_observations "
+                "WHERE source_unit_id = ? AND current_revision_id IS NOT NULL", (source_unit_id,),
+            )
+            if {row["current_revision_id"] for row in current_rows} != set(unit_revision.observation_revision_ids):
+                raise ValueError("stored current Source Unit manifest is incomplete")
+        observation_rows = []
+        for offset in range(0, len(unit_revision.observation_revision_ids), STORAGE_BIND_CHUNK_SIZE - 1):
+            member_ids = unit_revision.observation_revision_ids[offset:offset + STORAGE_BIND_CHUNK_SIZE - 1]
+            placeholders = ", ".join("?" for _ in member_ids)
+            observation_rows.extend(await self.db.execute_fetchall(
+                f"""SELECT so.*, sor.id AS revision_id, sor.semantic_hash AS revision_semantic_hash,
+                          sor.content, sor.metadata_json, sor.observed_at,
+                          sor.profile_name, sor.profile_version, sor.coordinate_space,
+                          sor.representation_schema_name,
+                          sor.representation_schema_version
+                     FROM source_observations so
+                     JOIN source_observation_revisions sor ON sor.observation_id = so.id
+                    WHERE so.source_unit_id = ? AND sor.id IN ({placeholders})
+                    ORDER BY so.id""",
+                (source_unit_id, *member_ids),
+            ))
         observations = tuple(
             SourceObservation(
                 id=str(row["id"]),
@@ -10282,12 +10317,17 @@ class Database:
                 params.append(source_id)
             rows = await self.db.execute_fetchall(
                 f"""SELECT msa.memory_id, msa.source_id, msa.evidence_unit_id,
+                           msa.validation_plan_id, lp.target_unit_revision_id AS validation_unit_revision_id,
                            er.id AS reference_id, er.role, er.anchor_kind,
                            er.observation_id, er.observation_revision_id,
                            er.fragment_id, er.range_start, er.range_end,
                            er.raw_content_sha256, er.presentation_sha256,
                            er.excerpt
                     FROM memory_unit_support_assertions msa
+                    JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+                    LEFT JOIN lifecycle_plans lp ON lp.id = msa.validation_plan_id
+                     AND lp.status = 'applied' AND lp.source_id = msa.source_id
+                     AND lp.source_unit_id = eu.source_lineage_id
                     JOIN evidence_references er
                       ON er.evidence_unit_id = msa.evidence_unit_id
                      AND er.role IN ('primary', 'required')
@@ -10301,6 +10341,8 @@ class Database:
                 grouped[memory_id].append(
                     ActiveSupportEvidence(
                         memory_id=memory_id,
+                        validation_plan_id=row["validation_plan_id"],
+                        validation_unit_revision_id=row["validation_unit_revision_id"],
                         source_id=str(row["source_id"]),
                         reference_id=str(row["reference_id"]),
                         evidence_unit_id=str(row["evidence_unit_id"]),
@@ -11214,7 +11256,6 @@ class Database:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     observed_at=excluded.observed_at,
-                    extractor_run_id=excluded.extractor_run_id,
                     access_context_hash=excluded.access_context_hash,
                     updated_at=excluded.updated_at""",
                 (
@@ -11443,6 +11484,12 @@ class Database:
                         created_at=now,
                     )
                     await self._insert_memory_unit_support_unlocked(assertion)
+                    await self.db.execute(
+                        "UPDATE memory_unit_support_assertions SET validation_plan_id = ? "
+                        "WHERE id = ? AND EXISTS (SELECT 1 FROM lifecycle_plans "
+                        "WHERE id = ? AND target_unit_revision_id IS NOT NULL)",
+                        (plan_id, assertion.id, plan_id),
+                    )
                     await self._corroborate_memory_unlocked(
                         mutation.memory_id,
                         str(unit["doc_id"]),
@@ -12810,7 +12857,6 @@ class Database:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         observed_at=excluded.observed_at,
-                        extractor_run_id=excluded.extractor_run_id,
                         access_context_hash=excluded.access_context_hash,
                         updated_at=excluded.updated_at""",
                     (
@@ -13419,7 +13465,6 @@ class Database:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         observed_at=excluded.observed_at,
-                        extractor_run_id=excluded.extractor_run_id,
                         access_context_hash=excluded.access_context_hash,
                         updated_at=excluded.updated_at""",
                 (

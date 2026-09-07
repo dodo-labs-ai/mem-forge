@@ -1185,24 +1185,32 @@ class MemoryEngine:
                         raise ReconciliationContractError("revision_support_missing", "incumbent has no complete scoped support")
                     work_by_memory[memory.id] = []
                     for evidence_unit_id, support in groups.items():
-                        unit = await self.db.get_evidence_unit(evidence_unit_id)
-                        context = assessment_context
-                        if unit and unit.doc_revision_id and (base is None or unit.doc_revision_id != base.source_unit_revisions[0].id):
-                            context = contexts_by_revision.get(unit.doc_revision_id)
-                            if context is None:
-                                historical = await self.db.get_source_projection(unit.extractor_run_id) if unit.extractor_run_id else None
-                                if historical is not None and (
-                                    historical.source_id != projection.source_id
-                                    or len(historical.source_unit_revisions) != 1
-                                    or historical.source_unit_revisions[0].source_unit_id != scope.source_unit_id
-                                    or historical.source_unit_revisions[0].id != unit.doc_revision_id
-                                ):
-                                    raise ReconciliationContractError("revision_support_baseline_invalid", "Support baseline provenance does not match")
-                                context = RevisionAssessmentContext(
-                                    projection=projection, base=historical, access_context_hash=access_context_hash,
-                                    image_loader=assessment_image_loader, indexes=assessment_context.indexes,
-                                )
-                                contexts_by_revision[unit.doc_revision_id] = context
+                        plan_ids = {item.validation_plan_id for item in support}
+                        baseline_ids = {item.validation_unit_revision_id for item in support}
+                        if len(plan_ids) != 1 or len(baseline_ids) != 1:
+                            raise ReconciliationContractError("revision_support_baseline_invalid", "Support validation association is inconsistent")
+                        baseline_id = next(iter(baseline_ids))
+                        if next(iter(plan_ids)) is not None and baseline_id is None:
+                            raise ReconciliationContractError("revision_support_baseline_invalid", "Support validation Plan is not applied to this Source Unit")
+                        context = contexts_by_revision.get(baseline_id)
+                        if context is None:
+                            historical = (
+                                await self.db.get_source_unit_revision_projection(scope.source_unit_id, baseline_id)
+                                if baseline_id is not None else None
+                            )
+                            if baseline_id is not None and (
+                                historical is None
+                                or historical.source_id != projection.source_id
+                                or len(historical.source_unit_revisions) != 1
+                                or historical.source_unit_revisions[0].source_unit_id != scope.source_unit_id
+                                or historical.source_unit_revisions[0].id != baseline_id
+                            ):
+                                raise ReconciliationContractError("revision_support_baseline_invalid", "Support validation snapshot is unavailable or inconsistent")
+                            context = RevisionAssessmentContext(
+                                projection=projection, base=historical, access_context_hash=access_context_hash,
+                                image_loader=assessment_image_loader, indexes=assessment_context.indexes,
+                            )
+                            contexts_by_revision[baseline_id] = context
                         work_id = f"w{len(work_items):06d}"
                         work_items.append(SupportWorkItem(work_id, memory, tuple(support), context))
                         work_by_memory[memory.id].append(work_id)
