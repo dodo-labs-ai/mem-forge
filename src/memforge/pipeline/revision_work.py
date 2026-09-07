@@ -677,7 +677,7 @@ class RevisionWorkExecutor:
                             raise FragmentSelectionError(
                                 FragmentSelectionErrorCode.UNKNOWN_REF,
                                 f"scan {result.work_id} used unknown refs "
-                                + json.dumps([ref if len(ref) <= 80 else f"<invalid ref: {len(ref)} chars>" for ref in invalid[:8]])
+                                + json.dumps([ref if len(ref) <= 80 else f"<invalid ref: {len(ref)} chars>" for ref in invalid[:8]])[:512]
                                 + (f" ({len(invalid)} invalid refs total)" if len(invalid) > 8 else ""),
                             )
 

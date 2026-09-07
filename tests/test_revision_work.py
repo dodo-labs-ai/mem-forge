@@ -323,7 +323,7 @@ def test_validated_baseline_can_be_newer_than_immutable_evidence_provenance():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('bad_ref', ['e0', 'p999999', 'quoted source text ' * 2000])
+@pytest.mark.parametrize('bad_ref', ['e0', 'p999999', 'quoted source text ' * 2000, '重复文本' * 20])
 async def test_scan_correction_identifies_invalid_ref_without_widening_evidence_scope(bad_ref):
     class RepairClient(Client):
         sent_invalid = False
@@ -335,11 +335,12 @@ async def test_scan_correction_identifies_invalid_ref_without_widening_evidence_
             result = await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
             if response_format is ScanResponse and not self.sent_invalid:
                 self.sent_invalid = True
-                result.results[0].observations_found = [Finding(kind='support', refs=[bad_ref], explanation='fixture')]
+                result.results[0].observations_found = [Finding(kind='support', refs=[bad_ref] + ([f'{i}' + bad_ref[1:] for i in range(8)] if bad_ref.startswith('重复') else []), explanation='fixture')]
                 result.results[0].no_local_effect = False
             elif 'Correction:' in prompt:
                 diagnostic = prompt.split('Correction:')[1]
-                assert (bad_ref if len(bad_ref) <= 80 else f'<invalid ref: {len(bad_ref)} chars>') in diagnostic
+                if not bad_ref.startswith('重复'):
+                    assert (bad_ref if len(bad_ref) <= 80 else f'<invalid ref: {len(bad_ref)} chars>') in diagnostic
                 assert len(diagnostic) < 1024
                 if len(bad_ref) > 80:
                     assert bad_ref not in diagnostic
