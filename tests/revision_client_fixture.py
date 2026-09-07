@@ -95,6 +95,14 @@ class RevisionClientFixture:
             )
         supported = audit.decisions[0].supported
         current = [*payload["current"]["primary_candidates"], *payload["current"]["required_only_candidates"]]
+        groups = {ref: group for group in payload["current"]["structural_groups"] for ref in group["refs"]}
+        current = [
+            {"ref": row[0], "text": row[1],
+             "kind": "artifact" if len(row) > 2 else "text",
+             "type": "markdown-heading" if row[1].startswith("#") else "text",
+             **{key: groups[row[0]][key] for key in ("observation_id", "revision_id")}}
+            for row in current
+        ]
         previous = payload["previous_evidence"]
         primary_old = next(item for item in previous if item["role"] == "primary")
         primary = next(

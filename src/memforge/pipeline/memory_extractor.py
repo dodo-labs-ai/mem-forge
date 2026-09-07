@@ -270,6 +270,8 @@ PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic kno
 
 <source_type>{source_type}</source_type>
 <doc_type>{doc_type}</doc_type>
+Catalog rows are [ref, exact source text, optional metadata]. Headings are ordinary selectable Fragments.
+Structural groups describe ancestry, not additional Evidence. When a heading defines claim scope, select its current ref as Required.
 Only the following application-owned Evidence Fragments may support a Memory:
 <evidence_fragment_catalog digest="{catalog_digest}">
 {fragment_catalog}

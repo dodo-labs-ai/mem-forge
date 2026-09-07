@@ -64,7 +64,7 @@ class Client:
         self.budgets = []
 
     def request_fits(self, prompt, **kwargs):
-        return self.mode == "full" or '"input_mode": "delta"' in prompt
+        return self.mode == "full" or '"input_mode":"delta"' in prompt
 
     async def assess_revision_support(self, prompt, **kwargs):
         self.prompts.append(prompt)
@@ -73,9 +73,9 @@ class Client:
             return RevisionSupportResponse(status="supported", primary_ref="invented")
         payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
         refs = payload["current"]["primary_candidates"]
-        primary = next(item for item in refs if "reviewers" in item["text"].lower())
-        required = [item["ref"] for item in refs if item["text"].startswith(("Country:", "Payroll type:"))]
-        return RevisionSupportResponse(status=self.status, primary_ref=primary["ref"], required_refs=required)
+        primary = next(item for item in refs if "reviewers" in item[1].lower())
+        required = [item[0] for item in refs if item[1].startswith(("Country:", "Payroll type:"))]
+        return RevisionSupportResponse(status=self.status, primary_ref=primary[0], required_refs=required)
 
 
 @pytest.mark.asyncio
@@ -106,8 +106,9 @@ async def test_complete_delta_includes_remote_exception_and_unchanged_heading():
     _, prompt, mode, _ = ctx.input_for(memory=memory(), support=old_support(base), client=Client("delta"), model="test")
     assert mode == "delta"
     payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
-    exception = next(item for item in payload["current"]["primary_candidates"] if "One reviewer" in item["text"])
-    assert any("Europe" in title for title in exception["heading_context"])
+    exception = next(item for item in payload["current"]["primary_candidates"] if "One reviewer" in item[1])
+    group = next(group for group in payload["current"]["structural_groups"] if exception[0] in group["refs"])
+    assert any("Europe" in title for title in group["heading_context"])
     assert any("Old note" in item["text"] for item in payload["removed_historical"])
 
 
