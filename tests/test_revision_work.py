@@ -183,8 +183,27 @@ async def test_shared_old_evidence_is_sent_once_but_supports_stay_separate():
     )
     payload = json.loads(client.prompts[0].split("<final>")[1].split("</final>")[0])
     assert len(payload["historical_evidence"]) == 1
+    assert all("ref" not in row for row in payload["historical_evidence"])
+    assert all(group["parts"][0] == {"role": "primary", "historical_index": 0}
+               for group in payload["previous_evidence"])
     assert len(payload["previous_evidence"]) == 3
     assert len({group["work_id"] for group in payload["previous_evidence"]}) == 3
+
+
+def test_previous_evidence_uses_current_ref_only_for_exact_current_anchor_and_text():
+    items = work_items("Two reviewers approve US releases.\n")
+    item = items[0]
+    catalog = item.context.catalog(item.context.full_fragments)
+    fragment = next(f for f in catalog.fragments if "Two reviewers" in f.presentation_text)
+    current_part = replace(item.support[0], anchor=fragment.anchor, excerpt=fragment.presentation_text)
+    payload = RevisionWorkExecutor._previous_evidence([replace(item, support=(current_part,))], catalog)
+    assert payload["historical_evidence"] == []
+    assert payload["previous_evidence"][0]["parts"] == [{"role": "primary", "current_ref": fragment.reference}]
+    # A matching anchor with different text is not current proof.
+    mismatched = replace(current_part, excerpt="Two reviewers approve EU releases.")
+    payload = RevisionWorkExecutor._previous_evidence([replace(item, support=(mismatched,))], catalog)
+    assert payload["previous_evidence"][0]["parts"] == [{"role": "primary", "historical_index": 0}]
+    assert payload["historical_evidence"][0]["excerpt"] == mismatched.excerpt
 
 
 @pytest.mark.asyncio
