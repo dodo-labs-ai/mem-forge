@@ -148,6 +148,7 @@ from memforge.memory.lifecycle_plan import (
     lifecycle_plan_to_payload,
     pending_review_contested_supports,
     plan_requires_complete_current_support,
+    plan_skips_support_revalidation,
     unprovable_cutover_retirement_plan_id,
     validate_unprovable_cutover_evidence,
 )
@@ -10943,9 +10944,10 @@ class Database:
         A pending Review intentionally preserves only its exact incumbent edge
         while a human decides. The current Plan's staged Reviews and prior
         applied Reviews whose own Source Unit revision remains current share
-        that contract. Every other surviving same-source assertion must point
-        to an Observation current in its own stable Source Unit. A newly
-        activated Memory must additionally gain support in the Plan's Unit.
+        that contract. An insufficient assessment may also preserve the exact
+        old Support recorded on this Plan's KEEP decision. Unrelated historical
+        Support cannot block a non-destructive write, matching the V2 invariant.
+        Newly activated Memories and new attachments still need current support.
         """
 
         if (
@@ -11042,6 +11044,7 @@ class Database:
             )
             if memory_id in created_ids | reactivated_ids and current_scope_total == 0:
                 raise ValueError(f"projected lifecycle activated Memory without source support: {memory_id}")
+            requires_complete_support = plan_requires_complete_current_support(plan, memory_id)
             accepted_supports = [
                 support
                 for support in structurally_valid
@@ -11053,6 +11056,15 @@ class Database:
                     evidence_reference_id=support["evidence_reference_id"],
                 )
                 in contested_supports
+                or plan_skips_support_revalidation(
+                    plan, memory_id,
+                    source_unit_id=support["source_unit_id"],
+                    support_id=support["evidence_reference_id"],
+                )
+                or (
+                    support["source_unit_id"] != plan.scope.source_unit_id
+                    and not requires_complete_support
+                )
             ]
             if len(accepted_supports) != len(supports):
                 raise ValueError(f"projected lifecycle left stale or ambiguous source support: {memory_id}")
@@ -11157,7 +11169,12 @@ class Database:
                     and support["source_lineage_id"]
                     != plan.scope.source_unit_id
                 )
-                if current or (structurally_valid and contested_edge in contested):
+                skipped = structurally_valid and plan_skips_support_revalidation(
+                    plan, memory_id,
+                    source_unit_id=str(support["source_lineage_id"]),
+                    support_id=str(support["evidence_unit_id"]),
+                )
+                if current or skipped or (structurally_valid and contested_edge in contested):
                     accepted.append(support)
                 elif unrelated_cross_unit_support and not requires_complete_support:
                     accepted.append(support)
