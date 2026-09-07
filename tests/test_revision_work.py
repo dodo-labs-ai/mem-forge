@@ -304,3 +304,19 @@ async def test_different_baselines_share_current_full_when_total_delta_cost_is_h
         seen = {row[1] for p in scans if any(c["work_id"] == item.id for c in p["claims"])
                 for row in p["current"]["primary_candidates"]}
         assert {f.presentation_text for f in item.context.full_fragments} <= seen
+
+
+def test_validated_baseline_can_be_newer_than_immutable_evidence_provenance():
+    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+
+    old = "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Stable note {i}." for i in range(120))
+    base, current = revisions(old, old + "\n\nOne new routine note.\n")
+    context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
+    part = old_support(base)[0]
+    part = replace(part, anchor=replace(part.anchor, observation_revision_id="original-v1"),
+                   validation_plan_id="validated-later", validation_unit_revision_id=base.source_unit_revisions[0].id)
+    item = SupportWorkItem("w0", memory(), (part,), context)
+    executor = RevisionWorkExecutor(client=Client(), model="fixture")
+    assert executor._range([item]).mode == "delta"
+    changed = replace(item, support=(replace(part, validation_plan_id="different-plan"),))
+    assert executor._identity([item]) != executor._identity([changed])
