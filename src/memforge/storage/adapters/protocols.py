@@ -489,6 +489,9 @@ class RelationalStore(Protocol):
         self,
         source_unit_id: str,
     ) -> SourceProjection | None: ...
+    async def get_source_unit_revision_projection(
+        self, source_unit_id: str, revision_id: str | None,
+    ) -> SourceProjection | None: ...
     async def get_source_artifact_revision(
         self,
         observation_revision_id: str,
