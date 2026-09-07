@@ -337,3 +337,39 @@ async def test_insufficient_is_preserved_in_complete_receipt_without_current_evi
     assert receipt.status == "completed"
     assert receipt.result["results"][0]["status"] == "insufficient"
     assert receipt.manifest["coverage"]["work_ids"] == ["w0", "w1"]
+
+
+@pytest.mark.asyncio
+async def test_claim_can_select_current_evidence_carried_by_another_claim_in_same_request():
+    class SharedEvidenceClient(Client):
+        def __init__(self):
+            super().__init__()
+            self.borrowed = False
+
+        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            self.prompts.append(prompt)
+            data = payload(prompt)
+            rows = data["current"]["primary_candidates"]
+            previous = {row["work_id"]: row for row in data["previous_state"]}
+            states = {key: SupportAssessmentResult.model_validate(row) for key, row in previous.items()}
+            for ref, text, *_ in rows:
+                if text.strip() == "Two reviewers approve US releases.":
+                    states["w0"].status = "supported"
+                    states["w0"].primary_ref = ref
+            carried_ref = previous["w0"]["primary_ref"]
+            if carried_ref and carried_ref not in {row[0] for row in rows}:
+                states["w1"].status = "supported"
+                states["w1"].primary_ref = carried_ref
+                self.borrowed = True
+            for state in states.values():
+                state.reason = "The same approval rule supports both fixed claims"
+            return SupportAssessmentResponse(results=list(states.values()))
+
+    client = SharedEvidenceClient()
+    items = work_items("Two reviewers approve US releases.\n\n" + "\n\n".join(f"Routine note {i}." for i in range(300)), 2)
+    executor = RevisionWorkExecutor(client=client, model="fixture")
+    results = await executor.assess_many(items)
+    assert client.borrowed and len(client.prompts) > 1
+    assert all(result.supported is True for result in results.values())
+    assert all(result.memory is not None for result in results.values())
+    assert not any("Correction:" in prompt for prompt in client.prompts)
