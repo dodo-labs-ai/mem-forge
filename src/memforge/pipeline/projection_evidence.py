@@ -220,8 +220,6 @@ def build_projected_claim_evidence(
                 else (EvidenceContentProvenance.SOURCE_EXCERPT if quote else EvidenceContentProvenance.NO_EXCERPT)
             ),
             source_metadata={
-                "projection_run_id": projection.run_id,
-                "source_unit_revision_id": unit_revision.id,
                 "observation_type": observations_by_id[primary_id].observation_type,
                 **_resolved_fragment_audit_metadata(raw),
             },
@@ -426,8 +424,6 @@ def _materialize_v2_claim_evidence(
             else EvidenceContentProvenance.SOURCE_EXCERPT
         ),
         source_metadata={
-            "projection_run_id": projection.run_id,
-            "source_unit_revision_id": unit_revision.id,
             "observation_type": observations[primary.anchor.observation_id].observation_type,
             "fragment_catalog_digest": selection.catalog_digest,
             "fragment_compiler_contract_version": selection.compiler_contract_version,

@@ -709,6 +709,9 @@ class SqliteRelationalStore:
     async def get_current_source_unit_projection(self, source_unit_id: str):
         return await self._db.get_current_source_unit_projection(source_unit_id)
 
+    async def get_source_unit_revision_projection(self, source_unit_id: str, revision_id: str | None):
+        return await self._db.get_source_unit_revision_projection(source_unit_id, revision_id)
+
     async def get_source_artifact_revision(
         self,
         observation_revision_id: str,
