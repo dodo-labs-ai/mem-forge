@@ -12,6 +12,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal, Protocol
 
+from memforge.derivation_work import DerivationWorkStore
 from memforge.models import DocumentRecord, MemoryExtractionResult, RawMemory
 from memforge.memory.evidence import (
     EvidencePartKind,
@@ -245,7 +246,9 @@ class StructuralExtractionBatch:
 SourceDerivationBatch = ProjectionExtractionBatch | DiffGuidedExtractionBatch | StructuralExtractionBatch
 
 
-class SourceDerivationStore(Protocol):
+
+
+class SourceDerivationStore(DerivationWorkStore, Protocol):
     async def stage_source_derivation(
         self,
         manifest: SourceDerivationManifest,
@@ -299,6 +302,7 @@ class SourceUnitDerivationRequest:
     committed_base_snapshot: CommittedSourceUnitSnapshot | None = None
     access_context_hash: str | None = None
     inference_capability_hash: str | None = None
+    prepare_batches: Callable[[tuple[SourceDerivationBatch, ...]], Awaitable[tuple[SourceDerivationBatch, ...]]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,7 +560,7 @@ class SourceUnitDeriver:
                 reused_batch_count=0,
                 executed_batch_count=0,
             )
-        batches = planned_work
+        batches = await request.prepare_batches(planned_work) if request.prepare_batches else planned_work
         manifest = source_derivation_manifest(
             request.projection,
             batches,
@@ -1348,6 +1352,8 @@ def _batch_input_payload_hash(
         "extraction_contract_version": extraction_contract_version,
         "evidence_work_identity_hash": evidence_work_identity_hash,
         "batch_id": batch.id,
+        "prepared_catalog_digest": batch.prepared_catalog.digest if batch.prepared_catalog else None,
+        "prepared_prompt_hash": hashlib.sha256(batch.prepared_prompt.encode()).hexdigest() if batch.prepared_prompt else None,
         "authority_policy_version": batch.authority_policy_version,
         "primary_observation_ids": list(batch.primary_observation_ids),
         "primary_authority_spans": [

@@ -660,10 +660,10 @@ class StructuredLlmConfig:
     # placeholder value so template-like source text remains data.
     prompt_template_variable: str | None = None
     # Gateway aliases may not exist in the model registry. These explicit,
-    # conservative limits also let deployments lower a provider's capacity.
-    max_input_tokens: int = 32_768
-    context_window_tokens: int = 65_536
-    max_output_tokens: int = 32_768
+    # limits let deployments lower known capacity or configure unknown aliases.
+    max_input_tokens: int | None = None
+    context_window_tokens: int | None = None
+    max_output_tokens: int | None = None
     input_budget_fraction: float = 0.8
 
 
@@ -957,7 +957,16 @@ class SourceSupportStructuredClient(Protocol):
 
     def request_fits(self, prompt: str, *, response_format: type[BaseModel],
                      max_tokens: int, model: str | None = None,
-                     images: tuple[StructuredLlmImage, ...] = ()) -> bool: ...
+                     images: tuple[StructuredLlmImage, ...] = (), reserve_correction: bool = True) -> bool: ...
+
+    def input_policy_identity_for(self, model: str | None = None) -> str: ...
+
+    def request_tokens(self, prompt: str, *, response_format: type[BaseModel], model: str | None = None,
+                       images: tuple[StructuredLlmImage, ...] = ()) -> int: ...
+
+    async def evaluate_revision_work(self, prompt: str, *, response_format: type[BaseModel],
+                                    max_tokens: int, model: str | None = None,
+                                    images: tuple[StructuredLlmImage, ...] = ()): ...
 
     async def assess_revision_support(
         self, prompt: str, *, max_tokens: int = 4096,
@@ -1105,6 +1114,43 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> AgentSessionAuthorityResponse:
         """Return semantic authority decisions for candidate user evidence."""
+
+
+class RevisionScanFinding(BaseModel):
+    kind: Literal["support", "counterexample", "scope", "dependency"]
+    refs: list[str]
+    explanation: str
+
+
+class RevisionScanResult(BaseModel):
+    work_id: str
+    observations_found: list[RevisionScanFinding] = Field(default_factory=list)
+    no_local_effect: bool = False
+    needs_context: list[str] = Field(default_factory=list)
+
+
+class RevisionScanResponse(BaseModel):
+    results: list[RevisionScanResult]
+
+
+class RevisionFinalResult(RevisionSupportResponse):
+    work_id: str
+
+
+class RevisionFinalResponse(BaseModel):
+    results: list[RevisionFinalResult]
+
+
+class RevisionReductionDisposition(BaseModel):
+    finding_id: str
+    retained_refs: list[str]
+    explanation: str
+
+
+class RevisionReductionResponse(BaseModel):
+    dispositions: list[RevisionReductionDisposition]
+    summary: str
+    needs_context: list[str]
 
 
 class StructuredLlmError(RuntimeError):
@@ -1720,6 +1766,7 @@ class LiteLlmStructuredClient:
     ) -> None:
         self.config = config
         self._telemetry_sink = telemetry_sink
+        self._request_budgets = {}
 
     @property
     def max_concurrent(self) -> int:
@@ -1727,54 +1774,42 @@ class LiteLlmStructuredClient:
 
         return max(1, int(self.config.max_concurrent))
 
+    def request_budget(self, model: str | None = None):
+        from memforge.llm.request_budget import RequestBudget
+
+        name = litellm_model_name(model or self.config.model)
+        if name not in self._request_budgets:
+            self._request_budgets[name] = RequestBudget.resolve(name, self.config)
+        return self._request_budgets[name]
+
     @property
     def input_policy_identity(self) -> str:
-        model_name = litellm_model_name(self.config.model)
-        try:
-            info = litellm.get_model_info(model_name)
-        except Exception:
-            info = {}
-        payload = {
-            "version": "revision-input-v1", "model": model_name,
-            "input": self.config.max_input_tokens, "context": self.config.context_window_tokens,
-            "output": self.config.max_output_tokens, "fraction": self.config.input_budget_fraction,
-            "registry": {key: info.get(key) for key in ("max_input_tokens", "max_output_tokens", "context_window")},
-        }
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        return self.input_policy_identity_for()
+
+    def input_policy_identity_for(self, model: str | None = None) -> str:
+        return self.request_budget(model).identity
+
+    def request_tokens(
+        self, prompt: str, *, response_format: type[BaseModel],
+        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
+    ) -> int:
+        """Count the schema fallback transport, including its real instructions."""
+        name = litellm_model_name(model or self.config.model)
+        material = _json_text_prompt(prompt, response_format)
+        messages = [{"role": "user", "content": _structured_user_content(material, images)}]
+        return litellm.token_counter(model=name, messages=messages)
 
     def request_fits(
         self, prompt: str, *, response_format: type[BaseModel],
         max_tokens: int, model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
+        images: tuple[StructuredLlmImage, ...] = (), reserve_correction: bool = True,
     ) -> bool:
-        """Budget the complete semantic input, including schema and image transport."""
-
-        model_name = litellm_model_name(model or self.config.model)
-        limit = self.config.max_input_tokens
-        context_limit = self.config.context_window_tokens
-        output_limit = self.config.max_output_tokens
-        try:
-            info = litellm.get_model_info(model_name)
-        except Exception:
-            info = {}
-        if info.get("max_input_tokens"):
-            limit = min(limit, int(info["max_input_tokens"]))
-            # Registry input limits are conservatively treated as the combined
-            # window when no separate provider context-window field is present.
-            context_limit = min(context_limit, int(info.get("context_window") or info["max_input_tokens"]))
-        if info.get("max_output_tokens"):
-            output_limit = min(output_limit, int(info["max_output_tokens"]))
-        if max_tokens > output_limit:
+        budget = self.request_budget(model)
+        if budget.available_input(max_tokens, reserve_correction=reserve_correction) < 0:
             return False
-        fraction = self.config.input_budget_fraction
-        if limit < 1 or not 0 < fraction <= 1:
-            raise ValueError("invalid structured input budget")
-        # Include the larger JSON-text schema path and a bounded repair reserve.
-        material = prompt + "\n" + json.dumps(response_format.model_json_schema())
-        messages = [{"role": "user", "content": _structured_user_content(material, images)}]
-        estimate = litellm.token_counter(model=model_name, messages=messages)
-        available_input = min(limit, context_limit - max_tokens)
-        return estimate + 1024 <= int(available_input * fraction)
+        return budget.fits(self.request_tokens(
+            prompt, response_format=response_format, model=model, images=images,
+        ), max_tokens, reserve_correction=reserve_correction)
 
     @contextmanager
     def metrics_scope(
@@ -1798,6 +1833,10 @@ class LiteLlmStructuredClient:
             max_tokens=4096,
             model=model,
         )
+
+    async def evaluate_revision_work(self, prompt, *, response_format, max_tokens, model=None, images=()):
+        return await self._call_schema(prompt=prompt, response_format=response_format,
+                                       max_tokens=max_tokens, model=model, images=images)
 
     async def assess_revision_support(
         self, prompt: str, *, max_tokens: int = 4096,
@@ -2323,6 +2362,19 @@ class LiteLlmStructuredClient:
                 validation_source=validation_source,
             )
         )
+        if response_format in {
+            ProjectionFragmentMemoryExtractionResponse, RevisionSupportResponse, ClaimRevisionResponse,
+            RevisionScanResponse, RevisionFinalResponse, RevisionReductionResponse,
+        }:
+            # Count the expanded template value and fallback repair diagnostics;
+            # provider placeholders must never make a large source look tiny.
+            material = _json_text_prompt(prompt, response_format) if native_schema else request_prompt
+            counted_messages = [{"role": "user", "content": _structured_user_content(material, images)}]
+            budget = self.request_budget(model_name)
+            tokens = litellm.token_counter(model=model_name, messages=counted_messages)
+            if not budget.fits(tokens, max_tokens, reserve_correction=False):
+                raise StructuredLlmError("complete structured request exceeds configured capacity",
+                                         error_code="input_capacity_exceeded")
         messages = [{"role": "user", "content": _structured_user_content(request_prompt, images)}]
         provider_kwargs: dict[str, Any] = {}
         prompt_template_variable = self.config.prompt_template_variable

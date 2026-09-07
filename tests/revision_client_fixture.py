@@ -21,6 +21,38 @@ class RevisionClientFixture:
     def request_fits(self, prompt, **kwargs):
         return True
 
+    def input_policy_identity_for(self, model=None):
+        return self.input_policy_identity + str(model)
+
+    def request_tokens(self, prompt, **kwargs):
+        return len(prompt)
+
+    async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+        from memforge.llm.structured import RevisionFinalResponse as FinalResponse, RevisionFinalResult as FinalResult
+        assert response_format is FinalResponse
+        payload = json.loads(prompt.split("<final>", 1)[1].split("</final>", 1)[0])
+        results = []
+        groups = [{**group, **payload["current"].get("observations", {}).get(group.get("source"), {})} for group in payload["current"]["structural_groups"]]
+        for claim in payload["claims"]:
+            previous = next((group["parts"] for group in payload.get("previous_evidence", []) if group["work_id"] == claim["work_id"]), None)
+            if previous is not None:
+                history = {part["ref"]: part for part in payload.get("historical_evidence", [])}
+                sources = {ref: group for group in groups for ref in group["refs"]}
+                for row in [*payload["current"]["primary_candidates"], *payload["current"]["required_only_candidates"]]:
+                    history[row[0]] = {"ref": row[0], "excerpt": row[1],
+                                       "observation_id": sources[row[0]]["observation_id"], "revision_id": sources[row[0]]["revision_id"]}
+                previous = [{**history[part["ref"]], "role": part["role"]} for part in previous]
+            if previous is None:
+                previous = [{"role": "primary", "excerpt": claim["claim"],
+                             "observation_id": groups[0]["observation_id"], "revision_id": groups[0]["revision_id"]}]
+            legacy = {**payload, **claim, "previous_evidence": previous}
+            assessment_prompt = "<assessment>" + json.dumps(legacy) + "</assessment>"
+            if "Correction:" in prompt:
+                assessment_prompt += "previous selection used invalid refs"
+            result = await self.assess_revision_support(assessment_prompt, **kwargs)
+            results.append(FinalResult(work_id=claim["work_id"], **result.model_dump()))
+        return FinalResponse(results=results)
+
     async def assess_claim_revisions(self, prompt, **kwargs):
         start, end = "<memory_pair_groups>\n", "\n</memory_pair_groups>"
         groups = json.loads(prompt.split(start, 1)[1].split(end, 1)[0])
@@ -95,6 +127,14 @@ class RevisionClientFixture:
             )
         supported = audit.decisions[0].supported
         current = [*payload["current"]["primary_candidates"], *payload["current"]["required_only_candidates"]]
+        groups = {ref: {**group, **payload["current"].get("observations", {}).get(group.get("source"), {})} for group in payload["current"]["structural_groups"] for ref in group["refs"]}
+        current = [
+            {"ref": row[0], "text": row[1],
+             "kind": "artifact" if len(row) > 2 and "image_source_observation_id" in row[2] else "text",
+             "type": row[2].get("format", "artifact") if len(row) > 2 else ("markdown-heading" if row[1].startswith("#") else "text"),
+             **{key: groups[row[0]][key] for key in ("observation_id", "revision_id")}}
+            for row in current
+        ]
         previous = payload["previous_evidence"]
         primary_old = next(item for item in previous if item["role"] == "primary")
         primary = next(

@@ -137,9 +137,9 @@ class EffectiveLlmConfig:
     embedding_base_url: str
     embedding_api_key: str
 
-    max_input_tokens: int = 32768
-    context_window_tokens: int = 65536
-    max_output_tokens: int = 32768
+    max_input_tokens: int | None = None
+    context_window_tokens: int | None = None
+    max_output_tokens: int | None = None
     input_budget_fraction: float = 0.8
 
 
