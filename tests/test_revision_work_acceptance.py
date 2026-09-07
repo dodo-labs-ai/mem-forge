@@ -324,3 +324,69 @@ async def test_completed_scans_cannot_commit_after_concurrent_state_change(tmp_p
         assert not await db.db.execute_fetchall("SELECT id FROM lifecycle_plans WHERE id = ?", (plan.id,))
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_admission_is_bounded_drains_inflight_and_preserves_serial_identity():
+    import asyncio
+    from tests.test_revision_work import Store
+
+    class ConcurrentClient(Client):
+        max_concurrent = 2
+
+        def __init__(self, fail=False):
+            super().__init__(limit=5000)
+            self.fail = fail
+            self.active = self.peak = 0
+            self.started = []
+            self.two_started = asyncio.Event()
+
+        def request_fits(self, prompt, *, response_format=None, **kwargs):
+            if response_format is RevisionScanResponse:
+                data = json.loads(prompt.split("<scan>")[1].split("</scan>")[0])
+                if len(data["claims"]) > 1:
+                    return False
+            return super().request_fits(prompt, **kwargs)
+
+        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            if response_format is not RevisionScanResponse:
+                return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
+            data = json.loads(prompt.split("<scan>")[1].split("</scan>")[0])
+            work_id = data["claims"][0]["work_id"]
+            self.started.append(work_id)
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            if self.active == 2:
+                self.two_started.set()
+            try:
+                if self.fail and work_id == "w0":
+                    await self.two_started.wait()
+                    self.fail = False
+                    raise TimeoutError("first sibling failed")
+                await asyncio.sleep(0)
+                return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
+            finally:
+                self.active -= 1
+
+    text = "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Routine operational note {i}." for i in range(200))
+    items = work_items(text, 4)
+    store = Store()
+    client = ConcurrentClient(fail=True)
+    first = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
+    with pytest.raises(TimeoutError, match="first sibling"):
+        await first.assess_many(items)
+    assert client.peak == 2 and client.active == 0
+    assert client.started == ["w0", "w1"]
+    assert sorted(work.status for work in store.works.values()) == ["completed", "retryable_failure"]
+    assert not first.final_work_ids
+    retry = RevisionWorkExecutor(client=ConcurrentClient(), model="fixture", store=store, derivation_id="root")
+    assert all(result.supported for result in (await retry.assess_many(items)).values())
+    assert retry.reused == 1
+    serial_store = Store()
+    serial_client = ConcurrentClient()
+    serial_client.max_concurrent = 1
+    serial = RevisionWorkExecutor(client=serial_client, model="fixture", store=serial_store, derivation_id="root")
+    await serial.assess_many(items)
+    assert {key: work.result_hash for key, work in store.works.items()} == {
+        key: work.result_hash for key, work in serial_store.works.items()
+    }
