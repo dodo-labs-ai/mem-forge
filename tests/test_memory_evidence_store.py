@@ -180,7 +180,7 @@ async def test_evidence_unit_retry_preserves_identity_fields(db: Database) -> No
     assert stored.excerpt == original.excerpt
     assert stored.evidence_provenance == original.evidence_provenance
     assert stored.observed_at == retry.observed_at
-    assert stored.extractor_run_id == retry.extractor_run_id
+    assert stored.extractor_run_id == original.extractor_run_id
     assert stored.access_context_hash == retry.access_context_hash
 
 
