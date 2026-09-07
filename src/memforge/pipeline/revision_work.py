@@ -54,7 +54,8 @@ missing material interpretation or an unresolved dependency remains insufficient
 Use supported, unsupported or insufficient. A supported judgment selects ONE complete
 current Evidence Unit via primary_ref and required_refs. A partial judgment may retain
 partial current refs while waiting for further material. Select refs only from this
-catalog or previous_state for that work_id. Never select removed_historical refs.
+catalog or any claim's previous_state in this request. Those supplied refs are shared
+Evidence candidates; judge each fixed claim independently. Never select removed_historical refs.
 Previous states are compact cumulative judgments grounded in earlier supplied material;
 they are not new Evidence. Their refs keep their original exact source identities.
 Do not request additional reading or collect a cross-batch context inventory.
@@ -497,17 +498,20 @@ class RevisionWorkExecutor:
                 )
             prompt, catalog, output = self._request(scope, chunk, group, states, position, len(units))
             current = {f.reference for f in catalog.fragments}
-            prior = {i.id: self._state_refs(states[i.id]) for i in group}
+            prior_refs = set().union(*(self._state_refs(states[item.id]) for item in group))
             all_current = {f.reference for f in scope.catalog.fragments}
+            allowed = (current | prior_refs) & all_current
 
             def validate(response):
                 self._coverage(response.results, group)
                 for r in response.results:
-                    allowed = current | prior[r.work_id]
                     selected = set(r.required_refs) | ({r.primary_ref} if r.primary_ref else set())
-                    if not selected <= allowed & all_current:
+                    unavailable = selected - allowed
+                    if unavailable:
                         raise FragmentSelectionError(
-                            FragmentSelectionErrorCode.UNKNOWN_REF, "assessment selected unavailable current Evidence"
+                            FragmentSelectionErrorCode.UNKNOWN_REF,
+                            f"assessment selected unavailable current Evidence for {r.work_id}: "
+                            + ", ".join(sorted(unavailable)),
                         )
                     if r.status == "supported":
                         scope.catalog.resolve_selection(
