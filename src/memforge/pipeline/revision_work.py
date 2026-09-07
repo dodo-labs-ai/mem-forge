@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 import json
 
 
+from memforge.pipeline.bounded_work import collect_bounded
+from memforge.llm.structured import structured_llm_max_concurrent
 from memforge.derivation_work import DerivationWork, DerivationWorkStore, payload_hash
 from memforge.llm.structured import (
     RevisionScanResponse as ScanResponse,
@@ -34,7 +36,12 @@ support, counterexamples, scope/definitions, negation, exceptions and cross-sect
 references even when the claim's words do not occur. Keep necessary versus sufficient
 conditions, quantifiers and time scope. Do not combine independent old Support groups.
 Return one result per work_id. Findings cite only refs present in current catalog or
-removed_historical. Historical rows also use [ref, exact text] and cannot be selected as current Evidence. no_local_effect means no findings in THIS batch, not verified.
+removed_historical. Removed rows use [ref, exact text] and cannot be current Evidence.
+previous_evidence links old parts by historical_index into the explanation-only
+historical_evidence array, or by current_ref when present in this batch. Historical
+indices are not selectors. Do not restate old Support as a local finding unless
+this batch supplies its selectable text. no_local_effect means no findings in THIS
+batch, not verified.
 Name unresolved dependencies in needs_context. Headings are ordinary Evidence;
 structural_groups describe ancestry and do not create selectable evidence.
 Catalog rows are [ref, exact text, optional metadata].
@@ -46,7 +53,9 @@ text together, including counterexamples and definitions. Account explicitly for
 needs_context; if supplied exact text cannot resolve a material dependency, return
 insufficient. No votes or AND/OR over batches. Do not rewrite a claim. Keep its time,
 quantifiers and necessary/sufficient modality. A supported result selects ONE complete
-current Evidence Unit. Historical text cannot be selected. Catalog rows are
+current Evidence Unit. Historical text cannot be selected. previous_evidence links
+parts through historical_index into historical_evidence, or current_ref into the
+current catalog. Historical indices are not selectors. Catalog rows are
 [ref, exact text, optional metadata]. Headings remain ordinary selectable Evidence;
 select their refs as Required when they establish material scope.
 <final>{payload}</final>"""
@@ -294,7 +303,7 @@ class RevisionWorkExecutor:
     @staticmethod
     def _previous_evidence(items, catalog):
         # Share exact historical identities, never merge the alternative Supports.
-        by_identity = {(f.anchor, f.presentation_text): f.reference for f in catalog.fragments}
+        by_identity = {(f.anchor, f.presentation_text): {"current_ref": f.reference} for f in catalog.fragments}
         historical = []
         supports = []
         for item in items:
@@ -302,17 +311,15 @@ class RevisionWorkExecutor:
             for part in item.support:
                 key = (part.anchor, part.excerpt)
                 if key not in by_identity:
-                    reference = f"e{len(historical)}"
-                    by_identity[key] = reference
+                    by_identity[key] = {"historical_index": len(historical)}
                     historical.append(
                         {
-                            "ref": reference,
                             "excerpt": part.excerpt,
                             "observation_id": part.anchor.observation_id,
                             "revision_id": part.anchor.observation_revision_id,
                         }
                     )
-                parts.append({"role": part.role.value, "ref": by_identity[key]})
+                parts.append({"role": part.role.value, **by_identity[key]})
             supports.append({"work_id": item.id, "parts": parts})
         return {"previous_evidence": supports, "historical_evidence": historical}
 
@@ -646,6 +653,7 @@ class RevisionWorkExecutor:
                     SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
                     "one Source structure exceeds configured assessment capability",
                 )
+            batches = []
             start = 0
             while start < len(items):
                 batch = []
@@ -662,6 +670,15 @@ class RevisionWorkExecutor:
                     batch.append(item)
                 if not batch:
                     raise ValueError("planned Source range cannot fit its claim")
+                batches.append(tuple(batch))
+                start += len(batch)
+
+            failed = False
+
+            async def execute(batch):
+                nonlocal failed
+                if failed:
+                    return None
                 prompt, cat, removed = self._scan_input(scope, chunk, batch)
                 allowed = {f.reference for f in cat.fragments} | {part["ref"] for part in removed}
 
@@ -681,21 +698,37 @@ class RevisionWorkExecutor:
                                 + (f" ({len(invalid)} invalid refs total)" if len(invalid) > 8 else ""),
                             )
 
-                response, work = await self._call(
-                    "support_scan",
-                    prompt,
-                    ScanResponse,
-                    self._scan_output(batch, len(cat.fragments) + len(removed)),
-                    identity=[scope.catalog.digest, position, len(chunk), self._identity(batch)],
-                    images=scope.context.images_for(cat),
-                    validate=validate,
-                )
+                try:
+                    response, work = await self._call(
+                        "support_scan",
+                        prompt,
+                        ScanResponse,
+                        self._scan_output(batch, len(cat.fragments) + len(removed)),
+                        identity=[scope.catalog.digest, position, len(chunk), self._identity(batch)],
+                        images=scope.context.images_for(cat),
+                        validate=validate,
+                    )
+                    return response, work
+                except Exception as error:
+                    failed = True
+                    return error
+
+            outcomes = await collect_bounded(
+                batches, execute, max_concurrent=structured_llm_max_concurrent(self.client)
+            )
+            # Drain already admitted siblings so their exact successes survive.
+            # External cancellation still propagates through collect_bounded.
+            for outcome in outcomes:
+                if isinstance(outcome, Exception):
+                    raise outcome
+            for outcome in outcomes:
+                assert outcome is not None
+                response, work = outcome
                 for result in response.results:
                     findings[result.work_id].extend(finding.model_dump() for finding in result.observations_found)
                     unresolved[result.work_id].extend(result.needs_context)
                     parents[result.work_id].append(work)
                     coverage[result.work_id].update(range(position, position + len(chunk)))
-                start += len(batch)
             position += len(chunk)
         expected = set(range(len(units)))
         if any(seen != expected for seen in coverage.values()):
