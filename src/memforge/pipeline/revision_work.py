@@ -44,8 +44,13 @@ batches, including changed definitions even when the claim's words do not appear
 
 In delta mode the old independent Support was valid at baseline. Judge the effect of
 changes; inherit its proven-current parts when unaffected. Removed historical content is
-explanation, never current Evidence. In full mode no old Support is assumed valid: build
-support from the supplied current text. Lack of proof in a partial batch is insufficient,
+explanation, never current Evidence. In full mode only historical_evidence / previous_evidence from OLD source revisions
+are unproven. previous_state is different: it records this SAME TARGET revision already
+read in earlier batches. Its selected current Evidence refs remain current and selectable in BOTH modes,
+even when their text is absent from this batch. Historical context refs remain historical,
+never Primary or Required Evidence. Carry forward those judgments and refs;
+change them only when supplied material changes the conclusion. A new batch is additional
+current text, not a replacement catalog. Do not restart full-mode proof from zero. Lack of proof in a partial batch is insufficient,
 not unsupported. After the complete range, loss of current support can be unsupported;
 missing material interpretation or an unresolved dependency remains insufficient.
 
