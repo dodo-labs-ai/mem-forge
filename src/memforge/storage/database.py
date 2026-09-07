@@ -22,6 +22,7 @@ from typing import Any, Mapping, Sequence
 
 import aiosqlite
 
+from memforge.derivation_work import DerivationWork
 from memforge.agent_session_contract import (
     AGENT_SESSION_WINDOW_SOURCE_KIND,
     successful_agent_session_activity_at,
@@ -1183,6 +1184,13 @@ CREATE TABLE IF NOT EXISTS source_derivation_batches (
 );
 CREATE INDEX IF NOT EXISTS idx_source_derivation_batches_status
     ON source_derivation_batches(derivation_id, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS source_derivation_work (
+    derivation_id TEXT NOT NULL REFERENCES source_derivation_attempts(id) ON DELETE CASCADE,
+    work_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (derivation_id, work_id)
+);
 
 CREATE TABLE IF NOT EXISTS source_lifecycle_gates (
     source_id   TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
@@ -4306,6 +4314,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE source_derivation_attempts ADD COLUMN authority_plan_identity_json TEXT",
         ],
     ),
+    (93, "Persist typed Source derivation inference stages", ["""CREATE TABLE IF NOT EXISTS source_derivation_work (
+    derivation_id TEXT NOT NULL REFERENCES source_derivation_attempts(id) ON DELETE CASCADE,
+    work_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (derivation_id, work_id)
+);
+"""]),
 ]
 
 
@@ -6322,6 +6337,53 @@ class Database:
                     )
                 await self.db.commit()
                 return derivation_ids
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def stage_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork:
+        return await self._persist_derivation_work(derivation_id, work, stage=True)
+
+    async def record_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork:
+        return await self._persist_derivation_work(derivation_id, work, stage=False)
+
+    async def _persist_derivation_work(self, derivation_id, work, *, stage):
+
+        DerivationWork.from_payload(work.to_payload())
+        async with self._write_lock:
+            try:
+                await self.db.execute("UPDATE source_derivation_attempts SET status = status WHERE id = ?", (derivation_id,))
+                async with self.db.execute("SELECT status FROM source_derivation_attempts WHERE id = ?", (derivation_id,)) as cursor:
+                    root = await cursor.fetchone()
+                if root is None or root["status"] == "superseded":
+                    raise ValueError("derivation work requires a live root")
+                async with self.db.execute("SELECT payload_json FROM source_derivation_work WHERE derivation_id = ? AND work_id = ?", (derivation_id, work.id)) as cursor:
+                    row = await cursor.fetchone()
+                existing = DerivationWork.from_payload(json.loads(row["payload_json"])) if row else None
+                if existing and (existing.manifest != work.manifest or existing.kind != work.kind):
+                    raise ValueError("derivation work manifest changed")
+                if existing and (stage or existing.status == "completed" or existing.permanent):
+                    await self.db.commit()
+                    return existing
+                if not existing and not stage:
+                    raise ValueError("derivation work was not staged")
+                if root["status"] == "applied":
+                    raise ValueError("cannot extend applied derivation")
+                for dependency in work.manifest.get("dependencies", []):
+                    async with self.db.execute("SELECT payload_json FROM source_derivation_work WHERE derivation_id = ? AND work_id = ?", (derivation_id, dependency[0])) as cursor:
+                        parent = await cursor.fetchone()
+                    if parent is None:
+                        raise ValueError("derivation work dependency missing")
+                    parent_work = DerivationWork.from_payload(json.loads(parent["payload_json"]))
+                    if parent_work.status != "completed" or parent_work.result_hash != dependency[1]:
+                        raise ValueError("derivation work dependency incomplete")
+                await self.db.execute(
+                    "INSERT INTO source_derivation_work (derivation_id, work_id, payload_json) VALUES (?, ?, ?) "
+                    "ON CONFLICT(derivation_id, work_id) DO UPDATE SET payload_json = excluded.payload_json",
+                    (derivation_id, work.id, json.dumps(work.to_payload(), ensure_ascii=False, sort_keys=True)),
+                )
+                await self.db.commit()
+                return work
             except Exception:
                 await self.db.rollback()
                 raise
@@ -10413,6 +10475,7 @@ class Database:
         document: DocumentRecord | None = None,
         derivation_id: str | None = None,
         derivation_context_identity_hash: str | None = None,
+        required_derivation_work_ids: tuple[str, ...] = (),
         expected_source_activity_epoch: int | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None:
@@ -10483,6 +10546,14 @@ class Database:
                         raise ValueError("Source derivation projection identity mismatch")
                     if derivation["context_identity_hash"] != (derivation_context_identity_hash):
                         raise ValueError("Source derivation context identity mismatch")
+                    for work_id in required_derivation_work_ids:
+                        async with self.db.execute("SELECT payload_json FROM source_derivation_work WHERE derivation_id = ? AND work_id = ?", (derivation_id, work_id)) as cursor:
+                            work_row = await cursor.fetchone()
+                        if work_row is None:
+                            raise ValueError("required derivation work missing at commit")
+                        work = DerivationWork.from_payload(json.loads(work_row["payload_json"]))
+                        if work.status != "completed" or work.kind != "support_finalize":
+                            raise ValueError("required derivation work incomplete at commit")
                     staged_context = source_unit_derivation_context_from_payload(
                         json.loads(derivation["context_payload_json"])
                     )

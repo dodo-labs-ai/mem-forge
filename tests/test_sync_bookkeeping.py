@@ -3752,6 +3752,9 @@ class RaisingLifecycleOutboxMemoryStore:
 
 
 class NoopMemoryExtractor:
+    model = "fixture"
+    max_tokens = 8192
+    structured_llm_client = SimpleNamespace(request_fits=lambda *args, **kwargs: True)
     async def extract_memories(self, **kwargs):
         return MemoryExtractionResult(memories=[])
 

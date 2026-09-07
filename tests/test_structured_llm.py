@@ -34,6 +34,7 @@ from memforge.llm.structured import (
     OfflineSemanticJudgeResponse,
     ProjectionFragmentMemoryExtractionResponse,
     ProjectionMemoryExtractionResponse,
+    RevisionSupportResponse,
     RevisionCompositionDecision,
     RevisionCompositionResponse,
     RerankResponse,
@@ -1142,6 +1143,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         )
     )
     operations = {
+        "evaluate_revision_work": lambda: client.evaluate_revision_work("prompt", response_format=RevisionSupportResponse, max_tokens=512),
         "assess_revision_support": lambda: client.assess_revision_support("prompt"),
         "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
         "verify_source_support": lambda: client.verify_source_support("prompt"),
@@ -1190,7 +1192,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
     assert [
         call["response_format"]["json_schema"]["name"]
         for call in calls
-    ] == list(payloads)
+    ] == ["RevisionSupportResponse", *payloads]
     assert all("output_config" not in call for call in calls)
 
 
@@ -2343,7 +2345,7 @@ def test_revision_input_budget_counts_complete_schema_and_output_reserve(monkeyp
 
 def test_revision_input_policy_identity_changes_with_budget_or_provider_limits(monkeypatch):
     from dataclasses import replace
-    config = StructuredLlmConfig(model='openai/test', base_url=None, api_key=None, timeout_s=1)
+    config = StructuredLlmConfig(model='openai/test', base_url=None, api_key=None, timeout_s=1, max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768)
     monkeypatch.setattr('memforge.llm.structured.litellm.get_model_info', lambda *a, **kw: {})
     original = LiteLlmStructuredClient(config).input_policy_identity
     assert LiteLlmStructuredClient(replace(config, input_budget_fraction=0.7)).input_policy_identity != original

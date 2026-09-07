@@ -56,6 +56,8 @@ class ProjectionExtractionBatch:
     primary_authority_spans: tuple[tuple[str, int, str], ...] = ()
     candidate_context_observation_ids: tuple[str, ...] | None = None
     candidate_context_image_bytes: int = 0
+    prepared_catalog: object | None = None
+    prepared_prompt: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
