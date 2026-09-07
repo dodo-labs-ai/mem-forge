@@ -36,12 +36,13 @@ class RevisionClientFixture:
         for claim in payload["claims"]:
             previous = next((group["parts"] for group in payload.get("previous_evidence", []) if group["work_id"] == claim["work_id"]), None)
             if previous is not None:
-                history = {part["ref"]: part for part in payload.get("historical_evidence", [])}
+                history = payload.get("historical_evidence", [])
+                current_parts = {}
                 sources = {ref: group for group in groups for ref in group["refs"]}
                 for row in [*payload["current"]["primary_candidates"], *payload["current"]["required_only_candidates"]]:
-                    history[row[0]] = {"ref": row[0], "excerpt": row[1],
+                    current_parts[row[0]] = {"ref": row[0], "excerpt": row[1],
                                        "observation_id": sources[row[0]]["observation_id"], "revision_id": sources[row[0]]["revision_id"]}
-                previous = [{**history[part["ref"]], "role": part["role"]} for part in previous]
+                previous = [{**(history[part["historical_index"]] if "historical_index" in part else current_parts[part["current_ref"]]), "role": part["role"]} for part in previous]
             if previous is None:
                 previous = [{"role": "primary", "excerpt": claim["claim"],
                              "observation_id": groups[0]["observation_id"], "revision_id": groups[0]["revision_id"]}]
