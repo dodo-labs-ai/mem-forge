@@ -1121,9 +1121,6 @@ class SupportAssessmentResult(RevisionSupportResponse):
 
     work_id: str
     reason: str = ""
-    considerations: list[str] = Field(default_factory=list)
-    context_refs: list[str] = Field(default_factory=list)
-    needs_context: list[str] = Field(default_factory=list)
 
 
 class SupportAssessmentResponse(BaseModel):
