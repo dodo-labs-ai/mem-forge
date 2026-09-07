@@ -9414,3 +9414,81 @@ async def test_tombstone_retains_document_when_unmapped_provenance_remains(
     )
 
     assert retry == result
+
+
+@pytest.mark.asyncio
+async def test_reused_evidence_advances_only_support_validation_plan_across_revisions(db, monkeypatch):
+    first = _projection(run_id="baseline-v1", body="A7 remains excluded.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_exact_incumbent_support(
+        db, projection=first, memory_id="mem-baseline", memory_content="A7 remains excluded.",
+    )
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(expected_report_id=cutover.id, owner_id="test-baseline")
+    await db.enable_lifecycle_gate("src-1")
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters), db=db,
+        memory_store=_OutboxDrainer(db), structured_llm_client=_FragmentSelectingSupportClient(),
+    )
+    prior = first
+    evidence_id = None
+    original_run = None
+    for version in (2, 3, 4, 5):
+        appendix = replace(first.observations[0], id="obs-appendix", provider_key="appendix")
+        appendix_revision = replace(
+            first.observation_revisions[0], id=f"appendix-v{version}", observation_id=appendix.id,
+            semantic_hash=f"appendix-hash-{version}", content=f"Appendix edition {version}.",
+        )
+        revision = replace(
+            first.source_unit_revisions[0], id=f"baseline-unit-v{version}",
+            semantic_hash=f"unit-hash-{version}",
+            observation_revision_ids=(first.observation_revisions[0].id, appendix_revision.id),
+        )
+        current = replace(
+            first, run_id=f"baseline-v{version}",
+            observations=(*first.observations, appendix),
+            observation_revisions=(*first.observation_revisions, appendix_revision),
+            source_unit_revisions=(revision,),
+            deltas=(replace(
+                first.deltas[0], previous_unit_revision_id=prior.source_unit_revisions[0].id,
+                current_unit_revision_id=revision.id,
+            ),),
+        )
+        if version == 5:
+            original_apply = db._apply_lifecycle_mutation_unlocked
+
+            async def fail_after_attach(*args, **kwargs):
+                await original_apply(*args, **kwargs)
+                if args[1].mutation_type is LifecycleMutationType.ATTACH_SUPPORT:
+                    raise RuntimeError("injected after Support attach")
+
+            monkeypatch.setattr(db, "_apply_lifecycle_mutation_unlocked", fail_after_attach)
+        async def commit():
+            return await engine.prepare_and_commit_projected_lifecycle(
+            projection=current, doc_id="confluence-123", raw_memories=[], doc_type="design-doc",
+            project_key="ENG", repo_identifier=None,
+            document_content="A7 remains excluded.\n\n" + appendix_revision.content,
+            update_mode="diff_guided", changed_hunks=appendix_revision.content,
+            update_plan_stats=None, source_updated_at=datetime(2026, 9, 7, version, tzinfo=timezone.utc),
+        )
+        if version == 5:
+            with pytest.raises(RuntimeError, match="injected after Support attach"):
+                await commit()
+            support = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+            assert {item.validation_unit_revision_id for item in support} == {"baseline-unit-v4"}
+            assert (await db.get_current_source_unit_revision(first.source_units[0].id)).id == "baseline-unit-v4"
+            break
+        stats = await commit()
+        assert stats["noop"] == 1
+        support = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+        assert {item.validation_unit_revision_id for item in support} == {revision.id}
+        assert len({item.validation_plan_id for item in support}) == 1
+        assert support[0].validation_plan_id is not None
+        unit = await db.get_evidence_unit(support[0].evidence_unit_id)
+        if evidence_id is None:
+            evidence_id, original_run = unit.id, unit.extractor_run_id
+        assert unit.id == evidence_id
+        assert unit.extractor_run_id == original_run
+        assert unit.doc_revision_id == "baseline-unit-v2"
+        prior = current
