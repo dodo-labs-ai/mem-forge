@@ -1116,6 +1116,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
             "MemoryExtractionResponse": '{"memories":[]}',
             "ProjectionMemoryExtractionResponse": '{"memories":[]}',
             "ProjectionFragmentMemoryExtractionResponse": '{"memories":[]}',
+        "ProjectionFragmentSelectorCorrectionResponse": '{"corrections":[]}',
         "CandidateLedgerResponse": '{"decisions":[]}',
         "IncumbentSupportAuditResponse": '{"decisions":[]}',
         "RevisionCompositionResponse": '{"decisions":[]}',
@@ -1165,6 +1166,9 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
                     max_tokens=512,
                 )
             ),
+        "correct_projection_fragment_selectors": lambda: client.correct_projection_fragment_selectors(
+            "prompt", max_tokens=512,
+        ),
         "select_memory_candidates": lambda: client.select_memory_candidates("prompt"),
         "audit_incumbent_support": lambda: client.audit_incumbent_support("prompt"),
         "prove_revision_compositions": lambda: client.prove_revision_compositions("prompt"),

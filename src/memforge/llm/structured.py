@@ -404,6 +404,24 @@ class ProjectionFragmentMemoryExtractionResponse(StructuredResponseModel):
     memories: list[ProjectionFragmentMemoryCandidate]
 
 
+class ProjectionFragmentSelectorCorrection(StructuredResponseModel):
+    """Selector-only proposal for one fixed extraction candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_index: int
+    primary_ref: str
+    required_refs: list[str] = Field(default_factory=list)
+
+
+class ProjectionFragmentSelectorCorrectionResponse(StructuredResponseModel):
+    """One optional correction pass; omitted candidates remain rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    corrections: list[ProjectionFragmentSelectorCorrection]
+
+
 class CandidateLedgerDecision(StructuredResponseModel):
     """One ordered uniqueness judgment for a transient extracted candidate."""
 
@@ -1010,6 +1028,12 @@ class SourceSupportStructuredClient(Protocol):
         images: tuple[StructuredLlmImage, ...] = (),
     ) -> ProjectionFragmentMemoryExtractionResponse:
         """Return v9 projection judgments with transient Fragment selectors."""
+
+    async def correct_projection_fragment_selectors(
+        self, prompt: str, *, max_tokens: int, model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> ProjectionFragmentSelectorCorrectionResponse:
+        """Propose Evidence selectors for fixed, previously rejected candidates."""
 
     async def select_memory_candidates(
         self,
@@ -1873,6 +1897,18 @@ class LiteLlmStructuredClient:
             images=images,
         )
 
+    async def correct_projection_fragment_selectors(
+        self, prompt: str, *, max_tokens: int, model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> ProjectionFragmentSelectorCorrectionResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=ProjectionFragmentSelectorCorrectionResponse,
+            max_tokens=max_tokens,
+            model=model,
+            images=images,
+        )
+
     async def select_memory_candidates(
         self,
         prompt: str,
@@ -2332,7 +2368,8 @@ class LiteLlmStructuredClient:
             )
         )
         if response_format in {
-            ProjectionFragmentMemoryExtractionResponse, RevisionSupportResponse, ClaimRevisionResponse,
+            ProjectionFragmentMemoryExtractionResponse, ProjectionFragmentSelectorCorrectionResponse,
+            RevisionSupportResponse, ClaimRevisionResponse,
             SupportAssessmentResponse,
         }:
             # Count the expanded template value and fallback repair diagnostics;
