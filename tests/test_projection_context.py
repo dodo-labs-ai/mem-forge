@@ -938,7 +938,7 @@ print("safe")
         "markdown-heading",
         "markdown-inline-html",
         "markdown-list-item",
-        "markdown-table-row",
+        "markdown-table",
         "markdown-blockquote",
         "markdown-code-block",
         "html-p",
