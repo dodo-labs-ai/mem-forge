@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.60 - 2026-09-08
+
+- Preserve the hook that wakes Agent Session capture while another local worker
+  is active. The detached worker waits for the shared queue lock and claims its
+  requesting session before unrelated historical backlog.
+- Keep the existing bounded claim, lease, bookmark, retry, and server upload
+  contracts unchanged.
+
 ## 0.1.59 - 2026-09-05
 
 - Publish the Codex and Claude Code plugins with grouped `get_memory.evidence[]`
