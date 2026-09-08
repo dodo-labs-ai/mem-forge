@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import replace
@@ -13,6 +14,9 @@ from memforge.evals.agent_evaluation import QualitySignalCollector, quality_sign
 from memforge.llm.structured import (
     ProjectionFragmentMemoryCandidate,
     ProjectionFragmentMemoryExtractionResponse,
+    ProjectionFragmentSelectorCorrectionResponse,
+    StructuredLlmError,
+    StructuredLlmImage,
 )
 from memforge.agent_knowledge import (
     AgentKnowledgePatchModelResponse,
@@ -25,6 +29,7 @@ from memforge.memory.evidence import (
 )
 from memforge.models import DocumentRecord
 from memforge.pipeline.memory_extractor import MemoryExtractor
+from memforge.pipeline.fragment_selector_correction import correct_fragment_selectors_once
 from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_V8,
     PROJECTION_EXTRACTION_V9,
@@ -46,6 +51,7 @@ from memforge.pipeline.projection_fragments import (
     resolve_projected_agent_claim_fragment,
 )
 from memforge.source_derivation import (
+    aggregate_extraction_metrics,
     SourceUnitDerivationContext,
     memory_extraction_output_payload,
     memory_extraction_result_from_output_payload,
@@ -1844,6 +1850,9 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
         def request_fits(self, prompt, **kwargs):
             return True
 
+        async def correct_projection_fragment_selectors(self, prompt: str, **kwargs):
+            return ProjectionFragmentSelectorCorrectionResponse(corrections=[])
+
         async def extract_projection_fragment_memories(self, prompt: str, **kwargs):
             return ProjectionFragmentMemoryExtractionResponse.model_validate(
                 {
@@ -1998,6 +2007,160 @@ async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> 
         memory.resolved_evidence_selection
     )
     assert "selector_normalization_count" not in restored.metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [
+    "valid", "repaired", "still_invalid", "required_only", "duplicate", "omitted",
+    "capacity", "provider_failure", "unexpected_failure", "cancelled",
+])
+async def test_selector_correction_preserves_success_and_fixed_claims(mode) -> None:
+    projection = _projection()
+    catalog = compile_projection_fragment_catalog(projection, _batch(projection), access_context_hash="access-1")
+    primary = next(f.reference for f in catalog.fragments if f.primary_eligible)
+    required = next(f.reference for f in catalog.fragments if not f.primary_eligible)
+    stable = ProjectionFragmentMemoryCandidate(
+        content="A successful original claim.", memory_type="fact", primary_ref=primary,
+    )
+    failed = ProjectionFragmentMemoryCandidate(
+        content="Release requires approval by two reviewers.", memory_type="convention",
+        confidence=0.8, entity_refs=["Release"], valid_from="2026-09-01", valid_until="2027-09-01",
+        primary_ref="broken", required_refs=[required],
+    )
+
+    class Client:
+        def __init__(self):
+            self.correction_calls = 0
+            self.extraction_calls = 0
+            self.budget_checks = []
+
+        def request_fits(self, prompt, **kwargs):
+            self.budget_checks.append((prompt, kwargs))
+            return not (mode == "capacity" and kwargs["response_format"] is ProjectionFragmentSelectorCorrectionResponse)
+
+        async def extract_projection_fragment_memories(self, prompt, **kwargs):
+            self.extraction_calls += 1
+            return ProjectionFragmentMemoryExtractionResponse(memories=[stable] if mode == "valid" else [stable, failed])
+
+        async def correct_projection_fragment_selectors(self, prompt, **kwargs):
+            self.correction_calls += 1
+            assert self.correction_calls == 1
+            assert stable.content not in prompt
+            assert failed.content in prompt
+            assert primary in prompt and required in prompt
+            assert '"error_code":"unknown_ref"' in prompt
+            assert self.budget_checks[-1][0] == prompt
+            assert self.budget_checks[-1][1]["model"] == kwargs["model"]
+            assert self.budget_checks[-1][1]["max_tokens"] == kwargs["max_tokens"]
+            assert self.budget_checks[-1][1]["images"] == kwargs["images"]
+            if mode == "provider_failure":
+                raise StructuredLlmError("private provider text", error_code="provider_unavailable")
+            if mode == "unexpected_failure":
+                raise RuntimeError("private provider text")
+            if mode == "cancelled":
+                raise asyncio.CancelledError()
+            correction = {"candidate_index": 1, "primary_ref": primary, "required_refs": [required]}
+            if mode == "still_invalid":
+                correction["primary_ref"] = "still-broken"
+            if mode == "required_only":
+                correction["primary_ref"] = required
+            corrections = [correction]
+            if mode == "duplicate":
+                corrections.append(dict(correction))
+            if mode == "omitted":
+                corrections = []
+            # An out-of-range index and an already successful candidate cannot
+            # introduce a Memory or replace its original Evidence.
+            corrections += [
+                {"candidate_index": 400, "primary_ref": primary},
+                {"candidate_index": 0, "primary_ref": primary, "required_refs": [required]},
+            ]
+            return ProjectionFragmentSelectorCorrectionResponse.model_validate({"corrections": corrections})
+
+    client = Client()
+    extractor = MemoryExtractor(structured_llm_client=client)
+    if mode == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await extractor.extract_projection_fragment_memories(catalog, source_type="github_repo", context_markdown="")
+        return
+    result = await extractor.extract_projection_fragment_memories(catalog, source_type="github_repo", context_markdown="")
+    assert result.error_type is None
+    assert result.memories[0].content == stable.content
+    assert len(result.memories[0].resolved_evidence_selection.parts) == 1
+    assert client.extraction_calls == 1
+    assert client.correction_calls == (0 if mode in {"valid", "capacity"} else 1)
+    assert result.metadata["structured_llm_calls"] == 1 + client.correction_calls
+    assert result.metadata["selector_correction_recovered_count"] == (1 if mode == "repaired" else 0)
+    assert len(result.memories) == (2 if mode == "repaired" else 1)
+    assert "private provider text" not in json.dumps(result.metadata)
+    if mode == "repaired":
+        repaired = result.memories[1]
+        for field in ("content", "memory_type", "confidence", "entity_refs", "valid_from", "valid_until"):
+            assert getattr(repaired, field) == getattr(failed, field)
+        assert len(repaired.resolved_evidence_selection.parts) == 2
+        assert failed.primary_ref == "broken"
+        assert result.metadata["rejected_fragment_selection_count"] == 0
+    elif mode != "valid":
+        assert result.metadata["rejected_fragment_selection_count"] == 1
+    # The existing persisted batch result carries only accepted Evidence and
+    # counters. A replay needs no correction-specific state or another call.
+    restored = memory_extraction_result_from_output_payload(memory_extraction_output_payload(result))
+    for key in (
+        "selector_correction_candidate_count",
+        "selector_correction_recovered_count", "selector_correction_outcome",
+    ):
+        assert restored.metadata[key] == result.metadata[key]
+    assert len(restored.memories) == len(result.memories)
+    assert "selector_correction_calls" not in restored.metadata
+    assert aggregate_extraction_metrics([restored])["selector_correction_calls"] == 0
+    assert aggregate_extraction_metrics([result, restored])["selector_correction_calls"] == client.correction_calls
+
+
+@pytest.mark.asyncio
+async def test_selector_correction_groups_failures_and_reuses_artifact_images() -> None:
+    projection = _projection(context_profile=BINARY_PROFILE, context_content="", context_metadata={
+        "source_artifact": {"inference_eligible": True, "sha256": "a" * 64,
+                            "media_type": "image/png", "size_bytes": 128, "filename": "diagram.png"},
+    })
+    catalog = compile_projection_fragment_catalog(
+        projection, _batch(projection), access_context_hash="access-1",
+        supplied_artifact_observation_ids=("obs-context",),
+    )
+    primary = next(f.reference for f in catalog.fragments if f.primary_eligible)
+    artifact = next(f.reference for f in catalog.fragments if f.kind.value == "artifact")
+    candidates = [
+        ProjectionFragmentMemoryCandidate(content="Fixed claim A", memory_type="fact", primary_ref="bad"),
+        ProjectionFragmentMemoryCandidate(content="Fixed claim B", memory_type="fact", primary_ref=primary,
+                                          required_refs=["unknown-required"]),
+    ]
+    images = (StructuredLlmImage(source_observation_id="obs-context", media_type="image/png", body=b"image"),)
+
+    class Client:
+        calls = 0
+
+        def request_fits(self, prompt, **kwargs):
+            assert kwargs["images"] is images
+            return True
+
+        async def correct_projection_fragment_selectors(self, prompt, **kwargs):
+            self.calls += 1
+            assert kwargs["images"] is images
+            assert all(candidate.content in prompt for candidate in candidates)
+            return ProjectionFragmentSelectorCorrectionResponse.model_validate({"corrections": [
+                {"candidate_index": 0, "primary_ref": primary, "required_refs": [artifact]},
+                {"candidate_index": 1, "primary_ref": primary, "required_refs": ["still-unknown"]},
+            ]})
+
+    client = Client()
+    corrected, metrics = await correct_fragment_selectors_once(
+        candidates, catalog=catalog, client=client, extraction_prompt="supplied catalog",
+        max_tokens=512, model="test-model", images=images,
+    )
+    assert client.calls == 1
+    assert metrics["selector_correction_candidate_count"] == 2
+    assert metrics["selector_correction_recovered_count"] == 1
+    assert corrected[0].required_refs == [artifact]
+    assert corrected[1] is candidates[1]
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,10 @@ from memforge.pipeline.evidence_catalog import (
     EvidenceResolution,
 )
 from memforge.pipeline.extraction_contract import DURABLE_MEMORY_QUALITY_RULES
+from memforge.pipeline.fragment_selector_correction import (
+    correct_fragment_selectors_once,
+    normalize_fragment_selector_refs,
+)
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
@@ -43,40 +47,6 @@ __all__ = ["MemoryExtractor"]
 
 _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT = 16
 
-
-def _normalize_projection_fragment_selector_refs(
-    *,
-    candidate_index: int,
-    primary_ref: str,
-    required_refs: list[str],
-) -> tuple[list[str], int, str | None]:
-    """Remove only unambiguous selector redundancy before strict resolution."""
-
-    seen: set[str] = set()
-    normalized_required: list[str] = []
-    for reference in required_refs:
-        if reference == primary_ref or reference in seen:
-            continue
-        seen.add(reference)
-        normalized_required.append(reference)
-    removed_ref_count = len(required_refs) - len(normalized_required)
-    if not removed_ref_count:
-        return normalized_required, 0, None
-    repair_shape = {
-        "candidate_index": candidate_index,
-        "primary_ref": primary_ref,
-        "required_refs": required_refs,
-        "normalized_required_refs": normalized_required,
-    }
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            repair_shape,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    return normalized_required, removed_ref_count, fingerprint
 
 # ---------------------------------------------------------------------------
 # Caps and bands shared by the extraction prompts and runtime truncation. Both
@@ -791,13 +761,20 @@ class MemoryExtractor:
                 },
             )
 
+        candidates, correction_metrics = await correct_fragment_selectors_once(
+            response.memories, catalog=catalog, client=self.structured_llm_client,
+            extraction_prompt=prompt, max_tokens=self.max_tokens, model=self.model, images=images,
+        )
+        metrics.update(correction_metrics)
+        metrics["structured_llm_calls"] += correction_metrics["selector_correction_calls"]
+
         memories: list[RawMemory] = []
         rejection_counts: dict[str, int] = {}
         selector_normalization_count = 0
         selector_normalization_fingerprints: list[str] = []
-        for candidate_index, candidate in enumerate(response.memories):
+        for candidate_index, candidate in enumerate(candidates):
             normalized_required, removed_ref_count, repair_fingerprint = (
-                _normalize_projection_fragment_selector_refs(
+                normalize_fragment_selector_refs(
                     candidate_index=candidate_index,
                     primary_ref=candidate.primary_ref,
                     required_refs=candidate.required_refs,
