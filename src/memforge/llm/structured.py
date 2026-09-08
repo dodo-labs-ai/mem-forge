@@ -553,7 +553,6 @@ class ClaimRevisionDecision(StructuredResponseModel):
     status: Literal["resolved", "insufficient"]
     relation: MemoryRelationAssessment | None = None
     revision_assessment: RevisionAssessment | None = None
-    consistent_with_support: bool | None = None
     reason: str = Field(default="", max_length=1000)
 
 
@@ -973,6 +972,8 @@ class SourceSupportStructuredClient(Protocol):
                      images: tuple[StructuredLlmImage, ...] = (), reserve_correction: bool = True) -> bool: ...
 
     def input_policy_identity_for(self, model: str | None = None) -> str: ...
+
+    def request_budget(self, model: str | None = None): ...
 
     def request_tokens(self, prompt: str, *, response_format: type[BaseModel], model: str | None = None,
                        images: tuple[StructuredLlmImage, ...] = ()) -> int: ...
@@ -1790,7 +1791,9 @@ class LiteLlmStructuredClient:
         name = litellm_model_name(model or self.config.model)
         material = _json_text_prompt(prompt, response_format)
         messages = [{"role": "user", "content": _structured_user_content(material, images)}]
-        return litellm.token_counter(model=name, messages=messages)
+        from memforge.llm.request_budget import metadata_model
+
+        return litellm.token_counter(model=metadata_model(name), messages=messages)
 
     def request_fits(
         self, prompt: str, *, response_format: type[BaseModel],

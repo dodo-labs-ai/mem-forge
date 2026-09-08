@@ -75,3 +75,31 @@ def test_incremental_extraction_does_not_expand_to_full_current_catalog():
     assert any("New approval" in t for t in text)
     assert any("# US payroll" in t for t in text)
     assert all("Old unrelated" not in t for t in text)
+
+
+def test_small_real_window_packs_whole_tables_without_fixed_output_reservation(monkeypatch):
+    from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, ProjectionFragmentMemoryExtractionResponse
+    monkeypatch.setattr("memforge.llm.structured.litellm.get_model_info",
+                        lambda _: {"max_input_tokens": 1000000, "max_output_tokens": 64000})
+    client = LiteLlmStructuredClient(StructuredLlmConfig(
+        model="openai/fixture", base_url=None, api_key=None, timeout_s=1,
+        max_input_tokens=8000, context_window_tokens=12000, max_output_tokens=1024,
+    ))
+    tables = ["| Field | Sandbox | Small Box |\n| --- | --- | --- |\n" + "\n".join(
+        f"| Rule {table}-{row} | Yes | No |" for row in range(70)) for table in range(5)]
+    projection = _projection(primary_content="\n\n".join(tables), context_content="Country: US.")
+    context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="scope")
+    catalog = context.catalog(context.full_fragments)
+    extractor = MemoryExtractor(model=client.config.model, structured_llm_client=client)
+    requests = plan_fragment_requests(_batch(projection), catalog, context=context,
+                                     extractor=extractor, source_type="confluence", doc_type="document")
+    assert len(requests) > 1
+    seen = []
+    for request in requests:
+        assert client.request_fits(request.prepared_prompt, response_format=ProjectionFragmentMemoryExtractionResponse,
+                                   max_tokens=extractor.fragment_output_tokens(request.prepared_catalog))
+        for f in request.prepared_catalog.fragments:
+            if f.fragment_type == "markdown-table" and f.primary_eligible:
+                seen.append(f.presentation_text)
+                assert "Sandbox" in f.presentation_text and "Small Box" in f.presentation_text
+    assert sorted(t.strip() for t in seen) == sorted(tables)

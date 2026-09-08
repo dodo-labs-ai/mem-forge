@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.revision_client_fixture import RevisionClientFixture
+
 import asyncio
 import hashlib
 import json
@@ -805,9 +807,8 @@ def test_large_canonical_observation_compiles_from_whole_authority(
         if observation_type == "comment"
         else json.dumps(
             {
-                "field": "description",
-                "from": "old",
-                "to": "x" * 31_000,
+                "created": "2026-09-08",
+                "items": [{"field": "description", "fromString": "old", "toString": "x" * 31_000}],
             },
             separators=(",", ":"),
         )
@@ -1312,7 +1313,7 @@ def test_binary_revalidation_preserves_exact_complete_unit_coordinates() -> None
 
 def test_large_canonical_fragment_fails_with_capacity_error_without_raw_slicing() -> None:
     content = json.dumps(
-        {"field": "description", "to": "x" * 2_000},
+        {"items": [{"field": "description", "toString": "x" * 2_000}]},
         separators=(",", ":"),
     )
     projection = _canonical_projection(
@@ -1522,7 +1523,7 @@ async def test_prompt_requires_empty_output_when_only_required_only_context_has_
     )
     prompts: list[str] = []
 
-    class Client:
+    class Client(RevisionClientFixture):
         def request_fits(self, prompt, **kwargs):
             return True
 
@@ -1784,7 +1785,7 @@ def test_inspected_artifact_uses_same_ref_shape_as_text_required() -> None:
     )
     assert artifact_payload[0] == artifact.reference
     assert artifact_payload[2]["image_source_observation_id"] == "obs-context"
-    assert "diagram.png" not in str(artifact_payload)
+    assert artifact_payload[2]["filename"] == "diagram.png"
 
     selection = catalog.resolve_selection(
         primary_ref=primary.reference,
@@ -1846,7 +1847,7 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
     primary = next(item for item in catalog.fragments if item.primary_eligible)
     artifact = next(item for item in catalog.fragments if item.kind.value == "artifact")
 
-    class Client:
+    class Client(RevisionClientFixture):
         def request_fits(self, prompt, **kwargs):
             return True
 
@@ -1967,7 +1968,7 @@ async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> 
         and "reviewers" in item.presentation_text.lower()
     )
 
-    class Client:
+    class Client(RevisionClientFixture):
         def request_fits(self, prompt, **kwargs):
             return True
 
@@ -2028,7 +2029,7 @@ async def test_selector_correction_preserves_success_and_fixed_claims(mode) -> N
         primary_ref="broken", required_refs=[required],
     )
 
-    class Client:
+    class Client(RevisionClientFixture):
         def __init__(self):
             self.correction_calls = 0
             self.extraction_calls = 0
@@ -2135,7 +2136,7 @@ async def test_selector_correction_groups_failures_and_reuses_artifact_images() 
     ]
     images = (StructuredLlmImage(source_observation_id="obs-context", media_type="image/png", body=b"image"),)
 
-    class Client:
+    class Client(RevisionClientFixture):
         calls = 0
 
         def request_fits(self, prompt, **kwargs):

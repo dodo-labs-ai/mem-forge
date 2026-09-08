@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.revision_client_fixture import RevisionClientFixture
+
 import asyncio
 import json
 from dataclasses import dataclass, field
@@ -47,7 +49,7 @@ def test_equivalent_identity_prompt_preserves_normative_modality() -> None:
 
 @pytest.mark.asyncio
 async def test_contradiction_scope_proof_is_preserved_in_auditable_reason() -> None:
-    class ContradictionClient:
+    class ContradictionClient(RevisionClientFixture):
         async def classify_memory_relations(self, _prompt: str, **_kwargs):
             return SimpleNamespace(
                 decisions=[
@@ -79,7 +81,7 @@ async def test_contradiction_scope_proof_is_preserved_in_auditable_reason() -> N
 
 @pytest.mark.asyncio
 async def test_different_source_scope_context_can_suppress_false_contradiction() -> None:
-    class ScopeAwareClient:
+    class ScopeAwareClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **_kwargs):
             payload = json.loads(
                 prompt.split("<memory_pair_groups>\n", 1)[1].split(
@@ -120,7 +122,7 @@ async def test_different_source_scope_context_can_suppress_false_contradiction()
 
 @pytest.mark.asyncio
 async def test_structured_classifier_runs_independent_batches_with_bounded_concurrency() -> None:
-    class ConcurrentClient:
+    class ConcurrentClient(RevisionClientFixture):
         max_concurrent = 2
 
         def __init__(self) -> None:
@@ -178,7 +180,7 @@ async def test_structured_classifier_runs_independent_batches_with_bounded_concu
 
 @pytest.mark.asyncio
 async def test_structured_classifier_reports_usage_when_a_later_batch_fails() -> None:
-    class FailingSecondBatchClient:
+    class FailingSecondBatchClient(RevisionClientFixture):
         def __init__(self) -> None:
             self.calls = 0
 
@@ -412,7 +414,7 @@ async def test_identity_resolver_batches_scope_and_reuses_only_equivalent_memory
     ]
 
 
-class _IncompleteStructuredClient:
+class _IncompleteStructuredClient(RevisionClientFixture):
     def __init__(self) -> None:
         self.calls: list[tuple[str, int, str | None]] = []
 
@@ -475,7 +477,7 @@ async def test_identity_resolver_fails_closed_for_incomplete_structured_pair_led
 
 @pytest.mark.asyncio
 async def test_structured_classifier_keeps_first_duplicate_without_retry() -> None:
-    class DuplicateClient:
+    class DuplicateClient(RevisionClientFixture):
         def __init__(self) -> None:
             self.calls: list[str] = []
 
@@ -519,7 +521,7 @@ async def test_structured_classifier_keeps_first_duplicate_without_retry() -> No
     assert len(client.calls) == 1
 
 
-class _CompleteStructuredClient:
+class _CompleteStructuredClient(RevisionClientFixture):
     def __init__(self) -> None:
         self.payloads: list[list[dict[str, object]]] = []
 

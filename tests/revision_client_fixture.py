@@ -18,6 +18,10 @@ from memforge.llm.structured import (
 class RevisionClientFixture:
     input_policy_identity = "test-input-policy"
 
+    def request_budget(self, model=None):
+        from memforge.llm.request_budget import RequestBudget
+        return RequestBudget(model or "fixture", 200000, 200000, 64000, 0.8, "fixture")
+
     def request_fits(self, prompt, **kwargs):
         return True
 

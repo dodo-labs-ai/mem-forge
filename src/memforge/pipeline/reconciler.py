@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import perf_counter
 
 from memforge.llm.structured import StructuredLlmError, structured_llm_metrics_scope
@@ -116,7 +116,7 @@ class RelationLedgerEntry:
 
     candidate_index: int
     incumbent_id: str
-    relation_type: MemoryRelationType
+    relation_type: MemoryRelationType | None
     direction: RelationDirection
     reason: str = ""
 
@@ -237,6 +237,13 @@ async def reconcile_memories(
             proofs = []
             for index, incumbent_id, decision in assessed.decisions:
                 relation = decision.relation
+                if decision.status == "insufficient":
+                    relation_entries.append(RelationLedgerEntry(
+                        candidate_index=index, incumbent_id=incumbent_id, relation_type=None,
+                        direction=RelationDirection.SYMMETRIC, reason=decision.reason,
+                    ))
+                    continue
+                assert relation is not None
                 relation_entries.append(RelationLedgerEntry(
                     candidate_index=index, incumbent_id=incumbent_id,
                     relation_type=MemoryRelationType(relation.classification),
@@ -257,7 +264,10 @@ async def reconcile_memories(
                     ))
             revision_proof_count = len(proofs)
 
-            refiners_by_incumbent = _supported_revision_candidates(relation_entries, audits)
+            _, unresolved_incumbents = _unresolved_component(relation_entries)
+            refiners_by_incumbent = _supported_revision_candidates(
+                [entry for entry in relation_entries if entry.incumbent_id not in unresolved_incumbents], audits,
+            )
             conditional_pairs = tuple(
                 MemoryPair(challenger=transient_candidates[left], candidate=transient_candidates[right])
                 for indices in refiners_by_incumbent.values()
@@ -270,11 +280,19 @@ async def reconcile_memories(
                 conditional = await classifier.classify(conditional_pairs)
                 relation_pair_count += len(conditional_pairs)
                 relation_prompt_chars += conditional.prompt_chars
-                if any(decision.relation_type is MemoryRelationType.CONTRADICTS for decision in conditional.decisions):
-                    raise ReconciliationContractError(
-                        "non_unique_refinement_conflict",
-                        "multiple refinement candidates contain incompatible current assertions",
-                    )
+                conflicting_ids = {
+                    memory_id for decision in conditional.decisions
+                    if decision.relation_type is MemoryRelationType.CONTRADICTS
+                    for memory_id in decision.pair.key
+                }
+                conflicting_candidates = {index for index, candidate in enumerate(transient_candidates)
+                                          if candidate.id in conflicting_ids}
+                relation_entries = [
+                    replace(entry, relation_type=None, reason="Current refinement candidates conflict")
+                    if entry.candidate_index in conflicting_candidates
+                    and entry.relation_type is not MemoryRelationType.UNRELATED else entry
+                    for entry in relation_entries
+                ]
 
             operation = "reduce_relation_ledger"
             operations = reduce_relation_ledger(
@@ -372,9 +390,17 @@ def reduce_relation_ledger(
     for entry in relations:
         by_incumbent[entry.incumbent_id].append(entry)
 
-    consumed_candidates: set[int] = set()
+    skipped_candidates, skipped_incumbents = _unresolved_component(relations)
+    consumed_candidates: set[int] = set(skipped_candidates)
     incumbent_operations: list[ReconcileOperation] = []
     for incumbent in existing_memories:
+        if incumbent.id in skipped_incumbents:
+            incumbent_operations.append(ReconcileOperation(
+                action=ReconcileAction.NOOP, memory_id=incumbent.id,
+                reason="Unresolved claim relationship; preserve existing Support and Evidence",
+                support_revalidation_skipped=True,
+            ))
+            continue
         audit = audits_by_id[incumbent.id]
         entries = by_incumbent[incumbent.id]
         equivalents = [entry for entry in entries if entry.relation_type is MemoryRelationType.EQUIVALENT]
@@ -459,6 +485,26 @@ def reduce_relation_ledger(
         if index not in consumed_candidates
     ]
     return [*candidate_operations, *incumbent_operations]
+
+
+def _unresolved_component(relations: list[RelationLedgerEntry]) -> tuple[set[int], set[str]]:
+    """Keep uncertainty local without letting a shared candidate escape as ADD.
+
+    A candidate can touch more than one incumbent. Preserve the related component
+    together; unrelated pairs never spread uncertainty to independent knowledge.
+    """
+    candidates = {entry.candidate_index for entry in relations if entry.relation_type is None}
+    incumbents = {entry.incumbent_id for entry in relations if entry.relation_type is None}
+    while True:
+        size = len(candidates) + len(incumbents)
+        for entry in relations:
+            if entry.relation_type is not MemoryRelationType.UNRELATED and (
+                entry.candidate_index in candidates or entry.incumbent_id in incumbents
+            ):
+                candidates.add(entry.candidate_index)
+                incumbents.add(entry.incumbent_id)
+        if len(candidates) + len(incumbents) == size:
+            return candidates, incumbents
 
 
 def _transient_candidate(index: int, raw: RawMemory) -> Memory:

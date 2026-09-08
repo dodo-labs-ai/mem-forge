@@ -40,7 +40,7 @@ from memforge.source_representation import (
 )
 
 
-COMPILER_CONTRACT_VERSION = 3
+COMPILER_CONTRACT_VERSION = 4
 DEFAULT_MAX_FRAGMENTS = 2_048
 DEFAULT_MAX_PRESENTATION_CHARS = 120_000
 _SUPPORTING_ROLES = frozenset({EvidenceRole.PRIMARY, EvidenceRole.REQUIRED})
@@ -608,7 +608,7 @@ def _compile_canonical_record_profile(
 
     candidates: list[_FragmentCandidate] = []
     errors: list[FragmentCompilationError] = []
-    for descriptor in schema.fields:
+    for descriptor in _canonical_descriptors(schema, document):
         node = document.nodes.get(descriptor.json_pointer)
         if node is None or node.value is None:
             continue
@@ -822,6 +822,7 @@ def _markdown_protected_ranges(text: str) -> tuple[tuple[int, int], ...]:
     protected_types = {
         "html_block",
         "table_open",
+        "ordered_list_open",
         "list_item_open",
         "blockquote_open",
         "heading_open",
@@ -904,7 +905,8 @@ def _markdown_candidates(
     token_specs = {
         "html_block": (0, "html-block", True),
         "list_item_open": (1, "markdown-list-item", False),
-        "tr_open": (1, "markdown-table-row", False),
+        "table_open": (1, "markdown-table", False),
+        "ordered_list_open": (1, "markdown-ordered-list", False),
         "blockquote_open": (1, "markdown-blockquote", False),
         "heading_open": (2, "markdown-heading", False),
         "fence": (2, "markdown-code-block", False),
@@ -922,7 +924,9 @@ def _markdown_candidates(
         structural.append((priority, start, end, fragment_type, is_html))
 
     selected: list[tuple[int, int, str, bool]] = []
-    for _, start, end, fragment_type, is_html in sorted(structural):
+    for _, start, end, fragment_type, is_html in sorted(
+        structural, key=lambda item: (item[1], -item[2], item[0])
+    ):
         if any(start < chosen_end and chosen_start < end for chosen_start, chosen_end, _, _ in selected):
             continue
         selected.append((start, end, fragment_type, is_html))
@@ -1083,7 +1087,8 @@ class _HTMLTextCollector(HTMLParser):
 
 
 _HTML_SEMANTIC_TAGS = frozenset(
-    {"p", "li", "tr", "blockquote", "pre", "figcaption", "dt", "dd", "h1", "h2", "h3", "h4", "h5", "h6"}
+    {"p", "li", "table", "ol", "dl", "figure", "blockquote", "pre", "figcaption", "dt", "dd",
+     "h1", "h2", "h3", "h4", "h5", "h6"}
 )
 _HTML_TOKEN_TAG_NAME_RE = re.compile(r"^<\s*/?\s*([A-Za-z][A-Za-z0-9-]*)\b")
 
@@ -1314,7 +1319,9 @@ def _html_candidates(
             base + node.start,
             base + (node.end or node.start),
             roles,
-            _html_presentation(source[node.start : node.end]),
+            (source[node.start : node.end] if any(child.tag in {"table", "ol", "dl", "figure", "pre"}
+                                             for child in _walk_html_nodes((node,)))
+             else _html_presentation(source[node.start : node.end])),
         )
         for node in sorted(selected, key=lambda value: (value.start, value.end or value.start, value.tag))
     )
@@ -1384,6 +1391,22 @@ class _JsonDocument:
         return cls(value=value, nodes=dict(scanner.nodes))
 
 
+def _canonical_descriptors(schema: CanonicalRecordSchema, document: _JsonDocument):
+    """Bind array wildcards to concrete, revision-local JSON pointers."""
+    for descriptor in schema.fields:
+        parts = descriptor.json_pointer.split("/")
+        if "*" not in parts:
+            yield descriptor
+            continue
+        for pointer in document.nodes:
+            actual = pointer.split("/")
+            if len(actual) == len(parts) and all(
+                expected == value or (expected == "*" and value.isdecimal())
+                for expected, value in zip(parts, actual, strict=True)
+            ):
+                yield replace(descriptor, json_pointer=pointer)
+
+
 def canonical_record_field_ranges(
     revision: SourceObservationRevision,
 ) -> tuple[CanonicalFieldRange, ...]:
@@ -1394,7 +1417,7 @@ def canonical_record_field_ranges(
         raise ValueError("Revision does not declare a registered canonical-record schema")
     document = _JsonDocument.parse(revision.content)
     indexed = []
-    for descriptor in contract.canonical_schema.fields:
+    for descriptor in _canonical_descriptors(contract.canonical_schema, document):
         node = document.nodes.get(descriptor.json_pointer)
         if node is None or node.value is None:
             continue

@@ -16,6 +16,10 @@ class Client:
         self.prompts = []
         self.fail_at = None
 
+    def request_budget(self, model=None):
+        from memforge.llm.request_budget import RequestBudget
+        return RequestBudget(model or "fixture", self.limit, self.limit * 8, 32768, 1, "fixture")
+
     def request_fits(self, prompt, *, max_tokens, reserve_correction=True, **kwargs):
         return len(prompt) + max_tokens // 8 <= self.limit - (256 if reserve_correction else 0)
 

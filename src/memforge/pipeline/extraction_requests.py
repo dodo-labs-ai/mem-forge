@@ -29,7 +29,7 @@ def plan_fragment_requests(batch, catalog, *, context, extractor, source_type, d
         text = prompt(selected)
         kwargs = dict(
             response_format=ProjectionFragmentMemoryExtractionResponse,
-            max_tokens=extractor.max_tokens,
+            max_tokens=extractor.fragment_output_tokens(selected),
             model=extractor.model,
         )
         if not extractor.structured_llm_client.request_fits(text, **kwargs):
