@@ -43,15 +43,6 @@ type TransientEvidenceBlockId = Annotated[
     str,
     Field(min_length=1, pattern=r"^EB-\d{3,}$"),
 ]
-type TransientPrimaryEvidenceFragmentRef = Annotated[
-    str,
-    Field(min_length=1, pattern=r"^p\d{6}$"),
-]
-type TransientRequiredEvidenceFragmentRef = Annotated[
-    str,
-    Field(min_length=1, pattern=r"^[pr]\d{6}$"),
-]
-
 _SCHEMA_REPAIR_MAX_VALIDATION_FIELDS = 8
 _SCHEMA_REPAIR_LOCATION_CHAR_CAP = 256
 _SCHEMA_REPAIR_RULE_CHAR_CAP = 128
@@ -398,8 +389,12 @@ class ProjectionFragmentMemoryCandidate(StructuredResponseModel):
     entity_refs: list[str] = Field(default_factory=list)
     valid_from: str | None = None
     valid_until: str | None = None
-    primary_ref: TransientPrimaryEvidenceFragmentRef
-    required_refs: list[TransientRequiredEvidenceFragmentRef] = Field(default_factory=list)
+    # Keep the transport schema structural.  Membership and role are
+    # catalog-local facts, so malformed or stale string selectors are rejected
+    # candidate-by-candidate by the catalog resolver instead of failing every
+    # other valid candidate in the LLM response.
+    primary_ref: str
+    required_refs: list[str] = Field(default_factory=list)
 
 class ProjectionFragmentMemoryExtractionResponse(StructuredResponseModel):
     """projection-extraction-v9 response containing model judgments only."""

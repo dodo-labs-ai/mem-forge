@@ -681,46 +681,37 @@ def test_v9_response_accepts_redundant_stringified_and_json_text_fallback_shapes
     assert response.memories[0].required_refs == ["r000002", "r000002"]
 
 
-@pytest.mark.parametrize(
-    ("primary_ref", "required_refs"),
-    [
-        ("not-a-fragment", []),
-        ("p000001", ["not-a-fragment"]),
-    ],
-)
-def test_v9_response_still_rejects_malformed_fragment_refs(
-    primary_ref: str,
-    required_refs: list[str],
-) -> None:
-    with pytest.raises(ValidationError):
-        ProjectionFragmentMemoryExtractionResponse.model_validate(
-            {
-                "memories": [
-                    {
-                        "content": "Approval is required.",
-                        "memory_type": "fact",
-                        "primary_ref": primary_ref,
-                        "required_refs": required_refs,
-                    }
-                ]
-            }
-        )
+def test_v9_response_defers_string_selector_membership_to_catalog_admission() -> None:
+    response = ProjectionFragmentMemoryExtractionResponse.model_validate(
+        {
+            "memories": [
+                {
+                    "content": "Approval is required.",
+                    "memory_type": "fact",
+                    "primary_ref": "not-a-fragment",
+                    "required_refs": ["also-not-a-fragment"],
+                }
+            ]
+        }
+    )
+
+    assert response.memories[0].primary_ref == "not-a-fragment"
 
 
-def test_v9_schema_rejects_required_only_ref_as_primary() -> None:
-    with pytest.raises(ValidationError):
-        ProjectionFragmentMemoryExtractionResponse.model_validate(
-            {
-                "memories": [
-                    {
-                        "content": "Historical context cannot authorize a new claim.",
-                        "memory_type": "fact",
-                        "primary_ref": "r000004",
-                        "required_refs": [],
-                    }
-                ]
-            }
-        )
+def test_v9_schema_defers_primary_role_to_catalog_admission() -> None:
+    deferred = ProjectionFragmentMemoryExtractionResponse.model_validate(
+        {
+            "memories": [
+                {
+                    "content": "Historical context cannot authorize a new claim.",
+                    "memory_type": "fact",
+                    "primary_ref": "r000004",
+                    "required_refs": [],
+                }
+            ]
+        }
+    )
+    assert deferred.memories[0].primary_ref == "r000004"
 
     accepted = ProjectionFragmentMemoryExtractionResponse.model_validate(
         {
@@ -1870,7 +1861,7 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
                         {
                             "content": "Unknown evidence must fail closed.",
                             "memory_type": "fact",
-                            "primary_ref": "p999999",
+                            "primary_ref": "not-a-fragment",
                             "required_refs": [artifact.reference, artifact.reference],
                         },
                         {
