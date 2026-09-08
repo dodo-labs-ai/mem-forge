@@ -9524,9 +9524,12 @@ async def test_reused_evidence_advances_only_support_validation_plan_across_revi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("equivalent_candidate,mixed_supports", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("equivalent_candidate,mixed_supports,skip_stage", [
+    (False, False, "support"), (True, False, "support"), (False, True, "support"),
+    (True, False, "claim"), (False, True, "claim"),
+])
 async def test_insufficient_support_preserves_old_baseline_while_other_memory_and_source_advance(
-    db, equivalent_candidate, mixed_supports,
+    db, equivalent_candidate, mixed_supports, skip_stage,
 ):
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 
@@ -9542,13 +9545,25 @@ async def test_insufficient_support_preserves_old_baseline_while_other_memory_an
                 prompt, classification="unrelated", reason="A7 exclusion and B8 approval are distinct rules",
             )
 
+        async def assess_claim_revisions(self, prompt, **kwargs):
+            response = await super().assess_claim_revisions(prompt, **kwargs)
+            if self.skip_claim and skip_stage == "claim":
+                groups = json.loads(prompt.split("<memory_pair_groups>\n", 1)[1].split("\n</memory_pair_groups>", 1)[0])
+                slots = {old["pair_index"] for group in groups for old in group["candidates"]
+                         if old["content"] == skipped_claim}
+                response = response.model_copy(update={"decisions": [
+                    decision.model_copy(update={"status": "insufficient", "relation": None})
+                    if decision.pair_index in slots else decision for decision in response.decisions
+                ]})
+            return response
+
         async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
             assert response_format is SupportAssessmentResponse
             payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
             rows = payload["current"]["primary_candidates"]
             results = []
             for claim in payload["claims"]:
-                skip = self.skip_claim and claim["claim"] == skipped_claim
+                skip = self.skip_claim and skip_stage == "support" and claim["claim"] == skipped_claim
                 if skip:
                     skip = not mixed_supports or not self.skipped_claim_statuses
                     self.skipped_claim_statuses.append("insufficient" if skip else "supported")
@@ -9651,8 +9666,9 @@ async def test_insufficient_support_preserves_old_baseline_while_other_memory_an
     old_memory = await db.get_memory(skipped.id)
     client.skip_claim = True
     client.skipped_claim_statuses = []
-    third, stats = await advance(second, 3, [skipped_claim] if equivalent_candidate else [])
-    assert client.skipped_claim_statuses == (["insufficient", "supported"] if mixed_supports else ["insufficient"])
+    third, stats = await advance(second, 3, [skipped_claim] if equivalent_candidate or skip_stage == "claim" else [])
+    assert client.skipped_claim_statuses == ([] if skip_stage == "claim" else
+        (["insufficient", "supported"] if mixed_supports else ["insufficient"]))
 
     assert (await db.get_current_source_unit_revision(first.source_units[0].id)).id == third.source_unit_revisions[0].id
     remaining_support = await db.get_active_memory_support_evidence(skipped.id, source_id="src-1")
@@ -9660,7 +9676,7 @@ async def test_insufficient_support_preserves_old_baseline_while_other_memory_an
     assert all(remaining_by_reference.get(part.reference_id) == part for part in old_support)
     for unit_id, unit in old_units.items():
         assert await db.get_evidence_unit(unit_id) == unit
-    if not equivalent_candidate:
+    if not equivalent_candidate or skip_stage == "claim":
         assert remaining_support == old_support
         assert await db.get_memory(skipped.id) == old_memory
     else:

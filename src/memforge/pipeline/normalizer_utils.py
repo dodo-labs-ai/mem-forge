@@ -36,6 +36,44 @@ _RE_EMPTY_HEADERS = re.compile(r"^#{1,6}\s*$", re.MULTILINE)
 _RE_TRAILING_WHITESPACE = re.compile(r"[ \t]+$", re.MULTILINE)
 
 
+class _StructuralMarkdownConverter(markdownify.MarkdownConverter):
+    """Keep HTML structures whose semantics Markdown cannot faithfully encode."""
+
+    def convert_table(self, el, text, *args, **kwargs):
+        if (el.find(attrs={"rowspan": True}) or el.find(attrs={"colspan": True})
+                or el.find(["caption", "table", "pre", "ol", "ul", "dl", "figure", "blockquote", "p", "div", "br"])):
+            return "\n\n" + str(el) + "\n\n"
+        return super().convert_table(el, text, *args, **kwargs)
+
+    def _complete_html(self, el, text, *args, **kwargs):
+        return "\n\n" + str(el) + "\n\n"
+
+    convert_dl = _complete_html
+    convert_figure = _complete_html
+    convert_pre = _complete_html
+    convert_ol = _complete_html
+
+
+def _clean_prose(markdown: str, transform) -> str:
+    """Whitespace/boilerplate cleanup must not rewrite code or retained HTML."""
+    from markdown_it import MarkdownIt
+
+    lines = markdown.splitlines(keepends=True)
+    protected = set()
+    for token in MarkdownIt("commonmark").parse(markdown):
+        if token.type in {"html_block", "fence", "code_block"} and token.map:
+            protected.update(range(*token.map))
+    result, pending = [], []
+    for index, line in enumerate(lines):
+        if index in protected:
+            result.extend((transform("".join(pending)), line))
+            pending = []
+        else:
+            pending.append(line)
+    result.append(transform("".join(pending)))
+    return "".join(result).strip("\r\n")
+
+
 def html_to_markdown(html: str) -> str:
     """Convert an HTML string to clean Markdown.
 
@@ -70,18 +108,14 @@ def html_to_markdown(html: str) -> str:
     for tag in soup.find_all(["script", "style", "nav", "footer"]):
         tag.decompose()
 
-    md: str = markdownify.markdownify(
-        str(soup),
-        heading_style="ATX",
-        bullets="-",
-    )
+    md = _StructuralMarkdownConverter(heading_style="ATX", bullets="-").convert(str(soup))
 
-    # Post-processing passes
-    md = _RE_TRAILING_WHITESPACE.sub("", md)
-    md = _RE_EMPTY_HEADERS.sub("", md)
-    md = _RE_CONSECUTIVE_BLANK_LINES.sub("\n\n", md)
+    def clean(text):
+        text = _RE_TRAILING_WHITESPACE.sub("", text)
+        text = _RE_EMPTY_HEADERS.sub("", text)
+        return _RE_CONSECUTIVE_BLANK_LINES.sub("\n\n", text)
 
-    return md.strip()
+    return _clean_prose(md, clean)
 
 
 # ---------------------------------------------------------------------------
@@ -137,13 +171,12 @@ def strip_boilerplate(md: str) -> str:
     if not md:
         return ""
 
-    for pattern, replacement in _BOILERPLATE_PATTERNS:
-        md = pattern.sub(replacement, md)
+    def clean(text):
+        for pattern, replacement in _BOILERPLATE_PATTERNS:
+            text = pattern.sub(replacement, text)
+        return _RE_POST_STRIP_BLANK_LINES.sub("\n\n", text)
 
-    # Collapse blank lines left behind by removed boilerplate.
-    md = _RE_POST_STRIP_BLANK_LINES.sub("\n\n", md)
-
-    return md.strip()
+    return _clean_prose(md, clean)
 
 
 # ---------------------------------------------------------------------------

@@ -296,14 +296,13 @@ async def test_revision_evidence_that_supports_only_added_detail_falls_back() ->
 
     assert isinstance(result, ReconciliationResult)
     assert result.failure is None
-    assert [operation.action for operation in result.operations] == [
-        ReconcileAction.ADD,
-        ReconcileAction.NOOP,
-    ]
+    [operation] = result.operations
+    assert operation.action == ReconcileAction.NOOP and operation.memory is None
+    assert operation.support_revalidation_skipped
 
 
 @pytest.mark.asyncio
-async def test_missing_conditional_assessment_fails_closed() -> None:
+async def test_missing_conditional_assessment_preserves_incumbent() -> None:
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
     refinement = RawMemory(
         content="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
@@ -343,8 +342,10 @@ async def test_missing_conditional_assessment_fails_closed() -> None:
     )
 
     assert isinstance(result, ReconciliationResult)
-    assert result.failure is not None
-    assert result.operations == []
+    assert result.failure is None
+    [operation] = result.operations
+    assert operation.action == ReconcileAction.NOOP
+    assert operation.memory is None and operation.support_revalidation_skipped
     assert client.proof_calls == 1
 
 
@@ -771,3 +772,27 @@ async def test_relation_provider_failure_fails_closed_with_incumbents() -> None:
     assert isinstance(result, ReconciliationResult)
     assert result.operations == []
     assert result.failure is not None
+
+
+def test_unresolved_pair_preserves_related_component_and_allows_independent_work():
+    candidates = [RawMemory(content=f"Claim {n}", memory_type="fact") for n in range(3)]
+    old = [_memory(f"mem-{n}", f"Old {n}") for n in range(3)]
+    relations = [RelationLedgerEntry(c, m.id, MemoryRelationType.UNRELATED, RelationDirection.SYMMETRIC)
+                 for c in range(3) for m in old]
+    # Candidate 0 is unresolved against old0 and equivalent to old1. Candidate1
+    # also touches old1. All four must stay together; candidate2/old2 may advance.
+    from dataclasses import replace
+    types = {(0, "mem-0"): None, (0, "mem-1"): MemoryRelationType.EQUIVALENT,
+             (1, "mem-1"): MemoryRelationType.CONTRADICTS}
+    relations = [replace(r, relation_type=types.get((r.candidate_index, r.incumbent_id), r.relation_type))
+                 for r in relations]
+    operations = reduce_relation_ledger(
+        new_extractions=candidates, existing_memories=old, relations=relations,
+        support_audits=[SupportAuditEntry(m.id, False) for m in old],
+    )
+    assert [op.memory for op in operations if op.action == ReconcileAction.ADD] == [candidates[2]]
+    by_id = {op.memory_id: op for op in operations if op.memory_id}
+    for mid in ("mem-0", "mem-1"):
+        assert by_id[mid].action == ReconcileAction.NOOP
+        assert by_id[mid].memory is None and by_id[mid].support_revalidation_skipped
+    assert by_id["mem-2"].action == ReconcileAction.DELETE

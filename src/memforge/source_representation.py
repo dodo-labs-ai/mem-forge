@@ -42,6 +42,7 @@ class CanonicalRecordField:
     json_pointer: str
     nested_profile: str | None = None
     comparison_keys: tuple[str, ...] = ()
+    contextual: bool = False
 
     def __post_init__(self) -> None:
         if self.nested_profile not in {None, "markdown-structural", "plain-text"}:
@@ -129,7 +130,12 @@ _CANONICAL_RECORD_SCHEMAS: Mapping[tuple[str, int], CanonicalRecordSchema] = {
     ("jira-changelog", 1): CanonicalRecordSchema(
         name="jira-changelog",
         version=1,
-        fields=(CanonicalRecordField(""),),
+        fields=(
+            CanonicalRecordField("/created", contextual=True),
+            CanonicalRecordField("/items/*/field", contextual=True),
+            CanonicalRecordField("/items/*/fromString", nested_profile="markdown-structural"),
+            CanonicalRecordField("/items/*/toString", nested_profile="markdown-structural"),
+        ),
     ),
     ("teams-message", 1): CanonicalRecordSchema(
         name="teams-message",
