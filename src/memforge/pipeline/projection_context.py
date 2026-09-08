@@ -16,7 +16,6 @@ from memforge.pipeline.extraction_contract import (
 )
 from memforge.pipeline.evidence_fragments import (
     StructuralUnit,
-    StructuralUnitTooLargeError,
     canonical_nested_changed_raw_ranges,
     canonical_record_field_ranges,
     canonical_record_is_tombstoned,
@@ -78,7 +77,6 @@ class ProjectionEvidencePlanningFailureCode(str, Enum):
     EVIDENCE_WORK_IDENTITY_INCOMPLETE = "EVIDENCE_WORK_IDENTITY_INCOMPLETE"
     REPRESENTATION_PROFILE_UNSUPPORTED = "REPRESENTATION_PROFILE_UNSUPPORTED"
     REPROCESS_AUTHORIZATION_MISSING = "REPROCESS_AUTHORIZATION_MISSING"
-    STRUCTURAL_UNIT_TOO_LARGE = "STRUCTURAL_UNIT_TOO_LARGE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,7 +308,7 @@ def _plan_projection_extraction_batches_or_failure(
     | None,
     extraction_contract_version: str,
 ) -> tuple[ProjectionExtractionBatch, ...] | ProjectionEvidencePlanningFailure:
-    """Keep deterministic presentation limits inside the typed planner contract."""
+    """Validate canonical fields before grouping exact extraction authority."""
 
     authority = dict(primary_authority_ranges_by_observation_id or {})
     for revision in projection.observation_revisions:
@@ -328,35 +326,12 @@ def _plan_projection_extraction_batches_or_failure(
             )
     primary_authority_ranges_by_observation_id = authority or None
 
-    try:
-        return plan_projection_extraction_batches(
-            projection,
-            primary_observation_ids=primary_observation_ids,
-            primary_authority_ranges_by_observation_id=(
-                primary_authority_ranges_by_observation_id
-            ),
-            extraction_contract_version=extraction_contract_version,
-        )
-    except StructuralUnitTooLargeError as exc:
-        revision = next(
-            (
-                candidate
-                for candidate in projection.observation_revisions
-                if candidate.id == exc.revision_id
-            ),
-            None,
-        )
-        return ProjectionEvidencePlanningFailure(
-            code=ProjectionEvidencePlanningFailureCode.STRUCTURAL_UNIT_TOO_LARGE,
-            observation_id=(revision.observation_id if revision is not None else None),
-            observation_revision_id=exc.revision_id,
-            representation_profile=(
-                revision.evidence_profile.name
-                if revision is not None and revision.evidence_profile is not None
-                else None
-            ),
-            changed_structure_count=1,
-        )
+    return plan_projection_extraction_batches(
+        projection,
+        primary_observation_ids=primary_observation_ids,
+        primary_authority_ranges_by_observation_id=primary_authority_ranges_by_observation_id,
+        extraction_contract_version=extraction_contract_version,
+    )
 
 
 def _incremental_base_failure(
@@ -412,7 +387,9 @@ def plan_projection_extraction_batches(
     candidate Context may be selected as Required, but relations never make it
     Primary-eligible. Compiler-backed v9 planning segments only range-addressable
     text profiles; canonical records and binary Artifacts retain whole-Observation
-    authority until compilation. Legacy projection extraction keeps its bounded
+    authority until compilation. Character counts are grouping targets, not
+    capacity gates for v9: a larger structure is passed intact to the actual
+    request planner. Legacy projection extraction keeps its bounded
     character segmentation because it presents batch Markdown directly.
     """
 
@@ -799,14 +776,6 @@ def _primary_segments(
                 f"### Observation {observation_id} ({observation_type}) "
                 f"[characters {unit.start}:{unit.end}]\n"
             )
-            content_budget = max_chars - len(header)
-            if unit.end - unit.start > content_budget:
-                raise StructuralUnitTooLargeError(
-                    revision_id=revision.id,
-                    start=unit.start,
-                    end=unit.end,
-                    budget=max(content_budget, 0),
-                )
             segments.append(
                 _PrimarySegment(
                     observation_id=observation_id,
@@ -831,6 +800,8 @@ def _primary_segments(
         f"[characters {'9' * max_digits}:{'9' * max_digits}]\n"
     )
     content_budget = max_chars - len(ranged_header)
+    if preserve_whole_authority:
+        content_budget = max(1, content_budget)
     if content_budget < 1:
         raise ValueError("primary character budget is too small for the Observation header")
     if preserve_whole_authority:

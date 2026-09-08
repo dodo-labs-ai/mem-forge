@@ -99,27 +99,16 @@ class CanonicalFieldRange:
     string_boundaries: tuple[int, ...] | None = None
 
 
-class StructuralUnitTooLargeError(ValueError):
-    """One complete structure cannot fit the configured presentation budget."""
-
-    code = "structural_unit_too_large"
-
-    def __init__(self, *, revision_id: str, start: int, end: int, budget: int) -> None:
-        super().__init__(
-            f"structural unit exceeds presentation budget: {revision_id}:{start}:{end}"
-        )
-        self.revision_id = revision_id
-        self.start = start
-        self.end = end
-        self.budget = budget
-
-
 def plan_revision_structural_units(
     revision: SourceObservationRevision,
     *,
     max_content_chars: int,
 ) -> tuple[StructuralUnit, ...]:
-    """Pack complete representation structures without granting authority."""
+    """Group complete structures using a soft character target.
+
+    A larger structure occupies its own group. Only the actual model request
+    budget can determine whether it fits; grouping never clips or rejects it.
+    """
 
     if max_content_chars < 1:
         raise ValueError("structural planning budget must be positive")
@@ -130,13 +119,6 @@ def plan_revision_structural_units(
     current_start: int | None = None
     current_end: int | None = None
     for start, end in protected:
-        if end - start > max_content_chars:
-            raise StructuralUnitTooLargeError(
-                revision_id=revision.id,
-                start=start,
-                end=end,
-                budget=max_content_chars,
-            )
         if current_start is None:
             current_start, current_end = start, end
             continue

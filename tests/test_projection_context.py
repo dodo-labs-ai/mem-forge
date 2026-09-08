@@ -21,12 +21,10 @@ from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_V9
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import (
     CommittedSourceUnitSnapshot,
-    ProjectionEvidencePlanningFailure,
     plan_projection_evidence_work,
     plan_projection_extraction_batches,
 )
 from memforge.pipeline.projection_fragments import compile_projection_fragment_catalog
-from memforge.pipeline.evidence_fragments import StructuralUnitTooLargeError
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_projection import (
     AnchorKind,
@@ -700,7 +698,8 @@ def test_v9_incremental_canonical_record_authorizes_only_changed_registered_fiel
     assert primary_text == ["A7 processing requires approval"]
 
 
-def test_v9_incremental_nested_canonical_text_keeps_unchanged_paragraph_non_primary() -> None:
+@pytest.mark.parametrize("changed", ["Rollout starts Tuesday.", "| Rule | Result |\n| --- | --- |\n" + "| approval | required |\n" * 2_000])
+def test_v9_incremental_nested_canonical_text_keeps_unchanged_paragraph_non_primary(changed) -> None:
     initial = _teams_projection(
         (
             "Historical context remains.\n\nRollout starts Monday.",
@@ -709,7 +708,7 @@ def test_v9_incremental_nested_canonical_text_keeps_unchanged_paragraph_non_prim
     )
     target = _teams_projection(
         (
-            "Historical context remains.\n\nRollout starts Tuesday.",
+            "Historical context remains.\n\n" + changed,
             "Independent message.",
         ),
         run_id="run-teams-nested-update",
@@ -741,8 +740,11 @@ def test_v9_incremental_nested_canonical_text_keeps_unchanged_paragraph_non_prim
         if fragment.primary_eligible
     )
 
-    assert "Rollout starts Tuesday." in primary_text
+    assert changed.strip() in primary_text
     assert "Historical context remains." not in primary_text
+    primary = [f for catalog in catalogs for f in catalog.fragments if f.primary_eligible]
+    assert len(primary) == 1
+    assert primary[0].presentation_text.strip() == changed.strip()
 
 
 @pytest.mark.parametrize("reprocess", [False, True])
@@ -830,20 +832,25 @@ def test_v9_batches_keep_one_crossing_markdown_structure_complete() -> None:
     assert code_fragments[0].anchor.range_end == code_end
 
 
-def test_v9_rejects_one_structural_unit_larger_than_the_batch_budget() -> None:
+def test_v9_keeps_one_structural_unit_larger_than_the_grouping_target() -> None:
     projection = _confluence_projection(
         "```text\n" + ("x" * 1_000) + "\n```\n"
     )
 
-    with pytest.raises(StructuralUnitTooLargeError):
-        plan_projection_extraction_batches(
-            projection,
-            max_primary_chars=500,
-            extraction_contract_version=PROJECTION_EXTRACTION_V9,
-        )
+    batches = plan_projection_extraction_batches(
+        projection,
+        max_primary_chars=1,
+        extraction_contract_version=PROJECTION_EXTRACTION_V9,
+    )
+    catalogs = [compile_projection_fragment_catalog(projection, batch, access_context_hash="scope")
+                for batch in batches]
+    assert all(catalog.usable for catalog in catalogs)
+    [fragment] = [f for catalog in catalogs for f in catalog.fragments
+                  if f.primary_eligible and f.fragment_type == "markdown-code-block"]
+    assert fragment.presentation_text == "```text\n" + ("x" * 1_000) + "\n```"
 
 
-def test_v9_incremental_oversized_structure_returns_typed_planning_failure() -> None:
+def test_v9_incremental_oversized_structure_keeps_only_changed_primary_authority() -> None:
     initial_body = "# Decision\n\n```text\nsmall\n```\n"
     target_body = "# Decision\n\n```text\n" + ("x" * 90_000) + "\n```\n"
     initial = _confluence_projection(initial_body)
@@ -880,9 +887,13 @@ def test_v9_incremental_oversized_structure_returns_typed_planning_failure() -> 
         extraction_contract_version=PROJECTION_EXTRACTION_V9,
     )
 
-    assert isinstance(result, ProjectionEvidencePlanningFailure)
-    assert result.code.value == "STRUCTURAL_UNIT_TOO_LARGE"
-    assert result.representation_profile == "markdown-structural"
+    assert isinstance(result, tuple) and len(result) == 1
+    catalog = compile_projection_fragment_catalog(target, result[0], access_context_hash="scope")
+    assert catalog.usable
+    primary = [f for f in catalog.fragments if f.primary_eligible]
+    assert len(primary) == 1
+    assert primary[0].presentation_text == "```text\n" + ("x" * 90_000) + "\n```"
+    assert not any(f.primary_eligible and "# Decision" in f.presentation_text for f in catalog.fragments)
 
 
 def test_v9_structure_planning_keeps_commonmark_protectors_complete() -> None:
