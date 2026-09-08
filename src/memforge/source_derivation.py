@@ -1840,7 +1840,6 @@ def _safe_evidence_telemetry(value: object) -> dict[str, object]:
             }
         )
     for key in (
-        "selector_correction_calls",
         "selector_correction_candidate_count",
         "selector_correction_recovered_count",
     ):
