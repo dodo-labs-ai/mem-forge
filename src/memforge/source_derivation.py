@@ -1664,6 +1664,9 @@ def aggregate_extraction_metrics(
         "artifact_summary_count",
         "discarded_orphan_artifact_summary_count",
         "discarded_invalid_artifact_summary_count",
+        "selector_correction_calls",
+        "selector_correction_candidate_count",
+        "selector_correction_recovered_count",
     )
     aggregated = {key: sum(int((result.metadata or {}).get(key, 0) or 0) for result in results) for key in keys}
     aggregated["max_active_multimodal"] = max(
@@ -1836,4 +1839,15 @@ def _safe_evidence_telemetry(value: object) -> dict[str, object]:
                 "selector_normalization_fingerprints": normalization_fingerprints,
             }
         )
+    for key in (
+        "selector_correction_calls",
+        "selector_correction_candidate_count",
+        "selector_correction_recovered_count",
+    ):
+        if isinstance(value.get(key), int):
+            telemetry[key] = max(0, value[key])
+    if value.get("selector_correction_outcome") in {
+        "not_needed", "capacity_skipped", "call_failed", "completed",
+    }:
+        telemetry["selector_correction_outcome"] = value["selector_correction_outcome"]
     return telemetry
