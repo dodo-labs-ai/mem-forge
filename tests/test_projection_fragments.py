@@ -51,6 +51,7 @@ from memforge.pipeline.projection_fragments import (
     resolve_projected_agent_claim_fragment,
 )
 from memforge.source_derivation import (
+    aggregate_extraction_metrics,
     SourceUnitDerivationContext,
     memory_extraction_output_payload,
     memory_extraction_result_from_output_payload,
@@ -2105,11 +2106,14 @@ async def test_selector_correction_preserves_success_and_fixed_claims(mode) -> N
     # counters. A replay needs no correction-specific state or another call.
     restored = memory_extraction_result_from_output_payload(memory_extraction_output_payload(result))
     for key in (
-        "selector_correction_calls", "selector_correction_candidate_count",
+        "selector_correction_candidate_count",
         "selector_correction_recovered_count", "selector_correction_outcome",
     ):
         assert restored.metadata[key] == result.metadata[key]
     assert len(restored.memories) == len(result.memories)
+    assert "selector_correction_calls" not in restored.metadata
+    assert aggregate_extraction_metrics([restored])["selector_correction_calls"] == 0
+    assert aggregate_extraction_metrics([result, restored])["selector_correction_calls"] == client.correction_calls
 
 
 @pytest.mark.asyncio
