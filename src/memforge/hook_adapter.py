@@ -94,7 +94,7 @@ MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.59"
+PLUGIN_VERSION = "0.1.60"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -220,11 +220,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--timeout", type=float, default=_env_float("MEMFORGE_HOOK_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
     )
+    parser.add_argument("--preferred-client")
+    parser.add_argument("--preferred-session-id")
+    parser.add_argument("--wait-for-lock", action="store_true")
     args = parser.parse_args(argv)
 
     if args.mode == "worker-run-once":
         try:
-            run_agent_window_worker_once(timeout=args.timeout)
+            run_agent_window_worker_once(
+                timeout=args.timeout,
+                preferred_client=args.preferred_client,
+                preferred_session_id=args.preferred_session_id,
+                wait_for_lock=args.wait_for_lock,
+            )
             return 0
         except Exception as exc:  # Hooks must not crash the coding session.
             print(
@@ -332,25 +340,30 @@ def _emit_additional_context(event_name: str, context: str) -> None:
 def _run_submit_session(payload: dict[str, Any], *, client: str, timeout: float) -> int:
     event_name = _event_name(payload)
     transcript_path = _transcript_path(payload)
+    session_id = str(payload.get("session_id") or "unknown-session")
     trigger = _capture_trigger(event_name)
     if trigger and transcript_path:
         try:
             if _should_request_capture(trigger, transcript_path, client=client, payload=payload):
                 request_session_capture(
                     client=client,
-                    session_id=str(payload.get("session_id") or "unknown-session"),
+                    session_id=session_id,
                     transcript_path=transcript_path,
                     workspace=_workspace(payload),
                     trigger=trigger,
                 )
-                _spawn_agent_window_worker(timeout=_agent_worker_timeout())
+                _spawn_agent_window_worker(
+                    timeout=_agent_worker_timeout(),
+                    preferred_client=client,
+                    preferred_session_id=session_id,
+                )
         except Exception:
             pass
 
     workspace = _workspace(payload)
     request = {
         "client": client,
-        "session_id": str(payload.get("session_id") or "unknown-session"),
+        "session_id": session_id,
         "hook": event_name,
         "workspace": workspace,
         "repo": _repo_name(payload),
@@ -572,12 +585,12 @@ def _recover_incomplete_sessions(
 _NULL_WORKER_LOCK = object()
 
 
-def _acquire_worker_lock(db_path: Path):
-    """Take a non-blocking single-flight lock for the queue.
+def _acquire_worker_lock(db_path: Path, *, wait: bool = False):
+    """Take the queue's single-flight lock, optionally waiting for its owner.
 
     Returns a held lock handle on success, a null sentinel when file locking is
-    unavailable (proceed without a lock), or None when another worker on this
-    host already holds the lock (the caller should exit without processing).
+    unavailable (proceed without a lock), or None when a non-waiting caller
+    finds another worker on this host already holding the lock.
     """
     if fcntl is None:
         return _NULL_WORKER_LOCK
@@ -588,7 +601,8 @@ def _acquire_worker_lock(db_path: Path):
     except OSError:
         return _NULL_WORKER_LOCK
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        operation = fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB
+        fcntl.flock(handle, operation)
     except OSError:
         handle.close()
         return None
@@ -617,17 +631,29 @@ def run_agent_window_worker_once(
     timeout: float,
     queue_db_path: str | Path | None = None,
     max_sessions: int = 5,
+    preferred_client: str | None = None,
+    preferred_session_id: str | None = None,
+    wait_for_lock: bool = False,
 ) -> int:
+    """Process one bounded queue claim, favoring the hook that started this worker."""
+    if bool(preferred_client) != bool(preferred_session_id):
+        raise ValueError("preferred worker identity requires both client and session_id")
     db_path = _agent_queue_db_path(queue_db_path)
     if not db_path.exists():
         return 0
-    lock = _acquire_worker_lock(db_path)
+    lock = _acquire_worker_lock(db_path, wait=wait_for_lock)
     if lock is None:
         # Another worker on this host already holds the queue lock; skip rather
         # than double-process the same pending sessions.
         return 0
     try:
-        return _process_session_captures(db_path, timeout=timeout, max_sessions=max_sessions)
+        return _process_session_captures(
+            db_path,
+            timeout=timeout,
+            max_sessions=max_sessions,
+            preferred_client=preferred_client,
+            preferred_session_id=preferred_session_id,
+        )
     finally:
         _release_worker_lock(lock)
 
@@ -637,23 +663,38 @@ def _claim_pending_sessions(
     *,
     timeout: float,
     max_sessions: int,
+    preferred_client: str | None = None,
+    preferred_session_id: str | None = None,
 ) -> tuple[list[tuple], str]:
     """Atomically claim pending sessions by leasing them, so two workers never collide."""
     now = _now_iso()
     lease_until = _iso_after(timeout + WORKER_LEASE_BUFFER_SECONDS)
     connection.execute("BEGIN IMMEDIATE")
     try:
-        rows = connection.execute(
-            """
-            SELECT client, session_id, transcript_path, workspace, workspace_id,
-                   captured_through, pending_trigger, request_seq
-            FROM session_cursor
-            WHERE capture_pending = 1 AND (lease_until IS NULL OR lease_until < ?)
-            ORDER BY updated_at
-            LIMIT ?
-            """,
-            (now, max_sessions),
-        ).fetchall()
+        if preferred_client is not None and preferred_session_id is not None:
+            rows = connection.execute(
+                """
+                SELECT client, session_id, transcript_path, workspace, workspace_id,
+                       captured_through, pending_trigger, request_seq
+                FROM session_cursor
+                WHERE capture_pending = 1 AND (lease_until IS NULL OR lease_until < ?)
+                ORDER BY CASE WHEN client = ? AND session_id = ? THEN 0 ELSE 1 END, updated_at
+                LIMIT ?
+                """,
+                (now, preferred_client, preferred_session_id, max_sessions),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT client, session_id, transcript_path, workspace, workspace_id,
+                       captured_through, pending_trigger, request_seq
+                FROM session_cursor
+                WHERE capture_pending = 1 AND (lease_until IS NULL OR lease_until < ?)
+                ORDER BY updated_at
+                LIMIT ?
+                """,
+                (now, max_sessions),
+            ).fetchall()
         claimed = []
         for row in rows:
             lease_token = _new_lease_token()
@@ -673,12 +714,25 @@ def _claim_pending_sessions(
     return claimed, now
 
 
-def _process_session_captures(db_path: Path, *, timeout: float, max_sessions: int) -> int:
+def _process_session_captures(
+    db_path: Path,
+    *,
+    timeout: float,
+    max_sessions: int,
+    preferred_client: str | None = None,
+    preferred_session_id: str | None = None,
+) -> int:
     connection = sqlite3.connect(db_path)
     connection.isolation_level = None  # manage the lease claim transaction explicitly
     try:
         _ensure_session_cursor(connection)
-        claimed, _claim_now = _claim_pending_sessions(connection, timeout=timeout, max_sessions=max_sessions)
+        claimed, _claim_now = _claim_pending_sessions(
+            connection,
+            timeout=timeout,
+            max_sessions=max_sessions,
+            preferred_client=preferred_client,
+            preferred_session_id=preferred_session_id,
+        )
         submitted = 0
         for (
             client,
@@ -818,8 +872,17 @@ def _drain_pending_agent_windows_if_present() -> None:
         return
 
 
-def _spawn_agent_window_worker(*, timeout: float) -> None:
-    command = _agent_window_worker_command(timeout=timeout)
+def _spawn_agent_window_worker(
+    *,
+    timeout: float,
+    preferred_client: str | None = None,
+    preferred_session_id: str | None = None,
+) -> None:
+    command = _agent_window_worker_command(
+        timeout=timeout,
+        preferred_client=preferred_client,
+        preferred_session_id=preferred_session_id,
+    )
     subprocess.Popen(  # noqa: S603 - plugin-local worker command is constructed without shell.
         command,
         stdin=subprocess.DEVNULL,
@@ -830,18 +893,36 @@ def _spawn_agent_window_worker(*, timeout: float) -> None:
     )
 
 
-def _agent_window_worker_command(*, timeout: float) -> list[str]:
+def _agent_window_worker_command(
+    *,
+    timeout: float,
+    preferred_client: str | None = None,
+    preferred_session_id: str | None = None,
+) -> list[str]:
+    if bool(preferred_client) != bool(preferred_session_id):
+        raise ValueError("preferred worker identity requires both client and session_id")
     script_path = Path(sys.argv[0]).expanduser()
     if script_path.exists() and script_path.name.startswith("memforge_hook"):
         command = [sys.executable, str(script_path)]
     else:
         command = [sys.executable, "-m", "memforge.hook_adapter"]
-    return [
+    worker_command = [
         *command,
         "worker-run-once",
         "--timeout",
         str(timeout),
+        "--wait-for-lock",
     ]
+    if preferred_client is not None and preferred_session_id is not None:
+        worker_command.extend(
+            [
+                "--preferred-client",
+                preferred_client,
+                "--preferred-session-id",
+                preferred_session_id,
+            ]
+        )
+    return worker_command
 
 
 def _agent_worker_timeout() -> float:
