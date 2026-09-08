@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.revision_client_fixture import RevisionClientFixture
+
 import hashlib
 import json
 import sqlite3
@@ -754,7 +756,7 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
         and fragment.primary_eligible
     )
 
-    class Client:
+    class Client(RevisionClientFixture):
         def request_fits(self, *args, **kwargs):
             return True
 
@@ -893,7 +895,7 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
         and fragment.primary_eligible
     )
 
-    class UpdatedClient:
+    class UpdatedClient(RevisionClientFixture):
         def request_fits(self, *args, **kwargs):
             return True
 

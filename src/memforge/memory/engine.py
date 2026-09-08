@@ -1314,7 +1314,6 @@ class MemoryEngine:
                     retryable=result.failure.terminal_category in {"provider_error", "deadline_exceeded"},
                     commit_attempted=False,
                 )
-            stats["support_revalidation_skipped_memory_count"] = len(skipped_revalidation)
             operations = tuple(result.operations) + tuple(
                 ReconcileOperation(
                     action=ReconcileAction.NOOP,
@@ -1324,6 +1323,12 @@ class MemoryEngine:
                 )
                 for memory_id, reason in skipped_revalidation.items()
             )
+            skipped_revalidation.update({
+                operation.memory_id: operation.reason
+                for operation in result.operations
+                if operation.support_revalidation_skipped and operation.memory_id
+            })
+            stats["support_revalidation_skipped_memory_count"] = len(skipped_revalidation)
             operations += tuple(
                 ReconcileOperation(
                     action=ReconcileAction.DELETE,
@@ -1397,7 +1402,8 @@ class MemoryEngine:
         incumbents_by_id = {memory.id: memory for memory in incumbents}
         operations = tuple(
             replace(operation, memory=assessed_evidence[operation.memory_id][0])
-            if operation.action is ReconcileAction.NOOP and assessed_evidence.get(operation.memory_id)
+            if (operation.action is ReconcileAction.NOOP and not operation.support_revalidation_skipped
+                and assessed_evidence.get(operation.memory_id))
             else operation
             for operation in operations
         )

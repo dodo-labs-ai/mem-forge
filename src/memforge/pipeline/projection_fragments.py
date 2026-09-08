@@ -847,7 +847,9 @@ class ProjectionFragmentCatalog:
             if (fragment.fragment_type.startswith("html-") and fragment.fragment_type != "html-p") or fragment.fragment_type.startswith("canonical-"):
                 row += ({"format": fragment.fragment_type},)
             if fragment.kind is EvidenceFragmentKind.ARTIFACT:
-                row += ({"image_source_observation_id": fragment.anchor.observation_id},)
+                metadata = self.artifact_metadata_by_revision_id.get(fragment.anchor.observation_revision_id, {})
+                row += ({"image_source_observation_id": fragment.anchor.observation_id,
+                         **{key: metadata[key] for key in ("filename", "parent_observation_id") if key in metadata}},)
             (primary if fragment.primary_eligible else required).append(row)
         return {
             "primary_candidates": tuple(primary),

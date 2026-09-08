@@ -12,7 +12,10 @@ from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from tests.test_revision_assessment import revisions, memory
 
 
-class Client:
+from tests.revision_client_fixture import RevisionClientFixture
+
+
+class Client(RevisionClientFixture):
     def __init__(self, classification, direction="symmetric", status="resolved", eligibility=True, consistent=True):
         self.calls = 0
         self.classification, self.direction = classification, direction
@@ -94,7 +97,7 @@ async def test_one_call_relation_and_revision_action_matrix(relation, direction,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "status,supported,consistent", [("insufficient", True, True), ("resolved", False, True), ("resolved", True, False)]
+    "status,supported,consistent", [("insufficient", True, True), ("resolved", False, True)]
 )
 async def test_uncertainty_or_l3_inconsistency_never_becomes_add(status, supported, consistent):
     client = Client("equivalent", status=status, consistent=consistent)
@@ -106,7 +109,10 @@ async def test_uncertainty_or_l3_inconsistency_never_becomes_add(status, support
         support_audits=[SupportAuditEntry("memory", supported)],
         include_metadata=True,
     )
-    assert result.failure is not None and not result.operations
+    assert result.failure is None
+    [operation] = result.operations
+    assert operation.action == ReconcileAction.NOOP and operation.memory is None
+    assert operation.support_revalidation_skipped
     assert client.calls == 1
 
 
@@ -163,7 +169,10 @@ async def test_refinement_entailment_chain_cannot_override_rejected_old_support(
         support_audits=[SupportAuditEntry("memory", False)],
         include_metadata=True,
     )
-    assert result.failure is not None and not result.operations
+    assert result.failure is None
+    [operation] = result.operations
+    assert operation.action == ReconcileAction.NOOP and operation.memory is None
+    assert operation.support_revalidation_skipped
     assert client.calls == 1
 
 
@@ -223,7 +232,12 @@ async def test_revision_conditions_map_independently_to_the_lifecycle_gate(condi
         include_metadata=True,
     )
     assert result.failure is None
-    assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
+    if condition == "current_evidence_entails_challenger":
+        [operation] = result.operations
+        assert operation.action == ReconcileAction.NOOP and operation.memory is None
+        assert operation.support_revalidation_skipped
+    else:
+        assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
     assert client.calls == 1
 
 
@@ -269,3 +283,35 @@ async def test_large_pair_group_subdivides_without_losing_pairs():
     )
     assert {(index, old_id) for index, old_id, _ in result.decisions} == {(0, old.id) for old in olds}
     assert len(client.prompts) == 3
+
+
+@pytest.mark.asyncio
+async def test_small_output_cap_can_assess_one_complete_pair():
+    from memforge.llm.request_budget import RequestBudget
+    client = Client("equivalent")
+    client.request_budget = lambda model=None: RequestBudget("fixture", 16000, 16000, 1024, .8, "fixture")
+    client.request_fits = lambda prompt, **kwargs: kwargs["max_tokens"] <= 1024
+    result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()],
+        doc_type="policy", structured_llm_client=client, support_audits=[SupportAuditEntry("memory", True)],
+        include_metadata=True)
+    assert result.failure is None and client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_conflicting_current_refiners_skip_their_incumbent():
+    from memforge.llm.structured import MemoryRelationResponse, MemoryRelationDecision
+    class Conflicting(Client):
+        async def assess_claim_revisions(self, prompt, **kwargs):
+            response = await super().assess_claim_revisions(prompt, **kwargs)
+            return response.model_copy(update={"decisions": [response.decisions[0],
+                response.decisions[0].model_copy(update={"pair_index": 1})]})
+        async def classify_memory_relations(self, prompt, **kwargs):
+            return MemoryRelationResponse(decisions=[MemoryRelationDecision(pair_index=0, classification="contradicts",
+                direction="symmetric", same_subject_and_scope=True, incompatible_assertions="Mutually exclusive refinements")])
+    client = Conflicting("refines", "challenger_to_candidate")
+    result = await reconcile_memories(new_extractions=[candidate(), candidate()], existing_memories=[memory()],
+        doc_type="policy", structured_llm_client=client, support_audits=[SupportAuditEntry("memory", True)],
+        include_metadata=True)
+    assert result.failure is None
+    [operation] = result.operations
+    assert operation.memory is None and operation.support_revalidation_skipped

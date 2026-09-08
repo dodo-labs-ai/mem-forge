@@ -168,8 +168,11 @@ class RevisionAssessmentContext:
         self.full_fragments = tuple(f for revision in self.current.values() for f in self.index(revision).fragments)
         self._delta = None
         self.structural_context = {}
-        self.canonical_fields = {revision.id: canonical_record_field_ranges(revision) for revision in self.current.values()
-                                 if revision.evidence_profile and revision.evidence_profile.name == "canonical-record"}
+        self.canonical_fields = {
+            revision.id: canonical_record_field_ranges(revision)
+            for revision in (*self.previous.values(), *self.current.values())
+            if revision.evidence_profile and revision.evidence_profile.name == "canonical-record"
+        }
         for revision in self.current.values():
             if revision.evidence_profile and revision.evidence_profile.name == "markdown-structural":
                 units = revision_structural_ranges(revision)
@@ -178,11 +181,52 @@ class RevisionAssessmentContext:
                     (unit.start, unit.end, identity[1]) for unit, identity in zip(units, identities, strict=True)
                 )
 
+    def canonical_context(self, fragment):
+        """Keep field and event identity on both sides of a canonical delta."""
+        anchor = fragment.anchor
+        fields = self.canonical_fields.get(anchor.observation_revision_id, ())
+        owner = next((item for item in fields
+                      if item.start <= (anchor.range_start or 0) < item.end), None)
+        if owner is None:
+            return {}
+        parent = owner.descriptor.json_pointer.rsplit("/", 1)[0]
+        return {"field": owner.descriptor.json_pointer, "context": {
+            item.descriptor.json_pointer: item.value
+            for item in fields if item.descriptor.contextual
+            and item.descriptor.json_pointer.rsplit("/", 1)[0] in {"", parent}
+        }}
+
     def ancestor_fragments(self, fragments):
         """Exact current heading Evidence, using the existing structural ancestry."""
         selected = {}
         for fragment in fragments:
             anchor = fragment.anchor
+            fields = self.canonical_fields.get(anchor.observation_revision_id, ())
+            owner = next((item for item in fields
+                          if item.start <= (anchor.range_start or 0) < item.end), None)
+            if owner is not None:
+                # Nested Markdown has the same selectable heading ancestry as a
+                # Markdown document, bounded to its concrete canonical field.
+                stack = []
+                for candidate in self.index(self.current[anchor.observation_id]).fragments:
+                    if (candidate.fragment_type == "canonical-markdown-heading"
+                            and owner.start <= (candidate.anchor.range_start or 0)
+                            <= (anchor.range_start or 0) < owner.end):
+                        level = len(candidate.presentation_text) - len(candidate.presentation_text.lstrip("#"))
+                        while stack and stack[-1][0] >= level:
+                            stack.pop()
+                        stack.append((level, candidate))
+                for _, heading in stack:
+                    selected[heading.anchor] = heading
+                parent = owner.descriptor.json_pointer.rsplit("/", 1)[0]
+                contexts = [item for item in fields if item.descriptor.contextual
+                            and item.descriptor.json_pointer.rsplit("/", 1)[0] in {"", parent}]
+                for candidate in self.full_fragments:
+                    if candidate.anchor.observation_revision_id == anchor.observation_revision_id and any(
+                        item.start == candidate.anchor.range_start and item.end == candidate.anchor.range_end
+                        for item in contexts
+                    ):
+                        selected[candidate.anchor] = candidate
             headings = next((headings for start, end, headings in self.structural_context.get(
                 anchor.observation_revision_id, ()) if start <= (anchor.range_start or 0) < end), ())
             for heading in headings:
@@ -318,7 +362,8 @@ class RevisionAssessmentContext:
                 continue
             ranges = _changed_ranges(current, old) if current else None
             removed.extend(
-                {"observation_id": key, "revision_id": old.id, "text": f.presentation_text}
+                {"observation_id": key, "revision_id": old.id, "text": f.presentation_text,
+                 **self.canonical_context(f)}
                 for f in self.index(old).fragments
                 if _in_ranges(f, ranges)
             )

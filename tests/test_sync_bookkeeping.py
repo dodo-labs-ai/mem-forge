@@ -3811,6 +3811,9 @@ class ProjectionBatchRecordingExtractor(RecordingMemoryExtractor):
 
 
 class ProjectionFragmentRecordingExtractor(RecordingMemoryExtractor):
+    def fragment_output_tokens(self, catalog):
+        return self.max_tokens
+
     def __init__(self, *, fail_if_called: bool = False) -> None:
         super().__init__()
         self.fail_if_called = fail_if_called

@@ -175,7 +175,11 @@ class RevisionWorkExecutor:
         return {
             "input_mode": scope.mode,
             "current": scope.context.model_payload(catalog),
-            "removed_historical": [[part["ref"], part["text"]] for part in removed],
+            "removed_historical": [
+                [part["ref"], part["text"], *(
+                    [{"field": part["field"], "context": part["context"]}] if "field" in part else []
+                )] for part in removed
+            ],
             "removed_observations": {
                 alias: {"observation_id": observation, "revision_id": revision}
                 for (observation, revision), alias in aliases.items()

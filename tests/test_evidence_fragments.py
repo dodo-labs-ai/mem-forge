@@ -184,7 +184,7 @@ print("safe")
         "markdown-heading",
         "markdown-paragraph",
         "markdown-list-item",
-        "markdown-table-row",
+        "markdown-table",
         "markdown-blockquote",
         "markdown-code-block",
     }
@@ -248,8 +248,8 @@ def test_nested_html_and_table_rows_remain_complete_and_non_overlapping() -> Non
         (_authority(revision, EvidenceRole.PRIMARY),),
     )
 
-    assert [item.fragment_type for item in catalog.fragments] == ["html-li", "html-tr"]
-    assert [item.presentation_text for item in catalog.fragments] == ["Outer Inner", "A & B C"]
+    assert [item.fragment_type for item in catalog.fragments] == ["html-li", "html-table"]
+    assert [item.presentation_text for item in catalog.fragments] == ["Outer Inner", "<table><tr><td>A &amp; B</td><td>C</td></tr></table>"]
     first, second = catalog.fragments
     assert first.anchor.range_end <= second.anchor.range_start
 
@@ -328,8 +328,8 @@ def test_unsafe_tag_text_inside_attribute_does_not_reclassify_the_tag() -> None:
         ("# Keep <em>A7</em> enabled.", "markdown-heading", "# Keep A7 enabled."),
         (
             "| <em>A7</em> | B |\n| - | - |",
-            "markdown-table-row",
-            "| A7 | B |",
+            "markdown-table",
+            "| A7 | B |\n| - | - |",
         ),
     ],
 )
@@ -379,7 +379,7 @@ def test_unsafe_inline_html_makes_the_enclosing_list_item_unselectable() -> None
         ),
         (
             "1. Keep <em>A7</em>\n   enabled.",
-            "markdown-list-item",
+            "markdown-ordered-list",
             "1. Keep A7\n   enabled.",
         ),
     ],
@@ -426,8 +426,8 @@ def test_duplicate_inline_html_table_cells_map_left_to_right() -> None:
     )
 
     assert catalog.errors == ()
-    table_row = next(item for item in catalog.fragments if item.fragment_type == "markdown-table-row")
-    assert table_row.presentation_text == "| A | A |"
+    table_row = next(item for item in catalog.fragments if item.fragment_type == "markdown-table")
+    assert table_row.presentation_text == "| A | A |\n| - | - |"
 
 
 @pytest.mark.parametrize(
@@ -797,3 +797,53 @@ def test_out_of_bounds_authority_range_fails_closed() -> None:
     assert catalog.fragments == ()
     assert catalog.errors[0].code is FragmentCompilationErrorCode.INVALID_AUTHORITY_RANGE
     assert catalog.errors[0].fatal is True
+
+
+@pytest.mark.parametrize("content,kind", [
+    ("| Field | Sandbox | Small Box |\n| --- | --- | --- |\n| Visibility | Yes | No |", "markdown-table"),
+    ("1. Stop.\n2. Update.\n3. Start.", "markdown-ordered-list"),
+    ("- For US payroll:\n  1. Stop.\n  2. Update.", "markdown-list-item"),
+    ('<table><tr><th rowspan="2">Scope</th><th colspan="2">Approval</th></tr>'
+     '<tr><td>US</td><td>Two</td></tr></table>', "html-table"),
+    ('<ol start="4"><li>Stop</li><li>Update</li></ol>', "html-ol"),
+    ('<dl><dt>Cedar</dt><dd>US regular payroll</dd><dt>Birch</dt><dd>EU payroll</dd></dl>', "html-dl"),
+    ('<figure><img src="diagram.png" alt="flow"><figcaption>Approval flow</figcaption></figure>', "html-figure"),
+    ('<pre><code>if approved:\n    submit()\nelse:\n    reject()</code></pre>', "html-pre"),
+    ('<blockquote><pre>if approved:\n    submit()</pre></blockquote>', "html-blockquote"),
+    ('<ul><li>US policy:<table><tr><th>US</th><th>EU</th></tr>'
+     '<tr><td>2</td><td>1</td></tr></table></li></ul>', "html-li"),
+])
+def test_complete_structural_units_keep_interpretation(content, kind):
+    revision = _revision(content, MARKDOWN_PROFILE)
+    catalog = compile_fragments(revision, (_authority(revision, EvidenceRole.PRIMARY),))
+    assert not catalog.errors
+    [fragment] = catalog.fragments
+    assert fragment.fragment_type == kind
+    raw = content[fragment.anchor.range_start:fragment.anchor.range_end]
+    assert fragment.presentation_text == raw
+    assert fragment.raw_content_sha256 == hashlib.sha256(raw.encode()).hexdigest()
+
+
+def test_changelog_descriptions_reuse_text_parser_without_splitting_tables():
+    import json
+    from memforge.pipeline.evidence_fragments import canonical_record_field_ranges
+    before = "Earlier summary.\n\n| Country | Approval |\n| --- | --- |\n| US | Two |"
+    after = "Updated summary.\n\n| Country | Approval |\n| --- | --- |\n| US | One |"
+    content = json.dumps({"created": "2026-09-08", "items": [
+        {"field": "description", "fromString": before, "toString": after},
+        {"field": "status", "fromString": "Open", "toString": "Done"},
+    ]})
+    revision = _revision(content, _canonical_profile("jira-changelog"))
+    fields = canonical_record_field_ranges(revision)
+    assert {f.descriptor.json_pointer for f in fields} == {
+        "/created", "/items/0/field", "/items/0/fromString", "/items/0/toString",
+        "/items/1/field", "/items/1/fromString", "/items/1/toString",
+    }
+    catalog = compile_fragments(revision, (_authority(revision, EvidenceRole.PRIMARY),))
+    assert not catalog.errors
+    tables = [f for f in catalog.fragments if f.fragment_type == "canonical-markdown-table"]
+    assert len(tables) == 2
+    assert all("Country" in f.presentation_text and "Approval" in f.presentation_text for f in tables)
+    for fragment in catalog.fragments:
+        raw = content[fragment.anchor.range_start:fragment.anchor.range_end]
+        assert fragment.raw_content_sha256 == hashlib.sha256(raw.encode()).hexdigest()

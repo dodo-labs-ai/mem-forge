@@ -241,6 +241,12 @@ PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic kno
 <source_type>{source_type}</source_type>
 <doc_type>{doc_type}</doc_type>
 Catalog rows are [ref, exact source text, optional metadata]. Headings are ordinary selectable Fragments.
+Preserve table column/row associations, list order, code indentation and explicit exceptions.
+A table ref contains the complete table; read its headers before asserting a cell value.
+A figure preserves its image link and caption together. Only a supplied image Artifact
+ref proves image contents; a caption or URL alone never proves unseen image details.
+Canonical fromString is the previous value; toString is the new value. Select the
+field-name/time refs when needed to state the change accurately.
 Structural groups describe ancestry, not additional Evidence. When a heading defines claim scope, select its current ref as Required.
 Only the following application-owned Evidence Fragments may support a Memory:
 <evidence_fragment_catalog digest="{catalog_digest}">
@@ -279,6 +285,15 @@ class MemoryExtractor:
     RuntimeProvider. The ``api_key`` construction path remains only for
     provider-neutral standalone library use.
     """
+
+    def fragment_output_tokens(self, catalog) -> int:
+        """Reserve output for this request's authorized content, not a full document."""
+        requested = 512 + sum(
+            max(768, len(fragment.presentation_text) // 2)
+            for fragment in catalog.fragments if fragment.primary_eligible
+        )
+        budget = self.structured_llm_client.request_budget(self.model)
+        return budget.output_reserve(min(self.max_tokens, requested))
 
     def __init__(
         self,
@@ -691,7 +706,7 @@ class MemoryExtractor:
             selected_images = revision_context.fitting_images(
                 selected, full_prompt, client=self.structured_llm_client,
                 response_format=ProjectionFragmentMemoryExtractionResponse,
-                max_tokens=self.max_tokens, model=self.model,
+                max_tokens=self.fragment_output_tokens(selected), model=self.model,
             )
             if selected_images is not None:
                 catalog, prompt, input_mode = selected, full_prompt, "full"
@@ -701,7 +716,7 @@ class MemoryExtractor:
                 selected_images = revision_context.fitting_images(
                     catalog, prompt, client=self.structured_llm_client,
                     response_format=ProjectionFragmentMemoryExtractionResponse,
-                    max_tokens=self.max_tokens, model=self.model,
+                    max_tokens=self.fragment_output_tokens(catalog), model=self.model,
                 )
             if selected_images is None:
                 return MemoryExtractionResult(error_type="evidence_catalog_unusable",
@@ -709,7 +724,7 @@ class MemoryExtractor:
                                               metadata={"catalog_error_codes": ["catalog_too_large"]})
             images = selected_images
         if not self.structured_llm_client.request_fits(prompt, response_format=ProjectionFragmentMemoryExtractionResponse,
-            max_tokens=self.max_tokens, model=self.model, images=images):
+            max_tokens=self.fragment_output_tokens(catalog), model=self.model, images=images):
             return MemoryExtractionResult(error_type="input_capacity_exceeded", error="planned extraction request exceeds configured capability")
         started = perf_counter()
         metrics = {
@@ -726,7 +741,7 @@ class MemoryExtractor:
         }
         try:
             call_kwargs = {
-                "max_tokens": self.max_tokens,
+                "max_tokens": self.fragment_output_tokens(catalog),
                 "model": self.model,
             }
             if images:
@@ -763,7 +778,7 @@ class MemoryExtractor:
 
         candidates, correction_metrics = await correct_fragment_selectors_once(
             response.memories, catalog=catalog, client=self.structured_llm_client,
-            extraction_prompt=prompt, max_tokens=self.max_tokens, model=self.model, images=images,
+            extraction_prompt=prompt, max_tokens=self.fragment_output_tokens(catalog), model=self.model, images=images,
         )
         metrics.update(correction_metrics)
         metrics["structured_llm_calls"] += correction_metrics["selector_correction_calls"]

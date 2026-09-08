@@ -261,3 +261,35 @@ def test_actual_extraction_allowance_is_part_of_reuse_identity():
     original = revision_inference_capability_hash(None, extraction_model="model-a", extraction_max_tokens=4096)
     assert original != revision_inference_capability_hash(None, extraction_model="model-a", extraction_max_tokens=8192)
     assert original != revision_inference_capability_hash(None, extraction_model="model-b", extraction_max_tokens=4096)
+
+
+def test_changelog_delta_keeps_before_after_field_identity_and_event_context():
+    import hashlib
+    from dataclasses import replace
+    from memforge.source_representation import representation_profile_for_observation_contract
+    from memforge.pipeline.revision_work import RevisionWorkExecutor
+    from types import SimpleNamespace
+    old, new = revisions("old", "new")
+    profile = representation_profile_for_observation_contract(source_type="jira", observation_type="changelog")
+    def canonical(projection, value):
+        revision = projection.observation_revisions[0]
+        body = json.dumps({"created": "2026-09-08", "items": [
+            {"field": "description", "fromString": "# US payroll\n\nTwo approvers.",
+             "toString": "# US payroll\n\n" + value}]})
+        revision = replace(revision, content=body, semantic_hash=hashlib.sha256(body.encode()).hexdigest(), evidence_profile=profile)
+        return replace(projection, observation_revisions=(revision, *projection.observation_revisions[1:]))
+    old, new = canonical(old, "Three approvers."), canonical(new, "One approver.")
+    context = RevisionAssessmentContext(projection=new, base=old, access_context_hash="scope")
+    current, removed = context.delta()
+    removed_claim = next(f for f in removed if f["text"] == "Three approvers.")
+    assert removed_claim["field"] == "/items/0/toString"
+    assert removed_claim["context"] == {"/created": "2026-09-08", "/items/0/field": "description"}
+    fragment = next(f for f in current if f.presentation_text == "One approver.")
+    ancestors = context.ancestor_fragments([fragment])
+    assert {f.presentation_text for f in ancestors} == {"# US payroll", "description", "2026-09-08"}
+    executor = object.__new__(RevisionWorkExecutor)
+    scope = SimpleNamespace(mode="delta", context=context)
+    payload = executor._source_payload(scope, context.catalog(()), [{**removed_claim, "ref": "d000001"}])
+    assert payload["removed_historical"][0][2] == {
+        "field": "/items/0/toString", "context": removed_claim["context"],
+    }

@@ -12,6 +12,14 @@ import litellm
 logger = logging.getLogger(__name__)
 
 
+def metadata_model(model: str) -> str:
+    """Route aliases identify models; all capacity numbers remain SDK-owned."""
+    return {
+        "sap/anthropic--claude-4.6-sonnet": "bedrock/anthropic.claude-sonnet-4-6",
+    }.get(model, model)
+
+
+
 @dataclass(frozen=True)
 class RequestBudget:
     model: str
@@ -25,7 +33,7 @@ class RequestBudget:
     @classmethod
     def resolve(cls, model, config):
         try:
-            info = litellm.get_model_info(model)
+            info = litellm.get_model_info(metadata_model(model))
         except Exception:
             info = {}
 
@@ -57,8 +65,12 @@ class RequestBudget:
 
     @property
     def identity(self):
-        payload = {"version": "request-budget-v2", **asdict(self)}
+        payload = {"version": "request-budget-v3", **asdict(self)}
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def output_reserve(self, requested: int) -> int:
+        """Bound variable output while leaving space for the request itself."""
+        return min(requested, self.output_limit, max(1, self.context_limit // 4))
 
     def available_input(self, output_tokens: int, *, reserve_correction: bool = True) -> int:
         if not 0 < output_tokens <= self.output_limit:

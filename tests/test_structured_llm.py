@@ -2402,3 +2402,21 @@ def test_correction_consumes_its_existing_reserve(monkeypatch):
     monkeypatch.setattr('memforge.llm.structured.litellm.token_counter', lambda **kwargs: 7500)
     assert not client.request_fits('correction', response_format=RevisionSupportResponse, max_tokens=1000)
     assert client.request_fits('correction', response_format=RevisionSupportResponse, max_tokens=1000, reserve_correction=False)
+
+
+def test_sap_route_uses_sdk_bedrock_metadata_and_preserves_operator_caps(monkeypatch):
+    seen = []
+    def info(model):
+        seen.append(model)
+        return {"max_input_tokens": 1000000, "max_output_tokens": 64000}
+    monkeypatch.setattr("memforge.llm.structured.litellm.get_model_info", info)
+    config = StructuredLlmConfig(model="sap/anthropic--claude-4.6-sonnet", base_url=None,
+        api_key=None, timeout_s=1, max_input_tokens=10000, context_window_tokens=16000, max_output_tokens=1024)
+    client = LiteLlmStructuredClient(config)
+    budget = client.request_budget()
+    assert seen == ["bedrock/anthropic.claude-sonnet-4-6"]
+    assert (budget.input_limit, budget.context_limit, budget.output_limit) == (10000, 16000, 1024)
+    from memforge.pipeline.memory_extractor import MemoryExtractor
+    from types import SimpleNamespace
+    catalog = SimpleNamespace(fragments=[SimpleNamespace(primary_eligible=True, presentation_text="Small claim.")])
+    assert MemoryExtractor(structured_llm_client=client, model=config.model).fragment_output_tokens(catalog) == 1024

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
 
-from memforge.llm.structured import StructuredLlmError, structured_llm_max_concurrent
+from memforge.llm.structured import MemoryRelationResponse, StructuredLlmError, structured_llm_max_concurrent
 from memforge.memory.evidence import RelationDirection
 from memforge.models import Memory
 from memforge.pipeline.bounded_work import collect_bounded
@@ -295,9 +295,11 @@ class StructuredMemoryPairClassifier:
                 batch_indices = tuple(index for index, _ in indexed_pairs)
                 request_prompt = prompt
                 for attempt in range(2):
+                    if not self._request_fits(request_prompt, len(indexed_pairs), reserve_correction=not attempt):
+                        raise MemoryPairClassificationError("one complete pair request exceeds configured capability")
                     response = await self._client.classify_memory_relations(
                         request_prompt,
-                        max_tokens=self._policy.max_output_tokens,
+                        max_tokens=self._output_tokens(len(indexed_pairs)),
                         model=self._model,
                     )
                     raw_decisions = tuple(response.decisions)
@@ -384,6 +386,17 @@ class StructuredMemoryPairClassifier:
             prompt_chars=sum(len(prompt) for _, prompt in batches),
         )
 
+    def _output_tokens(self, count: int) -> int:
+        return self._client.request_budget(self._model).output_reserve(
+            min(self._policy.max_output_tokens, 512 + 768 * count)
+        )
+
+    def _request_fits(self, prompt: str, count: int, *, reserve_correction: bool = True) -> bool:
+        return self._client.request_fits(
+            prompt, response_format=MemoryRelationResponse, model=self._model,
+            max_tokens=self._output_tokens(count), reserve_correction=reserve_correction,
+        )
+
     def _batches(
         self,
         pairs: tuple[MemoryPair, ...],
@@ -400,7 +413,7 @@ class StructuredMemoryPairClassifier:
                         max_content_chars=self._policy.max_memory_content_chars,
                     )
                 )
-                if len(prompt) <= self._policy.max_prompt_chars:
+                if len(prompt) <= self._policy.max_prompt_chars and self._request_fits(prompt, len(indexed_pairs)):
                     batches.append((indexed_pairs, prompt))
                     start = end
                     break
