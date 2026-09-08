@@ -9528,7 +9528,7 @@ async def test_reused_evidence_advances_only_support_validation_plan_across_revi
     (False, False, "support"), (True, False, "support"), (False, True, "support"),
     (True, False, "claim"), (False, True, "claim"),
 ])
-async def test_insufficient_support_preserves_old_baseline_while_other_memory_and_source_advance(
+async def test_insufficient_support_preserves_its_baseline_and_resumes_after_source_advances(
     db, equivalent_candidate, mixed_supports, skip_stage,
 ):
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
@@ -9560,6 +9560,7 @@ async def test_insufficient_support_preserves_old_baseline_while_other_memory_an
         async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
             assert response_format is SupportAssessmentResponse
             payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
+            self.assessments.append(payload)
             rows = payload["current"]["primary_candidates"]
             results = []
             for claim in payload["claims"]:
@@ -9567,11 +9568,17 @@ async def test_insufficient_support_preserves_old_baseline_while_other_memory_an
                 if skip:
                     skip = not mixed_supports or not self.skipped_claim_statuses
                     self.skipped_claim_statuses.append("insufficient" if skip else "supported")
+                primary_ref = next((ref for ref, text, *_ in rows if text == claim["claim"]), None)
+                status = "insufficient" if skip else ("supported" if primary_ref else "unsupported")
                 results.append({
                     "work_id": claim["work_id"],
-                    "status": "insufficient" if skip else "supported",
-                    "reason": "Interpretation unresolved" if skip else "Exact current statement supports the claim",
-                    "primary_ref": None if skip else next(ref for ref, text, *_ in rows if text == claim["claim"]),
+                    "status": status,
+                    "reason": {
+                        "insufficient": "Interpretation unresolved",
+                        "supported": "Exact current statement supports the claim",
+                        "unsupported": "The alternate statement was removed",
+                    }[status],
+                    "primary_ref": None if skip else primary_ref,
                     "required_refs": [],
                 })
             return SupportAssessmentResponse.model_validate({"results": results})
@@ -9590,6 +9597,7 @@ async def test_insufficient_support_preserves_old_baseline_while_other_memory_an
     await db.enable_lifecycle_gate("src-1")
     adapters = build_sqlite_adapters(db, object())
     client = SelectiveSupportClient()
+    client.assessments = []
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters), db=db,
         memory_store=_OutboxDrainer(db), structured_llm_client=client,
@@ -9691,3 +9699,28 @@ async def test_insufficient_support_preserves_old_baseline_while_other_memory_an
     assert not await db.db.execute_fetchall("SELECT id FROM lifecycle_reviews")
     assert stats["pending_review"] == 0
     assert stats["support_revalidation_skipped_memory_count"] == 1
+
+
+    client.skip_claim = False
+    client.assessments.clear()
+    fourth, resumed_stats = await advance(third, 4)
+    resumed = await db.get_active_memory_support_evidence(skipped.id, source_id="src-1")
+    assert resumed
+    assert {part.validation_unit_revision_id for part in resumed} == {fourth.source_unit_revisions[0].id}
+    assert {part.validation_plan_id for part in resumed}.isdisjoint(
+        {part.validation_plan_id for part in old_support}
+    )
+    assert resumed_stats["support_revalidation_skipped_memory_count"] == 0
+    assert (await db.get_current_source_unit_revision(first.source_units[0].id)).id == fourth.source_unit_revisions[0].id
+    assert len(await db.db.execute_fetchall("SELECT id FROM memories")) == 2
+    assert not await db.db.execute_fetchall("SELECT id FROM lifecycle_reviews")
+
+    # The skipped Support compares v2→v4, while the other Memory compares v3→v4.
+    for claim, old_edition in ((skipped_claim, "Edition 2."), (continued_claim, "Edition 3.")):
+        assert any(
+            any(item["claim"] == claim for item in payload["claims"])
+            and any(text == old_edition for _, text, *_ in payload["removed_historical"])
+            for payload in client.assessments
+        )
+    for unit_id, unit in old_units.items():
+        assert await db.get_evidence_unit(unit_id) == unit
