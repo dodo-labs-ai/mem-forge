@@ -640,8 +640,16 @@ class SqliteRelationalStore:
     async def get_document(self, doc_id: str) -> DocumentRecord | None:
         return await self._db.get_document(doc_id)
 
-    async def delete_projected_document(self, doc_id: str) -> None:
-        await self._db.delete_projected_document(doc_id)
+    async def delete_projected_document(
+        self,
+        doc_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
+        await self._db.delete_projected_document(
+            doc_id,
+            source_activity=source_activity,
+        )
 
     async def rebaseline_source_lifecycle(
         self,
@@ -658,18 +666,26 @@ class SqliteRelationalStore:
         self,
         old_doc_id: str,
         new_doc_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> None:
-        await self._db.rebind_projected_document_support(old_doc_id, new_doc_id)
+        await self._db.rebind_projected_document_support(
+            old_doc_id,
+            new_doc_id,
+            source_activity=source_activity,
+        )
 
     async def record_source_projection(
         self,
         projection: SourceProjection,
         *,
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
     ) -> None:
         await self._db.record_source_projection(
             projection,
             expected_source_activity_epoch=expected_source_activity_epoch,
+            source_activity=source_activity,
         )
 
     async def get_source_projection(self, run_id: str) -> SourceProjection | None:
@@ -1115,6 +1131,7 @@ class SqliteRelationalStore:
         derivation_context_identity_hash: str | None = None,
         required_derivation_work_ids: tuple[str, ...] = (),
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None:
         await self._db.apply_source_projection_lifecycle(
@@ -1125,6 +1142,7 @@ class SqliteRelationalStore:
             derivation_context_identity_hash=(derivation_context_identity_hash),
             required_derivation_work_ids=required_derivation_work_ids,
             expected_source_activity_epoch=expected_source_activity_epoch,
+            source_activity=source_activity,
             runtime_bundle=runtime_bundle,
         )
 

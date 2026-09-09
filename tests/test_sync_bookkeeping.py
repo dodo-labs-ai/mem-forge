@@ -1178,7 +1178,9 @@ async def test_source_sync_run_waits_for_exact_predecessor_activity(db: Database
 
 
 @pytest.mark.asyncio
-async def test_source_sync_run_does_not_wait_for_unrelated_activity(db: Database):
+async def test_source_sync_run_waits_for_any_active_source_writer_without_consuming_attempt(
+    db: Database,
+):
     source_id = "src-unrelated-handoff"
     await db.upsert_source(
         id=source_id,
@@ -1202,6 +1204,22 @@ async def test_source_sync_run_does_not_wait_for_unrelated_activity(db: Database
         predecessor_activity_id="laj-expected",
     )
 
+    blocked = await db.lease_next_source_sync_run(
+        worker_id="worker-unrelated",
+        lease_seconds=60,
+    )
+    unchanged = await db.get_source_sync_run(run.run_id)
+
+    assert blocked is None
+    assert unchanged is not None
+    assert unchanged.status == "pending"
+    assert unchanged.lease_attempt_count == 0
+    assert unchanged.recovery_count == 0
+
+    assert await db.release_source_activity(
+        activity_id="laj-other",
+        capability="laj-other",
+    )
     leased = await db.lease_next_source_sync_run(
         worker_id="worker-unrelated",
         lease_seconds=60,
@@ -1209,6 +1227,7 @@ async def test_source_sync_run_does_not_wait_for_unrelated_activity(db: Database
 
     assert leased is not None
     assert leased.run_id == run.run_id
+    assert leased.lease_attempt_count == 1
 
 
 @pytest.mark.asyncio
@@ -1259,6 +1278,92 @@ async def test_lease_next_source_sync_run_recovers_expired_run_without_new_run(d
     assert recovered.lease_owner == "worker-b"
     assert recovered.lease_attempt_count == 2
     assert recovered.recovery_count == 1
+
+
+@pytest.mark.asyncio
+async def test_source_sync_run_recovery_waits_for_later_source_activity_expiry(
+    db: Database,
+) -> None:
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    source_id = "src-lease-skew"
+    await db.upsert_source(
+        id=source_id,
+        type="confluence",
+        name="Lease skew",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    enqueued = await db.enqueue_source_sync_run(
+        source_id=source_id,
+        workspace_id="workspace-a",
+        trigger="manual",
+    )
+
+    first = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert first is not None
+    assert first.lease_expires_at == now + timedelta(seconds=60)
+    activity = await db.db.execute_fetchall(
+        "SELECT id, source_id, kind, epoch, capability, lease_until FROM source_activity_leases WHERE source_id = ?",
+        (source_id,),
+    )
+    assert [dict(row) for row in activity] == [
+        {
+            "id": enqueued.run_id,
+            "source_id": source_id,
+            "kind": SourceActivityKind.SYNC.value,
+            "epoch": 0,
+            "capability": "1",
+            "lease_until": first.lease_expires_at.isoformat(),
+        }
+    ]
+
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ((now + timedelta(seconds=70)).isoformat(), enqueued.run_id),
+    )
+    await db.db.commit()
+
+    blocked = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=61),
+    )
+    unchanged = await db.get_source_sync_run(enqueued.run_id)
+
+    assert blocked is None
+    assert unchanged is not None
+    assert unchanged.lease_owner == "worker-a"
+    assert unchanged.lease_attempt_count == 1
+    assert unchanged.recovery_count == 0
+
+    recovered = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        workspace_id="workspace-a",
+        lease_seconds=60,
+        now=now + timedelta(seconds=71),
+    )
+    assert recovered is not None
+    assert recovered.lease_owner == "worker-b"
+    assert recovered.lease_attempt_count == 2
+    assert recovered.recovery_count == 1
+    recovered_activity = await db.db.execute_fetchall(
+        "SELECT id, capability, lease_until FROM source_activity_leases WHERE source_id = ?",
+        (source_id,),
+    )
+    assert [dict(row) for row in recovered_activity] == [
+        {
+            "id": enqueued.run_id,
+            "capability": "2",
+            "lease_until": recovered.lease_expires_at.isoformat(),
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1338,6 +1443,25 @@ async def test_heartbeat_source_sync_run_extends_only_current_worker_lease(db: D
     assert right_worker is True
     assert after_right_worker is not None
     assert after_right_worker.lease_expires_at == now + timedelta(seconds=70)
+    activity = await db.db.execute_fetchall(
+        "SELECT capability, lease_until FROM source_activity_leases WHERE id = ?",
+        (enqueued.run_id,),
+    )
+    assert [dict(row) for row in activity] == [
+        {
+            "capability": str(leased.lease_attempt_count),
+            "lease_until": after_right_worker.lease_expires_at.isoformat(),
+        }
+    ]
+
+    expired = await db.heartbeat_source_sync_run(
+        enqueued.run_id,
+        worker_id="worker-a",
+        lease_attempt_count=leased.lease_attempt_count,
+        lease_seconds=60,
+        now=now + timedelta(seconds=71),
+    )
+    assert expired is False
 
 
 @pytest.mark.asyncio
@@ -1627,6 +1751,10 @@ async def test_fail_source_sync_run_requeues_retryable_failure_after_backoff(db:
         lease_seconds=60,
         now=now + timedelta(seconds=6),
     )
+    assert not await db.db.execute_fetchall(
+        "SELECT 1 FROM source_activity_leases WHERE id = ?",
+        (enqueued.run_id,),
+    )
     retried = await db.lease_next_source_sync_run(
         worker_id="worker-b",
         workspace_id="workspace-a",
@@ -1644,6 +1772,53 @@ async def test_fail_source_sync_run_requeues_retryable_failure_after_backoff(db:
     assert retried is not None
     assert retried.run_id == enqueued.run_id
     assert retried.lease_attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fail_source_sync_run_validation_does_not_leave_a_write_transaction(
+    db: Database,
+) -> None:
+    now = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
+    source_id = "src-invalid-terminal-state"
+    await db.upsert_source(
+        id=source_id,
+        type="github_repo",
+        name="Repo",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
+    )
+    enqueued = await db.enqueue_source_sync_run(source_id=source_id)
+    leased = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert leased is not None
+
+    with pytest.raises(ValueError, match="failed or partial"):
+        await db.fail_source_sync_run(
+            enqueued.run_id,
+            worker_id="worker-a",
+            lease_attempt_count=leased.lease_attempt_count,
+            error_message="invalid state",
+            final_state=SyncState(
+                source=source_id,
+                last_sync_status="success",
+            ),
+            retryable=False,
+            failed_at=now + timedelta(seconds=1),
+        )
+
+    unchanged = await db.get_source_sync_run(enqueued.run_id)
+    assert db.db.in_transaction is False
+    assert unchanged is not None
+    assert unchanged.status == "running"
+    assert unchanged.lease_owner == "worker-a"
+    assert await db.db.execute_fetchall(
+        "SELECT 1 FROM source_activity_leases WHERE id = ?",
+        (enqueued.run_id,),
+    )
 
 
 @pytest.mark.asyncio
@@ -7233,7 +7408,8 @@ async def test_rebaseline_replay_removes_legacy_document_without_source_unit(
                 "deletion_context": {
                     "deletion_kind": "rebaseline_legacy_absence",
                     "reason": "not_returned_by_complete_rebaseline_replay",
-                }
+                },
+                "source_activity": None,
             },
         )
     ]
@@ -9167,6 +9343,10 @@ async def test_source_sync_worker_terminalizes_expired_run_after_execution_budge
     assert failed.recovery_count == 1
     assert failed.next_attempt_at is None
     assert failed.error_message == "source sync execution attempt budget exhausted"
+    assert not await db.db.execute_fetchall(
+        "SELECT 1 FROM source_activity_leases WHERE id = ?",
+        (enqueued.run_id,),
+    )
 
 
 @pytest.mark.asyncio

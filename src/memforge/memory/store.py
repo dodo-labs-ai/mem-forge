@@ -58,7 +58,7 @@ from memforge.models import (
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
-from memforge.source_activity import SourceActivityLease
+from memforge.source_activity import SourceActivityConflict, SourceActivityLease
 from memforge.source_projection import SourceProjection
 
 logger = logging.getLogger(__name__)
@@ -2173,6 +2173,7 @@ class MemoryStore:
         doc_id: str,
         *,
         deletion_context: dict[str, Any] | None = None,
+        source_activity: SourceActivityLease | None = None,
     ) -> None:
         """Remove document storage after lifecycle was committed separately.
 
@@ -2185,7 +2186,12 @@ class MemoryStore:
         document_snapshot = await self.db.get_document(doc_id)
         document_side_snapshot = await self.db.get_document_side_table_snapshots([doc_id])
         try:
-            await self.db.delete_projected_document(doc_id)
+            await self.db.delete_projected_document(
+                doc_id,
+                source_activity=source_activity,
+            )
+        except SourceActivityConflict:
+            raise
         except Exception:
             if document_snapshot:
                 await self.db.restore_document_snapshot(
