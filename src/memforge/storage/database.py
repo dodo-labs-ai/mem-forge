@@ -549,7 +549,12 @@ def _source_schedule_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _source_sync_run_from_row(row: Mapping[str, Any], *, coalesced: bool = False) -> SourceSyncRun:
+def _source_sync_run_from_row(
+    row: Mapping[str, Any],
+    *,
+    coalesced: bool = False,
+    source_activity: SourceActivityLease | None = None,
+) -> SourceSyncRun:
     data = dict(row)
     return SourceSyncRun(
         run_id=str(data["run_id"]),
@@ -581,6 +586,7 @@ def _source_sync_run_from_row(row: Mapping[str, Any], *, coalesced: bool = False
         updated_at=_parse_dt(data.get("updated_at")),
         started_at=_parse_dt(data.get("started_at")),
         completed_at=_parse_dt(data.get("completed_at")),
+        source_activity=source_activity,
     )
 
 
@@ -5869,7 +5875,12 @@ class Database:
                 await self.db.rollback()
                 raise
 
-    async def delete_projected_document(self, doc_id: str) -> None:
+    async def delete_projected_document(
+        self,
+        doc_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None:
         """Delete document artifacts after an applied projected lifecycle plan.
 
         Unlike the legacy deletion path, this method never infers Memory
@@ -5896,6 +5907,10 @@ class Database:
                 if document_row is None:
                     return
                 source_id = str(document_row["source"])
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 for artifact_uri in dict.fromkeys(
                     str(uri)
                     for uri in (
@@ -5935,6 +5950,10 @@ class Database:
                 await self.db.execute("DELETE FROM changelog WHERE doc_id = ?", (doc_id,))
                 await self.db.execute("DELETE FROM agent_session_receipts WHERE doc_id = ?", (doc_id,))
                 await self.db.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -5944,6 +5963,8 @@ class Database:
         self,
         old_doc_id: str,
         new_doc_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> None:
         """Move legacy document provenance after a stable Source Unit rename.
 
@@ -5966,6 +5987,11 @@ class Database:
                     return
                 if sources[old_doc_id] != sources[new_doc_id]:
                     raise ValueError("document lineage cannot cross configured Sources")
+                source_id = sources[new_doc_id]
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 await self.db.execute(
                     """DELETE FROM memory_sources AS old_support
                        WHERE old_support.doc_id = ?
@@ -5982,6 +6008,10 @@ class Database:
                     (new_doc_id, old_doc_id),
                 )
                 await self._refresh_metadata_fts_for_doc_unlocked(new_doc_id)
+                await self._assert_source_activity_fence_unlocked(
+                    source_id,
+                    source_activity,
+                )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -6629,6 +6659,7 @@ class Database:
         projection: SourceProjection,
         *,
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
         _manage_transaction: bool = True,
     ) -> None:
         """Persist one complete provider-neutral projection atomically.
@@ -6649,6 +6680,10 @@ class Database:
                 # any mutable projection snapshot.
                 await self._acquire_source_writer_fence_unlocked(
                     projection.source_id
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    projection.source_id,
+                    source_activity,
                 )
                 async with self.db.execute(
                     "SELECT type, activity_epoch FROM sources WHERE id = ?",
@@ -6690,6 +6725,10 @@ class Database:
                         )
                     ):
                         raise ValueError("projection retry payload mismatch")
+                    await self._assert_source_activity_fence_unlocked(
+                        projection.source_id,
+                        source_activity,
+                    )
                     if _manage_transaction:
                         await self.db.commit()
                     return
@@ -6955,6 +6994,10 @@ class Database:
                                 WHERE source_unit_id = ? AND id IN ({placeholders})""",
                             (now, delta.source_unit_id, *delta.removed_observation_ids),
                         )
+                await self._assert_source_activity_fence_unlocked(
+                    projection.source_id,
+                    source_activity,
+                )
                 if _manage_transaction:
                     await self.db.commit()
             except Exception:
@@ -8067,6 +8110,8 @@ class Database:
         self,
         source_id: str,
         source_activity: SourceActivityLease | None,
+        *,
+        now: datetime | None = None,
     ) -> None:
         if source_activity is None:
             return
@@ -8084,7 +8129,7 @@ class Database:
         ) as cursor:
             source = await cursor.fetchone()
         async with self.db.execute(
-            """SELECT source_id, capability, epoch, lease_until
+            """SELECT source_id, kind, capability, epoch, lease_until
                FROM source_activity_leases WHERE id = ?""",
             (source_activity.id,),
         ) as cursor:
@@ -8094,9 +8139,10 @@ class Database:
             or int(source["activity_epoch"] or 0) != source_activity.epoch
             or lease is None
             or str(lease["source_id"]) != source_id
+            or str(lease["kind"]) != source_activity.kind.value
             or lease["capability"] != source_activity.capability
             or int(lease["epoch"]) != source_activity.epoch
-            or str(lease["lease_until"]) <= _now_iso()
+            or str(lease["lease_until"]) <= _utc_iso(now)
         ):
             raise SourceActivityConflict(f"source activity fence is not current: {source_activity.id}")
 
@@ -8493,8 +8539,9 @@ class Database:
         lease_seconds: int,
         expected_epoch: int | None = None,
         bump_epoch: bool = False,
+        now: datetime | None = None,
     ) -> SourceActivityLease:
-        now = datetime.now(timezone.utc)
+        now = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(now)
         lease_until = now + timedelta(seconds=max(1, lease_seconds))
         async with self.db.execute(
@@ -10520,6 +10567,7 @@ class Database:
         derivation_context_identity_hash: str | None = None,
         required_derivation_work_ids: tuple[str, ...] = (),
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None:
         """Advance Source Projection and Memory lifecycle in one transaction."""
@@ -10554,6 +10602,10 @@ class Database:
                 # serialized Source snapshot across SQLite processes.
                 await self._acquire_source_writer_fence_unlocked(
                     projection.source_id
+                )
+                await self._assert_source_activity_fence_unlocked(
+                    projection.source_id,
+                    source_activity,
                 )
                 if derivation_id is not None:
                     if document is None:
@@ -10629,6 +10681,7 @@ class Database:
                 await self.record_source_projection(
                     projection,
                     expected_source_activity_epoch=expected_source_activity_epoch,
+                    source_activity=source_activity,
                     _manage_transaction=False,
                 )
                 await self._apply_lifecycle_plan_with_identity_policy(
@@ -10648,6 +10701,10 @@ class Database:
                 if runtime_bundle is not None:
                     await self._insert_agent_runtime_events_unlocked(runtime_bundle.events)
                     await self._insert_agent_assessments_unlocked(runtime_bundle.assessments)
+                await self._assert_source_activity_fence_unlocked(
+                    projection.source_id,
+                    source_activity,
+                )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -20076,16 +20133,15 @@ class Database:
     ) -> SourceSyncRun | None:
         lease_started_at = now or datetime.now(timezone.utc)
         lease_started_iso = _utc_iso(lease_started_at)
-        lease_expires_at = _utc_iso(lease_started_at + timedelta(seconds=lease_seconds))
+        effective_lease_seconds = max(1, lease_seconds)
+        lease_expires_at = _utc_iso(lease_started_at + timedelta(seconds=effective_lease_seconds))
         conditions = [
             "((status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) "
             "OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))",
             "NOT EXISTS ("
-            "SELECT 1 FROM source_activity_leases predecessor "
-            "WHERE predecessor.id = source_sync_runs.predecessor_activity_id "
-            "AND predecessor.source_id = source_sync_runs.source_id "
-            "AND predecessor.kind = 'external_collection' "
-            "AND predecessor.lease_until > ?)",
+            "SELECT 1 FROM source_activity_leases activity "
+            "WHERE activity.source_id = source_sync_runs.source_id "
+            "AND activity.lease_until > ?)",
         ]
         params: list[Any] = [lease_started_iso, lease_started_iso, lease_started_iso]
         if workspace_id is not None:
@@ -20093,17 +20149,19 @@ class Database:
             params.append(workspace_id)
 
         async with self._write_lock:
-            async with self.db.execute(
-                "SELECT * FROM source_sync_runs WHERE " + " AND ".join(conditions) + " ORDER BY created_at LIMIT 1",
-                params,
-            ) as cursor:
-                row = await cursor.fetchone()
-            if not row:
-                return None
+            try:
+                async with self.db.execute(
+                    "SELECT * FROM source_sync_runs WHERE " + " AND ".join(conditions) + " ORDER BY created_at LIMIT 1",
+                    params,
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if not row:
+                    return None
 
-            recovery_increment = 1 if row["status"] == "running" else 0
-            cursor = await self.db.execute(
-                """UPDATE source_sync_runs
+                recovery_increment = 1 if row["status"] == "running" else 0
+                lease_attempt_count = int(row["lease_attempt_count"] or 0) + 1
+                cursor = await self.db.execute(
+                    """UPDATE source_sync_runs
                    SET status = 'running',
                        lease_owner = ?,
                        lease_expires_at = ?,
@@ -20119,36 +20177,87 @@ class Database:
                        (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
                      )
                      AND NOT EXISTS (
-                       SELECT 1 FROM source_activity_leases predecessor
-                       WHERE predecessor.id = ?
-                         AND predecessor.source_id = ?
-                         AND predecessor.kind = 'external_collection'
-                         AND predecessor.lease_until > ?
+                       SELECT 1 FROM source_activity_leases activity
+                       WHERE activity.source_id = source_sync_runs.source_id
+                         AND activity.lease_until > ?
                      )""",
-                (
-                    worker_id,
-                    lease_expires_at,
-                    recovery_increment,
-                    lease_started_iso,
-                    lease_started_iso,
-                    row["run_id"],
-                    lease_started_iso,
-                    lease_started_iso,
-                    row["predecessor_activity_id"],
-                    row["source_id"],
-                    lease_started_iso,
-                ),
-            )
-            if not cursor.rowcount:
+                    (
+                        worker_id,
+                        lease_expires_at,
+                        recovery_increment,
+                        lease_started_iso,
+                        lease_started_iso,
+                        row["run_id"],
+                        lease_started_iso,
+                        lease_started_iso,
+                        lease_started_iso,
+                    ),
+                )
+                if not cursor.rowcount:
+                    await self.db.rollback()
+                    return None
+                source_activity = await self._acquire_source_activity_unlocked(
+                    activity_id=str(row["run_id"]),
+                    source_id=str(row["source_id"]),
+                    kind=SourceActivityKind.SYNC,
+                    capability=str(lease_attempt_count),
+                    lease_seconds=effective_lease_seconds,
+                    now=lease_started_at,
+                )
+                async with self.db.execute(
+                    "SELECT * FROM source_sync_runs WHERE run_id = ?",
+                    (row["run_id"],),
+                ) as cursor:
+                    leased = await cursor.fetchone()
+                await self.db.commit()
+            except BaseException:
                 await self.db.rollback()
-                return None
-            await self.db.commit()
-            async with self.db.execute(
-                "SELECT * FROM source_sync_runs WHERE run_id = ?",
-                (row["run_id"],),
-            ) as cursor:
-                leased = await cursor.fetchone()
-        return _source_sync_run_from_row(leased) if leased else None
+                raise
+        return _source_sync_run_from_row(leased, source_activity=source_activity) if leased else None
+
+    async def _source_sync_activity_is_current_unlocked(
+        self,
+        run: Mapping[str, Any],
+        *,
+        lease_attempt_count: int,
+        at: str,
+    ) -> bool:
+        async with self.db.execute(
+            """SELECT 1
+               FROM source_activity_leases AS activity
+               JOIN sources AS source ON source.id = activity.source_id
+               WHERE activity.id = ?
+                 AND activity.source_id = ?
+                 AND activity.kind = 'sync'
+                 AND activity.capability = ?
+                 AND activity.epoch = source.activity_epoch
+                 AND activity.lease_until > ?""",
+            (
+                str(run["run_id"]),
+                str(run["source_id"]),
+                str(lease_attempt_count),
+                at,
+            ),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def _release_source_sync_activity_unlocked(
+        self,
+        run: Mapping[str, Any],
+        *,
+        lease_attempt_count: int,
+    ) -> bool:
+        cursor = await self.db.execute(
+            """DELETE FROM source_activity_leases
+               WHERE id = ? AND source_id = ? AND kind = 'sync'
+                 AND capability = ?""",
+            (
+                str(run["run_id"]),
+                str(run["source_id"]),
+                str(lease_attempt_count),
+            ),
+        )
+        return cursor.rowcount == 1
 
     async def heartbeat_source_sync_run(
         self,
@@ -20161,26 +20270,65 @@ class Database:
     ) -> bool:
         heartbeat_at = now or datetime.now(timezone.utc)
         heartbeat_iso = _utc_iso(heartbeat_at)
-        lease_expires_at = _utc_iso(heartbeat_at + timedelta(seconds=lease_seconds))
+        lease_expires_at = _utc_iso(heartbeat_at + timedelta(seconds=max(1, lease_seconds)))
         async with self._write_lock:
-            cursor = await self.db.execute(
-                """UPDATE source_sync_runs
-                   SET lease_expires_at = ?,
-                       updated_at = ?
-                   WHERE run_id = ?
-                     AND status = 'running'
-                     AND lease_owner = ?
-                     AND lease_attempt_count = ?""",
-                (
-                    lease_expires_at,
-                    heartbeat_iso,
-                    run_id,
-                    worker_id,
-                    lease_attempt_count,
-                ),
-            )
-            await self.db.commit()
-        return bool(cursor.rowcount)
+            try:
+                activity = await self.db.execute(
+                    """UPDATE source_activity_leases AS activity
+                       SET lease_until = ?, updated_at = ?
+                       WHERE activity.id = ?
+                         AND activity.kind = 'sync'
+                         AND activity.capability = ?
+                         AND activity.lease_until > ?
+                         AND EXISTS (
+                           SELECT 1 FROM source_sync_runs AS run
+                           WHERE run.run_id = ?
+                             AND run.source_id = activity.source_id
+                             AND run.status = 'running'
+                             AND run.lease_owner = ?
+                             AND run.lease_attempt_count = ?
+                             AND run.lease_expires_at > ?
+                         )""",
+                    (
+                        lease_expires_at,
+                        heartbeat_iso,
+                        run_id,
+                        str(lease_attempt_count),
+                        heartbeat_iso,
+                        run_id,
+                        worker_id,
+                        lease_attempt_count,
+                        heartbeat_iso,
+                    ),
+                )
+                if activity.rowcount != 1:
+                    await self.db.rollback()
+                    return False
+                run = await self.db.execute(
+                    """UPDATE source_sync_runs
+                       SET lease_expires_at = ?, updated_at = ?
+                       WHERE run_id = ?
+                         AND status = 'running'
+                         AND lease_owner = ?
+                         AND lease_attempt_count = ?
+                         AND lease_expires_at > ?""",
+                    (
+                        lease_expires_at,
+                        heartbeat_iso,
+                        run_id,
+                        worker_id,
+                        lease_attempt_count,
+                        heartbeat_iso,
+                    ),
+                )
+                if run.rowcount != 1:
+                    await self.db.rollback()
+                    return False
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return True
 
     async def report_source_sync_run_progress(
         self,
@@ -20202,13 +20350,28 @@ class Database:
                    WHERE run_id = ?
                      AND status = 'running'
                      AND lease_owner = ?
-                     AND lease_attempt_count = ?""",
+                     AND lease_attempt_count = ?
+                     AND lease_expires_at > ?
+                     AND EXISTS (
+                       SELECT 1
+                       FROM source_activity_leases AS activity
+                       JOIN sources AS source ON source.id = activity.source_id
+                       WHERE activity.id = source_sync_runs.run_id
+                         AND activity.source_id = source_sync_runs.source_id
+                         AND activity.kind = 'sync'
+                         AND activity.capability = ?
+                         AND activity.epoch = source.activity_epoch
+                         AND activity.lease_until > ?
+                     )""",
                 (
                     json.dumps(snapshot, sort_keys=True, separators=(",", ":")),
                     progress_at,
                     run_id,
                     worker_id,
                     lease_attempt_count,
+                    progress_at,
+                    str(lease_attempt_count),
+                    progress_at,
                 ),
             )
             await self.db.commit()
@@ -20228,6 +20391,10 @@ class Database:
             raise ValueError("complete_source_sync_run requires a timestamped successful final state")
         async with self._write_lock:
             try:
+                await self.db.execute(
+                    "UPDATE source_sync_runs SET status = status WHERE run_id = ?",
+                    (run_id,),
+                )
                 async with self.db.execute(
                     """SELECT * FROM source_sync_runs
                        WHERE run_id = ? AND status = 'running'
@@ -20237,6 +20404,14 @@ class Database:
                 ) as cursor:
                     leased_run = await cursor.fetchone()
                 if leased_run is None:
+                    await self.db.rollback()
+                    return False
+                if not await self._source_sync_activity_is_current_unlocked(
+                    leased_run,
+                    lease_attempt_count=lease_attempt_count,
+                    at=completed_iso,
+                ):
+                    await self.db.rollback()
                     return False
                 if final_state.source != str(leased_run["source_id"]):
                     raise ValueError("source sync final state does not belong to the leased run")
@@ -20270,6 +20445,12 @@ class Database:
                     ),
                 )
                 if not cursor.rowcount:
+                    await self.db.rollback()
+                    return False
+                if not await self._release_source_sync_activity_unlocked(
+                    leased_run,
+                    lease_attempt_count=lease_attempt_count,
+                ):
                     await self.db.rollback()
                     return False
                 await self._enqueue_successor_for_completed_run(run_id, completed_iso)
@@ -20362,23 +20543,32 @@ class Database:
         completed_at = None if retryable else failed_iso
         next_attempt_iso = _utc_iso(next_attempt_at) if retryable and next_attempt_at else None
         async with self._write_lock:
-            async with self.db.execute(
-                """SELECT * FROM source_sync_runs
-                   WHERE run_id = ? AND status = 'running'
-                     AND lease_owner = ? AND lease_attempt_count = ?
-                     AND lease_expires_at > ?""",
-                (run_id, worker_id, lease_attempt_count, failed_iso),
-            ) as cursor:
-                leased_run = await cursor.fetchone()
-            if leased_run is None:
-                return False
-            if final_state is not None:
-                if final_state.last_sync_status not in {"failed", "partial"}:
-                    raise ValueError("fail_source_sync_run requires a failed or partial final state")
-                if final_state.source != str(leased_run["source_id"]):
-                    raise ValueError("source sync final state does not belong to the leased run")
-            cursor = await self.db.execute(
-                """UPDATE source_sync_runs
+            try:
+                async with self.db.execute(
+                    """SELECT * FROM source_sync_runs
+                       WHERE run_id = ? AND status = 'running'
+                         AND lease_owner = ? AND lease_attempt_count = ?
+                         AND lease_expires_at > ?""",
+                    (run_id, worker_id, lease_attempt_count, failed_iso),
+                ) as cursor:
+                    leased_run = await cursor.fetchone()
+                if leased_run is None:
+                    await self.db.rollback()
+                    return False
+                if not await self._source_sync_activity_is_current_unlocked(
+                    leased_run,
+                    lease_attempt_count=lease_attempt_count,
+                    at=failed_iso,
+                ):
+                    await self.db.rollback()
+                    return False
+                if final_state is not None:
+                    if final_state.last_sync_status not in {"failed", "partial"}:
+                        raise ValueError("fail_source_sync_run requires a failed or partial final state")
+                    if final_state.source != str(leased_run["source_id"]):
+                        raise ValueError("source sync final state does not belong to the leased run")
+                cursor = await self.db.execute(
+                    """UPDATE source_sync_runs
                    SET status = ?,
                        input_snapshot_id = CASE
                            WHEN ? AND rerun_requested = 1
@@ -20431,31 +20621,36 @@ class Database:
                    WHERE run_id = ? AND status = 'running'
                      AND lease_owner = ? AND lease_attempt_count = ?
                      AND lease_expires_at > ?""",
-                (
-                    status,
-                    int(retryable),
-                    int(retryable),
-                    int(retryable),
-                    int(retryable),
-                    int(retryable),
-                    int(retryable),
-                    int(retryable),
-                    int(retryable),
-                    int(retryable),
-                    next_attempt_iso,
-                    error_message,
-                    completed_at,
-                    failed_iso,
-                    run_id,
-                    worker_id,
-                    lease_attempt_count,
-                    failed_iso,
-                ),
-            )
-            if not cursor.rowcount:
-                await self.db.rollback()
-                return False
-            try:
+                    (
+                        status,
+                        int(retryable),
+                        int(retryable),
+                        int(retryable),
+                        int(retryable),
+                        int(retryable),
+                        int(retryable),
+                        int(retryable),
+                        int(retryable),
+                        int(retryable),
+                        next_attempt_iso,
+                        error_message,
+                        completed_at,
+                        failed_iso,
+                        run_id,
+                        worker_id,
+                        lease_attempt_count,
+                        failed_iso,
+                    ),
+                )
+                if not cursor.rowcount:
+                    await self.db.rollback()
+                    return False
+                if not await self._release_source_sync_activity_unlocked(
+                    leased_run,
+                    lease_attempt_count=lease_attempt_count,
+                ):
+                    await self.db.rollback()
+                    return False
                 if final_state is not None:
                     await self._upsert_sync_state_unlocked(final_state)
                     for bundle in final_state.runtime_bundles:
