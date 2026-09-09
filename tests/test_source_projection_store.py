@@ -4,11 +4,18 @@ import asyncio
 import hashlib
 import json
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
 
+from memforge.memory.lifecycle_plan import (
+    CoverageProof,
+    LifecycleGateState,
+    LifecyclePlan,
+    ReconciliationScope,
+    StaleGuard,
+)
 from memforge.source_projection import (
     AnchorKind,
     DeltaAxis,
@@ -31,6 +38,7 @@ from memforge.source_projection import (
     source_projection_to_payload,
 )
 from memforge.models import DocumentRecord, Memory, MemorySource
+from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.storage.database import Database, MIGRATIONS
 
 
@@ -269,6 +277,110 @@ async def test_source_projection_round_trips_as_one_atomic_record(db: Database) 
     assert await db.get_source_projection(projection.run_id) == projection
     assert await db.get_current_source_unit_revision("unit-page-1") == projection.source_unit_revisions[0]
     assert await db.list_current_source_units("src-1") == projection.source_units
+
+
+@pytest.mark.asyncio
+async def test_source_projection_rejects_a_superseded_sync_attempt(db: Database) -> None:
+    now = datetime.now(timezone.utc)
+    enqueued = await db.enqueue_source_sync_run(source_id="src-1")
+    first = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert first is not None
+    assert first.source_activity is not None
+
+    recovered = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        lease_seconds=60,
+        now=now.replace(microsecond=0) + timedelta(seconds=61),
+    )
+    assert recovered is not None
+    assert recovered.source_activity is not None
+    assert recovered.run_id == enqueued.run_id
+
+    projection = _projection()
+    wrong_kind = replace(
+        recovered.source_activity,
+        kind=SourceActivityKind.MAINTENANCE,
+    )
+    with pytest.raises(SourceActivityConflict, match="fence is not current"):
+        await db.record_source_projection(
+            projection,
+            source_activity=wrong_kind,
+        )
+    with pytest.raises(SourceActivityConflict, match="fence is not current"):
+        await db.record_source_projection(
+            projection,
+            source_activity=first.source_activity,
+        )
+
+    await db.record_source_projection(
+        projection,
+        source_activity=recovered.source_activity,
+    )
+    assert await db.get_source_projection(projection.run_id) == projection
+
+
+@pytest.mark.asyncio
+async def test_projected_lifecycle_rejects_a_superseded_sync_attempt(
+    db: Database,
+) -> None:
+    now = datetime.now(timezone.utc)
+    enqueued = await db.enqueue_source_sync_run(source_id="src-1")
+    first = await db.lease_next_source_sync_run(
+        worker_id="worker-a",
+        lease_seconds=60,
+        now=now,
+    )
+    assert first is not None
+    assert first.source_activity is not None
+
+    recovered = await db.lease_next_source_sync_run(
+        worker_id="worker-b",
+        lease_seconds=60,
+        now=now.replace(microsecond=0) + timedelta(seconds=61),
+    )
+    assert recovered is not None
+    assert recovered.source_activity is not None
+    assert recovered.run_id == enqueued.run_id
+
+    projection = replace(_projection(), run_id="projection-run-lifecycle-fenced")
+    delta = projection.deltas[0]
+    plan = LifecyclePlan(
+        id="plan-lifecycle-fenced",
+        scope=ReconciliationScope(
+            id="scope-lifecycle-fenced",
+            source_id=projection.source_id,
+            source_unit_id=delta.source_unit_id,
+            base_unit_revision_id=None,
+            target_unit_revision_id=delta.current_unit_revision_id,
+        ),
+        gate_state=LifecycleGateState.GATED,
+        coverage_proof=CoverageProof((), (), (), ()),
+        stale_guard=StaleGuard((), {}),
+        mutations=(),
+    )
+
+    with pytest.raises(SourceActivityConflict, match="fence is not current"):
+        await db.apply_source_projection_lifecycle(
+            projection,
+            plan,
+            source_activity=first.source_activity,
+        )
+
+    assert await db.get_source_projection(projection.run_id) is None
+    assert await db.get_lifecycle_plan_status(plan.id) is None
+
+    await db.apply_source_projection_lifecycle(
+        projection,
+        plan,
+        source_activity=recovered.source_activity,
+    )
+
+    assert await db.get_source_projection(projection.run_id) == projection
+    assert await db.get_lifecycle_plan_status(plan.id) == "applied"
 
 
 @pytest.mark.asyncio

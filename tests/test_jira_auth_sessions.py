@@ -396,22 +396,24 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
             source_activity_epoch=None,
+            source_activity=None,
             lifecycle_cycle_id=None,
-                scope_transition_run_id=None,
-                reusable_projection_doc_ids=frozenset(),
-                projection_scope_attestations=(),
-                record_terminal_result=True,
-            ):
+            scope_transition_run_id=None,
+            reusable_projection_doc_ids=frozenset(),
+            projection_scope_attestations=(),
+            record_terminal_result=True,
+        ):
             del (
                 authoritative_snapshot,
                 reprocess_doc_ids,
                 source_activity_epoch,
+                source_activity,
                 lifecycle_cycle_id,
-                    scope_transition_run_id,
-                    reusable_projection_doc_ids,
-                    projection_scope_attestations,
-                    record_terminal_result,
-                )
+                scope_transition_run_id,
+                reusable_projection_doc_ids,
+                projection_scope_attestations,
+                record_terminal_result,
+            )
             captured["gene_config"] = gene.config
             return SyncState(source=source_id, last_sync_status="success")
 
@@ -503,22 +505,24 @@ async def test_runtime_keeps_legacy_jira_pat_source_in_pat_mode(db, tmp_path, mo
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
             source_activity_epoch=None,
+            source_activity=None,
             lifecycle_cycle_id=None,
-                scope_transition_run_id=None,
-                reusable_projection_doc_ids=frozenset(),
-                projection_scope_attestations=(),
-                record_terminal_result=True,
-            ):
+            scope_transition_run_id=None,
+            reusable_projection_doc_ids=frozenset(),
+            projection_scope_attestations=(),
+            record_terminal_result=True,
+        ):
             del (
                 authoritative_snapshot,
                 reprocess_doc_ids,
                 source_activity_epoch,
+                source_activity,
                 lifecycle_cycle_id,
-                    scope_transition_run_id,
-                    reusable_projection_doc_ids,
-                    projection_scope_attestations,
-                    record_terminal_result,
-                )
+                scope_transition_run_id,
+                reusable_projection_doc_ids,
+                projection_scope_attestations,
+                record_terminal_result,
+            )
             captured["gene_config"] = gene.config
             return SyncState(source=source_id, last_sync_status="success")
 

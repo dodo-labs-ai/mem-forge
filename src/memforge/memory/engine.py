@@ -74,6 +74,7 @@ from memforge.source_access import (
     memory_visibility_for_document,
     memory_visibility_for_source_id,
 )
+from memforge.source_activity import SourceActivityLease
 from memforge.source_projection import ImpactResult, ProjectionCoverage, resolve_anchor_impact
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
@@ -155,6 +156,7 @@ class _PreparedProjectedLifecycleCommit:
     derivation_context_identity_hash: str | None
     required_derivation_work_ids: tuple[str, ...]
     expected_source_activity_epoch: int | None
+    source_activity: SourceActivityLease | None
     base_stats: Mapping[str, int]
     corroboration_target_ids: frozenset[str]
     lifecycle_execution_owner_id: str | None
@@ -485,6 +487,7 @@ class MemoryEngine:
         derivation_reprocess_all_current_observations: bool = False,
         derivation_reprocess_operation_id: str | None = None,
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
         lifecycle_execution_owner_id: str | None = None,
         lifecycle_attempt_count: int = 1,
@@ -516,6 +519,7 @@ class MemoryEngine:
                     derivation_reprocess_operation_id
                 ),
                 expected_source_activity_epoch=expected_source_activity_epoch,
+                source_activity=source_activity,
                 current_changed_ranges=current_changed_ranges,
                 lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                 lifecycle_attempt_count=lifecycle_attempt_count,
@@ -819,6 +823,7 @@ class MemoryEngine:
                 expected_source_activity_epoch=(
                     prepared.expected_source_activity_epoch
                 ),
+                source_activity=prepared.source_activity,
                 runtime_bundle=runtime_bundle,
             )
         except ProjectedLifecycleDeferredError as exc:
@@ -981,6 +986,7 @@ class MemoryEngine:
         derivation_reprocess_all_current_observations: bool = False,
         derivation_reprocess_operation_id: str | None = None,
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
         current_changed_ranges: tuple[tuple[int, int], ...] = (),
         lifecycle_execution_owner_id: str | None = None,
         lifecycle_attempt_count: int = 1,
@@ -1641,6 +1647,7 @@ class MemoryEngine:
             derivation_context_identity_hash=derivation_context_identity_hash,
             required_derivation_work_ids=required_derivation_work_ids,
             expected_source_activity_epoch=expected_source_activity_epoch,
+            source_activity=source_activity,
             base_stats=dict(stats),
             corroboration_target_ids=frozenset(attached_target_ids),
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
@@ -1750,6 +1757,7 @@ class MemoryEngine:
         reason: str,
         lifecycle_cycle_id: str,
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
     ) -> dict[str, int | bool]:
         """Apply an authoritative Source Unit tombstone without an LLM call.
 
@@ -1854,6 +1862,7 @@ class MemoryEngine:
             projection,
             plan,
             expected_source_activity_epoch=expected_source_activity_epoch,
+            source_activity=source_activity,
         )
         await self.memory_store.attempt_lifecycle_vector_delivery(plan.id)
         return await self._projected_tombstone_result(

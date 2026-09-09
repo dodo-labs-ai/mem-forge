@@ -52,6 +52,7 @@ from memforge.source_secrets import decrypt_source_config_for_runtime, source_se
 from memforge.source_activity import (
     SourceActivityConflict,
     SourceActivityKind,
+    SourceActivityLease,
 )
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -264,6 +265,7 @@ class RuntimeProvider(Protocol):
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
         projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         record_terminal_result: bool = True,
+        source_activity: SourceActivityLease | None = None,
     ) -> SyncState: ...
 
 
@@ -363,6 +365,7 @@ class DefaultRuntimeProvider:
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
         projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
         record_terminal_result: bool = True,
+        source_activity: SourceActivityLease | None = None,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -380,6 +383,7 @@ class DefaultRuntimeProvider:
             reusable_projection_doc_ids=reusable_projection_doc_ids,
             projection_scope_attestations=projection_scope_attestations,
             record_terminal_result=record_terminal_result,
+            source_activity=source_activity,
         )
 
 
@@ -746,16 +750,27 @@ async def run_source_sync(
     reusable_projection_doc_ids: frozenset[str] = frozenset(),
     projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = (),
     record_terminal_result: bool = True,
+    source_activity: SourceActivityLease | None = None,
 ) -> SyncState:
     await authorize_source_sync_maintenance(
         db,
         str(source["id"]),
         lifecycle_job_id=lifecycle_job_id,
     )
-    activity_id = None
+    activity_id = source_activity.id if source_activity is not None else None
+    owns_activity = False
     source_activity_epoch: int | None = None
     heartbeat_task: asyncio.Task[None] | None = None
-    if lifecycle_job_id is None:
+    activity_lease = source_activity
+    if source_activity is not None:
+        if lifecycle_job_id is not None:
+            raise ValueError("durable Source activity cannot be combined with lifecycle maintenance")
+        if source_activity.source_id != str(source["id"]):
+            raise ValueError("durable Source activity does not belong to the synced Source")
+        if source_activity.kind is not SourceActivityKind.SYNC:
+            raise ValueError("durable Source activity must be a sync authority")
+        source_activity_epoch = source_activity.epoch
+    elif lifecycle_job_id is None:
         activity_id = f"source-sync-{uuid.uuid4().hex}"
         try:
             activity_lease = await db.acquire_source_activity(
@@ -765,6 +780,7 @@ async def run_source_sync(
                 lease_seconds=300,
             )
             source_activity_epoch = activity_lease.epoch
+            owns_activity = True
         except SourceActivityConflict as exc:
             raise SourceLifecycleMaintenanceError(str(exc)) from exc
 
@@ -801,6 +817,7 @@ async def run_source_sync(
             "authoritative_snapshot": authoritative_snapshot,
             "reprocess_doc_ids": reprocess_doc_ids,
             "source_activity_epoch": source_activity_epoch,
+            "source_activity": activity_lease,
             "lifecycle_cycle_id": lifecycle_cycle_id,
             "scope_transition_run_id": scope_transition_run_id,
             "reusable_projection_doc_ids": reusable_projection_doc_ids,
@@ -829,7 +846,7 @@ async def run_source_sync(
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
-        if activity_id is not None:
+        if owns_activity and activity_id is not None:
             await db.release_source_activity(activity_id=activity_id)
 
 
@@ -1254,6 +1271,10 @@ class SourceSyncWorker:
                 document_lifecycle_admission=self._document_lifecycle_admission,
             )
             self._relation_runtime = runtime
+            if run.source_activity is None:
+                raise SourceSyncLeaseLost(
+                    f"source sync claim is missing Source authority for run {run.run_id}"
+                )
             final_state = await self._run_source_sync_with_heartbeat(
                 run,
                 db=self.db,
@@ -1268,6 +1289,7 @@ class SourceSyncWorker:
                 reusable_projection_doc_ids=reusable_projection_doc_ids,
                 projection_scope_attestations=projection_scope_attestations,
                 record_terminal_result=False,
+                source_activity=run.source_activity,
             )
             if final_state is None:
                 final_state = SyncState(
