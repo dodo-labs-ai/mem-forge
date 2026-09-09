@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.61 - 2026-09-09
+
+- Coalesce Stop, PreCompact, and SessionStart capture requests under one on-demand
+  upload owner, with durable fresh-request priority and safe shutdown handoff.
+- Bound historical recovery to five sessions per activation and retry failures
+  only on later events after a 60-second cooldown.
+- Restart both clients after existing workers exit when upgrading from 0.1.60.
+
 ## 0.1.60 - 2026-09-08
 
 - Preserve the hook that wakes Agent Session capture while another local worker
