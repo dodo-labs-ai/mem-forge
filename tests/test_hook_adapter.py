@@ -256,14 +256,14 @@ def test_hook_adapter_precompact_posts_window_when_transcript_exists(monkeypatch
     )
     queue_db = tmp_path / "queue.sqlite"
     requests: list[tuple[str, dict]] = []
-    spawned_workers: list[float] = []
+    spawned_workers: list[dict] = []
 
     def fake_post_json(path: str, payload: dict, *, timeout: float):
         requests.append((path, payload))
         return {"receipt_id": "receipt-precompact"}
 
-    def fake_spawn_worker(*, timeout: float):
-        spawned_workers.append(timeout)
+    def fake_spawn_worker(**kwargs):
+        spawned_workers.append(kwargs)
 
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(queue_db))
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
@@ -285,7 +285,11 @@ def test_hook_adapter_precompact_posts_window_when_transcript_exists(monkeypatch
 
     assert exit_code == 0
     assert [request[0] for request in requests] == ["/hooks/receipts"]
-    assert spawned_workers == [180.0]
+    assert spawned_workers == [
+        {
+            "timeout": 180.0,
+        }
+    ]
     with sqlite3.connect(queue_db) as connection:
         rows = connection.execute(
             "SELECT capture_pending, captured_through, pending_trigger, transcript_path, session_id FROM session_cursor"
@@ -314,7 +318,7 @@ def test_hook_adapter_reprocesses_appended_transcript_window(monkeypatch, tmp_pa
         requests.append((path, payload))
         return {"ok": True}
 
-    def fake_spawn_worker(*, timeout: float):
+    def fake_spawn_worker(*, timeout: float, **_kwargs):
         spawned_workers.append(timeout)
 
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(queue_db))
@@ -444,7 +448,7 @@ def test_hook_adapter_stop_with_edit_and_test_signal_enqueues_window_worker(monk
         requests.append((path, payload))
         return {"receipt_id": "receipt-stop"}
 
-    def fake_spawn_worker(*, timeout: float):
+    def fake_spawn_worker(*, timeout: float, **_kwargs):
         spawned_workers.append(timeout)
 
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(tmp_path / "queue.sqlite"))
@@ -534,7 +538,7 @@ def test_hook_adapter_context_wakes_pending_queue_without_changing_output(monkey
             "context_markdown": "## MemForge Memory Context\n- Keep queue output quiet.",
         }
 
-    def fake_spawn_worker(*, timeout: float):
+    def fake_spawn_worker(*, timeout: float, **_kwargs):
         spawned_workers.append(timeout)
 
     monkeypatch.setenv("MEMFORGE_AGENT_QUEUE_DB", str(queue_db))
@@ -709,9 +713,7 @@ def test_hook_adapter_worker_splits_large_window_without_advancing_past_upload(m
     monkeypatch.setattr(hook_adapter, "MAX_TRANSCRIPT_CHARS", len("\n".join(lines[:2])))
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
-    submitted = hook_adapter.run_agent_window_worker_once(
-        timeout=77,
-    )
+    submitted = hook_adapter._process_session_captures(queue_db, timeout=5, max_sessions=5)
 
     assert submitted == 1
     payload = requests[0][1]
@@ -928,7 +930,7 @@ def test_packaged_plugin_version_is_consistent():
     import tomllib
 
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.59"
+    version = "0.1.61"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
@@ -5456,7 +5458,7 @@ def test_worker_single_flight_skips_when_locked(monkeypatch, tmp_path):
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
     held = hook_adapter._acquire_worker_lock(queue_db)
-    assert held is not None and held is not hook_adapter._NULL_WORKER_LOCK
+    assert held is not None
     try:
         skipped = hook_adapter.run_agent_window_worker_once(timeout=5, queue_db_path=queue_db)
     finally:
@@ -5468,6 +5470,59 @@ def test_worker_single_flight_skips_when_locked(monkeypatch, tmp_path):
     processed = hook_adapter.run_agent_window_worker_once(timeout=5, queue_db_path=queue_db)
     assert processed == 1
     assert posts and posts[0] == "/agent-sessions/windows"
+
+
+def test_worker_claims_requesting_session_before_older_backlog(monkeypatch, tmp_path):
+    from memforge import hook_adapter
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"tool","name":"pytest","input":"tests"}\n', encoding="utf-8")
+    queue_db = tmp_path / "queue.sqlite"
+    for index in range(6):
+        hook_adapter.request_session_capture(
+            client="codex",
+            session_id=f"old-session-{index}",
+            transcript_path=str(transcript),
+            workspace=str(tmp_path),
+            trigger="GATED_CAPTURE",
+            queue_db_path=queue_db,
+        )
+    hook_adapter.request_session_capture(
+        client="claude-code",
+        session_id="requesting-session",
+        transcript_path=str(transcript),
+        workspace=str(tmp_path),
+        trigger="GATED_CAPTURE",
+        queue_db_path=queue_db,
+    )
+    with sqlite3.connect(queue_db) as connection:
+        connection.execute(
+            "UPDATE session_cursor SET wake_requested_at = NULL, updated_at = '2026-01-01T00:00:00+00:00' "
+            "WHERE session_id LIKE 'old-session-%'"
+        )
+
+    submitted_sessions: list[str] = []
+
+    def fake_post_json(path, payload, *, timeout):
+        submitted_sessions.append(payload["session_id"])
+        return {"ok": True}
+
+    monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
+
+    submitted = hook_adapter._process_session_captures(queue_db, timeout=5, max_sessions=5)
+
+    assert submitted == 5
+    assert submitted_sessions[0] == "requesting-session"
+    with sqlite3.connect(queue_db) as connection:
+        requesting = connection.execute(
+            "SELECT capture_pending, captured_through FROM session_cursor "
+            "WHERE client = 'claude-code' AND session_id = 'requesting-session'"
+        ).fetchone()
+        old_pending = connection.execute(
+            "SELECT COUNT(*) FROM session_cursor WHERE session_id LIKE 'old-session-%' AND capture_pending = 1"
+        ).fetchone()[0]
+    assert requesting == (0, 1)
+    assert old_pending == 2
 
 
 def test_drain_does_not_spawn_when_no_pending(monkeypatch, tmp_path):
@@ -5527,7 +5582,7 @@ def test_worker_keeps_pending_when_capture_requested_during_upload(monkeypatch, 
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
-    submitted = hook_adapter.run_agent_window_worker_once(timeout=5, queue_db_path=queue_db)
+    submitted = hook_adapter._process_session_captures(queue_db, timeout=5, max_sessions=5)
 
     assert submitted == 1
     with sqlite3.connect(queue_db) as connection:
@@ -5573,7 +5628,7 @@ def test_worker_keeps_pending_when_request_timestamp_collides(monkeypatch, tmp_p
 
     monkeypatch.setattr(hook_adapter, "_post_json", fake_post_json)
 
-    submitted = hook_adapter.run_agent_window_worker_once(timeout=5, queue_db_path=queue_db)
+    submitted = hook_adapter._process_session_captures(queue_db, timeout=5, max_sessions=5)
 
     assert submitted == 1
     with sqlite3.connect(queue_db) as connection:

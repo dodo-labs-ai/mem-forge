@@ -19,6 +19,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -92,9 +93,10 @@ DEFAULT_AGENT_QUEUE_DB = Path.home() / ".memforge-agent" / "queue.sqlite"
 MAX_TRANSCRIPT_CHARS = 60000
 MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
+CAPTURE_RETRY_INTERVAL_SECONDS = 60.0
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.59"
+PLUGIN_VERSION = "0.1.61"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -215,16 +217,20 @@ _CAPTURE_TRIGGER_ALIASES = {
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MemForge agent hook adapter")
-    parser.add_argument("mode", choices=("context", "submit-session", "worker-run-once"))
+    parser.add_argument("mode", choices=("context", "submit-session", "worker-run-once", "worker-drain"))
     parser.add_argument("--client", default=os.getenv("MEMFORGE_HOOK_CLIENT", "codex"))
     parser.add_argument(
         "--timeout", type=float, default=_env_float("MEMFORGE_HOOK_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
     )
+    parser.add_argument("--owner-fd", type=int)
     args = parser.parse_args(argv)
 
-    if args.mode == "worker-run-once":
+    if args.mode in ("worker-run-once", "worker-drain"):
         try:
-            run_agent_window_worker_once(timeout=args.timeout)
+            if args.mode == "worker-drain":
+                run_agent_window_worker(timeout=args.timeout, owner_fd=args.owner_fd)
+            else:
+                run_agent_window_worker_once(timeout=args.timeout)
             return 0
         except Exception as exc:  # Hooks must not crash the coding session.
             print(
@@ -274,15 +280,10 @@ def _run_context(payload: dict[str, Any], *, client: str, timeout: float) -> int
     event_name = _event_name(payload)
     if event_name == "SessionStart":
         _emit_additional_context(event_name, SESSION_START_USAGE_GUIDANCE)
-        if _is_recover_event(event_name):
-            try:
-                _recover_incomplete_sessions(
-                    client=client,
-                    session_id=str(payload.get("session_id") or "") or None,
-                )
-            except Exception:
-                pass
-        _drain_pending_agent_windows_if_present()
+        try:
+            schedule_capture(payload, client=client, policy=RECOVER_TRIGGER)
+        except Exception as exc:
+            print(f"MemForge capture request deferred: {_safe_exception_message(exc)}", file=sys.stderr)
         return 0
 
     request = {
@@ -332,25 +333,18 @@ def _emit_additional_context(event_name: str, context: str) -> None:
 def _run_submit_session(payload: dict[str, Any], *, client: str, timeout: float) -> int:
     event_name = _event_name(payload)
     transcript_path = _transcript_path(payload)
+    session_id = str(payload.get("session_id") or "unknown-session")
     trigger = _capture_trigger(event_name)
     if trigger and transcript_path:
         try:
-            if _should_request_capture(trigger, transcript_path, client=client, payload=payload):
-                request_session_capture(
-                    client=client,
-                    session_id=str(payload.get("session_id") or "unknown-session"),
-                    transcript_path=transcript_path,
-                    workspace=_workspace(payload),
-                    trigger=trigger,
-                )
-                _spawn_agent_window_worker(timeout=_agent_worker_timeout())
-        except Exception:
-            pass
+            schedule_capture(payload, client=client, policy=trigger)
+        except Exception as exc:
+            print(f"MemForge capture request deferred: {_safe_exception_message(exc)}", file=sys.stderr)
 
     workspace = _workspace(payload)
     request = {
         "client": client,
-        "session_id": str(payload.get("session_id") or "unknown-session"),
+        "session_id": session_id,
         "hook": event_name,
         "workspace": workspace,
         "repo": _repo_name(payload),
@@ -360,6 +354,35 @@ def _run_submit_session(payload: dict[str, Any], *, client: str, timeout: float)
     }
     _post_json("/hooks/receipts", request, timeout=timeout)
     return 0
+
+
+def schedule_capture(payload: dict[str, Any], *, client: str, policy: str) -> None:
+    """Persist a capture request and ensure its queue has one upload owner."""
+    session_id = str(payload.get("session_id") or "unknown-session")
+    transcript_path = _transcript_path(payload)
+    if policy == RECOVER_TRIGGER:
+        db_path = _agent_queue_db_path()
+        if db_path.exists():
+            with sqlite3.connect(db_path) as connection:
+                _ensure_session_cursor(connection)
+                connection.execute(
+                    "UPDATE session_cursor SET wake_requested_at = COALESCE(wake_requested_at, ?), "
+                    "request_seq = request_seq + 1 "
+                    "WHERE client = ? AND session_id = ? AND capture_pending = 1",
+                    (_now_iso(), client, session_id),
+                )
+        _recover_incomplete_sessions(client=client, session_id=session_id)
+    elif transcript_path and _should_request_capture(policy, transcript_path, client=client, payload=payload):
+        request_session_capture(
+            client=client,
+            session_id=session_id,
+            transcript_path=transcript_path,
+            workspace=_workspace(payload),
+            trigger=policy,
+        )
+    else:
+        return
+    _drain_pending_agent_windows_if_present()
 
 
 # ---------------------------------------------------------------------------
@@ -442,14 +465,15 @@ def request_session_capture(
             """
             INSERT INTO session_cursor (
                 client, session_id, transcript_path, workspace, workspace_id,
-                captured_through, capture_pending, pending_trigger, request_seq, created_at, updated_at
+                captured_through, capture_pending, pending_trigger, request_seq, created_at, updated_at, wake_requested_at
             )
-            VALUES (?, ?, ?, ?, ?, 0, 1, ?, 1, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 0, 1, ?, 1, ?, ?, ?)
             ON CONFLICT(client, session_id) DO UPDATE SET
                 transcript_path = excluded.transcript_path,
                 workspace = excluded.workspace,
                 workspace_id = COALESCE(session_cursor.workspace_id, excluded.workspace_id),
                 capture_pending = 1,
+                wake_requested_at = COALESCE(session_cursor.wake_requested_at, excluded.wake_requested_at),
                 request_seq = session_cursor.request_seq + 1,
                 pending_trigger = CASE
                     WHEN session_cursor.pending_trigger IN ('REQUIRED_CAPTURE', 'BOUNDARY')
@@ -459,7 +483,7 @@ def request_session_capture(
                 END,
                 updated_at = excluded.updated_at
             """,
-            (client, session_id, transcript_path, workspace, workspace_id, trigger, now, now),
+            (client, session_id, transcript_path, workspace, workspace_id, trigger, now, now, now),
         )
 
 
@@ -552,10 +576,10 @@ def _recover_incomplete_sessions(
                     continue
                 cursor = connection.execute(
                     "UPDATE session_cursor SET capture_pending = 1, pending_trigger = ?, "
-                    "request_seq = request_seq + 1, updated_at = ? "
+                    "request_seq = request_seq + 1, updated_at = ?, wake_requested_at = COALESCE(wake_requested_at, ?) "
                     "WHERE client = ? AND session_id = ? AND capture_pending = 0 "
                     "AND captured_through = ?",
-                    (RECOVER_TRIGGER, now, client, row_session_id, int(captured_through or 0)),
+                    (RECOVER_TRIGGER, now, now, client, row_session_id, int(captured_through or 0)),
                 )
                 if cursor.rowcount:
                     rearmed += 1
@@ -569,34 +593,25 @@ def _recover_incomplete_sessions(
 # ---------------------------------------------------------------------------
 
 
-_NULL_WORKER_LOCK = object()
-
-
 def _acquire_worker_lock(db_path: Path):
-    """Take a non-blocking single-flight lock for the queue.
-
-    Returns a held lock handle on success, a null sentinel when file locking is
-    unavailable (proceed without a lock), or None when another worker on this
-    host already holds the lock (the caller should exit without processing).
-    """
+    """Reserve upload ownership without waiting or silently running unlocked."""
     if fcntl is None:
-        return _NULL_WORKER_LOCK
-    lock_path = db_path.parent / "worker.lock"
-    try:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(lock_path, "w")
-    except OSError:
-        return _NULL_WORKER_LOCK
+        raise RuntimeError("Agent capture requires POSIX file locking")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(db_path.parent / "worker.lock", "a")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except BlockingIOError:
         handle.close()
         return None
+    except OSError:
+        handle.close()
+        raise
     return handle
 
 
 def _release_worker_lock(lock) -> None:
-    if lock is None or lock is _NULL_WORKER_LOCK:
+    if lock is None:
         return
     try:
         fcntl.flock(lock, fcntl.LOCK_UN)
@@ -612,24 +627,100 @@ def _new_lease_token() -> str:
     return uuid.uuid4().hex
 
 
+@dataclass
+class _CaptureDrain:
+    background_remaining: int = 5
+    failed: set[tuple[str, str]] = field(default_factory=set)
+
+
 def run_agent_window_worker_once(
-    *,
-    timeout: float,
-    queue_db_path: str | Path | None = None,
-    max_sessions: int = 5,
+    *, timeout: float, queue_db_path: str | Path | None = None, max_sessions: int = 5
 ) -> int:
+    """Activate recovery once; bound history while draining concurrent fresh wakes."""
+    if max_sessions < 1:
+        raise ValueError("max_sessions must be positive")
     db_path = _agent_queue_db_path(queue_db_path)
     if not db_path.exists():
         return 0
     lock = _acquire_worker_lock(db_path)
     if lock is None:
-        # Another worker on this host already holds the queue lock; skip rather
-        # than double-process the same pending sessions.
         return 0
     try:
-        return _process_session_captures(db_path, timeout=timeout, max_sessions=max_sessions)
+        return _drain_session_captures(db_path, lock, timeout=timeout, max_sessions=max_sessions)
     finally:
         _release_worker_lock(lock)
+
+
+def run_agent_window_worker(*, timeout: float, owner_fd: int) -> int:
+    """Consume durable wakes, then release ownership at the SQLite handoff point."""
+    db_path = _agent_queue_db_path()
+    lock = open(owner_fd, "a", closefd=True)
+    try:
+        held = os.fstat(lock.fileno())
+        expected = (db_path.parent / "worker.lock").stat()
+        if (held.st_dev, held.st_ino) != (expected.st_dev, expected.st_ino):
+            raise ValueError("capture owner descriptor does not match queue lock")
+        if fcntl is None:
+            raise RuntimeError("Agent capture requires POSIX file locking")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return _drain_session_captures(db_path, lock, timeout=timeout, max_sessions=5)
+    finally:
+        _release_worker_lock(lock)
+
+
+def _drain_session_captures(db_path: Path, lock, *, timeout: float, max_sessions: int) -> int:
+    drain = _CaptureDrain(background_remaining=max_sessions)
+    submitted = 0
+    while True:
+        submitted += _process_session_captures(db_path, timeout=timeout, max_sessions=max_sessions, drain=drain)
+        if _finish_capture_drain(db_path, lock, drain):
+            return submitted
+
+
+def _finish_capture_drain(db_path: Path, lock, drain: _CaptureDrain) -> bool:
+    with sqlite3.connect(db_path) as connection:
+        connection.isolation_level = None
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if _pending_capture_rows(connection, max_sessions=1, drain=drain):
+                connection.execute("COMMIT")
+                return False
+            # Enqueue transactions cannot pass this check until ownership is free.
+            # After unlocking, this worker only closes the transaction and exits.
+            _release_worker_lock(lock)
+            connection.execute("COMMIT")
+            return True
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+
+
+def _pending_capture_rows(connection: sqlite3.Connection, *, max_sessions: int, drain: _CaptureDrain) -> list[tuple]:
+    now = _now_iso()
+    retry_before = (datetime.fromisoformat(now) - timedelta(seconds=CAPTURE_RETRY_INTERVAL_SECONDS)).isoformat()
+    query = (
+        "SELECT client, session_id, transcript_path, workspace, workspace_id, "
+        "captured_through, pending_trigger, request_seq, wake_requested_at "
+        "FROM session_cursor WHERE capture_pending = 1 "
+        "AND (lease_until IS NULL OR lease_until < ?) "
+        "AND (last_error IS NULL OR last_attempt_at IS NULL OR last_attempt_at <= ?) "
+    )
+    params: list[Any] = [now, retry_before]
+    connection.create_function("capture_failed", 2, lambda client, session: (client, session) in drain.failed)
+    query += "AND NOT capture_failed(client, session_id) "
+    fresh = connection.execute(
+        query + "AND wake_requested_at IS NOT NULL ORDER BY wake_requested_at, client, session_id LIMIT ?",
+        (*params, max_sessions),
+    ).fetchall()
+    remaining = min(max_sessions - len(fresh), drain.background_remaining)
+    if remaining:
+        fresh.extend(
+            connection.execute(
+                query + "AND wake_requested_at IS NULL ORDER BY updated_at, client, session_id LIMIT ?",
+                (*params, remaining),
+            ).fetchall()
+        )
+    return fresh
 
 
 def _claim_pending_sessions(
@@ -637,48 +728,49 @@ def _claim_pending_sessions(
     *,
     timeout: float,
     max_sessions: int,
+    drain: _CaptureDrain | None = None,
 ) -> tuple[list[tuple], str]:
-    """Atomically claim pending sessions by leasing them, so two workers never collide."""
+    """Claim one bounded round, consuming wakes atomically with lease creation."""
+    drain = drain if drain is not None else _CaptureDrain(background_remaining=max_sessions)
     now = _now_iso()
     lease_until = _iso_after(timeout + WORKER_LEASE_BUFFER_SECONDS)
     connection.execute("BEGIN IMMEDIATE")
     try:
-        rows = connection.execute(
-            """
-            SELECT client, session_id, transcript_path, workspace, workspace_id,
-                   captured_through, pending_trigger, request_seq
-            FROM session_cursor
-            WHERE capture_pending = 1 AND (lease_until IS NULL OR lease_until < ?)
-            ORDER BY updated_at
-            LIMIT ?
-            """,
-            (now, max_sessions),
-        ).fetchall()
+        rows = _pending_capture_rows(connection, max_sessions=max_sessions, drain=drain)
         claimed = []
         for row in rows:
             lease_token = _new_lease_token()
             connection.execute(
-                "UPDATE session_cursor SET lease_until = ?, lease_token = ?, updated_at = ? "
-                "WHERE client = ? AND session_id = ?",
+                "UPDATE session_cursor SET lease_until = ?, lease_token = ?, updated_at = ?, "
+                "wake_requested_at = NULL WHERE client = ? AND session_id = ?",
                 (lease_until, lease_token, now, row[0], row[1]),
             )
-            claimed.append((*row, lease_token))
+            claimed.append((*row[:8], lease_token))
         connection.execute("COMMIT")
+        drain.background_remaining -= sum(row[8] is None for row in rows)
     except Exception:
-        try:
-            connection.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
+        connection.execute("ROLLBACK")
         raise
     return claimed, now
 
 
-def _process_session_captures(db_path: Path, *, timeout: float, max_sessions: int) -> int:
+def _process_session_captures(
+    db_path: Path,
+    *,
+    timeout: float,
+    max_sessions: int,
+    drain: _CaptureDrain | None = None,
+) -> int:
     connection = sqlite3.connect(db_path)
     connection.isolation_level = None  # manage the lease claim transaction explicitly
     try:
         _ensure_session_cursor(connection)
-        claimed, _claim_now = _claim_pending_sessions(connection, timeout=timeout, max_sessions=max_sessions)
+        claimed, _claim_now = _claim_pending_sessions(
+            connection,
+            timeout=timeout,
+            max_sessions=max_sessions,
+            drain=drain,
+        )
         submitted = 0
         for (
             client,
@@ -743,6 +835,9 @@ def _process_session_captures(db_path: Path, *, timeout: float, max_sessions: in
                         workspace_id=workspace_id,
                     )
             except Exception as exc:
+                if drain is not None:
+                    drain.failed.add((client, session_id))
+                now = _now_iso()
                 # Keep capture_pending set so the next pass retries; release the lease.
                 connection.execute(
                     "UPDATE session_cursor SET lease_until = NULL, lease_token = NULL, last_error = ?, "
@@ -755,11 +850,13 @@ def _process_session_captures(db_path: Path, *, timeout: float, max_sessions: in
             # finish the row. If a hook requested another capture mid-upload,
             # request_seq changed and capture_pending stays set for the tail.
             uploaded_through = int(window_payload["history_window"]["end"])
+            now = _now_iso()
             cursor = connection.execute(
                 "UPDATE session_cursor SET captured_through = "
                 "CASE WHEN ? < ? THEN ? ELSE max(captured_through, ?) END, "
                 "capture_pending = CASE WHEN ? < ? THEN 1 WHEN request_seq = ? THEN 0 ELSE 1 END, "
                 "pending_trigger = CASE WHEN ? < ? THEN pending_trigger WHEN request_seq = ? THEN NULL ELSE pending_trigger END, "
+                "wake_requested_at = CASE WHEN ? < ? THEN COALESCE(wake_requested_at, ?) ELSE wake_requested_at END, "
                 "lease_until = NULL, lease_token = NULL, last_error = NULL, "
                 "last_attempt_at = ?, updated_at = ? "
                 "WHERE client = ? AND session_id = ? AND lease_token = ?",
@@ -774,6 +871,9 @@ def _process_session_captures(db_path: Path, *, timeout: float, max_sessions: in
                     uploaded_through,
                     count,
                     request_seq,
+                    uploaded_through,
+                    count,
+                    now,
                     now,
                     now,
                     client,
@@ -814,34 +914,45 @@ def _drain_pending_agent_windows_if_present() -> None:
     try:
         if _has_pending_session_captures(_agent_queue_db_path()):
             _spawn_agent_window_worker(timeout=_agent_worker_timeout())
-    except Exception:
-        return
+    except Exception as exc:
+        print(f"MemForge capture wakeup deferred: {_safe_exception_message(exc)}", file=sys.stderr)
 
 
 def _spawn_agent_window_worker(*, timeout: float) -> None:
-    command = _agent_window_worker_command(timeout=timeout)
-    subprocess.Popen(  # noqa: S603 - plugin-local worker command is constructed without shell.
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        start_new_session=True,
-    )
+    """Reserve before spawning; another owner consumes the durable wake instead."""
+    db_path = _agent_queue_db_path()
+    lock = None
+    try:
+        with sqlite3.connect(db_path) as connection:
+            _ensure_session_cursor(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            if not _pending_capture_rows(connection, max_sessions=1, drain=_CaptureDrain()):
+                return
+            lock = _acquire_worker_lock(db_path)
+        if lock is None:
+            return
+        subprocess.Popen(  # noqa: S603 - packaged command, no shell, one inherited owner fd.
+            _agent_window_worker_command(timeout=timeout, owner_fd=lock.fileno()),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(lock.fileno(),),
+            start_new_session=True,
+        )
+    finally:
+        # close, not LOCK_UN: the child shares the locked open file description.
+        if lock is not None:
+            lock.close()
 
 
-def _agent_window_worker_command(*, timeout: float) -> list[str]:
+def _agent_window_worker_command(*, timeout: float, owner_fd: int) -> list[str]:
     script_path = Path(sys.argv[0]).expanduser()
     if script_path.exists() and script_path.name.startswith("memforge_hook"):
         command = [sys.executable, str(script_path)]
     else:
         command = [sys.executable, "-m", "memforge.hook_adapter"]
-    return [
-        *command,
-        "worker-run-once",
-        "--timeout",
-        str(timeout),
-    ]
+    return [*command, "worker-drain", "--timeout", str(timeout), "--owner-fd", str(owner_fd)]
 
 
 def _agent_worker_timeout() -> float:
@@ -1652,6 +1763,7 @@ def _ensure_session_cursor(connection: sqlite3.Connection) -> None:
             request_seq INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             last_attempt_at TEXT,
+            wake_requested_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (client, session_id)
@@ -1661,6 +1773,7 @@ def _ensure_session_cursor(connection: sqlite3.Connection) -> None:
     _ensure_column(connection, "session_cursor", "lease_token", "TEXT")
     _ensure_column(connection, "session_cursor", "request_seq", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(connection, "session_cursor", "workspace_id", "TEXT")
+    _ensure_column(connection, "session_cursor", "wake_requested_at", "TEXT")
 
 
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
