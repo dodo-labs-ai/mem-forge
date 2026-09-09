@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 from memforge.evals.agent_evaluation import AgentRuntimeBundle
 from memforge.memory.evidence import ResolvedEvidenceSelection
+from memforge.source_activity import SourceActivityLease
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactSummary
 
 # ---------------------------------------------------------------------------
@@ -536,6 +537,11 @@ class SourceSyncRun:
     updated_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    source_activity: SourceActivityLease | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass

@@ -1998,21 +1998,23 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
             source_activity_epoch=None,
+            source_activity=None,
             lifecycle_cycle_id=None,
-                scope_transition_run_id=None,
-                reusable_projection_doc_ids=frozenset(),
-                projection_scope_attestations=(),
-                record_terminal_result=True,
-            ):
+            scope_transition_run_id=None,
+            reusable_projection_doc_ids=frozenset(),
+            projection_scope_attestations=(),
+            record_terminal_result=True,
+        ):
             del (
                 authoritative_snapshot,
                 reprocess_doc_ids,
                 source_activity_epoch,
-                    scope_transition_run_id,
-                    reusable_projection_doc_ids,
-                    projection_scope_attestations,
-                    record_terminal_result,
-                )
+                source_activity,
+                scope_transition_run_id,
+                reusable_projection_doc_ids,
+                projection_scope_attestations,
+                record_terminal_result,
+            )
             self.lifecycle_cycle_id = lifecycle_cycle_id
             await gene.authenticate()
             return SyncState(source=source_id, last_sync_status="success")
@@ -2120,22 +2122,24 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
             source_activity_epoch=None,
+            source_activity=None,
             lifecycle_cycle_id=None,
-                scope_transition_run_id=None,
-                reusable_projection_doc_ids=frozenset(),
-                projection_scope_attestations=(),
-                record_terminal_result=True,
-            ):
+            scope_transition_run_id=None,
+            reusable_projection_doc_ids=frozenset(),
+            projection_scope_attestations=(),
+            record_terminal_result=True,
+        ):
             del (
                 authoritative_snapshot,
                 reprocess_doc_ids,
                 source_activity_epoch,
+                source_activity,
                 lifecycle_cycle_id,
-                    scope_transition_run_id,
-                    reusable_projection_doc_ids,
-                    projection_scope_attestations,
-                    record_terminal_result,
-                )
+                scope_transition_run_id,
+                reusable_projection_doc_ids,
+                projection_scope_attestations,
+                record_terminal_result,
+            )
             self.gene = gene
             return SyncState(source=source_id, last_sync_status="success")
 

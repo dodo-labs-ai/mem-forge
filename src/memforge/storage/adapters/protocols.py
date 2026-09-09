@@ -459,7 +459,12 @@ class RelationalStore(Protocol):
         source_activity: SourceActivityLease | None = None,
     ) -> None: ...
     async def get_document(self, doc_id: str) -> DocumentRecord | None: ...
-    async def delete_projected_document(self, doc_id: str) -> None: ...
+    async def delete_projected_document(
+        self,
+        doc_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
+    ) -> None: ...
     async def rebaseline_source_lifecycle(
         self,
         source_id: str,
@@ -470,12 +475,15 @@ class RelationalStore(Protocol):
         self,
         old_doc_id: str,
         new_doc_id: str,
+        *,
+        source_activity: SourceActivityLease | None = None,
     ) -> None: ...
     async def record_source_projection(
         self,
         projection: SourceProjection,
         *,
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
     ) -> None: ...
     async def get_source_projection(self, run_id: str) -> SourceProjection | None: ...
     async def get_current_source_unit_revision(
@@ -762,6 +770,7 @@ class RelationalStore(Protocol):
         derivation_context_identity_hash: str | None = None,
         required_derivation_work_ids: tuple[str, ...] = (),
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
         runtime_bundle: AgentRuntimeBundle | None = None,
     ) -> None: ...
     async def apply_agent_claim_source_projection_lifecycle(

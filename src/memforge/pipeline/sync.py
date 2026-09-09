@@ -114,6 +114,7 @@ from memforge.pipeline.projection_images import (
     load_projection_images,
 )
 from memforge.source_access import memory_visibility_for_source_id
+from memforge.source_activity import SourceActivityLease
 from memforge.source_projection_config import canonical_projection_scope
 
 if TYPE_CHECKING:
@@ -737,6 +738,7 @@ class GeneSyncOrchestrator:
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
@@ -784,6 +786,15 @@ class GeneSyncOrchestrator:
         SyncState
             Final sync result with counts and error details.
         """
+        if source_activity is not None:
+            if source_activity.source_id != source_id:
+                raise ValueError("source activity does not belong to the synced Source")
+            if (
+                source_activity_epoch is not None
+                and source_activity_epoch != source_activity.epoch
+            ):
+                raise ValueError("source activity epoch does not match the supplied fence")
+            source_activity_epoch = source_activity.epoch
         run_id = uuid.uuid4().hex[:12]
         durable_cycle_id = lifecycle_cycle_id or run_id
         transition_run_id = scope_transition_run_id or durable_cycle_id
@@ -846,6 +857,7 @@ class GeneSyncOrchestrator:
                 recovered = await self._resume_source_derivations(
                     source_id=source_id,
                     source_activity_epoch=source_activity_epoch,
+                    source_activity=source_activity,
                     run_id=run_id,
                     lifecycle_execution_owner_id=durable_cycle_id,
                     progress_callback=progress_callback,
@@ -1110,6 +1122,7 @@ class GeneSyncOrchestrator:
                                 authoritative_snapshot=authoritative_snapshot,
                                 execution_mode=execution_mode,
                                 expected_source_activity_epoch=source_activity_epoch,
+                                source_activity=source_activity,
                                 lifecycle_execution_owner_id=durable_cycle_id,
                                 lifecycle_attempt_count=attempt,
                                 source_unit_target_callback=on_item_target,
@@ -1386,6 +1399,7 @@ class GeneSyncOrchestrator:
                     source_filter_summary=_source_filter_summary(gene, last_sync_time),
                     allow_legacy_orphan_cleanup=rebaseline_replay,
                     expected_source_activity_epoch=source_activity_epoch,
+                    source_activity=source_activity,
                 )
                 if deletion_failures:
                     failed_docs.extend(deletion_failures)
@@ -1700,6 +1714,7 @@ class GeneSyncOrchestrator:
         run_id: str,
         lifecycle_execution_owner_id: str | None = None,
         progress_callback: Callable[[dict], None] | None = None,
+        source_activity: SourceActivityLease | None = None,
     ) -> _SourceDerivationRecovery:
         """Resume durable Source Unit work before reading the provider."""
 
@@ -1792,6 +1807,7 @@ class GeneSyncOrchestrator:
                             attempt=attempt,
                             source_id=source_id,
                             source_activity_epoch=source_activity_epoch,
+                            source_activity=source_activity,
                             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                             diagnostics=diagnostics,
                         )
@@ -1874,6 +1890,7 @@ class GeneSyncOrchestrator:
         source_activity_epoch: int | None,
         lifecycle_execution_owner_id: str | None,
         diagnostics: _SourceUnitExecutionDiagnostics,
+        source_activity: SourceActivityLease | None = None,
     ) -> dict | None:
         """Resume one derivation inside the process document admission."""
 
@@ -1958,6 +1975,7 @@ class GeneSyncOrchestrator:
             ),
             derivation_reprocess_operation_id=context.reprocess_operation_id,
             expected_source_activity_epoch=source_activity_epoch,
+            source_activity=source_activity,
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
             lifecycle_attempt_count=1,
         )
@@ -2020,6 +2038,7 @@ class GeneSyncOrchestrator:
         authoritative_snapshot: bool = False,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
         lifecycle_execution_owner_id: str | None = None,
         lifecycle_attempt_count: int = 1,
         source_unit_target_callback: Callable[[str, str], None] | None = None,
@@ -2060,6 +2079,7 @@ class GeneSyncOrchestrator:
                         authoritative_snapshot=authoritative_snapshot,
                         execution_mode=execution_mode,
                         expected_source_activity_epoch=expected_source_activity_epoch,
+                        source_activity=source_activity,
                         lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                         lifecycle_attempt_count=lifecycle_attempt_count,
                         source_unit_target_callback=source_unit_target_callback,
@@ -2119,6 +2139,7 @@ class GeneSyncOrchestrator:
         authoritative_snapshot: bool = False,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
         source_unit_id_callback: Callable[[str], None] | None = None,
         lifecycle_execution_owner_id: str | None = None,
         lifecycle_attempt_count: int = 1,
@@ -2452,6 +2473,7 @@ class GeneSyncOrchestrator:
                 await self.db.record_source_projection(
                     projection,
                     expected_source_activity_epoch=expected_source_activity_epoch,
+                    source_activity=source_activity,
                 )
 
             lineage_document_ids = await self.db.list_source_unit_document_ids(source_unit.id)
@@ -2609,10 +2631,12 @@ class GeneSyncOrchestrator:
                 await self.db.upsert_document(
                     doc_record,
                     require_configured_source=True,
+                    source_activity=source_activity,
                 )
                 await self.db.record_source_projection(
                     projection,
                     expected_source_activity_epoch=expected_source_activity_epoch,
+                    source_activity=source_activity,
                 )
             if progress_callback:
                 progress_callback(
@@ -2635,11 +2659,13 @@ class GeneSyncOrchestrator:
                 await self.db.upsert_document(
                     doc_record,
                     require_configured_source=True,
+                    source_activity=source_activity,
                 )
             await self._finalize_projected_document_moves(
                 predecessor_docs=lineage_predecessor_docs,
                 current_doc_id=doc_id,
                 source_unit_id=source_unit.id,
+                source_activity=source_activity,
             )
 
             if progress_callback:
@@ -2699,6 +2725,7 @@ class GeneSyncOrchestrator:
                 ),
                 document=doc_record,
                 expected_source_activity_epoch=expected_source_activity_epoch,
+                source_activity=source_activity,
                 lifecycle_execution_owner_id=lifecycle_execution_owner_id,
                 lifecycle_attempt_count=lifecycle_attempt_count,
             )
@@ -2723,6 +2750,7 @@ class GeneSyncOrchestrator:
                 predecessor_docs=lineage_predecessor_docs,
                 current_doc_id=doc_id,
                 source_unit_id=source_unit.id,
+                source_activity=source_activity,
             )
             if progress_callback:
                 progress_callback(
@@ -2840,6 +2868,7 @@ class GeneSyncOrchestrator:
                 derivation_context.reprocess_operation_id
             ),
             expected_source_activity_epoch=expected_source_activity_epoch,
+            source_activity=source_activity,
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
             lifecycle_attempt_count=lifecycle_attempt_count,
         )
@@ -2900,6 +2929,7 @@ class GeneSyncOrchestrator:
             predecessor_docs=lineage_predecessor_docs,
             current_doc_id=doc_id,
             source_unit_id=source_unit.id,
+            source_activity=source_activity,
         )
 
         if progress_callback:
@@ -3808,6 +3838,7 @@ class GeneSyncOrchestrator:
         predecessor_docs: list[DocumentRecord],
         current_doc_id: str,
         source_unit_id: str,
+        source_activity: SourceActivityLease | None = None,
     ) -> None:
         """Atomically rebind provenance, then remove obsolete document aliases."""
         if not predecessor_docs:
@@ -3818,6 +3849,7 @@ class GeneSyncOrchestrator:
             await self.db.rebind_projected_document_support(
                 predecessor.doc_id,
                 current_doc_id,
+                source_activity=source_activity,
             )
             deletion_context = {
                 "deletion_kind": "source_unit_move",
@@ -3829,9 +3861,13 @@ class GeneSyncOrchestrator:
                 await self.memory_store.delete_projected_document(
                     predecessor.doc_id,
                     deletion_context=deletion_context,
+                    source_activity=source_activity,
                 )
             else:
-                await self.db.delete_projected_document(predecessor.doc_id)
+                await self.db.delete_projected_document(
+                    predecessor.doc_id,
+                    source_activity=source_activity,
+                )
 
     # ==================================================================
     # Private: deletion detection
@@ -3849,6 +3885,7 @@ class GeneSyncOrchestrator:
         source_filter_summary: str | None,
         allow_legacy_orphan_cleanup: bool = False,
         expected_source_activity_epoch: int | None = None,
+        source_activity: SourceActivityLease | None = None,
     ) -> tuple[int, list[FailedDoc], set[str]]:
         """Detect and handle documents deleted from the source.
 
@@ -3895,9 +3932,13 @@ class GeneSyncOrchestrator:
                             await self.memory_store.delete_projected_document(
                                 doc_id,
                                 deletion_context=deletion_context,
+                                source_activity=source_activity,
                             )
                         else:
-                            await self.db.delete_projected_document(doc_id)
+                            await self.db.delete_projected_document(
+                                doc_id,
+                                source_activity=source_activity,
+                            )
                         logger.info(
                             "Removed legacy document %s after complete rebaseline replay proved absence",
                             doc_id,
@@ -3913,6 +3954,7 @@ class GeneSyncOrchestrator:
                         await self.db.rebind_projected_document_support(
                             doc_id,
                             current_document_id,
+                            source_activity=source_activity,
                         )
                         await self.memory_store.delete_projected_document(
                             doc_id,
@@ -3922,6 +3964,7 @@ class GeneSyncOrchestrator:
                                 "source_unit_id": source_unit.id,
                                 "successor_doc_id": current_document_id,
                             },
+                            source_activity=source_activity,
                         )
                         logger.info(
                             "Removed historical document locator %s after move to %s",
@@ -3968,10 +4011,12 @@ class GeneSyncOrchestrator:
                     reason=AUTHORITATIVE_SOURCE_UNIT_REMOVAL_REASON,
                     lifecycle_cycle_id=lifecycle_cycle_id,
                     expected_source_activity_epoch=expected_source_activity_epoch,
+                    source_activity=source_activity,
                 )
                 await self.db.record_source_projection(
                     tombstone,
                     expected_source_activity_epoch=expected_source_activity_epoch,
+                    source_activity=source_activity,
                 )
                 tombstoned_source_unit_ids.add(source_unit.id)
                 if lifecycle_result["can_delete_document"]:
@@ -3984,6 +4029,7 @@ class GeneSyncOrchestrator:
                             "source_unit_id": source_unit.id,
                             "target_unit_revision_id": target_revision.id,
                         },
+                        source_activity=source_activity,
                     )
                 else:
                     logger.warning(
