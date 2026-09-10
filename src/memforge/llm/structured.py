@@ -393,8 +393,19 @@ class ProjectionFragmentMemoryCandidate(StructuredResponseModel):
     # catalog-local facts, so malformed or stale string selectors are rejected
     # candidate-by-candidate by the catalog resolver instead of failing every
     # other valid candidate in the LLM response.
-    primary_ref: str
-    required_refs: list[str] = Field(default_factory=list)
+    primary_ref: str = Field(
+        description=(
+            "Exactly one reference copied unchanged from primary_candidates; "
+            "never select from required_only_candidates."
+        )
+    )
+    required_refs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "A duplicate-free list of references copied unchanged from "
+            "primary_candidates or required_only_candidates; do not repeat primary_ref."
+        ),
+    )
 
 class ProjectionFragmentMemoryExtractionResponse(StructuredResponseModel):
     """projection-extraction-v9 response containing model judgments only."""
@@ -410,8 +421,19 @@ class ProjectionFragmentSelectorCorrection(StructuredResponseModel):
     model_config = ConfigDict(extra="forbid")
 
     candidate_index: int
-    primary_ref: str
-    required_refs: list[str] = Field(default_factory=list)
+    primary_ref: str = Field(
+        description=(
+            "Exactly one reference copied unchanged from primary_candidates; "
+            "never select from required_only_candidates."
+        )
+    )
+    required_refs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "A duplicate-free list of references copied unchanged from "
+            "primary_candidates or required_only_candidates; do not repeat primary_ref."
+        ),
+    )
 
 
 class ProjectionFragmentSelectorCorrectionResponse(StructuredResponseModel):

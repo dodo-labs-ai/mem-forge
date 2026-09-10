@@ -33,6 +33,7 @@ from memforge.llm.structured import (
     MemorySupportValidationResponse,
     OfflineSemanticJudgeResponse,
     ProjectionFragmentMemoryExtractionResponse,
+    ProjectionFragmentSelectorCorrectionResponse,
     ProjectionMemoryExtractionResponse,
     RevisionSupportResponse,
     RevisionCompositionDecision,
@@ -217,6 +218,30 @@ def test_projection_artifact_schema_exposes_only_observation_authority() -> None
                     ]
                 }
             )
+
+
+def test_projection_fragment_schemas_describe_catalog_role_constraints() -> None:
+    schemas = (
+        (
+            ProjectionFragmentMemoryExtractionResponse.model_json_schema(),
+            "ProjectionFragmentMemoryCandidate",
+        ),
+        (
+            ProjectionFragmentSelectorCorrectionResponse.model_json_schema(),
+            "ProjectionFragmentSelectorCorrection",
+        ),
+    )
+
+    for schema, definition_name in schemas:
+        properties = schema["$defs"][definition_name]["properties"]
+        assert properties["primary_ref"]["description"] == (
+            "Exactly one reference copied unchanged from primary_candidates; "
+            "never select from required_only_candidates."
+        )
+        assert properties["required_refs"]["description"] == (
+            "A duplicate-free list of references copied unchanged from "
+            "primary_candidates or required_only_candidates; do not repeat primary_ref."
+        )
 
 
 class ChoiceMessage:
