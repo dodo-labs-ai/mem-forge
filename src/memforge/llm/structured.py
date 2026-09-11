@@ -2531,15 +2531,16 @@ class LiteLlmStructuredClient:
         )
         schema_transport = native_schema_transport if native_schema else "json_text"
         try:
-            if response_format is ClaimRevisionWireResponse:
+            if response_format in (ClaimRevisionWireResponse, SupportAssessmentResponse):
                 finish = _response_finish_reason(response)
                 stop = _response_stop_reason(response)
                 message = _object_value(_first_response_choice(response), "message")
                 if (finish in {"length", "max_tokens", "content_filter", "refusal"}
                         or stop in {"max_tokens", "refusal"}
                         or _object_value(message, "refusal")):
-                    raise StructuredLlmError("claim catalog response did not complete",
-                        error_code="claim_response_incomplete")
+                    raise StructuredLlmError("assessment response did not complete",
+                        error_code=("claim_response_incomplete" if response_format is ClaimRevisionWireResponse
+                                    else "support_response_incomplete"))
             raw_content = _message_content(response)
             if isinstance(raw_content, response_format):
                 return raw_content
