@@ -582,6 +582,57 @@ class ClaimRevisionResponse(StructuredResponseModel):
     decisions: list[ClaimRevisionDecision]
 
 
+class ClaimContradiction(StructuredResponseModel):
+    """Applicable proof only for a contradictory pair."""
+
+    same_subject_and_scope: bool
+    incompatible_assertions: str = Field(min_length=1, max_length=1000)
+
+
+class ClaimRevisionWireDecision(StructuredResponseModel):
+    """One complete pair judgment with direction encoded in its relation."""
+
+    pair_index: int = Field(ge=0)
+    relation: Literal[
+        "equivalent", "refines_challenger_to_candidate", "refines_candidate_to_challenger",
+        "contradicts", "unrelated", "insufficient",
+    ]
+    reason: str = Field(default="", max_length=1000, description="One brief decisive reason; do not restate either claim.")
+    contradiction: ClaimContradiction | None = None
+    revision_assessment: RevisionAssessment | None = None
+
+    @model_validator(mode="after")
+    def _applicable_proofs(self):
+        if self.relation == "contradicts":
+            if (self.contradiction is None or not self.contradiction.same_subject_and_scope
+                    or not self.contradiction.incompatible_assertions.strip()):
+                raise ValueError("CONTRADICTS requires overlapping scope and incompatible assertions")
+        elif self.contradiction is not None:
+            raise ValueError("only CONTRADICTS may provide a contradiction proof")
+        if self.revision_assessment is not None and self.relation != "refines_challenger_to_candidate":
+            raise ValueError("revision proof applies only to challenger-to-candidate refinement")
+        return self
+
+    def decision(self) -> ClaimRevisionDecision:
+        unresolved = self.relation == "insufficient"
+        refinement = self.relation.startswith("refines_")
+        return ClaimRevisionDecision(
+            pair_index=self.pair_index, status="insufficient" if unresolved else "resolved",
+            reason=self.reason, revision_assessment=self.revision_assessment,
+            relation=None if unresolved else MemoryRelationAssessment(
+                classification="refines" if refinement else self.relation,
+                direction=self.relation.removeprefix("refines_") if refinement else "symmetric",
+                same_subject_and_scope=self.contradiction is not None,
+                incompatible_assertions=self.contradiction.incompatible_assertions if self.contradiction else "",
+                reason=self.reason,
+            ),
+        )
+
+
+class ClaimRevisionWireResponse(StructuredResponseModel):
+    decisions: list[ClaimRevisionWireDecision]
+
+
 class RevisionSupportResponse(StructuredResponseModel):
     """Fixed-claim judgment and a complete current selection, with variable Required."""
 
@@ -1179,11 +1230,13 @@ class StructuredLlmError(RuntimeError):
         terminal_category: StructuredLlmTerminalCategory = "invalid_response",
         error_code: str = "structured_llm_error",
         validation_fields: tuple[tuple[str, str], ...] = (),
+        diagnostic: Any = None,
     ) -> None:
         super().__init__(message)
         self.terminal_category = terminal_category
         self.error_code = error_code
         self.validation_fields = validation_fields
+        self.diagnostic = diagnostic
 
 
 @dataclass(frozen=True, slots=True)
@@ -1480,6 +1533,8 @@ def _safe_json_error_position(exc: BaseException) -> tuple[int | None, int | Non
 
 
 def _schema_operation_name(response_format: type[BaseModel]) -> str:
+    if response_format is ClaimRevisionWireResponse:
+        return "claim_revision"
     name = response_format.__name__.removesuffix("Response")
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
@@ -1869,10 +1924,11 @@ class LiteLlmStructuredClient:
         self, prompt: str, *, max_tokens: int = 32_768,
         model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
     ) -> ClaimRevisionResponse:
-        return await self._call_schema(
-            prompt=prompt, response_format=ClaimRevisionResponse,
+        response = await self._call_schema(
+            prompt=prompt, response_format=ClaimRevisionWireResponse,
             max_tokens=max_tokens, model=model, images=images,
         )
+        return ClaimRevisionResponse(decisions=[item.decision() for item in response.decisions])
 
     async def extract_memories(
         self,
@@ -2206,7 +2262,23 @@ class LiteLlmStructuredClient:
                     error_code=failure.error_code,
                 )
             )
-            raise failure.to_error(timeout_s=self.config.timeout_s)
+            from dataclasses import asdict
+            from memforge.evals.agent_evaluation import QualitySignal
+
+            error = failure.to_error(timeout_s=self.config.timeout_s)
+            attempt = next((item for item in reversed(state.diagnostic_attempts)
+                            if item.error_code == failure.error_code), None)
+            details = asdict(attempt) if attempt is not None else {
+                "terminal_category": failure.terminal_category, "error_code": failure.error_code,
+                "structured_mode": state.final_mode, "requested_max_tokens": max_tokens,
+            }
+            error.diagnostic = QualitySignal(
+                event_name="structured_llm_attempt_outcome", outcome="failed",
+                reason_code=failure.terminal_category, operation=state.operation,
+                provider=_safe_llm_provider(model or self.config.model), model=model or self.config.model,
+                **details,
+            )
+            raise error
 
         self._emit_telemetry(
             state.telemetry(
@@ -2394,7 +2466,7 @@ class LiteLlmStructuredClient:
         )
         if response_format in {
             ProjectionFragmentMemoryExtractionResponse, ProjectionFragmentSelectorCorrectionResponse,
-            RevisionSupportResponse, ClaimRevisionResponse,
+            RevisionSupportResponse, ClaimRevisionResponse, ClaimRevisionWireResponse,
             SupportAssessmentResponse,
         }:
             # Count the expanded template value and fallback repair diagnostics;

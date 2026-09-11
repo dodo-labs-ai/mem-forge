@@ -12,6 +12,8 @@ import logging
 from dataclasses import dataclass, replace
 from time import perf_counter
 
+from memforge.derivation_work import DerivationWorkStore
+from memforge.evals.agent_evaluation import QualitySignal
 from memforge.llm.structured import StructuredLlmError, structured_llm_metrics_scope
 from memforge.memory.evidence import RelationDirection
 from memforge.memory.relation_classifier import (
@@ -77,6 +79,8 @@ class ReconciliationFailure:
     operation: str | None = None
     terminal_category: str | None = None
     error_code: str | None = None
+    validation_fields: tuple[tuple[str, str], ...] = ()
+    diagnostic: QualitySignal | None = None
 
 
 class ReconciliationContractError(ValueError):
@@ -108,6 +112,7 @@ class ReconciliationResult:
     operations: list[ReconcileOperation]
     failure: ReconciliationFailure | None = None
     metrics: ReconciliationMetrics = ReconciliationMetrics()
+    work_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +173,9 @@ async def reconcile_memories(
     support_audits: list[SupportAuditEntry] | None = None,
     images: tuple = (),
     image_loader=None,
+    work_store: DerivationWorkStore | None = None,
+    derivation_id: str | None = None,
+    operation_input_hash: str | None = None,
 ) -> list[ReconcileOperation] | ReconciliationResult:
     """Classify a complete relation/support ledger and reduce it deterministically."""
 
@@ -226,12 +234,13 @@ async def reconcile_memories(
             if {entry.incumbent_id for entry in audits} != {old.id for old in existing_memories}:
                 raise ReconciliationContractError("support_ledger_incomplete", "missing exact incumbent assessment")
             operation = "assess_claim_revisions"
+            relation_pair_count += len(pairs)
             assessed = await assess_claim_pairs(
                 candidates=new_extractions, incumbents=existing_memories,
                 support_audits=audits, client=structured_llm_client,
                 model=llm_model, images=images, image_loader=image_loader,
+                store=work_store, derivation_id=derivation_id, operation_input_hash=operation_input_hash,
             )
-            relation_pair_count += len(pairs)
             relation_prompt_chars += assessed.prompt_chars
             relation_entries = []
             proofs = []
@@ -302,7 +311,7 @@ async def reconcile_memories(
                 support_audits=audits,
                 revision_proofs=proofs,
             )
-            return _return_result(operations, metrics=metrics(), include_metadata=include_metadata)
+            return _return_result(operations, metrics=metrics(), include_metadata=include_metadata, work_ids=assessed.work_ids)
         except ReconciliationContractError as error:
             logger.warning("Relation-first reconciliation failed closed: %s", error)
             return _return_result(
@@ -314,6 +323,8 @@ async def reconcile_memories(
                     operation=operation,
                     terminal_category=getattr(error, "terminal_category", None),
                     error_code=getattr(error, "error_code", None),
+                    validation_fields=getattr(error, "validation_fields", ()),
+                    diagnostic=getattr(error, "diagnostic", None),
                 ),
                 metrics=metrics(),
                 include_metadata=include_metadata,
@@ -329,6 +340,8 @@ async def reconcile_memories(
                     operation=operation,
                     terminal_category=getattr(error, "terminal_category", None),
                     error_code=getattr(error, "error_code", None),
+                    validation_fields=getattr(error, "validation_fields", ()),
+                    diagnostic=getattr(error, "diagnostic", None),
                 ),
                 metrics=metrics(),
                 include_metadata=include_metadata,
@@ -632,7 +645,8 @@ def _return_result(
     failure: ReconciliationFailure | None = None,
     metrics: ReconciliationMetrics,
     include_metadata: bool,
+    work_ids: tuple[str, ...] = (),
 ) -> list[ReconcileOperation] | ReconciliationResult:
     if include_metadata:
-        return ReconciliationResult(operations=operations, failure=failure, metrics=metrics)
+        return ReconciliationResult(operations=operations, failure=failure, metrics=metrics, work_ids=work_ids)
     return operations

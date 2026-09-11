@@ -1136,7 +1136,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
     calls: list[dict[str, object]] = []
     payloads = {
         "RevisionSupportResponse": '{"status":"unsupported"}',
-        "ClaimRevisionResponse": '{"decisions":[]}',
+        "ClaimRevisionWireResponse": '{"decisions":[]}',
         "SourceSupportResponse": '{"decisions":[]}',
             "MemoryExtractionResponse": '{"memories":[]}',
             "ProjectionMemoryExtractionResponse": '{"memories":[]}',

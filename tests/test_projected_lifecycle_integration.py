@@ -5182,6 +5182,11 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
             if "<memory_pair_groups>" in prompt
             else await responses.evaluate_revision_work(prompt, response_format=SupportAssessmentResponse)
         )
+        if "<memory_pair_groups>" in prompt:
+            from memforge.llm.structured import ClaimRevisionWireResponse, ClaimRevisionWireDecision
+            response = ClaimRevisionWireResponse(decisions=[ClaimRevisionWireDecision(
+                pair_index=item.pair_index, relation=item.relation.classification,
+            ) for item in response.decisions])
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
