@@ -144,7 +144,7 @@ async def test_cross_batch_exception_survives_later_unrelated_and_rule_text(reve
     assert all("<scan>" not in p and "<reduce>" not in p and "<final>" not in p for p in client.prompts)
     for work_id in results:
         spans = [
-            payload(p)["coverage"] for p in client.prompts if any(c["work_id"] == work_id for c in payload(p)["claims"])
+            payload(p)["coverage"] for p in client.prompts if any(c["work_id"] == f"WRK-{int(work_id[1:]):04d}" for c in payload(p)["claims"])
         ]
         assert spans[0]["processed_before"] == 0
         assert spans[-1]["complete_after_batch"]
@@ -265,26 +265,10 @@ async def test_growing_shared_state_splits_only_unprocessed_tail_and_resumes():
     assert receipts[0].manifest["dependencies"][0] == receipts[1].manifest["dependencies"][0]
 
 
-def test_output_budget_counts_same_refs_per_claim_and_existing_state():
-    import litellm
-
+def test_output_allowance_saturates_provider_capacity_without_limiting_refs():
     items = work_items("Two reviewers approve US releases.", 32)
     executor = RevisionWorkExecutor(client=Client(), model="gpt-4o")
-    refs = [f"p{i:06d}" for i in range(300)]
-    response = SupportAssessmentResponse(
-        results=[
-            SupportAssessmentResult(
-                work_id=i.id,
-                status="supported",
-                primary_ref=refs[0],
-                required_refs=refs[1:],
-            )
-            for i in items
-        ]
-    )
-    minimum = litellm.token_counter(model="gpt-4o", text=response.model_dump_json())
-    assert executor._output(items, 300) >= minimum
-    assert executor._output(items, 300, response.results) > executor._output(items, 300)
+    assert executor._output(items, 300) == executor.client.request_budget().output_reserve(999999)
 
 
 def test_deleted_text_counts_as_input_but_never_as_selectable_output_refs():
@@ -358,12 +342,12 @@ async def test_claim_can_select_current_evidence_carried_by_another_claim_in_sam
             states = {key: SupportAssessmentResult.model_validate(row) for key, row in previous.items()}
             for ref, text, *_ in rows:
                 if text.strip() == "Two reviewers approve US releases.":
-                    states["w0"].status = "supported"
-                    states["w0"].primary_ref = ref
-            carried_ref = previous["w0"]["primary_ref"]
+                    states["WRK-0000"].status = "supported"
+                    states["WRK-0000"].primary_ref = ref
+            carried_ref = previous["WRK-0000"]["primary_ref"]
             if carried_ref and carried_ref not in {row[0] for row in rows}:
-                states["w1"].status = "supported"
-                states["w1"].primary_ref = carried_ref
+                states["WRK-0001"].status = "supported"
+                states["WRK-0001"].primary_ref = carried_ref
                 self.borrowed = True
             for state in states.values():
                 state.reason = "The same approval rule supports both fixed claims"
