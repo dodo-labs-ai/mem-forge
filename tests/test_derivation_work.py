@@ -150,7 +150,8 @@ async def test_executor_resumes_from_actual_sqlite_roundtrip(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_atomic_commit_requires_complete_final_work(tmp_path):
+@pytest.mark.parametrize("work_kind", ["support_finalize", "claim_assess"])
+async def test_atomic_commit_requires_complete_final_work(tmp_path, work_kind):
     from memforge.memory.lifecycle_plan import (
         LifecyclePlan,
         ReconciliationScope,
@@ -177,7 +178,7 @@ async def test_atomic_commit_requires_complete_final_work(tmp_path):
         stale_guard=StaleGuard((), {}),
         mutations=(),
     )
-    final = DerivationWork.create("support_finalize", {"dependencies": []})
+    final = DerivationWork.create(work_kind, {"dependencies": []})
     kwargs = dict(
         document=source_unit_derivation_context_from_payload(root.context_payload).document,
         derivation_id=root.id,

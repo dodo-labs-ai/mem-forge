@@ -582,6 +582,81 @@ class ClaimRevisionResponse(StructuredResponseModel):
     decisions: list[ClaimRevisionDecision]
 
 
+class ClaimContradiction(StructuredResponseModel):
+    """Applicable proof only for a contradictory pair."""
+
+    same_subject_and_scope: bool
+    incompatible_assertions: str = Field(min_length=1, max_length=1000)
+
+
+class ClaimRevisionWireDecision(StructuredResponseModel):
+    """An explicitly discovered relationship; omission is not UNRELATED."""
+
+    existing_id: str
+    relation: Literal[
+        "equivalent", "refines_challenger_to_candidate", "refines_candidate_to_challenger",
+        "contradicts",
+    ]
+    reason: str = Field(default="", max_length=1000)
+    contradiction: ClaimContradiction | None = None
+    revision_assessment: RevisionAssessment | None = None
+
+    @model_validator(mode="after")
+    def _applicable_proofs(self):
+        if self.relation == "contradicts":
+            if (self.contradiction is None or not self.contradiction.same_subject_and_scope
+                    or not self.contradiction.incompatible_assertions.strip()):
+                raise ValueError("CONTRADICTS requires overlapping scope and incompatible assertions")
+        elif self.contradiction is not None:
+            raise ValueError("only CONTRADICTS may provide a contradiction proof")
+        if self.revision_assessment is not None and self.relation != "refines_challenger_to_candidate":
+            raise ValueError("revision proof applies only to challenger-to-candidate refinement")
+        return self
+
+    def decision(self) -> ClaimRevisionDecision:
+        refinement = self.relation.startswith("refines_")
+        return ClaimRevisionDecision(
+            pair_index=0, status="resolved", reason=self.reason,
+            revision_assessment=self.revision_assessment,
+            relation=MemoryRelationAssessment(
+                classification="refines" if refinement else self.relation,
+                direction=self.relation.removeprefix("refines_") if refinement else "symmetric",
+                same_subject_and_scope=self.contradiction is not None,
+                incompatible_assertions=self.contradiction.incompatible_assertions if self.contradiction else "",
+                reason=self.reason,
+            ),
+        )
+
+
+class ClaimCandidateResult(StructuredResponseModel):
+    """Every requested candidate has one result, even when no edges were found."""
+
+    candidate_id: str
+    evidence_status: Literal["entailed", "insufficient"]
+    relations: list[ClaimRevisionWireDecision]
+    uncertain_existing_ids: list[str]
+
+    @model_validator(mode="after")
+    def _unique_relationships(self):
+        ids = [edge.existing_id for edge in self.relations] + self.uncertain_existing_ids
+        if len(ids) != len(set(ids)):
+            raise ValueError("each incumbent may occur only once per candidate")
+        if self.evidence_status == "insufficient" and self.relations:
+            raise ValueError("insufficient candidate evidence cannot assert relationships")
+        return self
+
+
+class ClaimRevisionWireResponse(StructuredResponseModel):
+    results: list[ClaimCandidateResult]
+
+    @model_validator(mode="after")
+    def _unique_candidates(self):
+        ids = [row.candidate_id for row in self.results]
+        if len(ids) != len(set(ids)):
+            raise ValueError("each candidate must occur exactly once")
+        return self
+
+
 class RevisionSupportResponse(StructuredResponseModel):
     """Fixed-claim judgment and a complete current selection, with variable Required."""
 
@@ -1012,7 +1087,7 @@ class SourceSupportStructuredClient(Protocol):
     async def assess_claim_revisions(
         self, prompt: str, *, max_tokens: int = 32_768,
         model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
-    ) -> ClaimRevisionResponse: ...
+    ) -> ClaimRevisionWireResponse: ...
 
     async def verify_source_support(
         self,
@@ -1179,11 +1254,13 @@ class StructuredLlmError(RuntimeError):
         terminal_category: StructuredLlmTerminalCategory = "invalid_response",
         error_code: str = "structured_llm_error",
         validation_fields: tuple[tuple[str, str], ...] = (),
+        diagnostic: Any = None,
     ) -> None:
         super().__init__(message)
         self.terminal_category = terminal_category
         self.error_code = error_code
         self.validation_fields = validation_fields
+        self.diagnostic = diagnostic
 
 
 @dataclass(frozen=True, slots=True)
@@ -1480,6 +1557,8 @@ def _safe_json_error_position(exc: BaseException) -> tuple[int | None, int | Non
 
 
 def _schema_operation_name(response_format: type[BaseModel]) -> str:
+    if response_format is ClaimRevisionWireResponse:
+        return "claim_revision"
     name = response_format.__name__.removesuffix("Response")
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
@@ -1868,9 +1947,9 @@ class LiteLlmStructuredClient:
     async def assess_claim_revisions(
         self, prompt: str, *, max_tokens: int = 32_768,
         model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
-    ) -> ClaimRevisionResponse:
+    ) -> ClaimRevisionWireResponse:
         return await self._call_schema(
-            prompt=prompt, response_format=ClaimRevisionResponse,
+            prompt=prompt, response_format=ClaimRevisionWireResponse,
             max_tokens=max_tokens, model=model, images=images,
         )
 
@@ -2206,7 +2285,23 @@ class LiteLlmStructuredClient:
                     error_code=failure.error_code,
                 )
             )
-            raise failure.to_error(timeout_s=self.config.timeout_s)
+            from dataclasses import asdict
+            from memforge.evals.agent_evaluation import QualitySignal
+
+            error = failure.to_error(timeout_s=self.config.timeout_s)
+            attempt = next((item for item in reversed(state.diagnostic_attempts)
+                            if item.error_code == failure.error_code), None)
+            details = asdict(attempt) if attempt is not None else {
+                "terminal_category": failure.terminal_category, "error_code": failure.error_code,
+                "structured_mode": state.final_mode, "requested_max_tokens": max_tokens,
+            }
+            error.diagnostic = QualitySignal(
+                event_name="structured_llm_attempt_outcome", outcome="failed",
+                reason_code=failure.terminal_category, operation=state.operation,
+                provider=_safe_llm_provider(model or self.config.model), model=model or self.config.model,
+                **details,
+            )
+            raise error
 
         self._emit_telemetry(
             state.telemetry(
@@ -2394,7 +2489,7 @@ class LiteLlmStructuredClient:
         )
         if response_format in {
             ProjectionFragmentMemoryExtractionResponse, ProjectionFragmentSelectorCorrectionResponse,
-            RevisionSupportResponse, ClaimRevisionResponse,
+            RevisionSupportResponse, ClaimRevisionResponse, ClaimRevisionWireResponse,
             SupportAssessmentResponse,
         }:
             # Count the expanded template value and fallback repair diagnostics;
@@ -2436,6 +2531,15 @@ class LiteLlmStructuredClient:
         )
         schema_transport = native_schema_transport if native_schema else "json_text"
         try:
+            if response_format is ClaimRevisionWireResponse:
+                finish = _response_finish_reason(response)
+                stop = _response_stop_reason(response)
+                message = _object_value(_first_response_choice(response), "message")
+                if (finish in {"length", "max_tokens", "content_filter", "refusal"}
+                        or stop in {"max_tokens", "refusal"}
+                        or _object_value(message, "refusal")):
+                    raise StructuredLlmError("claim catalog response did not complete",
+                        error_code="claim_response_incomplete")
             raw_content = _message_content(response)
             if isinstance(raw_content, response_format):
                 return raw_content

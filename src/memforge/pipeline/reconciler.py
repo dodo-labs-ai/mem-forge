@@ -12,6 +12,8 @@ import logging
 from dataclasses import dataclass, replace
 from time import perf_counter
 
+from memforge.derivation_work import DerivationWorkStore
+from memforge.evals.agent_evaluation import QualitySignal
 from memforge.llm.structured import StructuredLlmError, structured_llm_metrics_scope
 from memforge.memory.evidence import RelationDirection
 from memforge.memory.relation_classifier import (
@@ -77,6 +79,8 @@ class ReconciliationFailure:
     operation: str | None = None
     terminal_category: str | None = None
     error_code: str | None = None
+    validation_fields: tuple[tuple[str, str], ...] = ()
+    diagnostic: QualitySignal | None = None
 
 
 class ReconciliationContractError(ValueError):
@@ -108,6 +112,7 @@ class ReconciliationResult:
     operations: list[ReconcileOperation]
     failure: ReconciliationFailure | None = None
     metrics: ReconciliationMetrics = ReconciliationMetrics()
+    work_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +173,9 @@ async def reconcile_memories(
     support_audits: list[SupportAuditEntry] | None = None,
     images: tuple = (),
     image_loader=None,
+    work_store: DerivationWorkStore | None = None,
+    derivation_id: str | None = None,
+    operation_input_hash: str | None = None,
 ) -> list[ReconcileOperation] | ReconciliationResult:
     """Classify a complete relation/support ledger and reduce it deterministically."""
 
@@ -205,11 +213,6 @@ async def reconcile_memories(
         try:
             classifier = StructuredMemoryPairClassifier(client=structured_llm_client, model=llm_model)
             transient_candidates = tuple(_transient_candidate(index, raw) for index, raw in enumerate(new_extractions))
-            pairs = tuple(
-                MemoryPair(challenger=candidate, candidate=incumbent)
-                for candidate in transient_candidates
-                for incumbent in existing_memories
-            )
             from memforge.pipeline.claim_revision import assess_claim_pairs, candidate_evidence
 
             operation = "assess_revision_support"
@@ -226,12 +229,13 @@ async def reconcile_memories(
             if {entry.incumbent_id for entry in audits} != {old.id for old in existing_memories}:
                 raise ReconciliationContractError("support_ledger_incomplete", "missing exact incumbent assessment")
             operation = "assess_claim_revisions"
+            relation_pair_count += len(new_extractions) * len(existing_memories)
             assessed = await assess_claim_pairs(
                 candidates=new_extractions, incumbents=existing_memories,
                 support_audits=audits, client=structured_llm_client,
                 model=llm_model, images=images, image_loader=image_loader,
+                store=work_store, derivation_id=derivation_id, operation_input_hash=operation_input_hash,
             )
-            relation_pair_count += len(pairs)
             relation_prompt_chars += assessed.prompt_chars
             relation_entries = []
             proofs = []
@@ -264,7 +268,7 @@ async def reconcile_memories(
                     ))
             revision_proof_count = len(proofs)
 
-            _, unresolved_incumbents = _unresolved_component(relation_entries)
+            _, unresolved_incumbents = _unresolved_component(relation_entries, set(assessed.blocked_candidates))
             refiners_by_incumbent = _supported_revision_candidates(
                 [entry for entry in relation_entries if entry.incumbent_id not in unresolved_incumbents], audits,
             )
@@ -301,8 +305,9 @@ async def reconcile_memories(
                 relations=relation_entries,
                 support_audits=audits,
                 revision_proofs=proofs,
+                blocked_candidates=assessed.blocked_candidates,
             )
-            return _return_result(operations, metrics=metrics(), include_metadata=include_metadata)
+            return _return_result(operations, metrics=metrics(), include_metadata=include_metadata, work_ids=assessed.work_ids)
         except ReconciliationContractError as error:
             logger.warning("Relation-first reconciliation failed closed: %s", error)
             return _return_result(
@@ -314,6 +319,8 @@ async def reconcile_memories(
                     operation=operation,
                     terminal_category=getattr(error, "terminal_category", None),
                     error_code=getattr(error, "error_code", None),
+                    validation_fields=getattr(error, "validation_fields", ()),
+                    diagnostic=getattr(error, "diagnostic", None),
                 ),
                 metrics=metrics(),
                 include_metadata=include_metadata,
@@ -329,6 +336,8 @@ async def reconcile_memories(
                     operation=operation,
                     terminal_category=getattr(error, "terminal_category", None),
                     error_code=getattr(error, "error_code", None),
+                    validation_fields=getattr(error, "validation_fields", ()),
+                    diagnostic=getattr(error, "diagnostic", None),
                 ),
                 metrics=metrics(),
                 include_metadata=include_metadata,
@@ -357,20 +366,19 @@ def reduce_relation_ledger(
     relations: list[RelationLedgerEntry],
     support_audits: list[SupportAuditEntry],
     revision_proofs: list[RevisionCompositionProof] | None = None,
+    blocked_candidates: tuple[int, ...] = (),
 ) -> list[ReconcileOperation]:
-    """Apply the complete relation/support matrix to one deterministic action table."""
+    """Reduce explicit relationships and complete Support; omitted edges propose no action."""
 
     incumbent_ids = {memory.id for memory in existing_memories}
-    expected_pairs = {
-        (candidate_index, memory.id)
-        for candidate_index in range(len(new_extractions))
-        for memory in existing_memories
-    }
+    candidate_indices = set(range(len(new_extractions)))
     actual_pairs = {(entry.candidate_index, entry.incumbent_id) for entry in relations}
-    if len(actual_pairs) != len(relations) or actual_pairs != expected_pairs:
+    if (len(actual_pairs) != len(relations)
+            or not set(blocked_candidates).issubset(candidate_indices)
+            or any(index not in candidate_indices or old_id not in incumbent_ids for index, old_id in actual_pairs)):
         raise ReconciliationContractError(
             "relation_ledger_incomplete",
-            "relation ledger does not cover every exact candidate/incumbent pair once",
+            "relation ledger contains duplicate or unknown candidate/incumbent references",
         )
     audits_by_id = {entry.incumbent_id: entry for entry in support_audits}
     if len(audits_by_id) != len(support_audits) or set(audits_by_id) != incumbent_ids:
@@ -390,7 +398,7 @@ def reduce_relation_ledger(
     for entry in relations:
         by_incumbent[entry.incumbent_id].append(entry)
 
-    skipped_candidates, skipped_incumbents = _unresolved_component(relations)
+    skipped_candidates, skipped_incumbents = _unresolved_component(relations, set(blocked_candidates))
     consumed_candidates: set[int] = set(skipped_candidates)
     incumbent_operations: list[ReconcileOperation] = []
     for incumbent in existing_memories:
@@ -487,13 +495,13 @@ def reduce_relation_ledger(
     return [*candidate_operations, *incumbent_operations]
 
 
-def _unresolved_component(relations: list[RelationLedgerEntry]) -> tuple[set[int], set[str]]:
+def _unresolved_component(relations: list[RelationLedgerEntry], blocked_candidates: set[int] | None = None) -> tuple[set[int], set[str]]:
     """Keep uncertainty local without letting a shared candidate escape as ADD.
 
     A candidate can touch more than one incumbent. Preserve the related component
     together; unrelated pairs never spread uncertainty to independent knowledge.
     """
-    candidates = {entry.candidate_index for entry in relations if entry.relation_type is None}
+    candidates = {entry.candidate_index for entry in relations if entry.relation_type is None} | (blocked_candidates or set())
     incumbents = {entry.incumbent_id for entry in relations if entry.relation_type is None}
     while True:
         size = len(candidates) + len(incumbents)
@@ -632,7 +640,8 @@ def _return_result(
     failure: ReconciliationFailure | None = None,
     metrics: ReconciliationMetrics,
     include_metadata: bool,
+    work_ids: tuple[str, ...] = (),
 ) -> list[ReconcileOperation] | ReconciliationResult:
     if include_metadata:
-        return ReconciliationResult(operations=operations, failure=failure, metrics=metrics)
+        return ReconciliationResult(operations=operations, failure=failure, metrics=metrics, work_ids=work_ids)
     return operations

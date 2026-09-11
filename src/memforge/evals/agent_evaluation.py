@@ -922,6 +922,8 @@ def bind_source_lifecycle_outcome(
     operation: str | None = None,
     terminal_category: str | None = None,
     error_code: str | None = None,
+    validation_fields: tuple[tuple[str, str], ...] = (),
+    diagnostic: QualitySignal | None = None,
 ) -> AgentRuntimeBundle:
     """Bind one durable Source Unit lifecycle terminal result and assessment."""
 
@@ -1003,6 +1005,18 @@ def bind_source_lifecycle_outcome(
             if value is not None
         }
     )
+    if diagnostic is not None:
+        for name in (
+            "provider", "model", "attempt_index", "structured_mode", "schema_transport",
+            "requested_max_tokens", "finish_reason", "stop_reason", "provider_request_id",
+            "prompt_tokens", "completion_tokens", "total_tokens", "response_chars", "response_hash",
+            "validation_location", "validation_rule", "json_error_line", "json_error_column",
+        ):
+            value = getattr(diagnostic, name)
+            if value is not None:
+                payload[name] = value
+    if validation_fields:
+        payload["validation_location"], payload["validation_rule"] = validation_fields[0]
     payload_hash = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

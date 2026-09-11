@@ -104,10 +104,8 @@ async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypa
             raise TimeoutError("provider secret detail must not be persisted")
         prompt = kwargs["messages"][0]["content"]
         if stage == "classification":
-            pairs = json.loads(prompt.split("<memory_pair_groups>\n")[1].split("\n</memory_pair_groups>")[0])
-            payload = json.dumps({"decisions": [{"pair_index": pair["pair_index"], "status": "resolved",
-                "relation": {"classification": "unrelated", "direction": "symmetric",
-                             "same_subject_and_scope": False, "incompatible_assertions": ""}, "consistent_with_support": True} for group in pairs for pair in group["candidates"]]})
+            from tests.revision_client_fixture import sparse_response
+            payload = sparse_response(prompt, []).model_dump_json()
         else:
             incumbents = json.loads(prompt.split("<incumbents>")[1].split("</incumbents>")[0])
             payload = json.dumps({"decisions": [{"supported": True} for _ in incumbents]})
@@ -134,6 +132,14 @@ async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypa
             max_concurrent=1,
         )
     )
+    original_fits = client.request_fits
+    def fixture_capacity(prompt, **kwargs):
+        if "<claim_catalog>" in prompt:
+            from tests.revision_client_fixture import catalog_payload
+            if len(catalog_payload(prompt)["existing_claims"]) > 40:
+                return False
+        return original_fits(prompt, **kwargs)
+    client.request_fits = fixture_capacity
     unit = StructuredLlmMetricsCollector()
     with client.metrics_scope(unit):
         result = await reconcile_memories(
@@ -221,6 +227,14 @@ async def test_failed_parallel_batch_counts_cancelled_provider_sibling(monkeypat
             max_concurrent=2,
         )
     )
+    original_fits = client.request_fits
+    def fixture_capacity(prompt, **kwargs):
+        if "<claim_catalog>" in prompt:
+            from tests.revision_client_fixture import catalog_payload
+            if len(catalog_payload(prompt)["existing_claims"]) > 40:
+                return False
+        return original_fits(prompt, **kwargs)
+    client.request_fits = fixture_capacity
     unit = StructuredLlmMetricsCollector()
     with client.metrics_scope(unit):
         result = await reconcile_memories(

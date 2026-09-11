@@ -723,6 +723,9 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
             RawMemory(
                 content="Service uses PostgreSQL 16.",
                 memory_type="fact",
+                source_observation_id=second.observations[0].id,
+                evidence_quote="Service uses PostgreSQL 16.",
+                evidence_resolved_from_block=True,
             )
         ],
         doc_type="design-doc",
@@ -5171,6 +5174,7 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
         memory_type="procedure",
         evidence_quote="Payroll validation requires approval before release.",
         source_observation_id=description.id,
+        evidence_resolved_from_block=True,
     )
     responses = _RecordingAddClient(incumbent.id)
     from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
@@ -5179,7 +5183,7 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
         prompt = kwargs["messages"][0]["content"]
         response = (
             await responses.assess_claim_revisions(prompt)
-            if "<memory_pair_groups>" in prompt
+            if "<claim_catalog>" in prompt
             else await responses.evaluate_revision_work(prompt, response_format=SupportAssessmentResponse)
         )
         return SimpleNamespace(
@@ -9116,6 +9120,9 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
         confidence=0.95,
         entity_refs=["A7"],
         extraction_context="A7 is retained and marked as reduced retro chain.",
+        source_observation_id=second.observations[0].id,
+        evidence_quote="A7 is retained and marked as reduced retro chain.",
+        evidence_resolved_from_block=True,
     )
     evidence = build_projected_claim_evidence(
         projection=second,
@@ -9548,12 +9555,11 @@ async def test_insufficient_support_preserves_its_baseline_and_resumes_after_sou
         async def assess_claim_revisions(self, prompt, **kwargs):
             response = await super().assess_claim_revisions(prompt, **kwargs)
             if self.skip_claim and skip_stage == "claim":
-                groups = json.loads(prompt.split("<memory_pair_groups>\n", 1)[1].split("\n</memory_pair_groups>", 1)[0])
-                slots = {old["pair_index"] for group in groups for old in group["candidates"]
-                         if old["content"] == skipped_claim}
-                response = response.model_copy(update={"decisions": [
-                    decision.model_copy(update={"status": "insufficient", "relation": None})
-                    if decision.pair_index in slots else decision for decision in response.decisions
+                from tests.revision_client_fixture import catalog_payload
+                catalog = catalog_payload(prompt)
+                refs = [old["id"] for old in catalog["existing_claims"] if old["text"] == skipped_claim]
+                response = response.model_copy(update={"results": [
+                    row.model_copy(update={"uncertain_existing_ids": refs}) for row in response.results
                 ]})
             return response
 
