@@ -105,9 +105,8 @@ async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypa
         prompt = kwargs["messages"][0]["content"]
         if stage == "classification":
             pairs = json.loads(prompt.split("<memory_pair_groups>\n")[1].split("\n</memory_pair_groups>")[0])
-            payload = json.dumps({"decisions": [{"pair_index": pair["pair_index"], "status": "resolved",
-                "relation": {"classification": "unrelated", "direction": "symmetric",
-                             "same_subject_and_scope": False, "incompatible_assertions": ""}, "consistent_with_support": True} for group in pairs for pair in group["candidates"]]})
+            payload = json.dumps({"decisions": [{"pair_index": pair["pair_index"], "relation": "unrelated"}
+                for group in pairs for pair in group["candidates"]]})
         else:
             incumbents = json.loads(prompt.split("<incumbents>")[1].split("</incumbents>")[0])
             payload = json.dumps({"decisions": [{"supported": True} for _ in incumbents]})

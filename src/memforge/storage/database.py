@@ -10649,7 +10649,7 @@ class Database:
                         if work_row is None:
                             raise ValueError("required derivation work missing at commit")
                         work = DerivationWork.from_payload(json.loads(work_row["payload_json"]))
-                        if work.status != "completed" or work.kind != "support_finalize":
+                        if work.status != "completed" or work.kind not in {"support_finalize", "claim_assess"}:
                             raise ValueError("required derivation work incomplete at commit")
                     staged_context = source_unit_derivation_context_from_payload(
                         json.loads(derivation["context_payload_json"])
