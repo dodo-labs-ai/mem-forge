@@ -7,12 +7,44 @@ contract tests assert the actual single-call boundary and complete input shape.
 import json
 
 from memforge.llm.structured import (
-    ClaimRevisionResponse,
     ClaimRevisionDecision,
     MemoryRelationAssessment,
     RevisionAssessment,
     RevisionSupportResponse,
 )
+
+
+def catalog_payload(prompt):
+    return json.loads(prompt.split("<claim_catalog>\n", 1)[1].split("\n</claim_catalog>", 1)[0])
+
+
+def legacy_groups(prompt):
+    data = catalog_payload(prompt)
+    return [dict(challenger={"content": c["text"], "type": c["type"], "valid_from": c["valid_from"], "valid_until": c["valid_until"]},
+        current_evidence=[data["evidence_catalog"][ref] for ref in c["evidence_refs"]],
+        candidates=[dict(pair_index=i * len(data["existing_claims"]) + j, content=m["text"], type=m["type"],
+            valid_from=m["valid_from"], valid_until=m["valid_until"], incumbent_support=m["current_support"])
+            for j, m in enumerate(data["existing_claims"])]) for i, c in enumerate(data["new_claims"])]
+
+
+def sparse_response(prompt, decisions):
+    from memforge.llm.structured import ClaimRevisionWireResponse
+    data = catalog_payload(prompt)
+    rows = [dict(candidate_id=c["id"], evidence_status="entailed", relations=[], uncertain_existing_ids=[]) for c in data["new_claims"]]
+    count = len(data["existing_claims"])
+    for d in decisions:
+        i, j = divmod(d.pair_index, count)
+        ref = data["existing_claims"][j]["id"]
+        if d.status == "insufficient":
+            rows[i]["uncertain_existing_ids"].append(ref)
+        elif d.relation.classification != "unrelated":
+            relation = d.relation
+            rows[i]["relations"].append(dict(existing_id=ref,
+                relation="refines_" + relation.direction if relation.classification == "refines" else relation.classification,
+                reason=d.reason, revision_assessment=d.revision_assessment,
+                contradiction=dict(same_subject_and_scope=relation.same_subject_and_scope,
+                    incompatible_assertions=relation.incompatible_assertions) if relation.classification == "contradicts" else None))
+    return ClaimRevisionWireResponse.model_validate(dict(results=rows))
 
 
 class RevisionClientFixture:
@@ -60,7 +92,7 @@ class RevisionClientFixture:
 
     async def assess_claim_revisions(self, prompt, **kwargs):
         start, end = "<memory_pair_groups>\n", "\n</memory_pair_groups>"
-        groups = json.loads(prompt.split(start, 1)[1].split(end, 1)[0])
+        groups = legacy_groups(prompt)
         pairs = [
             {
                 "pair_index": old["pair_index"],
@@ -85,8 +117,7 @@ class RevisionClientFixture:
                 "<refinement_pairs>" + json.dumps(requests) + "</refinement_pairs>", **kwargs
             )
             proofs = {proof.pair_index: proof for proof in response.decisions}
-        return ClaimRevisionResponse(
-            decisions=[
+        return sparse_response(prompt, [
                 ClaimRevisionDecision(
                     pair_index=relation.pair_index,
                     status="resolved",
@@ -113,8 +144,7 @@ class RevisionClientFixture:
                     ),
                 )
                 for relation in relations.decisions
-            ]
-        )
+            ])
 
     async def assess_revision_support(self, prompt, **kwargs):
         payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])

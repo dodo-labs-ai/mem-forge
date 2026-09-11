@@ -1,7 +1,6 @@
 import pytest
 
 from memforge.llm.structured import (
-    ClaimRevisionResponse,
     ClaimRevisionDecision,
     MemoryRelationAssessment,
     RevisionAssessment,
@@ -12,7 +11,7 @@ from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from tests.test_revision_assessment import revisions, memory
 
 
-from tests.revision_client_fixture import RevisionClientFixture
+from tests.revision_client_fixture import RevisionClientFixture, sparse_response, catalog_payload
 
 
 class Client(RevisionClientFixture):
@@ -31,7 +30,8 @@ class Client(RevisionClientFixture):
         self.calls += 1
         self.prompts.append(prompt)
         if self.invalid:
-            return ClaimRevisionResponse(decisions=[])
+            from memforge.llm.structured import ClaimRevisionWireResponse
+            return ClaimRevisionWireResponse(results=[])
         response = ClaimRevisionDecision(
             pair_index=0,
             status=self.status,
@@ -51,7 +51,7 @@ class Client(RevisionClientFixture):
             if self.classification == "refines" and self.direction == "challenger_to_candidate"
             else None,
         )
-        return ClaimRevisionResponse(decisions=[response, response] if self.duplicate else [response])
+        return sparse_response(prompt, [response, response] if self.duplicate else [response])
 
 
 def candidate():
@@ -117,7 +117,7 @@ async def test_uncertainty_or_l3_inconsistency_never_becomes_add(status, support
 
 
 @pytest.mark.asyncio
-async def test_duplicate_slot_is_normalized_but_missing_coverage_is_bounded():
+async def test_duplicate_edge_and_missing_candidate_fail_closed():
     client = Client("equivalent")
     client.duplicate = True
     args = dict(
@@ -128,12 +128,12 @@ async def test_duplicate_slot_is_normalized_but_missing_coverage_is_bounded():
         support_audits=[SupportAuditEntry("memory", True)],
         include_metadata=True,
     )
-    assert (await reconcile_memories(**args)).failure is None
+    assert (await reconcile_memories(**args)).failure is not None
     client.invalid = True
     client.calls = 0
     result = await reconcile_memories(**args)
     assert result.failure is not None and not result.operations
-    assert client.calls == 2
+    assert client.calls == 1
 
 
 @pytest.mark.asyncio
@@ -218,8 +218,8 @@ async def test_revision_conditions_map_independently_to_the_lifecycle_gate(condi
 
     async def assess(*args, **kwargs):
         response = await original(*args, **kwargs)
-        proof = response.decisions[0].revision_assessment
-        response.decisions[0].revision_assessment = proof.model_copy(update={condition: False})
+        proof = response.results[0].relations[0].revision_assessment
+        response.results[0].relations[0].revision_assessment = proof.model_copy(update={condition: False})
         return response
 
     client.assess_claim_revisions = assess
@@ -243,34 +243,16 @@ async def test_revision_conditions_map_independently_to_the_lifecycle_gate(condi
 
 @pytest.mark.asyncio
 async def test_large_pair_group_subdivides_without_losing_pairs():
-    import json
     from dataclasses import replace
     from memforge.pipeline.claim_revision import assess_claim_pairs
 
     class BudgetClient(Client):
         def request_fits(self, prompt, **kwargs):
-            return prompt.count('"pair_index":') <= 2
+            return len(catalog_payload(prompt)["existing_claims"]) <= 2
 
         async def assess_claim_revisions(self, prompt, **kwargs):
             self.prompts.append(prompt)
-            groups = json.loads(prompt.split("<memory_pair_groups>")[1].split("</memory_pair_groups>")[0])
-            return ClaimRevisionResponse(
-                decisions=[
-                    ClaimRevisionDecision(
-                        pair_index=item["pair_index"],
-                        status="resolved",
-                        consistent_with_support=True,
-                        relation=MemoryRelationAssessment(
-                            classification="unrelated",
-                            direction="symmetric",
-                            same_subject_and_scope=False,
-                            incompatible_assertions="",
-                        ),
-                    )
-                    for group in groups
-                    for item in group["candidates"]
-                ]
-            )
+            return sparse_response(prompt, [])
 
     client = BudgetClient("unrelated")
     olds = [replace(memory(), id=f"memory-{i}") for i in range(5)]
@@ -281,7 +263,8 @@ async def test_large_pair_group_subdivides_without_losing_pairs():
         client=client,
         model="fixture",
     )
-    assert {(index, old_id) for index, old_id, _ in result.decisions} == {(0, old.id) for old in olds}
+    assert result.decisions == ()
+    assert {m["id"] for p in client.prompts for m in catalog_payload(p)["existing_claims"]} == {f"M{i}" for i in range(5)}
     assert len(client.prompts) == 3
 
 
@@ -303,8 +286,8 @@ async def test_conflicting_current_refiners_skip_their_incumbent():
     class Conflicting(Client):
         async def assess_claim_revisions(self, prompt, **kwargs):
             response = await super().assess_claim_revisions(prompt, **kwargs)
-            return response.model_copy(update={"decisions": [response.decisions[0],
-                response.decisions[0].model_copy(update={"pair_index": 1})]})
+            return response.model_copy(update={"results": [response.results[0],
+                response.results[0].model_copy(update={"candidate_id": "C1"})]})
         async def classify_memory_relations(self, prompt, **kwargs):
             return MemoryRelationResponse(decisions=[MemoryRelationDecision(pair_index=0, classification="contradicts",
                 direction="symmetric", same_subject_and_scope=True, incompatible_assertions="Mutually exclusive refinements")])
