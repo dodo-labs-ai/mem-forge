@@ -598,6 +598,8 @@ class MemoryEngine:
                     (exc.reason_code if isinstance(exc, ReconciliationContractError) else
                           exc.error_code if isinstance(exc, StructuredLlmError) else None)
                 ),
+                validation_fields=getattr(exc, "validation_fields", ()),
+                diagnostic=getattr(exc, "diagnostic", None),
             )
             raise SourceUnitLifecycleExecutionError(
                 str(exc),
@@ -1265,10 +1267,14 @@ class MemoryEngine:
                 include_metadata=True,
                 support_audits=support_audits,
                 image_loader=assessment_image_loader,
+                work_store=self.db,
+                derivation_id=derivation_id,
+                operation_input_hash=operation_input_hash,
             )
             if not isinstance(result, ReconciliationResult):
                 raise TypeError("metadata reconciliation must return ReconciliationResult")
             reconciliation_metrics = result.metrics
+            required_derivation_work_ids += result.work_ids
             model_batch_count = reconciliation_metrics.model_batch_count
             structured_llm_call_count = reconciliation_metrics.structured_llm_calls
             structured_llm_elapsed_ms = reconciliation_metrics.structured_llm_elapsed_ms
@@ -1306,6 +1312,8 @@ class MemoryEngine:
                     operation=result.failure.operation,
                     terminal_category=result.failure.terminal_category,
                     error_code=result.failure.error_code,
+                    validation_fields=result.failure.validation_fields,
+                    diagnostic=result.failure.diagnostic,
                     attempt_count=lifecycle_attempt_count,
                     duration_ms=max(0, round((perf_counter() - lifecycle_started) * 1000)),
                     incumbent_count=len(incumbents),
