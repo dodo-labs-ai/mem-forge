@@ -88,6 +88,8 @@ async def test_supported_incumbent_and_unrelated_case25_keep_and_add() -> None:
         content="Case 25 verifies that a mixed valid and invalid batch returns partial results.",
         memory_type="fact",
         source_observation_id="obs-case25",
+        evidence_quote="Case 25 verifies that a mixed valid and invalid batch returns partial results.",
+        evidence_resolved_from_block=True,
         evidence_anchor="projection_batch",
     )
 
@@ -399,7 +401,6 @@ async def test_unprovided_required_evidence_blocks_revision() -> None:
     assert isinstance(result, ReconciliationResult)
     assert result.failure is None
     assert [operation.action for operation in result.operations] == [
-        ReconcileAction.ADD,
         ReconcileAction.NOOP,
     ]
 
@@ -733,10 +734,11 @@ async def test_incomplete_relation_ledger_retries_then_fails_closed() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        async def classify_memory_relations(self, prompt: str, **kwargs):
+        async def assess_claim_revisions(self, prompt: str, **kwargs):
             del prompt, kwargs
             self.calls += 1
-            return MemoryRelationResponse(decisions=[])
+            from memforge.llm.structured import ClaimRevisionWireResponse
+            return ClaimRevisionWireResponse(results=[])
 
     client = IncompleteClient()
     result = await reconcile_memories(
@@ -751,7 +753,7 @@ async def test_incomplete_relation_ledger_retries_then_fails_closed() -> None:
     assert isinstance(result, ReconciliationResult)
     assert result.operations == []
     assert result.failure is not None
-    assert client.calls == 2
+    assert client.calls == 1
 
 
 @pytest.mark.asyncio

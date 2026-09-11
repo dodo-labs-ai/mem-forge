@@ -590,14 +590,14 @@ class ClaimContradiction(StructuredResponseModel):
 
 
 class ClaimRevisionWireDecision(StructuredResponseModel):
-    """One complete pair judgment with direction encoded in its relation."""
+    """An explicitly discovered relationship; omission is not UNRELATED."""
 
-    pair_index: int = Field(ge=0)
+    existing_id: str
     relation: Literal[
         "equivalent", "refines_challenger_to_candidate", "refines_candidate_to_challenger",
-        "contradicts", "unrelated", "insufficient",
+        "contradicts",
     ]
-    reason: str = Field(default="", max_length=1000, description="One brief decisive reason; do not restate either claim.")
+    reason: str = Field(default="", max_length=1000)
     contradiction: ClaimContradiction | None = None
     revision_assessment: RevisionAssessment | None = None
 
@@ -614,12 +614,11 @@ class ClaimRevisionWireDecision(StructuredResponseModel):
         return self
 
     def decision(self) -> ClaimRevisionDecision:
-        unresolved = self.relation == "insufficient"
         refinement = self.relation.startswith("refines_")
         return ClaimRevisionDecision(
-            pair_index=self.pair_index, status="insufficient" if unresolved else "resolved",
-            reason=self.reason, revision_assessment=self.revision_assessment,
-            relation=None if unresolved else MemoryRelationAssessment(
+            pair_index=0, status="resolved", reason=self.reason,
+            revision_assessment=self.revision_assessment,
+            relation=MemoryRelationAssessment(
                 classification="refines" if refinement else self.relation,
                 direction=self.relation.removeprefix("refines_") if refinement else "symmetric",
                 same_subject_and_scope=self.contradiction is not None,
@@ -629,8 +628,33 @@ class ClaimRevisionWireDecision(StructuredResponseModel):
         )
 
 
+class ClaimCandidateResult(StructuredResponseModel):
+    """Every requested candidate has one result, even when no edges were found."""
+
+    candidate_id: str
+    evidence_status: Literal["entailed", "insufficient"]
+    relations: list[ClaimRevisionWireDecision]
+    uncertain_existing_ids: list[str]
+
+    @model_validator(mode="after")
+    def _unique_relationships(self):
+        ids = [edge.existing_id for edge in self.relations] + self.uncertain_existing_ids
+        if len(ids) != len(set(ids)):
+            raise ValueError("each incumbent may occur only once per candidate")
+        if self.evidence_status == "insufficient" and self.relations:
+            raise ValueError("insufficient candidate evidence cannot assert relationships")
+        return self
+
+
 class ClaimRevisionWireResponse(StructuredResponseModel):
-    decisions: list[ClaimRevisionWireDecision]
+    results: list[ClaimCandidateResult]
+
+    @model_validator(mode="after")
+    def _unique_candidates(self):
+        ids = [row.candidate_id for row in self.results]
+        if len(ids) != len(set(ids)):
+            raise ValueError("each candidate must occur exactly once")
+        return self
 
 
 class RevisionSupportResponse(StructuredResponseModel):
@@ -1063,7 +1087,7 @@ class SourceSupportStructuredClient(Protocol):
     async def assess_claim_revisions(
         self, prompt: str, *, max_tokens: int = 32_768,
         model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
-    ) -> ClaimRevisionResponse: ...
+    ) -> ClaimRevisionWireResponse: ...
 
     async def verify_source_support(
         self,
@@ -1923,12 +1947,11 @@ class LiteLlmStructuredClient:
     async def assess_claim_revisions(
         self, prompt: str, *, max_tokens: int = 32_768,
         model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
-    ) -> ClaimRevisionResponse:
-        response = await self._call_schema(
+    ) -> ClaimRevisionWireResponse:
+        return await self._call_schema(
             prompt=prompt, response_format=ClaimRevisionWireResponse,
             max_tokens=max_tokens, model=model, images=images,
         )
-        return ClaimRevisionResponse(decisions=[item.decision() for item in response.decisions])
 
     async def extract_memories(
         self,
@@ -2508,6 +2531,15 @@ class LiteLlmStructuredClient:
         )
         schema_transport = native_schema_transport if native_schema else "json_text"
         try:
+            if response_format is ClaimRevisionWireResponse:
+                finish = _response_finish_reason(response)
+                stop = _response_stop_reason(response)
+                message = _object_value(_first_response_choice(response), "message")
+                if (finish in {"length", "max_tokens", "content_filter", "refusal"}
+                        or stop in {"max_tokens", "refusal"}
+                        or _object_value(message, "refusal")):
+                    raise StructuredLlmError("claim catalog response did not complete",
+                        error_code="claim_response_incomplete")
             raw_content = _message_content(response)
             if isinstance(raw_content, response_format):
                 return raw_content
