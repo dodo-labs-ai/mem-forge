@@ -1,0 +1,73 @@
+{
+  "description": "Synthetic labeled evaluation; not a runtime semantic validator. Required evidence is assessed as a set; alternate sufficient sets are accepted.",
+  "evidence": [
+    [
+      "PRM-0001",
+      "Atlas will formally publish observability ownership and support contacts."
+    ],
+    [
+      "PRM-0002",
+      "The central team will publish the Atlas observability support ownership matrix."
+    ],
+    [
+      "PRM-0003",
+      "Atlas observability ownership is unclear until publication."
+    ],
+    [
+      "PRM-0004",
+      "Atlas also supports dark mode."
+    ],
+    [
+      "PRM-0005",
+      "Borealis will publish observability ownership and support contacts via a central ownership matrix; ownership remains unclear until publication."
+    ],
+    [
+      "PRM-0006",
+      "Borealis ownership is unclear pending formal publication of its observability ownership and support contacts through the central ownership matrix."
+    ],
+    [
+      "PRM-0007",
+      "Cygnus will publish observability ownership and support contacts."
+    ]
+  ],
+  "cases": [
+    {
+      "work_id": "WRK-0001",
+      "claim": "Atlas will formally publish observability ownership and support contacts via a central ownership matrix; ownership is unclear until publication.",
+      "acceptable_selected_sets": [
+        [
+          "PRM-0001",
+          "PRM-0002",
+          "PRM-0003"
+        ]
+      ],
+      "statuses": [
+        "supported"
+      ]
+    },
+    {
+      "work_id": "WRK-0002",
+      "claim": "Borealis will formally publish observability ownership and support contacts via a central ownership matrix; ownership is unclear until publication.",
+      "acceptable_selected_sets": [
+        [
+          "PRM-0005"
+        ],
+        [
+          "PRM-0006"
+        ]
+      ],
+      "statuses": [
+        "supported"
+      ]
+    },
+    {
+      "work_id": "WRK-0003",
+      "claim": "Cygnus will formally publish observability ownership and support contacts via a central ownership matrix; ownership is unclear until publication.",
+      "acceptable_selected_sets": [],
+      "statuses": [
+        "insufficient",
+        "unsupported"
+      ]
+    }
+  ]
+}
