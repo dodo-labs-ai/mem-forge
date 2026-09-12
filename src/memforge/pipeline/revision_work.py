@@ -61,8 +61,16 @@ not unsupported. After the complete range, loss of current support can be unsupp
 missing material interpretation or an unresolved dependency remains insufficient.
 
 Use supported, unsupported or insufficient. A supported judgment selects ONE complete
-current Evidence Unit via primary_ref and required_refs. A partial judgment may retain
-partial current refs while waiting for further material. Select refs only from this
+current Evidence Unit via primary_ref and required_refs. Judge support from the selected
+Evidence together, not from unselected passages you have read. Primary is the main
+fragment, not necessarily the whole proof; Required supplies necessary complementary
+facts or scope. Before returning supported, check that the selected set covers every
+material part of the fixed claim, including its subject, scope, conditions, timing and
+specific requirements. Include a complementary fragment when omitting it would leave
+any such part unproven. Return ONE sufficient set, not alternative Support combinations.
+Exclude redundant corroboration and merely related background. Do not omit necessary
+Evidence to shorten the result. Perform this check internally; do not add output fields.
+A partial judgment may retain partial current refs while waiting for further material. Select refs only from this
 catalog or any claim's previous_state in this request. Those supplied refs are shared
 Evidence candidates; judge each fixed claim independently. Never select removed_historical refs.
 Previous states are compact cumulative judgments grounded in earlier supplied material;
