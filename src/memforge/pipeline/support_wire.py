@@ -2,6 +2,8 @@
 
 from copy import deepcopy
 
+from memforge.llm.structured import SupportAssessmentResponse, SupportAssessmentResult
+
 from memforge.pipeline.projection_fragments import FragmentSelectionError, FragmentSelectionErrorCode
 
 
@@ -66,9 +68,10 @@ class SupportWireAliases:
                     FragmentSelectionErrorCode.INELIGIBLE_ROLE,
                     f"Evidence ID is not eligible as Primary: {row.primary_ref}",
                 )
-            rows.append(row.model_copy(update={
+            rows.append(SupportAssessmentResult.model_validate({**row.model_dump(),
+                'reason': getattr(row, 'reason', 'Supported by selected current Evidence.'),
                 'work_id': self._resolve(self._work_ids, row.work_id),
                 'primary_ref': self._resolve(self._ref_ids, row.primary_ref) if row.primary_ref is not None else None,
                 'required_refs': [self._resolve(self._ref_ids, ref) for ref in row.required_refs],
             }))
-        return response.model_copy(update={'results': rows})
+        return SupportAssessmentResponse(results=rows)
