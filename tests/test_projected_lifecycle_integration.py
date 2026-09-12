@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from tests.revision_client_fixture import RevisionClientFixture
 
 import pytest
-from memforge.llm.structured import SupportAssessmentResponse
+from memforge.llm.structured import SupportAssessmentResponse, SupportAssessmentWireResponse
 import pytest_asyncio
 
 
@@ -5184,7 +5184,7 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
         response = (
             await responses.assess_claim_revisions(prompt)
             if "<claim_catalog>" in prompt
-            else await responses.evaluate_revision_work(prompt, response_format=SupportAssessmentResponse)
+            else await responses.evaluate_revision_work(prompt, response_format=SupportAssessmentWireResponse)
         )
         return SimpleNamespace(
             choices=[
@@ -9564,7 +9564,7 @@ async def test_insufficient_support_preserves_its_baseline_and_resumes_after_sou
             return response
 
         async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-            assert response_format is SupportAssessmentResponse
+            assert response_format is SupportAssessmentWireResponse
             payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
             self.assessments.append(payload)
             rows = payload["current"]["primary_candidates"]

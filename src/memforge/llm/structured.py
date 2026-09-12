@@ -1244,6 +1244,31 @@ class SupportAssessmentResponse(BaseModel):
     results: list[SupportAssessmentResult]
 
 
+class SupportedAssessmentWireResult(BaseModel):
+    """Current support is explained by its selected Evidence, without generated prose."""
+
+    model_config = ConfigDict(extra="forbid")
+    work_id: str
+    status: Literal["supported"]
+    primary_ref: str
+    required_refs: list[str]
+
+
+class UnresolvedAssessmentWireResult(BaseModel):
+    """A negative or uncertain judgment retains its decisive diagnostic basis."""
+
+    model_config = ConfigDict(extra="forbid")
+    work_id: str
+    status: Literal["unsupported", "insufficient"]
+    primary_ref: str | None
+    required_refs: list[str]
+    reason: str = Field(max_length=1000)
+
+
+class SupportAssessmentWireResponse(BaseModel):
+    results: list[SupportedAssessmentWireResult | UnresolvedAssessmentWireResult]
+
+
 class StructuredLlmError(RuntimeError):
     """Raised when a required structured LLM call cannot produce valid schema output."""
 
@@ -1559,6 +1584,8 @@ def _safe_json_error_position(exc: BaseException) -> tuple[int | None, int | Non
 def _schema_operation_name(response_format: type[BaseModel]) -> str:
     if response_format is ClaimRevisionWireResponse:
         return "claim_revision"
+    if response_format is SupportAssessmentWireResponse:
+        return "support_assessment"
     name = response_format.__name__.removesuffix("Response")
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
@@ -2490,7 +2517,7 @@ class LiteLlmStructuredClient:
         if response_format in {
             ProjectionFragmentMemoryExtractionResponse, ProjectionFragmentSelectorCorrectionResponse,
             RevisionSupportResponse, ClaimRevisionResponse, ClaimRevisionWireResponse,
-            SupportAssessmentResponse,
+            SupportAssessmentResponse, SupportAssessmentWireResponse,
         }:
             # Count the expanded template value and fallback repair diagnostics;
             # provider placeholders must never make a large source look tiny.
@@ -2531,15 +2558,16 @@ class LiteLlmStructuredClient:
         )
         schema_transport = native_schema_transport if native_schema else "json_text"
         try:
-            if response_format is ClaimRevisionWireResponse:
+            if response_format in (ClaimRevisionWireResponse, SupportAssessmentResponse, SupportAssessmentWireResponse):
                 finish = _response_finish_reason(response)
                 stop = _response_stop_reason(response)
                 message = _object_value(_first_response_choice(response), "message")
                 if (finish in {"length", "max_tokens", "content_filter", "refusal"}
                         or stop in {"max_tokens", "refusal"}
                         or _object_value(message, "refusal")):
-                    raise StructuredLlmError("claim catalog response did not complete",
-                        error_code="claim_response_incomplete")
+                    raise StructuredLlmError("assessment response did not complete",
+                        error_code=("claim_response_incomplete" if response_format is ClaimRevisionWireResponse
+                                    else "support_response_incomplete"))
             raw_content = _message_content(response)
             if isinstance(raw_content, response_format):
                 return raw_content
