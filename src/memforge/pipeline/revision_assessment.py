@@ -35,7 +35,7 @@ from memforge.pipeline.projection_fragments import (
 from memforge.source_projection import SourceObservationRevision, SourceProjection
 
 REVISION_SUPPORT_CONTRACT = "revision-support-v2"
-REVISION_INPUT_POLICY = "revision-input-v3"
+REVISION_INPUT_POLICY = "revision-input-v5"
 
 
 def revision_inference_capability_hash(client, *, extraction_model=None, extraction_max_tokens=None) -> str:
