@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 
 from memforge.pipeline.revision_work import RevisionWorkExecutor, SupportWorkItem
-from memforge.llm.structured import SupportAssessmentResponse, SupportAssessmentResult
+from memforge.llm.structured import SupportAssessmentResponse, SupportAssessmentResult, SupportAssessmentWireResponse
 from tests.test_revision_assessment import revisions, old_support, memory
 
 
@@ -30,7 +30,7 @@ class Client:
         return f"fixture-{self.limit}-{model}"
 
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-        assert response_format is SupportAssessmentResponse
+        assert response_format is SupportAssessmentWireResponse
         self.prompts.append(prompt)
         if self.fail_at == len(self.prompts):
             self.fail_at = None

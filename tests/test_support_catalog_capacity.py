@@ -39,7 +39,7 @@ async def test_complete_catalog_first_despite_dense_output_estimate():
     assert len(results) == 183 and all(row.supported for row in results.values())
     work = next(w for w in store.works.values() if w.kind == 'support_assess')
     assert work.manifest['output'] == 64000
-    assert work.manifest['contract'] == 'support-delta-assessment-v2'
+    assert work.manifest['contract'] == 'support-delta-assessment-v3'
     assert all(row['work_id'].startswith('w') for row in work.result['results'])
     assert all(row['primary_ref'].startswith('p') for row in work.result['results'])
     assert all(row['work_id'].startswith('WRK-') for row in request['claims'])

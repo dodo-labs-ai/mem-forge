@@ -64,7 +64,7 @@ class RevisionClientFixture:
         return len(prompt)
 
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-        from memforge.llm.structured import SupportAssessmentResponse as FinalResponse, SupportAssessmentResult as FinalResult
+        from memforge.llm.structured import SupportAssessmentWireResponse as FinalResponse, SupportAssessmentResult as FinalResult
         assert response_format is FinalResponse
         payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
         results = []
@@ -88,7 +88,10 @@ class RevisionClientFixture:
                 assessment_prompt += "previous selection used invalid refs"
             result = await self.assess_revision_support(assessment_prompt, **kwargs)
             results.append(FinalResult(work_id=claim["work_id"], **result.model_dump()))
-        return FinalResponse(results=results)
+        return FinalResponse.model_validate({'results': [
+            {k: v for k, v in r.model_dump().items() if k != 'reason' or r.status != 'supported'}
+            for r in results
+        ]})
 
     async def assess_claim_revisions(self, prompt, **kwargs):
         start, end = "<memory_pair_groups>\n", "\n</memory_pair_groups>"

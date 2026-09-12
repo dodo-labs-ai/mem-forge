@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import json
 import math
+import logging
 
 import litellm
 from memforge.llm.structured import litellm_model_name
 
 from memforge.derivation_work import DerivationWork, DerivationWorkStore, payload_hash
-from memforge.llm.structured import SupportAssessmentResponse as AssessmentResponse, SupportAssessmentResult
+from memforge.llm.structured import SupportAssessmentWireResponse as AssessmentResponse, SupportAssessmentResponse, SupportAssessmentResult
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
     FragmentSelectionErrorCode,
@@ -43,8 +44,9 @@ HIS IDs identify historical material, never selectable current Evidence. Numeric
 suffixes in different namespaces have no relationship. Copy supplied IDs exactly.
 Return only the Primary and Required refs actually needed for each judgment,
 not every possible claim/Evidence combination. Never omit a requested work_id.
-Keep reason brief: the conclusion and its decisive basis, not a running list of facts
-or missing context. Prior judgments may be corrected; they are not authoritative facts.
+For supported judgments omit reason: selected Primary/Required Evidence is the basis.
+For unsupported or insufficient judgments include a brief reason: the conclusion and
+its decisive basis, not a running list of facts or missing context. Prior judgments may be corrected; they are not authoritative facts.
 An unrelated passage alone does not invalidate earlier support or an identified exception.
 
 In delta mode the old independent Support was valid at baseline. Judge the effect of
@@ -219,7 +221,7 @@ class RevisionWorkExecutor:
             )
         budget_identity = self.client.input_policy_identity_for(self.model)
         manifest = {
-            "contract": "support-delta-assessment-v2",
+            "contract": "support-delta-assessment-v3",
             "scope": identity,
             "prompt_hash": payload_hash(prompt),
             "schema": payload_hash(schema.model_json_schema()),
@@ -233,7 +235,7 @@ class RevisionWorkExecutor:
         if self.derivation_id is not None:
             work = await self.store.stage_derivation_work(derivation_id=self.derivation_id, work=work)
         if work.status == "completed":
-            response = schema.model_validate(work.result)
+            response = SupportAssessmentResponse.model_validate(work.result)
             validate(response)
             self.reused += 1
             self.completed[work.id] = work
@@ -261,6 +263,12 @@ class RevisionWorkExecutor:
                     validate(response)
                     break
                 except (ValueError, FragmentSelectionError) as error:
+                    logging.getLogger(__name__).warning(
+                        "support_assessment_validation work_id=%s attempt=%s error_class=%s rule=%s expected_items=%s",
+                        work.id, attempt + 1, type(error).__name__,
+                        error.code.value if isinstance(error, FragmentSelectionError) else "coverage_mismatch",
+                        len(identity["work_items"]),
+                    )
                     if attempt:
                         from memforge.pipeline.reconciler import ReconciliationContractError
 
@@ -298,7 +306,7 @@ class RevisionWorkExecutor:
             raise
         if self.derivation_id is not None:
             work = await self.store.record_derivation_work(derivation_id=self.derivation_id, work=work)
-            response = schema.model_validate(work.result)
+            response = SupportAssessmentResponse.model_validate(work.result)
             validate(response)
         self.completed[work.id] = work
         return response, work
@@ -586,7 +594,7 @@ class RevisionWorkExecutor:
     async def _complete(self, scope, items, states, parents, total):
         # This is a program completion receipt, not another inference call.
         manifest = {
-            "contract": "support-delta-assessment-v2",
+            "contract": "support-delta-assessment-v3",
             "completion": "program",
             "scope": {
                 "catalog": scope.catalog.digest,
