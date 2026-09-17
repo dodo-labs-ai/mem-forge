@@ -15,7 +15,7 @@ vi.mock("@/api/localAgentJobs", () => ({
   createLocalAgentJob: vi.fn(), getCurrentLocalAgentJobs: vi.fn(), getLocalAgentJob: vi.fn(),
   getLocalAgentDaemonStatus: async () => ({ state: "online", last_seen_at: null }),
 }));
-vi.mock("./SourceSetupDialog", () => ({ SourceSetupDialog: () => null }));
+vi.mock("./SourceSetupDialog", () => ({ SourceSetupDialog: ({ open, initialFocus }: { open: boolean; initialFocus?: { step: string } }) => open ? <div data-testid="setup-focus">{initialFocus?.step}</div> : null }));
 vi.mock("./SourceAccessChangeDialog", () => ({ SourceAccessChangeDialog: () => null }));
 vi.mock("./LocalAgentDaemonStatus", () => ({ LocalAgentDaemonStatus: () => null }));
 
@@ -216,4 +216,17 @@ it("shows exact-record refresh failures without releasing the admitted-work guar
   expect(screen.getByRole("button", { name: "Configure Local fixture" }).hasAttribute("disabled")).toBe(true);
   expect(screen.queryByText("Sync failed")).toBeNull();
   expect(createLocalAgentJob).toHaveBeenCalledTimes(1);
+});
+
+it("opens content settings for a file-limit failure without starting sync", async () => {
+  vi.mocked(getCurrentLocalAgentJobs).mockResolvedValue([]);
+  vi.mocked(resourceClient.get).mockImplementation(async (path) => ({ data: path === "/sources"
+    ? [{ ...source, type: "github_repo", execution: { kind: "server", operation: null, immutable_config_fields: [] },
+      sync: { ...source.sync, status: "failed", error_message: "GitHub Repository discovery matched 571 files, exceeding max_files=500" } }]
+    : otherResponse(path) }));
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Configure file scope" }));
+  expect(screen.getByTestId("setup-focus").textContent).toBe("content");
+  expect(resourceClient.post).not.toHaveBeenCalled();
+  expect(createLocalAgentJob).not.toHaveBeenCalled();
 });
