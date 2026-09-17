@@ -1915,10 +1915,9 @@ def _require_bounded_principal_id(name: str, value: str | None) -> None:
 def _require_safe_diagnostic_path(name: str, value: str | None) -> None:
     if value is None:
         return
-    if not value or len(value) > 255 or any(
-        ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.$[]:-"
-        for ch in value
-    ):
+    from memforge.diagnostics import is_diagnostic_path
+
+    if not is_diagnostic_path(value):
         raise ValueError(f"{name} must be a bounded diagnostic path")
 
 
