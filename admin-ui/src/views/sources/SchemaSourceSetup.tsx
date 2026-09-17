@@ -78,7 +78,7 @@ export function SchemaSourceSetup({
   sourceType: string | null;
   source?: Source | null;
   onSaved?: (sourceId: string) => void;
-  initialFocus?: { step: "project" };
+  initialFocus?: { step: "project" | "content" };
   onRequestAccessChange?: (source: Source) => void;
 }) {
   // Backend authority: an existing source the viewer cannot configure should
@@ -157,7 +157,7 @@ function SourceConfigForm({
   schema: GeneConfigSchema;
   onOpenChange: (open: boolean) => void;
   onSaved?: (sourceId: string) => void;
-  initialFocus?: { step: "project" };
+  initialFocus?: { step: "project" | "content" };
   canConfigureConnection: boolean;
   onRequestAccessChange?: (source: Source) => void;
 }) {
@@ -184,7 +184,7 @@ function SourceConfigForm({
   const [validationMessage, setValidationMessage] = useState<string | null>(null);
   const [githubRepoTreeItems, setGitHubRepoTreeItems] = useState<RepoPickerItem[]>([]);
   const [focusSection, setFocusSection] = useState<SourceSetupSectionId>(
-    initialFocus?.step === "project" ? "project" : isEdit ? "basics" : "basics",
+    initialFocus?.step ?? "basics",
   );
   const authMode = stringValue(config.auth_mode) || "browser_cookie";
   const githubConnectionMode = sourceType === "github_repo"
@@ -456,7 +456,7 @@ function SourceConfigForm({
         />
       )}
       {advancedFields.length > 0 && (
-        <details className="group space-y-3 border-t pt-3">
+        <details open={initialFocus?.step === "content" || undefined} className="group space-y-3 border-t pt-3">
           <summary className="inline-flex cursor-pointer select-none items-center gap-1 rounded-md px-1 py-0.5 text-sm font-semibold hover:bg-muted focus:outline-none focus-visible:ring-1 focus-visible:ring-ring/40">
             <ChevronRight className="size-4 transition-transform group-open:rotate-90" />
             Advanced settings
