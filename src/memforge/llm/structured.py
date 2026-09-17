@@ -1431,7 +1431,9 @@ def _safe_validation_fields(
             for part in error.get("loc", ())
             if isinstance(part, (str, int))
         ]
-        location = ".".join(location_parts) or "$"
+        from memforge.diagnostics import diagnostic_path
+
+        location = diagnostic_path(location_parts)
         rule_type = str(error.get("type") or "").strip()
         if rule_type:
             fields.append((location, rule_type))
@@ -2322,12 +2324,15 @@ class LiteLlmStructuredClient:
                 "terminal_category": failure.terminal_category, "error_code": failure.error_code,
                 "structured_mode": state.final_mode, "requested_max_tokens": max_tokens,
             }
-            error.diagnostic = QualitySignal(
-                event_name="structured_llm_attempt_outcome", outcome="failed",
-                reason_code=failure.terminal_category, operation=state.operation,
-                provider=_safe_llm_provider(model or self.config.model), model=model or self.config.model,
-                **details,
-            )
+            try:
+                error.diagnostic = QualitySignal(
+                    event_name="structured_llm_attempt_outcome", outcome="failed",
+                    reason_code=failure.terminal_category, operation=state.operation,
+                    provider=_safe_llm_provider(model or self.config.model), model=model or self.config.model,
+                    **details,
+                )
+            except Exception:
+                logger.warning("Structured LLM failure diagnostic construction failed")
             raise error
 
         self._emit_telemetry(
@@ -2656,6 +2661,14 @@ class LiteLlmStructuredClient:
             return response, attempt_index
 
     def _emit_telemetry(self, telemetry: StructuredLlmCallTelemetry) -> None:
+        try:
+            self._emit_call_diagnostics(telemetry)
+        except Exception:
+            # Observability must not replace a successful response, cancellation,
+            # or the original provider error. Never log raw diagnostic exceptions.
+            logger.warning("Structured LLM diagnostic reporting failed")
+
+    def _emit_call_diagnostics(self, telemetry: StructuredLlmCallTelemetry) -> None:
         from memforge.evals.agent_evaluation import QualitySignal, record_quality_signal
 
         payload = {
