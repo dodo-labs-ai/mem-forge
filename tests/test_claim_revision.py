@@ -264,7 +264,7 @@ async def test_large_pair_group_subdivides_without_losing_pairs():
         model="fixture",
     )
     assert result.decisions == ()
-    assert {m["id"] for p in client.prompts for m in catalog_payload(p)["existing_claims"]} == {f"M{i}" for i in range(5)}
+    assert {m["id"] for p in client.prompts for m in catalog_payload(p)["existing_claims"]} == {f"MEM-{i:04d}" for i in range(1, 6)}
     assert len(client.prompts) == 3
 
 
@@ -287,7 +287,7 @@ async def test_conflicting_current_refiners_skip_their_incumbent():
         async def assess_claim_revisions(self, prompt, **kwargs):
             response = await super().assess_claim_revisions(prompt, **kwargs)
             return response.model_copy(update={"results": [response.results[0],
-                response.results[0].model_copy(update={"candidate_id": "C1"})]})
+                response.results[0].model_copy(update={"candidate_id": "NEW-0002"})]})
         async def classify_memory_relations(self, prompt, **kwargs):
             return MemoryRelationResponse(decisions=[MemoryRelationDecision(pair_index=0, classification="contradicts",
                 direction="symmetric", same_subject_and_scope=True, incompatible_assertions="Mutually exclusive refinements")])

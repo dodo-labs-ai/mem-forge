@@ -30,27 +30,38 @@ class RelationDiscoveryWorkStatus(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class PreclassifiedRelationDecision:
-    """Reusable pair decision fenced by content, current Evidence, and access."""
+    """Completed discovery snapshot with an optional edge, fenced against staleness.
+
+    A null relationship means no edge was proposed, not proven independence.
+    """
 
     candidate_memory_id: str
     expected_candidate_content_hash: str
     expected_candidate_support_set_hash: str
     expected_candidate_access_context_hash: str
     expected_challenger_access_context_hash: str
-    relation_type: MemoryRelationType
-    direction: RelationDirection
+    relation_type: MemoryRelationType | None
+    direction: RelationDirection | None
     reason: str
     classifier_version: str
 
-    def to_payload(self) -> dict[str, str]:
+    def __post_init__(self) -> None:
+        if (self.relation_type is None) != (self.direction is None):
+            raise ValueError("an omitted relationship cannot have a direction")
+        if self.relation_type is not None:
+            directional = self.relation_type is MemoryRelationType.REFINES
+            if directional == (self.direction is RelationDirection.SYMMETRIC):
+                raise ValueError("REFINES must be directional and other relations symmetric")
+
+    def to_payload(self) -> dict[str, str | None]:
         return {
             "candidate_memory_id": self.candidate_memory_id,
             "expected_candidate_content_hash": self.expected_candidate_content_hash,
             "expected_candidate_support_set_hash": self.expected_candidate_support_set_hash,
             "expected_candidate_access_context_hash": self.expected_candidate_access_context_hash,
             "expected_challenger_access_context_hash": self.expected_challenger_access_context_hash,
-            "relation_type": self.relation_type.value,
-            "direction": self.direction.value,
+            "relation_type": self.relation_type.value if self.relation_type is not None else None,
+            "direction": self.direction.value if self.direction is not None else None,
             "reason": self.reason,
             "classifier_version": self.classifier_version,
         }
@@ -69,8 +80,8 @@ class PreclassifiedRelationDecision:
             expected_challenger_access_context_hash=str(
                 payload.get("expected_challenger_access_context_hash") or ""
             ),
-            relation_type=MemoryRelationType(str(payload["relation_type"])),
-            direction=RelationDirection(str(payload["direction"])),
+            relation_type=MemoryRelationType(str(payload["relation_type"])) if payload["relation_type"] is not None else None,
+            direction=RelationDirection(str(payload["direction"])) if payload["direction"] is not None else None,
             reason=str(payload["reason"]),
             classifier_version=str(payload["classifier_version"]),
         )

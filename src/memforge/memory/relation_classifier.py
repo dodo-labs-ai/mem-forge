@@ -1,4 +1,4 @@
-"""Provider-neutral semantic classification for exact Memory pairs."""
+"""Provider-neutral relationship rules and exact Memory-pair classification."""
 
 from __future__ import annotations
 
@@ -123,9 +123,7 @@ class MemoryPairClassificationPolicy:
             raise ValueError("max_memory_content_chars must be positive")
 
 
-MEMORY_RELATION_PROMPT = """Classify the semantic relationship of every exact Memory pair.
-
-Use these definitions strictly:
+MEMORY_RELATION_RULES = """Use these definitions strictly:
 - EQUIVALENT: the claims express one durable proposition with exactly the same truth conditions.
 - REFINES: one claim is compatible with the other but narrows it, adds a condition, or adds a material detail.
 - CONTRADICTS: the claims make mutually incompatible assertions about the same subject.
@@ -162,7 +160,9 @@ authority, subject, action or value, scope, polarity, conditions, time, or modal
 Treat "a document, case, or record states that P" and a direct statement of P as
 equivalent only when P is the durable knowledge and neither claim is about the
 recording act, its completeness, or its authority.
+"""
 
+MEMORY_RELATION_PROMPT = "Classify the semantic relationship of every exact Memory pair.\n\n" + MEMORY_RELATION_RULES + """
 <memory_pair_groups>
 {groups_json}
 </memory_pair_groups>

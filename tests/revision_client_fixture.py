@@ -63,6 +63,35 @@ class RevisionClientFixture:
     def request_tokens(self, prompt, **kwargs):
         return len(prompt)
 
+    async def discover_memory_relations(self, prompt, **kwargs):
+        """Adapt existing scenario judgments to the sparse wire fixture."""
+        from memforge.llm.structured import MemoryRelationCatalogResponse
+
+        payload = json.loads(prompt.split("<memory_relation_catalog>\n", 1)[1].split(
+            "\n</memory_relation_catalog>", 1)[0])
+        old = {row["id"]: row for row in payload["existing_claims"]}
+        pairs = []
+        groups = []
+        for challenger in payload["new_claims"]:
+            group = dict(challenger=challenger, candidates=[])
+            for ref in payload["allowed_existing_ids"][challenger["id"]]:
+                group["candidates"].append(dict(pair_index=len(pairs), candidate=old[ref]))
+                pairs.append((challenger["id"], ref))
+            groups.append(group)
+        exact = await self.classify_memory_relations(
+            "<memory_pair_groups>\n" + json.dumps(groups) + "\n</memory_pair_groups>", **kwargs)
+        rows = {row["id"]: dict(candidate_id=row["id"], relations=[]) for row in payload["new_claims"]}
+        indices = [decision.pair_index for decision in exact.decisions]
+        if len(indices) != len(set(indices)) or set(indices) != set(range(len(pairs))):
+            return MemoryRelationCatalogResponse(results=[])
+        for decision in exact.decisions:
+            if decision.classification == "unrelated":
+                continue
+            new_ref, old_ref = pairs[decision.pair_index]
+            rows[new_ref]["relations"].append(dict(existing_id=old_ref,
+                **decision.model_dump(exclude={"pair_index"})))
+        return MemoryRelationCatalogResponse.model_validate(dict(results=list(rows.values())))
+
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
         from memforge.llm.structured import SupportAssessmentWireResponse as FinalResponse, SupportAssessmentResult as FinalResult
         assert response_format is FinalResponse
