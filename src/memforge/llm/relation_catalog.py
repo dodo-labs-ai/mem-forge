@@ -9,9 +9,15 @@ from typing import Any, Generic, Hashable, Mapping, TypeVar
 T = TypeVar("T")
 
 
+class CatalogCapacityError(ValueError):
+    error_code = "input_capacity_exceeded"
+
+
 def request_ref(prefix: str, ordinal: int) -> str:
-    if not re.fullmatch(r"[A-Z]{3}", prefix) or not 1 <= ordinal <= 9999:
+    if not re.fullmatch(r"[A-Z]{3}", prefix) or ordinal < 1:
         raise ValueError("request references require three uppercase letters and 0001–9999")
+    if ordinal > 9999:
+        raise CatalogCapacityError("request catalog exceeds four-digit reference capacity")
     return f"{prefix}-{ordinal:04d}"
 
 
@@ -22,6 +28,9 @@ class RequestCatalog(Generic[T]):
     prefix: str
     records: dict[str, T] = field(default_factory=dict, init=False)
     refs: dict[Hashable, str] = field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        request_ref(self.prefix, 1)
 
     def add(self, key: Hashable, value: T) -> str:
         if key in self.refs:

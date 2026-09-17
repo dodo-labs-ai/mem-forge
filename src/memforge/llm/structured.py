@@ -613,7 +613,7 @@ class ClaimContradiction(StructuredResponseModel):
 class ClaimRevisionWireDecision(StructuredResponseModel):
     """An explicitly discovered relationship; omission is not UNRELATED."""
 
-    existing_id: str
+    existing_id: str = Field(pattern=r"^MEM-[0-9]{4}$")
     relation: Literal[
         "equivalent", "refines_challenger_to_candidate", "refines_candidate_to_challenger",
         "contradicts",
@@ -652,10 +652,10 @@ class ClaimRevisionWireDecision(StructuredResponseModel):
 class ClaimCandidateResult(StructuredResponseModel):
     """Every requested candidate has one result, even when no edges were found."""
 
-    candidate_id: str
+    candidate_id: str = Field(pattern=r"^NEW-[0-9]{4}$")
     evidence_status: Literal["entailed", "insufficient"]
     relations: list[ClaimRevisionWireDecision]
-    uncertain_existing_ids: list[str]
+    uncertain_existing_ids: list[Annotated[str, Field(pattern=r"^MEM-[0-9]{4}$")]]
 
     @model_validator(mode="after")
     def _unique_relationships(self):
