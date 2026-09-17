@@ -39,6 +39,7 @@ export interface SourceSyncActivity {
 export interface SourceSyncPresentation {
   message: string;
   detail: string;
+  configureScope?: boolean;
   completed?: number;
   total?: number;
 }
@@ -263,6 +264,12 @@ export function presentSourceSyncActivity(
     return withProgress("Recovering sync", activity.progress, fallbackItems);
   }
   if (activity.state === "failed") {
+    const limit = repositoryFileLimit(activity.error);
+    if (limit) return {
+      message: "Sync scope exceeds file limit",
+      detail: `Last sync matched ${limit.count} files, exceeding its configured limit of ${limit.limit}. Adjust Max Files or narrow the scope, then retry.`,
+      configureScope: true,
+    };
     return { message: "Action needed", detail: safeFailureDetail(activity.error) };
   }
   if (activity.state === "partial") {
@@ -424,4 +431,9 @@ function isConnectivityFailure(value: string): boolean {
     "failed to connect",
     "network is unreachable",
   ].some((marker) => value.includes(marker));
+}
+
+function repositoryFileLimit(error: SourceSyncActivity["error"]): { count: string; limit: string } | null {
+  const match = error?.message?.match(/^GitHub Repository (?:discovery|Internal network \/ VPN sync) matched ([0-9]{1,9}) files, exceeding max_files=([0-9]{1,9})$/);
+  return match ? { count: match[1], limit: match[2] } : null;
 }

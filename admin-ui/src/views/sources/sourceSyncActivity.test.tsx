@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { SourceSyncStatusCard } from "@/components/admin/SourceSyncStatusCard";
 import { sourceSyncActivityFromLocalJob, presentSourceSyncActivity, sourceSyncActivityPolicy } from "./sourceSyncActivity";
@@ -29,4 +29,26 @@ it("shows eligible but unclaimed work as waiting for device, not syncing", () =>
   expect(presentSourceSyncActivity(activity, "GitHub", "files").message).toBe("Waiting for your device");
   render(<SourceSyncStatusCard activity={activity} sourceName="GitHub" itemLabel="files" />);
   expect(screen.queryByRole("progressbar")).toBeNull();
+});
+
+it.each(["discovery", "Internal network / VPN sync"])("shows bounded file-limit details and configuration action for %s", (mode) => {
+  const onConfigureScope = vi.fn();
+  const onRetry = vi.fn();
+  render(<SourceSyncStatusCard activity={{ kind: "sync", state: "failed", error: {
+    message: `GitHub Repository ${mode} matched 571 files, exceeding max_files=500`,
+  } }} sourceName="Cookbook" itemLabel="files" onConfigureScope={onConfigureScope} onRetry={onRetry} />);
+  expect(screen.getByText("Sync scope exceeds file limit")).toBeTruthy();
+  expect(screen.getByText(/Last sync matched 571 files, exceeding its configured limit of 500/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Configure file scope" }));
+  expect(onConfigureScope).toHaveBeenCalledOnce();
+  expect(onRetry).not.toHaveBeenCalled();
+});
+
+it("does not expose arbitrary raw errors or offer unavailable configuration", () => {
+  render(<SourceSyncStatusCard activity={{ kind: "sync", state: "failed", error: {
+    message: "private credentials: secret",
+  } }} sourceName="Cookbook" itemLabel="files" />);
+  expect(screen.getByText("Sync failed. Retry when ready.")).toBeTruthy();
+  expect(screen.queryByText(/private credentials/)).toBeNull();
+  expect(screen.queryByRole("button", { name: "Configure file scope" })).toBeNull();
 });
