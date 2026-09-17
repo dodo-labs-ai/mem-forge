@@ -23,7 +23,7 @@ export function SourceSetupDialog({
   sourceType: string | null;
   source?: Source | null;
   onSaved?: (sourceId: string) => void;
-  initialFocus?: { step: "project" };
+  initialFocus?: { step: "project" | "content" };
   onRequestAccessChange?: (source: Source) => void;
 }) {
   if (!sourceType) return null;
@@ -34,7 +34,7 @@ export function SourceSetupDialog({
         onOpenChange={onOpenChange}
         source={source}
         onSaved={onSaved}
-        initialFocus={initialFocus}
+        initialFocus={initialFocus?.step === "project" ? { step: "project" } : undefined}
         onRequestAccessChange={onRequestAccessChange}
       />
     );
