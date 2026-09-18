@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 
+from memforge.llm.failure_trace import failure_trace_context, validation_trace
 from memforge.derivation_work import DerivationWork, DerivationWorkStore, payload_hash
 from memforge.llm.structured import ClaimRevisionDecision, ClaimRevisionWireResponse
 from memforge.memory.relation_classifier import MemoryPairClassificationPolicy
@@ -204,8 +205,12 @@ async def assess_claim_pairs(
         if response is None:
             try:
                 prompt_chars += len(prompt)
-                response = validate(await client.assess_claim_revisions(prompt, max_tokens=max_output_tokens,
-                    model=model, **({"images": batch_images} if batch_images else {})))
+                with failure_trace_context(derivation_id=derivation_id, work_id=work.id if work else None,
+                        operation_input_hash=operation_input_hash):
+                    wire_response = await client.assess_claim_revisions(prompt, max_tokens=max_output_tokens,
+                        model=model, **({"images": batch_images} if batch_images else {}))
+                async with validation_trace(wire_response):
+                    response = validate(wire_response)
             except Exception as error:
                 if work is not None:
                     await store.record_derivation_work(derivation_id=derivation_id,

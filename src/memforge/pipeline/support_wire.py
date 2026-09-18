@@ -53,25 +53,30 @@ class SupportWireAliases:
         return result
 
     @staticmethod
-    def _resolve(mapping, alias):
+    def _resolve(mapping, alias, location, *, allowed_refs=None):
         if alias not in mapping:
             raise FragmentSelectionError(
-                FragmentSelectionErrorCode.UNKNOWN_REF, f"unknown supplied task/Evidence ID: {alias}"
+                FragmentSelectionErrorCode.UNKNOWN_REF, f"unknown supplied task/Evidence ID: {alias}",
+                location=location, received=alias,
+                allowed_refs=sorted(mapping if allowed_refs is None else allowed_refs),
             )
         return mapping[alias]
 
     def decode(self, response):
         rows = []
-        for row in response.results:
+        for index, row in enumerate(response.results):
             if row.status == 'supported' and row.primary_ref in self._ref_ids and row.primary_ref not in self._primary_ids:
                 raise FragmentSelectionError(
                     FragmentSelectionErrorCode.INELIGIBLE_ROLE,
                     f"Evidence ID is not eligible as Primary: {row.primary_ref}",
+                    location=f"results[{index}].primary_ref", received=row.primary_ref,
+                    allowed_refs=sorted(self._primary_ids),
                 )
             rows.append(SupportAssessmentResult.model_validate({**row.model_dump(),
                 'reason': getattr(row, 'reason', 'Supported by selected current Evidence.'),
-                'work_id': self._resolve(self._work_ids, row.work_id),
-                'primary_ref': self._resolve(self._ref_ids, row.primary_ref) if row.primary_ref is not None else None,
-                'required_refs': [self._resolve(self._ref_ids, ref) for ref in row.required_refs],
+                'work_id': self._resolve(self._work_ids, row.work_id, f"results[{index}].work_id"),
+                'primary_ref': self._resolve(self._ref_ids, row.primary_ref, f"results[{index}].primary_ref",
+                    allowed_refs=self._primary_ids if row.status == 'supported' else None) if row.primary_ref is not None else None,
+                'required_refs': [self._resolve(self._ref_ids, ref, f"results[{index}].required_refs[{ref_index}]") for ref_index, ref in enumerate(row.required_refs)],
             }))
         return SupportAssessmentResponse(results=rows)
