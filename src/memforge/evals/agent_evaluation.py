@@ -897,6 +897,30 @@ def bind_quality_signals(
     return tuple(events)
 
 
+def source_lifecycle_execution_identity(*, source_id: str, source_unit_id: str,
+    base_unit_revision_id: str | None, target_unit_revision_id: str,
+    operation_input_hash: str, execution_owner_id: str) -> dict[str, str]:
+    """Use the same durable execution correlation in diagnostics and runtime events."""
+    operation_id = _runtime_identity(
+        "source-unit-lifecycle-operation-v1",
+        source_id,
+        source_unit_id,
+        base_unit_revision_id or "none",
+        target_unit_revision_id,
+        operation_input_hash,
+        SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION,
+        prefix="aop",
+    )
+    execution_id = _runtime_identity(
+        "source-unit-lifecycle-execution-v1",
+        operation_id,
+        execution_owner_id,
+        prefix="aex",
+    )
+    return dict(operation_id=operation_id, execution_id=execution_id,
+        trace_id=runtime_execution_trace_id(execution_id))
+
+
 def bind_source_lifecycle_outcome(
     *,
     source_id: str,
@@ -944,22 +968,10 @@ def bind_source_lifecycle_outcome(
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
         raise ValueError("agent runtime event timestamp requires a timezone")
     timestamp = timestamp.astimezone(timezone.utc)
-    operation_id = _runtime_identity(
-        "source-unit-lifecycle-operation-v1",
-        source_id,
-        source_unit_id,
-        base_unit_revision_id or "none",
-        target_unit_revision_id,
-        operation_input_hash,
-        SOURCE_UNIT_LIFECYCLE_CONTRACT_VERSION,
-        prefix="aop",
-    )
-    execution_id = _runtime_identity(
-        "source-unit-lifecycle-execution-v1",
-        operation_id,
-        execution_owner_id,
-        prefix="aex",
-    )
+    identity = source_lifecycle_execution_identity(source_id=source_id, source_unit_id=source_unit_id,
+        base_unit_revision_id=base_unit_revision_id, target_unit_revision_id=target_unit_revision_id,
+        operation_input_hash=operation_input_hash, execution_owner_id=execution_owner_id)
+    operation_id, execution_id = identity["operation_id"], identity["execution_id"]
     event_id = _runtime_identity(
         AGENT_RUNTIME_EVENT_SCHEMA_VERSION,
         execution_id,

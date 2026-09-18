@@ -60,9 +60,14 @@ class FragmentSelectionErrorCode(str, Enum):
 class FragmentSelectionError(ValueError):
     """Typed fail-closed selector rejection safe for bounded telemetry."""
 
-    def __init__(self, code: FragmentSelectionErrorCode, message: str) -> None:
+    def __init__(self, code: FragmentSelectionErrorCode, message: str, *,
+                 location: str | None = None, received: str | None = None,
+                 allowed_refs: list[str] | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.location = location
+        self.received = received
+        self.allowed_refs = allowed_refs
 
 
 class RevalidatedSelectionErrorCode(str, Enum):
@@ -912,20 +917,24 @@ class ProjectionFragmentCatalog:
 
         by_reference = {fragment.reference: fragment for fragment in self.fragments}
         selected: list[tuple[EvidenceRole, EvidenceFragment]] = []
-        for role, reference in (
+        for index, (role, reference) in enumerate((
             (EvidenceRole.PRIMARY, primary_ref),
             *((EvidenceRole.REQUIRED, value) for value in normalized_required),
-        ):
+        )):
+            location = "primary_ref" if index == 0 else f"required_refs[{index - 1}]"
             fragment = by_reference.get(reference)
             if fragment is None:
                 raise FragmentSelectionError(
                     FragmentSelectionErrorCode.UNKNOWN_REF,
                     f"unknown, stale, or cross-catalog Fragment reference: {reference}",
+                    location=location, received=reference, allowed_refs=sorted(by_reference),
                 )
             if role is EvidenceRole.PRIMARY and not fragment.primary_eligible:
                 raise FragmentSelectionError(
                     FragmentSelectionErrorCode.INELIGIBLE_ROLE,
                     f"Fragment reference is not eligible for {role.value}: {reference}",
+                    location=location, received=reference,
+                    allowed_refs=sorted(f.reference for f in self.fragments if f.primary_eligible),
                 )
             selected.append((role, fragment))
 

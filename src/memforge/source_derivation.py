@@ -12,6 +12,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal, Protocol
 
+from memforge.llm.failure_trace import failure_trace_context
 from memforge.derivation_work import DerivationWorkStore
 from memforge.models import DocumentRecord, MemoryExtractionResult, RawMemory
 from memforge.memory.evidence import (
@@ -35,6 +36,7 @@ from memforge.evals.agent_evaluation import (
     publish_agent_assessments,
     publish_runtime_events,
     quality_signal_scope,
+    runtime_trace_id,
 )
 from memforge.pipeline.bounded_work import collect_bounded
 from memforge.pipeline.extraction_contract import (
@@ -583,7 +585,16 @@ class SourceUnitDeriver:
         ) -> MemoryExtractionResult:
             quality_signals = QualitySignalCollector()
             try:
-                with quality_signal_scope(quality_signals):
+                batch_record = next(record for record in derivation.batches if record.batch_id == batch.id)
+                with quality_signal_scope(quality_signals), failure_trace_context(
+                    source_id=request.projection.source_id, source_type=request.projection.source_type,
+                    doc_id=request.context.document.doc_id, source_unit_id=request.projection.source_unit_revisions[0].source_unit_id,
+                    target_unit_revision_id=request.projection.source_unit_revisions[0].id,
+                    projection_run_id=request.projection.run_id, derivation_id=derivation.id,
+                    batch_id=batch.id, batch_attempt=batch_record.attempt_count + 1,
+                    trace_id=runtime_trace_id(derivation_id=derivation.id, batch_id=batch.id,
+                        batch_attempt=batch_record.attempt_count + 1),
+                ):
                     result = await request.extract_batch(batch)
             except Exception as exc:
                 if not isinstance(batch, DiffGuidedExtractionBatch):

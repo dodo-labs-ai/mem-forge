@@ -14,7 +14,16 @@ from memforge.llm.structured import (
     StructuredLlmError,
     StructuredLlmImage,
 )
+from memforge.llm.failure_trace import record_validation_failure
 from memforge.pipeline.projection_fragments import FragmentSelectionError, ProjectionFragmentCatalog
+
+
+def _original_selector_location(error, selector, prefix):
+    """Report the original provider field, before deterministic normalization."""
+    location = error.location
+    if location and location.startswith("required_refs") and error.received in selector.required_refs:
+        location = f"required_refs[{selector.required_refs.index(error.received)}]"
+    return f"{prefix}.{location}" if location else prefix
 
 
 def normalize_fragment_selector_refs(
@@ -53,6 +62,7 @@ async def correct_fragment_selectors_once(
     max_tokens: int,
     model: str | None,
     images: tuple[StructuredLlmImage, ...],
+    source_response=None,
 ) -> tuple[list[ProjectionFragmentMemoryCandidate], dict[str, Any]]:
     """Preserve fixed claims and successful selections across best-effort correction.
 
@@ -69,6 +79,8 @@ async def correct_fragment_selectors_once(
         try:
             catalog.resolve_selection(primary_ref=candidate.primary_ref, required_refs=required)
         except FragmentSelectionError as error:
+            await record_validation_failure(source_response, error, persist=False,
+                location=_original_selector_location(error, candidate, f"memories[{index}]"), candidate_index=index)
             rejected[index] = {
                 "candidate_index": index,
                 "candidate": candidate.model_dump(mode="json"),
@@ -83,6 +95,9 @@ async def correct_fragment_selectors_once(
     }
     if not rejected:
         return candidates, metrics
+    capture = getattr(source_response, "_llm_failure_capture", None)
+    if capture is not None:
+        await capture.persist()
 
     prompt = extraction_prompt + "\n\n" + (
         "SELECTOR CORRECTION TASK: The extraction above has already completed. "
@@ -119,21 +134,32 @@ async def correct_fragment_selectors_once(
 
     corrected = list(candidates)
     counts = Counter(item.candidate_index for item in response.corrections)
-    for item in response.corrections:
+    for row_index, item in enumerate(response.corrections):
         index = item.candidate_index
         # Ambiguous or unrequested proposals cannot replace even one candidate.
         if index not in rejected or counts[index] != 1:
+            await record_validation_failure(response, ValueError("ambiguous or unrequested correction index"),
+                persist=False, location=f"corrections[{row_index}].candidate_index", received=index,
+                allowed_indices=sorted(rejected))
             continue
         required, _, _ = normalize_fragment_selector_refs(
             candidate_index=index, primary_ref=item.primary_ref, required_refs=item.required_refs,
         )
         try:
             catalog.resolve_selection(primary_ref=item.primary_ref, required_refs=required)
-        except FragmentSelectionError:
+        except FragmentSelectionError as error:
+            await record_validation_failure(response, error, persist=False,
+                location=_original_selector_location(error, item, f"corrections[{row_index}]"), candidate_index=index)
             continue
         corrected[index] = candidates[index].model_copy(update={
             "primary_ref": item.primary_ref, "required_refs": item.required_refs,
         })
         metrics["selector_correction_recovered_count"] += 1
     metrics["selector_correction_outcome"] = "completed"
+    correction_capture = getattr(response, "_llm_failure_capture", None)
+    if correction_capture is not None:
+        await correction_capture.persist()
+    capture = getattr(source_response, "_llm_failure_capture", None)
+    if capture is not None and metrics["selector_correction_recovered_count"] == len(rejected):
+        await capture.recovered()
     return corrected, metrics

@@ -9,6 +9,7 @@ import logging
 
 import litellm
 from memforge.llm.structured import litellm_model_name
+from memforge.llm.failure_trace import failure_trace_context, validation_trace
 
 from memforge.derivation_work import DerivationWork, DerivationWorkStore, payload_hash
 from memforge.llm.structured import SupportAssessmentWireResponse as AssessmentResponse, SupportAssessmentResponse, SupportAssessmentResult
@@ -246,6 +247,7 @@ class RevisionWorkExecutor:
                 "unchanged assessment capability cannot execute this work",
             )
         current_prompt = prompt
+        failed_captures = []
         try:
             for attempt in range(2):
                 if not self._fits(current_prompt, schema, output, images, reserve_correction=not attempt):
@@ -255,14 +257,22 @@ class RevisionWorkExecutor:
                     )
                 self.calls += 1
                 self.prompt_chars += len(current_prompt)
-                response = await self.client.evaluate_revision_work(
-                    current_prompt, response_format=schema, max_tokens=output, model=self.model, images=images
-                )
+                with failure_trace_context(derivation_id=self.derivation_id, work_id=work.id,
+                        correction_attempt=attempt + 1):
+                    response = await self.client.evaluate_revision_work(
+                        current_prompt, response_format=schema, max_tokens=output, model=self.model, images=images
+                    )
+                capture = None
                 try:
-                    response = decode(response)
-                    validate(response)
+                    async with validation_trace(response, work_id=work.id) as capture:
+                        response = decode(response)
+                        validate(response)
+                    for failed_capture in failed_captures:
+                        await failed_capture.recovered()
                     break
                 except (ValueError, FragmentSelectionError) as error:
+                    if capture is not None:
+                        failed_captures.append(capture)
                     logging.getLogger(__name__).warning(
                         "support_assessment_validation work_id=%s attempt=%s error_class=%s rule=%s expected_items=%s",
                         work.id, attempt + 1, type(error).__name__,
