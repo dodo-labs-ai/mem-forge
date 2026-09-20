@@ -428,7 +428,7 @@ def _authority_plan_identity(
         "access_context_hash": request.access_context_hash,
         "source_activity_epoch": request.context.source_activity_epoch,
         "inference_capability_hash": request.inference_capability_hash,
-        "semantic_input_policy": "revision-input-v1",
+        "semantic_input_policy": "revision-input-v6",
         "authority_policy_version": (
             PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
         ),
@@ -1365,6 +1365,9 @@ def _batch_input_payload_hash(
         "batch_id": batch.id,
         "prepared_catalog_digest": batch.prepared_catalog.digest if batch.prepared_catalog else None,
         "prepared_prompt_hash": hashlib.sha256(batch.prepared_prompt.encode()).hexdigest() if batch.prepared_prompt else None,
+        "prepared_input_mode": batch.prepared_input_mode,
+        "prepared_selection_reason": batch.prepared_selection_reason,
+        "prepared_estimated_cost": dict(batch.prepared_estimated_cost or {}),
         "authority_policy_version": batch.authority_policy_version,
         "primary_observation_ids": list(batch.primary_observation_ids),
         "primary_authority_spans": [

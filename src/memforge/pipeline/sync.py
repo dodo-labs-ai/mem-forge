@@ -3339,9 +3339,17 @@ class GeneSyncOrchestrator:
                         source_type=source_type,
                         doc_type=doc_type,
                         context_markdown=batch.context_markdown,
+                        context_observation_ids=batch.context_observation_ids,
                         images=batch_images,
                         revision_context=revision_context,
                         prepared_prompt=batch.prepared_prompt,
+                        prepared_input_mode=batch.prepared_input_mode,
+                        prepared_selection_reason=batch.prepared_selection_reason,
+                        prepared_estimated_cost=(
+                            dict(batch.prepared_estimated_cost)
+                            if batch.prepared_estimated_cost is not None
+                            else None
+                        ),
                     )
                 else:
                     result = await self.memory_extractor.extract_projection_batch_memories(

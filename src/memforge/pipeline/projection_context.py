@@ -60,6 +60,9 @@ class ProjectionExtractionBatch:
     candidate_context_image_bytes: int = 0
     prepared_catalog: ProjectionFragmentCatalog | None = None
     prepared_prompt: str | None = None
+    prepared_input_mode: str | None = None
+    prepared_selection_reason: str | None = None
+    prepared_estimated_cost: Mapping[str, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)

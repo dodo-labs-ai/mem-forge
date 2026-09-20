@@ -35,6 +35,7 @@ from memforge.pipeline.projection_context import ProjectionExtractionBatch
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
     ProjectionFragmentCatalog,
+    SupportRevalidationLimitation,
 )
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_SUMMARY_CHARS,
@@ -633,13 +634,54 @@ class MemoryExtractor:
         )
 
     @staticmethod
-    def projection_fragment_prompt(catalog, *, source_type, doc_type, context_markdown="", revision_context=None, mode="authorized_work"):
+    def projection_fragment_prompt(
+        catalog,
+        *,
+        source_type,
+        doc_type,
+        context_markdown="",
+        context_observation_ids=(),
+        revision_context=None,
+        mode="authorized_work",
+    ):
         payload = revision_context.model_payload(catalog) if revision_context is not None else catalog.model_payload()
+        context_ids = set(context_observation_ids)
+        if context_ids and revision_context is not None:
+            required_context_anchors = {
+                fragment.anchor
+                for fragment in revision_context.full_fragments
+                if fragment.anchor.observation_id in context_ids
+            }
+            represented_context_anchors = {
+                fragment.anchor
+                for fragment in catalog.fragments
+                if fragment.anchor.observation_id in context_ids
+            }
+            if (
+                context_ids
+                <= {anchor.observation_id for anchor in required_context_anchors}
+                and required_context_anchors <= represented_context_anchors
+            ):
+                context_markdown = ""
+        if revision_context is not None and mode in {"delta", "full"}:
+            context_payload = {
+                "input_mode": mode,
+                **(
+                    {"removed_historical": revision_context.delta()[1]}
+                    if mode == "delta"
+                    else {}
+                ),
+                **({"additional_context": context_markdown} if context_markdown else {}),
+            }
+            context_observations = json.dumps(
+                context_payload, ensure_ascii=False, separators=(",", ":")
+            )
+        else:
+            context_observations = context_markdown
         return PROJECTION_FRAGMENT_EXTRACTION_PROMPT.format(
             source_type=source_type, doc_type=doc_type, catalog_digest=catalog.digest,
             fragment_catalog=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            context_observations=(json.dumps({"input_mode": mode, "removed_historical": revision_context.delta()[1]}, ensure_ascii=False, separators=(",", ":"))
-                                  if mode == "delta" else context_markdown),
+            context_observations=context_observations,
         )
 
     async def extract_projection_fragment_memories(
@@ -652,6 +694,10 @@ class MemoryExtractor:
         images: tuple[StructuredLlmImage, ...] = (),
         revision_context=None,
         prepared_prompt: str | None = None,
+        prepared_input_mode: str | None = None,
+        prepared_selection_reason: str | None = None,
+        prepared_estimated_cost: dict[str, int] | None = None,
+        context_observation_ids: tuple[str, ...] = (),
     ) -> MemoryExtractionResult:
         """Select exact current Evidence within this work's Primary authority."""
 
@@ -696,33 +742,112 @@ class MemoryExtractor:
 
         def make_prompt(selected_catalog, mode):
             return self.projection_fragment_prompt(selected_catalog, source_type=source_type, doc_type=doc_type,
-                context_markdown=context_markdown, revision_context=revision_context, mode=mode)
+                context_markdown=context_markdown, context_observation_ids=context_observation_ids,
+                revision_context=revision_context, mode=mode)
 
-        input_mode = "authorized_work"
+        input_mode = prepared_input_mode or "authorized_work"
+        input_selection_reason = prepared_selection_reason
+        estimated_input_cost = prepared_estimated_cost
         prompt = prepared_prompt or make_prompt(catalog, input_mode)
         if revision_context is not None and prepared_prompt is None:
-            selected = revision_context.extraction_catalog(catalog, "full")
-            full_prompt = make_prompt(selected, "full")
-            selected_images = revision_context.fitting_images(
-                selected, full_prompt, client=self.structured_llm_client,
-                response_format=ProjectionFragmentMemoryExtractionResponse,
-                max_tokens=self.fragment_output_tokens(selected), model=self.model,
+            from memforge.pipeline.revision_input import (
+                ExtractionInputTask,
+                InputCandidate,
+                InputCost,
+                PlannedTransport,
+                RevisionInputPlanner,
             )
-            if selected_images is not None:
-                catalog, prompt, input_mode = selected, full_prompt, "full"
-            else:
-                catalog = revision_context.extraction_catalog(catalog, "delta")
-                prompt, input_mode = make_prompt(catalog, "delta"), "delta"
-                selected_images = revision_context.fitting_images(
-                    catalog, prompt, client=self.structured_llm_client,
-                    response_format=ProjectionFragmentMemoryExtractionResponse,
-                    max_tokens=self.fragment_output_tokens(catalog), model=self.model,
+
+            extractor = self
+
+            class RequestPolicy:
+                @staticmethod
+                def _prompt(candidate):
+                    return make_prompt(candidate.catalog, candidate.mode.value)
+
+                @staticmethod
+                def lower_bound(candidate: InputCandidate):
+                    text = RequestPolicy._prompt(candidate)
+                    output = extractor.fragment_output_tokens(candidate.catalog)
+                    if not extractor.structured_llm_client.request_fits(
+                        text,
+                        response_format=ProjectionFragmentMemoryExtractionResponse,
+                        max_tokens=output,
+                        model=extractor.model,
+                    ):
+                        return None
+                    return InputCost(
+                        input_tokens=extractor.structured_llm_client.request_tokens(
+                            text,
+                            response_format=ProjectionFragmentMemoryExtractionResponse,
+                            model=extractor.model,
+                        ),
+                        output_tokens=output,
+                        request_count=1,
+                        complete=not any(
+                            fragment.kind.value == "artifact"
+                            for fragment in candidate.catalog.fragments
+                        ),
+                    )
+
+                @staticmethod
+                def materialize(candidate: InputCandidate):
+                    text = RequestPolicy._prompt(candidate)
+                    output = extractor.fragment_output_tokens(candidate.catalog)
+                    selected_images = revision_context.fitting_images(
+                        candidate.catalog,
+                        text,
+                        client=extractor.structured_llm_client,
+                        response_format=ProjectionFragmentMemoryExtractionResponse,
+                        max_tokens=output,
+                        model=extractor.model,
+                    )
+                    if selected_images is None:
+                        return None
+                    return PlannedTransport(
+                        InputCost(
+                            input_tokens=extractor.structured_llm_client.request_tokens(
+                                text,
+                                response_format=ProjectionFragmentMemoryExtractionResponse,
+                                model=extractor.model,
+                                images=selected_images,
+                            ),
+                            output_tokens=output,
+                            request_count=1,
+                            image_count=len(selected_images),
+                            image_bytes=sum(len(image.body) for image in selected_images),
+                        ),
+                        (candidate.catalog, text, selected_images),
+                    )
+
+            baseline = (
+                revision_context.projection.deltas[0].previous_unit_revision_id
+                if revision_context.projection.deltas
+                else None
+            )
+            try:
+                plan = RevisionInputPlanner.plan(
+                    context=revision_context,
+                    task=ExtractionInputTask(catalog, named_baseline_revision_id=baseline),
+                    request_policy=RequestPolicy(),
                 )
-            if selected_images is None:
-                return MemoryExtractionResult(error_type="evidence_catalog_unusable",
-                                              error="complete revision input exceeds configured capacity",
-                                              metadata={"catalog_error_codes": ["catalog_too_large"]})
-            images = selected_images
+            except SupportRevalidationLimitation as error:
+                return MemoryExtractionResult(
+                    error_type="evidence_catalog_unusable",
+                    error=str(error),
+                    metadata={"catalog_error_codes": [error.code.value]},
+                )
+            catalog, prompt, images = plan.transport
+            input_mode = plan.mode.value
+            input_selection_reason = plan.selection_reason
+            estimated_input_cost = {
+                "input_tokens": plan.estimated_cost.input_tokens,
+                "output_tokens": plan.estimated_cost.output_tokens,
+                "request_count": plan.estimated_cost.request_count,
+                "image_count": plan.estimated_cost.image_count,
+                "image_bytes": plan.estimated_cost.image_bytes,
+                "total_tokens": plan.estimated_cost.total_tokens,
+            }
         if not self.structured_llm_client.request_fits(prompt, response_format=ProjectionFragmentMemoryExtractionResponse,
             max_tokens=self.fragment_output_tokens(catalog), model=self.model, images=images):
             return MemoryExtractionResult(error_type="input_capacity_exceeded", error="planned extraction request exceeds configured capability")
@@ -730,6 +855,8 @@ class MemoryExtractor:
         metrics = {
             "structured_llm_calls": 1,
             "input_mode": input_mode,
+            "input_selection_reason": input_selection_reason,
+            "estimated_input_cost": estimated_input_cost,
             "extraction_model": self.model,
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "prompt_chars": len(prompt),
