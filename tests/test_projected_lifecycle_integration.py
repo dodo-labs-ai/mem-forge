@@ -1749,12 +1749,14 @@ class _SupportValidatingNoopClient(_NoopClient):
         evidence_quote: str = "",
         required_evidence_quote: str = "",
         required_evidence_quotes: tuple[str, ...] = (),
+        prefer_artifact_primary: bool = False,
     ) -> None:
         super().__init__(memory_id)
         self.supported = supported
         self.evidence_quote = evidence_quote
         self.required_evidence_quote = required_evidence_quote
         self.required_evidence_quotes = required_evidence_quotes
+        self.prefer_artifact_primary = prefer_artifact_primary
         self.validation_calls = 0
 
     async def validate_memory_support(self, prompt: str, **kwargs):
@@ -5336,6 +5338,7 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
         structured_llm_client=_SupportValidatingNoopClient(
             incumbent.id,
             supported=True,
+            required_evidence_quote="A7 remains limited to regular payroll runs.",
         ),
     )
 
@@ -6688,6 +6691,8 @@ async def test_noop_revalidates_revised_required_with_artifact_primary(
         structured_llm_client=_SupportValidatingNoopClient(
             incumbent.id,
             supported=True,
+            required_evidence_quote="A7 remains limited to regular payroll runs.",
+            prefer_artifact_primary=True,
         ),
     )
 
@@ -9546,6 +9551,14 @@ async def test_insufficient_support_preserves_its_baseline_and_resumes_after_sou
     class SelectiveSupportClient(_FragmentSelectingSupportClient):
         skip_claim = False
         skipped_claim_statuses = None
+
+        def request_tokens(self, prompt, **kwargs):
+            # This scenario exercises baseline-specific resume behavior. Keep
+            # the delta plan selected even when the tiny fixture's current-full
+            # payload would otherwise be a few tokens cheaper.
+            return len(prompt) + (
+                1_000_000 if '"input_mode":"full"' in prompt else 0
+            )
 
         async def classify_memory_relations(self, prompt, **kwargs):
             return _uniform_relation_response(

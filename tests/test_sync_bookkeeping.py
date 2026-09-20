@@ -3929,7 +3929,10 @@ class RaisingLifecycleOutboxMemoryStore:
 class NoopMemoryExtractor:
     model = "fixture"
     max_tokens = 8192
-    structured_llm_client = SimpleNamespace(request_fits=lambda *args, **kwargs: True)
+    structured_llm_client = SimpleNamespace(
+        request_fits=lambda *args, **kwargs: True,
+        request_tokens=lambda prompt, **kwargs: max(1, len(prompt) // 4),
+    )
     async def extract_memories(self, **kwargs):
         return MemoryExtractionResult(memories=[])
 
@@ -5700,6 +5703,7 @@ async def _stage_completed_v9_recovery_attempt(
     access_hash = lifecycle_access_context_hash(visibility="workspace", owner_user_id=None, project_key=None, repo_identifier=None)
     assessment = RevisionAssessmentContext(projection=projection, base=None, access_context_hash=access_hash)
     capability = revision_inference_capability_hash(client, extraction_model="fixture", extraction_max_tokens=8192)
+    recovery_extractor = ProjectionFragmentRecordingExtractor()
     async def prepare_batches(batches):
         prepared = []
         for batch in batches:
@@ -5707,7 +5711,7 @@ async def _stage_completed_v9_recovery_attempt(
                 inference_capability_hash=capability, max_fragments=len(assessment.full_fragments),
                 max_presentation_chars=sum(len(f.presentation_text) for f in assessment.full_fragments))
             prepared.extend(plan_fragment_requests(batch, catalog, context=assessment,
-                extractor=ProjectionFragmentRecordingExtractor(), source_type="github_repo", doc_type="document"))
+                extractor=recovery_extractor, source_type="github_repo", doc_type="document"))
         return tuple(prepared)
 
     staged = await SourceUnitDeriver(db).derive(

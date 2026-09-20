@@ -71,17 +71,73 @@ class RevisionClientFixture:
         groups = [{**group, **payload["current"].get("observations", {}).get(group.get("source"), {})} for group in payload["current"]["structural_groups"]]
         for claim in payload["claims"]:
             previous = next((group["parts"] for group in payload.get("previous_evidence", []) if group["work_id"] == claim["work_id"]), None)
+            rows = [
+                *payload["current"]["primary_candidates"],
+                *payload["current"]["required_only_candidates"],
+            ]
+            sources = {
+                ref: group for group in groups for ref in group["refs"]
+            }
             if previous is not None:
                 history = payload.get("historical_evidence", [])
                 current_parts = {}
-                sources = {ref: group for group in groups for ref in group["refs"]}
-                for row in [*payload["current"]["primary_candidates"], *payload["current"]["required_only_candidates"]]:
+                for row in rows:
                     current_parts[row[0]] = {"ref": row[0], "excerpt": row[1],
                                        "observation_id": sources[row[0]]["observation_id"], "revision_id": sources[row[0]]["revision_id"]}
                 previous = [{**(history[part["historical_index"]] if "historical_index" in part else current_parts[part["current_ref"]]), "role": part["role"]} for part in previous]
             if previous is None:
-                previous = [{"role": "primary", "excerpt": claim["claim"],
-                             "observation_id": groups[0]["observation_id"], "revision_id": groups[0]["revision_id"]}]
+                configured_primary = getattr(self, "evidence_quote", "")
+                if getattr(self, "prefer_artifact_primary", False):
+                    primary_row = next(
+                        (
+                            row
+                            for row in rows
+                            if len(row) > 2
+                            and "image_source_observation_id" in row[2]
+                        ),
+                        None,
+                    )
+                else:
+                    primary_row = next(
+                        (
+                            row
+                            for row in rows
+                            if configured_primary
+                            and configured_primary in row[1]
+                        ),
+                        None,
+                    )
+                    if primary_row is None:
+                        primary_row = next(
+                            (row for row in rows if row[1] == claim["claim"]),
+                            None,
+                        )
+                if primary_row is None:
+                    previous = [{"role": "primary", "excerpt": claim["claim"],
+                                 "observation_id": groups[0]["observation_id"], "revision_id": groups[0]["revision_id"]}]
+                else:
+                    primary_source = sources[primary_row[0]]
+                    previous = [{
+                        "role": "primary",
+                        "excerpt": primary_row[1],
+                        "observation_id": primary_source["observation_id"],
+                        "revision_id": primary_source["revision_id"],
+                    }]
+                configured_required = tuple(getattr(self, "required_evidence_quotes", ()))
+                single_required = getattr(self, "required_evidence_quote", "")
+                if single_required:
+                    configured_required = (*configured_required, single_required)
+                for quote in configured_required:
+                    row = next((row for row in rows if quote in row[1]), None)
+                    if row is not None:
+                        previous.append(
+                            {
+                                "role": "required",
+                                "excerpt": row[1],
+                                "observation_id": sources[row[0]]["observation_id"],
+                                "revision_id": sources[row[0]]["revision_id"],
+                            }
+                        )
             legacy = {**payload, **claim, "previous_evidence": previous}
             assessment_prompt = "<assessment>" + json.dumps(legacy) + "</assessment>"
             if "Correction:" in prompt:
