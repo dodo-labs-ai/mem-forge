@@ -93,7 +93,7 @@ export function SourceRow({
   itemLabel: string;
   enabledForMe: boolean;
   isSubscriptionPending: boolean;
-  onConfigure: () => void;
+  onConfigure: (step?: "content") => void;
   onSync: () => void;
   onResume?: () => void;
   onShowDetails: () => void;
@@ -253,7 +253,7 @@ export function SourceRow({
               variant="outline"
               aria-label={`Configure ${source.name}`}
               disabled={isSourceBusy || isDeleting}
-              onClick={onConfigure}
+              onClick={() => onConfigure()}
             >
               <SlidersHorizontal className="size-4" />
               <span className="hidden md:inline">{sourceActionLayout.primary.configure.label}</span>
@@ -328,6 +328,7 @@ export function SourceRow({
       )}
 
       <SourceSyncStatusCard
+        onConfigureScope={capabilities.can_configure && capabilities.can_configure_connection ? () => onConfigure("content") : undefined}
         activity={actionableSyncActivity}
         sourceName={sourceLabel.name}
         itemLabel={itemLabel}
