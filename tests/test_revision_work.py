@@ -95,7 +95,9 @@ async def test_small_delta_shares_one_direct_request_and_program_completion():
     results = await executor.assess_many(items)
     assert len(client.prompts) == 1 and len(results) == 3
     assert all(r.supported for r in results.values())
-    assert payload(client.prompts[0])["input_mode"] == "delta"
+    # With a tiny current Source Unit, current-full is cheaper than carrying
+    # baseline Support material; the shared selector uses the cheaper plan.
+    assert payload(client.prompts[0])["input_mode"] == "full"
     assert set(payload(client.prompts[0])["previous_state"][0]) == {
         "work_id", "status", "reason", "primary_ref", "required_refs"
     }
@@ -281,10 +283,12 @@ def test_deleted_text_counts_as_input_but_never_as_selectable_output_refs():
     executor = RevisionWorkExecutor(client=Client(limit=100000), model="gpt-4o")
     scope = executor._range(items)
     states = {i.id: executor._initial(scope, i) for i in items}
+    assert scope.mode == "full"
+    assert scope.selection_reason == "full_has_lower_total_request_cost"
     units = [("historical", part) for part in scope.removed]
     prompt, catalog, budget = executor._request(scope, units, items, states, 0, len(units))
-    assert len(units) >= 250
-    assert "Deleted condition 249" in prompt
+    assert units == []
+    assert "Deleted condition 249" not in prompt
     assert budget == executor._output(items, len(catalog.fragments), states.values())
 
 

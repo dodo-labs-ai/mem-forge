@@ -66,6 +66,9 @@ class Client:
     def request_fits(self, prompt, **kwargs):
         return self.mode == "full" or '"input_mode":"delta"' in prompt
 
+    def request_tokens(self, prompt, **kwargs):
+        return len(prompt)
+
     async def assess_revision_support(self, prompt, **kwargs):
         self.prompts.append(prompt)
         self.budgets.append(kwargs["max_tokens"])
@@ -242,6 +245,7 @@ def test_processing_limitation_cannot_retry_whole_document():
 @pytest.mark.parametrize("mode", ["full", "delta"])
 def test_extraction_context_expansion_preserves_exact_changed_primary_authority(mode):
     from dataclasses import replace
+    from memforge.pipeline.revision_input import ExtractionInputTask, RevisionInputPlanner
 
     base, target = revisions(
         "Two reviewers approve US releases.\n", "Two reviewers approve US releases.\n\nNew deployment owner: Alex.\n"
@@ -249,7 +253,13 @@ def test_extraction_context_expansion_preserves_exact_changed_primary_authority(
     ctx = RevisionAssessmentContext(projection=target, base=base, access_context_hash="scope")
     changed = next(f for f in ctx.full_fragments if "New deployment owner" in f.presentation_text)
     authorized = ctx.catalog((replace(changed, primary_eligible=True),))
-    expanded = ctx.extraction_catalog(authorized, mode)
+    expanded = next(
+        candidate.catalog
+        for candidate in RevisionInputPlanner._extraction_candidates(
+            ctx, ExtractionInputTask(authorized)
+        )
+        if candidate.mode.value == mode
+    )
     assert {f.anchor for f in expanded.fragments if f.primary_eligible} == {changed.anchor}
     if mode == "full":
         assert any("Two reviewers" in f.presentation_text and not f.primary_eligible for f in expanded.fragments)
@@ -285,8 +295,14 @@ def test_changelog_delta_keeps_before_after_field_identity_and_event_context():
     assert removed_claim["field"] == "/items/0/toString"
     assert removed_claim["context"] == {"/created": "2026-09-08", "/items/0/field": "description"}
     fragment = next(f for f in current if f.presentation_text == "One approver.")
-    ancestors = context.ancestor_fragments([fragment])
-    assert {f.presentation_text for f in ancestors} == {"# US payroll", "description", "2026-09-08"}
+    revision = context.current[fragment.anchor.observation_id]
+    expansion = context.reading_index(revision).expand([fragment])
+    added = {
+        f.presentation_text
+        for f in expansion.fragments
+        if f.anchor in expansion.context_anchors
+    }
+    assert added == {"# US payroll", "description", "2026-09-08"}
     executor = object.__new__(RevisionWorkExecutor)
     scope = SimpleNamespace(mode="delta", context=context)
     payload = executor._source_payload(scope, context.catalog(()), [{**removed_claim, "ref": "d000001"}])
