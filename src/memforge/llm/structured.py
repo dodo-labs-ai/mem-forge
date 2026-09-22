@@ -19,6 +19,9 @@ from weakref import WeakKeyDictionary
 import litellm
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from memforge.llm.failure_trace import (
+    FailureTraceSink, capture_call, current_capture, local_failure_trace_sink_from_env,
+)
 from memforge.llm.providers import litellm_optional_kwargs
 from memforge.llm.structured_images import (
     StructuredLlmImage,
@@ -619,8 +622,14 @@ class ClaimRevisionWireDecision(StructuredResponseModel):
         "contradicts",
     ]
     reason: str = Field(default="", max_length=1000)
-    contradiction: ClaimContradiction | None = None
-    revision_assessment: RevisionAssessment | None = None
+    contradiction: ClaimContradiction | None = Field(default=None, description=(
+        "Provide a proof only for relation=contradicts. For equivalent and both refinement "
+        "directions this field must be null; do not fill unrelated proof fields."))
+    revision_assessment: RevisionAssessment | None = Field(default=None, description=(
+        "Assess the NEW challenger replacing the OLD incumbent only for "
+        "relation=refines_challenger_to_candidate. For equivalent, contradicts and "
+        "refines_candidate_to_challenger this field must be null, even if its conditions "
+        "could all be true. Field presence is not a request to fill it."))
 
     @model_validator(mode="after")
     def _applicable_proofs(self):
@@ -1913,9 +1922,11 @@ class LiteLlmStructuredClient:
         config: StructuredLlmConfig,
         *,
         telemetry_sink: Callable[[StructuredLlmCallTelemetry], None] | None = None,
+        failure_trace_sink: FailureTraceSink | None = None,
     ) -> None:
         self.config = config
         self._telemetry_sink = telemetry_sink
+        self._failure_trace_sink = failure_trace_sink if failure_trace_sink is not None else local_failure_trace_sink_from_env()
         self._request_budgets = {}
 
     @property
@@ -2257,15 +2268,16 @@ class LiteLlmStructuredClient:
         images: tuple[StructuredLlmImage, ...] = (),
     ):
         admission = _process_structured_llm_admission(self.config.max_concurrent)
-        async with admission.semaphore:
-            return await self._call_schema_admitted(
-                prompt=prompt,
-                response_format=response_format,
-                max_tokens=max_tokens,
-                model=model,
-                retry_with_json_text=retry_with_json_text,
-                images=images,
-            )
+        async with capture_call(self._failure_trace_sink, prompt=prompt,
+                schema=response_format, operation=_schema_operation_name(response_format)) as capture:
+            async with admission.semaphore:
+                result = await self._call_schema_admitted(
+                    prompt=prompt, response_format=response_format, max_tokens=max_tokens,
+                    model=model, retry_with_json_text=retry_with_json_text, images=images,
+                )
+            if capture is not None:
+                object.__setattr__(result, "_llm_failure_capture", capture)
+            return result
 
     async def _call_schema_admitted(
         self,
@@ -2615,6 +2627,9 @@ class LiteLlmStructuredClient:
                 return response_format.model_validate(raw_content)
             return _validate_structured_json_text(str(raw_content), response_format)
         except Exception as exc:
+            capture = current_capture()
+            if capture is not None:
+                capture.failed(exc, stage="schema_validation")
             state.record_invalid_response_attempt(
                 response,
                 attempt_index=attempt_index,
@@ -2648,6 +2663,11 @@ class LiteLlmStructuredClient:
             attempt_index = state.attempt_count
             failure: _StructuredLlmFailure | None = None
             retry = False
+            capture = current_capture()
+            if capture is not None:
+                capture.begin_attempt(dict(model=model_name, messages=messages,
+                    max_tokens=max_tokens, timeout=remaining_s, num_retries=0,
+                    **provider_kwargs, **schema_kwargs))
             try:
                 response = await litellm.acompletion(
                     model=model_name,
@@ -2664,7 +2684,11 @@ class LiteLlmStructuredClient:
                     **provider_kwargs,
                     **schema_kwargs,
                 )
-            except Exception as exc:
+            except BaseException as exc:
+                if capture is not None:
+                    capture.failed(exc, stage="provider")
+                if not isinstance(exc, Exception):
+                    raise
                 state.record_failed_attempt()
                 retry = _is_retryable_provider_error(exc) and state.retry_budget > 0
                 failure = _structured_failure(
@@ -2692,6 +2716,8 @@ class LiteLlmStructuredClient:
                 backoff_s = min(0.25 * (2 ** (state.retry_count - 1)), 1.0)
                 await asyncio.sleep(min(backoff_s, max(0.0, deadline - loop.time())))
                 continue
+            if capture is not None:
+                capture.response(response)
             state.record_response(response)
             return response, attempt_index
 
