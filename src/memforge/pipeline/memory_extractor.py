@@ -779,6 +779,7 @@ class MemoryExtractor:
         candidates, correction_metrics = await correct_fragment_selectors_once(
             response.memories, catalog=catalog, client=self.structured_llm_client,
             extraction_prompt=prompt, max_tokens=self.fragment_output_tokens(catalog), model=self.model, images=images,
+            source_response=response,
         )
         metrics.update(correction_metrics)
         metrics["structured_llm_calls"] += correction_metrics["selector_correction_calls"]

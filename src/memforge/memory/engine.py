@@ -25,6 +25,7 @@ from memforge.evals.agent_evaluation import (
     RuntimeEventTraceSink,
     assessment_sink_for_runtime_sink,
     bind_source_lifecycle_outcome,
+    source_lifecycle_execution_identity,
     current_deployment_revision,
     publish_agent_assessments,
     publish_runtime_events,
@@ -83,6 +84,7 @@ from memforge.source_derivation import (
     source_derivation_projection_identity_hash,
 )
 from memforge.storage.adapters.protocols import EntityResolutionScope
+from memforge.llm.failure_trace import failure_trace_context, enrich_failure_trace_context
 from memforge.models import (
     Memory,
     RawMemory,
@@ -497,35 +499,40 @@ class MemoryEngine:
 
         runtime_context = _LifecycleExecutionContext(started_at=perf_counter())
         try:
-            return await self._prepare_and_commit_projected_lifecycle_once(
-                projection=projection,
-                doc_id=doc_id,
-                raw_memories=raw_memories,
-                doc_type=doc_type,
-                project_key=project_key,
-                repo_identifier=repo_identifier,
-                document_content=document_content,
-                update_mode=update_mode,
-                changed_hunks=changed_hunks,
-                update_plan_stats=update_plan_stats,
-                source_updated_at=source_updated_at,
-                user_id=user_id,
-                protected_source_observation_ids=protected_source_observation_ids,
-                document=document,
-                derivation_id=derivation_id,
-                derivation_reprocess_all_current_observations=(
-                    derivation_reprocess_all_current_observations
-                ),
-                derivation_reprocess_operation_id=(
-                    derivation_reprocess_operation_id
-                ),
-                expected_source_activity_epoch=expected_source_activity_epoch,
-                source_activity=source_activity,
-                current_changed_ranges=current_changed_ranges,
-                lifecycle_execution_owner_id=lifecycle_execution_owner_id,
-                lifecycle_attempt_count=lifecycle_attempt_count,
-                _runtime_context=runtime_context,
-            )
+            with failure_trace_context(source_id=projection.source_id, source_type=projection.source_type,
+                    doc_id=doc_id, projection_run_id=projection.run_id, derivation_id=derivation_id,
+                    source_unit_id=projection.source_unit_revisions[0].source_unit_id,
+                    target_unit_revision_id=projection.source_unit_revisions[0].id,
+                    execution_owner_id=lifecycle_execution_owner_id, lifecycle_attempt=lifecycle_attempt_count):
+                return await self._prepare_and_commit_projected_lifecycle_once(
+                    projection=projection,
+                    doc_id=doc_id,
+                    raw_memories=raw_memories,
+                    doc_type=doc_type,
+                    project_key=project_key,
+                    repo_identifier=repo_identifier,
+                    document_content=document_content,
+                    update_mode=update_mode,
+                    changed_hunks=changed_hunks,
+                    update_plan_stats=update_plan_stats,
+                    source_updated_at=source_updated_at,
+                    user_id=user_id,
+                    protected_source_observation_ids=protected_source_observation_ids,
+                    document=document,
+                    derivation_id=derivation_id,
+                    derivation_reprocess_all_current_observations=(
+                        derivation_reprocess_all_current_observations
+                    ),
+                    derivation_reprocess_operation_id=(
+                        derivation_reprocess_operation_id
+                    ),
+                    expected_source_activity_epoch=expected_source_activity_epoch,
+                    source_activity=source_activity,
+                    current_changed_ranges=current_changed_ranges,
+                    lifecycle_execution_owner_id=lifecycle_execution_owner_id,
+                    lifecycle_attempt_count=lifecycle_attempt_count,
+                    _runtime_context=runtime_context,
+                )
         except SourceUnitLifecycleExecutionError:
             raise
         except Exception as exc:
@@ -1075,6 +1082,13 @@ class MemoryEngine:
             input_policy_identity=getattr(self.structured_llm_client, "input_policy_identity", None),
         )
         _runtime_context.operation_input_hash = operation_input_hash
+        enrich_failure_trace_context(operation_input_hash=operation_input_hash)
+        if lifecycle_execution_owner_id is not None:
+            enrich_failure_trace_context(**source_lifecycle_execution_identity(
+                source_id=projection.source_id, source_unit_id=scope.source_unit_id,
+                base_unit_revision_id=scope.base_unit_revision_id,
+                target_unit_revision_id=scope.target_unit_revision_id,
+                operation_input_hash=operation_input_hash, execution_owner_id=lifecycle_execution_owner_id))
         _runtime_context.incumbent_count = len(incumbents)
         _runtime_context.stage = "candidate_admission"
         candidate_ledger = await self._select_projected_candidates(
