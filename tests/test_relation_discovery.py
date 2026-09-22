@@ -16,7 +16,6 @@ from memforge.memory.relation_candidate_retrieval import (
     RetrievedRelationCandidate,
 )
 from memforge.memory.relation_classifier import (
-    MEMORY_PAIR_CLASSIFIER_VERSION,
     MemoryPairClassification,
     MemoryPairClassificationError,
     MemoryPairClassificationPlan,
@@ -24,6 +23,7 @@ from memforge.memory.relation_classifier import (
     MemoryRelationType,
 )
 from memforge.memory.relation_discovery import RelationDiscovery, RelationDiscoveryBudget
+from memforge.memory.sparse_relation_classifier import SPARSE_MEMORY_CLASSIFIER_VERSION as MEMORY_PAIR_CLASSIFIER_VERSION
 from memforge.memory.lifecycle_planner import lifecycle_access_context_hash
 from memforge.memory.relation_discovery_contract import (
     PreclassifiedRelationDecision,
@@ -298,7 +298,8 @@ async def test_relation_discovery_can_scope_leases_to_one_source() -> None:
 
 
 @pytest.mark.asyncio
-async def test_relation_discovery_reuses_current_identity_pair_and_only_classifies_new_candidates() -> None:
+@pytest.mark.parametrize("relation_type,direction", [(MemoryRelationType.UNRELATED, RelationDirection.SYMMETRIC), (None, None)])
+async def test_relation_discovery_reuses_current_identity_pair_and_only_classifies_new_candidates(relation_type, direction) -> None:
     challenger = _memory("challenger", "Current claim")
     candidates = (
         _memory("candidate-reused", "Previously classified claim"),
@@ -326,10 +327,10 @@ async def test_relation_discovery_reuses_current_identity_pair_and_only_classifi
                         project_key=challenger.project_key,
                         repo_identifier=challenger.repo_identifier,
                     ),
-                    relation_type=MemoryRelationType.UNRELATED,
-                    direction=RelationDirection.SYMMETRIC,
+                    relation_type=relation_type,
+                    direction=direction,
                     reason="identity stage already checked this pair",
-                        classifier_version=MEMORY_PAIR_CLASSIFIER_VERSION,
+                    classifier_version=MEMORY_PAIR_CLASSIFIER_VERSION,
                 ),
             ),
         ),
@@ -348,15 +349,18 @@ async def test_relation_discovery_reuses_current_identity_pair_and_only_classifi
     assert classifier.classified_pair_ids == ("candidate-new",)
     assert store.completed is not None
     assert store.completed.relation_run.audit["reused_identity_pair_count"] == 1
+    assert store.completed.relations == ()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "stale_field",
-    ("expected_candidate_support_set_hash", "expected_candidate_access_context_hash"),
+    ("expected_candidate_support_set_hash", "expected_candidate_access_context_hash",
+     "expected_candidate_content_hash", "expected_challenger_access_context_hash", "classifier_version"),
 )
+@pytest.mark.parametrize("omitted", [False, True])
 async def test_relation_discovery_reclassifies_identity_seed_with_stale_context(
-    stale_field: str,
+    stale_field: str, omitted: bool,
 ) -> None:
     challenger = _memory("challenger", "Current claim")
     candidate = _memory("candidate", "Previously classified claim")
@@ -377,8 +381,8 @@ async def test_relation_discovery_reclassifies_identity_seed_with_stale_context(
             project_key=challenger.project_key,
             repo_identifier=challenger.repo_identifier,
         ),
-        relation_type=MemoryRelationType.UNRELATED,
-        direction=RelationDirection.SYMMETRIC,
+        relation_type=None if omitted else MemoryRelationType.UNRELATED,
+        direction=None if omitted else RelationDirection.SYMMETRIC,
         reason="identity stage already checked this pair",
         classifier_version=MEMORY_PAIR_CLASSIFIER_VERSION,
     )

@@ -65,10 +65,11 @@ from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitationCode,
 )
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
-from memforge.memory.relation_classifier import (
-    MEMORY_PAIR_CLASSIFIER_VERSION,
-    StructuredMemoryPairClassifier,
+from memforge.memory.sparse_relation_classifier import (
+    SPARSE_MEMORY_CLASSIFIER_VERSION,
+    SparseMemoryRelationClassifier,
 )
+from memforge.memory.relation_classifier import MemoryPairClassificationError
 from memforge.memory.relation_discovery_contract import PreclassifiedRelationDecision
 from memforge.source_access import (
     memory_visibility_for_document,
@@ -283,11 +284,11 @@ class MemoryEngine:
             self.runtime_event_trace_sink
         )
         self.pair_classifier = (
-            StructuredMemoryPairClassifier(
+            SparseMemoryRelationClassifier(
                 client=structured_llm_client,
                 model=llm_model,
             )
-            if callable(getattr(structured_llm_client, "classify_memory_relations", None))
+            if callable(getattr(structured_llm_client, "discover_memory_relations", None))
             else None
         )
         self.identity_resolver = IdentityResolver(
@@ -1492,6 +1493,16 @@ class MemoryEngine:
                 "identity_resolution_elapsed_ms": identity_resolution.metrics.elapsed_ms,
             }
         )
+        incomplete_identity = next((item for item in identity_resolutions if not item.classification_complete), None)
+        if incomplete_identity is not None:
+            raise MemoryPairClassificationError(
+                incomplete_identity.failure_reason or "identity discovery did not complete",
+                pair_count=identity_resolution.metrics.pair_count,
+                llm_calls=identity_resolution.metrics.llm_calls,
+                prompt_chars=identity_resolution.metrics.prompt_chars,
+                terminal_category=incomplete_identity.terminal_category,
+                error_code=incomplete_identity.error_code,
+            )
         classified_candidate_ids = tuple(
             dict.fromkeys(
                 memory_id
@@ -1528,7 +1539,7 @@ class MemoryEngine:
                     relation_type=decision.relation_type,
                     direction=decision.direction,
                     reason=decision.reason,
-                    classifier_version=MEMORY_PAIR_CLASSIFIER_VERSION,
+                    classifier_version=SPARSE_MEMORY_CLASSIFIER_VERSION,
                 )
                 for decision in resolution.classified_pairs
             )
@@ -2034,7 +2045,7 @@ def _source_lifecycle_operation_input_hash(
 
     manifest = {
         "semantic_contract": "/".join((REVISION_SUPPORT_CONTRACT, CLAIM_REVISION_CONTRACT,
-                                       REVISION_INPUT_POLICY, MEMORY_PAIR_CLASSIFIER_VERSION)),
+                                       REVISION_INPUT_POLICY, SPARSE_MEMORY_CLASSIFIER_VERSION)),
         "input_policy_identity": input_policy_identity,
         "projection_identity_hash": source_derivation_projection_identity_hash(projection),
         "candidates": [
