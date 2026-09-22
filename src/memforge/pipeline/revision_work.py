@@ -25,6 +25,13 @@ from memforge.pipeline.revision_assessment import (
     SupportAssessment,
     REVISION_SUPPORT_CONTRACT,
 )
+from memforge.pipeline.revision_input import (
+    InputCandidate,
+    InputCost,
+    PlannedTransport,
+    RevisionInputPlanner,
+    SupportInputTask,
+)
 from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
 from memforge.models import Memory, RawMemory
 from memforge.pipeline.support_wire import SupportWireAliases
@@ -99,6 +106,112 @@ class AssessmentRange:
     removed: tuple
     mode: str
     include_history: bool = True
+    reading_indexes: tuple = ()
+    selection_reason: str = "legacy_delegated"
+    estimated_cost: InputCost | None = None
+
+
+class _SupportRequestPolicy:
+    def __init__(self, executor, items):
+        self.executor = executor
+        self.items = items
+
+    @staticmethod
+    def _scope(candidate):
+        return AssessmentRange(
+            context=None,
+            catalog=candidate.catalog,
+            removed=tuple(
+                {"ref": f"h{index:06d}", **part}
+                for index, part in enumerate(candidate.removed_historical)
+            ),
+            mode=candidate.mode.value,
+            include_history=candidate.include_history,
+            reading_indexes=candidate.reading_indexes,
+        )
+
+    def _material(self, candidate, *, load_images):
+        scope = replace(self._scope(candidate), context=self.items[0].context)
+        units = [("current", fragment) for fragment in scope.catalog.fragments] + [
+            ("historical", part) for part in scope.removed
+        ]
+        states = {item.id: self.executor._initial(scope, item) for item in self.items}
+        remaining = list(self.items)
+        input_tokens = output_tokens = image_count = image_bytes = request_count = 0
+        while remaining:
+            try:
+                group = self.executor._group(
+                    scope, units, remaining, states, load_images=load_images
+                )
+            except SupportRevalidationLimitation:
+                return None
+            while True:
+                position = 0
+                group_input = group_output = group_image_count = group_image_bytes = group_requests = 0
+                restart_with_smaller_group = False
+                while True:
+                    chunk = self.executor._chunk(
+                        scope,
+                        units[position:],
+                        group,
+                        states,
+                        position,
+                        len(units),
+                        load_images=load_images,
+                    )
+                    if position < len(units) and not chunk and len(group) > 1:
+                        group = group[: max(1, len(group) // 2)]
+                        restart_with_smaller_group = True
+                        break
+                    if position < len(units) and not chunk:
+                        return None
+                    prompt, catalog, output = self.executor._request(
+                        scope, chunk, group, states, position, len(units)
+                    )
+                    images = self.executor._catalog_images(scope, catalog) if load_images else ()
+                    if not self.executor._fits(prompt, AssessmentResponse, output, images):
+                        return None
+                    group_input += self.executor.client.request_tokens(
+                        prompt,
+                        response_format=AssessmentResponse,
+                        model=self.executor.model,
+                        images=images,
+                    )
+                    group_output += output
+                    group_image_count += len(images)
+                    group_image_bytes += sum(len(image.body) for image in images)
+                    group_requests += 1
+                    position += len(chunk)
+                    if position == len(units):
+                        break
+                if restart_with_smaller_group:
+                    continue
+                input_tokens += group_input
+                output_tokens += group_output
+                image_count += group_image_count
+                image_bytes += group_image_bytes
+                request_count += group_requests
+                break
+            remaining = remaining[len(group) :]
+        has_images = any(fragment.kind.value == "artifact" for fragment in candidate.catalog.fragments)
+        return PlannedTransport(
+            InputCost(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                request_count=request_count,
+                image_count=image_count,
+                image_bytes=image_bytes,
+                complete=load_images or not has_images,
+            ),
+            scope,
+        )
+
+    def lower_bound(self, candidate: InputCandidate):
+        planned = self._material(candidate, load_images=False)
+        return planned.cost if planned is not None else None
+
+    def materialize(self, candidate: InputCandidate):
+        return self._material(candidate, load_images=True)
 
 
 class RevisionWorkExecutor:
@@ -115,6 +228,7 @@ class RevisionWorkExecutor:
         self.stage_counts = {"support_assess": 0}
         self.covered_source_claim_pairs = 0
         self.work_aliases = {}
+        self._planner_image_cache = {}
 
     @staticmethod
     def _identity(items):
@@ -182,10 +296,22 @@ class RevisionWorkExecutor:
 
     def _evidence_subset(self, scope, refs):
         selected = self._subset(scope.catalog, refs)
-        ancestors = {fragment.anchor for fragment in scope.context.ancestor_fragments(selected.fragments)}
+        context_anchors = set()
+        for index in scope.reading_indexes:
+            scoped = tuple(
+                fragment
+                for fragment in selected.fragments
+                if fragment.anchor.observation_revision_id == index.observation_revision_id
+            )
+            if scoped:
+                context_anchors.update(index.expand(scoped).context_anchors)
         return self._subset(
             scope.catalog,
-            {f.reference for f in scope.catalog.fragments if f.anchor in ancestors or f.reference in refs},
+            {
+                fragment.reference
+                for fragment in scope.catalog.fragments
+                if fragment.anchor in context_anchors or fragment.reference in refs
+            },
         )
 
     def _source_payload(self, scope, catalog, removed=()):
@@ -356,13 +482,19 @@ class RevisionWorkExecutor:
             supports.append({"work_id": item.id, "parts": parts})
         return {"previous_evidence": supports, "historical_evidence": historical}
 
-    def _fits_catalog(self, scope, catalog, prompt, schema, output):
+    def _catalog_images(self, scope, catalog):
+        key = catalog.digest
+        if key not in self._planner_image_cache:
+            self._planner_image_cache[key] = scope.context.images_for(catalog)
+        return self._planner_image_cache[key]
+
+    def _fits_catalog(self, scope, catalog, prompt, schema, output, *, load_images=True):
         from memforge.pipeline.projection_images import ProjectionImageLoadError
 
         if not self._fits(prompt, schema, output):
             return False
         try:
-            images = scope.context.images_for(catalog)
+            images = self._catalog_images(scope, catalog) if load_images else ()
         except ProjectionImageLoadError as error:
             if error.error_code == "image_batch_too_large":
                 return False
@@ -382,31 +514,21 @@ class RevisionWorkExecutor:
 
     def _range(self, items):
         context = items[0].context
-        full = context.catalog(context.full_fragments)
-        if context.base is None:
-            return AssessmentRange(context, full, (), "full")
-        baseline = context.base.source_unit_revisions[0].id
-        if any(p.validation_unit_revision_id not in (None, baseline) for i in items for p in i.support):
-            raise ValueError("Support baseline differs from delta baseline")
-        changed, removed = context.delta()
-        refs = {f.anchor for f in changed}
-        # Current matches are ordinary model candidates. Text equality never
-        # establishes cross-revision semantic authority or permits silent rebinding.
-        for item in items:
-            for part in item.support:
-                refs.update(
-                    f.anchor
-                    for f in full.fragments
-                    if f.anchor.observation_id == part.anchor.observation_id
-                    and (f.anchor == part.anchor or f.presentation_text == part.excerpt)
-                )
-        selected = tuple(f for f in full.fragments if f.anchor in refs)
-        refs.update(f.anchor for f in context.ancestor_fragments(selected))
-        return AssessmentRange(
-            context,
-            self._subset(full, {f.reference for f in full.fragments if f.anchor in refs}),
-            tuple({"ref": f"h{i:06d}", **p} for i, p in enumerate(removed)),
-            "delta",
+        plan = RevisionInputPlanner.plan(
+            context=context,
+            task=SupportInputTask(tuple(item.support for item in items)),
+            request_policy=_SupportRequestPolicy(self, items),
+        )
+        scope = plan.transport
+        removed = tuple(
+            {"ref": f"h{index:06d}", **part}
+            for index, part in enumerate(plan.removed_historical)
+        )
+        return replace(
+            scope,
+            removed=removed,
+            selection_reason=plan.selection_reason,
+            estimated_cost=plan.estimated_cost,
         )
 
     @staticmethod
@@ -477,18 +599,22 @@ class RevisionWorkExecutor:
             prompt, catalog = self._input(replace(scope, include_history=False), units, items, states, position, total)
         return prompt, catalog, output
 
-    def _chunk(self, scope, units, items, states, position, total):
+    def _chunk(self, scope, units, items, states, position, total, *, load_images=True):
         def fits(trial):
             prompt, catalog, output = self._request(scope, trial, items, states, position, total)
-            return self._fits_catalog(scope, catalog, prompt, AssessmentResponse, output)
+            return self._fits_catalog(
+                scope, catalog, prompt, AssessmentResponse, output, load_images=load_images
+            )
 
         return self._prefix(units, fits)
 
-    def _group(self, scope, units, items, states):
+    def _group(self, scope, units, items, states, *, load_images=True):
         # Compare a few transport packings instead of filling a request with
         # claims at the expense of repeatedly sending tiny Source slices.
         prompt, catalog, output = self._request(scope, units, items, states, 0, len(units))
-        if self._fits_catalog(scope, catalog, prompt, AssessmentResponse, output):
+        if self._fits_catalog(
+            scope, catalog, prompt, AssessmentResponse, output, load_images=load_images
+        ):
             return items
         sizes = [1]
         while sizes[-1] < len(items):
@@ -496,13 +622,20 @@ class RevisionWorkExecutor:
         best = None
         for size in sizes:
             group = items[:size]
-            chunk = self._chunk(scope, units, group, states, 0, len(units)) if units else []
+            chunk = self._chunk(
+                scope, units, group, states, 0, len(units), load_images=load_images
+            ) if units else []
             prompt, cat, output = self._request(scope, chunk, group, states, 0, len(units))
-            if (units and not chunk) or not self._fits_catalog(scope, cat, prompt, AssessmentResponse, output):
+            if (units and not chunk) or not self._fits_catalog(
+                scope, cat, prompt, AssessmentResponse, output, load_images=load_images
+            ):
                 continue
             cost = (
                 self.client.request_tokens(
-                    prompt, response_format=AssessmentResponse, model=self.model, images=scope.context.images_for(cat)
+                    prompt,
+                    response_format=AssessmentResponse,
+                    model=self.model,
+                    images=self._catalog_images(scope, cat) if load_images else (),
                 )
                 + output
             )
@@ -584,9 +717,25 @@ class RevisionWorkExecutor:
                     "start": position,
                     "count": len(chunk),
                     "total": len(units),
+                    "input_plan": {
+                        "mode": scope.mode,
+                        "selection_reason": scope.selection_reason,
+                        "estimated_cost": (
+                            {
+                                "input_tokens": scope.estimated_cost.input_tokens,
+                                "output_tokens": scope.estimated_cost.output_tokens,
+                                "request_count": scope.estimated_cost.request_count,
+                                "image_count": scope.estimated_cost.image_count,
+                                "image_bytes": scope.estimated_cost.image_bytes,
+                                "total_tokens": scope.estimated_cost.total_tokens,
+                            }
+                            if scope.estimated_cost is not None
+                            else None
+                        ),
+                    },
                 },
                 dependencies=parents[-1:],
-                images=scope.context.images_for(catalog),
+                images=self._catalog_images(scope, catalog),
                 validate=validate,
                 decode=wire.decode,
             )
@@ -611,6 +760,13 @@ class RevisionWorkExecutor:
                 "baseline": scope.context.base.source_unit_revisions[0].id if scope.context.base else None,
                 "target": scope.context.projection.source_unit_revisions[0].id,
                 "work_items": self._identity(items),
+                "input_plan": {
+                    "mode": scope.mode,
+                    "selection_reason": scope.selection_reason,
+                    "estimated_total_tokens": (
+                        scope.estimated_cost.total_tokens if scope.estimated_cost is not None else None
+                    ),
+                },
             },
             "coverage": {"source_items": total, "work_ids": [i.id for i in items]},
             "dependencies": [[w.id, w.result_hash] for w in parents],
@@ -665,6 +821,18 @@ class RevisionWorkExecutor:
                         "model": self.model,
                         "reason": result.reason,
                         "input_mode": scope.mode,
+                        "input_selection_reason": scope.selection_reason,
+                        "estimated_input_cost": (
+                            {
+                                "input_tokens": scope.estimated_cost.input_tokens,
+                                "output_tokens": scope.estimated_cost.output_tokens,
+                                "request_count": scope.estimated_cost.request_count,
+                                "image_count": scope.estimated_cost.image_count,
+                                "image_bytes": scope.estimated_cost.image_bytes,
+                            }
+                            if scope.estimated_cost is not None
+                            else None
+                        ),
                     },
                 )
             results[result.work_id] = SupportAssessment(

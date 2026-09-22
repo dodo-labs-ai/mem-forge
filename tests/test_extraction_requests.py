@@ -86,7 +86,8 @@ def test_first_import_over_old_catalog_limit_batches_complete_requests_and_keeps
         max_fragments=len(context.full_fragments),
         max_presentation_chars=sum(len(f.presentation_text) for f in context.full_fragments),
     )
-    client = Client(limit=10000)
+    # A later paragraph now carries the complete first-paragraph section intro.
+    client = Client(limit=12000)
     extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=client)
     requests = plan_fragment_requests(
         batch, catalog, context=context, extractor=extractor, source_type="confluence", doc_type="document"
@@ -139,7 +140,79 @@ def test_incremental_extraction_does_not_expand_to_full_current_catalog():
     text = [f.presentation_text for f in request.prepared_catalog.fragments]
     assert any("New approval" in t for t in text)
     assert any("# US payroll" in t for t in text)
-    assert all("Old unrelated" not in t for t in text)
+    assert any("Old unrelated" in t for t in text)
+    assert [
+        f.presentation_text.strip()
+        for f in request.prepared_catalog.fragments
+        if f.primary_eligible
+    ] == ["New approval rule."]
+
+
+def test_planner_never_promotes_required_only_or_added_reading_context():
+    from memforge.pipeline.revision_input import ExtractionInputTask, RevisionInputPlanner
+
+    projection = _projection(
+        primary_content="# US payroll\n\nLocal definition.\n\nNew approval rule.\n",
+        context_content="Country: US.\n",
+    )
+    context = RevisionAssessmentContext(projection=projection, base=projection, access_context_hash="scope")
+    new_rule = next(f for f in context.full_fragments if "New approval" in f.presentation_text)
+    required_only = next(f for f in context.full_fragments if "Country: US" in f.presentation_text)
+    authorized = context.catalog(
+        (
+            replace(new_rule, primary_eligible=True),
+            replace(required_only, primary_eligible=False),
+        )
+    )
+
+    candidates = RevisionInputPlanner._extraction_candidates(
+        context, ExtractionInputTask(authorized)
+    )
+    for candidate in candidates:
+        primary = {f.anchor for f in candidate.catalog.fragments if f.primary_eligible}
+        assert primary == {new_rule.anchor}
+        assert next(
+            f for f in candidate.catalog.fragments if f.anchor == required_only.anchor
+        ).primary_eligible is False
+        definition = next(
+            f for f in candidate.catalog.fragments if "Local definition" in f.presentation_text
+        )
+        assert definition.primary_eligible is False
+
+
+def test_raw_context_is_deduped_only_with_explicit_complete_fragment_coverage():
+    projection = _projection(
+        primary_content="New approval rule.\n",
+        context_content="Country: US.\n\nPayroll type: regular.\n",
+    )
+    context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="scope")
+    context_id = projection.observations[1].id
+    context_fragments = tuple(
+        fragment
+        for fragment in context.full_fragments
+        if fragment.anchor.observation_id == context_id
+    )
+    raw = "Country: US.\n\nPayroll type: regular.\n"
+
+    def prompt(catalog, ids=()):
+        return MemoryExtractor.projection_fragment_prompt(
+            catalog,
+            source_type="fixture",
+            doc_type="document",
+            context_markdown=raw,
+            context_observation_ids=ids,
+            revision_context=context,
+            mode="full",
+        )
+
+    partial = context.catalog((context_fragments[0],))
+    complete = context.catalog(context_fragments)
+    assert prompt(partial).count("Payroll type: regular.") == 1
+    assert prompt(partial, (context_id,)).count("Payroll type: regular.") == 1
+    assert prompt(complete, (context_id,)).count("Payroll type: regular.") == 1
+    assert '"additional_context"' in prompt(partial)
+    assert '"additional_context"' in prompt(partial, (context_id,))
+    assert '"additional_context"' not in prompt(complete, (context_id,))
 
 
 def test_small_real_window_packs_whole_tables_without_fixed_output_reservation(monkeypatch):
