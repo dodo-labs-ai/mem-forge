@@ -30,7 +30,6 @@ from memforge.memory.relation_classifier import (
     MemoryPairClassifier,
     MemoryPairClassificationError,
     MemoryPairContext,
-    MEMORY_PAIR_CLASSIFIER_VERSION,
     MemoryPairDecision,
     MemoryRelationType,
 )
@@ -39,6 +38,7 @@ from memforge.memory.relation_discovery_contract import (
     resolve_relation_discovery_actor_user_id,
 )
 from memforge.memory.lifecycle_planner import lifecycle_access_context_hash
+from memforge.memory.sparse_relation_classifier import SPARSE_MEMORY_CLASSIFIER_VERSION
 from memforge.models import (
     Memory,
     MemoryReview,
@@ -50,7 +50,7 @@ from memforge.models import (
 from memforge.storage.adapters.protocols import RelationalStore
 
 
-RELATION_DISCOVERY_CLASSIFIER_VERSION = MEMORY_PAIR_CLASSIFIER_VERSION
+RELATION_DISCOVERY_CLASSIFIER_VERSION = SPARSE_MEMORY_CLASSIFIER_VERSION
 logger = logging.getLogger(__name__)
 
 
@@ -290,6 +290,7 @@ class RelationDiscovery:
             repo_identifier=challenger.repo_identifier,
         )
         reused_decisions: dict[tuple[str, str], MemoryPairDecision] = {}
+        reused_candidate_ids: set[str] = set()
         pending_pairs: list[MemoryPair] = []
         for pair in pairs:
             saved = reusable_by_candidate_id.get(pair.candidate.id)
@@ -311,12 +312,14 @@ class RelationDiscovery:
             ):
                 pending_pairs.append(pair)
                 continue
-            reused_decisions[pair.key] = MemoryPairDecision(
-                pair=pair,
-                relation_type=saved.relation_type,
-                direction=saved.direction,
-                reason=saved.reason,
-            )
+            reused_candidate_ids.add(pair.candidate.id)
+            if saved.relation_type is not None:
+                reused_decisions[pair.key] = MemoryPairDecision(
+                    pair=pair,
+                    relation_type=saved.relation_type,
+                    direction=saved.direction,
+                    reason=saved.reason,
+                )
         try:
             classification = (
                 await self._pair_classifier.classify(tuple(pending_pairs))
@@ -335,7 +338,7 @@ class RelationDiscovery:
                 **reused_decisions,
                 **{decision.pair.key: decision for decision in classification.decisions},
             }
-            decisions = tuple(classified_by_key[pair.key] for pair in pairs)
+            decisions = tuple(classified_by_key[pair.key] for pair in pairs if pair.key in classified_by_key)
             await self._candidate_retriever.ensure_selection_current(
                 selection,
                 challenger=challenger,
@@ -359,7 +362,7 @@ class RelationDiscovery:
                 loaded_by_id=loaded_by_id,
                 classification_llm_calls=classification.llm_calls,
                 classification_prompt_chars=classification.prompt_chars,
-                reused_pair_count=len(reused_decisions),
+                reused_pair_count=len(reused_candidate_ids),
                 candidate_support_set_hashes={
                     pair.candidate.id: candidate_support[
                         pair.candidate.id
@@ -371,7 +374,7 @@ class RelationDiscovery:
             raise _WorkProcessingError(
                 cause=error,
                 pair_count=len(pairs),
-                reused_pair_count=len(reused_decisions),
+                reused_pair_count=len(reused_candidate_ids),
                 llm_calls=classification.llm_calls,
                 prompt_chars=classification.prompt_chars,
             ) from error
@@ -380,7 +383,7 @@ class RelationDiscovery:
             reviews,
             _CompletedClassification(
                 pair_count=len(pairs),
-                reused_pair_count=len(reused_decisions),
+                reused_pair_count=len(reused_candidate_ids),
                 llm_calls=classification.llm_calls,
                 prompt_chars=classification.prompt_chars,
             ),

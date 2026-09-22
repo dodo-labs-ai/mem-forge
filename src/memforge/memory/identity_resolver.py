@@ -46,7 +46,7 @@ class IdentityResolutionPolicy:
 
 @dataclass(frozen=True, slots=True)
 class IdentityPairDecision:
-    """A classified candidate snapshot retained after its workset completes."""
+    """A completed candidate snapshot with an optional proposed relationship."""
 
     candidate_memory_id: str
     candidate_content_hash: str
@@ -54,8 +54,8 @@ class IdentityPairDecision:
     candidate_owner_user_id: str | None
     candidate_project_key: str | None
     candidate_repo_identifier: str | None
-    relation_type: MemoryRelationType
-    direction: RelationDirection
+    relation_type: MemoryRelationType | None
+    direction: RelationDirection | None
     reason: str
 
 
@@ -67,6 +67,8 @@ class IdentityResolution:
     classified_pairs: tuple[IdentityPairDecision, ...]
     classification_complete: bool = True
     failure_reason: str | None = None
+    terminal_category: str | None = None
+    error_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,11 +246,13 @@ class IdentityResolver:
                     classified_pairs=(),
                     classification_complete=False,
                     failure_reason=str(error),
+                    terminal_category=error.terminal_category,
+                    error_code=error.error_code,
                 )
         else:
             decisions_by_key = {decision.pair.key: decision for decision in decisions}
             for index, pairs in pending.items():
-                pair_decisions = tuple(decisions_by_key[pair.key] for pair in pairs)
+                pair_decisions = tuple(decisions_by_key[pair.key] for pair in pairs if pair.key in decisions_by_key)
                 equivalent = next(
                     (
                         decision
@@ -274,17 +278,17 @@ class IdentityResolver:
                     ),
                     classified_pairs=tuple(
                         IdentityPairDecision(
-                            candidate_memory_id=decision.pair.candidate.id,
-                            candidate_content_hash=decision.pair.candidate.content_hash,
-                            candidate_visibility=decision.pair.candidate.visibility,
-                            candidate_owner_user_id=decision.pair.candidate.owner_user_id,
-                            candidate_project_key=decision.pair.candidate.project_key,
-                            candidate_repo_identifier=decision.pair.candidate.repo_identifier,
-                            relation_type=decision.relation_type,
-                            direction=decision.direction,
-                            reason=decision.reason,
+                            candidate_memory_id=pair.candidate.id,
+                            candidate_content_hash=pair.candidate.content_hash,
+                            candidate_visibility=pair.candidate.visibility,
+                            candidate_owner_user_id=pair.candidate.owner_user_id,
+                            candidate_project_key=pair.candidate.project_key,
+                            candidate_repo_identifier=pair.candidate.repo_identifier,
+                            relation_type=decisions_by_key[pair.key].relation_type if pair.key in decisions_by_key else None,
+                            direction=decisions_by_key[pair.key].direction if pair.key in decisions_by_key else None,
+                            reason=decisions_by_key[pair.key].reason if pair.key in decisions_by_key else "",
                         )
-                        for decision in pair_decisions
+                        for pair in pairs
                     ),
                 )
         return (

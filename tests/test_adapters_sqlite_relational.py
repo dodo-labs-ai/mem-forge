@@ -30,8 +30,9 @@ from memforge.storage.admin_memory import MemoryAdminListFilters
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("omitted", [False, True])
 async def test_sqlite_relation_work_round_trips_preclassified_identity_decisions(
-    db: Database,
+    db: Database, omitted: bool,
 ) -> None:
     await db.upsert_source(
         id="src-confluence",
@@ -74,8 +75,8 @@ async def test_sqlite_relation_work_round_trips_preclassified_identity_decisions
                 expected_candidate_support_set_hash="support-hash",
                 expected_candidate_access_context_hash="candidate-access",
                 expected_challenger_access_context_hash="challenger-access",
-                relation_type=MemoryRelationType.REFINES,
-                direction=RelationDirection.CANDIDATE_TO_CHALLENGER,
+                relation_type=None if omitted else MemoryRelationType.REFINES,
+                direction=None if omitted else RelationDirection.CANDIDATE_TO_CHALLENGER,
                 reason="identity stage checked this pair",
                 classifier_version="memory-relation-v1",
             ),

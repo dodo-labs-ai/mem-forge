@@ -81,10 +81,10 @@ async def test_reconciliation_preserves_validation_fields_and_attempted_pair_cou
 @pytest.mark.parametrize("relation", ["equivalent", "refines_challenger_to_candidate", "refines_candidate_to_challenger", "contradicts"])
 def test_sparse_wire_preserves_relations_and_proofs(relation):
     from memforge.llm.structured import ClaimRevisionWireDecision, ClaimContradiction
-    wire = ClaimRevisionWireDecision(existing_id="M7", relation=relation,
+    wire = ClaimRevisionWireDecision(existing_id="MEM-0008", relation=relation,
         contradiction=ClaimContradiction(same_subject_and_scope=True, incompatible_assertions="one versus two") if relation == "contradicts" else None)
     decision = wire.decision()
-    assert wire.existing_id == "M7"
+    assert wire.existing_id == "MEM-0008"
     if relation.startswith("refines_"):
         assert decision.relation.classification == "refines"
         assert decision.relation.direction == relation.removeprefix("refines_")
@@ -99,7 +99,7 @@ async def test_provider_validation_diagnostic_reaches_durable_lifecycle_event(mo
     from memforge.evals.agent_evaluation import bind_source_lifecycle_outcome
     from tests.test_structured_llm import CompletionResponse
     async def invalid(**kwargs):
-        return CompletionResponse('{"results":[{"candidate_id":"C0","evidence_status":"entailed","relations":[{"existing_id":"M0","relation":"invalid"}],"uncertain_existing_ids":[]}]}')
+        return CompletionResponse('{"results":[{"candidate_id":"NEW-0001","evidence_status":"entailed","relations":[{"existing_id":"MEM-0001","relation":"invalid"}],"uncertain_existing_ids":[]}]}')
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", invalid)
     client = LiteLlmStructuredClient(StructuredLlmConfig(model="openai/gpt-4o-mini", api_key="fixture",
         base_url=None, timeout_s=5, num_retries=0, native_schema_transport="response_format"))

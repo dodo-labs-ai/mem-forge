@@ -545,6 +545,27 @@ class MemoryRelationResponse(StructuredResponseModel):
     decisions: list[MemoryRelationDecision]
 
 
+class MemoryRelationCatalogEdge(MemoryRelationAssessment):
+    model_config = ConfigDict(extra="forbid")
+
+    existing_id: str = Field(pattern=r"^MEM-\d{4}$")
+    classification: Literal["equivalent", "refines", "contradicts"]
+
+
+class MemoryRelationCatalogResult(StructuredResponseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str = Field(pattern=r"^NEW-\d{4}$")
+    relations: list[MemoryRelationCatalogEdge]
+
+
+class MemoryRelationCatalogResponse(StructuredResponseModel):
+    """One completion per challenger, with only explicitly discovered edges."""
+
+    model_config = ConfigDict(extra="forbid")
+    results: list[MemoryRelationCatalogResult]
+
+
 class RevisionAssessment(StructuredResponseModel):
     """Conditions for revising the incumbent with the current challenger."""
 
@@ -592,7 +613,7 @@ class ClaimContradiction(StructuredResponseModel):
 class ClaimRevisionWireDecision(StructuredResponseModel):
     """An explicitly discovered relationship; omission is not UNRELATED."""
 
-    existing_id: str
+    existing_id: str = Field(pattern=r"^MEM-[0-9]{4}$")
     relation: Literal[
         "equivalent", "refines_challenger_to_candidate", "refines_candidate_to_challenger",
         "contradicts",
@@ -631,10 +652,10 @@ class ClaimRevisionWireDecision(StructuredResponseModel):
 class ClaimCandidateResult(StructuredResponseModel):
     """Every requested candidate has one result, even when no edges were found."""
 
-    candidate_id: str
+    candidate_id: str = Field(pattern=r"^NEW-[0-9]{4}$")
     evidence_status: Literal["entailed", "insufficient"]
     relations: list[ClaimRevisionWireDecision]
-    uncertain_existing_ids: list[str]
+    uncertain_existing_ids: list[Annotated[str, Field(pattern=r"^MEM-[0-9]{4}$")]]
 
     @model_validator(mode="after")
     def _unique_relationships(self):
@@ -1168,6 +1189,11 @@ class SourceSupportStructuredClient(Protocol):
         model: str | None = None,
     ) -> MemoryRelationResponse:
         """Return exact, directed relationship decisions for Memory pairs."""
+
+    async def discover_memory_relations(
+        self, prompt: str, *, max_tokens: int = 32_768, model: str | None = None,
+    ) -> MemoryRelationCatalogResponse:
+        """Complete a sparse relationship catalog through the shared transport."""
 
     async def validate_memory_support(
         self,
@@ -2098,6 +2124,14 @@ class LiteLlmStructuredClient:
             model=model,
         )
 
+    async def discover_memory_relations(
+        self, prompt: str, *, max_tokens: int = 32_768, model: str | None = None,
+    ) -> MemoryRelationCatalogResponse:
+        return await self._call_schema(
+            prompt=prompt, response_format=MemoryRelationCatalogResponse,
+            max_tokens=max_tokens, model=model,
+        )
+
     async def validate_memory_support(
         self,
         prompt: str,
@@ -2522,7 +2556,7 @@ class LiteLlmStructuredClient:
         if response_format in {
             ProjectionFragmentMemoryExtractionResponse, ProjectionFragmentSelectorCorrectionResponse,
             RevisionSupportResponse, ClaimRevisionResponse, ClaimRevisionWireResponse,
-            SupportAssessmentResponse, SupportAssessmentWireResponse,
+            SupportAssessmentResponse, SupportAssessmentWireResponse, MemoryRelationCatalogResponse,
         }:
             # Count the expanded template value and fallback repair diagnostics;
             # provider placeholders must never make a large source look tiny.
@@ -2563,7 +2597,7 @@ class LiteLlmStructuredClient:
         )
         schema_transport = native_schema_transport if native_schema else "json_text"
         try:
-            if response_format in (ClaimRevisionWireResponse, SupportAssessmentResponse, SupportAssessmentWireResponse):
+            if response_format in (ClaimRevisionWireResponse, SupportAssessmentResponse, SupportAssessmentWireResponse, MemoryRelationCatalogResponse):
                 finish = _response_finish_reason(response)
                 stop = _response_stop_reason(response)
                 message = _object_value(_first_response_choice(response), "message")
@@ -2572,6 +2606,7 @@ class LiteLlmStructuredClient:
                         or _object_value(message, "refusal")):
                     raise StructuredLlmError("assessment response did not complete",
                         error_code=("claim_response_incomplete" if response_format is ClaimRevisionWireResponse
+                                    else "memory_relation_response_incomplete" if response_format is MemoryRelationCatalogResponse
                                     else "support_response_incomplete"))
             raw_content = _message_content(response)
             if isinstance(raw_content, response_format):

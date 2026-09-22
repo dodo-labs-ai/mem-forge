@@ -1146,6 +1146,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "IncumbentSupportAuditResponse": '{"decisions":[]}',
         "RevisionCompositionResponse": '{"decisions":[]}',
         "MemoryRelationResponse": '{"decisions":[]}',
+        "MemoryRelationCatalogResponse": '{"results":[]}',
         "MemorySupportValidationResponse": '{"supported":true}',
         "EntityValidationResponse": '{}',
         "EntityBatchValidationResponse": '{"decisions":[]}',
@@ -1198,6 +1199,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "audit_incumbent_support": lambda: client.audit_incumbent_support("prompt"),
         "prove_revision_compositions": lambda: client.prove_revision_compositions("prompt"),
         "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
+        "discover_memory_relations": lambda: client.discover_memory_relations("prompt"),
         "validate_memory_support": lambda: client.validate_memory_support("prompt"),
         "validate_entity_match": lambda: client.validate_entity_match("prompt"),
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
@@ -1726,6 +1728,26 @@ async def test_litellm_structured_client_fails_closed_after_both_strategies_are_
     assert calls[0]["response_format"] is MemoryExtractionResponse
     assert "response_format" not in calls[1]
     assert "response_format" not in calls[2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter", "refusal"])
+async def test_sparse_catalog_rejects_valid_json_from_unfinished_provider_response(monkeypatch, finish_reason):
+    response = CompletionResponse('{"results":[{"candidate_id":"NEW-0001","relations":[]}]}')
+    response.choices[0].finish_reason = finish_reason
+
+    async def fake_acompletion(**_kwargs):
+        return response
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(StructuredLlmConfig(
+        model="anthropic--claude-sonnet-latest", base_url=None, api_key=None,
+        timeout_s=1.0, num_retries=1,
+    ))
+    with pytest.raises(StructuredLlmError) as error:
+        await client.discover_memory_relations("prompt")
+    assert error.value.error_code == "memory_relation_response_incomplete"
 
 
 @pytest.mark.asyncio

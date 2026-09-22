@@ -7049,8 +7049,9 @@ async def test_cross_source_keep_persists_provenance_and_survives_other_source_r
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("semantic_outcome", ["equivalent", "no_proposal", "incomplete"])
 async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attaches_support(
-    db: Database,
+    db: Database, semantic_outcome: str,
 ) -> None:
     first = _projection(run_id="projection-equivalent-source-1", body="A7 is removed.")
     await db.record_source_projection(first)
@@ -7100,6 +7101,15 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
     )
     adapters = build_sqlite_adapters(db, object())
     client = _SemanticEquivalentClient()
+    if semantic_outcome != "equivalent":
+        from memforge.llm.structured import MemoryRelationCatalogResponse
+
+        async def discover(prompt, **kwargs):
+            payload = json.loads(prompt.split("<memory_relation_catalog>\n", 1)[1].split("\n</memory_relation_catalog>", 1)[0])
+            return MemoryRelationCatalogResponse.model_validate(dict(results=[] if semantic_outcome == "incomplete"
+                else [dict(candidate_id=row["id"], relations=[]) for row in payload["new_claims"]]))
+
+        client.discover_memory_relations = discover
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
         db=db,
@@ -7107,7 +7117,7 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
         structured_llm_client=client,
     )
 
-    stats = await engine.prepare_and_commit_projected_lifecycle(
+    prepared = engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-456",
         raw_memories=[raw],
@@ -7121,6 +7131,25 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
         source_updated_at=datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
     )
 
+    if semantic_outcome == "incomplete":
+        from memforge.memory.relation_classifier import MemoryPairClassificationError
+        with pytest.raises(MemoryPairClassificationError, match="missing candidate completion"):
+            await prepared
+        rows = await db.db.execute_fetchall("SELECT id FROM lifecycle_plans WHERE source_id = ?", ("src-2",))
+        assert rows == []
+        sources = await db.get_memory_sources(incumbent.id)
+        assert {source.source_id for source in sources} == {"src-1"}
+        return
+    stats = await prepared
+    if semantic_outcome == "no_proposal":
+        assert stats["added"] == 1 and stats["corroborated"] == 0
+        [row] = await db.db.execute_fetchall("SELECT payload_json FROM lifecycle_plans WHERE source_id = ?", ("src-2",))
+        request = json.loads(row["payload_json"])["relation_discovery_requests"][0]
+        [snapshot] = request["preclassified_decisions"]
+        assert snapshot["candidate_memory_id"] == incumbent.id
+        assert snapshot["relation_type"] is None and snapshot["direction"] is None
+        assert snapshot["expected_candidate_content_hash"] == incumbent.content_hash
+        return
     assert stats["added"] == 0
     assert stats["corroborated"] == 1
     sources = await db.get_memory_sources(incumbent.id)
