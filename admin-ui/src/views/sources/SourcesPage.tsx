@@ -221,7 +221,7 @@ export function SourcesPage() {
   const [configDialog, setConfigDialog] = useState<{
     sourceType: string | null;
     source?: Source | null;
-    initialFocus?: { step: "project" };
+    initialFocus?: { step: "project" | "content" };
   }>({ sourceType: null, source: null });
   const [detailsSource, setDetailsSource] = useState<Source | null>(null);
   const [accessSource, setAccessSource] = useState<Source | null>(null);
@@ -837,12 +837,12 @@ export function SourcesPage() {
                         itemLabel={itemLabel}
                         enabledForMe={enabledForMe}
                         isSubscriptionPending={pendingSubscriptionIds.has(source.id)}
-                        onConfigure={() => {
+                        onConfigure={(step) => {
                           if (!capabilities.can_configure) return;
                           setConfigDialog({
                             sourceType: source.type,
                             source,
-                            initialFocus: isUnmappedGroup ? { step: "project" } : undefined,
+                            initialFocus: step ? { step } : isUnmappedGroup ? { step: "project" } : undefined,
                           });
                         }}
                         onSync={() => {

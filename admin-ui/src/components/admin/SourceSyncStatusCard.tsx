@@ -13,11 +13,13 @@ export function SourceSyncStatusCard({
   sourceName,
   itemLabel,
   onRetry,
+  onConfigureScope,
 }: {
   activity: SourceSyncActivity | undefined;
   sourceName: string;
   itemLabel: string;
   onRetry?: () => void;
+  onConfigureScope?: () => void;
 }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
@@ -53,10 +55,15 @@ export function SourceSyncStatusCard({
             : "bg-muted text-muted-foreground",
       )}
     >
-      <div className="flex min-w-0 items-center gap-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
         <Icon className={cn("size-3.5 shrink-0", active && "animate-spin text-foreground")} />
         <span className={cn("shrink-0 font-medium", !failed && "text-foreground")}>{presentation.message}</span>
-        {presentation.detail && <span className="min-w-0 truncate text-xs opacity-80">{presentation.detail}</span>}
+        {presentation.detail && <span className="min-w-0 break-words text-xs opacity-80">{presentation.detail}</span>}
+        {presentation.configureScope && onConfigureScope && (
+          <button type="button" onClick={onConfigureScope} className="ml-auto shrink-0 underline underline-offset-2">
+            Configure file scope
+          </button>
+        )}
         {(failed || (queued && activity.retryTarget)) && policy.canRetry && onRetry && (
           <button type="button" onClick={onRetry} className="ml-auto flex items-center gap-1" aria-label={queued ? "Retry now" : "Retry sync"}>
             <RotateCw className="size-3.5" />
