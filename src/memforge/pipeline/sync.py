@@ -2991,7 +2991,7 @@ class GeneSyncOrchestrator:
             return result
         if (changed_observation_ids or reprocess_current_observations) and hasattr(
             self.memory_extractor,
-            "extract_projection_batch_memories",
+            "extract_projection_fragment_memories",
         ):
             if derivation_context is None:
                 raise ValueError("Source derivation work requires a durable derivation context")

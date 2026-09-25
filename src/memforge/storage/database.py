@@ -753,6 +753,12 @@ def _local_agent_job_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return data
 
 
+REFERENCE_SCOPED_SUPPORT_UNSUPPORTED_MESSAGE = (
+    "This workspace still records reference-scoped Support, which this MemForge "
+    "version no longer supports. Complete the Support cutover with an earlier "
+    "MemForge version or rebuild the workspace."
+)
+
 _VALID_VISIBILITIES = frozenset({Visibility.WORKSPACE.value, Visibility.PRIVATE.value})
 
 
@@ -1509,10 +1515,6 @@ CREATE TABLE IF NOT EXISTS support_cutover_lease (
     owner_id TEXT NOT NULL,
     acquired_at TEXT NOT NULL
 );
-
-INSERT OR IGNORE INTO system_contract_markers (
-    marker_key, marker_value, updated_at
-) VALUES ('support_scope_version', 'reference-set-v1', datetime('now'));
 
 CREATE TRIGGER IF NOT EXISTS block_legacy_support_insert_v2
 BEFORE INSERT ON memory_support_assertions
@@ -4535,6 +4537,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "Remove contradiction counts superseded by cross-document relations",
         ["DROP TABLE IF EXISTS memory_contradictions"],
     ),
+    (97, "Require Evidence Unit Support", []),
 ]
 
 
@@ -4594,12 +4597,53 @@ class Database:
         await self._db.execute("PRAGMA foreign_keys = ON")
         if not run_migrations:
             await self._db.execute("PRAGMA query_only = ON")
+            await self._assert_evidence_unit_support_marker()
             return
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(SCHEMA)
         await self._run_migrations()
         await self._assert_memory_source_ids_resolved()
+        await self._assert_evidence_unit_support_marker()
         await self._db.commit()
+
+    async def _assert_evidence_unit_support_marker(self) -> None:
+        """Refuse to serve a workspace whose Support is not Evidence Unit scoped."""
+
+        if await self.get_support_scope_version() is not SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
+            raise RuntimeError(REFERENCE_SCOPED_SUPPORT_UNSUPPORTED_MESSAGE)
+
+    async def _require_evidence_unit_support_unlocked(self) -> None:
+        """Move a workspace without reference-scoped Support onto Evidence Unit Support.
+
+        A workspace that still holds reference-scoped Support rows cannot be
+        opened by this version; its marker is left unchanged so an earlier
+        version can still complete the Support cutover.
+        """
+
+        async with self.db.execute(
+            """SELECT marker_value FROM system_contract_markers
+               WHERE marker_key = 'support_scope_version'"""
+        ) as cursor:
+            marker = await cursor.fetchone()
+        if marker is not None and marker["marker_value"] == SupportScopeVersion.EVIDENCE_UNIT_SET_V2.value:
+            return
+        async with self.db.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type = 'table' AND name = 'memory_support_assertions'"""
+        ) as cursor:
+            has_reference_support_table = await cursor.fetchone() is not None
+        if has_reference_support_table:
+            async with self.db.execute("SELECT 1 FROM memory_support_assertions LIMIT 1") as cursor:
+                if await cursor.fetchone() is not None:
+                    raise RuntimeError(REFERENCE_SCOPED_SUPPORT_UNSUPPORTED_MESSAGE)
+        await self.db.execute(
+            """INSERT INTO system_contract_markers (marker_key, marker_value, updated_at)
+               VALUES ('support_scope_version', ?, ?)
+               ON CONFLICT(marker_key) DO UPDATE SET
+                   marker_value = excluded.marker_value,
+                   updated_at = excluded.updated_at""",
+            (SupportScopeVersion.EVIDENCE_UNIT_SET_V2.value, _now_iso()),
+        )
 
     async def _migrate_agent_runtime_event_v3_unlocked(self) -> None:
         """Relax extraction-only lineage and preserve v2 events and assessments."""
@@ -4748,6 +4792,8 @@ class Database:
                         await self.purge_memory(memory_id)
             if version == 79:
                 await self._migrate_agent_runtime_event_v3_unlocked()
+            if version == 97:
+                await self._require_evidence_unit_support_unlocked()
             for sql in statements:
                 try:
                     await self.db.execute(sql)
@@ -11207,7 +11253,7 @@ class Database:
             getattr(
                 getattr(plan, "stale_guard", None),
                 "support_scope_version",
-                SupportScopeVersion.REFERENCE_SET_V1,
+                SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
             )
             is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
         ):
@@ -11370,6 +11416,12 @@ class Database:
                               AS primary_count,
                           SUM(CASE WHEN er.observation_revision_id != so.current_revision_id
                                    THEN 1 ELSE 0 END) AS stale_part_count,
+                          SUM(CASE WHEN so.id IS NULL
+                                     OR sor.id IS NULL
+                                     OR sor.observation_id != er.observation_id
+                                     OR so.source_id != eu.source_id
+                                     OR so.source_unit_id != eu.source_lineage_id
+                                   THEN 1 ELSE 0 END) AS broken_lineage_part_count,
                           CASE WHEN EXISTS (
                               SELECT 1 FROM memory_sources ms
                                WHERE ms.memory_id = msa.memory_id
@@ -11377,12 +11429,14 @@ class Database:
                                  AND ms.doc_id = eu.doc_id
                           ) THEN 1 ELSE 0 END AS has_source_provenance
                    FROM memory_unit_support_assertions msa
-                   JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
-                   JOIN source_units su ON su.id = eu.source_lineage_id
+                   LEFT JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+                   LEFT JOIN source_units su ON su.id = eu.source_lineage_id
                    LEFT JOIN evidence_references er
                      ON er.evidence_unit_id = msa.evidence_unit_id
                     AND er.role IN ('primary', 'required')
                    LEFT JOIN source_observations so ON so.id = er.observation_id
+                   LEFT JOIN source_observation_revisions sor
+                     ON sor.id = er.observation_revision_id
                   WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
                   GROUP BY msa.evidence_unit_id, eu.source_id,
                            eu.source_lineage_id, eu.doc_revision_id,
@@ -11403,6 +11457,7 @@ class Database:
                     and support["unit_source_id"] == plan.scope.source_id
                     and int(support["primary_count"] or 0) == 1
                     and int(support["supporting_part_count"] or 0) >= 1
+                    and int(support["broken_lineage_part_count"] or 0) == 0
                     and int(support["has_source_provenance"] or 0) == 1
                 )
                 current = (
@@ -13598,6 +13653,11 @@ class Database:
                    JOIN source_units su ON su.id = eu.source_lineage_id
                   WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
                     AND eu.source_id = ? AND eu.source_lineage_id = ?
+                    AND (
+                        SELECT COUNT(*) FROM evidence_references primary_part
+                        WHERE primary_part.evidence_unit_id = eu.id
+                          AND primary_part.role = 'primary'
+                    ) = 1
                     AND NOT EXISTS (
                         SELECT 1 FROM evidence_references er
                         JOIN source_observations so ON so.id = er.observation_id

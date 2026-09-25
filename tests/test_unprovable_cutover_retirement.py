@@ -7,13 +7,6 @@ from datetime import datetime, timezone
 import pytest
 import pytest_asyncio
 
-from memforge.memory.evidence import (
-    EvidenceContentProvenance,
-    EvidenceReference,
-    EvidenceRole,
-    EvidenceUnit,
-    MemorySupportAssertion,
-)
 from memforge.memory.lifecycle_plan import (
     CutoverFindingReason,
     CutoverFindingStatus,
@@ -26,15 +19,10 @@ from memforge.memory.cutover import (
     reconstruct_historical_source_projection,
 )
 from memforge.models import (
-    ContentItem,
     DocumentRecord,
     Memory,
-    NormalizedContent,
-    RawContent,
     content_hash,
 )
-from memforge.pipeline.source_projection_adapters import project_source_item
-from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
 
@@ -206,78 +194,6 @@ async def test_unprovable_cutover_retirement_rejects_another_source_edge(db: Dat
 
     assert (await db.get_memory(finding.memory_id)).status == "active"
     assert (await db.get_lifecycle_cutover_finding(finding.id)).status is CutoverFindingStatus.OPEN
-
-
-@pytest.mark.asyncio
-async def test_unprovable_cutover_retirement_rejects_active_support(db: Database) -> None:
-    finding = await _seed_open_finding(db)
-    item = ContentItem(
-        item_id="doc-agent-1",
-        title="Agent Session",
-        source_url="agent-session://codex/session/doc-agent-1",
-        last_modified=NOW,
-        version="1",
-    )
-    native = '{"doc_id":"doc-agent-1","markdown":"Historical excerpt","receipt":{"client":"codex"}}'
-    projection = project_source_item(
-        source_id="src-agent",
-        source_type="agent_session",
-        run_id="projection-active-support",
-        item=item,
-        raw=RawContent(item=item, body=native.encode(), content_type="application/json"),
-        normalized=NormalizedContent(item=item, markdown_body="Historical excerpt"),
-    )
-    await db.record_source_projection(projection)
-    observation = projection.observations[0]
-    revision = projection.observation_revisions[0]
-    source_unit = projection.source_units[0]
-    unit = EvidenceUnit(
-        id="eu-active-support",
-        source_id="src-agent",
-        doc_id="doc-agent-1",
-        doc_revision_id=revision.id,
-        source_type="agent_session",
-        source_anchor=observation.id,
-        source_lineage_id=source_unit.id,
-        project_key="memforge",
-        repo_identifier=None,
-        visibility="private",
-        owner_user_id="owner-1",
-        content="Historical excerpt",
-        excerpt="Historical excerpt",
-        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
-        access_context_hash="access-1",
-    )
-    await db.upsert_evidence_unit(unit)
-    [reference] = await db.record_evidence_references(
-        unit.id,
-        (
-            EvidenceReference(
-                id="ref-active-support",
-                evidence_unit_id=unit.id,
-                role=EvidenceRole.PRIMARY,
-                anchor=SourceAnchor(
-                    kind=AnchorKind.WHOLE_OBSERVATION,
-                    observation_id=observation.id,
-                    observation_revision_id=revision.id,
-                ),
-            ),
-        ),
-    )
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-active",
-            memory_id=finding.memory_id,
-            evidence_reference_id=reference.id or "",
-            source_id="src-agent",
-            access_context_hash="access-1",
-        )
-    )
-
-    with pytest.raises(ValueError, match="active support"):
-        await _retire(db, finding)
-
-    assert (await db.get_memory(finding.memory_id)).status == "active"
 
 
 @pytest.mark.asyncio

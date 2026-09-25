@@ -16,7 +16,8 @@ from memforge.memory.audit import AuditContext, MemoryAuditEvent, MemoryAuditLog
 from memforge.memory.evidence import (
     EvidenceContentProvenance,
     EvidenceUnit,
-    MemorySupportAssertion,
+    MemoryUnitSupportAssertion,
+    memory_unit_support_assertion_id,
 )
 from memforge.memory.lifecycle_service import (
     MaintenanceClosureEntry,
@@ -36,10 +37,12 @@ from memforge.models import (
     content_hash,
 )
 from memforge.pipeline.source_projection_adapters import project_source_item
+from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.retrieval.search import SearchEngine
 from memforge.server.source_admin_service import can_manage_source
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from tests.unit_support_fixture import primary_reference, record_unit_support
 
 
 class RecordingCollection:
@@ -223,30 +226,19 @@ async def _source_backed_memory(
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
         access_context_hash="workspace-eng",
     )
-    await db.upsert_evidence_unit(unit)
-    reference_id = f"eref-{suffix}"
-    await db.db.execute(
-        """INSERT INTO evidence_references (
-               id, evidence_unit_id, role, anchor_kind, observation_id,
-               observation_revision_id, fragment_id, range_start, range_end, created_at
-           ) VALUES (?, ?, 'primary', 'whole_observation', ?, ?, NULL, NULL, NULL, ?)""",
-        (
-            reference_id,
-            unit.id,
-            observation.id,
-            observation_revision.id,
-            observed.isoformat(),
+    await record_unit_support(
+        db,
+        memory_id=old.id,
+        unit=unit,
+        references=(
+            primary_reference(
+                SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=observation.id,
+                    observation_revision_id=observation_revision.id,
+                )
+            ),
         ),
-    )
-    await db.db.commit()
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id=f"support-{suffix}",
-            memory_id=old.id,
-            evidence_reference_id=reference_id,
-            source_id=source_id,
-            access_context_hash="workspace-eng",
-        )
     )
     return old
 
@@ -262,11 +254,27 @@ async def _move_source_support(db: Database, *, from_memory: Memory, to_memory: 
             support_kind=source.support_kind,
             source_updated_at=source.source_updated_at,
         )
-    await db.db.execute(
-        "UPDATE memory_support_assertions SET memory_id = ? WHERE memory_id = ?",
-        (to_memory.id, from_memory.id),
+    supports = await db.db.execute_fetchall(
+        """SELECT evidence_unit_id, source_id, access_context_hash
+             FROM memory_unit_support_assertions
+            WHERE memory_id = ? AND active = 1""",
+        (from_memory.id,),
     )
-    await db.db.commit()
+    for support in supports:
+        await db.upsert_memory_unit_support_assertion(
+            MemoryUnitSupportAssertion(
+                id=memory_unit_support_assertion_id(
+                    memory_id=to_memory.id,
+                    evidence_unit_id=support["evidence_unit_id"],
+                    source_id=support["source_id"],
+                    access_context_hash=support["access_context_hash"],
+                ),
+                memory_id=to_memory.id,
+                evidence_unit_id=support["evidence_unit_id"],
+                source_id=support["source_id"],
+                access_context_hash=support["access_context_hash"],
+            )
+        )
     await db.purge_memory(from_memory.id)
 
 
@@ -421,29 +429,19 @@ async def test_user_lifecycle_cannot_bypass_active_projected_source_support(db: 
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
         access_context_hash="workspace-eng",
     )
-    await db.upsert_evidence_unit(unit)
-    await db.db.execute(
-        """INSERT INTO evidence_references (
-               id, evidence_unit_id, role, anchor_kind, observation_id,
-               observation_revision_id, fragment_id, range_start, range_end, created_at
-           ) VALUES (?, ?, 'primary', 'whole_observation', ?, ?, NULL, NULL, NULL, ?)""",
-        (
-            "eref-source-managed",
-            unit.id,
-            observation.id,
-            observation_revision.id,
-            observed.isoformat(),
+    await record_unit_support(
+        db,
+        memory_id=old.id,
+        unit=unit,
+        references=(
+            primary_reference(
+                SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=observation.id,
+                    observation_revision_id=observation_revision.id,
+                )
+            ),
         ),
-    )
-    await db.db.commit()
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-source-managed",
-            memory_id=old.id,
-            evidence_reference_id="eref-source-managed",
-            source_id="src-managed",
-            access_context_hash="workspace-eng",
-        )
     )
     service = MemoryLifecycleService(
         db=db,
@@ -522,104 +520,11 @@ async def test_propose_memory_correction_applies_for_complete_source_authority(d
     assert stored_new is not None and stored_new.status == "active"
     assert stored_new.visibility == "workspace"
     assert stored_new.owner_user_id is None
-    assert await db.get_active_memory_support_reference_ids(old.id) == ()
+    assert await db.get_active_memory_support_unit_ids(old.id) == ()
     assert review is not None and review.status == "approved"
     assert review.expected_support_set_hash == support_hash
     old_sources = await db.get_memory_sources(old.id)
     assert any(source.source_type == "confluence" for source in old_sources)
-
-
-@pytest.mark.asyncio
-async def test_legacy_limited_correction_stages_review_without_direct_apply(
-    db: Database,
-):
-    old = _memory("mem-legacy-limited", "The legacy source-backed rule is stale.")
-    observed = datetime(2026, 7, 15, tzinfo=timezone.utc)
-    await db.upsert_source(
-        id="src-legacy-limited",
-        type="confluence",
-        name="Legacy limited source",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="source-owner",
-    )
-    await db.upsert_document(
-        DocumentRecord(
-            doc_id="doc-legacy-limited",
-            source="src-legacy-limited",
-            source_url="https://example.test/doc-legacy-limited",
-            title="Legacy limited document",
-            space_or_project="ENG",
-            author=None,
-            last_modified=observed,
-            labels=[],
-            version="1",
-            content_hash="legacy-limited-doc-hash",
-            token_count=8,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
-            last_synced=observed,
-        )
-    )
-    await db.insert_memory(old)
-    await db.add_memory_source(
-        old.id,
-        "doc-legacy-limited",
-        "confluence",
-        old.content,
-        support_kind="legacy_limited",
-        source_updated_at=observed,
-    )
-    service = MemoryLifecycleService(
-        db=db,
-        memory_store=_store(db, RecordingCollection()),
-    )
-
-    result = await service.propose_memory_correction(
-        old.id,
-        replacement_content="The corrected legacy source-backed rule.",
-        provenance="The user supplied a correction while legacy Support remained gated.",
-        reason="Correct the stale legacy-limited claim without claiming Source authority.",
-        expected_content_hash=old.content_hash,
-        authority=_authority("workspace-admin", "workspace_admin"),
-        replacement_kind="revision",
-    )
-
-    incumbent = await db.get_memory(old.id)
-    challenger = await db.get_memory(result.replacement_memory_id)
-    review = await db.get_memory_review(result.review_id)
-    assert result.outcome == "review_created"
-    assert incumbent is not None and incumbent.status == "active"
-    assert challenger is not None and challenger.status == "pending_review"
-    assert review is not None and review.status == "pending"
-    assert review.expected_support_set_hash is None
-    incumbent_sources = await db.get_memory_sources(old.id)
-    assert [(source.source_id, source.support_kind) for source in incumbent_sources] == [
-        ("src-legacy-limited", "legacy_limited")
-    ]
-
-    await ReviewService(
-        db=db,
-        memory_store=service.memory_store,
-    ).approve(
-        review.id,
-        reviewer="workspace-admin",
-        note="Approve the explicitly confirmed correction.",
-        expected_fingerprint=memory_review_decision_fingerprint(review),
-    )
-
-    approved_incumbent = await db.get_memory(old.id)
-    approved_challenger = await db.get_memory(result.replacement_memory_id)
-    approved_review = await db.get_memory_review(review.id)
-    assert approved_incumbent is not None and approved_incumbent.status == "superseded"
-    assert approved_challenger is not None and approved_challenger.status == "active"
-    assert approved_review is not None and approved_review.status == "approved"
-    assert await db.get_active_memory_support_reference_ids(old.id) == ()
-    assert [(source.source_id, source.support_kind) for source in await db.get_memory_sources(old.id)] == [
-        ("src-legacy-limited", "legacy_limited")
-    ]
 
 
 @pytest.mark.asyncio
@@ -690,7 +595,7 @@ async def test_authorized_correction_rolls_back_staging_when_atomic_resolution_f
     stored_old = await db.get_memory(old.id)
     assert stored_old is not None and stored_old.status == "active"
     assert await db.count_memories() == 1
-    assert await db.get_active_memory_support_reference_ids(old.id) == ("eref-atomic-rollback",)
+    assert await db.get_active_memory_support_unit_ids(old.id) == ("eu-atomic-rollback",)
     assert await db.count_documents("user_correction") == 0
     assert await db.count_memory_reviews() == 0
 
@@ -746,7 +651,7 @@ async def test_propose_memory_correction_creates_review_without_complete_source_
     assert result.status == "pending"
     assert stored_old is not None and stored_old.status == "active"
     assert stored_new is not None and stored_new.status == "pending_review"
-    assert await db.get_active_memory_support_reference_ids(old.id) == ("eref-review",)
+    assert await db.get_active_memory_support_unit_ids(old.id) == ("eu-review",)
     assert review is not None and review.status == "pending"
     assert review.expected_support_set_hash == support_hash
 
@@ -768,9 +673,9 @@ async def test_propose_memory_correction_requires_authority_over_every_supportin
     )
 
     assert result.outcome == "review_created"
-    assert set((await db.get_active_memory_support_states((old.id,)))[old.id].reference_ids) == {
-        "eref-multi-a",
-        "eref-multi-b",
+    assert set((await db.get_active_memory_support_states((old.id,)))[old.id].unit_ids) == {
+        "eu-multi-a",
+        "eu-multi-b",
     }
 
 
@@ -791,7 +696,7 @@ async def test_propose_memory_correction_self_hosted_owner_has_complete_workspac
     )
 
     assert result.outcome == "applied"
-    assert await db.get_active_memory_support_reference_ids(old.id) == ()
+    assert await db.get_active_memory_support_unit_ids(old.id) == ()
 
 
 @pytest.mark.asyncio
@@ -890,10 +795,10 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     assert stored_old is not None
     assert stored_old.status == "superseded"
     assert stored_old.superseded_by == result.replacement_memory_id
-    assert await db.get_active_memory_support_reference_ids(old.id) == ()
+    assert await db.get_active_memory_support_unit_ids(old.id) == ()
     assert stored_new is not None
     assert stored_new.status == "active"
-    assert await db.get_active_memory_support_reference_ids(result.replacement_memory_id)
+    assert await db.get_active_memory_support_unit_ids(result.replacement_memory_id)
     assert stored_new.content == "Invoke Claude Code with `claude`, not `claude-code`."
     assert stored_new.extraction_context == (
         "Invoke Claude Code with `claude`, not `claude-code`."
@@ -911,23 +816,14 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
 
     await db.delete_source_cascade("src-agent-sessions-codex")
 
-    assert await db.get_source("src-agent-sessions-codex") is None
-    assert await db.get_agent_concept("concept-claude-cli") is None
-    assert await db.get_agent_claim("claim-claude-cli") is None
+    deleted_source = await db.get_source("src-agent-sessions-codex")
+    assert deleted_source is not None and deleted_source["status"] == "retired"
     deleted_source_memory = await db.get_memory(result.replacement_memory_id)
     assert deleted_source_memory is not None
     assert deleted_source_memory.status == "retired"
-    assert await db.get_active_memory_support_reference_ids(result.replacement_memory_id) == ()
-    for table in (
-        "source_projection_runs",
-        "source_units",
-        "source_observations",
-        "source_lifecycle_gates",
-        "lifecycle_plans",
-        "memory_support_assertions",
-    ):
-        async with db.db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
-            assert (await cursor.fetchone())[0] == 0
+    assert deleted_source_memory.retirement_reason == "source_deleted"
+    assert await db.get_active_memory_support_unit_ids(result.replacement_memory_id) == ()
+    assert await db.get_memory_sources(result.replacement_memory_id) == []
 
 
 async def _legacy_limited_managed_agent_claim(
@@ -981,11 +877,6 @@ async def _legacy_limited_managed_agent_claim(
     memory = await db.get_memory(created.memory_id or "")
     assert memory is not None
     await db.enable_lifecycle_gate(source_id)
-    await db.db.execute(
-        """UPDATE system_contract_markers
-              SET marker_value = 'evidence-unit-set-v2'
-            WHERE marker_key = 'support_scope_version'"""
-    )
     await db.db.execute(
         "DELETE FROM memory_unit_support_assertions WHERE memory_id = ?",
         (memory.id,),

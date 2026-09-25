@@ -4,7 +4,6 @@ from dataclasses import replace
 
 import pytest
 
-from memforge.memory.evidence import SupportScopeVersion
 from memforge.memory.lifecycle_plan import (
     IncumbentAuthority,
     IncumbentAuthorityGrant,
@@ -71,7 +70,7 @@ def _defaults() -> NewMemoryDefaults:
     )
 
 
-def _build(*, gate: LifecycleGateState, all_support=("eref-old",), flagged=False, defaults=None):
+def _build(*, gate: LifecycleGateState, all_support=("eu-old",), flagged=False, defaults=None):
     old = _memory()
     return build_lifecycle_plan(
         plan_id="plan-1",
@@ -87,11 +86,11 @@ def _build(*, gate: LifecycleGateState, all_support=("eref-old",), flagged=False
             ),
         ),
         incumbents={old.id: old},
-        source_support_reference_ids={old.id: ("eref-old",)},
-        all_active_support_reference_ids={old.id: all_support},
+        source_support_unit_ids={old.id: ("eu-old",)},
+        all_active_support_unit_ids={old.id: all_support},
         support_set_hashes={old.id: "support-hash"},
         observation_revision_ids=("obsrev-2",),
-        new_evidence_reference_ids=("eref-new",),
+        new_evidence_unit_ids=("eu-new",),
         defaults=defaults or _defaults(),
     )
 
@@ -138,11 +137,11 @@ def test_unsupported_destructive_incumbent_still_fails_without_explicit_owner_au
                 ),
             ),
             incumbents={old.id: old},
-            source_support_reference_ids={old.id: ()},
-            all_active_support_reference_ids={old.id: ()},
+            source_support_unit_ids={old.id: ()},
+            all_active_support_unit_ids={old.id: ()},
             support_set_hashes={old.id: "empty-support-hash"},
             observation_revision_ids=("obsrev-2",),
-            new_evidence_reference_ids=("eref-new",),
+            new_evidence_unit_ids=("eu-new",),
             defaults=_defaults(),
         )
 
@@ -163,11 +162,11 @@ def test_explicit_owner_managed_claim_authority_does_not_fabricate_old_support()
             ),
         ),
         incumbents={old.id: old},
-        source_support_reference_ids={old.id: ()},
-        all_active_support_reference_ids={old.id: ()},
+        source_support_unit_ids={old.id: ()},
+        all_active_support_unit_ids={old.id: ()},
         support_set_hashes={old.id: "empty-support-hash"},
         observation_revision_ids=("obsrev-2",),
-        new_evidence_reference_ids=("eref-new",),
+        new_evidence_unit_ids=("eu-new",),
         defaults=_defaults(),
         incumbent_authority_grants={
             old.id: IncumbentAuthorityGrant(
@@ -213,11 +212,11 @@ def test_gated_noop_evidence_rebind_stages_review_without_mutating_incumbent() -
             ),
         ),
         incumbents={old.id: old},
-        source_support_reference_ids={old.id: ("eref-old",)},
-        all_active_support_reference_ids={old.id: ("eref-old",)},
+        source_support_unit_ids={old.id: ("eu-old",)},
+        all_active_support_unit_ids={old.id: ("eu-old",)},
         support_set_hashes={old.id: "support-hash"},
         observation_revision_ids=("obsrev-2",),
-        new_evidence_reference_ids=("eref-new",),
+        new_evidence_unit_ids=("eu-new",),
         defaults=_defaults(),
     )
 
@@ -230,8 +229,8 @@ def test_gated_noop_evidence_rebind_stages_review_without_mutating_incumbent() -
         "remove_support",
         "attach_support",
     ]
-    assert proposed[0]["evidence_reference_ids"] == ["eref-old"]
-    assert proposed[1]["evidence_reference_ids"] == ["eref-new"]
+    assert proposed[0]["evidence_unit_ids"] == ["eu-old"]
+    assert proposed[1]["evidence_unit_ids"] == ["eu-new"]
 
     mutation = plan.mutations[0]
     review = LifecycleReview(
@@ -308,11 +307,11 @@ def test_pending_review_without_activation_does_not_enqueue_relation_discovery()
             ),
         ),
         incumbents={old.id: old},
-        source_support_reference_ids={old.id: ("eref-old",)},
-        all_active_support_reference_ids={old.id: ("eref-old",)},
+        source_support_unit_ids={old.id: ("eu-old",)},
+        all_active_support_unit_ids={old.id: ("eu-old",)},
         support_set_hashes={old.id: "support-hash"},
         observation_revision_ids=("obsrev-2",),
-        new_evidence_reference_ids=(),
+        new_evidence_unit_ids=(),
         defaults=_defaults(),
     )
     mutation = original.mutations[0]
@@ -336,7 +335,7 @@ def test_pending_review_without_activation_does_not_enqueue_relation_discovery()
 def test_stale_review_refresh_creates_only_a_new_pending_decision() -> None:
     original = _build(
         gate=LifecycleGateState.ENABLED,
-        all_support=("eref-old", "eref-other-source"),
+        all_support=("eu-old", "eu-other-source"),
     )
     mutation = original.mutations[0]
     review = LifecycleReview(
@@ -380,7 +379,7 @@ def test_stale_review_refresh_creates_only_a_new_pending_decision() -> None:
 def test_refresh_rejects_a_non_stale_lifecycle_review() -> None:
     original = _build(
         gate=LifecycleGateState.ENABLED,
-        all_support=("eref-old", "eref-other-source"),
+        all_support=("eu-old", "eu-other-source"),
     )
     mutation = original.mutations[0]
     review = LifecycleReview(
@@ -459,7 +458,7 @@ def test_private_lifecycle_plan_persists_owner_as_relation_discovery_actor() -> 
 def test_support_outside_current_scope_routes_replacement_to_review() -> None:
     plan = _build(
         gate=LifecycleGateState.ENABLED,
-        all_support=("eref-old", "eref-other-source"),
+        all_support=("eu-old", "eu-other-source"),
     )
 
     assert [item.mutation_type for item in plan.mutations] == [
@@ -480,16 +479,15 @@ def test_planner_rejects_incomplete_incumbent_ledger() -> None:
             gate_state=LifecycleGateState.ENABLED,
             operations=(),
             incumbents={old.id: old},
-            source_support_reference_ids={old.id: ("eref-old",)},
-            all_active_support_reference_ids={old.id: ("eref-old",)},
+            source_support_unit_ids={old.id: ("eu-old",)},
+            all_active_support_unit_ids={old.id: ("eu-old",)},
             support_set_hashes={old.id: "support-hash"},
             observation_revision_ids=("obsrev-2",),
-            new_evidence_reference_ids=("eref-new",),
+            new_evidence_unit_ids=("eu-new",),
             defaults=_defaults(),
         )
 
 
-@pytest.mark.parametrize("version", list(SupportScopeVersion))
 @pytest.mark.parametrize(
     "candidate_support_ids, expected_attached",
     [
@@ -498,13 +496,12 @@ def test_planner_rejects_incomplete_incumbent_ledger() -> None:
     ],
 )
 def test_skipped_corroboration_reuses_identity_without_reattaching_preserved_support(
-    version, candidate_support_ids, expected_attached,
+    candidate_support_ids, expected_attached,
 ) -> None:
     old = _memory()
     candidate = RawMemory(
         content=old.content, memory_type=old.memory_type, evidence_quote=old.content,
     )
-    v2 = version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
     plan = build_lifecycle_plan(
         plan_id="plan-skipped-corroboration",
         scope=_scope(),
@@ -517,15 +514,11 @@ def test_skipped_corroboration_reuses_identity_without_reattaching_preserved_sup
             ),
         ),
         incumbents={old.id: old},
-        source_support_reference_ids={} if v2 else {old.id: ("support-old",)},
-        all_active_support_reference_ids={} if v2 else {old.id: ("support-old",)},
-        source_support_unit_ids={old.id: ("support-old",)} if v2 else None,
-        all_active_support_unit_ids={old.id: ("support-old",)} if v2 else None,
-        support_scope_version=version,
+        source_support_unit_ids={old.id: ("support-old",)},
+        all_active_support_unit_ids={old.id: ("support-old",)},
         support_set_hashes={old.id: "original-support-hash"},
         observation_revision_ids=("obsrev-2",),
-        new_evidence_reference_ids=() if v2 else candidate_support_ids,
-        new_evidence_unit_ids=candidate_support_ids if v2 else (),
+        new_evidence_unit_ids=candidate_support_ids,
         corroboration_targets_by_claim_hash={content_hash(candidate.content): old},
         corroboration_proofs_by_claim_hash={content_hash(candidate.content): {"method": "exact_content"}},
         defaults=_defaults(),
@@ -545,5 +538,5 @@ def test_skipped_corroboration_reuses_identity_without_reattaching_preserved_sup
         ]
         attachment = plan.mutations[0]
         assert attachment.memory_id == old.id
-        assert (attachment.evidence_unit_ids if v2 else attachment.evidence_reference_ids) == expected_attached
+        assert attachment.evidence_unit_ids == expected_attached
     assert plan.relation_discovery_requests == ()

@@ -89,7 +89,7 @@ def test_gated_source_rejects_destructive_plan() -> None:
                 mutation_type=LifecycleMutationType.REMOVE_SUPPORT,
                 memory_id="mem-a",
                 source_id="src-1",
-                evidence_reference_ids=("eref-a",),
+                evidence_unit_ids=("eu-a",),
             ),
         ),
     )
@@ -118,7 +118,7 @@ def test_gated_source_still_allows_create_and_attach_support() -> None:
                 mutation_type=LifecycleMutationType.ATTACH_SUPPORT,
                 memory_id="mem-new",
                 source_id="src-1",
-                evidence_reference_ids=("eref-new",),
+                evidence_unit_ids=("eu-new",),
             ),
         ),
     )
@@ -152,7 +152,7 @@ def test_supersession_is_distinct_from_support_removal_and_retirement() -> None:
                 mutation_type=LifecycleMutationType.REMOVE_SUPPORT,
                 memory_id="mem-b",
                 source_id="src-1",
-                evidence_reference_ids=("eref-b",),
+                evidence_unit_ids=("eu-b",),
             ),
             LifecycleMutation(
                 mutation_type=LifecycleMutationType.RETIRE_MEMORY,
@@ -230,7 +230,7 @@ def test_maintenance_operator_authority_cannot_attach_support_during_retirement(
                 mutation_type=LifecycleMutationType.ATTACH_SUPPORT,
                 memory_id="mem-a",
                 source_id="src-1",
-                evidence_reference_ids=("eref-new",),
+                evidence_unit_ids=("eu-new",),
             ),
         ),
     )
@@ -288,7 +288,7 @@ def test_plan_rejects_mutation_for_memory_outside_incumbent_ledger() -> None:
                 mutation_type=LifecycleMutationType.REMOVE_SUPPORT,
                 memory_id="mem-not-covered",
                 source_id="src-1",
-                evidence_reference_ids=("eref-x",),
+                evidence_unit_ids=("eu-x",),
             ),
         ),
     )
@@ -304,32 +304,32 @@ def test_skipped_support_is_exact_scoped_keep_and_never_authorizes_new_attachmen
     plan = LifecyclePlan(
         id="skip-plan", scope=_scope(), gate_state=LifecycleGateState.GATED,
         coverage_proof=_proof(
-            IncumbentDecision("mem-a", IncumbentDisposition.KEEP, "insufficient", skipped_support_ids=("eref-old",)),
+            IncumbentDecision("mem-a", IncumbentDisposition.KEEP, "insufficient", skipped_support_ids=("eu-old",)),
             IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "supported"),
         ), stale_guard=_guard(), mutations=(),
     )
     plan.validate()
-    def skipped(candidate, memory_id="mem-a", unit="unit-1", support="eref-old"):
+    def skipped(candidate, memory_id="mem-a", unit="unit-1", support="eu-old"):
         return plan_skips_support_revalidation(candidate, memory_id, source_unit_id=unit, support_id=support)
     assert skipped(plan)
     assert not skipped(plan, memory_id="mem-b")
     assert not skipped(plan, unit="other-unit")
-    assert not skipped(plan, support="eref-new")
+    assert not skipped(plan, support="eu-new")
     decisions = lifecycle_plan_to_payload(plan)["coverage_proof"]["incumbent_decisions"]
-    assert decisions[0]["skipped_support_ids"] == ["eref-old"]
+    assert decisions[0]["skipped_support_ids"] == ["eu-old"]
     assert "skipped_support_ids" not in decisions[1]
     attached = replace(plan, mutations=(LifecycleMutation(
         LifecycleMutationType.ATTACH_SUPPORT, memory_id="mem-a", source_id="src-1",
-        evidence_reference_ids=("eref-old",),
+        evidence_unit_ids=("eu-old",),
     ),))
     assert not skipped(attached)
     with pytest.raises(ValueError, match="cannot advance preserved assertions"):
         attached.validate()
     destructive = replace(plan, gate_state=LifecycleGateState.ENABLED, mutations=(LifecycleMutation(
         LifecycleMutationType.REMOVE_SUPPORT, memory_id="mem-a", source_id="src-1",
-        evidence_reference_ids=("eref-old",),
+        evidence_unit_ids=("eu-old",),
     ),))
     with pytest.raises(ValueError, match="cannot authorize destructive"):
         destructive.validate()
     with pytest.raises(ValueError, match="Source-scoped KEEP"):
-        IncumbentDecision("mem-a", IncumbentDisposition.REMOVE_SUPPORT, "insufficient", skipped_support_ids=("eref-old",))
+        IncumbentDecision("mem-a", IncumbentDisposition.REMOVE_SUPPORT, "insufficient", skipped_support_ids=("eu-old",))

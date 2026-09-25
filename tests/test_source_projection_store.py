@@ -979,8 +979,10 @@ async def test_configured_document_write_serializes_with_cross_process_source_de
         await write_task
         await delete_task
 
-        assert await deleter.get_source("src-race") is None
-        assert await deleter.get_document("doc-race") is None
+        retired_source = await deleter.get_source("src-race")
+        assert retired_source is not None and retired_source["status"] == "retired"
+        written_document = await deleter.get_document("doc-race")
+        assert written_document is not None and written_document.content_hash == "race-hash-1"
     finally:
         release_writer.set()
         await writer.close()

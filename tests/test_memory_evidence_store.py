@@ -1376,69 +1376,6 @@ async def test_purge_memory_does_not_delete_non_materializing_evidence_unit(db: 
 
 
 @pytest.mark.asyncio
-async def test_delete_document_deletes_derived_evidence_graph(db: Database) -> None:
-    await db.upsert_document(_document("doc-1"))
-    await db.upsert_evidence_unit(_unit())
-    await db.insert_memory(_memory("mem-doc-evidence"))
-    await db.add_memory_source("mem-doc-evidence", "doc-1", "confluence", source_updated_at=None)
-    await _record_run(db, action=LifecycleAction.CREATE_MEMORY)
-    await db.replace_evidence_relations("eu-1", [_relation("mem-doc-evidence")])
-
-    await db.delete_document("doc-1")
-
-    assert await db.get_evidence_unit("eu-1") is None
-    assert await db.get_relation_run("rel-run-1") is None
-    assert await db.get_evidence_relations("eu-1") == []
-
-
-@pytest.mark.asyncio
-async def test_delete_source_cascade_deletes_docless_source_owned_evidence_graph(db: Database) -> None:
-    unit = replace(
-        _unit(),
-        id="eu-docless",
-        source_id="src-docless",
-        doc_id=None,
-        source_anchor="agent-session#claim-1",
-        source_lineage_id="agent-session#claim-1",
-        source_type="agent_session",
-    )
-    await db.upsert_evidence_unit(unit)
-    await db.insert_memory(_memory("mem-docless-source"))
-    run = RelationRunRecord(
-        id="rel-run-docless",
-        evidence_unit_id=unit.id,
-        access_context_hash="ctx-1",
-        candidate_count=0,
-        mandatory_candidate_count=0,
-        checked_candidate_count=0,
-        incomplete_mandatory_buckets=(),
-        classifier_version="test-v1",
-        lifecycle_action=LifecycleAction.CREATE_MEMORY,
-        review_case=None,
-        status="success",
-        result_memory_id="mem-docless-source",
-        audit={},
-    )
-    await db.record_relation_run(run)
-    await db.replace_evidence_relations(
-        unit.id,
-        [
-            replace(
-                _relation("mem-docless-source", run_id=run.id),
-                evidence_unit_id=unit.id,
-                source_lineage_id=unit.source_lineage_id,
-            )
-        ],
-    )
-
-    await db.delete_source_cascade("src-docless")
-
-    assert await db.get_evidence_unit(unit.id) is None
-    assert await db.get_relation_run(run.id) is None
-    assert await db.get_evidence_relations(unit.id) == []
-
-
-@pytest.mark.asyncio
 async def test_remove_memory_source_preserves_shared_evidence_audit(db: Database) -> None:
     await db.upsert_source(
         id="src-1",

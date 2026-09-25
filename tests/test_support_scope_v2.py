@@ -11,16 +11,15 @@ import pytest
 import pytest_asyncio
 
 from memforge.memory.evidence import (
+    EvidenceContentProvenance,
     EvidencePartKind,
     EvidenceReference,
     EvidenceRole,
-    MemorySupportAssertion,
-    MemoryUnitSupportAssertion,
+    EvidenceUnit,
     SupportScopeVersion,
     evidence_part_set_digest,
     evidence_unit_id_v2,
     evidence_unit_revision_lineage_is_valid,
-    memory_unit_support_assertion_id,
 )
 from memforge.memory.lifecycle_plan import ReconciliationScope
 from memforge.memory.lifecycle_planner import NewMemoryDefaults, build_lifecycle_plan
@@ -47,6 +46,7 @@ from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.source_access import source_is_discoverable
 from memforge.storage.database import Database
+from tests.unit_support_fixture import record_unit_support
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
@@ -64,7 +64,7 @@ async def db(tmp_path):
         await database.close()
 
 
-async def _seed_complete_legacy_support(db: Database) -> tuple[str, str, str, str]:
+async def _seed_complete_unit_support(db: Database) -> tuple[str, str, str, str]:
     now = datetime(2026, 8, 27, 8, 0, tzinfo=timezone.utc).isoformat()
     source_id = "source-1"
     memory_id = "memory-1"
@@ -147,20 +147,27 @@ async def _seed_complete_legacy_support(db: Database) -> tuple[str, str, str, st
             now,
         ),
     )
-    await db.db.execute(
-        """INSERT INTO evidence_units (
-               id, source_id, doc_id, doc_revision_id, source_type,
-               source_anchor, source_lineage_id, source_metadata_json,
-               visibility, access_context_hash, content, excerpt,
-               evidence_provenance, created_at, updated_at
-           ) VALUES (?, ?, 'doc-1', ?, 'github_repo', 'obs-primary', ?, '{}',
-                     'workspace', ?, 'Release requires approval.',
-                     'Release requires approval.', 'source_excerpt', ?, ?)""",
-        (evidence_unit_id, source_id, unit_revision_id, unit_id, access_hash, now, now),
-    )
-    references = await db.record_evidence_references(
-        evidence_unit_id,
-        (
+    await record_unit_support(
+        db,
+        memory_id=memory_id,
+        unit=EvidenceUnit(
+            id=evidence_unit_id,
+            source_id=source_id,
+            doc_id="doc-1",
+            doc_revision_id=unit_revision_id,
+            source_type="github_repo",
+            source_anchor="obs-primary",
+            source_lineage_id=unit_id,
+            project_key=None,
+            visibility="workspace",
+            owner_user_id=None,
+            repo_identifier=None,
+            content="Release requires approval.",
+            excerpt="Release requires approval.",
+            evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+            access_context_hash=access_hash,
+        ),
+        references=(
             EvidenceReference(
                 id="eref-primary",
                 role=EvidenceRole.PRIMARY,
@@ -181,17 +188,6 @@ async def _seed_complete_legacy_support(db: Database) -> tuple[str, str, str, st
             ),
         ),
     )
-    for reference in references:
-        await db.upsert_memory_support_assertion(
-            MemorySupportAssertion(
-                id=f"legacy-{reference.id}",
-                memory_id=memory_id,
-                evidence_reference_id=str(reference.id),
-                source_id=source_id,
-                access_context_hash=access_hash,
-                created_at=now,
-            )
-        )
     await db.db.execute(
         """INSERT INTO memory_sources (
                memory_id, doc_id, source_id, source_type, excerpt,
@@ -202,6 +198,91 @@ async def _seed_complete_legacy_support(db: Database) -> tuple[str, str, str, st
     )
     await db.db.commit()
     return memory_id, evidence_unit_id, source_id, access_hash
+
+
+_REQUIRE_EVIDENCE_UNIT_SUPPORT_MIGRATION = 97
+
+
+async def _support_scope_marker(db: Database) -> str:
+    [row] = await db.db.execute_fetchall(
+        "SELECT marker_value FROM system_contract_markers WHERE marker_key = 'support_scope_version'"
+    )
+    return str(row["marker_value"])
+
+
+def _mark_reference_scoped_before_upgrade(path: str, *, reference_support_row: bool) -> None:
+    """Rewind a closed workspace to the state an earlier version left behind."""
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """UPDATE system_contract_markers SET marker_value = 'reference-set-v1'
+                WHERE marker_key = 'support_scope_version'"""
+        )
+        if reference_support_row:
+            connection.execute(
+                """INSERT INTO memory_support_assertions (
+                       id, memory_id, evidence_reference_id, source_id,
+                       access_context_hash, active, created_at
+                   ) VALUES ('reference-support', 'memory-1', 'eref-primary',
+                             'source-1', 'access-1', 1, '2026-08-27T08:00:00+00:00')"""
+            )
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version = ?",
+            (_REQUIRE_EVIDENCE_UNIT_SUPPORT_MIGRATION,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_new_workspace_starts_on_evidence_unit_support(db) -> None:
+    assert await _support_scope_marker(db) == "evidence-unit-set-v2"
+
+
+@pytest.mark.asyncio
+async def test_workspace_without_reference_scoped_support_moves_to_evidence_unit_support(db) -> None:
+    await _seed_complete_unit_support(db)
+    await db.close()
+    _mark_reference_scoped_before_upgrade(db.db_path, reference_support_row=False)
+
+    await db.connect()
+
+    assert await _support_scope_marker(db) == "evidence-unit-set-v2"
+    assert await db.get_active_memory_support_unit_ids("memory-1") == ("evidence-unit-1",)
+
+
+@pytest.mark.asyncio
+async def test_workspace_with_reference_scoped_support_refuses_to_start(db) -> None:
+    await _seed_complete_unit_support(db)
+    await db.close()
+    _mark_reference_scoped_before_upgrade(db.db_path, reference_support_row=True)
+
+    with pytest.raises(RuntimeError, match="reference-scoped Support"):
+        await db.connect()
+    await db.close()
+
+    with sqlite3.connect(db.db_path) as connection:
+        [(marker,)] = connection.execute(
+            "SELECT marker_value FROM system_contract_markers WHERE marker_key = 'support_scope_version'"
+        ).fetchall()
+        applied = connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (_REQUIRE_EVIDENCE_UNIT_SUPPORT_MIGRATION,),
+        ).fetchall()
+    assert marker == "reference-set-v1"
+    assert applied == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_support_scope_marker_refuses_to_start(db) -> None:
+    await db.close()
+    with sqlite3.connect(db.db_path) as connection:
+        connection.execute(
+            """UPDATE system_contract_markers SET marker_value = 'unknown-scope'
+                WHERE marker_key = 'support_scope_version'"""
+        )
+
+    with pytest.raises(RuntimeError, match="support_scope_version marker is unknown"):
+        await db.connect()
+    await db.close()
 
 
 def test_evidence_unit_revision_lineage_predicate_covers_identity_and_membership() -> None:
@@ -289,255 +370,8 @@ def test_v2_part_and_support_identity_exclude_presentation_only_changes() -> Non
 
 
 @pytest.mark.asyncio
-async def test_report_then_exact_cutover_creates_one_unit_support_and_blocks_v1(db) -> None:
-    memory_id, unit_id, source_id, access_hash = await _seed_complete_legacy_support(db)
-    assert await db.get_support_scope_version() is SupportScopeVersion.REFERENCE_SET_V1
-
-    report = await db.report_support_scope_cutover()
-    assert report.legacy_group_count == 1
-    assert report.eligible_group_count == 1
-    assert report.ineligible_group_count == 0
-    assert await db.get_support_scope_version() is SupportScopeVersion.REFERENCE_SET_V1
-    assert await db.db.execute_fetchall(
-        "SELECT id FROM memory_unit_support_assertions"
-    ) == []
-
-    applied = await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="test-cutover",
-    )
-    assert applied.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-    assert await db.get_support_scope_version() is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-    rows = await db.db.execute_fetchall(
-        "SELECT * FROM memory_unit_support_assertions"
-    )
-    assert len(rows) == 1
-    assert rows[0]["memory_id"] == memory_id
-    assert rows[0]["evidence_unit_id"] == unit_id
-    assert rows[0]["id"] == memory_unit_support_assertion_id(
-        memory_id=memory_id,
-        evidence_unit_id=unit_id,
-        source_id=source_id,
-        access_context_hash=access_hash,
-    )
-    unit = await db.db.execute_fetchall(
-        "SELECT part_set_digest FROM evidence_units WHERE id = ?",
-        (unit_id,),
-    )
-    assert unit[0]["part_set_digest"]
-    parts = await db.db.execute_fetchall(
-        """SELECT part_kind, raw_content_sha256 FROM evidence_references
-           WHERE evidence_unit_id = ? ORDER BY role""",
-        (unit_id,),
-    )
-    assert len(parts) == 2
-    assert all(row["part_kind"] == "text" for row in parts)
-    [group] = await db.get_memory_evidence_units(memory_id)
-    assert group.evidence_unit_id == unit_id
-    assert group.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-    assert [item.role for item in group.items] == [
-        EvidenceRole.PRIMARY,
-        EvidenceRole.REQUIRED,
-    ]
-    assert all(item.grants_support for item in group.items)
-    assert [item.excerpt for item in group.items] == [
-        "Release requires approval.",
-        "Only after two reviewers agree.",
-    ]
-
-    with pytest.raises(Exception, match="reference-scoped Support writer is disabled"):
-        await db.upsert_memory_support_assertion(
-            MemorySupportAssertion(
-                id="legacy-after-cutover",
-                memory_id=memory_id,
-                evidence_reference_id="eref-primary",
-                source_id=source_id,
-                access_context_hash=access_hash,
-            )
-        )
-
-    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
-        await db.db.execute(
-            """INSERT INTO memory_support_assertions (
-                   id, memory_id, evidence_reference_id, source_id,
-                   access_context_hash, active, created_at
-               ) VALUES ('legacy-direct-after-cutover', ?, 'eref-primary', ?, ?, 1,
-                         '2026-08-27T12:00:00+00:00')""",
-            (memory_id, source_id, access_hash),
-        )
-    await db.db.rollback()
-
-    await db.upsert_memory_unit_support_assertion(
-        MemoryUnitSupportAssertion(
-            id=memory_unit_support_assertion_id(
-                memory_id=memory_id,
-                evidence_unit_id=unit_id,
-                source_id=source_id,
-                access_context_hash=access_hash,
-            ),
-            memory_id=memory_id,
-            evidence_unit_id=unit_id,
-            source_id=source_id,
-            access_context_hash=access_hash,
-        )
-    )
-
-
-@pytest.mark.asyncio
-async def test_report_gates_invalid_unit_revision_lineage_before_cutover_apply(db) -> None:
-    memory_id, unit_id, source_id, access_hash = await _seed_complete_legacy_support(db)
-    await db.db.execute(
-        "UPDATE evidence_units SET doc_revision_id = 'missing-unit-revision' WHERE id = ?",
-        (unit_id,),
-    )
-    await db.db.commit()
-
-    report = await db.report_support_scope_cutover()
-
-    assert report.legacy_group_count == 1
-    assert report.eligible_group_count == 0
-    assert report.ineligible_group_count == 1
-    assert report.findings[0].reason_codes == ("unit_revision_lineage_invalid",)
-
-    applied = await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="test-invalid-lineage-cutover",
-    )
-
-    assert applied.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-    assert await db.get_support_scope_version() is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-    assert await db.db.execute_fetchall(
-        "SELECT id FROM memory_unit_support_assertions"
-    ) == []
-    [unit] = await db.db.execute_fetchall(
-        "SELECT evidence_provenance FROM evidence_units WHERE id = ?",
-        (unit_id,),
-    )
-    assert unit["evidence_provenance"] == "legacy_limited"
-    assert await db.db.execute_fetchall(
-        "SELECT id FROM memory_support_assertions WHERE memory_id = ?",
-        (memory_id,),
-    )
-    source_rows = await db.db.execute_fetchall(
-        "SELECT source_id FROM memory_sources WHERE memory_id = ?",
-        (memory_id,),
-    )
-    assert [row["source_id"] for row in source_rows] == [source_id]
-    assert access_hash == "access-1"
-
-
-@pytest.mark.asyncio
-async def test_cutover_keeps_active_non_current_support_legacy_limited(db) -> None:
-    memory_id, unit_id, source_id, _access_hash = (
-        await _seed_complete_legacy_support(db)
-    )
-    now = datetime(2026, 8, 28, 8, 0, tzinfo=timezone.utc).isoformat()
-    current_text = "Release now requires three reviewers."
-    await db.db.execute(
-        """INSERT INTO source_observation_revisions (
-               id, observation_id, semantic_hash, content, metadata_json,
-               observed_at, profile_name, profile_version, coordinate_space,
-               created_at
-           ) VALUES ('obsrev-primary-2', 'obs-primary', ?, ?, '{}', ?,
-                     'markdown-structural', 1, 'unicode-scalar', ?)""",
-        (hashlib.sha256(current_text.encode()).hexdigest(), current_text, now, now),
-    )
-    await db.db.execute(
-        "UPDATE source_observations SET current_revision_id = 'obsrev-primary-2' "
-        "WHERE id = 'obs-primary'"
-    )
-    await db.db.execute(
-        """INSERT INTO source_unit_revisions (
-               id, source_unit_id, semantic_hash, access_hash,
-               observation_revision_ids_json, observed_at, created_at
-           ) VALUES ('unitrev-2', 'unit-1', 'unit-hash-2', 'access-1', ?, ?, ?)""",
-        (json.dumps(["obsrev-primary-2", "obsrev-required"]), now, now),
-    )
-    await db.db.execute(
-        "UPDATE source_units SET current_revision_id = 'unitrev-2' "
-        "WHERE id = 'unit-1'"
-    )
-    await db.db.commit()
-
-    report = await db.report_support_scope_cutover()
-
-    assert report.eligible_group_count == 0
-    assert report.ineligible_group_count == 1
-    assert report.findings[0].reason_codes == (
-        "active_support_revision_non_current",
-    )
-
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="non-current-cutover",
-    )
-
-    assert await db.get_active_memory_support_unit_ids(memory_id) == ()
-    [source_row] = await db.db.execute_fetchall(
-        "SELECT support_kind FROM memory_sources WHERE memory_id = ?",
-        (memory_id,),
-    )
-    assert source_row["support_kind"] == "legacy_limited"
-    evidence_unit = await db.get_evidence_unit(unit_id)
-    assert evidence_unit is not None
-    assert evidence_unit.evidence_provenance.value == "legacy_limited"
-
-
-@pytest.mark.asyncio
-async def test_cutover_preserves_inactive_non_current_support_as_history(db) -> None:
-    memory_id, _unit_id, _source_id, _access_hash = (
-        await _seed_complete_legacy_support(db)
-    )
-    now = datetime(2026, 8, 28, 8, 0, tzinfo=timezone.utc).isoformat()
-    await db.db.execute(
-        "UPDATE memory_support_assertions SET active = 0, removed_at = ?",
-        (now,),
-    )
-    await db.db.execute(
-        """INSERT INTO source_observation_revisions (
-               id, observation_id, semantic_hash, content, metadata_json,
-               observed_at, profile_name, profile_version, coordinate_space,
-               created_at
-           ) VALUES ('obsrev-primary-2', 'obs-primary', 'current-hash',
-                     'Release now requires three reviewers.', '{}', ?,
-                     'markdown-structural', 1, 'unicode-scalar', ?)""",
-        (now, now),
-    )
-    await db.db.execute(
-        "UPDATE source_observations SET current_revision_id = 'obsrev-primary-2' "
-        "WHERE id = 'obs-primary'"
-    )
-    await db.db.commit()
-
-    report = await db.report_support_scope_cutover()
-
-    assert report.eligible_group_count == 1
-    assert report.inactive_eligible_group_count == 1
-    assert report.ineligible_group_count == 0
-
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="inactive-history-cutover",
-    )
-
-    [support] = await db.db.execute_fetchall(
-        """SELECT active, removed_at
-             FROM memory_unit_support_assertions
-            WHERE memory_id = ?""",
-        (memory_id,),
-    )
-    assert support["active"] == 0
-    assert support["removed_at"] == now
-
-
-@pytest.mark.asyncio
 async def test_v2_lifecycle_removes_one_complete_unit_then_retires_last_support(db) -> None:
-    memory_id, unit_id, source_id, access_hash = await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="test-cutover",
-    )
+    memory_id, unit_id, source_id, access_hash = await _seed_complete_unit_support(db)
     await db.enable_lifecycle_gate(source_id)
     memory = await db.get_memory(memory_id)
     assert memory is not None
@@ -590,12 +424,7 @@ async def test_v2_lifecycle_removes_one_complete_unit_then_retires_last_support(
 
 @pytest.mark.asyncio
 async def test_v2_source_removal_retires_last_support_without_deleting_history(db) -> None:
-    memory_id, unit_id, source_id, _access_hash = await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="test-source-removal-cutover",
-    )
+    memory_id, unit_id, source_id, _access_hash = await _seed_complete_unit_support(db)
 
     result = await db.delete_source_cascade(source_id)
 
@@ -628,12 +457,7 @@ async def test_v2_source_removal_retires_last_support_without_deleting_history(d
 
 @pytest.mark.asyncio
 async def test_v2_source_removal_preserves_memory_with_independent_support(db) -> None:
-    memory_id, unit_id, source_id, _access_hash = await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="test-shared-source-removal-cutover",
-    )
+    memory_id, unit_id, source_id, _access_hash = await _seed_complete_unit_support(db)
     now = datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc).isoformat()
     await db.upsert_source(
         id="source-2",
@@ -691,12 +515,7 @@ async def test_v2_source_removal_preserves_memory_with_independent_support(db) -
 
 @pytest.mark.asyncio
 async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> None:
-    await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="test-cutover",
-    )
+    await _seed_complete_unit_support(db)
     await db.enable_lifecycle_gate("source-1")
     now = datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc)
     body = "# Deployment rule\n\nDeploy only after approval.\n"
@@ -1002,12 +821,7 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
 
 @pytest.mark.asyncio
 async def test_context_replacement_does_not_change_unit_support_identity_or_hash(db) -> None:
-    memory_id, unit_id, source_id, _access_hash = await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="test-cutover",
-    )
+    memory_id, unit_id, source_id, _access_hash = await _seed_complete_unit_support(db)
     before = (await db.get_active_memory_support_states((memory_id,)))[memory_id]
     now = datetime(2026, 8, 27, 10, 0, tzinfo=timezone.utc).isoformat()
     for suffix in ("one", "two"):
@@ -1087,12 +901,7 @@ async def test_context_replacement_does_not_change_unit_support_identity_or_hash
 @pytest.mark.asyncio
 async def test_invalid_supporting_part_omits_complete_evidence_unit(db) -> None:
     memory_id, _unit_id, _source_id, _access_hash = (
-        await _seed_complete_legacy_support(db)
-    )
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="test-cutover",
+        await _seed_complete_unit_support(db)
     )
     await db.db.execute(
         """UPDATE evidence_references
@@ -1105,66 +914,8 @@ async def test_invalid_supporting_part_omits_complete_evidence_unit(db) -> None:
 
 
 @pytest.mark.asyncio
-async def test_cutover_rejects_stale_report_and_rolls_back_without_partial_v2(db) -> None:
-    await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.db.execute(
-        """UPDATE memory_support_assertions
-              SET active = 0, removed_at = '2026-08-27T11:00:00+00:00'
-            WHERE evidence_reference_id = 'eref-required'"""
-    )
-    await db.db.commit()
-    with pytest.raises(ValueError, match="report is stale"):
-        await db.apply_support_scope_v2_cutover(
-            expected_report_id=report.id,
-            owner_id="stale-cutover",
-        )
-    assert await db.get_support_scope_version() is SupportScopeVersion.REFERENCE_SET_V1
-    assert await db.db.execute_fetchall(
-        "SELECT id FROM memory_unit_support_assertions"
-    ) == []
-    assert await db.db.execute_fetchall("SELECT owner_id FROM support_cutover_lease") == []
-
-
-@pytest.mark.asyncio
-async def test_ineligible_mixed_group_stays_legacy_limited_without_v2_authority(db) -> None:
-    memory_id, unit_id, _source_id, _access_hash = await _seed_complete_legacy_support(db)
-    await db.db.execute(
-        """UPDATE memory_support_assertions
-              SET active = 0, removed_at = '2026-08-27T11:00:00+00:00'
-            WHERE evidence_reference_id = 'eref-required'"""
-    )
-    await db.db.commit()
-    report = await db.report_support_scope_cutover()
-    assert report.eligible_group_count == 0
-    assert report.ineligible_group_count == 1
-    assert "active_state_mixed" in report.findings[0].reason_codes
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="mixed-cutover",
-    )
-    memory = await db.get_memory(memory_id)
-    assert memory is not None and memory.status == "active"
-    state = (await db.get_active_memory_support_states((memory_id,)))[memory_id]
-    assert state.unit_ids == ()
-    source_rows = await db.db.execute_fetchall(
-        "SELECT support_kind FROM memory_sources WHERE memory_id = ?",
-        (memory_id,),
-    )
-    assert [row["support_kind"] for row in source_rows] == ["legacy_limited"]
-    unit = await db.get_evidence_unit(unit_id)
-    assert unit is not None
-    assert unit.evidence_provenance.value == "legacy_limited"
-
-
-@pytest.mark.asyncio
 async def test_v2_deriver_stages_projection_extraction_v9_without_ingestion_replay(db) -> None:
-    await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="test-cutover",
-    )
+    await _seed_complete_unit_support(db)
     now = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
     body = "# Durable rule\n\nAlways validate the complete Evidence Unit.\n"
     item = ContentItem(
@@ -1238,42 +989,3 @@ async def test_v2_deriver_stages_projection_extraction_v9_without_ingestion_repl
     assert result.derivation.extraction_contract_version == "projection-extraction-v9"
     assert result.derivation.target_unit_revision_id == projection.source_unit_revisions[0].id
 
-
-@pytest.mark.asyncio
-async def test_v1_plan_is_stale_after_atomic_v2_marker_switch(db) -> None:
-    await _seed_complete_legacy_support(db)
-    report = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=report.id,
-        owner_id="test-cutover",
-    )
-    scope = ReconciliationScope(
-        id="scope-stale-v1",
-        source_id="source-1",
-        source_unit_id="unit-1",
-        base_unit_revision_id="unitrev-1",
-        target_unit_revision_id="unitrev-1",
-    )
-    v1_plan = build_lifecycle_plan(
-        plan_id="plan-stale-v1",
-        scope=scope,
-        gate_state=(await db.get_lifecycle_gate("source-1")).state,
-        operations=(),
-        incumbents={},
-        source_support_reference_ids={},
-        all_active_support_reference_ids={},
-        support_set_hashes={},
-        observation_revision_ids=(),
-        new_evidence_reference_ids=(),
-        defaults=NewMemoryDefaults(
-            visibility="workspace",
-            owner_user_id=None,
-            project_key=None,
-            repo_identifier=None,
-            doc_id="doc-1",
-            source_type="github_repo",
-            access_context_hash="access-1",
-        ),
-    )
-    with pytest.raises(ValueError, match="Support scope version is stale"):
-        await db.apply_lifecycle_plan(v1_plan)
