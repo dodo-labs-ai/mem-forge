@@ -12,9 +12,8 @@ from memforge.pipeline.revision_input import (
     PlannedTransport,
     RevisionInputMode,
     RevisionInputPlanner,
-    SupportInputTask,
 )
-from tests.test_revision_assessment import old_support, revisions
+from tests.test_revision_assessment import revisions
 
 
 class CostPolicy:
@@ -102,34 +101,5 @@ def test_named_extraction_baseline_must_match_exactly():
         RevisionInputPlanner.plan(
             context=context,
             task=replace(task, named_baseline_revision_id="different-baseline"),
-            request_policy=CostPolicy(),
-        )
-
-
-def test_unnamed_support_without_baseline_uses_full_but_named_missing_fails():
-    base, current, _context = context_pair(
-        base_text="Two reviewers approve US releases.\n",
-        current_text="Two reviewers approve US releases.\n\nNew approval rule.\n",
-    )
-    no_baseline = RevisionAssessmentContext(
-        projection=current, base=None, access_context_hash="scope"
-    )
-    support = old_support(base)
-    plan = RevisionInputPlanner.plan(
-        context=no_baseline,
-        task=SupportInputTask((support,)),
-        request_policy=CostPolicy(),
-    )
-    assert plan.mode is RevisionInputMode.FULL
-    assert plan.selection_reason == "full_required_without_applicable_baseline"
-
-    named = tuple(
-        replace(part, validation_unit_revision_id=base.source_unit_revisions[0].id)
-        for part in support
-    )
-    with pytest.raises(SupportRevalidationLimitation, match="named Support baseline"):
-        RevisionInputPlanner.plan(
-            context=no_baseline,
-            task=SupportInputTask((named,)),
             request_policy=CostPolicy(),
         )

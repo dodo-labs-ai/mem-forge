@@ -94,11 +94,13 @@ class ItemFailure:
 
     ``capacity_exceeded`` means the item alone exceeds the route's input
     capacity. ``error`` is the exception that ended the item, when there is one.
+    For a chain item, ``part`` is the index of the first part it could not read.
     """
 
     category: FailureCategory
     error_code: str
     error: Exception | None = None
+    part: int | None = None
 
 
 @dataclass(frozen=True)
@@ -121,14 +123,28 @@ class ChainStep(Generic[Part, State]):
     # Index of ``parts[0]`` in the task's full part order.
     position: int
     total: int
+    # Items whose first part is fully read once this step is read; only these may finish here.
+    may_finish: frozenset[ItemId]
 
 
 @dataclass(frozen=True)
 class ChainTask(Generic[Part, State]):
-    """Items that read every part in order, carrying compact state between steps."""
+    """Items that read the parts in order, carrying compact state between steps.
+
+    Each item reads at least its first part and at most every part. While any
+    first part is unread, a step reads no further than the farthest unread
+    first-part boundary of its lane, so the lane's first parts are packed
+    together, by capacity alone, ahead of the rest. An item may finish only at a
+    step that completes its own first part (``may_finish``); it leaves the chain
+    at the first step whose decoded state is ``finished``. The step that reads
+    the last part must finish every item still reading.
+    """
 
     initial_states: Mapping[ItemId, State]
     parts: Sequence[Part]
+    # Per item: how many leading parts it reads before it may finish.
+    first_part_end: Mapping[ItemId, int]
+    finished: Callable[[State], bool]
     render: Callable[[ChainStep[Part, State]], LlmRequest]
     decode: Callable[[BaseModel, ChainStep[Part, State]], Iterable[tuple[ItemId, State]]]
     call: StructuredCall
@@ -206,26 +222,6 @@ class LlmBatchRunner:
             raise ItemCapacityExceeded(unfit[0])
         return tuple(planned)
 
-    def plan_chain(self, task: ChainTask[Part, State]) -> tuple[LlmRequest, ...]:
-        """Pack the chain with states frozen at their initial values, without sending."""
-
-        total = len(task.parts)
-        requests = []
-        lanes = [_Lane(tuple(task.initial_states), 0, total)]
-        while lanes:
-            lane = lanes.pop(0)
-            while lane.position < total:
-                found = self._next_step(task, lane, task.initial_states)
-                if found is None:
-                    if len(lane.item_ids) == 1:
-                        raise ItemCapacityExceeded(lane.item_ids[0])
-                    lanes[:0] = _halve_lane(lane)
-                    break
-                step, request = found
-                requests.append(request)
-                lane.position += len(step.parts)
-        return tuple(requests)
-
     async def run_items(self, task: ItemTask[Part, Result]) -> dict[ItemId, tuple[Result, ...] | ItemFailure]:
         """Return every item's results, one per context chunk in context order, or its failure."""
 
@@ -252,11 +248,15 @@ class LlmBatchRunner:
         }
 
     async def run_chain(self, task: ChainTask[Part, State]) -> dict[ItemId, State | ItemFailure]:
-        """Return every item's state after it read all parts, or its failure."""
+        """Return every item's state at the step it finished, or its failure."""
 
+        total = len(task.parts)
+        outside = sorted(item_id for item_id in task.initial_states if not 0 <= task.first_part_end[item_id] <= total)
+        if outside:
+            raise ValueError(f"first parts end outside the {total} chain parts: {', '.join(outside)}")
         states = dict(task.initial_states)
         outcomes: dict[ItemId, State | ItemFailure] = {}
-        await self._run_lane(task, _Lane(tuple(states), 0, len(task.parts)), states, outcomes)
+        await self._run_lane(task, _Lane(tuple(states), 0, total), states, outcomes)
         return {item_id: outcomes[item_id] for item_id in task.initial_states}
 
     async def run_one(
@@ -363,16 +363,22 @@ class LlmBatchRunner:
 
         lane_states = {item_id: states[item_id] for item_id in lane.item_ids}
         total = len(task.parts)
+        # The lane's first parts are read before the rest; once they are, any length that fits.
+        boundary = max(
+            (end for item_id in lane.item_ids if (end := task.first_part_end[item_id]) > lane.position),
+            default=total,
+        )
 
         def attempt(count: int) -> tuple[ChainStep[Part, State], LlmRequest] | None:
+            read = lane.position + count
             step = ChainStep(
-                lane.item_ids, tuple(task.parts[lane.position:lane.position + count]),
-                lane_states, lane.position, total,
+                lane.item_ids, tuple(task.parts[lane.position:read]), lane_states, lane.position, total,
+                frozenset(item_id for item_id in lane.item_ids if read >= task.first_part_end[item_id]),
             )
             request = self.fit(lambda: task.render(step))
             return None if request is None else (step, request)
 
-        return _longest(min(lane.part_limit, total - lane.position), attempt)
+        return _longest(min(lane.part_limit, boundary - lane.position), attempt)
 
     async def _run_lane(
         self, task: ChainTask[Part, State], lane: _Lane, states: dict[ItemId, State],
@@ -380,22 +386,28 @@ class LlmBatchRunner:
     ) -> None:
         """Read the remaining parts in order; split lanes run in this worker one after the other."""
 
-        while lane.position < len(task.parts):
+        while lane.item_ids and lane.position < len(task.parts):
             found = self._next_step(task, lane, states)
             if found is None:
                 if len(lane.item_ids) == 1:
-                    outcomes[lane.item_ids[0]] = ItemFailure("capacity_exceeded", INPUT_CAPACITY_EXCEEDED)
+                    outcomes[lane.item_ids[0]] = ItemFailure(
+                        "capacity_exceeded", INPUT_CAPACITY_EXCEEDED, part=lane.position,
+                    )
                     return
                 for half in _halve_lane(lane):
                     await self._run_lane(task, half, states, outcomes)
                 return
             step, request = found
             outcome = await self._send(
-                request, step.item_ids, task.call, lambda response: task.decode(response, step), task.journal,
+                request, step.item_ids, task.call,
+                lambda response, step=step: _chain_states(task, step, task.decode(response, step)), task.journal,
             )
             if not isinstance(outcome, ItemFailure):
                 states.update(outcome)
                 lane.position += len(step.parts)
+                finished = {item_id for item_id, state in outcome.items() if task.finished(state)}
+                outcomes.update({item_id: outcome[item_id] for item_id in finished})
+                lane.item_ids = tuple(item_id for item_id in lane.item_ids if item_id not in finished)
                 continue
             if _is_size_failure(outcome) and len(step.item_ids) > 1:
                 self._record_split(outcome, items=len(step.item_ids), parts=len(step.parts))
@@ -407,8 +419,9 @@ class LlmBatchRunner:
                 lane.part_limit = len(step.parts) // 2
                 continue
             self.stats.failed_requests += 1
-            outcomes.update(dict.fromkeys(lane.item_ids, outcome))
+            outcomes.update(dict.fromkeys(lane.item_ids, replace(outcome, part=step.position)))
             return
+        # Only a chain without parts ends with items still reading.
         outcomes.update({item_id: states[item_id] for item_id in lane.item_ids})
 
     async def _send(
@@ -504,6 +517,22 @@ def _halve_lane(lane: _Lane) -> list[_Lane]:
         _Lane(lane.item_ids[:middle], lane.position, lane.part_limit),
         _Lane(lane.item_ids[middle:], lane.position, lane.part_limit),
     ]
+
+
+def _chain_states(
+    task: ChainTask[Part, State], step: ChainStep[Part, State], pairs: Iterable[tuple[ItemId, State]],
+) -> list[tuple[ItemId, State]]:
+    """Hold a decoded step to the chain contract, so a violation gets the one correction."""
+
+    states = _covered(pairs, step.item_ids)
+    early = sorted(item_id for item_id, state in states.items() if task.finished(state) and item_id not in step.may_finish)
+    if early:
+        raise ValueError(f"items finished before reading their first part: {', '.join(early)}")
+    if step.position + len(step.parts) == step.total:
+        unfinished = sorted(item_id for item_id, state in states.items() if not task.finished(state))
+        if unfinished:
+            raise ValueError(f"items did not finish at the last part: {', '.join(unfinished)}")
+    return list(states.items())
 
 
 def _covered(pairs: Iterable[tuple[ItemId, Result]], item_ids: tuple[ItemId, ...]) -> dict[ItemId, Result]:
