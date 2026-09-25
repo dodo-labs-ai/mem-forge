@@ -1,4 +1,4 @@
-"""Full/delta semantics and exact current Evidence selection contracts."""
+"""Ordered Support reading semantics and exact current Evidence selection contracts."""
 
 import json
 from dataclasses import replace
@@ -11,6 +11,7 @@ from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.reconciler import ReconciliationContractError
 from memforge.pipeline.projection_fragments import SupportRevalidationLimitation
 from memforge.source_projection import ProjectionCoverage
+from tests.revision_client_fixture import continued, supported
 from tests.test_projection_fragments import _projection
 
 
@@ -47,6 +48,8 @@ def old_support(base):
             role=EvidenceRole.PRIMARY,
             anchor=primary.anchor,
             excerpt=primary.presentation_text,
+            raw_content_sha256=primary.raw_content_sha256,
+            presentation_sha256=primary.presentation_sha256,
         ),
     )
 
@@ -63,8 +66,8 @@ def payload(prompt):
 class Client:
     """Select the reviewer rule as Primary and its scope conditions as Required."""
 
-    def __init__(self, mode="full", invalid=0):
-        self.mode, self.invalid = mode, invalid
+    def __init__(self, invalid=0):
+        self.invalid = invalid
         self.prompts = []
         self.images = []
 
@@ -73,7 +76,7 @@ class Client:
         return RequestBudget(model or "fixture", 200000, 200000, 64000, 0.8, "fixture")
 
     def request_fits(self, prompt, **kwargs):
-        return self.mode == "full" or '"input_mode":"delta"' in prompt
+        return True
 
     def request_tokens(self, prompt, **kwargs):
         return len(prompt)
@@ -84,36 +87,41 @@ class Client:
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
         self.prompts.append(prompt)
         self.images.append(kwargs.get("images", ()))
-        current = payload(prompt)["current"]
-        rows = current["primary_candidates"] + current["required_only_candidates"]
-        primary = next(row for row in current["primary_candidates"] if "reviewers" in row[1].lower())
+        data = payload(prompt)
+        current = data["current"]
+        rows = [*current["primary_candidates"], *current["required_only_candidates"], *data["carried_witness_catalog"]]
+        primary = next((row[0] for row in rows if row[0].startswith("PRM-") and "reviewers" in row[1].lower()), None)
         required = [row[0] for row in rows if row[1].startswith(("Country:", "Payroll type:"))]
         if len(self.prompts) <= self.invalid:
-            primary = ["PRM-9999"]
-        return response_format.model_validate({"results": [
-            {"work_id": claim["work_id"], "status": "supported", "primary_ref": primary[0], "required_refs": required}
-            for claim in payload(prompt)["claims"]
-        ]})
+            primary = "PRM-9999"
+        results = [
+            continued(work) if primary is None or not work["may_conclude"] else supported(work, primary, required)
+            for work in data["works"]
+        ]
+        return response_format.model_validate({"results": results})
 
 
 async def assess(context, base, client):
-    from memforge.pipeline.revision_work import RevisionWorkExecutor, SupportWorkItem
+    from memforge.pipeline.revision_work import RevisionWorkExecutor
+    from memforge.pipeline.support_reading import SupportWorkItem
 
     item = SupportWorkItem("w0", memory(), old_support(base), context)
     return (await RevisionWorkExecutor(client=client, model="test").assess_many([item]))["w0"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["full", "delta"])
-async def test_moved_rewritten_primary_and_split_required_select_current_coordinates(mode):
+async def test_moved_rewritten_primary_and_split_required_select_current_coordinates():
     base, current = revisions(
         "Two reviewers approve US regular payroll.\n",
         "# New section\n\nCountry: US.\n\nPayroll type: regular.\n\nRelease requires two reviewers.\n",
     )
     context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
-    client = Client(mode)
+    client = Client()
     result = await assess(context, base, client)
-    assert result.supported and result.input_mode == mode
+    assert result.supported
+    assert payload(client.prompts[0])["works"][0]["prior_evidence"] == [
+        {"role": "primary", "historical_excerpt": "Two reviewers approve US regular payroll."}
+    ]
     assert (
         len(result.memory.resolved_evidence_selection.parts) >= 3
     )  # primary plus complete country and payroll conditions
@@ -122,14 +130,14 @@ async def test_moved_rewritten_primary_and_split_required_select_current_coordin
 
 
 @pytest.mark.asyncio
-async def test_complete_delta_includes_remote_exception_and_unchanged_heading():
+async def test_first_part_includes_remote_exception_and_unchanged_heading():
     base, current = revisions(
         "Two reviewers approve US releases.\n\n# Europe\n\nOld note.\n",
         "Two reviewers approve US releases.\n\n# Europe\n\nOne reviewer is sufficient.\n",
     )
     ctx = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
-    client = Client("delta")
-    assert (await assess(ctx, base, client)).input_mode == "delta"
+    client = Client()
+    assert (await assess(ctx, base, client)).supported
     request = payload(client.prompts[0])
     exception = next(item for item in request["current"]["primary_candidates"] if "One reviewer" in item[1])
     group = next(group for group in request["current"]["structural_groups"] if exception[0] in group["refs"])
@@ -152,11 +160,13 @@ async def test_current_selection_has_one_local_correction(invalid):
 
 
 @pytest.mark.asyncio
-async def test_missing_baseline_never_becomes_empty_delta():
+async def test_missing_baseline_reads_the_whole_revision_without_history():
     base, current = revisions("Two reviewers approve US releases.\n", "Two reviewers approve US releases today.\n")
     ctx = RevisionAssessmentContext(projection=current, base=None, access_context_hash="scope")
-    with pytest.raises(SupportRevalidationLimitation):
-        await assess(ctx, base, Client("delta"))
+    client = Client()
+    assert (await assess(ctx, base, client)).supported
+    [request] = [payload(prompt) for prompt in client.prompts]
+    assert request["last"] and request["removed_historical"] == []
 
 
 def test_partial_projection_keeps_exact_carried_member():
@@ -174,7 +184,7 @@ def test_partial_projection_keeps_exact_carried_member():
 
 
 @pytest.mark.asyncio
-async def test_large_unchanged_artifacts_do_not_block_text_delta_or_get_read(monkeypatch):
+async def test_large_unchanged_artifacts_after_the_first_part_are_never_read(monkeypatch):
     from types import SimpleNamespace
     from memforge.pipeline.projection_images import load_projection_images
     from tests.test_projected_lifecycle_integration import _projection_with_artifact
@@ -195,7 +205,7 @@ async def test_large_unchanged_artifacts_do_not_block_text_delta_or_get_read(mon
         prior=base.source_unit_revisions[0],
         prior_observations={r.observation_id: r for r in base.observation_revisions},
     )
-    # Total metadata admission rejects full image context before any read.
+    # The total image size limit rejects the whole Artifact context before any read.
     monkeypatch.setattr("memforge.pipeline.projection_images.MAX_SOURCE_ARTIFACT_INFERENCE_BYTES_PER_BATCH", 50)
     reads = []
     ctx = RevisionAssessmentContext(
@@ -209,7 +219,8 @@ async def test_large_unchanged_artifacts_do_not_block_text_delta_or_get_read(mon
         ),
     )
     client = Client()
-    assert (await assess(ctx, base, client)).input_mode == "delta"
+    assert (await assess(ctx, base, client)).supported
+    # The unchanged artifact lies after the first part, which already concludes.
     assert client.images == [()] and reads == []
     assert "New unrelated note." in client.prompts[0]
     assert all(len(row) < 3 or "image_source_observation_id" not in row[2]
@@ -217,7 +228,7 @@ async def test_large_unchanged_artifacts_do_not_block_text_delta_or_get_read(mon
 
 
 @pytest.mark.asyncio
-async def test_changed_artifact_bytes_are_supplied_to_the_selected_delta():
+async def test_changed_artifact_bytes_are_supplied_in_the_first_part():
     from types import SimpleNamespace
     from memforge.llm.structured_images import StructuredLlmImage
     from memforge.pipeline.projection_images import load_projection_images
@@ -245,7 +256,7 @@ async def test_changed_artifact_bytes_are_supplied_to_the_selected_delta():
         reads.append(uri)
         return b"new"
 
-    client = Client("delta")
+    client = Client()
     ctx = RevisionAssessmentContext(
         projection=target,
         base=base,
@@ -254,7 +265,8 @@ async def test_changed_artifact_bytes_are_supplied_to_the_selected_delta():
             projection=target, observation_ids=ids, document_store=SimpleNamespace(read_artifact=read)
         ),
     )
-    assert (await assess(ctx, base, client)).input_mode == "delta" and len(reads) == 1
+    assert (await assess(ctx, base, client)).supported
+    assert len(reads) == 1
     [images] = client.images
     assert len(images) == 1 and isinstance(images[0], StructuredLlmImage) and images[0].body == b"new"
 
@@ -302,7 +314,6 @@ def test_changelog_delta_keeps_before_after_field_identity_and_event_context():
     from dataclasses import replace
     from memforge.source_representation import representation_profile_for_observation_contract
     from memforge.pipeline.revision_work import RevisionWorkExecutor
-    from types import SimpleNamespace
     old, new = revisions("old", "new")
     profile = representation_profile_for_observation_contract(source_type="jira", observation_type="changelog")
     def canonical(projection, value):
@@ -327,9 +338,7 @@ def test_changelog_delta_keeps_before_after_field_identity_and_event_context():
         if f.anchor in expansion.context_anchors
     }
     assert added == {"# US payroll", "description", "2026-09-08"}
-    executor = object.__new__(RevisionWorkExecutor)
-    scope = SimpleNamespace(mode="delta", context=context)
-    payload = executor._source_payload(scope, context.catalog(()), [{**removed_claim, "ref": "d000001"}])
+    payload = RevisionWorkExecutor._source_payload(context, context.catalog(()), [{**removed_claim, "ref": "d000001"}])
     assert payload["removed_historical"][0][2] == {
         "field": "/items/0/toString", "context": removed_claim["context"],
     }

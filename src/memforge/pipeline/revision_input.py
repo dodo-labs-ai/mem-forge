@@ -1,4 +1,4 @@
-"""One provider-neutral policy for revision reading scope and input mode."""
+"""One provider-neutral policy for Claim Extraction reading scope and input mode."""
 
 from __future__ import annotations
 
@@ -24,13 +24,6 @@ class ExtractionInputTask:
 
     authorized: ProjectionFragmentCatalog
     named_baseline_revision_id: str | None = None
-
-
-@dataclass(frozen=True)
-class SupportInputTask:
-    """L3 work over fixed claims and their independently validated Support."""
-
-    supports: tuple[tuple[Any, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -65,8 +58,6 @@ class InputCandidate:
     catalog: ProjectionFragmentCatalog
     reading_groups: tuple[Any, ...]
     reading_indexes: tuple[Any, ...] = ()
-    removed_historical: tuple[dict[str, Any], ...] = ()
-    include_history: bool = False
 
 
 @dataclass(frozen=True)
@@ -80,11 +71,9 @@ class InputPlan:
     mode: RevisionInputMode
     catalog: ProjectionFragmentCatalog
     reading_groups: tuple[Any, ...]
-    removed_historical: tuple[dict[str, Any], ...]
     selection_reason: str
     estimated_cost: InputCost
     transport: Any
-    include_history: bool = False
 
 
 class RevisionRequestPolicy(Protocol):
@@ -103,31 +92,17 @@ class RevisionInputPlanner:
         return context.base.source_unit_revisions[0].id if context.base is not None else None
 
     @classmethod
-    def _validate_baseline(cls, context, task: ExtractionInputTask | SupportInputTask) -> None:
-        actual = cls._baseline_id(context)
-        if isinstance(task, ExtractionInputTask):
-            expected = task.named_baseline_revision_id
-            if expected is not None and actual != expected:
-                raise SupportRevalidationLimitation(
-                    SupportRevalidationLimitationCode.UNSUPPORTED_REPRESENTATION,
-                    "named incremental baseline is unavailable or does not match the prepared revision",
-                )
-            return
-
-        named = {
-            part.validation_unit_revision_id
-            for support in task.supports
-            for part in support
-            if part.validation_unit_revision_id is not None
-        }
-        if len(named) > 1 or (named and actual not in named):
+    def _validate_baseline(cls, context, task: ExtractionInputTask) -> None:
+        """An incremental extraction never silently becomes an initial full extraction."""
+        expected = task.named_baseline_revision_id
+        if expected is not None and cls._baseline_id(context) != expected:
             raise SupportRevalidationLimitation(
                 SupportRevalidationLimitationCode.UNSUPPORTED_REPRESENTATION,
-                "named Support baseline is unavailable or does not match the prepared revision",
+                "named incremental baseline is unavailable or does not match the prepared revision",
             )
 
     @staticmethod
-    def _reading_expansion(context, selected, *, added_primary_eligible: bool):
+    def _reading_expansion(context, selected):
         from memforge.pipeline.revision_reading import build_revision_reading_index
 
         selected_by_anchor = {fragment.anchor: fragment for fragment in selected}
@@ -150,12 +125,11 @@ class RevisionInputPlanner:
             )
             reading_indexes.append(index)
             expansion = index.expand(authority)
+            # Added reading context is never Primary authority.
             for fragment in expansion.fragments:
                 expanded_by_anchor[fragment.anchor] = (
                     selected_by_anchor[fragment.anchor]
                     if fragment.anchor in expansion.authority_anchors
-                    else fragment
-                    if added_primary_eligible
                     else replace(fragment, primary_eligible=False)
                 )
             included = set(expansion.authority_anchors) | set(expansion.context_anchors)
@@ -179,7 +153,7 @@ class RevisionInputPlanner:
     def _extraction_candidates(cls, context, task: ExtractionInputTask):
         authorized = tuple(task.authorized.fragments)
         delta_fragments, delta_groups, delta_indexes = cls._reading_expansion(
-            context, authorized, added_primary_eligible=False
+            context, authorized
         )
         delta = InputCandidate(
             RevisionInputMode.DELTA,
@@ -197,7 +171,7 @@ class RevisionInputPlanner:
             for fragment in context.full_fragments
         )
         full_expanded, full_groups, full_indexes = cls._reading_expansion(
-            context, full_fragments, added_primary_eligible=False
+            context, full_fragments
         )
         full = InputCandidate(
             RevisionInputMode.FULL,
@@ -207,54 +181,15 @@ class RevisionInputPlanner:
         )
         return (full,) if context.base is None else (delta, full)
 
-    @classmethod
-    def _support_candidates(cls, context, task: SupportInputTask):
-        full_fragments, full_groups, full_indexes = cls._reading_expansion(
-            context, context.full_fragments, added_primary_eligible=True
-        )
-        full = InputCandidate(
-            RevisionInputMode.FULL,
-            context.catalog(full_fragments),
-            full_groups,
-            full_indexes,
-            include_history=False,
-        )
-        if context.base is None:
-            return (full,)
-
-        changed, removed = context.delta()
-        selected = {fragment.anchor: fragment for fragment in changed}
-        for support in task.supports:
-            for part in support:
-                for fragment in context.full_fragments:
-                    if fragment.anchor.observation_id == part.anchor.observation_id and (
-                        fragment.anchor == part.anchor or fragment.presentation_text == part.excerpt
-                    ):
-                        selected[fragment.anchor] = fragment
-        delta_fragments, delta_groups, delta_indexes = cls._reading_expansion(
-            context, tuple(selected.values()), added_primary_eligible=True
-        )
-        delta = InputCandidate(
-            RevisionInputMode.DELTA,
-            context.catalog(delta_fragments),
-            delta_groups,
-            delta_indexes,
-            tuple(removed),
-            include_history=True,
-        )
-        return delta, full
-
     @staticmethod
     def _result(candidate: InputCandidate, transport: PlannedTransport, reason: str) -> InputPlan:
         return InputPlan(
             mode=candidate.mode,
             catalog=candidate.catalog,
             reading_groups=candidate.reading_groups,
-            removed_historical=candidate.removed_historical,
             selection_reason=reason,
             estimated_cost=transport.cost,
             transport=transport.payload,
-            include_history=candidate.include_history,
         )
 
     @classmethod
@@ -262,15 +197,11 @@ class RevisionInputPlanner:
         cls,
         *,
         context,
-        task: ExtractionInputTask | SupportInputTask,
+        task: ExtractionInputTask,
         request_policy: RevisionRequestPolicy,
     ) -> InputPlan:
         cls._validate_baseline(context, task)
-        candidates = (
-            cls._extraction_candidates(context, task)
-            if isinstance(task, ExtractionInputTask)
-            else cls._support_candidates(context, task)
-        )
+        candidates = cls._extraction_candidates(context, task)
         by_mode = {candidate.mode: candidate for candidate in candidates}
         delta = by_mode.get(RevisionInputMode.DELTA)
         full = by_mode[RevisionInputMode.FULL]

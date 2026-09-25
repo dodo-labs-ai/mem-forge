@@ -117,7 +117,7 @@ def test_unknown_support_reference_identifies_exact_field_and_allowed_catalog(fi
     from memforge.pipeline.support_wire import SupportWireAliases
     from memforge.llm.structured import SupportAssessmentWireResponse
     aliases = SupportWireAliases(SimpleNamespace(fragments=[SimpleNamespace(reference="f2", primary_eligible=True)]), [], {"work":"WRK-0000"})
-    row = dict(work_id="WRK-0000", status="supported", primary_ref="PRM-0002", required_refs=[])
+    row = dict(work_id="WRK-0000", status="supported", primary_ref="PRM-0002", required_refs=[], omitted_matched_refs=[])
     row[field] = "PRM-0007" if field == "primary_ref" else ["PRM-0007"]
     with pytest.raises(ValueError) as error:
         aliases.decode(SupportAssessmentWireResponse.model_validate({"results":[row]}))
@@ -136,7 +136,8 @@ def test_unknown_primary_diagnostic_excludes_required_only_refs():
     aliases = SupportWireAliases(catalog, [], {"work":"WRK-0000"})
     with pytest.raises(ValueError) as error:
         aliases.decode(SupportAssessmentWireResponse.model_validate({"results":[dict(
-            work_id="WRK-0000", status="supported", primary_ref="PRM-0007", required_refs=[])]}))
+            work_id="WRK-0000", status="supported", primary_ref="PRM-0007", required_refs=[],
+            omitted_matched_refs=[])]}))
     assert error.value.allowed_refs == ["PRM-0002"]
 
 
@@ -255,8 +256,10 @@ async def test_actual_executor_correction_marks_failed_attempt_recovered(monkeyp
         nonlocal calls
         calls += 1
         p = payload(kwargs["messages"][0]["content"])
-        row = dict(work_id=p["claims"][0]["work_id"], status="insufficient", primary_ref=None,
-            required_refs=["PRM-9999"] if calls == 1 else [], reason="not proven")
+        work_id = p["works"][0]["work_id"]
+        row = (dict(work_id=work_id, status="unsupported") if p["last"] else dict(
+            work_id=work_id, status="continue",
+            witness_delta=dict(support_witness_refs=["PRM-9999"] if calls == 1 else [], opposing_witness_refs=[])))
         return response(json.dumps({"results":[row]}))
     monkeypatch.setattr("litellm.acompletion", complete)
     class ExecutorClient(Client):
@@ -264,10 +267,11 @@ async def test_actual_executor_correction_marks_failed_attempt_recovered(monkeyp
             return await actual.evaluate_revision_work(prompt, **kwargs)
     executor = RevisionWorkExecutor(client=ExecutorClient(limit=100000), model="openai/gpt-4o")
     await executor.assess_many(work_items("Two reviewers approve US releases.\nRoutine note."))
-    assert calls == 2
+    # The first request is corrected once; the reading then continues to its last group.
+    assert calls == 3
     record = next(iter(sink.records.values()))
     assert record["outcome"] == "recovered"
-    assert record["failures"][-1]["location"] == "results[0].required_refs[0]"
+    assert record["failures"][-1]["location"] == "results[0].support_witness_refs[0]"
     assert "PRM-9999" in record["attempts"][0]["response"]["choices"][0]["message"]["content"]
 
 
