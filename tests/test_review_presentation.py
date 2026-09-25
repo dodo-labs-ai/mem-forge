@@ -46,7 +46,6 @@ def test_support_removal_explains_that_other_support_can_keep_memory_active() ->
 
 def test_legacy_internal_reason_is_only_technical_detail() -> None:
     presentation = present_memory_review(
-        kind="supersede",
         reason="deterministic_relation_conflict:v7:v8",
     )
 
@@ -57,7 +56,6 @@ def test_legacy_internal_reason_is_only_technical_detail() -> None:
 
 def test_source_backed_correction_explains_support_override() -> None:
     presentation = present_memory_review(
-        kind="supersede",
         reason="user corrected source-backed knowledge",
         source_backed_correction=True,
     )
@@ -65,21 +63,3 @@ def test_source_backed_correction_explains_support_override() -> None:
     assert "source-backed" in presentation.summary
     assert "active Source Support" in presentation.why_human
     assert "preserve its Source evidence" in presentation.actions[0].consequence
-
-
-def test_cross_source_conflict_is_presented_as_a_non_destructive_finding() -> None:
-    presentation = present_memory_review(
-        kind="cross_source_conflict",
-        reason="conflicting_source_authority",
-    )
-
-    assert presentation.decision_label == "Conflict"
-    assert presentation.summary == "Do these source-backed memories really conflict?"
-    assert presentation.current_label == "Source-backed memory"
-    assert presentation.proposed_label == "Other source-backed memory"
-    assert [action.key for action in presentation.actions] == [
-        "confirm_conflict",
-        "not_a_conflict",
-    ]
-    assert [action.decision for action in presentation.actions] == ["approve", "reject"]
-    assert all("keep both" in action.consequence for action in presentation.actions)

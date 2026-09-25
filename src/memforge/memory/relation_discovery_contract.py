@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from hashlib import sha256
-
-from memforge.memory.evidence import RelationDirection
-from memforge.memory.relation_classifier import MemoryRelationType
 
 
 CURRENT_RELATION_EVIDENCE_PREDICATE_SQL = """
@@ -20,6 +18,12 @@ AND er.observation_revision_id = so.current_revision_id
 """.strip()
 
 
+# Stored failure text is bounded; the error code carries the stable classification.
+RELATION_DISCOVERY_ERROR_MAX_CHARS = 4000
+# Audit event recorded for each work item an operator re-runs, before it is reset.
+RELATION_DISCOVERY_RERUN_EVENT = "relation_discovery_rerun"
+
+
 class RelationDiscoveryWorkStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -28,63 +32,87 @@ class RelationDiscoveryWorkStatus(str, Enum):
     OBSOLETE = "obsolete"
 
 
+class RelationDiscoveryWorkState(str, Enum):
+    """Operator-facing states; exhausted is failed work that used every attempt."""
+
+    EXHAUSTED = "exhausted"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True, slots=True)
-class PreclassifiedRelationDecision:
-    """Completed discovery snapshot with an optional edge, fenced against staleness.
+class RelationDiscoveryWorkSelection:
+    """Which durable discovery work an operator lists, counts or re-runs."""
 
-    A null relationship means no edge was proposed, not proven independence.
-    """
-
-    candidate_memory_id: str
-    expected_candidate_content_hash: str
-    expected_candidate_support_set_hash: str
-    expected_candidate_access_context_hash: str
-    expected_challenger_access_context_hash: str
-    relation_type: MemoryRelationType | None
-    direction: RelationDirection | None
-    reason: str
-    classifier_version: str
+    state: RelationDiscoveryWorkState
+    max_attempts: int
+    error_code: str | None = None
+    # Half-open range over the work's last update; a time without a zone is UTC.
+    updated_from: datetime | None = None
+    updated_to: datetime | None = None
+    classifier_version: str | None = None
 
     def __post_init__(self) -> None:
-        if (self.relation_type is None) != (self.direction is None):
-            raise ValueError("an omitted relationship cannot have a direction")
-        if self.relation_type is not None:
-            directional = self.relation_type is MemoryRelationType.REFINES
-            if directional == (self.direction is RelationDirection.SYMMETRIC):
-                raise ValueError("REFINES must be directional and other relations symmetric")
+        if self.max_attempts < 1:
+            raise ValueError("relation discovery selection requires positive max attempts")
 
-    def to_payload(self) -> dict[str, str | None]:
-        return {
-            "candidate_memory_id": self.candidate_memory_id,
-            "expected_candidate_content_hash": self.expected_candidate_content_hash,
-            "expected_candidate_support_set_hash": self.expected_candidate_support_set_hash,
-            "expected_candidate_access_context_hash": self.expected_candidate_access_context_hash,
-            "expected_challenger_access_context_hash": self.expected_challenger_access_context_hash,
-            "relation_type": self.relation_type.value if self.relation_type is not None else None,
-            "direction": self.direction.value if self.direction is not None else None,
-            "reason": self.reason,
-            "classifier_version": self.classifier_version,
-        }
+    @property
+    def rerunnable(self) -> bool:
+        """Only finished work is re-run; failed work still retrying is left to its schedule."""
 
-    @classmethod
-    def from_payload(cls, payload: dict[str, object]) -> "PreclassifiedRelationDecision":
-        return cls(
-            candidate_memory_id=str(payload["candidate_memory_id"]),
-            expected_candidate_content_hash=str(payload["expected_candidate_content_hash"]),
-            expected_candidate_support_set_hash=str(
-                payload.get("expected_candidate_support_set_hash") or ""
-            ),
-            expected_candidate_access_context_hash=str(
-                payload.get("expected_candidate_access_context_hash") or ""
-            ),
-            expected_challenger_access_context_hash=str(
-                payload.get("expected_challenger_access_context_hash") or ""
-            ),
-            relation_type=MemoryRelationType(str(payload["relation_type"])) if payload["relation_type"] is not None else None,
-            direction=RelationDirection(str(payload["direction"])) if payload["direction"] is not None else None,
-            reason=str(payload["reason"]),
-            classifier_version=str(payload["classifier_version"]),
-        )
+        return self.state is not RelationDiscoveryWorkState.FAILED
+
+
+def stored_work_time(moment: datetime) -> str:
+    """A time in the form work times are stored: ISO 8601 in UTC, so text order is time order."""
+
+    aware = moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+    return aware.astimezone(timezone.utc).isoformat()
+
+
+def relation_discovery_work_selection_sql(
+    selection: RelationDiscoveryWorkSelection,
+) -> tuple[str, tuple[object, ...]]:
+    """Portable predicate over relation_discovery_work for one selection."""
+
+    clauses: list[str]
+    params: list[object]
+    if selection.state is RelationDiscoveryWorkState.EXHAUSTED:
+        clauses, params = ["status = 'failed'", "attempts >= ?"], [selection.max_attempts]
+    elif selection.state is RelationDiscoveryWorkState.FAILED:
+        clauses, params = ["status = 'failed'", "attempts < ?"], [selection.max_attempts]
+    else:
+        clauses, params = ["status = 'completed'"], []
+    for column, operator, value in (
+        ("error_code", "=", selection.error_code),
+        ("updated_at", ">=", stored_work_time(selection.updated_from) if selection.updated_from else None),
+        ("updated_at", "<", stored_work_time(selection.updated_to) if selection.updated_to else None),
+        ("classifier_version", "=", selection.classifier_version),
+    ):
+        if value is not None:
+            clauses.append(f"{column} {operator} ?")
+            params.append(value)
+    return " AND ".join(clauses), tuple(params)
+
+
+def rerunnable_relation_discovery_work_sql(max_attempts: int) -> tuple[str, tuple[object, ...]]:
+    """Portable predicate for work an operator may re-run: completed or exhausted."""
+
+    completed, completed_params = relation_discovery_work_selection_sql(
+        RelationDiscoveryWorkSelection(state=RelationDiscoveryWorkState.COMPLETED, max_attempts=max_attempts)
+    )
+    exhausted, exhausted_params = relation_discovery_work_selection_sql(
+        RelationDiscoveryWorkSelection(state=RelationDiscoveryWorkState.EXHAUSTED, max_attempts=max_attempts)
+    )
+    return f"(({completed}) OR ({exhausted}))", (*completed_params, *exhausted_params)
+
+
+def relation_discovery_work_rerunnable(work: RelationDiscoveryWork, *, max_attempts: int) -> bool:
+    """The same rule as ``rerunnable_relation_discovery_work_sql``, for one loaded item."""
+
+    return work.status is RelationDiscoveryWorkStatus.COMPLETED or (
+        work.status is RelationDiscoveryWorkStatus.FAILED and work.attempts >= max_attempts
+    )
 
 
 def resolve_relation_discovery_actor_user_id(
@@ -111,11 +139,12 @@ class RelationDiscoveryRequest:
     expected_content_hash: str
     source_id: str
     source_unit_id: str
+    # The Source Unit revision whose commit queued the request, kept for audit;
+    # completion is fenced by the challenger's content and current evidence.
     source_unit_revision_id: str | None
     doc_id: str
     actor_user_id: str | None
     entity_ids: tuple[int, ...] = ()
-    preclassified_decisions: tuple[PreclassifiedRelationDecision, ...] = ()
 
     def __post_init__(self) -> None:
         required = {
@@ -129,14 +158,17 @@ class RelationDiscoveryRequest:
         missing = sorted(name for name, value in required.items() if not value)
         if missing:
             raise ValueError("relation discovery request requires " + ", ".join(missing))
-        candidate_ids = [item.candidate_memory_id for item in self.preclassified_decisions]
-        if len(set(candidate_ids)) != len(candidate_ids):
-            raise ValueError("duplicate preclassified relation candidate")
 
 
 @dataclass(frozen=True, slots=True)
 class RelationDiscoveryWork:
-    """A leased durable request; attempts are fenced by worker and lease token."""
+    """A leased durable request; attempts are fenced by worker and lease token.
+
+    ``run_generation`` counts operator re-runs, so each run of the same request
+    records a distinct relation run. ``error`` and ``error_code`` describe the
+    last failure; ``classifier_version`` names the classifier of the last
+    completed run.
+    """
 
     request: RelationDiscoveryRequest
     lifecycle_plan_id: str
@@ -147,6 +179,9 @@ class RelationDiscoveryWork:
     lease_until: str | None = None
     next_attempt_at: str | None = None
     error: str | None = None
+    error_code: str | None = None
+    run_generation: int = 0
+    classifier_version: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     completed_at: str | None = None

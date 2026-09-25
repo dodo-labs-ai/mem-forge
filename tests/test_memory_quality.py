@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.memory.store import MemoryStore
-from memforge.models import DocumentRecord, Memory, MemoryReview, RawMemory, content_hash
+from memforge.models import DocumentRecord, Memory, RawMemory, content_hash
 from memforge.storage.database import Database
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 
@@ -516,46 +516,6 @@ async def test_memory_detail_represents_unprojected_legacy_provenance_without_re
     assert item["observation_id"] is None
     assert item["observation_revision_id"] is None
     assert item["excerpt"] == "Legacy source excerpt."
-
-
-@pytest.mark.asyncio
-async def test_admin_memory_detail_exposes_reviewed_cross_source_conflict(db: Database, tmp_path: Path):
-    from memforge.server.admin_api import create_admin_app
-
-    incumbent = await _insert_memory(
-        db,
-        mem_id="mem-detail-conflict-a",
-        content="Payroll closes on the 20th.",
-    )
-    counterpart = await _insert_memory(
-        db,
-        mem_id="mem-detail-conflict-b",
-        content="Payroll closes on the 25th.",
-    )
-    await db.insert_memory_review(
-        MemoryReview(
-            id="review-detail-conflict",
-            kind="cross_source_conflict",
-            status="approved",
-            incumbent_memory_id=incumbent.id,
-            challenger_memory_id=counterpart.id,
-            reason="Both claims govern the same payroll scope.",
-            review_note="Confirmed source disagreement.",
-            reviewer="reviewer-1",
-            resolved_at=datetime.now(timezone.utc),
-        )
-    )
-
-    app = create_admin_app(db=db, config=_config(tmp_path))
-    with TestClient(app) as client:
-        response = client.get(f"/api/v1/memories/{incumbent.id}")
-
-    assert response.status_code == 200
-    [context] = response.json()["conflict_contexts"]
-    assert context["review_id"] == "review-detail-conflict"
-    assert context["counterpart_memory_id"] == counterpart.id
-    assert context["counterpart_summary"] == counterpart.content
-    assert context["disposition"] == "confirmed"
 
 
 @pytest.mark.asyncio

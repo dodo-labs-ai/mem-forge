@@ -8,7 +8,7 @@ adapter's job, never the caller's.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 from typing import Any, Mapping, Protocol, Sequence, TypedDict, runtime_checkable
@@ -20,9 +20,8 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
-    MemoryConflictContext,
-    MemoryReview,
     MemorySource,
+    MemorySourceRef,
     Project,
     SourceLifecycleResetResult,
 )
@@ -38,6 +37,7 @@ from memforge.memory.evidence import (
     RelationOutcomeBundle,
 )
 from memforge.memory.audit import MemoryAuditEvent
+from memforge.memory.cross_document_relation import CrossDocumentRelationOutcome, CurrentCrossDocumentRelation
 from memforge.memory.lifecycle_plan import (
     LegacyMemoryProvenance,
     LifecycleCutoverFinding,
@@ -49,7 +49,10 @@ from memforge.memory.lifecycle_plan import (
     LifecycleReviewStatus,
     LifecycleVectorTask,
 )
-from memforge.memory.relation_discovery_contract import RelationDiscoveryWork
+from memforge.memory.relation_discovery_contract import (
+    RelationDiscoveryWork,
+    RelationDiscoveryWorkSelection,
+)
 from memforge.memory.review_decision import ReviewVectorTask
 from memforge.source_projection import (
     ProjectionCoverage,
@@ -121,6 +124,8 @@ class ActiveMemorySupportState:
     unit_ids: tuple[str, ...] = ()
     current_unit_ids: tuple[str, ...] = ()
     support_scope_version: SupportScopeVersion = SupportScopeVersion.REFERENCE_SET_V1
+    # Newest source revision time among the current Support; None without one.
+    latest_source_revision_at: str | None = None
 
     @property
     def support_ids(self) -> tuple[str, ...]:
@@ -148,6 +153,7 @@ class ActiveMemorySupportRow:
     source_id: str
     access_context_hash: str
     is_current: bool
+    source_revision_at: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +165,30 @@ class ActiveMemoryUnitSupportRow:
     access_context_hash: str
     part_set_digest: str
     is_current: bool
+    source_revision_at: str | None
+
+
+def parse_source_revision_time(value: str | None) -> datetime | None:
+    """Parse one stored source revision time; a time without a zone is UTC.
+
+    Source adapters supply these times. One that is not ISO 8601 is unknown,
+    like a missing one, so it neither orders an ``updates`` pair nor fails a read.
+    """
+
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def latest_source_revision_at(values: Sequence[str | None]) -> str | None:
+    """The newest of several stored source revision times, as stored."""
+
+    dated = [(parsed, value) for value in values if (parsed := parse_source_revision_time(value)) is not None]
+    return max(dated)[1] if dated else None
 
 
 def build_active_memory_support_states(
@@ -170,6 +200,7 @@ def build_active_memory_support_states(
     ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
     grouped: dict[str, list[tuple[str, str, str]]] = {memory_id: [] for memory_id in ids}
     current_grouped: dict[str, list[tuple[str, str, str]]] = {memory_id: [] for memory_id in ids}
+    current_times: dict[str, list[str | None]] = {memory_id: [] for memory_id in ids}
     for row in sorted(
         rows,
         key=lambda item: (
@@ -184,6 +215,7 @@ def build_active_memory_support_states(
             grouped[row.memory_id].append(value)
             if row.is_current:
                 current_grouped[row.memory_id].append(value)
+                current_times[row.memory_id].append(row.source_revision_at)
     return {
         memory_id: ActiveMemorySupportState(
             reference_ids=tuple(reference_id for reference_id, _source_id, _access_hash in state_rows),
@@ -193,6 +225,7 @@ def build_active_memory_support_states(
             ),
             current_support_set_hash=active_support_rows_hash(current_grouped[memory_id]),
             source_ids=tuple(dict.fromkeys(source_id for _reference_id, source_id, _access_hash in state_rows)),
+            latest_source_revision_at=latest_source_revision_at(current_times[memory_id]),
         )
         for memory_id, state_rows in grouped.items()
     }
@@ -215,6 +248,7 @@ def build_active_memory_unit_support_states(
     current_grouped: dict[str, list[tuple[str, str, str, str, str]]] = {
         memory_id: [] for memory_id in ids
     }
+    current_times: dict[str, list[str | None]] = {memory_id: [] for memory_id in ids}
     for row in sorted(
         rows,
         key=lambda item: (
@@ -238,6 +272,7 @@ def build_active_memory_unit_support_states(
         grouped[row.memory_id].append(value)
         if row.is_current:
             current_grouped[row.memory_id].append(value)
+            current_times[row.memory_id].append(row.source_revision_at)
 
     def digest(values: Sequence[tuple[str, str, str, str, str]]) -> str:
         return hashlib.sha256(
@@ -262,6 +297,7 @@ def build_active_memory_unit_support_states(
                 for _sid, unit_id, _source, _access, _part in current_grouped[memory_id]
             ),
             support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
+            latest_source_revision_at=latest_source_revision_at(current_times[memory_id]),
         )
         for memory_id, values in grouped.items()
     }
@@ -378,11 +414,27 @@ class RelationalStore(Protocol):
         self,
         memory_ids: Sequence[str],
     ) -> Mapping[str, tuple[str, ...]]: ...
-    async def list_memory_conflict_contexts(
+    async def get_memory_source_refs_many(
         self,
         memory_ids: Sequence[str],
         scope: AccessScope,
-    ) -> Mapping[str, tuple[MemoryConflictContext, ...]]: ...
+    ) -> Mapping[str, tuple[MemorySourceRef, ...]]:
+        """Return each Memory's Sources that the caller may read, virtual Sources included."""
+        ...
+
+    async def list_cross_document_relations(
+        self,
+        memory_ids: Sequence[str],
+        scope: AccessScope,
+    ) -> Mapping[str, tuple[CurrentCrossDocumentRelation, ...]]:
+        """Return up to MAX_RELATIONS_PER_MEMORY current relations per Memory.
+
+        A relation is current when both Memories are active and visible under
+        ``scope``, both contents equal the stored hashes, and no dismissal that
+        is not undone names the same label and both hashes. Rows are ordered by
+        RELATION_READ_ORDER, then newest decision first.
+        """
+        ...
     async def get_memory_entity_ids(self, memory_id: str) -> list[int]: ...
     async def get_current_relation_evidence_unit(
         self,
@@ -883,8 +935,8 @@ class RelationalStore(Protocol):
         *,
         worker_id: str,
         lease_token: str,
-        relation_outcome: RelationOutcomeBundle,
-        reviews: Sequence[MemoryReview] = (),
+        relation_run: RelationOutcomeBundle,
+        document_relations: CrossDocumentRelationOutcome,
     ) -> None: ...
     async def fail_relation_discovery_work(
         self,
@@ -893,9 +945,14 @@ class RelationalStore(Protocol):
         worker_id: str,
         lease_token: str,
         error: str,
+        error_code: str,
         next_attempt_at: str | None,
         exhausted: bool,
     ) -> None: ...
+    async def count_relation_discovery_work(
+        self,
+        selection: RelationDiscoveryWorkSelection,
+    ) -> int: ...
     async def obsolete_relation_discovery_work(
         self,
         work_id: str,

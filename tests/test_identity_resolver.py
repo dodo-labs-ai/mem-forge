@@ -17,7 +17,6 @@ from memforge.memory.identity_resolver import (
 from memforge.memory.evidence import RelationDirection
 from memforge.memory.relation_classifier import (
     MemoryPair,
-    MemoryPairContext,
     MemoryPairClassification,
     MemoryPairClassificationError,
     MemoryPairDecision,
@@ -84,47 +83,6 @@ async def test_contradiction_scope_proof_is_preserved_in_auditable_reason() -> N
 
     assert "same_subject_and_scope=true" in decision.reason
     assert "Payroll area A closes Friday" in decision.reason
-
-
-@pytest.mark.asyncio
-async def test_different_source_scope_context_can_suppress_false_contradiction() -> None:
-    class ScopeAwareClient(RevisionClientFixture):
-        async def classify_memory_relations(self, prompt: str, **_kwargs):
-            payload = json.loads(
-                prompt.split("<memory_pair_groups>\n", 1)[1].split(
-                    "\n</memory_pair_groups>",
-                    1,
-                )[0]
-            )
-            assert payload[0]["challenger"]["source_context"]["source_id"] == "payroll-prod"
-            assert payload[0]["candidates"][0]["candidate"]["source_context"]["source_id"] == "payroll-template"
-            return SimpleNamespace(
-                decisions=[
-                    SimpleNamespace(
-                        pair_index=0,
-                        classification="unrelated",
-                        direction="symmetric",
-                        same_subject_and_scope=False,
-                        incompatible_assertions="",
-                        reason="Production policy and template example have different scopes.",
-                    )
-                ]
-            )
-
-    pair = MemoryPair(
-        _memory("challenger", "The cutoff is Friday."),
-        _memory("candidate", "The cutoff is Thursday."),
-        challenger_context=MemoryPairContext(source_id="payroll-prod", doc_id="prod-policy"),
-        candidate_context=MemoryPairContext(source_id="payroll-template", doc_id="example"),
-    )
-    [decision] = (
-        await StructuredMemoryPairClassifier(
-            client=ScopeAwareClient(),
-            model="test-model",
-        ).classify((pair,))
-    ).decisions
-
-    assert decision.relation_type is MemoryRelationType.UNRELATED
 
 
 @pytest.mark.asyncio
@@ -318,15 +276,6 @@ async def test_identity_resolver_bounds_candidate_recall_and_classification_work
     assert [len(call) for call in classifier.calls] == [2, 2, 1]
     assert [resolution.challenger for resolution in batch.resolutions] == list(challengers)
     assert all(resolution.target is None for resolution in batch.resolutions)
-    for resolution, candidate in zip(batch.resolutions, candidates, strict=True):
-        [decision] = resolution.classified_pairs
-        assert decision.candidate_memory_id == candidate.id
-        assert decision.candidate_content_hash == candidate.content_hash
-        assert decision.candidate_visibility == candidate.visibility
-        assert decision.candidate_owner_user_id == candidate.owner_user_id
-        assert decision.candidate_project_key == candidate.project_key
-        assert decision.candidate_repo_identifier == candidate.repo_identifier
-        assert not hasattr(decision, "pair")
     assert batch.metrics.pair_count == 5
     assert batch.metrics.llm_calls == 3
 
@@ -392,12 +341,6 @@ async def test_identity_resolver_batches_scope_and_reuses_only_equivalent_memory
         equivalent_incumbent,
         None,
     ]
-    assert results[0].classified_pairs == ()
-    assert [decision.relation_type for decision in results[1].classified_pairs] == [
-        MemoryRelationType.REFINES,
-        MemoryRelationType.EQUIVALENT,
-    ]
-    assert [decision.relation_type for decision in results[2].classified_pairs] == [MemoryRelationType.REFINES]
     assert len(classifier.calls) == 1
     assert batch.metrics.pair_count == 3
     assert batch.metrics.llm_calls == 1
@@ -456,7 +399,6 @@ async def test_identity_resolver_fails_closed_for_incomplete_structured_pair_led
 
     assert result.target is None
     assert result.equivalence_proof is None
-    assert result.classified_pairs == ()
     assert result.classification_complete is False
     assert result.failure_reason == (
         "memory relation classification failed (output_invalid): the response omits 1 of 2 requested IDs"

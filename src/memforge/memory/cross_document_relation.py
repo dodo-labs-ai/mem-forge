@@ -43,6 +43,13 @@ class CrossDocumentRelationLabel(str, Enum):
     CONTRADICTS = "contradicts"
 
 
+class CrossDocumentRelationDecider(str, Enum):
+    """Who decided a stored relation: the classifier or a person's confirmed Review."""
+
+    CLASSIFIER = "classifier"
+    REVIEW = "review"
+
+
 CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v2"
 
 # Requested output per request: a response envelope plus one label and one
@@ -136,6 +143,184 @@ class CrossDocumentRelationClassifier(Protocol):
         self,
         pairs: tuple[CrossDocumentRelationPair, ...],
     ) -> CrossDocumentRelationClassification: ...
+
+
+def pair_key(first_memory_id: str, second_memory_id: str) -> tuple[str, str]:
+    """The stored order of a pair: the lower Memory id first."""
+
+    if first_memory_id == second_memory_id:
+        raise ValueError("a relation needs two different Memories")
+    return (
+        (first_memory_id, second_memory_id)
+        if first_memory_id < second_memory_id
+        else (second_memory_id, first_memory_id)
+    )
+
+
+def pair_counterpart(memory_low_id: str, memory_high_id: str, memory_id: str) -> str:
+    """The other Memory of a stored pair."""
+
+    if memory_id == memory_low_id:
+        return memory_high_id
+    if memory_id == memory_high_id:
+        return memory_low_id
+    raise ValueError(f"{memory_id} is not part of this pair")
+
+
+@dataclass(frozen=True, slots=True)
+class CrossDocumentRelationRecord:
+    """One relation a discovery run found, bound to the two contents it judged."""
+
+    memory_low_id: str
+    memory_high_id: str
+    label: CrossDocumentRelationLabel
+    low_content_hash: str
+    high_content_hash: str
+    reason: str
+    relation_run_id: str
+    discovery_work_id: str
+    classifier_version: str = CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+
+    def __post_init__(self) -> None:
+        if self.memory_low_id >= self.memory_high_id:
+            raise ValueError("a relation pair must be stored lower Memory id first")
+        if self.label is CrossDocumentRelationLabel.NONE:
+            raise ValueError("a none judgment is not stored as a relation")
+
+    def counterpart_of(self, memory_id: str) -> str:
+        return pair_counterpart(self.memory_low_id, self.memory_high_id, memory_id)
+
+    @classmethod
+    def from_judgment(
+        cls,
+        judgment: CrossDocumentRelationJudgment,
+        *,
+        relation_run_id: str,
+        discovery_work_id: str,
+    ) -> CrossDocumentRelationRecord:
+        by_id = {
+            judgment.pair.challenger.memory_id: judgment.pair.challenger,
+            judgment.pair.candidate.memory_id: judgment.pair.candidate,
+        }
+        low_id, high_id = pair_key(*by_id)
+        return cls(
+            memory_low_id=low_id,
+            memory_high_id=high_id,
+            label=judgment.label,
+            low_content_hash=by_id[low_id].content_hash,
+            high_content_hash=by_id[high_id].content_hash,
+            reason=judgment.reason,
+            relation_run_id=relation_run_id,
+            discovery_work_id=discovery_work_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CrossDocumentRelationOutcome:
+    """What one discovery run judged for its challenger.
+
+    ``judged_content_hashes`` maps every judged candidate to the content it was
+    judged on; a judged candidate without a relation was judged none. Storage
+    records the outcome only while the challenger and every judged candidate
+    still hold those contents.
+    """
+
+    challenger_id: str
+    challenger_content_hash: str
+    judged_content_hashes: Mapping[str, str]
+    relations: tuple[CrossDocumentRelationRecord, ...] = ()
+
+    def __post_init__(self) -> None:
+        judged = {self.challenger_id: self.challenger_content_hash, **self.judged_content_hashes}
+        for record in self.relations:
+            counterpart = record.counterpart_of(self.challenger_id)
+            if counterpart not in self.judged_content_hashes or (
+                record.low_content_hash,
+                record.high_content_hash,
+            ) != (judged[record.memory_low_id], judged[record.memory_high_id]):
+                raise ValueError("a relation must name a judged pair and the contents it was judged on")
+
+    @classmethod
+    def from_judgments(
+        cls,
+        challenger: RelationSubject,
+        judgments: Sequence[CrossDocumentRelationJudgment],
+        *,
+        relation_run_id: str,
+        discovery_work_id: str,
+    ) -> CrossDocumentRelationOutcome:
+        if any(judgment.pair.challenger != challenger for judgment in judgments):
+            raise ValueError("a discovery outcome judges pairs of one challenger")
+        return cls(
+            challenger_id=challenger.memory_id,
+            challenger_content_hash=challenger.content_hash,
+            judged_content_hashes={
+                judgment.pair.candidate.memory_id: judgment.pair.candidate.content_hash
+                for judgment in judgments
+            },
+            relations=tuple(
+                CrossDocumentRelationRecord.from_judgment(
+                    judgment,
+                    relation_run_id=relation_run_id,
+                    discovery_work_id=discovery_work_id,
+                )
+                for judgment in judgments
+                if judgment.label is not CrossDocumentRelationLabel.NONE
+            ),
+        )
+
+
+# Relations shown per Memory, most consequential label first.
+MAX_RELATIONS_PER_MEMORY = 10
+RELATION_READ_ORDER = (
+    CrossDocumentRelationLabel.CONTRADICTS,
+    CrossDocumentRelationLabel.UPDATES,
+    CrossDocumentRelationLabel.EQUIVALENT,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentCrossDocumentRelation:
+    """A stored relation that is current for the caller.
+
+    Current means both Memories are active and visible to the caller, both
+    contents still equal the judged contents, and no active dismissal hides
+    it. ``label`` is the stored label; the reader decides how ``updates`` reads.
+    """
+
+    memory_low_id: str
+    memory_high_id: str
+    label: CrossDocumentRelationLabel
+    low_content_hash: str
+    high_content_hash: str
+    reason: str
+    decided_by: CrossDocumentRelationDecider
+    decided_at: str
+
+    def counterpart_of(self, memory_id: str) -> str:
+        return pair_counterpart(self.memory_low_id, self.memory_high_id, memory_id)
+
+
+@dataclass(frozen=True, slots=True)
+class CrossDocumentRelationDismissal:
+    """A person's record that one relation is wrong for both current contents."""
+
+    id: str
+    memory_low_id: str
+    memory_high_id: str
+    label: CrossDocumentRelationLabel
+    low_content_hash: str
+    high_content_hash: str
+    dismissed_by: str
+    dismissed_at: str
+    note: str | None = None
+
+    def counterpart_of(self, memory_id: str) -> str:
+        return pair_counterpart(self.memory_low_id, self.memory_high_id, memory_id)
+
+
+class RelationDismissalConflict(ValueError):
+    """The dismissal names content or a relation that is no longer current."""
 
 
 CROSS_DOCUMENT_RELATION_RULES = """Each pair holds two statements taken from different documents.

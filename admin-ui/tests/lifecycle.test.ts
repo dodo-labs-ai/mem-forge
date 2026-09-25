@@ -13,7 +13,6 @@ const baseMemory: Memory = {
   project_key: null,
   confidence: 0.9,
   corroboration_count: 1,
-  contradiction_count: 0,
   status: "active",
   retirement_reason: null,
   retired_at: null,

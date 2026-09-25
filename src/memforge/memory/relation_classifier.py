@@ -45,20 +45,9 @@ MEMORY_PAIR_CLASSIFIER_VERSION = "memory-relation-v3"
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryPairContext:
-    """Source and scope facts that disambiguate otherwise similar claims."""
-
-    source_id: str | None = None
-    doc_id: str | None = None
-    source_lineage_id: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class MemoryPair:
     challenger: Memory
     candidate: Memory
-    challenger_context: MemoryPairContext | None = None
-    candidate_context: MemoryPairContext | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -212,12 +201,8 @@ def _auditable_relation_reason(decision: Any) -> str:
     return f"{reason} [{proof}]" if reason else proof
 
 
-def _prompt_memory(
-    memory: Memory,
-    *,
-    context: MemoryPairContext | None,
-) -> dict[str, object]:
-    payload: dict[str, object] = {
+def _prompt_memory(memory: Memory) -> dict[str, object]:
+    return {
         "id": memory.id,
         "content": memory.content,
         "type": memory.memory_type,
@@ -229,13 +214,6 @@ def _prompt_memory(
         "created_at": memory.created_at.isoformat() if memory.created_at else None,
         "updated_at": memory.updated_at.isoformat() if memory.updated_at else None,
     }
-    if context is not None:
-        payload["source_context"] = {
-            "source_id": context.source_id,
-            "doc_id": context.doc_id,
-            "source_lineage_id": context.source_lineage_id,
-        }
-    return payload
 
 
 def _grouped_pair_payload(indexed_pairs: tuple[tuple[int, MemoryPair], ...]) -> str:
@@ -245,14 +223,14 @@ def _grouped_pair_payload(indexed_pairs: tuple[tuple[int, MemoryPair], ...]) -> 
         challenger_id = pair.challenger.id
         if challenger_id not in groups:
             groups[challenger_id] = {
-                "challenger": _prompt_memory(pair.challenger, context=pair.challenger_context),
+                "challenger": _prompt_memory(pair.challenger),
                 "candidates": [],
             }
             order.append(challenger_id)
         groups[challenger_id]["candidates"].append(
             {
                 "pair_index": pair_index,
-                "candidate": _prompt_memory(pair.candidate, context=pair.candidate_context),
+                "candidate": _prompt_memory(pair.candidate),
             }
         )
     return json.dumps([groups[challenger_id] for challenger_id in order], ensure_ascii=False)

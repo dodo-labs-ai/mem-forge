@@ -135,15 +135,6 @@ class ReviewService:
             incumbent=incumbent,
             challenger=challenger,
         )
-        if review.kind == ReviewKind.CROSS_SOURCE_CONFLICT.value:
-            return await self._resolve_cross_source_finding(
-                review,
-                incumbent=incumbent,
-                challenger=challenger,
-                status=ReviewStatus.APPROVED,
-                reviewer=reviewer,
-                note=note,
-            )
         self._guard_supersede(review, incumbent, challenger)
         await self._guard_fresh(review, incumbent, challenger)
         self._guard_related_pending(review, related_challengers, incumbent, challenger)
@@ -210,15 +201,6 @@ class ReviewService:
             incumbent=incumbent,
             challenger=challenger,
         )
-        if review.kind == ReviewKind.CROSS_SOURCE_CONFLICT.value:
-            return await self._resolve_cross_source_finding(
-                review,
-                incumbent=incumbent,
-                challenger=challenger,
-                status=ReviewStatus.REJECTED,
-                reviewer=reviewer,
-                note=note,
-            )
         self._guard_supersede(review, incumbent, challenger)
         await self._guard_fresh(review, incumbent, challenger)
         self._guard_related_pending(review, related_challengers, incumbent, challenger)
@@ -371,43 +353,6 @@ class ReviewService:
             return "durable_retry_pending"
         return "synchronized"
 
-    async def _resolve_cross_source_finding(
-        self,
-        review: MemoryReview,
-        *,
-        incumbent: Memory,
-        challenger: Memory,
-        status: ReviewStatus,
-        reviewer: str | None,
-        note: str | None,
-    ) -> ResolvedReview:
-        """Acknowledge or dismiss a cross-source finding without lifecycle mutation."""
-        await self._guard_fresh(review, incumbent, challenger)
-        await self._resolve_pending_review(
-            review.id,
-            status=status.value,
-            reviewer=reviewer,
-            review_note=note,
-        )
-        await self.memory_store.record_review_decision(
-            "cross_source_review_resolved",
-            memory_id=challenger.id,
-            review_id=review.id,
-            reviewer=reviewer,
-            reason=review.reason,
-            context=self.memory_store.operation_context(),
-            payload={
-                "incumbent_memory_id": incumbent.id,
-                "resolution": status.value,
-                "destructive_action": False,
-            },
-        )
-        return ResolvedReview(
-            review=await self.db.get_memory_review(review.id),  # type: ignore[arg-type]
-            incumbent=await self.db.get_memory(incumbent.id),
-            challenger=await self.db.get_memory(challenger.id),
-        )
-
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -416,6 +361,8 @@ class ReviewService:
         review = await self.db.get_memory_review(review_id)
         if review is None:
             raise ReviewNotFound(review_id)
+        if review.kind != ReviewKind.SUPERSEDE.value:
+            raise ReviewKindUnsupported(f"Review kind {review.kind!r} is not supported")
         if review.status != ReviewStatus.PENDING.value:
             raise ReviewAlreadyResolved(review)
         return review
@@ -453,8 +400,6 @@ class ReviewService:
         incumbent: Memory,
         challenger: Memory,
     ) -> None:
-        if review.kind != ReviewKind.SUPERSEDE.value:
-            raise ReviewKindUnsupported(f"Review kind {review.kind!r} is not supported in this version")
         if challenger.status != "pending_review":
             raise ReviewError(f"Challenger {challenger.id} has status {challenger.status!r}; expected pending_review")
         if incumbent.status != "active":

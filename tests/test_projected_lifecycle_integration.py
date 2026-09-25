@@ -58,7 +58,6 @@ from memforge.memory.evidence import (
     LifecycleAction,
     MemorySupportAssertion,
     MemoryUnitSupportAssertion,
-    RelationDirection,
     RelationOutcomeBundle,
     RelationRunRecord,
     RelationType,
@@ -98,10 +97,12 @@ from memforge.memory.relation_candidate_retrieval import (
     CrossDocumentCandidateSelection,
     RetrievedRelationCandidate,
 )
-from memforge.memory.relation_classifier import (
-    MemoryPairClassification,
-    MemoryPairDecision,
-    MemoryRelationType,
+from memforge.memory.cross_document_relation import (
+    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+    CrossDocumentRelationClassification,
+    CrossDocumentRelationJudgment,
+    CrossDocumentRelationLabel,
+    CrossDocumentRelationOutcome,
 )
 from memforge.memory.relation_discovery import RelationDiscovery
 from memforge.models import (
@@ -7207,10 +7208,11 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
         assert stats["added"] == 1 and stats["corroborated"] == 0
         [row] = await db.db.execute_fetchall("SELECT payload_json FROM lifecycle_plans WHERE source_id = ?", ("src-2",))
         request = json.loads(row["payload_json"])["relation_discovery_requests"][0]
-        [snapshot] = request["preclassified_decisions"]
-        assert snapshot["candidate_memory_id"] == incumbent.id
-        assert snapshot["relation_type"] is None and snapshot["direction"] is None
-        assert snapshot["expected_candidate_content_hash"] == incumbent.content_hash
+        assert "preclassified_decisions" not in request
+        [work] = await db.db.execute_fetchall(
+            "SELECT memory_id FROM relation_discovery_work WHERE id = ?", (request["id"],)
+        )
+        assert work["memory_id"] == request["memory_id"]
         return
     assert stats["added"] == 0
     assert stats["corroborated"] == 1
@@ -7881,6 +7883,7 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
         worker_id="relation-worker-a",
         lease_token=work.lease_token or "",
         error="transient classifier failure",
+        error_code="TimeoutError",
         next_attempt_at="2999-01-01T00:00:00+00:00",
         exhausted=False,
     )
@@ -7977,7 +7980,7 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
         completion.request.id,
         worker_id="relation-worker-d",
         lease_token=completion.lease_token or "",
-        relation_outcome=RelationOutcomeBundle(
+        relation_run=RelationOutcomeBundle(
             evidence_unit=evidence_unit,
             relation_run=RelationRunRecord(
                 id="relation-run-empty-discovery",
@@ -7997,6 +8000,11 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
                 completed_at=completed_at,
             ),
         ),
+        document_relations=CrossDocumentRelationOutcome(
+            challenger_id=memory.id,
+            challenger_content_hash=memory.content_hash,
+            judged_content_hashes={},
+        ),
     )
 
     assert await db.get_evidence_relations(evidence_unit.id) == authoritative_relations
@@ -8010,31 +8018,16 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
     assert completed_work["error"] is None
 
 
-class _DeterministicRefinementClassifier:
-    async def classify(self, pairs):
-        return MemoryPairClassification(
-            decisions=tuple(
-                MemoryPairDecision(
-                    pair=pair,
-                    relation_type=MemoryRelationType.REFINES,
-                    direction=RelationDirection.CHALLENGER_TO_CANDIDATE,
-                    reason="deterministic contract fixture",
-                )
-                for pair in pairs
-            ),
-            llm_calls=1 if pairs else 0,
-            prompt_chars=123 if pairs else 0,
-        )
+class _DeterministicRelationClassifier:
+    def __init__(self, label: CrossDocumentRelationLabel = CrossDocumentRelationLabel.UPDATES) -> None:
+        self.label = label
 
-
-class _DeterministicContradictionClassifier:
     async def classify(self, pairs):
-        return MemoryPairClassification(
-            decisions=tuple(
-                MemoryPairDecision(
+        return CrossDocumentRelationClassification(
+            judgments=tuple(
+                CrossDocumentRelationJudgment(
                     pair=pair,
-                    relation_type=MemoryRelationType.CONTRADICTS,
-                    direction=RelationDirection.SYMMETRIC,
+                    label=self.label,
                     reason="deterministic contract fixture",
                 )
                 for pair in pairs
@@ -8141,12 +8134,12 @@ async def _create_relation_discovery_fixture(
 
 
 @pytest.mark.asyncio
-async def test_relation_discovery_rejects_stale_source_unit_revision(
+async def test_relation_discovery_completes_after_source_unit_revision_with_current_evidence(
     db: Database,
 ) -> None:
     projection, _memory = await _create_relation_discovery_fixture(
         db,
-        run_id="projection-stale-relation-revision",
+        run_id="projection-newer-unit-revision",
     )
     await db.db.execute(
         "UPDATE source_units SET current_revision_id = NULL WHERE id = ?",
@@ -8157,14 +8150,13 @@ async def test_relation_discovery_rejects_stale_source_unit_revision(
     result = await RelationDiscovery(
         store=db,
         candidate_retriever=_EmptyRelationCandidates(),
-        pair_classifier=_DeterministicRefinementClassifier(),
+        pair_classifier=_DeterministicRelationClassifier(),
     ).process_slice(worker_id="relation-worker")
 
-    assert result.failed_work == 1
+    assert result.completed_work == 1
     row = await db.db.execute_fetchall("SELECT status, error FROM relation_discovery_work")
-    assert row[0]["status"] == "failed"
-    assert "Source Unit revision is stale" in row[0]["error"]
-    assert await db.db.execute_fetchall("SELECT id FROM relation_runs") == []
+    assert row[0]["status"] == "completed"
+    assert row[0]["error"] is None
 
 
 @pytest.mark.asyncio
@@ -8192,7 +8184,7 @@ async def test_relation_discovery_does_not_overwrite_changed_evidence_access(
     result = await RelationDiscovery(
         store=db,
         candidate_retriever=_EmptyRelationCandidates(change_access),
-        pair_classifier=_DeterministicRefinementClassifier(),
+        pair_classifier=_DeterministicRelationClassifier(),
     ).process_slice(worker_id="relation-worker")
 
     assert result.failed_work == 1
@@ -8229,7 +8221,7 @@ async def test_relation_discovery_rejects_primary_evidence_demotion_before_commi
     result = await RelationDiscovery(
         store=db,
         candidate_retriever=_EmptyRelationCandidates(demote_primary_evidence),
-        pair_classifier=_DeterministicRefinementClassifier(),
+        pair_classifier=_DeterministicRelationClassifier(),
     ).process_slice(worker_id="relation-worker")
 
     assert result.failed_work == 1
@@ -8293,7 +8285,7 @@ async def test_relation_discovery_rejects_candidate_provenance_removed_before_co
     result = await RelationDiscovery(
         store=db,
         candidate_retriever=_MutatingRelationCandidates(candidate, remove_provenance),
-        pair_classifier=_DeterministicRefinementClassifier(),
+        pair_classifier=_DeterministicRelationClassifier(),
     ).process_slice(worker_id="relation-worker")
 
     assert result.failed_work == 1
@@ -8364,7 +8356,7 @@ async def test_relation_discovery_rejects_candidate_support_change_before_commit
     result = await RelationDiscovery(
         store=db,
         candidate_retriever=_MutatingRelationCandidates(candidate, attach_new_support),
-        pair_classifier=_DeterministicRefinementClassifier(),
+        pair_classifier=_DeterministicRelationClassifier(),
     ).process_slice(worker_id="relation-worker")
 
     assert result.failed_work == 1
@@ -8446,7 +8438,7 @@ async def test_private_relation_completion_rechecks_access_as_current_owner(
     result = await RelationDiscovery(
         store=db,
         candidate_retriever=_MutatingRelationCandidates(candidate, disable_candidate_source),
-        pair_classifier=_DeterministicRefinementClassifier(),
+        pair_classifier=_DeterministicRelationClassifier(),
     ).process_slice(worker_id="relation-worker")
 
     assert result.failed_work == 1
@@ -8462,7 +8454,7 @@ async def test_private_relation_completion_rechecks_access_as_current_owner(
      ("user_memory", "user_memory"), ("user_correction", "user_correction")],
 )
 @pytest.mark.asyncio
-async def test_relation_discovery_persists_direction_after_lifecycle_commit(
+async def test_relation_discovery_records_relation_after_lifecycle_commit(
     db: Database,
     candidate_source_id: str,
     candidate_source_type: str,
@@ -8539,7 +8531,7 @@ async def test_relation_discovery_persists_direction_after_lifecycle_commit(
     result = await RelationDiscovery(
         store=db,
         candidate_retriever=candidates,
-        pair_classifier=_DeterministicRefinementClassifier(),
+        pair_classifier=_DeterministicRelationClassifier(),
     ).process_slice(worker_id="relation-worker")
 
     assert result.completed_work == 1
@@ -8551,22 +8543,257 @@ async def test_relation_discovery_persists_direction_after_lifecycle_commit(
         source_unit_id=projection.source_units[0].id,
     )
     assert unit is not None
-    [relation] = await db.get_evidence_relations(unit.id)
-    assert relation.memory_id == candidate.id
-    assert relation.relation_type is RelationType.REFINES
-    assert relation.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
+    assert all(relation.memory_id != candidate.id for relation in await db.get_evidence_relations(unit.id))
+    low_id, high_id = sorted((challenger.id, candidate.id))
+    [relation] = await db.db.execute_fetchall("SELECT * FROM cross_document_relations")
+    assert (relation["memory_low_id"], relation["memory_high_id"]) == (low_id, high_id)
+    assert relation["label"] == "updates"
+    assert relation["decided_by"] == "classifier"
+    assert relation["classifier_version"] == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+    assert {relation["low_content_hash"], relation["high_content_hash"]} == {
+        challenger.content_hash,
+        candidate.content_hash,
+    }
     [relation_run] = await db.db.execute_fetchall(
         "SELECT result_memory_id FROM relation_runs WHERE evidence_unit_id = ?",
         (unit.id,),
     )
     assert relation_run["result_memory_id"] == challenger.id
-    [work] = await db.db.execute_fetchall("SELECT status FROM relation_discovery_work")
+    [work] = await db.db.execute_fetchall("SELECT status, classifier_version FROM relation_discovery_work")
     assert work["status"] == "completed"
+    assert work["classifier_version"] == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
     assert (await db.get_memory(candidate.id)).status == "active"
     assert (await db.get_memory(challenger.id)).status == "active"
     source_ids = await db.get_memory_source_ids_many((candidate.id,))
     expected_sources = () if candidate_source_type.startswith("user_") else (candidate_source_id,)
     assert source_ids[candidate.id] == expected_sources
+
+
+@pytest.mark.asyncio
+async def test_support_states_report_the_newest_current_source_revision_time_in_both_scopes(
+    db: Database,
+) -> None:
+    _projection_row, memory = await _create_relation_discovery_fixture(db, run_id="projection-revision-time")
+    revision_time = "2026-07-14T09:30:00Z"
+    await db.db.execute("UPDATE source_observation_revisions SET observed_at = ?", (revision_time,))
+    await db.db.commit()
+
+    v1_state = (await db.get_active_memory_support_states((memory.id,)))[memory.id]
+
+    assert v1_state.support_scope_version is SupportScopeVersion.REFERENCE_SET_V1
+    assert v1_state.latest_source_revision_at == revision_time
+
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(expected_report_id=cutover.id, owner_id="revision-time")
+    [unit_time] = await db.db.execute_fetchall(
+        """SELECT eu.observed_at FROM memory_unit_support_assertions msa
+             JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+            WHERE msa.memory_id = ? AND msa.active = 1""",
+        (memory.id,),
+    )
+
+    v2_state = (await db.get_active_memory_support_states((memory.id,)))[memory.id]
+
+    assert v2_state.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
+    assert v2_state.latest_source_revision_at == unit_time["observed_at"] == "2026-07-15T11:00:00+00:00"
+
+
+async def _relation_pair_fixture(db: Database, *, run_id: str) -> tuple[Memory, Memory]:
+    _projection_row, challenger = await _create_relation_discovery_fixture(db, run_id=run_id)
+    candidate = Memory(
+        id="mem-relation-pair-candidate",
+        memory_type="decision",
+        content="A7 applies to payroll.",
+        content_hash=content_hash("A7 applies to payroll."),
+        project_key="ENG",
+    )
+    await db.insert_memory(candidate)
+    now = datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="other-doc",
+            source="src-other",
+            source_url="https://example.test/other-doc",
+            title="Relation candidate",
+            space_or_project="ENG",
+            author=None,
+            last_modified=now,
+            labels=[],
+            version="1",
+            content_hash="candidate-doc-hash",
+            token_count=4,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=now,
+        )
+    )
+    await db.add_memory_source(candidate.id, "other-doc", "confluence", source_updated_at=now)
+    return challenger, candidate
+
+
+async def _run_relation_discovery(
+    db: Database,
+    candidate: Memory,
+    label: CrossDocumentRelationLabel,
+    *,
+    candidates=None,
+):
+    return await RelationDiscovery(
+        store=db,
+        candidate_retriever=candidates or _DeterministicRelationCandidates(candidate),
+        pair_classifier=_DeterministicRelationClassifier(label),
+    ).process_slice(worker_id="relation-worker")
+
+
+async def _rerun_relation_work(db: Database) -> None:
+    await db.db.execute(
+        """UPDATE relation_discovery_work
+              SET status = 'pending', attempts = 0, run_generation = run_generation + 1,
+                  completed_at = NULL"""
+    )
+    await db.db.commit()
+
+
+async def _stored_relations(db: Database) -> list[dict]:
+    return [
+        dict(row)
+        for row in await db.db.execute_fetchall(
+            "SELECT memory_low_id, memory_high_id, label, decided_by, low_content_hash, high_content_hash "
+            "FROM cross_document_relations"
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_none_judgment_drops_the_classifier_relation(db: Database) -> None:
+    challenger, candidate = await _relation_pair_fixture(db, run_id="projection-relation-none")
+
+    first = await _run_relation_discovery(db, candidate, CrossDocumentRelationLabel.CONTRADICTS)
+    assert first.completed_work == 1
+    assert [row["label"] for row in await _stored_relations(db)] == ["contradicts"]
+
+    await _rerun_relation_work(db)
+    second = await _run_relation_discovery(db, candidate, CrossDocumentRelationLabel.NONE)
+
+    assert second.completed_work == 1
+    assert await _stored_relations(db) == []
+    assert len(await db.db.execute_fetchall("SELECT id FROM relation_runs WHERE result_memory_id = ?", (challenger.id,))) == 2
+
+
+async def _insert_review_relation(
+    db: Database,
+    challenger: Memory,
+    candidate: Memory,
+    label: CrossDocumentRelationLabel = CrossDocumentRelationLabel.CONTRADICTS,
+) -> None:
+    by_id = {challenger.id: challenger, candidate.id: candidate}
+    low_id, high_id = sorted(by_id)
+    await db.db.execute(
+        """INSERT INTO cross_document_relations (
+               memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
+               reason, decided_by, decided_at
+           ) VALUES (?, ?, ?, ?, ?, 'confirmed by a reviewer', 'review', ?)""",
+        (
+            low_id,
+            high_id,
+            label.value,
+            by_id[low_id].content_hash,
+            by_id[high_id].content_hash,
+            "2026-07-20T00:00:00+00:00",
+        ),
+    )
+    await db.db.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("confirmed", "label"),
+    [
+        (CrossDocumentRelationLabel.CONTRADICTS, CrossDocumentRelationLabel.UPDATES),
+        (CrossDocumentRelationLabel.CONTRADICTS, CrossDocumentRelationLabel.NONE),
+        (CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.CONTRADICTS),
+        (CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.NONE),
+    ],
+)
+async def test_relation_discovery_keeps_a_confirmed_relation_while_both_memories_are_unchanged(
+    db: Database,
+    confirmed: CrossDocumentRelationLabel,
+    label: CrossDocumentRelationLabel,
+) -> None:
+    challenger, candidate = await _relation_pair_fixture(db, run_id="projection-relation-review-kept")
+    await _insert_review_relation(db, challenger, candidate, confirmed)
+
+    result = await _run_relation_discovery(db, candidate, label)
+
+    assert result.completed_work == 1
+    assert [(row["label"], row["decided_by"]) for row in await _stored_relations(db)] == [
+        (confirmed.value, "review")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_replaces_a_confirmed_relation_after_a_memory_changed(db: Database) -> None:
+    challenger, candidate = await _relation_pair_fixture(db, run_id="projection-relation-review-replaced")
+    await _insert_review_relation(db, challenger, candidate)
+    revised = replace(
+        candidate,
+        content="A7 applies to all payroll runs.",
+        content_hash=content_hash("A7 applies to all payroll runs."),
+    )
+    await db.db.execute(
+        "UPDATE memories SET content = ?, content_hash = ? WHERE id = ?",
+        (revised.content, revised.content_hash, candidate.id),
+    )
+    await db.db.commit()
+
+    result = await _run_relation_discovery(db, revised, CrossDocumentRelationLabel.UPDATES)
+
+    assert result.completed_work == 1
+    [row] = await _stored_relations(db)
+    assert (row["label"], row["decided_by"]) == ("updates", "classifier")
+    assert revised.content_hash in {row["low_content_hash"], row["high_content_hash"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label", [CrossDocumentRelationLabel.CONTRADICTS, CrossDocumentRelationLabel.NONE]
+)
+async def test_relation_discovery_rejects_a_candidate_whose_content_changed_before_commit(
+    db: Database, label: CrossDocumentRelationLabel,
+) -> None:
+    challenger, candidate = await _relation_pair_fixture(db, run_id="projection-relation-stale-content")
+    revised = replace(
+        candidate,
+        content="A7 applies to all payroll runs.",
+        content_hash=content_hash("A7 applies to all payroll runs."),
+    )
+
+    async def revise_candidate() -> None:
+        # The candidate's own content changes without a Support change, and a
+        # relation is recorded for the new content before this run completes.
+        await db.db.execute(
+            "UPDATE memories SET content = ?, content_hash = ? WHERE id = ?",
+            (revised.content, revised.content_hash, candidate.id),
+        )
+        await db.db.commit()
+        await _insert_review_relation(db, challenger, revised)
+
+    result = await _run_relation_discovery(
+        db,
+        candidate,
+        label,
+        candidates=_MutatingRelationCandidates(candidate, revise_candidate),
+    )
+
+    assert result.failed_work == 1
+    [row] = await db.db.execute_fetchall("SELECT status, error FROM relation_discovery_work")
+    assert row["status"] == "failed"
+    assert "relation discovery candidate is stale" in row["error"]
+    [relation] = await _stored_relations(db)
+    assert revised.content_hash in {relation["low_content_hash"], relation["high_content_hash"]}
+    assert await db.db.execute_fetchall("SELECT id FROM relation_runs WHERE status = 'checked'") == []
 
 
 @pytest.mark.asyncio
@@ -9244,13 +9471,18 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
     discovery = await RelationDiscovery(
         store=db,
         candidate_retriever=_candidate_retriever(adapters),
-        pair_classifier=_DeterministicContradictionClassifier(),
+        pair_classifier=_DeterministicRelationClassifier(CrossDocumentRelationLabel.CONTRADICTS),
     ).process_slice(worker_id="relation-worker-cross-source")
     assert discovery.completed_work == 1
     assert discovery.checked_candidate_pairs >= 1
-    cross_source_review = await db.get_pending_review_for_challenger(replacement.id)
-    assert cross_source_review is not None
-    assert cross_source_review.kind == "cross_source_conflict"
+    assert await db.get_pending_review_for_challenger(replacement.id) is None
+    relation_rows = await db.db.execute_fetchall(
+        "SELECT memory_low_id, memory_high_id, label, decided_by FROM cross_document_relations"
+    )
+    assert {
+        (row["memory_low_id"], row["memory_high_id"], row["label"], row["decided_by"])
+        for row in relation_rows
+    } >= {(*sorted((replacement.id, cross_source_memory.id)), "contradicts", "classifier")}
     assert (await db.get_memory(cross_source_memory.id)).status == "active"
     assert (await db.get_memory(replacement.id)).status == "active"
     persisted_evidence = await db.get_evidence_unit(evidence.units[0].id)

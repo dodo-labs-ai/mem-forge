@@ -21,15 +21,15 @@ const postMock = vi.mocked(resourceClient.post);
 
 function detailFixture(): MemoryReviewDetail {
   return {
-    id: "review-conflict",
-    kind: "cross_source_conflict",
+    id: "review-update",
+    kind: "supersede",
     status: "pending",
     review_origin: "memory",
     source_id: null,
     source_name: "Payroll Agent",
     incumbent_memory_id: "memory-a",
     challenger_memory_id: "memory-b",
-    reason: "same-scope contradiction",
+    reason: "newer payroll close day",
     review_note: null,
     reviewer: null,
     expected_incumbent_updated_at: "2026-08-08T09:00:00+00:00",
@@ -39,29 +39,29 @@ function detailFixture(): MemoryReviewDetail {
     is_stale: false,
     decision_fingerprint: "review-decision-v1:exact",
     presentation: {
-      decision_label: "Conflict",
-      summary: "Do these source-backed memories really conflict?",
-      why_human: "Source authority has not been decided.",
-      current_label: "Source-backed memory A",
-      proposed_label: "Source-backed memory B",
-      proposed_empty_text: "Memory B unavailable",
+      decision_label: "Updated",
+      summary: "Use the proposed memory or keep the current one?",
+      why_human: "The update would change active memory state.",
+      current_label: "Current memory",
+      proposed_label: "Proposed memory",
+      proposed_empty_text: "The proposed memory snapshot is unavailable.",
       actions: [
         {
-          key: "confirm_conflict",
+          key: "use_latest_state",
           decision: "approve",
-          label: "Confirm conflict",
-          consequence: "Close the finding and keep both memories active.",
+          label: "Use latest state",
+          consequence: "Use the proposed state going forward.",
           requires_note: false,
         },
         {
-          key: "not_a_conflict",
+          key: "keep_current_state",
           decision: "reject",
-          label: "Not a conflict",
-          consequence: "Dismiss the finding and keep both memories active.",
+          label: "Keep current state",
+          consequence: "Keep the current memory active and discard this proposal.",
           requires_note: true,
         },
       ],
-      technical_reason: "same-scope contradiction",
+      technical_reason: "newer payroll close day",
     },
     incumbent: {
       id: "memory-a",
@@ -146,17 +146,17 @@ describe("Review interaction", () => {
 
   afterEach(cleanup);
 
-  it("uses truthful cross-source dismissal, requires a note, and sends the fingerprint", async () => {
+  it("requires a note to keep the current state and sends the fingerprint", async () => {
     const detail = detailFixture();
     getMock.mockResolvedValue({ data: detail });
     postMock.mockResolvedValue({ data: { ...detail, status: "rejected" } });
     const user = userEvent.setup();
 
-    renderAt("/review/review-conflict", <ReviewDetailPage />);
+    renderAt("/review/review-update", <ReviewDetailPage />);
 
     expect(await screen.findByRole("heading", { name: detail.presentation.summary })).toBeTruthy();
-    expect(screen.getAllByText(/keep both memories active/i)).toHaveLength(2);
-    const dismiss = screen.getByRole("button", { name: "Not a conflict" });
+    expect(screen.getByText(/discard this proposal/i)).toBeTruthy();
+    const dismiss = screen.getByRole("button", { name: "Keep current state" });
     expect((dismiss as HTMLButtonElement).disabled).toBe(true);
     await user.type(screen.getByLabelText("Decision note"), "Different payroll environments");
     expect((dismiss as HTMLButtonElement).disabled).toBe(false);
@@ -164,24 +164,24 @@ describe("Review interaction", () => {
     await user.keyboard("{Enter}");
 
     await waitFor(() =>
-      expect(postMock).toHaveBeenCalledWith("/memory-reviews/review-conflict/reject", {
+      expect(postMock).toHaveBeenCalledWith("/memory-reviews/review-update/reject", {
         expected_fingerprint: "review-decision-v1:exact",
         note: "Different payroll environments",
       }),
     );
   });
 
-  it("confirms a cross-source finding without requiring a note", async () => {
+  it("uses the latest state without requiring a note", async () => {
     const detail = detailFixture();
     getMock.mockResolvedValue({ data: detail });
     postMock.mockResolvedValue({ data: { ...detail, status: "approved" } });
     const user = userEvent.setup();
 
-    renderAt("/review/review-conflict", <ReviewDetailPage />);
-    await user.click(await screen.findByRole("button", { name: "Confirm conflict" }));
+    renderAt("/review/review-update", <ReviewDetailPage />);
+    await user.click(await screen.findByRole("button", { name: "Use latest state" }));
 
     await waitFor(() =>
-      expect(postMock).toHaveBeenCalledWith("/memory-reviews/review-conflict/approve", {
+      expect(postMock).toHaveBeenCalledWith("/memory-reviews/review-update/approve", {
         expected_fingerprint: "review-decision-v1:exact",
         note: null,
       }),
@@ -241,9 +241,9 @@ describe("Review interaction", () => {
     });
     const user = userEvent.setup();
 
-    renderAt("/review/review-conflict", <ReviewDetailPage />);
-    await screen.findByRole("button", { name: "Confirm conflict" });
-    await user.click(screen.getByRole("button", { name: "Confirm conflict" }));
+    renderAt("/review/review-update", <ReviewDetailPage />);
+    await screen.findByRole("button", { name: "Use latest state" });
+    await user.click(screen.getByRole("button", { name: "Use latest state" }));
 
     expect(await screen.findByText("Review participants changed")).toBeTruthy();
     expect(getMock.mock.calls.length).toBeGreaterThan(1);
@@ -255,8 +255,8 @@ describe("Review interaction", () => {
     postMock.mockRejectedValue({ response: { status: 403, data: { detail: "Source management required" } } });
     const user = userEvent.setup();
 
-    renderAt("/review/review-conflict", <ReviewDetailPage />);
-    await user.click(await screen.findByRole("button", { name: "Confirm conflict" }));
+    renderAt("/review/review-update", <ReviewDetailPage />);
+    await user.click(await screen.findByRole("button", { name: "Use latest state" }));
 
     expect(await screen.findByText("Source management required")).toBeTruthy();
     expect(screen.getByText("Payroll area A closes Friday.")).toBeTruthy();
@@ -268,17 +268,17 @@ describe("Review interaction", () => {
 
     renderAt("/review?page=3", <ReviewQueuePage />);
     const filter = await screen.findByLabelText("Filter reviews");
-    fireEvent.change(filter, { target: { value: "cross_source_conflict" } });
+    fireEvent.change(filter, { target: { value: "memory" } });
 
     await waitFor(() => {
       const [, options] = getMock.mock.calls.at(-1) ?? [];
       expect(options?.params).toMatchObject({
         status: "open",
-        kind: "cross_source_conflict",
+        origin: "memory",
         offset: 0,
       });
     });
-    expect(screen.getByText(/Resolve lifecycle proposals and conflict findings/)).toBeTruthy();
+    expect(screen.getByText(/Resolve lifecycle proposals and Memory updates/)).toBeTruthy();
   });
 
   it("shows the exact total and requests the next actionable page", async () => {

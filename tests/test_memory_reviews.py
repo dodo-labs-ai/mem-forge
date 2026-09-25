@@ -16,10 +16,12 @@ from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.lifecycle_plan import LifecycleReviewStatus
 from memforge.memory.lifecycle_planner import lifecycle_memory_version
 from memforge.memory.review_decision import memory_review_decision_fingerprint
+from memforge.memory.cross_source_conflict_reviews import CROSS_SOURCE_CONFLICT_REVIEW_KIND
 from memforge.memory.review_service import (
     ResolvedReview,
     ReviewAlreadyResolved,
     ReviewError,
+    ReviewKindUnsupported,
     ReviewService,
 )
 from memforge.memory.store import MemoryStore
@@ -415,7 +417,7 @@ async def _seed_cross_source_review(
     )
     review = MemoryReview(
         id=generate_review_id(),
-        kind=ReviewKind.CROSS_SOURCE_CONFLICT.value,
+        kind=CROSS_SOURCE_CONFLICT_REVIEW_KIND,
         status=ReviewStatus.PENDING.value,
         incumbent_memory_id=incumbent.id,
         challenger_memory_id=challenger.id,
@@ -930,7 +932,7 @@ class TestUnifiedLifecycleReviewApi:
         chroma,
         tmp_path,
     ):
-        incumbent, challenger, review = await _seed_cross_source_review(db, chroma)
+        incumbent, challenger, review = await _seed_supersede_review(db, chroma)
         for memory in (incumbent, challenger):
             await db.db.execute(
                 "UPDATE memories SET visibility = 'private', owner_user_id = ? WHERE id = ?",
@@ -1029,7 +1031,7 @@ class TestUnifiedLifecycleReviewApi:
         chroma,
         tmp_path,
     ):
-        incumbent, challenger, review = await _seed_cross_source_review(db, chroma)
+        incumbent, challenger, review = await _seed_supersede_review(db, chroma)
         from memforge.server.admin_api import create_admin_app
 
         app = create_admin_app(db=db, config=_config(tmp_path))
@@ -1066,7 +1068,7 @@ class TestUnifiedLifecycleReviewApi:
         assert unrelated_fingerprint.status_code == 409
         stored = await db.get_memory_review(review.id)
         assert stored is not None and stored.reviewer == "dev"
-        assert (await db.get_memory(incumbent.id)).status == "active"
+        assert (await db.get_memory(incumbent.id)).status == "superseded"
         assert (await db.get_memory(challenger.id)).status == "active"
 
     @pytest.mark.asyncio
@@ -1076,19 +1078,19 @@ class TestUnifiedLifecycleReviewApi:
         chroma,
         tmp_path,
     ):
-        incumbent, challenger, cross_review = await _seed_cross_source_review(db, chroma)
+        incumbent, challenger, memory_review = await _seed_supersede_review(db, chroma)
         lifecycle_review_id = await _seed_lifecycle_review(db, review_id="review-lifecycle-batch")
         from memforge.server.admin_api import create_admin_app
 
         app = create_admin_app(db=db, config=_config(tmp_path))
         with TestClient(app) as client:
-            cross = client.get(f"/api/v1/memory-reviews/{cross_review.id}").json()
+            current = client.get(f"/api/v1/memory-reviews/{memory_review.id}").json()
             lifecycle = client.get(f"/api/v1/memory-reviews/{lifecycle_review_id}").json()
             decisions = [
                 {
-                    "review_id": cross_review.id,
+                    "review_id": memory_review.id,
                     "decision": "approve",
-                    "expected_fingerprint": cross["decision_fingerprint"],
+                    "expected_fingerprint": current["decision_fingerprint"],
                     "rationale": "The claims concern the same deployment.",
                     "confidence": 0.94,
                     "risk": "low",
@@ -1110,7 +1112,7 @@ class TestUnifiedLifecycleReviewApi:
                 "/api/v1/memory-reviews/decisions/validate",
                 json={"decisions": decisions},
             )
-            assert (await db.get_memory_review(cross_review.id)).status == "pending"
+            assert (await db.get_memory_review(memory_review.id)).status == "pending"
             assert (await db.get_lifecycle_review(lifecycle_review_id)).status is LifecycleReviewStatus.PENDING
             applied = client.post(
                 "/api/v1/memory-reviews/decisions/apply",
@@ -1134,9 +1136,9 @@ class TestUnifiedLifecycleReviewApi:
         ]
         assert applied.json()["applied"] == 2
         assert applied.json()["failed"] == 1
-        assert (await db.get_memory(incumbent.id)).status == "active"
+        assert (await db.get_memory(incumbent.id)).status == "superseded"
         assert (await db.get_memory(challenger.id)).status == "active"
-        assert (await db.get_memory_review(cross_review.id)).status == "approved"
+        assert (await db.get_memory_review(memory_review.id)).status == "approved"
         assert (await db.get_lifecycle_review(lifecycle_review_id)).status is LifecycleReviewStatus.REJECTED
 
     @pytest.mark.asyncio
@@ -1146,7 +1148,7 @@ class TestUnifiedLifecycleReviewApi:
         chroma,
         tmp_path,
     ):
-        _, _, review = await _seed_cross_source_review(db, chroma)
+        _, _, review = await _seed_supersede_review(db, chroma)
         from memforge.server.admin_api import create_admin_app
 
         app = create_admin_app(db=db, config=_config(tmp_path))
@@ -1186,7 +1188,7 @@ class TestUnifiedLifecycleReviewApi:
         chroma,
         tmp_path,
     ):
-        _, _, review = await _seed_cross_source_review(db, chroma)
+        _, _, review = await _seed_supersede_review(db, chroma)
         from memforge.server.admin_api import create_admin_app
 
         config = _config(tmp_path)
@@ -1219,7 +1221,7 @@ class TestUnifiedLifecycleReviewApi:
 class TestReviewResolutionConcurrency:
     @pytest.mark.asyncio
     async def test_compare_and_set_allows_only_one_pending_resolution(self, db, chroma):
-        _, _, review = await _seed_cross_source_review(db, chroma)
+        _, _, review = await _seed_supersede_review(db, chroma)
 
         results = await asyncio.gather(
             db.resolve_memory_review(
@@ -1730,39 +1732,34 @@ class TestReject:
 
 
 # ---------------------------------------------------------------------------
-# Non-destructive cross-source finding resolution
+# Cross-Source Conflict Review rows awaiting conversion
 # ---------------------------------------------------------------------------
 
 
-class TestCrossSourceReviewResolution:
+class TestUnconvertedCrossSourceReviews:
     @pytest.mark.asyncio
-    async def test_approve_acknowledges_finding_without_mutating_memories(self, db, chroma, review_service):
+    async def test_review_service_refuses_them_without_changing_memories(self, db, chroma, review_service):
         incumbent, challenger, review = await _seed_cross_source_review(db, chroma)
 
-        result = await _approve(
-            review_service,
-            review.id,
-            reviewer="alice",
-            note="confirmed conflict; no authority decision yet",
-        )
+        with pytest.raises(ReviewKindUnsupported):
+            await _approve(review_service, review.id, reviewer="alice")
+        with pytest.raises(ReviewKindUnsupported):
+            await _reject(review_service, review.id, reviewer="alice", note="different deployments")
 
-        assert result.review.status == "approved"
+        assert (await db.get_memory_review(review.id)).status == "pending"
         assert (await db.get_memory(incumbent.id)).status == "active"
         assert (await db.get_memory(challenger.id)).status == "active"
-        assert set(chroma.records) == {incumbent.id, challenger.id}
 
     @pytest.mark.asyncio
-    async def test_reject_dismisses_finding_without_mutating_memories(self, db, chroma, review_service):
-        incumbent, challenger, review = await _seed_cross_source_review(db, chroma)
+    async def test_review_api_does_not_list_or_show_them(self, db, chroma, tmp_path):
+        _, _, review = await _seed_cross_source_review(db, chroma)
+        from memforge.server.admin_api import create_admin_app
 
-        result = await _reject(
-            review_service,
-            review.id,
-            reviewer="alice",
-            note="claims apply to different deployments",
-        )
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            queue = client.get("/api/v1/memory-reviews", params={"status": "all"})
+            detail = client.get(f"/api/v1/memory-reviews/{review.id}")
 
-        assert result.review.status == "rejected"
-        assert (await db.get_memory(incumbent.id)).status == "active"
-        assert (await db.get_memory(challenger.id)).status == "active"
-        assert set(chroma.records) == {incumbent.id, challenger.id}
+        assert queue.status_code == 200
+        assert review.id not in {item["id"] for item in queue.json()["data"]}
+        assert detail.status_code == 404

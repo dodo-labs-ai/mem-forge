@@ -967,7 +967,7 @@ class SourceSyncWorker:
             if result.attempted_work:
                 logger.info(
                     "Relation discovery slice attempted=%d completed=%d failed=%d "
-                    "obsolete=%d pairs=%d llm_calls=%d elapsed_ms=%d",
+                    "obsolete=%d pairs=%d llm_calls=%d elapsed_ms=%d exhausted_total=%d",
                     result.attempted_work,
                     result.completed_work,
                     result.failed_work,
@@ -975,6 +975,7 @@ class SourceSyncWorker:
                     result.checked_candidate_pairs,
                     result.llm_calls,
                     result.elapsed_ms,
+                    result.exhausted_work,
                 )
             return bool(result.attempted_work)
         except Exception:

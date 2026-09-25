@@ -14,7 +14,7 @@ from memforge.memory.evidence import RelationDirection
 from memforge.memory.relation_classifier import (
     MEMORY_RELATION_RULES, MemoryPair, MemoryPairClassification,
     MemoryPairDecision, MemoryRelationType,
-    MemoryPairClassificationPolicy, MemoryPairContext,
+    MemoryPairClassificationPolicy,
     _auditable_relation_reason, _prompt_memory, relation_output_tokens, run_pair_items,
 )
 from memforge.models import Memory
@@ -23,20 +23,20 @@ SPARSE_MEMORY_CLASSIFIER_VERSION = "memory-relation-v4-sparse"
 
 
 def _catalog_request(pairs: tuple[MemoryPair, ...]):
-    new: RequestCatalog[tuple[Memory, MemoryPairContext | None]] = RequestCatalog("NEW")
-    old: RequestCatalog[tuple[Memory, MemoryPairContext | None]] = RequestCatalog("MEM")
+    new: RequestCatalog[Memory] = RequestCatalog("NEW")
+    old: RequestCatalog[Memory] = RequestCatalog("MEM")
     allowed: dict[str, set[str]] = {}
     pair_by_refs: dict[tuple[str, str], MemoryPair] = {}
     for pair in pairs:
-        new_ref = new.add(pair.challenger.id, (pair.challenger, pair.challenger_context))
-        old_ref = old.add(pair.candidate.id, (pair.candidate, pair.candidate_context))
+        new_ref = new.add(pair.challenger.id, pair.challenger)
+        old_ref = old.add(pair.candidate.id, pair.candidate)
         if (new_ref, old_ref) in pair_by_refs:
             raise ValueError("duplicate allowed Memory pair")
         allowed.setdefault(new_ref, set()).add(old_ref)
         pair_by_refs[new_ref, old_ref] = pair
 
-    def present(ref: str, record: tuple[Memory, MemoryPairContext | None]) -> dict[str, object]:
-        value = _prompt_memory(record[0], context=record[1])
+    def present(ref: str, memory: Memory) -> dict[str, object]:
+        value = _prompt_memory(memory)
         value["id"] = ref
         return value
 
