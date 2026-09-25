@@ -30,8 +30,7 @@ from memforge.memory.relation_discovery_contract import (
 )
 from memforge.models import DocumentRecord, Memory, MemoryStatus, content_hash
 from memforge.storage.adapters.protocols import (
-    ActiveMemorySupportState,
-    active_support_rows_hash,
+    build_active_memory_unit_support_states,
 )
 from tests.relation_evidence_fixture import primary_evidence_unit_fixture, primary_observation_revision_fixture
 
@@ -214,15 +213,7 @@ class _Store:
         )
 
     async def get_active_memory_support_states(self, memory_ids):
-        return {
-            memory_id: ActiveMemorySupportState(
-                reference_ids=(),
-                support_set_hash=active_support_rows_hash(()),
-                current_reference_ids=(),
-                current_support_set_hash=active_support_rows_hash(()),
-            )
-            for memory_id in memory_ids
-        }
+        return build_active_memory_unit_support_states(memory_ids, ())
 
     async def complete_relation_discovery_work(self, _work_id, **kwargs):
         self.completion_kwargs = kwargs

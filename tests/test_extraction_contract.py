@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 
 import pytest
 
-from memforge.memory.evidence import SupportScopeVersion
 from memforge.models import (
     ContentItem,
     DocumentRecord,
@@ -19,7 +18,6 @@ from memforge.pipeline.extraction_contract import (
     PROJECTION_EXTRACTION_V8,
     PROJECTION_EXTRACTION_V9,
     ProjectionExtractionContract,
-    active_projection_extraction_contract,
     projection_extraction_contract,
 )
 from memforge.pipeline.source_projection_adapters import project_source_item
@@ -44,46 +42,20 @@ async def db(tmp_path) -> Database:
 
 
 @pytest.mark.parametrize(
-    ("support_scope_version", "expected_version", "uses_fragment_catalog"),
+    ("version", "uses_fragment_catalog"),
     (
-        (SupportScopeVersion.REFERENCE_SET_V1, PROJECTION_EXTRACTION_V8, False),
-        (SupportScopeVersion.EVIDENCE_UNIT_SET_V2, PROJECTION_EXTRACTION_V9, True),
+        (PROJECTION_EXTRACTION_V8, False),
+        (PROJECTION_EXTRACTION_V9, True),
     ),
 )
-def test_active_projection_extraction_contract_is_scope_driven(
-    support_scope_version: SupportScopeVersion,
-    expected_version: str,
+def test_projection_extraction_contract_resolves_by_version(
+    version: str,
     uses_fragment_catalog: bool,
 ) -> None:
-    contract = active_projection_extraction_contract(support_scope_version)
+    contract = projection_extraction_contract(version)
 
-    assert contract.version == expected_version
+    assert contract.version == version
     assert contract.uses_fragment_catalog is uses_fragment_catalog
-    assert projection_extraction_contract(expected_version) is contract
-
-
-def test_future_fragment_contract_promotion_changes_only_the_registry(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    v10 = ProjectionExtractionContract(
-        version="projection-extraction-v10",
-        uses_fragment_catalog=True,
-    )
-    monkeypatch.setitem(
-        extraction_contract._PROJECTION_EXTRACTION_CONTRACTS,
-        v10.version,
-        v10,
-    )
-    monkeypatch.setitem(
-        extraction_contract._ACTIVE_CONTRACT_VERSION_BY_SUPPORT_SCOPE,
-        SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
-        v10.version,
-    )
-
-    assert active_projection_extraction_contract(
-        SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-    ) is v10
-    assert projection_extraction_contract(v10.version) is v10
 
 
 @pytest.mark.asyncio
@@ -99,11 +71,6 @@ async def test_future_fragment_contract_runs_through_the_deriver(
         extraction_contract._PROJECTION_EXTRACTION_CONTRACTS,
         v10.version,
         v10,
-    )
-    monkeypatch.setitem(
-        extraction_contract._ACTIVE_CONTRACT_VERSION_BY_SUPPORT_SCOPE,
-        SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
-        v10.version,
     )
     source_id = "source-v10-contract"
     await db.upsert_source(
@@ -180,11 +147,7 @@ async def test_future_fragment_contract_runs_through_the_deriver(
             ),
             extract_batch=extract,
             max_concurrent=1,
-            extraction_contract_version=(
-                active_projection_extraction_contract(
-                    SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-                ).version
-            ),
+            extraction_contract_version=v10.version,
             access_context_hash="access-v10-contract",
             inference_capability_hash="inference-v10-contract",
         )

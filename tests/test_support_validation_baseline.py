@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from tests.test_support_scope_v2 import db as db, _seed_complete_unit_support
+from tests.test_evidence_unit_support import db as db, _seed_complete_unit_support
 
 
 @pytest.mark.asyncio
@@ -62,7 +62,6 @@ async def test_existing_database_upgrade_preserves_support_and_evidence(db):
 async def _support_plan(db, memory_id, unit_id, *, plan_id, action):
     from memforge.memory.lifecycle_plan import ReconciliationScope
     from memforge.memory.lifecycle_planner import NewMemoryDefaults, build_lifecycle_plan
-    from memforge.memory.evidence import SupportScopeVersion
     from memforge.models import RawMemory, ReconcileAction, ReconcileOperation, content_hash
 
     memory = await db.get_memory(memory_id)
@@ -81,10 +80,9 @@ async def _support_plan(db, memory_id, unit_id, *, plan_id, action):
                 if action is ReconcileAction.NOOP else None,
             reason="test validation" if action is ReconcileAction.NOOP else "source withdrew claim",
         ),),
-        incumbents={memory_id: memory}, source_support_reference_ids={}, all_active_support_reference_ids={},
+        incumbents={memory_id: memory},
         support_set_hashes={memory_id: state.support_set_hash},
-        observation_revision_ids=("obsrev-primary", "obsrev-required"), new_evidence_reference_ids=(),
-        support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
+        observation_revision_ids=("obsrev-primary", "obsrev-required"),
         source_support_unit_ids={memory_id: (unit_id,)}, all_active_support_unit_ids={memory_id: (unit_id,)},
         evidence_unit_ids_by_claim_hash={content_hash(memory.content): (unit_id,)},
         defaults=NewMemoryDefaults(

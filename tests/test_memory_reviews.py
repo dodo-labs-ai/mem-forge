@@ -282,7 +282,6 @@ async def _seed_lifecycle_review(db: Database, *, review_id: str = "review-lifec
         "stale_guard": {
             "observation_revision_ids": [],
             "support_set_hashes": {incumbent.id: "support-hash"},
-            "support_scope_version": "evidence-unit-set-v2",
             "memory_versions": {incumbent.id: incumbent.updated_at.isoformat()},
         },
     }

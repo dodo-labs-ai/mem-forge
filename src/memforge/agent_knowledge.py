@@ -33,7 +33,6 @@ from memforge.memory.evidence import (
     RelationOutcomeBundle,
     RelationRunRecord,
     RelationType,
-    SupportScopeVersion,
     build_candidate_universe,
     build_mandatory_candidate_bucket_results,
     relation_bundle_snapshot_audit,
@@ -727,7 +726,7 @@ class AgentKnowledgeBundleService:
             raise AgentClaimLifecycleConflict(
                 "source_backed_memory_lineage_incomplete"
             )
-        if support.support_ids:
+        if support.unit_ids:
             raise AgentClaimLifecycleConflict("maintenance_closure_active_support")
         gate = await self.db.get_lifecycle_gate(source_id)
         if gate.state is not LifecycleGateState.ENABLED:
@@ -1171,14 +1170,7 @@ class AgentKnowledgeBundleService:
                     "agent_event_source_range_receipt": event_receipt.to_payload(),
                 },
             )
-        support_scope_version = await self.db.get_support_scope_version()
-        source_support = (
-            await self.db.get_source_unit_support_unit_ids(scope.source_unit_id)
-            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else await self.db.get_source_unit_support_reference_ids(
-                scope.source_unit_id
-            )
-        )
+        source_support = await self.db.get_source_unit_support_unit_ids(scope.source_unit_id)
         incumbents: dict[str, Memory] = {}
         incumbent_candidates: dict[str, RawMemory] = {}
         for memory_id in sorted(source_support):
@@ -1229,7 +1221,7 @@ class AgentKnowledgeBundleService:
                     and edge.source_type == "agent_session"
                     for edge in requested_sources
                 )
-                and not requested_support.support_ids
+                and not requested_support.unit_ids
             )
             if not owner_authorized:
                 raise AgentClaimLifecycleConflict(
@@ -1277,7 +1269,6 @@ class AgentKnowledgeBundleService:
             access_context_hash=access_hash,
             extractor_run_id=projection.run_id,
             observed_at=observed_at.isoformat(),
-            support_scope_version=support_scope_version,
         )
         canonical_memories = evidence.canonical_memories_by_claim_hash
         incumbent_candidates = {
@@ -1311,7 +1302,7 @@ class AgentKnowledgeBundleService:
             tuple(incumbents)
         )
         all_active_support = {
-            memory_id: active_support_states[memory_id].support_ids
+            memory_id: active_support_states[memory_id].unit_ids
             for memory_id in incumbents
         }
         support_hashes = {
@@ -1325,24 +1316,11 @@ class AgentKnowledgeBundleService:
             gate_state=gate.state,
             operations=tuple(operations),
             incumbents=incumbents,
-            source_support_reference_ids=source_support,
-            all_active_support_reference_ids=all_active_support,
+            source_support_unit_ids=source_support,
+            all_active_support_unit_ids=all_active_support,
             support_set_hashes=support_hashes,
             observation_revision_ids=tuple(
                 revision.id for revision in projection.observation_revisions
-            ),
-            new_evidence_reference_ids=(),
-            evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
-            support_scope_version=support_scope_version,
-            source_support_unit_ids=(
-                source_support
-                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-                else None
-            ),
-            all_active_support_unit_ids=(
-                all_active_support
-                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-                else None
             ),
             evidence_unit_ids_by_claim_hash=evidence.evidence_unit_ids_by_claim_hash,
             defaults=NewMemoryDefaults(
@@ -1397,24 +1375,12 @@ class AgentKnowledgeBundleService:
         revision-pinned Evidence References used by Support Assertions.
         """
 
-        support_unit_ids = {
+        evidence_unit_ids = {
             evidence_unit_id
             for mutation in plan.mutations
             if mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
             and mutation.memory_id == target_memory_id
             for evidence_unit_id in mutation.evidence_unit_ids
-        }
-        support_reference_ids = {
-            reference_id
-            for mutation in plan.mutations
-            if mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
-            and mutation.memory_id == target_memory_id
-            for reference_id in mutation.evidence_reference_ids
-        }
-        evidence_unit_ids = support_unit_ids or {
-            reference.evidence_unit_id
-            for reference in plan.evidence_references
-            if reference.id in support_reference_ids
         }
         if len(evidence_unit_ids) != 1:
             raise ValueError("agent relation requires one revision-pinned projected Evidence Unit")
@@ -1537,7 +1503,7 @@ class AgentKnowledgeBundleService:
             active_support = await self.db.get_active_memory_support_states(
                 (old_memory_id,)
             )
-            if not active_support[old_memory_id].support_ids:
+            if not active_support[old_memory_id].unit_ids:
                 raise RuntimeError("agent claim replacement retry lacks active Source Projection support")
             current_memory = await self.db.get_memory(old_memory_id)
             if current_memory is None or current_memory.status != "active":

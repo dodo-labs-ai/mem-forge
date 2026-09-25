@@ -293,6 +293,31 @@ def test_pending_review_builds_fresh_atomic_approval_plan() -> None:
     assert request.entity_ids == (7, 11)
 
 
+def test_review_proposing_support_without_evidence_units_fails_its_stale_guard() -> None:
+    original = _build(gate=LifecycleGateState.GATED)
+    mutation = original.mutations[0]
+    staged_evidence = dict(mutation.payload["staged_evidence"])
+    staged_evidence["proposed_mutations"] = [
+        {
+            key: value
+            for key, value in proposed.items()
+            if key != "evidence_unit_ids"
+        }
+        for proposed in staged_evidence["proposed_mutations"]
+    ]
+    review = LifecycleReview(
+        id=str(mutation.payload["review_id"]),
+        lifecycle_plan_id=original.id,
+        incumbent_memory_id=mutation.memory_id,
+        status=LifecycleReviewStatus.PENDING,
+        staged_evidence=staged_evidence,
+        reason=str(mutation.payload["reason"]),
+    )
+
+    with pytest.raises(ValueError, match="stale guard"):
+        build_lifecycle_review_approval_plan(review, lifecycle_plan_to_payload(original))
+
+
 def test_pending_review_without_activation_does_not_enqueue_relation_discovery() -> None:
     old = _memory()
     original = build_lifecycle_plan(

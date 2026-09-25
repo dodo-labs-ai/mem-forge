@@ -749,7 +749,6 @@ class MemoryEvidenceGroupDetail(BaseModel):
     kind: Literal["evidence_unit", "document"]
     evidence_unit_id: str | None = None
     support_ids: list[str]
-    support_scope_version: Literal["reference-set-v1", "evidence-unit-set-v2"] | None = None
     source_id: str
     source_type: str
     source_unit_id: str | None = None
@@ -2969,7 +2968,6 @@ def _memory_evidence_unit_detail(
         kind="evidence_unit",
         evidence_unit_id=group.evidence_unit_id,
         support_ids=list(group.support_ids),
-        support_scope_version=group.support_scope_version.value,
         source_id=group.source_id,
         source_type=group.source_type,
         source_unit_id=group.source_unit_id,

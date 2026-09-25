@@ -39,7 +39,6 @@ from memforge.memory.entity_resolver import EntityResolver
 from memforge.memory.evidence import (
     EvidenceReference,
     EvidenceUnit,
-    SupportScopeVersion,
 )
 from memforge.memory.identity_resolver import (
     IdentityResolutionRequest,
@@ -138,8 +137,6 @@ class _PreparedLifecyclePlanInputs:
     memory_authority_hashes: Mapping[str, str]
     initial_support_owners: Mapping[str, Mapping[str, str]]
     observation_revision_ids: tuple[str, ...]
-    support_scope_version: SupportScopeVersion
-    evidence_reference_ids_by_claim_hash: Mapping[str, tuple[str, ...]]
     evidence_unit_ids_by_claim_hash: Mapping[str, tuple[str, ...]]
     corroboration_targets_by_claim_hash: Mapping[str, Memory]
     corroboration_proofs_by_claim_hash: Mapping[str, Mapping[str, object]]
@@ -319,19 +316,15 @@ class MemoryEngine:
         doc_id: str,
         source_unit_id: str,
     ) -> tuple[list[Memory], dict[str, tuple[str, ...]]]:
-        """Load the complete active ledger by stable Unit, with a legacy fallback.
+        """Load the complete active ledger by stable Unit, plus same-document provenance.
 
         A provider-backed rename can change ``doc_id`` without changing the
-        Source Unit. Support Assertions are therefore authoritative for the
-        projected path; same-document extracted support is included only to
-        keep pre-cutover rows visible to the conservative lineage gate.
+        Source Unit. Unit Support is therefore authoritative for the projected
+        path; an active Memory with same-document extracted provenance but no
+        Support in this Unit is included so the conservative lineage gate
+        still sees it.
         """
-        support_scope_version = await self.db.get_support_scope_version()
-        unit_support = (
-            await self.db.get_source_unit_support_unit_ids(source_unit_id)
-            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else await self.db.get_source_unit_support_reference_ids(source_unit_id)
-        )
+        unit_support = await self.db.get_source_unit_support_unit_ids(source_unit_id)
         incumbents_by_id = {
             memory.id: memory for memory in await self.db.list_active_memories(tuple(sorted(unit_support)))
         }
@@ -352,7 +345,7 @@ class MemoryEngine:
     ) -> dict[str, ImpactResult]:
         """Resolve each incumbent against the current Revision Delta.
 
-        Missing legacy Support, ambiguous mappings, and mixed evidence stay
+        Missing Unit Support, ambiguous mappings, and mixed evidence stay
         UNKNOWN. A single affected reference makes the incumbent AFFECTED;
         only a complete set of disjoint references proves DISJOINT.
         """
@@ -364,25 +357,16 @@ class MemoryEngine:
             source_id=projection.source_id,
         )
         resolved: dict[str, ImpactResult] = {}
-        v2 = (
-            await self.db.get_support_scope_version()
-            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-        )
         for memory_id in ordered_incumbent_ids:
-            reference_ids = unit_support.get(memory_id)
-            if not reference_ids:
+            unit_ids = frozenset(unit_support.get(memory_id, ()))
+            if not unit_ids:
                 resolved[memory_id] = ImpactResult.UNKNOWN
                 continue
-            scoped_reference_ids = frozenset(reference_ids)
             evidence = evidence_by_memory_id.get(memory_id, ())
             impacts = {
                 resolve_anchor_impact(item.anchor, delta)
                 for item in evidence
-                if (
-                    item.evidence_unit_id in scoped_reference_ids
-                    if v2
-                    else item.reference_id in scoped_reference_ids
-                )
+                if item.evidence_unit_id in unit_ids
             }
             if ImpactResult.AFFECTED in impacts:
                 resolved[memory_id] = ImpactResult.AFFECTED
@@ -674,7 +658,7 @@ class MemoryEngine:
                     f"prepared lifecycle Memory changed before commit: {memory_id}"
                 )
 
-        current_support_owners = await self._active_v2_support_owners(
+        current_support_owners = await self._active_support_owners(
             memory_ids
         )
         changed_owner_units: set[str] = set()
@@ -715,22 +699,15 @@ class MemoryEngine:
             memory_ids
         )
         all_support = {
-            memory_id: support_states[memory_id].support_ids
+            memory_id: support_states[memory_id].unit_ids
             for memory_id in memory_ids
         }
         support_hashes = {
             memory_id: support_states[memory_id].support_set_hash
             for memory_id in memory_ids
         }
-        source_support = (
-            await self.db.get_source_unit_support_unit_ids(
-                inputs.scope.source_unit_id
-            )
-            if inputs.support_scope_version
-            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else await self.db.get_source_unit_support_reference_ids(
-                inputs.scope.source_unit_id
-            )
+        source_support = await self.db.get_source_unit_support_unit_ids(
+            inputs.scope.source_unit_id
         )
 
         return build_lifecycle_plan(
@@ -739,24 +716,10 @@ class MemoryEngine:
             gate_state=inputs.gate_state,
             operations=inputs.operations,
             incumbents=current_incumbents,
-            source_support_reference_ids=source_support,
-            all_active_support_reference_ids=all_support,
+            source_support_unit_ids=source_support,
+            all_active_support_unit_ids=all_support,
             support_set_hashes=support_hashes,
             observation_revision_ids=inputs.observation_revision_ids,
-            new_evidence_reference_ids=(),
-            evidence_reference_ids_by_claim_hash=(
-                inputs.evidence_reference_ids_by_claim_hash
-            ),
-            support_scope_version=inputs.support_scope_version,
-            source_support_unit_ids=(
-                source_support
-                if inputs.support_scope_version
-                is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-                else None
-            ),
-            all_active_support_unit_ids=(
-                all_support if inputs.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2 else None
-            ),
             evidence_unit_ids_by_claim_hash=(inputs.evidence_unit_ids_by_claim_hash),
             corroboration_targets_by_claim_hash=current_corroboration_targets,
             corroboration_proofs_by_claim_hash=(
@@ -963,22 +926,17 @@ class MemoryEngine:
             ),
         )
 
-    async def _active_v2_support_owners(
+    async def _active_support_owners(
         self,
         memory_ids: Sequence[str],
     ) -> dict[str, dict[str, str]]:
-        """Return exact active v2 Support ownership for prepared drift guards."""
+        """Return exact active Support ownership for prepared drift guards."""
 
         owners: dict[str, dict[str, str]] = {
             memory_id: {} for memory_id in memory_ids
         }
         for memory_id in memory_ids:
             for unit in await self.db.get_memory_evidence_units(memory_id):
-                if (
-                    unit.support_scope_version
-                    is not SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-                ):
-                    continue
                 owners[memory_id][unit.evidence_unit_id] = unit.source_unit_id
         return owners
 
@@ -1076,7 +1034,6 @@ class MemoryEngine:
             source_unit_id=scope.source_unit_id,
         )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
-        support_scope_version = await self.db.get_support_scope_version()
         incumbent_support_states = await self.db.get_active_memory_support_states(
             tuple(memory.id for memory in incumbents)
         )
@@ -1222,8 +1179,7 @@ class MemoryEngine:
                 for memory in model_incumbents:
                     groups: dict[str, list] = {}
                     for item in evidence_by_memory.get(memory.id, ()):
-                        scoped_id = item.evidence_unit_id if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2 else item.reference_id
-                        if scoped_id in unit_support.get(memory.id, ()):
+                        if item.evidence_unit_id in unit_support.get(memory.id, ()):
                             groups.setdefault(item.evidence_unit_id, []).append(item)
                     if not groups:
                         raise ReconciliationContractError("revision_support_missing", "incumbent has no complete scoped support")
@@ -1584,7 +1540,6 @@ class MemoryEngine:
             access_context_hash=access_context_hash,
             extractor_run_id=projection.run_id,
             observed_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
-            support_scope_version=support_scope_version,
         )
         operations = tuple(
             replace(
@@ -1620,7 +1575,7 @@ class MemoryEngine:
                 for target in corroboration_targets.values()
             },
         }
-        initial_support_owners = await self._active_v2_support_owners(
+        initial_support_owners = await self._active_support_owners(
             tuple(sorted(prepared_memories))
         )
         derivation_context_identity_hash = (
@@ -1667,10 +1622,6 @@ class MemoryEngine:
                 },
                 initial_support_owners=initial_support_owners,
                 observation_revision_ids=observation_revision_ids,
-                support_scope_version=support_scope_version,
-                evidence_reference_ids_by_claim_hash=(
-                    projected_evidence.reference_ids_by_claim_hash
-                ),
                 evidence_unit_ids_by_claim_hash=(
                     projected_evidence.evidence_unit_ids_by_claim_hash
                 ),
@@ -1855,8 +1806,7 @@ class MemoryEngine:
         )
         gate = await self.db.get_lifecycle_gate(scope.source_id)
         support_states = await self.db.get_active_memory_support_states(tuple(incumbents_by_id))
-        support_scope_version = await self.db.get_support_scope_version()
-        all_support = {memory_id: state.support_ids for memory_id, state in support_states.items()}
+        all_support = {memory_id: state.unit_ids for memory_id, state in support_states.items()}
         support_hashes = {memory_id: state.support_set_hash for memory_id, state in support_states.items()}
         visibility, owner_user_id = await memory_visibility_for_document(self.db, doc_id=doc_id)
         plan = build_lifecycle_plan(
@@ -1865,22 +1815,10 @@ class MemoryEngine:
             gate_state=gate.state,
             operations=operations,
             incumbents=incumbents_by_id,
-            source_support_reference_ids=unit_support,
-            all_active_support_reference_ids=all_support,
+            source_support_unit_ids=unit_support,
+            all_active_support_unit_ids=all_support,
             support_set_hashes=support_hashes,
             observation_revision_ids=(),
-            new_evidence_reference_ids=(),
-            support_scope_version=support_scope_version,
-            source_support_unit_ids=(
-                unit_support
-                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-                else None
-            ),
-            all_active_support_unit_ids=(
-                all_support
-                if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-                else None
-            ),
             defaults=NewMemoryDefaults(
                 visibility=visibility,
                 owner_user_id=owner_user_id,

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from memforge.memory.evidence import SupportScopeVersion
-
 __all__ = [
     "CONTRACT_SUPERSEDED",
     "DURABLE_MEMORY_QUALITY_RULES",
@@ -14,7 +12,6 @@ __all__ = [
     "PROJECTION_EXTRACTION_V9",
     "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
     "ProjectionExtractionContract",
-    "active_projection_extraction_contract",
     "projection_extraction_contract",
 ]
 
@@ -28,7 +25,7 @@ CONTRACT_SUPERSEDED = "CONTRACT_SUPERSEDED"
 
 @dataclass(frozen=True, slots=True)
 class ProjectionExtractionContract:
-    """Versioned extraction behavior selected from durable Support capability."""
+    """Versioned extraction behavior recorded on every Source derivation."""
 
     version: str
     uses_fragment_catalog: bool
@@ -45,11 +42,6 @@ _PROJECTION_EXTRACTION_CONTRACTS = {
     ),
 }
 
-_ACTIVE_CONTRACT_VERSION_BY_SUPPORT_SCOPE = {
-    SupportScopeVersion.REFERENCE_SET_V1: PROJECTION_EXTRACTION_V8,
-    SupportScopeVersion.EVIDENCE_UNIT_SET_V2: PROJECTION_EXTRACTION_V9,
-}
-
 
 def projection_extraction_contract(version: str) -> ProjectionExtractionContract:
     """Resolve one historical or current contract without inferring by version number."""
@@ -59,19 +51,6 @@ def projection_extraction_contract(version: str) -> ProjectionExtractionContract
     except KeyError as exc:
         raise ValueError(f"unknown projection extraction contract: {version}") from exc
 
-
-def active_projection_extraction_contract(
-    support_scope_version: SupportScopeVersion,
-) -> ProjectionExtractionContract:
-    """Return the sole active extraction contract for one durable Support scope."""
-
-    try:
-        version = _ACTIVE_CONTRACT_VERSION_BY_SUPPORT_SCOPE[support_scope_version]
-    except KeyError as exc:
-        raise ValueError(
-            f"support scope has no active extraction contract: {support_scope_version}"
-        ) from exc
-    return projection_extraction_contract(version)
 
 DURABLE_MEMORY_QUALITY_RULES = """Top rules (apply these first; reject candidates that fail any of them):
 

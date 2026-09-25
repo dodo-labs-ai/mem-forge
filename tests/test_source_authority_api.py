@@ -705,14 +705,6 @@ def test_delete_source_is_idempotent_functional_removal_after_v2_cutover(tmp_pat
             )
             assert created.status_code == 200, created.text
             source_id = created.json()["id"]
-            asyncio.run(
-                database.db.execute(
-                    """UPDATE system_contract_markers
-                          SET marker_value = 'evidence-unit-set-v2'
-                        WHERE marker_key = 'support_scope_version'"""
-                )
-            )
-            asyncio.run(database.db.commit())
 
             removed = client.delete(
                 f"/api/v1/sources/{source_id}",

@@ -129,7 +129,6 @@ export interface MemoryEvidenceGroup {
   kind: "evidence_unit" | "document";
   evidence_unit_id: string | null;
   support_ids: string[];
-  support_scope_version: "reference-set-v1" | "evidence-unit-set-v2" | null;
   source_id: string;
   source_type: string;
   source_unit_id: string | null;

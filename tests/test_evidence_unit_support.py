@@ -16,7 +16,6 @@ from memforge.memory.evidence import (
     EvidenceReference,
     EvidenceRole,
     EvidenceUnit,
-    SupportScopeVersion,
     evidence_part_set_digest,
     evidence_unit_id_v2,
     evidence_unit_revision_lineage_is_valid,
@@ -30,6 +29,7 @@ from memforge.models import (
     MemoryExtractionResult,
     NormalizedContent,
     RawContent,
+    RawMemory,
     ReconcileAction,
     ReconcileOperation,
     content_hash,
@@ -201,6 +201,12 @@ async def _seed_complete_unit_support(db: Database) -> tuple[str, str, str, str]
 
 
 _REQUIRE_EVIDENCE_UNIT_SUPPORT_MIGRATION = 97
+_REMOVE_REFERENCE_SCOPED_SUPPORT_MIGRATION = 98
+_REFERENCE_SCOPED_SUPPORT_TABLES = (
+    "memory_support_assertions",
+    "support_cutover_reports",
+    "support_cutover_lease",
+)
 
 
 async def _support_scope_marker(db: Database) -> str:
@@ -218,6 +224,16 @@ def _mark_reference_scoped_before_upgrade(path: str, *, reference_support_row: b
             """UPDATE system_contract_markers SET marker_value = 'reference-set-v1'
                 WHERE marker_key = 'support_scope_version'"""
         )
+        connection.execute(
+            """CREATE TABLE memory_support_assertions (
+                   id TEXT PRIMARY KEY, memory_id TEXT NOT NULL,
+                   evidence_reference_id TEXT NOT NULL, source_id TEXT NOT NULL,
+                   access_context_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+                   created_at TEXT NOT NULL, removed_at TEXT
+               )"""
+        )
+        connection.execute("CREATE TABLE support_cutover_reports (id TEXT PRIMARY KEY)")
+        connection.execute("CREATE TABLE support_cutover_lease (lease_key TEXT PRIMARY KEY)")
         if reference_support_row:
             connection.execute(
                 """INSERT INTO memory_support_assertions (
@@ -227,14 +243,28 @@ def _mark_reference_scoped_before_upgrade(path: str, *, reference_support_row: b
                              'source-1', 'access-1', 1, '2026-08-27T08:00:00+00:00')"""
             )
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version = ?",
-            (_REQUIRE_EVIDENCE_UNIT_SUPPORT_MIGRATION,),
+            "DELETE FROM schema_migrations WHERE version IN (?, ?)",
+            (
+                _REQUIRE_EVIDENCE_UNIT_SUPPORT_MIGRATION,
+                _REMOVE_REFERENCE_SCOPED_SUPPORT_MIGRATION,
+            ),
         )
+
+
+def _existing_tables(path: str, names: tuple[str, ...]) -> set[str]:
+    placeholders = ", ".join("?" for _ in names)
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            f"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ({placeholders})",
+            names,
+        ).fetchall()
+    return {str(name) for (name,) in rows}
 
 
 @pytest.mark.asyncio
 async def test_new_workspace_starts_on_evidence_unit_support(db) -> None:
     assert await _support_scope_marker(db) == "evidence-unit-set-v2"
+    assert _existing_tables(db.db_path, _REFERENCE_SCOPED_SUPPORT_TABLES) == set()
 
 
 @pytest.mark.asyncio
@@ -247,6 +277,7 @@ async def test_workspace_without_reference_scoped_support_moves_to_evidence_unit
 
     assert await _support_scope_marker(db) == "evidence-unit-set-v2"
     assert await db.get_active_memory_support_unit_ids("memory-1") == ("evidence-unit-1",)
+    assert _existing_tables(db.db_path, _REFERENCE_SCOPED_SUPPORT_TABLES) == set()
 
 
 @pytest.mark.asyncio
@@ -269,6 +300,9 @@ async def test_workspace_with_reference_scoped_support_refuses_to_start(db) -> N
         ).fetchall()
     assert marker == "reference-set-v1"
     assert applied == []
+    assert _existing_tables(db.db_path, _REFERENCE_SCOPED_SUPPORT_TABLES) == set(
+        _REFERENCE_SCOPED_SUPPORT_TABLES
+    )
 
 
 @pytest.mark.asyncio
@@ -280,7 +314,7 @@ async def test_unknown_support_scope_marker_refuses_to_start(db) -> None:
                 WHERE marker_key = 'support_scope_version'"""
         )
 
-    with pytest.raises(RuntimeError, match="support_scope_version marker is unknown"):
+    with pytest.raises(RuntimeError, match="requires 'evidence-unit-set-v2'"):
         await db.connect()
     await db.close()
 
@@ -377,7 +411,6 @@ async def test_v2_lifecycle_removes_one_complete_unit_then_retires_last_support(
     assert memory is not None
     states = await db.get_active_memory_support_states((memory_id,))
     state = states[memory_id]
-    assert state.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
     assert state.unit_ids == (unit_id,)
     scope = ReconciliationScope(
         id="scope-v2-delete",
@@ -398,12 +431,8 @@ async def test_v2_lifecycle_removes_one_complete_unit_then_retires_last_support(
             ),
         ),
         incumbents={memory_id: memory},
-        source_support_reference_ids={},
-        all_active_support_reference_ids={},
         support_set_hashes={memory_id: state.support_set_hash},
         observation_revision_ids=(),
-        new_evidence_reference_ids=(),
-        support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
         source_support_unit_ids={memory_id: (unit_id,)},
         all_active_support_unit_ids={memory_id: (unit_id,)},
         defaults=NewMemoryDefaults(
@@ -513,6 +542,49 @@ async def test_v2_source_removal_preserves_memory_with_independent_support(db) -
     assert await db.get_evidence_unit(unit_id) is not None
 
 
+def test_claim_without_resolved_evidence_selection_is_rejected() -> None:
+    now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    body = "# Rule\n\nReleases require a signed changelog.\n"
+    item = ContentItem(
+        item_id="doc-unselected",
+        title="Rule",
+        source_url="https://example.test/repo/rule.md",
+        last_modified=now,
+        content_type="text/markdown",
+        version="1",
+    )
+    projection = project_source_item(
+        source_id="source-1",
+        source_type="github_repo",
+        run_id="run-unselected",
+        item=item,
+        raw=RawContent(item=item, body=body.encode(), content_type="text/markdown"),
+        normalized=NormalizedContent(item=item, markdown_body=body),
+        scope={},
+        access_context={"visibility": "workspace"},
+    )
+
+    with pytest.raises(ValueError, match="lacks a resolved Evidence selection"):
+        build_projected_claim_evidence(
+            projection=projection,
+            raw_memories=(
+                RawMemory(
+                    content="Releases require a signed changelog.",
+                    memory_type="decision",
+                    evidence_quote="Releases require a signed changelog.",
+                ),
+            ),
+            doc_id=item.item_id,
+            source_type="github_repo",
+            project_key=None,
+            visibility="workspace",
+            owner_user_id=None,
+            repo_identifier=None,
+            access_context_hash="workspace",
+            extractor_run_id=projection.run_id,
+        )
+
+
 @pytest.mark.asyncio
 async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> None:
     await _seed_complete_unit_support(db)
@@ -611,7 +683,6 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
         access_context_hash=access_hash,
         extractor_run_id="run-v9",
         observed_at=now.isoformat(),
-        support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
     )
     claim_hash = content_hash(raw.content.strip())
     scope = ReconciliationScope(
@@ -633,14 +704,12 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
             ),
         ),
         incumbents={},
-        source_support_reference_ids={},
-        all_active_support_reference_ids={},
+        source_support_unit_ids={},
+        all_active_support_unit_ids={},
         support_set_hashes={},
         observation_revision_ids=tuple(
             revision.id for revision in projection.observation_revisions
         ),
-        new_evidence_reference_ids=(),
-        support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
         evidence_unit_ids_by_claim_hash=evidence.evidence_unit_ids_by_claim_hash,
         evidence_units=evidence.units,
         evidence_references=evidence.references,
@@ -749,7 +818,6 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
         access_context_hash=access_hash,
         extractor_run_id="run-v9-update",
         observed_at=updated_item.last_modified.isoformat(),
-        support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
     )
     old_memory = created[0]
     old_state = (
@@ -779,14 +847,10 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
             ),
         ),
         incumbents={old_memory.id: old_memory},
-        source_support_reference_ids={},
-        all_active_support_reference_ids={},
         support_set_hashes={old_memory.id: old_state.support_set_hash},
         observation_revision_ids=tuple(
             revision.id for revision in updated_projection.observation_revisions
         ),
-        new_evidence_reference_ids=(),
-        support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
         source_support_unit_ids={old_memory.id: old_unit_ids},
         all_active_support_unit_ids={old_memory.id: old_unit_ids},
         evidence_unit_ids_by_claim_hash=(

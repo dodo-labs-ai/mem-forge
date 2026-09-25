@@ -1344,30 +1344,6 @@ async def test_purge_memory_redacts_existing_audit_payloads(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_remove_source_support_keeps_retirement_committed_when_vector_delivery_fails(db: Database):
-    await _insert_doc(db)
-    memory = _memory("mem-source-rollback", "Last sourced fact")
-    await db.insert_memory(memory)
-    await db.add_memory_source(memory.id, "doc-1", "confluence", "source excerpt", source_updated_at=None)
-    store = _store(db, FailingDeleteCollection())
-
-    retired = await store.remove_source_support(memory.id, "doc-1", source_id="src-1", reason="no_support")
-
-    stored = await db.get_memory(memory.id)
-    sources = await db.get_memory_sources(memory.id)
-    async with db.db.execute("SELECT COUNT(*) FROM memories_fts WHERE memory_id = ?", (memory.id,)) as cursor:
-        fts_count = (await cursor.fetchone())[0]
-    tasks = await db.list_lifecycle_vector_tasks(source_id="src-1", limit=10)
-    assert retired is True
-    assert stored.status == "retired"
-    assert sources == []
-    assert fts_count == 0
-    assert [(task.memory_id, task.operation.value, task.status) for task in tasks] == [
-        (memory.id, "delete", "failed")
-    ]
-
-
-@pytest.mark.asyncio
 async def test_lifecycle_vector_delivery_attempt_is_bounded() -> None:
     class Relational:
         def __init__(self) -> None:

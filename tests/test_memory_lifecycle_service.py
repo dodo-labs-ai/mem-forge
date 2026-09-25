@@ -657,6 +657,34 @@ async def test_propose_memory_correction_creates_review_without_complete_source_
 
 
 @pytest.mark.asyncio
+async def test_failed_correction_review_keeps_its_error_and_discards_the_correction_document(
+    db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    old = await _source_backed_memory(db, suffix="discard", source_owner="source-owner")
+    store = _store(db, RecordingCollection())
+    service = MemoryLifecycleService(db=db, memory_store=store)
+
+    async def fail_insert(*args, **kwargs):
+        raise ValueError("challenger insert failed")
+
+    monkeypatch.setattr(store, "insert_memory", fail_insert)
+
+    with pytest.raises(ValueError, match="challenger insert failed"):
+        await service.propose_memory_correction(
+            old.id,
+            replacement_content="The proposed corrected source-backed rule.",
+            provenance="A workspace member proposed the correction.",
+            reason="A workspace member reported a stale rule.",
+            expected_content_hash=old.content_hash,
+            authority=_authority("workspace-member", "member"),
+        )
+
+    assert await db.count_documents("user_correction") == 0
+    assert await db.count_memory_reviews() == 0
+
+
+@pytest.mark.asyncio
 async def test_propose_memory_correction_requires_authority_over_every_supporting_source(db: Database):
     old = await _source_backed_memory(db, suffix="multi-a", source_owner="alice")
     additional = await _source_backed_memory(db, suffix="multi-b", source_owner="bob")
