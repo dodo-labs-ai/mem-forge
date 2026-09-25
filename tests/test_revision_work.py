@@ -6,23 +6,28 @@ from dataclasses import replace
 
 import pytest
 
-from memforge.llm.structured import StructuredLlmError, SupportAssessmentWireResponse
+from memforge.llm.structured import ChangeImpactWireResponse, StructuredLlmError, SupportAssessmentWireResponse
 from memforge.memory.evidence import EvidenceRole
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-from memforge.pipeline.revision_work import RevisionWorkExecutor
+from memforge.pipeline.revision_work import SUPPORT_ASSESSMENT_CONTRACT, RevisionWorkExecutor
 from memforge.pipeline.support_reading import SupportWorkItem, plan_support_revision
-from tests.revision_client_fixture import continued, supported, unsupported
+from tests.revision_client_fixture import change_impact_response, continued, supported, unsupported
 from tests.test_revision_assessment import memory, old_support, revisions
 from tests.test_support_reading import part
 
 RULE = "Two reviewers approve US releases."
 EXCEPTION_TERMS = ("Cedar", "Alder", "Birch")
-# A target that changed beside the unchanged rule, so exact prior Evidence is assessed rather than rebound.
+# A target that changed beside the unchanged rule: the exact Support first goes through
+# Change Impact, which the fixture client judges AFFECTED, and is then read.
 CHANGED = f"{RULE}\n\nRelease notes are published weekly.\n"
 
 
 def payload(prompt):
     return json.loads(prompt.split("<assessment>")[1].split("</assessment>")[0])
+
+
+def is_impact(prompt):
+    return "<change_impact>" in prompt
 
 
 def readable(data):
@@ -40,6 +45,7 @@ class Client:
     def __init__(self, limit=8000):
         self.limit = limit
         self.prompts = []
+        self.impact_prompts = []
         self.fail_at = None
 
     def request_budget(self, model=None):
@@ -56,12 +62,19 @@ class Client:
         return f"fixture-{self.limit}-{model}"
 
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+        if response_format is ChangeImpactWireResponse:
+            self.impact_prompts.append(prompt)
+            return change_impact_response(prompt, self.impact)
         assert response_format is SupportAssessmentWireResponse
         self.prompts.append(prompt)
         if self.fail_at == len(self.prompts):
             self.fail_at = None
             raise TimeoutError("fixture interruption")
         return SupportAssessmentWireResponse.model_validate({"results": self.judge(prompt)})
+
+    def impact(self, work, data):
+        """Every change may affect the claim, so exact Supports are read like any other."""
+        return "affected"
 
     def judge(self, prompt):
         data = payload(prompt)
@@ -112,6 +125,12 @@ def receipts(store):
     return [w for w in store.works.values() if w.kind == "support_finalize"]
 
 
+def reading_order(items):
+    """The reading order of a cohort in which every Support is read."""
+    revision_plan = plan_support_revision(items[0].context, items)
+    return revision_plan.reading_order(revision_plan.supports)
+
+
 def selected_texts(result):
     return [p.excerpt for p in result.memory.resolved_evidence_selection.parts]
 
@@ -128,8 +147,9 @@ async def test_small_change_shares_one_request_and_program_completion():
         "work_id", "claim", "memory_type", "valid_from", "valid_until", "prior_evidence", "previous_state", "may_conclude",
     }
     [receipt] = receipts(store)
-    assert receipt.manifest["completion"] == "program" and receipt.manifest["contract"] == "support-ordered-reading-v1"
-    assert receipt.manifest["dependencies"] and executor.calls == 1
+    assert receipt.manifest["completion"] == "program" and receipt.manifest["contract"] == SUPPORT_ASSESSMENT_CONTRACT
+    # One Change Impact request judged the three exact Supports AFFECTED; one reading request followed.
+    assert receipt.manifest["dependencies"] and len(client.impact_prompts) == 1 and executor.calls == 2
     assert all(
         r.memory.resolved_evidence_selection.parts[0].anchor.observation_revision_id == "rev-primary-v2"
         for r in results.values()
@@ -173,7 +193,7 @@ async def test_cross_request_exception_survives_later_unrelated_and_rule_text(re
         any("Cedar" in row[1] for row in payload(p)["carried_witness_catalog"]) for p in client.prompts
     )
     # Unsupported only after the whole order was read.
-    total = len(plan_support_revision(items[0].context, items).reading.parts)
+    total = len(reading_order(items).parts)
     assert all(
         count == total for receipt in receipts(store) for count in receipt.manifest["coverage"]["read_parts"].values()
     )
@@ -242,6 +262,8 @@ def test_output_allowance_is_requested_in_full_and_bounded_only_by_the_route():
 async def test_growing_witness_state_splits_only_the_unread_tail_and_resumes():
     class GrowingClient(Client):
         def request_fits(self, prompt, **kwargs):
+            if is_impact(prompt):
+                return super().request_fits(prompt, **kwargs)
             data = payload(prompt)
             witnesses = [w["previous_state"]["support_witness_refs"] for w in data["works"]]
             if len(witnesses) > 1 and any(witnesses):
@@ -360,7 +382,7 @@ async def test_section_deletion_is_unsupported_only_after_the_whole_order():
     [result] = (await executor.assess_many([item])).values()
     assert result.supported is False and result.unresolved is None
     assert len(client.prompts) > 1
-    total = len(plan_support_revision(item.context, [item]).reading.parts)
+    total = len(reading_order([item]).parts)
     [receipt] = receipts(store)
     assert receipt.manifest["coverage"] == {"total": total, "read_parts": {"w0": total}}
     assert all(any(f"Other note {i}." in p for p in client.prompts) for i in range(60))
@@ -418,7 +440,7 @@ async def test_supports_with_different_first_parts_share_one_request_when_they_f
         SupportWorkItem(f"w{i}", replace(memory(), id=f"memory-{i}", content=rule), (part(base, rule),), context)
         for i, rule in enumerate(rules)
     ]
-    reading = plan_support_revision(context, items).reading
+    reading = reading_order(items)
     assert len(set(reading.first_part_end.values())) == len(rules)
 
     class OwnRuleClient(Client):
@@ -455,7 +477,7 @@ async def test_ambiguous_part_reads_every_candidate_first_and_needs_no_accountin
     base, current = revisions(f"{RULE}\n\n{notes}\n", f"{RULE}\n\n{notes}\n\n{RULE}\n")
     context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
     item = SupportWorkItem("w0", memory(), (part(base, RULE),), context)
-    reading = plan_support_revision(context, [item]).reading
+    reading = reading_order([item])
     first_part = reading.parts[:reading.first_part_end["w0"]]
     assert [[f.presentation_text for f in p.fragments] for p in first_part] == [[RULE], [RULE]]
 
@@ -543,7 +565,7 @@ async def test_single_reading_group_over_capacity_is_unresolved_capacity(caplog)
     assert results["rule"].supported is True
     assert results["other"].supported is None and results["other"].unresolved == "capacity"
     [huge_list] = [
-        p for p in plan_support_revision(context, items).reading.parts
+        p for p in reading_order(items).parts
         if p.fragments and "Huge item 0" in p.fragments[0].presentation_text
     ]
     assert "Huge item 39" in huge_list.fragments[-1].presentation_text
@@ -559,10 +581,10 @@ async def test_transient_failure_raises_after_split_to_one_item():
 
     class TimeoutClient(Client):
         async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-            self.prompts.append(prompt)
-            if "WRK-0001" in prompt:
+            if response_format is SupportAssessmentWireResponse and "WRK-0001" in prompt:
+                self.prompts.append(prompt)
                 raise error
-            return SupportAssessmentWireResponse.model_validate({"results": self.judge(prompt)})
+            return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
 
     client = TimeoutClient(limit=16000)
     with pytest.raises(StructuredLlmError) as raised:

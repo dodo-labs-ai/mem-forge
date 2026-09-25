@@ -1,4 +1,4 @@
-"""Exact prior Evidence correspondence and whole-Support routing; program only, no model."""
+"""Exact prior Evidence correspondence, whole-Support routing, changes and reading order; program only, no model."""
 
 from dataclasses import replace
 
@@ -56,8 +56,8 @@ def test_exact_match_ignores_container_change():
     assert statuses(support) == [Status.EXACT_UNCHANGED]
     [current] = support.parts[0].current
     assert current.presentation_text == RULE and current.anchor.observation_revision_id == "rev-primary-v2"
-    # The heading changed, so an exact Support is still assessed rather than rebound.
-    assert support.route is SupportRoute.SUPPORT_ASSESSMENT
+    # The heading changed, so Change Impact decides whether the exact Support is rebound.
+    assert support.route is SupportRoute.CHANGE_IMPACT
 
 
 def test_punctuation_change_is_modified_only_for_its_own_support():
@@ -91,7 +91,8 @@ def test_modified_part_is_read_in_the_first_part_even_without_changed_content():
     same_revision = RevisionAssessmentContext(projection=base, base=base, access_context_hash="scope")
     assert same_revision.delta() == ((), [])
     items = [SupportWorkItem("w0", memory(), (part(base, RULE, exact=False),), same_revision)]
-    reading = plan_support_revision(same_revision, items).reading
+    revision_plan = plan_support_revision(same_revision, items)
+    reading = revision_plan.reading_order(revision_plan.supports)
     assert reading_texts(reading)[0] == [RULE]
     assert reading.first_part_end == {"w0": 1}
 
@@ -104,7 +105,7 @@ def test_modified_part_in_a_changed_revision_still_reads_one_part_first():
     [support] = revision_plan.supports
     assert statuses(support) == [Status.MODIFIED] and support.parts[0].current == ()
     # Nothing changed and no current text is located, yet the old excerpt still needs one request.
-    assert revision_plan.reading.first_part_end == {"w0": 1}
+    assert revision_plan.reading_order(revision_plan.supports).first_part_end == {"w0": 1}
 
 
 def test_other_unit_observation_is_never_rebound():
@@ -133,11 +134,11 @@ def test_all_exact_without_changed_content_rebinds():
     assert [p.anchor.observation_revision_id for p in selection.parts] == ["rev-primary-v2", "rev-context"]
 
 
-def test_all_exact_with_changed_content_is_assessed():
+def test_all_exact_with_changed_content_routes_to_change_impact():
     base, context = context_for(f"{RULE}\n", f"{RULE}\n\nNew unrelated note.\n")
     [support] = plan(context, (part(base, RULE),))
     assert statuses(support) == [Status.EXACT_UNCHANGED]
-    assert support.route is SupportRoute.SUPPORT_ASSESSMENT
+    assert support.route is SupportRoute.CHANGE_IMPACT
 
 
 def test_removed_content_counts_as_changed():
@@ -146,7 +147,7 @@ def test_removed_content_counts_as_changed():
     assert changed == () and [entry["text"] for entry in removed] == ["Old distant exception."]
     [support] = plan(context, (part(base, RULE),))
     assert statuses(support) == [Status.EXACT_UNCHANGED]
-    assert support.route is SupportRoute.SUPPORT_ASSESSMENT
+    assert support.route is SupportRoute.CHANGE_IMPACT
 
 
 def test_unknown_part_takes_priority_over_modified():
@@ -206,7 +207,8 @@ def test_reading_order_puts_changed_removed_and_own_evidence_first():
         SupportWorkItem("w0", memory(), (part(base, RULE),), context),
         SupportWorkItem("w1", memory(), (part(base, other),), context),
     ]
-    reading = plan_support_revision(context, items).reading
+    revision_plan = plan_support_revision(context, items)
+    reading = revision_plan.reading_order(revision_plan.supports)
     assert reading_texts(reading) == [
         # Changed current groups: the whole changed list is one group.
         ["- item a", "- item b", "- item c"], ["Added note."],
@@ -227,14 +229,51 @@ def test_without_usable_baseline_first_part_is_the_whole_revision():
     base, current = revisions(f"Intro para.\n\n{RULE}\n", f"Intro para.\n\n{RULE}\n\nNew note.\n")
     no_baseline = RevisionAssessmentContext(projection=current, base=None, access_context_hash="scope")
     items = [SupportWorkItem("w0", memory(), (part(base, RULE),), no_baseline)]
-    reading = plan_support_revision(no_baseline, items).reading
+    revision_plan = plan_support_revision(no_baseline, items)
+    assert revision_plan.changes == ()
+    reading = revision_plan.reading_order(revision_plan.supports)
     assert reading_texts(reading) == [["Country: US."], ["Intro para."], [RULE], ["New note."]]
     assert reading.first_part_end == {"w0": len(reading.parts)}
 
 
-def test_rebind_only_cohort_has_no_reading_order():
+def test_changes_hold_changed_groups_then_removed_text():
+    old = f"Intro para.\n\n{RULE}\n\nDeleted note.\n\n- item a\n- item b\n\nTail para.\n"
+    new = f"Intro para.\n\n{RULE}\n\n- item a\n- item b\n- item c\n\nTail para.\n\nAdded note.\n"
+    base, context = context_for(old, new)
+    revision_plan = plan_support_revision(context, [SupportWorkItem("w0", memory(), (part(base, RULE),), context)])
+    # The whole changed list is one group, in document order; removed old text follows.
+    assert [
+        [f.presentation_text for f in change.fragments] or [change.removed["text"]] for change in revision_plan.changes
+    ] == [["- item a", "- item b", "- item c"], ["Added note."], ["Deleted note."]]
+    by_ref = {f.reference: f.presentation_text for f in revision_plan.catalog.fragments}
+    # Only the added list item is changed; its unchanged siblings are context.
+    assert sorted(by_ref[ref] for ref in revision_plan.changed_refs) == ["- item c", "Added note."]
+
+
+def test_unchanged_revision_has_no_changes():
     base, context = context_for(f"{RULE}\n", f"{RULE}\n")
-    assert plan_support_revision(context, [SupportWorkItem("w0", memory(), (part(base, RULE),), context)]).reading is None
+    revision_plan = plan_support_revision(context, [SupportWorkItem("w0", memory(), (part(base, RULE),), context)])
+    assert revision_plan.changes == () and revision_plan.changed_refs == frozenset()
+    assert revision_plan.supports[0].route is SupportRoute.REBIND_SUPPORT
+
+
+def test_reading_order_is_built_for_assessed_supports_only():
+    other = "Other rule."
+    old = f"{RULE}\n\nIntro para.\n\n{other}\n\nTail para.\n"
+    new = f"{RULE[:-1]}!\n\nIntro para.\n\n{other}\n\nTail para.\n\nAdded note.\n"
+    base, context = context_for(old, new)
+    items = [
+        SupportWorkItem("modified", memory(), (part(base, RULE),), context),
+        SupportWorkItem("exact", memory(), (part(base, other),), context),
+    ]
+    revision_plan = plan_support_revision(context, items)
+    modified, exact = revision_plan.supports
+    assert modified.route is SupportRoute.SUPPORT_ASSESSMENT and exact.route is SupportRoute.CHANGE_IMPACT
+    reading = revision_plan.reading_order([modified])
+    assert reading.parts[:len(revision_plan.changes)] == revision_plan.changes
+    # The exact Support's own group is not pulled forward for a cohort that does not read it.
+    first = reading_texts(reading)[:reading.first_part_end["modified"]]
+    assert [other] not in first and reading.first_part_end == {"modified": len(revision_plan.changes)}
 
 
 def test_ambiguous_candidates_are_all_in_the_first_part():
@@ -242,6 +281,7 @@ def test_ambiguous_candidates_are_all_in_the_first_part():
     new = f"{RULE}\n\nIntro para.\n\n{RULE}\n\nTail para.\n"
     base, context = context_for(old, new)
     items = [SupportWorkItem("w0", memory(), (part(base, RULE),), context)]
-    reading = plan_support_revision(context, items).reading
+    revision_plan = plan_support_revision(context, items)
+    reading = revision_plan.reading_order(revision_plan.supports)
     first = reading_texts(reading)[:reading.first_part_end["w0"]]
     assert first.count([RULE]) == 2 and ["Tail para."] not in first
