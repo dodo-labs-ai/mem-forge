@@ -20,10 +20,8 @@ from memforge.memory.relation_classifier import (
     MemoryPairContext,
     MemoryPairClassification,
     MemoryPairClassificationError,
-    MemoryPairClassificationPlan,
     MemoryPairDecision,
     MemoryRelationType,
-    MemoryPairClassificationPolicy,
     MEMORY_RELATION_PROMPT,
     StructuredMemoryPairClassifier,
 )
@@ -37,6 +35,15 @@ def _memory(memory_id: str, content: str) -> Memory:
         content=content,
         content_hash=content_hash(content),
     )
+
+
+class _PairsPerRequest(RevisionClientFixture):
+    """Route capacity that fits ``pairs_per_request`` exact pairs in one request."""
+
+    pairs_per_request = 1
+
+    def request_fits(self, prompt, **kwargs):
+        return prompt.count('"pair_index"') <= self.pairs_per_request
 
 
 def test_equivalent_identity_prompt_preserves_normative_modality() -> None:
@@ -122,7 +129,7 @@ async def test_different_source_scope_context_can_suppress_false_contradiction()
 
 @pytest.mark.asyncio
 async def test_structured_classifier_runs_independent_batches_with_bounded_concurrency() -> None:
-    class ConcurrentClient(RevisionClientFixture):
+    class ConcurrentClient(_PairsPerRequest):
         max_concurrent = 2
 
         def __init__(self) -> None:
@@ -162,11 +169,7 @@ async def test_structured_classifier_runs_independent_batches_with_bounded_concu
     challenger = _memory("challenger", "Current claim")
     pairs = tuple(MemoryPair(challenger, _memory(f"candidate-{index}", f"Candidate {index}")) for index in range(3))
     client = ConcurrentClient()
-    classifier = StructuredMemoryPairClassifier(
-        client=client,
-        model="test-model",
-        policy=MemoryPairClassificationPolicy(max_pairs_per_call=1),
-    )
+    classifier = StructuredMemoryPairClassifier(client=client, model="test-model")
     classification = asyncio.create_task(classifier.classify(pairs))
 
     await asyncio.wait_for(client.two_admitted.wait(), timeout=0.5)
@@ -180,7 +183,7 @@ async def test_structured_classifier_runs_independent_batches_with_bounded_concu
 
 @pytest.mark.asyncio
 async def test_structured_classifier_reports_usage_when_a_later_batch_fails() -> None:
-    class FailingSecondBatchClient(RevisionClientFixture):
+    class FailingSecondBatchClient(_PairsPerRequest):
         def __init__(self) -> None:
             self.calls = 0
 
@@ -203,7 +206,6 @@ async def test_structured_classifier_reports_usage_when_a_later_batch_fails() ->
     classifier = StructuredMemoryPairClassifier(
         client=FailingSecondBatchClient(),
         model="test-model",
-        policy=MemoryPairClassificationPolicy(max_pairs_per_call=1),
     )
     pairs = (
         MemoryPair(challenger, _memory("candidate-1", "First candidate")),
@@ -244,13 +246,6 @@ class _PairClassifier:
     def __init__(self, relation_by_pair: dict[tuple[str, str], MemoryRelationType]) -> None:
         self._relation_by_pair = relation_by_pair
         self.calls: list[tuple[MemoryPair, ...]] = []
-
-    def plan(self, pairs: tuple[MemoryPair, ...]):
-        return MemoryPairClassificationPlan(
-            pair_count=len(pairs),
-            llm_calls=1 if pairs else 0,
-            prompt_chars=0,
-        )
 
     async def classify(self, pairs: tuple[MemoryPair, ...]):
         self.calls.append(pairs)
@@ -464,19 +459,17 @@ async def test_identity_resolver_fails_closed_for_incomplete_structured_pair_led
     assert result.classified_pairs == ()
     assert result.classification_complete is False
     assert result.failure_reason == (
-        "memory relation decision coverage invalid: "
-        "expected_count=2, actual_count=1, missing_count=1, "
-        "duplicate_count=0, unexpected_count=0"
+        "memory relation classification failed (output_invalid): the response omits 1 of 2 requested IDs"
     )
     assert len(client.calls) == 2
-    assert "coverage_correction" in client.calls[1][0]
+    assert "<correction>" in client.calls[1][0]
     assert batch.metrics.pair_count == 2
     assert batch.metrics.llm_calls == 2
     assert batch.metrics.prompt_chars > 0
 
 
 @pytest.mark.asyncio
-async def test_structured_classifier_keeps_first_duplicate_without_retry() -> None:
+async def test_structured_classifier_corrects_a_duplicate_pair_decision_once() -> None:
     class DuplicateClient(RevisionClientFixture):
         def __init__(self) -> None:
             self.calls: list[str] = []
@@ -487,7 +480,7 @@ async def test_structured_classifier_keeps_first_duplicate_without_retry() -> No
             **_kwargs,
         ):
             self.calls.append(prompt)
-            indices = [0, 0, 1]
+            indices = [0, 0, 1] if len(self.calls) == 1 else [0, 1]
             return SimpleNamespace(
                 decisions=[
                     SimpleNamespace(
@@ -516,12 +509,13 @@ async def test_structured_classifier_keeps_first_duplicate_without_retry() -> No
 
     assert tuple(decision.pair for decision in result.decisions) == pairs
     assert result.decisions[0].relation_type is MemoryRelationType.EQUIVALENT
-    assert result.decisions[0].reason == "fixture-0"
-    assert result.llm_calls == 1
-    assert len(client.calls) == 1
+    assert result.llm_calls == 2
+    assert "more than once" in client.calls[1]
 
 
-class _CompleteStructuredClient(RevisionClientFixture):
+class _CompleteStructuredClient(_PairsPerRequest):
+    pairs_per_request = 2
+
     def __init__(self) -> None:
         self.payloads: list[list[dict[str, object]]] = []
 
@@ -567,7 +561,6 @@ async def test_identity_resolver_preserves_pair_attribution_across_classifier_ba
         pair_classifier=StructuredMemoryPairClassifier(
             client=client,
             model="test-model",
-            policy=MemoryPairClassificationPolicy(max_pairs_per_call=2),
         ),
         llm_model="test-model",
     )

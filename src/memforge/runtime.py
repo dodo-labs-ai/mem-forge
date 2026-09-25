@@ -37,7 +37,6 @@ from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateR
 from memforge.memory.store import MemoryStore
 from memforge.models import SourceSyncRun, SyncState
 from memforge.pipeline.memory_extractor import MemoryExtractor
-from memforge.pipeline.source_support_detector import SourceSupportDetector
 from memforge.pipeline.sync_memory import SyncMemoryObserver
 from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
@@ -154,7 +153,6 @@ class SyncRuntime:
     memory_engine: MemoryEngine
     structured_llm_client: LiteLlmStructuredClient | None
     llm_model: str
-    source_support_detector: SourceSupportDetector | None
     relation_discovery: Any | None = None
     extraction_pool: ExtractionWorkPool | None = None
     document_lifecycle_admission: DocumentLifecycleAdmission | None = None
@@ -184,7 +182,6 @@ class SyncRuntime:
             memory_extractor=self.memory_extractor,
             memory_engine=self.memory_engine,
             memory_store=self.memory_store,
-            source_support_detector=self.source_support_detector,
             max_concurrent=self.config.llm.enrichment_max_concurrent,
             extraction_pool=self.extraction_pool,
             document_lifecycle_admission=self.document_lifecycle_admission,
@@ -411,7 +408,6 @@ async def get_effective_llm_config(db: "Database", config: AppConfig) -> Effecti
 
 
 AUDIT_HEALTH_FAILURE_EVENTS = (
-    "source_support_verification_failed",
     "contradiction_detection_failed",
     "reconciliation_failed",
     "reconciliation_action_failed",
@@ -710,11 +706,6 @@ def _build_default_sync_runtime(
             candidate_retriever=memory_engine.cross_document_candidates,
             pair_classifier=memory_engine.pair_classifier,
         )
-    source_support_kwargs = {
-        "structured_llm_client": structured_llm_client,
-        "llm_model": llm.enrichment_model,
-    }
-    source_support_detector = SourceSupportDetector(**source_support_kwargs)
 
     return SyncRuntime(
         db=db,
@@ -725,7 +716,6 @@ def _build_default_sync_runtime(
         memory_engine=memory_engine,
         structured_llm_client=structured_llm_client,
         llm_model=llm.enrichment_model,
-        source_support_detector=source_support_detector,
         relation_discovery=relation_discovery,
         extraction_pool=extraction_pool,
         document_lifecycle_admission=document_lifecycle_admission,

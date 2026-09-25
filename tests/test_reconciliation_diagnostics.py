@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -17,6 +16,7 @@ from memforge.llm.structured import (
 )
 from memforge.models import RawMemory
 from memforge.pipeline.reconciler import reconcile_memories, SupportAuditEntry
+from tests.revision_client_fixture import catalog_payload, sparse_response
 from tests.test_relation_first_reconciliation import _memory
 from tests.test_projected_lifecycle_integration import (
     db as db,
@@ -94,21 +94,14 @@ async def test_mandatory_provider_failure_preserves_support_and_revision_without
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", ["classification", "support_audit"])
-async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypatch, stage):
+async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypatch):
     calls = []
 
     async def provider(**kwargs):
         calls.append(kwargs)
         if len(calls) == 2:
             raise TimeoutError("provider secret detail must not be persisted")
-        prompt = kwargs["messages"][0]["content"]
-        if stage == "classification":
-            from tests.revision_client_fixture import sparse_response
-            payload = sparse_response(prompt, []).model_dump_json()
-        else:
-            incumbents = json.loads(prompt.split("<incumbents>")[1].split("</incumbents>")[0])
-            payload = json.dumps({"decisions": [{"supported": True} for _ in incumbents]})
+        payload = sparse_response(kwargs["messages"][0]["content"], []).model_dump_json()
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -135,7 +128,6 @@ async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypa
     original_fits = client.request_fits
     def fixture_capacity(prompt, **kwargs):
         if "<claim_catalog>" in prompt:
-            from tests.revision_client_fixture import catalog_payload
             if len(catalog_payload(prompt)["existing_claims"]) > 40:
                 return False
         return original_fits(prompt, **kwargs)
@@ -143,12 +135,12 @@ async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypa
     unit = StructuredLlmMetricsCollector()
     with client.metrics_scope(unit):
         result = await reconcile_memories(
-            new_extractions=[RawMemory(content="New claim", memory_type="fact")] if stage == "classification" else [],
+            new_extractions=[RawMemory(content="New claim", memory_type="fact")],
             existing_memories=[_memory(f"mem-{i}", f"Claim {i}") for i in range(65)],
             doc_type="design",
             structured_llm_client=client,
             include_metadata=True,
-            support_audits=[SupportAuditEntry(f"mem-{i}", True) for i in range(65)] if stage == "classification" else None,
+            support_audits=[SupportAuditEntry(f"mem-{i}", True) for i in range(65)],
         )
     assert len(calls) == 2
     assert result.operations == []
@@ -157,7 +149,7 @@ async def test_failed_second_call_is_counted_without_losing_unit_totals(monkeypa
     assert unit.summary(source_unit_elapsed_ms=1).logical_calls == 2
     assert result.failure.terminal_category == "provider_error"
     assert result.failure.error_code == "TimeoutError"
-    assert result.failure.operation in {"assess_claim_revisions", "assess_revision_support"}
+    assert result.failure.operation == "assess_claim_revisions"
     assert "provider secret" not in result.failure.error
 
 
@@ -189,30 +181,33 @@ def test_lifecycle_binder_retains_optional_safe_diagnostics():
     assert legacy.payload_hash == absent.payload_hash
     diagnosed = bind_source_lifecycle_outcome(
         **values,
-        operation="audit_incumbent_support",
+        operation="assess_revision_support",
         error_code="TimeoutError",
         terminal_category="provider_error",
     ).event
     assert diagnosed.event_id == legacy.event_id
     assert diagnosed.payload_hash != legacy.payload_hash
-    assert diagnosed.operation == "audit_incumbent_support"
+    assert diagnosed.operation == "assess_revision_support"
     assert diagnosed.error_code == "TimeoutError"
     assert diagnosed.terminal_category == "provider_error"
 
 
 @pytest.mark.asyncio
-async def test_failed_parallel_batch_counts_cancelled_provider_sibling(monkeypatch):
+async def test_failed_parallel_batch_counts_every_provider_sibling(monkeypatch):
     started = 0
     both_started = asyncio.Event()
+    first_failed = asyncio.Event()
 
     async def provider(**kwargs):
         nonlocal started
         started += 1
         if started == 1:
             await both_started.wait()
+            first_failed.set()
             raise TimeoutError("first batch failed")
         both_started.set()
-        await asyncio.Future()
+        await first_failed.wait()
+        raise TimeoutError("second batch failed")
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", provider)
     monkeypatch.setattr("memforge.llm.structured.litellm.supports_response_schema", lambda **_: False)
@@ -230,7 +225,6 @@ async def test_failed_parallel_batch_counts_cancelled_provider_sibling(monkeypat
     original_fits = client.request_fits
     def fixture_capacity(prompt, **kwargs):
         if "<claim_catalog>" in prompt:
-            from tests.revision_client_fixture import catalog_payload
             if len(catalog_payload(prompt)["existing_claims"]) > 40:
                 return False
         return original_fits(prompt, **kwargs)
@@ -251,4 +245,4 @@ async def test_failed_parallel_batch_counts_cancelled_provider_sibling(monkeypat
     assert result.failure.reason_code == "relation_first_failed"
     assert result.metrics.structured_llm_calls == 2
     assert summary.logical_calls == summary.provider_attempts == 2
-    assert summary.terminal_category_counts == {"provider_error": 1, "cancelled": 1}
+    assert summary.terminal_category_counts == {"provider_error": 2}

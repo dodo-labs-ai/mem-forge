@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
+from dataclasses import dataclass
 
 import pytest
 
-from memforge.llm.structured import EntityBatchValidationDecision, EntityBatchValidationResponse
+from memforge.llm.structured import EntityBatchValidationDecision, EntityBatchValidationResponse, StructuredLlmError
 from memforge.memory.entity_resolver import (
     EntityResolutionContext,
     EntityResolutionPolicy,
@@ -17,6 +17,7 @@ from memforge.memory.entity_resolver import (
 from memforge.models import Entity, EntityAlias, canonicalize_entity_name
 from memforge.storage.database import Database
 from memforge.storage.adapters.protocols import EntityResolutionScope, EntityUpsert
+from tests.llm_fixture import FixtureBudgetClient
 
 
 _SCOPE = EntityResolutionScope(access_context_hash="access-a")
@@ -151,67 +152,51 @@ class FakeEntityStore:
         self.aliases.extend(aliases)
 
 
-class BatchEntityClient:
-    def __init__(self, decisions: list[EntityBatchValidationDecision]) -> None:
-        self.decisions = decisions
-        self.calls = 0
-        self.prompts: list[str] = []
+def _cases(prompt: str) -> list[dict]:
+    return json.loads(prompt.split("Cases:\n", 1)[1].split("\n\nReturn one decision", 1)[0])
+
+
+def _mentions(*names: str) -> dict[str, tuple[str, ...]]:
+    """Mentions whose referencing Memory text does not matter to the test."""
+
+    return dict.fromkeys(names, ())
+
+
+@dataclass
+class EntityClient(FixtureBudgetClient):
+    """Answers through ``respond``; ``max_cases`` limits how many mentions one request fits."""
+
+    max_cases: int | None = None
+
+    @property
+    def calls(self) -> int:
+        return len(self.prompts)
+
+    def request_fits(self, prompt, **kwargs):
+        return (self.max_cases is None or len(_cases(prompt)) <= self.max_cases) and super().request_fits(
+            prompt, **kwargs,
+        )
 
     async def validate_entity_batch(self, prompt, *, max_tokens, model):
-        del max_tokens, model
-        self.calls += 1
-        self.prompts.append(prompt)
-        return _entity_batch_response(self.decisions)
+        return await self.call(prompt, max_tokens=max_tokens, model=model)
 
 
-class SequencedBatchEntityClient:
-    def __init__(self, responses: list[list[EntityBatchValidationDecision]]) -> None:
-        self.responses = responses
-        self.calls = 0
-        self.prompts: list[str] = []
-
-    async def validate_entity_batch(self, prompt, *, max_tokens, model):
-        del max_tokens, model
-        self.prompts.append(prompt)
-        response = self.responses[self.calls]
-        self.calls += 1
-        return _entity_batch_response(response)
+def _fixed_client(decisions: list[EntityBatchValidationDecision]) -> EntityClient:
+    return EntityClient(respond=lambda _prompt: _entity_batch_response(decisions))
 
 
-class ConcurrentBatchEntityClient:
-    max_concurrent = 2
+def _sequenced_client(responses: list[list[EntityBatchValidationDecision]]) -> EntityClient:
+    pending = list(responses)
+    return EntityClient(respond=lambda _prompt: _entity_batch_response(pending.pop(0)))
 
-    def __init__(self) -> None:
-        self.active = 0
-        self.max_active = 0
-        self.two_admitted = asyncio.Event()
-        self.release = asyncio.Event()
 
-    async def validate_entity_batch(self, prompt, *, max_tokens, model):
-        del max_tokens, model
-        self.active += 1
-        self.max_active = max(self.max_active, self.active)
-        if self.active == 2:
-            self.two_admitted.set()
-        try:
-            await self.release.wait()
-            cases = json.loads(
-                prompt.split("Mentions and candidate IDs:\n", 1)[1].split(
-                    "\n\nDocument context:",
-                    1,
-                )[0]
-            )
-            return _entity_batch_response(
-                [
-                    EntityBatchValidationDecision(
-                        matched_id=case["candidates"][0]["id"],
-                        confidence=0.99,
-                    )
-                    for case in cases
-                ]
-            )
-        finally:
-            self.active -= 1
+def _match_first_candidate(prompt: str) -> EntityBatchValidationResponse:
+    return _entity_batch_response(
+        [
+            EntityBatchValidationDecision(mention=case["mention"], matched_id=case["candidates"][0]["id"], confidence=0.99)
+            for case in _cases(prompt)
+        ]
+    )
 
 
 def _entity_batch_response(
@@ -236,10 +221,10 @@ async def test_resolve_many_batches_lookup_embedding_and_ambiguity(monkeypatch):
             },
         )
     )
-    client = BatchEntityClient(
+    client = _fixed_client(
         [
-            EntityBatchValidationDecision(matched_id=1, confidence=0.96),
-            EntityBatchValidationDecision(matched_id=2, confidence=0.97),
+            EntityBatchValidationDecision(mention="pay service", matched_id=1, confidence=0.96),
+            EntityBatchValidationDecision(mention="auth svc", matched_id=2, confidence=0.97),
         ]
     )
     embedding_batches: list[list[str]] = []
@@ -256,14 +241,26 @@ async def test_resolve_many_batches_lookup_embedding_and_ambiguity(monkeypatch):
     )
 
     result = await resolver.resolve_many(
-        ["MemForge", "pay-service", "auth_svc", "pay-service", "new component"],
+        {
+            "MemForge": ("MemForge stores Memories.",),
+            "pay-service": ("pay-service posts payroll runs to the ledger.",),
+            "pay service": ("Payroll runs retry through pay service.", "pay-service posts payroll runs to the ledger."),
+            "auth_svc": ("auth_svc issues session tokens.",),
+            "new component": ("The new component caches tokens.",),
+        },
         scope=_SCOPE,
-        doc_context="bounded source unit",
     )
 
     assert store.context_calls == 1
     assert len(embedding_batches) == 1
     assert client.calls == 1
+    assert {case["mention"]: case["memory_texts"] for case in _cases(client.prompts[0])} == {
+        "pay service": [
+            "pay-service posts payroll runs to the ledger.",
+            "Payroll runs retry through pay service.",
+        ],
+        "auth svc": ["auth_svc issues session tokens."],
+    }
     assert result.entity_id("MemForge") == 3
     assert result.entity_id("pay-service") == 1
     assert result.entity_id("auth_svc") == 2
@@ -280,7 +277,7 @@ async def test_resolve_many_batches_lookup_embedding_and_ambiguity(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_many_binds_adjudication_by_request_order(monkeypatch):
+async def test_resolve_many_binds_adjudication_by_mention_not_position(monkeypatch):
     first = Entity(id=1, canonical_name="first service", display_name="First Service")
     second = Entity(id=2, canonical_name="second service", display_name="Second Service")
     store = FakeEntityStore(
@@ -290,10 +287,10 @@ async def test_resolve_many_binds_adjudication_by_request_order(monkeypatch):
             candidates={"first svc": (first,), "second svc": (second,)},
         )
     )
-    client = BatchEntityClient(
+    client = _fixed_client(
         [
-            EntityBatchValidationDecision(matched_id=1, confidence=0.99),
-            EntityBatchValidationDecision(matched_id=2, confidence=0.99),
+            EntityBatchValidationDecision(mention="second svc", matched_id=2, confidence=0.99),
+            EntityBatchValidationDecision(mention="first svc", matched_id=1, confidence=0.99),
         ]
     )
     monkeypatch.setattr(
@@ -306,7 +303,7 @@ async def test_resolve_many_binds_adjudication_by_request_order(monkeypatch):
         structured_llm_client=client,
     )
 
-    result = await resolver.resolve_many(("first svc", "second svc"), scope=_SCOPE)
+    result = await resolver.resolve_many(_mentions("first svc", "second svc"), scope=_SCOPE)
 
     assert client.calls == 1
     assert result.entity_id("first svc") == 1
@@ -327,7 +324,7 @@ async def test_resolve_many_rejects_classifier_id_outside_candidate_set(monkeypa
             candidates={"pay service": (candidate,)},
         )
     )
-    client = BatchEntityClient([EntityBatchValidationDecision(matched_id=999, confidence=1.0)])
+    client = _fixed_client([EntityBatchValidationDecision(mention="pay service", matched_id=999, confidence=1.0)])
     monkeypatch.setattr(
         "memforge.retrieval.embeddings.embed_texts",
         lambda texts, *_args: [[1.0, 0.0] for _ in texts],
@@ -338,18 +335,23 @@ async def test_resolve_many_rejects_classifier_id_outside_candidate_set(monkeypa
         structured_llm_client=client,
     )
 
-    result = await resolver.resolve_many(["pay service"], scope=_SCOPE)
+    result = await resolver.resolve_many(_mentions("pay service"), scope=_SCOPE)
 
     assert result.entity_id("pay service") == 100
     assert store.aliases == []
 
 
-@pytest.mark.parametrize("decision_count", (1, 3))
+@pytest.mark.parametrize(
+    "mentions",
+    (
+        ("first svc",),
+        ("first svc", "first svc"),
+        ("first svc", "second svc", "third svc"),
+    ),
+    ids=("missing", "duplicate_hides_missing", "unknown"),
+)
 @pytest.mark.asyncio
-async def test_resolve_many_rejects_wrong_size_adjudication_before_entity_writes(
-    monkeypatch,
-    decision_count,
-):
+async def test_resolve_many_rejects_incomplete_adjudication_before_entity_writes(monkeypatch, mentions):
     first = Entity(id=1, canonical_name="first service", display_name="First Service")
     second = Entity(id=2, canonical_name="second service", display_name="Second Service")
     store = FakeEntityStore(
@@ -359,12 +361,7 @@ async def test_resolve_many_rejects_wrong_size_adjudication_before_entity_writes
             candidates={"first svc": (first,), "second svc": (second,)},
         )
     )
-    client = BatchEntityClient(
-        [
-            EntityBatchValidationDecision(matched_id=1, confidence=0.99)
-            for _ in range(decision_count)
-        ]
-    )
+    client = _fixed_client([EntityBatchValidationDecision(mention=mention, matched_id=1, confidence=0.99) for mention in mentions])
     monkeypatch.setattr(
         "memforge.retrieval.embeddings.embed_texts",
         lambda texts, *_args: [[1.0, 0.0] for _ in texts],
@@ -375,11 +372,11 @@ async def test_resolve_many_rejects_wrong_size_adjudication_before_entity_writes
         structured_llm_client=client,
     )
 
-    with pytest.raises(RuntimeError, match="coverage invalid"):
-        await resolver.resolve_many(("first svc", "second svc"), scope=_SCOPE)
+    with pytest.raises(RuntimeError, match="output_invalid"):
+        await resolver.resolve_many(_mentions("first svc", "second svc"), scope=_SCOPE)
 
     assert client.calls == 2
-    assert "<validation_feedback>" in client.prompts[1]
+    assert "<correction>" in client.prompts[1]
     assert store.created == []
     assert store.aliases == []
 
@@ -395,12 +392,12 @@ async def test_resolve_many_retries_incomplete_adjudication_once(monkeypatch):
             candidates={"first svc": (first,), "second svc": (second,)},
         )
     )
-    client = SequencedBatchEntityClient(
+    client = _sequenced_client(
         [
-            [EntityBatchValidationDecision(matched_id=1, confidence=0.99)],
+            [EntityBatchValidationDecision(mention="first svc", matched_id=1, confidence=0.99)],
             [
-                EntityBatchValidationDecision(matched_id=1, confidence=0.99),
-                EntityBatchValidationDecision(matched_id=2, confidence=0.99),
+                EntityBatchValidationDecision(mention="first svc", matched_id=1, confidence=0.99),
+                EntityBatchValidationDecision(mention="second svc", matched_id=2, confidence=0.99),
             ],
         ]
     )
@@ -414,10 +411,10 @@ async def test_resolve_many_retries_incomplete_adjudication_once(monkeypatch):
         structured_llm_client=client,
     )
 
-    result = await resolver.resolve_many(("first svc", "second svc"), scope=_SCOPE)
+    result = await resolver.resolve_many(_mentions("first svc", "second svc"), scope=_SCOPE)
 
     assert client.calls == 2
-    assert "<validation_feedback>" in client.prompts[1]
+    assert "<correction>" in client.prompts[1]
     assert result.metrics.structured_llm_calls == 2
     assert result.metrics.validation_retries == 1
     assert result.entity_id("first svc") == 1
@@ -425,7 +422,7 @@ async def test_resolve_many_retries_incomplete_adjudication_once(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_many_bounds_context_and_adjudication_batches(monkeypatch):
+async def test_resolve_many_bounds_context_batches_and_packs_adjudication_by_capacity(monkeypatch):
     mentions = tuple(f"service {index}" for index in range(5))
     candidates = {
         mention: (Entity(id=index + 1, canonical_name=f"canonical {index}", display_name=f"Canonical {index}"),)
@@ -442,18 +439,7 @@ async def test_resolve_many_bounds_context_and_adjudication_batches(monkeypatch)
             )
 
     store = ChunkedStore(EntityResolutionContext({}, {}, {}))
-    client = SequencedBatchEntityClient(
-        [
-            [
-                EntityBatchValidationDecision(
-                    matched_id=candidates[mention][0].id,
-                    confidence=0.99,
-                )
-                for mention in mentions[start : start + 2]
-            ]
-            for start in range(0, len(mentions), 2)
-        ]
-    )
+    client = EntityClient(respond=_match_first_candidate, max_cases=2, max_concurrent=2)
     monkeypatch.setattr(
         "memforge.retrieval.embeddings.embed_texts",
         lambda texts, *_args: [[1.0, 0.0] for _ in texts],
@@ -462,39 +448,28 @@ async def test_resolve_many_bounds_context_and_adjudication_batches(monkeypatch)
         store=store,  # type: ignore[arg-type]
         embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
         structured_llm_client=client,
-        policy=EntityResolutionPolicy(context_batch_size=2, adjudication_batch_size=2),
+        policy=EntityResolutionPolicy(context_batch_size=2),
     )
 
-    result = await resolver.resolve_many(mentions, scope=_SCOPE)
+    result = await resolver.resolve_many(_mentions(*mentions), scope=_SCOPE)
 
     assert store.context_calls == 3
-    assert client.calls == 3
-    assert all(len(prompt) <= 32_000 for prompt in client.prompts)
+    assert [[case["mention"] for case in _cases(prompt)] for prompt in client.prompts] == [
+        list(mentions[0:2]), list(mentions[2:4]), list(mentions[4:]),
+    ]
+    assert tuple(result.entity_id(mention) for mention in mentions) == (1, 2, 3, 4, 5)
     assert result.metrics.structured_llm_calls == 3
     assert result.metrics.new_entities == 0
+    assert client.peak_in_flight == 2
 
 
 @pytest.mark.asyncio
-async def test_resolve_many_runs_independent_adjudication_batches_concurrently(monkeypatch):
-    mentions = tuple(f"service {index}" for index in range(5))
-    candidates = {
-        mention: (
-            Entity(
-                id=index + 1,
-                canonical_name=f"canonical {index}",
-                display_name=f"Canonical {index}",
-            ),
-        )
-        for index, mention in enumerate(mentions)
-    }
+async def test_resolve_many_fails_before_entity_writes_when_one_mention_exceeds_capacity(monkeypatch):
+    candidate = Entity(id=1, canonical_name="payroll service", display_name="Payroll Service")
     store = FakeEntityStore(
-        EntityResolutionContext(
-            exact_matches={},
-            alias_matches={},
-            candidates=candidates,
-        )
+        EntityResolutionContext(exact_matches={}, alias_matches={}, candidates={"pay service": (candidate,)})
     )
-    client = ConcurrentBatchEntityClient()
+    client = EntityClient(respond=_match_first_candidate, max_cases=0)
     monkeypatch.setattr(
         "memforge.retrieval.embeddings.embed_texts",
         lambda texts, *_args: [[1.0, 0.0] for _ in texts],
@@ -503,36 +478,37 @@ async def test_resolve_many_runs_independent_adjudication_batches_concurrently(m
         store=store,  # type: ignore[arg-type]
         embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
         structured_llm_client=client,
-        policy=EntityResolutionPolicy(adjudication_batch_size=2),
     )
-    resolution = asyncio.create_task(resolver.resolve_many(mentions, scope=_SCOPE))
 
-    await asyncio.wait_for(client.two_admitted.wait(), timeout=0.5)
-    client.release.set()
-    result = await resolution
+    with pytest.raises(RuntimeError, match="input_capacity_exceeded"):
+        await resolver.resolve_many(_mentions("pay service"), scope=_SCOPE)
 
-    assert tuple(result.entity_id(mention) for mention in mentions) == (1, 2, 3, 4, 5)
-    assert result.metrics.structured_llm_calls == 3
-    assert client.max_active == 2
+    assert client.prompts == []
+    assert store.created == []
 
 
-def test_adjudication_batch_rejects_single_case_over_final_prompt_limit():
+@pytest.mark.asyncio
+async def test_resolve_many_keeps_provider_error_type(monkeypatch):
+    candidate = Entity(id=1, canonical_name="payroll service", display_name="Payroll Service")
+    store = FakeEntityStore(
+        EntityResolutionContext(exact_matches={}, alias_matches={}, candidates={"pay service": (candidate,)})
+    )
+
+    def respond(_prompt: str) -> EntityBatchValidationResponse:
+        raise StructuredLlmError("provider down", terminal_category="provider_error", error_code="provider_error")
+
+    monkeypatch.setattr(
+        "memforge.retrieval.embeddings.embed_texts",
+        lambda texts, *_args: [[1.0, 0.0] for _ in texts],
+    )
     resolver = EntityResolver(
-        store=FakeEntityStore(EntityResolutionContext({}, {}, {})),  # type: ignore[arg-type]
-        policy=EntityResolutionPolicy(max_adjudication_prompt_chars=300),
+        store=store,  # type: ignore[arg-type]
+        embed_cfg={"base_url": "http://embed", "api_key": "key", "model": "model"},
+        structured_llm_client=EntityClient(respond=respond),
     )
-    oversized_case = {
-        "mention": "service",
-        "candidates": [{"id": 1, "name": "x" * 400}],
-    }
 
-    with pytest.raises(RuntimeError, match="exceeds prompt character limit"):
-        resolver._adjudication_batches((oversized_case,), context="")
-
-
-def test_entity_resolution_policy_rejects_batch_larger_than_bounded_limit():
-    with pytest.raises(ValueError, match="bounded adjudication limit"):
-        EntityResolutionPolicy(adjudication_batch_size=33)
+    with pytest.raises(StructuredLlmError, match="provider down"):
+        await resolver.resolve_many(_mentions("pay service"), scope=_SCOPE)
 
 
 @pytest.mark.asyncio

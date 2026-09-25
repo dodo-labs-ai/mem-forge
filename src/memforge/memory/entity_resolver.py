@@ -1,4 +1,4 @@
-"""Bounded batch resolution of extracted entity mentions."""
+"""Batch resolution of extracted entity mentions."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ from math import sqrt
 from time import perf_counter
 from typing import Any
 
-from memforge.llm.structured import structured_llm_max_concurrent
+from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.structured import EntityBatchValidationResponse, StructuredLlmError
 from memforge.models import Entity, EntityAlias, canonicalize_entity_name
-from memforge.pipeline.bounded_work import collect_bounded
 from memforge.storage.adapters.protocols import (
     EntityResolutionContext,
     EntityResolutionScope,
@@ -24,8 +24,9 @@ from memforge.storage.adapters.protocols import (
 
 logger = logging.getLogger(__name__)
 
-_ENTITY_ADJUDICATION_BATCH_LIMIT = 32
-_ENTITY_ADJUDICATION_VALIDATION_ATTEMPTS = 2
+# Requested output: one short decision per mention, with a floor for the envelope.
+_ENTITY_DECISION_OUTPUT_TOKENS = 256
+_ENTITY_MIN_OUTPUT_TOKENS = 512
 
 __all__ = [
     "EntityResolutionBatch",
@@ -65,27 +66,18 @@ class EntityResolutionBatch:
 
 @dataclass(frozen=True, slots=True)
 class EntityResolutionPolicy:
-    """Provider-neutral bounds for storage, embedding, and adjudication batches."""
+    """Provider-neutral bounds for storage and embedding batches."""
 
     context_batch_size: int = 64
     embedding_batch_size: int = 256
-    adjudication_batch_size: int = 32
-    max_adjudication_prompt_chars: int = 32_000
 
     def __post_init__(self) -> None:
         for name, value in (
             ("context_batch_size", self.context_batch_size),
             ("embedding_batch_size", self.embedding_batch_size),
-            ("adjudication_batch_size", self.adjudication_batch_size),
-            ("max_adjudication_prompt_chars", self.max_adjudication_prompt_chars),
         ):
             if value < 1:
                 raise ValueError(f"{name} must be positive")
-        if self.adjudication_batch_size > _ENTITY_ADJUDICATION_BATCH_LIMIT:
-            raise ValueError(
-                "adjudication_batch_size cannot exceed the bounded adjudication limit "
-                f"({_ENTITY_ADJUDICATION_BATCH_LIMIT})"
-            )
 
 
 def validate_alias(alias_name: str, canonical_name: str) -> bool:
@@ -107,15 +99,14 @@ def validate_alias(alias_name: str, canonical_name: str) -> bool:
 
 _ENTITY_BATCH_PROMPT = """Resolve each entity mention against only its supplied candidates.
 
-Return a decisions array with exactly one judgment per case, in the same order
-as the cases below. Do not repeat or rewrite the mention; the caller binds each
-decision by array position.
+Return a decisions array with exactly one judgment per case. Set each
+judgment's mention to its case's mention, copied exactly.
 
-Mentions and candidate IDs:
+Each case lists the mention, its candidate IDs, and the memory_texts that
+mention it. Judge the mention by what those texts say about it.
+
+Cases:
 {cases_json}
-
-Document context:
-{context}
 
 Return one decision for every mention. matched_id must be one supplied candidate
 ID or null. Related, parent/child, or same-category entities are not identical.
@@ -123,7 +114,7 @@ Return only the structured response."""
 
 
 class EntityResolver:
-    """Own bounded entity recall, ambiguity proof, alias learning, and creation."""
+    """Own entity recall, ambiguity proof, alias learning, and creation."""
 
     def __init__(
         self,
@@ -147,19 +138,24 @@ class EntityResolver:
 
     async def resolve_many(
         self,
-        mentions: Sequence[str],
+        mentions: Mapping[str, Sequence[str]],
         *,
         scope: EntityResolutionScope,
-        doc_context: str | None = None,
     ) -> EntityResolutionBatch:
-        """Resolve distinct mentions with bounded storage and model batches."""
+        """Resolve distinct mentions with bounded storage batches and packed model requests.
+
+        ``mentions`` maps each mention to the Memory texts that reference it;
+        adjudication shows the model those texts for that mention.
+        """
 
         started = perf_counter()
         display_by_canonical: dict[str, str] = {}
-        for mention in mentions:
+        texts_by_canonical: dict[str, list[str]] = {}
+        for mention, memory_texts in mentions.items():
             canonical = canonicalize_entity_name(mention)
             if canonical:
                 display_by_canonical.setdefault(canonical, mention.strip() or canonical)
+                texts_by_canonical.setdefault(canonical, []).extend(memory_texts)
         canonical_names = tuple(display_by_canonical)
         if not canonical_names:
             return self._finish_batch(started=started, resolved={})
@@ -252,67 +248,12 @@ class EntityResolver:
         validation_retries = 0
         learned_aliases: list[EntityAlias] = []
         if ambiguous and self.structured_llm_client is not None:
-            cases = tuple(
-                {
-                    "mention": mention,
-                    "candidates": [{"id": candidate.id, "name": candidate.canonical_name} for candidate in candidates],
-                }
-                for mention, candidates in ambiguous.items()
-            )
-            decisions: dict[str, object] = {}
-            context_text = (doc_context or "")[:2000]
-            case_batches = self._adjudication_batches(cases, context=context_text)
-
-            async def adjudicate_batch(
-                case_batch: tuple[dict[str, object], ...],
-            ) -> tuple[tuple[tuple[str, object], ...], int, int]:
-                prompt = self._render_adjudication_prompt(case_batch, context=context_text)
-                for attempt in range(_ENTITY_ADJUDICATION_VALIDATION_ATTEMPTS):
-                    response = await self.structured_llm_client.validate_entity_batch(
-                        prompt,
-                        max_tokens=max(512, min(4096, len(case_batch) * 256)),
-                        model=self.llm_model,
-                    )
-                    if len(response.decisions) == len(case_batch):
-                        return (
-                            tuple(
-                                (str(case["mention"]), decision)
-                                for case, decision in zip(
-                                    case_batch,
-                                    response.decisions,
-                                    strict=True,
-                                )
-                            ),
-                            attempt + 1,
-                            attempt,
-                        )
-                    error = (
-                        "entity adjudication coverage invalid: "
-                        f"expected_count={len(case_batch)}, "
-                        f"actual_count={len(response.decisions)}"
-                    )
-                    if attempt + 1 >= _ENTITY_ADJUDICATION_VALIDATION_ATTEMPTS:
-                        raise RuntimeError(error)
-                    prompt = (
-                        f"{prompt}\n\n<validation_feedback>\n"
-                        f"The previous response was rejected: {error}. Return exactly "
-                        f"{len(case_batch)} decisions in case order.\n"
-                        "</validation_feedback>"
-                    )
-                raise AssertionError("entity adjudication attempts exhausted")
-
-            batch_decisions = await collect_bounded(
-                case_batches,
-                adjudicate_batch,
-                max_concurrent=structured_llm_max_concurrent(self.structured_llm_client),
-            )
-            structured_llm_calls += sum(result[1] for result in batch_decisions)
-            validation_retries += sum(result[2] for result in batch_decisions)
-            for adjudicated, _, _ in batch_decisions:
-                decisions.update(adjudicated)
+            runner = LlmBatchRunner(self.structured_llm_client, model=self.llm_model)
+            decisions = await self._adjudicate(runner, ambiguous, texts_by_canonical)
+            structured_llm_calls = runner.stats.calls
+            validation_retries = runner.stats.corrections
             for mention, candidates in ambiguous.items():
-                decision = decisions.get(mention)
-                assert decision is not None
+                decision = decisions[mention]
                 candidate_ids = {candidate.id for candidate in candidates}
                 matched_id = getattr(decision, "matched_id", None)
                 confidence = float(getattr(decision, "confidence", 0.0))
@@ -358,43 +299,45 @@ class EntityResolver:
             new_entities=len(new_names),
         )
 
-    def _adjudication_batches(
+    async def _adjudicate(
         self,
-        cases: tuple[dict[str, object], ...],
-        *,
-        context: str,
-    ) -> tuple[tuple[dict[str, object], ...], ...]:
-        batches: list[tuple[dict[str, object], ...]] = []
-        current: list[dict[str, object]] = []
-        for case in cases:
-            candidate = (*current, case)
-            candidate_chars = len(self._render_adjudication_prompt(candidate, context=context))
-            if current and (
-                len(candidate) > self.policy.adjudication_batch_size
-                or candidate_chars > self.policy.max_adjudication_prompt_chars
-            ):
-                batches.append(tuple(current))
-                current = [case]
-            else:
-                current.append(case)
-            if len(self._render_adjudication_prompt(current, context=context)) > (
-                self.policy.max_adjudication_prompt_chars
-            ):
-                raise RuntimeError("single entity adjudication case exceeds prompt character limit")
-        if current:
-            batches.append(tuple(current))
-        return tuple(batches)
+        runner: LlmBatchRunner,
+        ambiguous: Mapping[str, tuple[Entity, ...]],
+        memory_texts: Mapping[str, Sequence[str]],
+    ) -> dict[str, Any]:
+        """Return one decision per ambiguous mention; any unresolved mention fails the batch."""
 
-    @staticmethod
-    def _render_adjudication_prompt(
-        cases: Sequence[dict[str, object]],
-        *,
-        context: str,
-    ) -> str:
-        return _ENTITY_BATCH_PROMPT.format(
-            cases_json=json.dumps(tuple(cases), ensure_ascii=False, sort_keys=True),
-            context=context,
-        )
+        def render(mentions: tuple[str, ...], _context: tuple) -> LlmRequest:
+            cases = tuple(
+                {
+                    "mention": mention,
+                    "candidates": [
+                        {"id": candidate.id, "name": candidate.canonical_name}
+                        for candidate in ambiguous[mention]
+                    ],
+                    "memory_texts": list(dict.fromkeys(memory_texts[mention])),
+                }
+                for mention in mentions
+            )
+            prompt = _ENTITY_BATCH_PROMPT.format(
+                cases_json=json.dumps(cases, ensure_ascii=False, sort_keys=True),
+            )
+            max_tokens = max(_ENTITY_MIN_OUTPUT_TOKENS, _ENTITY_DECISION_OUTPUT_TOKENS * len(mentions))
+            return LlmRequest(prompt, EntityBatchValidationResponse, max_tokens)
+
+        def decode(response: EntityBatchValidationResponse, _mentions: tuple[str, ...], _context: tuple):
+            return ((decision.mention, decision) for decision in response.decisions)
+
+        outcomes = await runner.run_items(ItemTask(
+            item_ids=tuple(ambiguous), render=render, decode=decode,
+            call=self.structured_llm_client.validate_entity_batch,
+        ))
+        decisions: dict[str, Any] = {}
+        for mention, outcome in outcomes.items():
+            if isinstance(outcome, ItemFailure):
+                raise _adjudication_error(outcome)
+            decisions[mention] = outcome[0]
+        return decisions
 
     def _finish_batch(
         self,
@@ -441,6 +384,15 @@ class EntityResolver:
             metrics.elapsed_ms,
         )
         return EntityResolutionBatch(dict(resolved), metrics)
+
+
+def _adjudication_error(failure: ItemFailure) -> Exception:
+    """Client errors keep their type; runner-owned failures read as adjudication failures."""
+
+    if isinstance(failure.error, StructuredLlmError):
+        return failure.error
+    detail = f": {failure.error}" if failure.error is not None else ""
+    return RuntimeError(f"entity adjudication failed ({failure.error_code}){detail}")
 
 
 def _cosine(left: Sequence[float], right: Sequence[float]) -> float:

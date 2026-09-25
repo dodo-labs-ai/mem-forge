@@ -1,19 +1,19 @@
-"""Bounded uniqueness selection for one extracted Source Unit revision."""
+"""Uniqueness selection for one extracted Source Unit revision."""
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Literal, Sequence
 
-from memforge.llm.structured import (
-    CandidateLedgerDecision,
-    structured_llm_max_concurrent,
-)
+from memforge.llm.batch_runner import OUTPUT_INVALID, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.structured import CandidateLedgerResponse
 from memforge.models import RawMemory
-from memforge.pipeline.bounded_work import collect_bounded
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CandidateLedgerError",
@@ -23,12 +23,11 @@ __all__ = [
 ]
 
 
-_CANDIDATE_LEDGER_PROMPT = """Select the non-redundant durable Memory candidates in one bounded
+_CANDIDATE_LEDGER_PROMPT = """Select the non-redundant durable Memory candidates in one
 admission batch extracted from a Source Unit revision.
 
-Return a decisions array with exactly one judgment per candidate, in the same
-order as <candidates>. Do not repeat the candidate index inside the judgment;
-the caller owns candidate identity and binds each decision by array position.
+Return a decisions array with exactly one judgment per candidate. Set each
+judgment's candidate_index to the index of the candidate it judges.
 
 For each mapped candidate:
 - KEEP when the candidate has any material truth condition not fully captured by another visible kept
@@ -47,12 +46,12 @@ record a different outcome, or preserve a distinct durable fact. Do not rewrite 
 {candidates_json}
 </candidates>
 
-Return only the ordered decisions object required by the response schema."""
+Return only the decisions object required by the response schema."""
 
-_VALIDATION_ATTEMPTS = 2
-_DEFAULT_MAX_CONTEXT_CHARS = 100_000
-_DEFAULT_MAX_OUTPUT_TOKENS = 8192
-_CANDIDATE_LEDGER_DECISION_BATCH_SIZE = 24
+# Requested output: one decision with a reason of up to 1000 characters per
+# candidate, with a floor for the envelope. The runner bounds it by the route.
+_LEDGER_DECISION_OUTPUT_TOKENS = 320
+_LEDGER_MIN_OUTPUT_TOKENS = 1024
 
 
 @dataclass(frozen=True)
@@ -67,7 +66,7 @@ class CandidateLedgerDrop:
 
 @dataclass(frozen=True)
 class _IndexedLedgerDecision:
-    """Judgment bound to its caller-owned candidate index by array position."""
+    """One validated judgment for the candidate at ``index``."""
 
     index: int
     action: Literal["KEEP", "DROP_REDUNDANT", "DROP_LOW_VALUE"]
@@ -76,25 +75,8 @@ class _IndexedLedgerDecision:
 
 
 @dataclass(frozen=True)
-class _CandidateLedgerBatchPlan:
-    expected_indices: tuple[int, ...]
-    prompt: str
-
-
-@dataclass(frozen=True)
-class _CandidateLedgerBatchResult:
-    decisions: dict[int, _IndexedLedgerDecision]
-    structured_llm_calls: int
-    structured_llm_elapsed_ms: int
-    validation_retries: int
-    fallback_batch_count: int
-    fallback_candidate_count: int
-    prompt_chars: int
-
-
-@dataclass(frozen=True)
 class CandidateLedgerResult:
-    """Selected original candidates and bounded ledger accounting."""
+    """Selected original candidates and ledger accounting."""
 
     candidates: tuple[RawMemory, ...]
     input_count: int
@@ -141,9 +123,8 @@ async def select_unique_memory_candidates(
     *,
     structured_llm_client,
     llm_model: str | None,
-    max_context_chars: int = _DEFAULT_MAX_CONTEXT_CHARS,
 ) -> CandidateLedgerResult:
-    """Return original candidates selected by bounded admission batches."""
+    """Return original candidates selected by capacity-packed admission requests."""
 
     original = tuple(candidates)
     exact_unique, exact_drops = _collapse_exact_duplicates(original)
@@ -188,128 +169,64 @@ async def select_unique_memory_candidates(
             semantic_input_count=semantic_count,
         )
 
-    plans: list[_CandidateLedgerBatchPlan] = []
-    offset = 0
-    while offset < semantic_count:
-        stop = min(
-            semantic_count,
-            offset + _CANDIDATE_LEDGER_DECISION_BATCH_SIZE,
+    def render(item_ids: tuple[str, ...], _context: tuple) -> LlmRequest:
+        payload = [
+            {
+                "index": index,
+                "memory_type": ordered_candidates[index].memory_type,
+                "content": ordered_candidates[index].content,
+                "source_observation_id": ordered_candidates[index].source_observation_id,
+            }
+            for index in map(int, item_ids)
+        ]
+        prompt = _CANDIDATE_LEDGER_PROMPT.format(
+            candidates_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         )
-        prompt: str | None = None
-        expected_indices: tuple[int, ...] = ()
-        while stop > offset:
-            expected_indices = tuple(range(offset, stop))
-            payload = [
-                {
-                    "index": index,
-                    "memory_type": ordered_candidates[index].memory_type,
-                    "content": ordered_candidates[index].content,
-                    "source_observation_id": ordered_candidates[index].source_observation_id,
-                }
-                for index in expected_indices
-            ]
-            candidate_prompt = _CANDIDATE_LEDGER_PROMPT.format(
-                candidates_json=json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            )
-            if len(candidate_prompt) <= max_context_chars:
-                prompt = candidate_prompt
-                break
-            stop -= 1
-        if prompt is None:
+        max_tokens = max(_LEDGER_MIN_OUTPUT_TOKENS, _LEDGER_DECISION_OUTPUT_TOKENS * len(item_ids))
+        return LlmRequest(prompt, CandidateLedgerResponse, max_tokens)
+
+    def decode(response: CandidateLedgerResponse, item_ids: tuple[str, ...], _context: tuple):
+        visible = frozenset(map(int, item_ids))
+        return ((str(decision.index), decision) for decision in _ledger_decisions(response, visible))
+
+    runner = LlmBatchRunner(structured_llm_client, model=llm_model)
+    indices = tuple(range(semantic_count))
+    item_ids = tuple(map(str, indices))
+    started = perf_counter()
+    try:
+        outcomes = await runner.run_items(ItemTask(item_ids=item_ids, render=render, decode=decode, call=selector))
+        fallback_batch_count = runner.stats.failed_requests
+    except ValueError as error:
+        # Admission is best effort: a route whose request budget cannot be
+        # resolved admits every candidate.
+        logger.warning("candidate_ledger_unavailable candidates=%d", semantic_count, exc_info=True)
+        unavailable = ItemFailure("provider_error", type(error).__name__, error)
+        outcomes = dict.fromkeys(item_ids, unavailable)
+        fallback_batch_count = 1
+    structured_llm_elapsed_ms = max(0, round((perf_counter() - started) * 1000))
+
+    decisions_by_index: dict[int, _IndexedLedgerDecision] = {}
+    fallback_candidate_count = 0
+    for index in indices:
+        outcome = outcomes[str(index)]
+        if isinstance(outcome, ItemFailure) and outcome.category == "capacity_exceeded":
             raise CandidateLedgerError(
                 "budget_exceeded",
-                (f"one candidate ledger request exceeds the context budget of {max_context_chars} chars"),
+                "one candidate ledger request exceeds the route's input capacity",
                 input_count=len(original),
                 semantic_input_count=semantic_count,
+                structured_llm_calls=runner.stats.calls,
+                structured_llm_elapsed_ms=structured_llm_elapsed_ms,
+                validation_retries=runner.stats.corrections,
+                prompt_chars=runner.stats.prompt_chars,
             )
-        plans.append(
-            _CandidateLedgerBatchPlan(
-                expected_indices=expected_indices,
-                prompt=prompt,
+        if isinstance(outcome, ItemFailure):
+            fallback_candidate_count += 1
+            decisions_by_index[index] = _IndexedLedgerDecision(
+                index=index, action="KEEP", canonical_index=None, reason=_fallback_reason(outcome),
             )
-        )
-        offset = stop
-
-    async def select_batch(plan: _CandidateLedgerBatchPlan) -> _CandidateLedgerBatchResult:
-        prompt = plan.prompt
-        batch_decisions: dict[int, _IndexedLedgerDecision] | None = None
-        structured_llm_calls = 0
-        structured_llm_elapsed_ms = 0
-        validation_retries = 0
-        fallback_batch_count = 0
-        fallback_candidate_count = 0
-        prompt_chars = 0
-        for attempt in range(_VALIDATION_ATTEMPTS):
-            prompt_chars += len(prompt)
-            call_started = perf_counter()
-            try:
-                structured_llm_calls += 1
-                response = await selector(
-                    prompt,
-                    max_tokens=_DEFAULT_MAX_OUTPUT_TOKENS,
-                    model=llm_model,
-                )
-            except Exception:
-                structured_llm_elapsed_ms += max(0, round((perf_counter() - call_started) * 1000))
-                batch_decisions = _keep_batch(
-                    plan.expected_indices,
-                    reason="structured_admission_unavailable",
-                )
-                fallback_batch_count += 1
-                fallback_candidate_count += len(plan.expected_indices)
-                break
-            structured_llm_elapsed_ms += max(0, round((perf_counter() - call_started) * 1000))
-            try:
-                batch_decisions = _validate_ledger_batch(
-                    response.decisions,
-                    expected_indices=plan.expected_indices,
-                )
-                break
-            except ValueError as exc:
-                if attempt + 1 >= _VALIDATION_ATTEMPTS:
-                    break
-                validation_retries += 1
-                prompt = (
-                    f"{prompt}\n\n<validation_feedback>\n"
-                    f"The previous response was rejected: {exc}. Return exactly "
-                    f"{len(plan.expected_indices)} valid decisions in candidate order.\n"
-                    "</validation_feedback>"
-                )
-        if batch_decisions is None:
-            batch_decisions = _keep_batch(
-                plan.expected_indices,
-                reason="structured_admission_invalid",
-            )
-            fallback_batch_count += 1
-            fallback_candidate_count += len(plan.expected_indices)
-        return _CandidateLedgerBatchResult(
-            decisions=batch_decisions,
-            structured_llm_calls=structured_llm_calls,
-            structured_llm_elapsed_ms=structured_llm_elapsed_ms,
-            validation_retries=validation_retries,
-            fallback_batch_count=fallback_batch_count,
-            fallback_candidate_count=fallback_candidate_count,
-            prompt_chars=prompt_chars,
-        )
-
-    batch_results = await collect_bounded(
-        plans,
-        select_batch,
-        max_concurrent=structured_llm_max_concurrent(structured_llm_client),
-    )
-    decisions_by_index: dict[int, _IndexedLedgerDecision] = {}
-    for batch_result in batch_results:
-        decisions_by_index.update(batch_result.decisions)
-    structured_llm_calls = sum(result.structured_llm_calls for result in batch_results)
-    structured_llm_elapsed_ms = sum(result.structured_llm_elapsed_ms for result in batch_results)
-    validation_retries = sum(result.validation_retries for result in batch_results)
-    fallback_batch_count = sum(result.fallback_batch_count for result in batch_results)
-    fallback_candidate_count = sum(result.fallback_candidate_count for result in batch_results)
-    prompt_chars = sum(result.prompt_chars for result in batch_results)
+        else:
+            decisions_by_index[index] = outcome[0]
 
     decisions_by_index = _normalize_ledger_canonicals(decisions_by_index)
     _validate_complete_ledger(
@@ -352,12 +269,12 @@ async def select_unique_memory_candidates(
         dropped_exact_count=dropped_exact_count,
         dropped_redundant_count=dropped_redundant_count,
         dropped_low_value_count=dropped_low_value_count,
-        structured_llm_calls=structured_llm_calls,
+        structured_llm_calls=runner.stats.calls,
         structured_llm_elapsed_ms=structured_llm_elapsed_ms,
-        validation_retries=validation_retries,
+        validation_retries=runner.stats.corrections,
         fallback_batch_count=fallback_batch_count,
         fallback_candidate_count=fallback_candidate_count,
-        prompt_chars=prompt_chars,
+        prompt_chars=runner.stats.prompt_chars,
         drops=exact_drops + redundant_drops + low_value_drops,
     )
 
@@ -386,20 +303,12 @@ def _collapse_exact_duplicates(
     return tuple(unique), tuple(drops)
 
 
-def _keep_batch(
-    expected_indices: tuple[int, ...],
-    *,
-    reason: str,
-) -> dict[int, _IndexedLedgerDecision]:
-    return {
-        index: _IndexedLedgerDecision(
-            index=index,
-            action="KEEP",
-            canonical_index=None,
-            reason=reason,
-        )
-        for index in expected_indices
-    }
+def _fallback_reason(failure: ItemFailure) -> str:
+    """Why a candidate was admitted without a ledger judgment."""
+
+    if failure.error_code == OUTPUT_INVALID:
+        return "structured_admission_invalid"
+    return "structured_admission_unavailable"
 
 
 def _validate_complete_ledger(
@@ -439,36 +348,22 @@ def _validate_complete_ledger(
     return by_index
 
 
-def _validate_ledger_batch(
-    decisions: Sequence[CandidateLedgerDecision],
-    *,
-    expected_indices: tuple[int, ...],
-) -> dict[int, _IndexedLedgerDecision]:
-    if len(decisions) != len(expected_indices):
-        raise ValueError(
-            "candidate ledger decision count mismatch: "
-            f"expected {len(expected_indices)}, got {len(decisions)}"
-        )
-    by_index: dict[int, _IndexedLedgerDecision] = {}
-    visible_indices = set(expected_indices)
-    for index, judgment in zip(expected_indices, decisions, strict=True):
-        if judgment.action == "DROP_REDUNDANT" and (
-            judgment.canonical_index is None or judgment.canonical_index >= index
-        ):
+def _ledger_decisions(response: CandidateLedgerResponse, visible: frozenset[int]):
+    """Yield each judgment; a redundant drop must name a lower index visible in its request."""
+
+    for judgment in response.decisions:
+        index = judgment.candidate_index
+        redundant = judgment.action == "DROP_REDUNDANT"
+        if redundant and (judgment.canonical_index is None or judgment.canonical_index >= index):
             raise ValueError(f"DROP_REDUNDANT index {index} must target a lower index")
-        if judgment.action == "DROP_REDUNDANT" and judgment.canonical_index not in visible_indices:
+        if redundant and judgment.canonical_index not in visible:
             raise ValueError(f"DROP_REDUNDANT index {index} must target a visible lower index")
-        by_index[index] = _IndexedLedgerDecision(
+        yield _IndexedLedgerDecision(
             index=index,
             action=judgment.action,
-            canonical_index=(
-                judgment.canonical_index
-                if judgment.action == "DROP_REDUNDANT"
-                else None
-            ),
+            canonical_index=judgment.canonical_index if redundant else None,
             reason=judgment.reason,
         )
-    return by_index
 
 
 def _normalize_ledger_canonicals(

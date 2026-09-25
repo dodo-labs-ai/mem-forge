@@ -13,7 +13,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field as dataclass_field
 from threading import Lock
 from time import perf_counter
-from typing import Annotated, Any, Callable, Iterator, Literal, Mapping, Protocol, get_args, get_origin
+from typing import Annotated, Any, Callable, Iterator, Literal, Mapping, get_args, get_origin
 from weakref import WeakKeyDictionary
 
 import litellm
@@ -46,6 +46,12 @@ type TransientEvidenceBlockId = Annotated[
     str,
     Field(min_length=1, pattern=r"^EB-\d{3,}$"),
 ]
+# Request-size failures: a smaller request can succeed where this one cannot,
+# so callers split the work instead of resending it unchanged.
+INPUT_CAPACITY_EXCEEDED = "input_capacity_exceeded"
+PAYLOAD_TOO_LARGE = "payload_too_large"
+OUTPUT_TRUNCATED = "output_truncated"
+_HTTP_PAYLOAD_TOO_LARGE = 413
 _SCHEMA_REPAIR_MAX_VALIDATION_FIELDS = 8
 _SCHEMA_REPAIR_LOCATION_CHAR_CAP = 256
 _SCHEMA_REPAIR_RULE_CHAR_CAP = 128
@@ -161,25 +167,6 @@ class StructuredResponseModel(BaseModel):
                 decoded = dict(data)
             decoded[key] = parsed
         return decoded if decoded is not None else data
-
-
-class SourceSupportDecision(StructuredResponseModel):
-    """One verifier decision for an existing memory candidate."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    memory_id: str = Field(min_length=1)
-    supported: bool
-    excerpt: str | None = None
-    reason: str | None = None
-
-
-class SourceSupportResponse(StructuredResponseModel):
-    """Schema returned by the source-support verifier."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    decisions: list[SourceSupportDecision]
 
 
 class AgentSessionAuthorityDecision(StructuredResponseModel):
@@ -448,59 +435,22 @@ class ProjectionFragmentSelectorCorrectionResponse(StructuredResponseModel):
 
 
 class CandidateLedgerDecision(StructuredResponseModel):
-    """One ordered uniqueness judgment for a transient extracted candidate."""
+    """One uniqueness judgment for the transient extracted candidate it names."""
 
     model_config = ConfigDict(extra="forbid")
 
+    candidate_index: int = Field(ge=0)
     action: Literal["KEEP", "DROP_REDUNDANT", "DROP_LOW_VALUE"]
     canonical_index: int | None = Field(default=None, ge=0)
     reason: str = Field(default="", max_length=1000)
 
 
 class CandidateLedgerResponse(StructuredResponseModel):
-    """Ordered decisions for one bounded candidate-ledger batch."""
+    """One decision per candidate in a candidate-ledger request."""
 
     model_config = ConfigDict(extra="forbid")
 
     decisions: list[CandidateLedgerDecision]
-
-
-class IncumbentSupportAuditDecision(StructuredResponseModel):
-    """One factual Source Unit support judgment, without lifecycle semantics."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    supported: bool
-    reason: str = Field(default="", max_length=1000)
-
-
-class IncumbentSupportAuditResponse(StructuredResponseModel):
-    """Ordered incumbent side of a composed reconciliation ledger."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    decisions: list[IncumbentSupportAuditDecision]
-
-
-class RevisionCompositionDecision(StructuredResponseModel):
-    """One transient proof that a REFINES pair is eligible for revision."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    pair_index: int = Field(ge=0)
-    same_memory_identity: bool
-    preserves_incumbent_truth: bool
-    candidate_is_canonical_composite: bool
-    current_evidence_entails_candidate: bool
-    reason: str = Field(default="", max_length=1000)
-
-
-class RevisionCompositionResponse(StructuredResponseModel):
-    """Ordered revision proofs for exact REFINES pairs."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    decisions: list[RevisionCompositionDecision]
 
 
 class MemoryRelationAssessment(StructuredResponseModel):
@@ -602,10 +552,6 @@ class ClaimRevisionDecision(StructuredResponseModel):
     reason: str = Field(default="", max_length=1000)
 
 
-class ClaimRevisionResponse(StructuredResponseModel):
-    decisions: list[ClaimRevisionDecision]
-
-
 class ClaimContradiction(StructuredResponseModel):
     """Applicable proof only for a contradictory pair."""
 
@@ -696,63 +642,23 @@ class RevisionSupportResponse(StructuredResponseModel):
     reason: str = Field(default="", max_length=1000)
 
 
-class MemorySupportValidationRequiredEvidence(StructuredResponseModel):
-    """One application-issued current Required Fragment selection."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    selector: str = Field(pattern=r"^r\d{6}$")
-    evidence_ref: str = Field(pattern=r"^f\d{6}$")
-
-
-class MemorySupportValidationResponse(StructuredResponseModel):
-    """Semantic decision plus application-issued current Fragment selections."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    supported: bool
-    reason: str = Field(default="", max_length=1000)
-    primary_ref: str | None = Field(default=None, pattern=r"^f\d{6}$")
-    required_evidence: list[MemorySupportValidationRequiredEvidence] = Field(
-        default_factory=list,
-    )
-
-
-class EntityValidationResponse(StructuredResponseModel):
-    """Schema returned by entity-match validation."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    same_entity: bool = False
-    matched_id: int | None = None
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    reason: str | None = None
-
-
 class EntityBatchValidationDecision(StructuredResponseModel):
-    """One semantic judgment bound to a datastore-owned response slot."""
+    """One semantic judgment for the mention it names."""
 
     model_config = ConfigDict(extra="forbid")
 
+    mention: str
     matched_id: int | None = None
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reason: str = Field(default="", max_length=1000)
 
 
 class EntityBatchValidationResponse(StructuredResponseModel):
-    """Ordered decisions for one bounded entity ambiguity adjudication call."""
+    """One decision per mention in an entity ambiguity adjudication request."""
 
     model_config = ConfigDict(extra="forbid")
 
     decisions: list[EntityBatchValidationDecision]
-
-
-class QueryEntityDetectionResponse(StructuredResponseModel):
-    """Schema returned by query entity detection."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    entity_ids: list[int] = Field(default_factory=list)
 
 
 class RerankResponse(StructuredResponseModel):
@@ -1090,184 +996,6 @@ class _StructuredCallState:
         )
 
 
-class SourceSupportStructuredClient(Protocol):
-    @property
-    def input_policy_identity(self) -> str: ...
-
-    def request_fits(self, prompt: str, *, response_format: type[BaseModel],
-                     max_tokens: int, model: str | None = None,
-                     images: tuple[StructuredLlmImage, ...] = (), reserve_correction: bool = True) -> bool: ...
-
-    def input_policy_identity_for(self, model: str | None = None) -> str: ...
-
-    def request_budget(self, model: str | None = None): ...
-
-    def request_tokens(self, prompt: str, *, response_format: type[BaseModel], model: str | None = None,
-                       images: tuple[StructuredLlmImage, ...] = ()) -> int: ...
-
-    async def evaluate_revision_work(self, prompt: str, *, response_format: type[BaseModel],
-                                    max_tokens: int, model: str | None = None,
-                                    images: tuple[StructuredLlmImage, ...] = ()): ...
-
-    async def assess_revision_support(
-        self, prompt: str, *, max_tokens: int = 4096,
-        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
-    ) -> RevisionSupportResponse: ...
-
-    async def assess_claim_revisions(
-        self, prompt: str, *, max_tokens: int = 32_768,
-        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
-    ) -> ClaimRevisionWireResponse: ...
-
-    async def verify_source_support(
-        self,
-        prompt: str,
-        *,
-        model: str | None = None,
-    ) -> SourceSupportResponse:
-        """Return schema-validated source-support decisions."""
-
-    async def extract_memories(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int,
-        model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
-    ) -> MemoryExtractionResponse:
-        """Return schema-validated extracted memory candidates."""
-
-    async def extract_projection_memories(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int,
-        model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
-    ) -> ProjectionMemoryExtractionResponse:
-        """Return projection judgments without datastore-owned anchor fields."""
-
-    async def extract_projection_fragment_memories(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int,
-        model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
-    ) -> ProjectionFragmentMemoryExtractionResponse:
-        """Return v9 projection judgments with transient Fragment selectors."""
-
-    async def correct_projection_fragment_selectors(
-        self, prompt: str, *, max_tokens: int, model: str | None = None,
-        images: tuple[StructuredLlmImage, ...] = (),
-    ) -> ProjectionFragmentSelectorCorrectionResponse:
-        """Propose Evidence selectors for fixed, previously rejected candidates."""
-
-    async def select_memory_candidates(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 8192,
-        model: str | None = None,
-    ) -> CandidateLedgerResponse:
-        """Return one bounded candidate-admission ledger batch."""
-
-    async def audit_incumbent_support(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 4096,
-        model: str | None = None,
-    ) -> IncumbentSupportAuditResponse:
-        """Return one support disposition for every incumbent in an audit batch."""
-
-    async def prove_revision_compositions(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 4096,
-        model: str | None = None,
-    ) -> RevisionCompositionResponse:
-        """Return transient revision-eligibility proofs for REFINES pairs."""
-
-    async def classify_memory_relations(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 32_768,
-        model: str | None = None,
-    ) -> MemoryRelationResponse:
-        """Return exact, directed relationship decisions for Memory pairs."""
-
-    async def discover_memory_relations(
-        self, prompt: str, *, max_tokens: int = 32_768, model: str | None = None,
-    ) -> MemoryRelationCatalogResponse:
-        """Complete a sparse relationship catalog through the shared transport."""
-
-    async def validate_memory_support(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 512,
-        model: str | None = None,
-    ) -> MemorySupportValidationResponse:
-        """Prove whether current Primary and Required evidence support a claim."""
-
-    async def validate_entity_match(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 200,
-        model: str | None = None,
-    ) -> EntityValidationResponse:
-        """Return schema-validated entity validation."""
-
-    async def validate_entity_batch(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 2048,
-        model: str | None = None,
-    ) -> EntityBatchValidationResponse:
-        """Return attributable decisions for bounded entity candidate sets."""
-
-    async def detect_query_entities(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 64,
-        model: str | None = None,
-    ) -> QueryEntityDetectionResponse:
-        """Return schema-validated query entity ids."""
-
-    async def rerank_memories(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 256,
-        model: str | None = None,
-    ) -> RerankResponse:
-        """Return schema-validated reranking indices."""
-
-    async def generate_agent_knowledge_patch(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 2048,
-        model: str | None = None,
-    ):
-        """Return a private agent-knowledge patch proposal."""
-
-    async def classify_agent_session_evidence_authority(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 4096,
-        model: str | None = None,
-    ) -> AgentSessionAuthorityResponse:
-        """Return semantic authority decisions for candidate user evidence."""
-
-
 class SupportAssessmentResult(RevisionSupportResponse):
     """Cumulative fixed-claim judgment over the processed revision range."""
 
@@ -1353,7 +1081,7 @@ class _StructuredLlmFailure:
 
 _SAFE_PROVIDER_ERROR_PATTERNS = (
     (
-        "payload_too_large",
+        PAYLOAD_TOO_LARGE,
         re.compile(
             r"status(?:_code)?[=: ]+413|HTTP/\S+ 413|request entity too large|"
             r"payload too large|body too large",
@@ -1392,12 +1120,26 @@ _SAFE_PROVIDER_ERROR_PATTERNS = (
 
 
 def _safe_provider_error_code(exc: BaseException) -> str:
-    """Return a bounded content-free provider failure code."""
+    """Return a bounded content-free provider failure code.
 
+    Request-size rejections get one shared code whatever transport shape the
+    provider used, so callers can split the work without reading provider text.
+    """
+
+    if isinstance(exc, litellm.ContextWindowExceededError):
+        return INPUT_CAPACITY_EXCEEDED
+    if _provider_status_code(exc) == _HTTP_PAYLOAD_TOO_LARGE:
+        return PAYLOAD_TOO_LARGE
     outer_code = type(exc).__name__
     if outer_code != "APIConnectionError":
         return outer_code
+    detail = _connection_error_detail(exc)
+    if detail is None:
+        return outer_code
+    return PAYLOAD_TOO_LARGE if detail == PAYLOAD_TOO_LARGE else f"{outer_code}.{detail}"
 
+
+def _connection_error_detail(exc: BaseException) -> str | None:
     current: BaseException | None = exc
     seen: set[int] = set()
     for _ in range(4):
@@ -1407,7 +1149,7 @@ def _safe_provider_error_code(exc: BaseException) -> str:
         type_name = type(current).__name__
         for detail, pattern in _SAFE_PROVIDER_ERROR_PATTERNS:
             if pattern.search(type_name):
-                return f"{outer_code}.{detail}"
+                return detail
         current = current.__cause__ or current.__context__
 
     # LiteLLM 1.86 flattens many transport exceptions into the outer message
@@ -1416,8 +1158,8 @@ def _safe_provider_error_code(exc: BaseException) -> str:
     message_prefix = str(exc)[:2048]
     for detail, pattern in _SAFE_PROVIDER_ERROR_PATTERNS:
         if pattern.search(message_prefix):
-            return f"{outer_code}.{detail}"
-    return outer_code
+            return detail
+    return None
 
 
 def _safe_llm_provider(model: str) -> str | None:
@@ -1647,8 +1389,10 @@ def _is_non_fallback_provider_error(exc: BaseException) -> bool:
         return exc.terminal_category in {"deadline_exceeded", "provider_error"}
     if _is_retryable_provider_error(exc):
         return True
-    status_code = _provider_status_code(exc)
-    return status_code in {401, 403, 404}
+    if _provider_status_code(exc) in {401, 403, 404}:
+        return True
+    # The JSON-text transport is longer, so it cannot fit where this request did not.
+    return _safe_provider_error_code(exc) in {INPUT_CAPACITY_EXCEEDED, PAYLOAD_TOO_LARGE}
 
 
 def litellm_model_name(model: str) -> str:
@@ -1907,6 +1651,37 @@ def _validate_structured_json_text(text: str, response_format: type[BaseModel]):
         raise
 
 
+_TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens"})
+_REFUSAL_FINISH_REASONS = frozenset({"content_filter", "refusal"})
+# Judgments whose empty-but-valid output would read as "nothing found"; a
+# refused reply must fail instead.
+_REFUSAL_ERROR_CODES: dict[type[BaseModel], str] = {
+    ClaimRevisionWireResponse: "claim_response_incomplete",
+    MemoryRelationCatalogResponse: "memory_relation_response_incomplete",
+    SupportAssessmentResponse: "support_response_incomplete",
+    SupportAssessmentWireResponse: "support_response_incomplete",
+}
+
+
+def _raise_for_unfinished_response(response: object, response_format: type[BaseModel]) -> None:
+    """Reject replies the provider did not finish, even when they parse.
+
+    Truncated output is a request-size failure: resending the same request at
+    the same output limit cannot complete it, so no JSON-text fallback follows.
+    """
+
+    finish = _response_finish_reason(response)
+    stop = _response_stop_reason(response)
+    if finish in _TRUNCATED_FINISH_REASONS or stop == "max_tokens":
+        raise StructuredLlmError("structured response reached its output limit", error_code=OUTPUT_TRUNCATED)
+    refusal_code = _REFUSAL_ERROR_CODES.get(response_format)
+    message = _object_value(_first_response_choice(response), "message")
+    if refusal_code is not None and (
+        finish in _REFUSAL_FINISH_REASONS or stop == "refusal" or _object_value(message, "refusal")
+    ):
+        raise StructuredLlmError("assessment response did not complete", error_code=refusal_code)
+
+
 class LiteLlmStructuredClient:
     """LiteLLM-backed structured client.
 
@@ -1984,31 +1759,11 @@ class LiteLlmStructuredClient:
         with structured_llm_metrics_scope(collector) as selected:
             yield selected
 
-    async def verify_source_support(
-        self,
-        prompt: str,
-        *,
-        model: str | None = None,
-    ) -> SourceSupportResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=SourceSupportResponse,
-            max_tokens=4096,
-            model=model,
-        )
 
     async def evaluate_revision_work(self, prompt, *, response_format, max_tokens, model=None, images=()):
         return await self._call_schema(prompt=prompt, response_format=response_format,
                                        max_tokens=max_tokens, model=model, images=images)
 
-    async def assess_revision_support(
-        self, prompt: str, *, max_tokens: int = 4096,
-        model: str | None = None, images: tuple[StructuredLlmImage, ...] = (),
-    ) -> RevisionSupportResponse:
-        return await self._call_schema(
-            prompt=prompt, response_format=RevisionSupportResponse,
-            max_tokens=max_tokens, model=model, images=images,
-        )
 
     async def assess_claim_revisions(
         self, prompt: str, *, max_tokens: int = 32_768,
@@ -2093,33 +1848,6 @@ class LiteLlmStructuredClient:
             model=model,
         )
 
-    async def audit_incumbent_support(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 4096,
-        model: str | None = None,
-    ) -> IncumbentSupportAuditResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=IncumbentSupportAuditResponse,
-            max_tokens=max_tokens,
-            model=model,
-        )
-
-    async def prove_revision_compositions(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 4096,
-        model: str | None = None,
-    ) -> RevisionCompositionResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=RevisionCompositionResponse,
-            max_tokens=max_tokens,
-            model=model,
-        )
 
     async def classify_memory_relations(
         self,
@@ -2143,34 +1871,6 @@ class LiteLlmStructuredClient:
             max_tokens=max_tokens, model=model,
         )
 
-    async def validate_memory_support(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 512,
-        model: str | None = None,
-    ) -> MemorySupportValidationResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=MemorySupportValidationResponse,
-            max_tokens=max_tokens,
-            model=model,
-        )
-
-    async def validate_entity_match(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 200,
-        model: str | None = None,
-    ) -> EntityValidationResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=EntityValidationResponse,
-            max_tokens=max_tokens,
-            model=model,
-        )
-
     async def validate_entity_batch(
         self,
         prompt: str,
@@ -2181,20 +1881,6 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=EntityBatchValidationResponse,
-            max_tokens=max_tokens,
-            model=model,
-        )
-
-    async def detect_query_entities(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 64,
-        model: str | None = None,
-    ) -> QueryEntityDetectionResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=QueryEntityDetectionResponse,
             max_tokens=max_tokens,
             model=model,
         )
@@ -2442,7 +2128,11 @@ class LiteLlmStructuredClient:
             schema_failure = _structured_failure(exc)
         if schema_failure is None:
             return result
-        if not retry_with_json_text or schema_failure.terminal_category == "provider_error":
+        if (
+            not retry_with_json_text
+            or schema_failure.terminal_category == "provider_error"
+            or schema_failure.error_code == OUTPUT_TRUNCATED
+        ):
             raise schema_failure.to_error()
 
         state.fallback_count += 1
@@ -2565,20 +2255,6 @@ class LiteLlmStructuredClient:
                 validation_source=validation_source,
             )
         )
-        if response_format in {
-            ProjectionFragmentMemoryExtractionResponse, ProjectionFragmentSelectorCorrectionResponse,
-            RevisionSupportResponse, ClaimRevisionResponse, ClaimRevisionWireResponse,
-            SupportAssessmentResponse, SupportAssessmentWireResponse, MemoryRelationCatalogResponse,
-        }:
-            # Count the expanded template value and fallback repair diagnostics;
-            # provider placeholders must never make a large source look tiny.
-            material = _json_text_prompt(prompt, response_format) if native_schema else request_prompt
-            counted_messages = [{"role": "user", "content": _structured_user_content(material, images)}]
-            budget = self.request_budget(model_name)
-            tokens = litellm.token_counter(model=model_name, messages=counted_messages)
-            if not budget.fits(tokens, max_tokens, reserve_correction=False):
-                raise StructuredLlmError("complete structured request exceeds configured capacity",
-                                         error_code="input_capacity_exceeded")
         messages = [{"role": "user", "content": _structured_user_content(request_prompt, images)}]
         provider_kwargs: dict[str, Any] = {}
         prompt_template_variable = self.config.prompt_template_variable
@@ -2609,17 +2285,7 @@ class LiteLlmStructuredClient:
         )
         schema_transport = native_schema_transport if native_schema else "json_text"
         try:
-            if response_format in (ClaimRevisionWireResponse, SupportAssessmentResponse, SupportAssessmentWireResponse, MemoryRelationCatalogResponse):
-                finish = _response_finish_reason(response)
-                stop = _response_stop_reason(response)
-                message = _object_value(_first_response_choice(response), "message")
-                if (finish in {"length", "max_tokens", "content_filter", "refusal"}
-                        or stop in {"max_tokens", "refusal"}
-                        or _object_value(message, "refusal")):
-                    raise StructuredLlmError("assessment response did not complete",
-                        error_code=("claim_response_incomplete" if response_format is ClaimRevisionWireResponse
-                                    else "memory_relation_response_incomplete" if response_format is MemoryRelationCatalogResponse
-                                    else "support_response_incomplete"))
+            _raise_for_unfinished_response(response, response_format)
             raw_content = _message_content(response)
             if isinstance(raw_content, response_format):
                 return raw_content

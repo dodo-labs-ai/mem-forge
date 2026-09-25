@@ -7,7 +7,6 @@ deterministic action matrix and never mutates durable lifecycle state.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, replace
 from time import perf_counter
@@ -45,29 +44,6 @@ __all__ = [
     "reduce_relation_ledger",
 ]
 
-RECONCILIATION_INCUMBENT_BATCH_SIZE = 30
-REVISION_COMPOSITION_BATCH_SIZE = 64
-RECONCILIATION_BATCH_VALIDATION_ATTEMPTS = 2
-
-INCUMBENT_SUPPORT_AUDIT_PROMPT = """Audit whether the current Source Unit still supports every incumbent Memory.
-
-This is a factual support judgment, not a lifecycle action. Return supported=true
-when the exact claim remains entailed by the current Source Unit or is provably
-disjoint from the changed evidence. Return supported=false only when the current
-Source Unit removed, replaced, or contradicts the claim. Do not decide KEEP,
-DELETE, UPDATE, or SUPERSEDE.
-
-When update_mode is diff_guided, changed_hunks are authoritative for what
-changed. Absence from an incomplete excerpt is not proof of unsupported status.
-Return exactly one ordered decision for every listed incumbent.
-
-<update_mode>{update_mode}</update_mode>
-<diff_stats>{diff_stats}</diff_stats>
-<changed_hunks>{changed_hunks}</changed_hunks>
-<doc_type>{doc_type}</doc_type>
-<updated_document>{updated_document}</updated_document>
-<incumbents>{incumbents}</incumbents>
-"""
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationFailure:
@@ -165,12 +141,9 @@ async def reconcile_memories(
     doc_type: str,
     structured_llm_client,
     llm_model: str = "claude-sonnet-4-20250514",
-    updated_document: str | None = None,
-    update_mode: str = "full_document",
-    changed_hunks: str | None = None,
-    update_plan_stats: dict | None = None,
+    *,
+    support_audits: list[SupportAuditEntry],
     include_metadata: bool = False,
-    support_audits: list[SupportAuditEntry] | None = None,
     images: tuple = (),
     image_loader=None,
     work_store: DerivationWorkStore | None = None,
@@ -216,23 +189,13 @@ async def reconcile_memories(
             from memforge.pipeline.claim_revision import assess_claim_pairs, candidate_evidence
 
             operation = "assess_revision_support"
-            if support_audits is None:
-                audits, _calls, _elapsed = await _audit_incumbent_support(
-                    incumbents=existing_memories,
-                    structured_llm_client=structured_llm_client,
-                    llm_model=llm_model, doc_type=doc_type,
-                    updated_document=updated_document, update_mode=update_mode,
-                    changed_hunks=changed_hunks, update_plan_stats=update_plan_stats,
-                )
-            else:
-                audits = support_audits
-            if {entry.incumbent_id for entry in audits} != {old.id for old in existing_memories}:
+            if {entry.incumbent_id for entry in support_audits} != {old.id for old in existing_memories}:
                 raise ReconciliationContractError("support_ledger_incomplete", "missing exact incumbent assessment")
             operation = "assess_claim_revisions"
             relation_pair_count += len(new_extractions) * len(existing_memories)
             assessed = await assess_claim_pairs(
                 candidates=new_extractions, incumbents=existing_memories,
-                support_audits=audits, client=structured_llm_client,
+                support_audits=support_audits, client=structured_llm_client,
                 model=llm_model, images=images, image_loader=image_loader,
                 store=work_store, derivation_id=derivation_id, operation_input_hash=operation_input_hash,
             )
@@ -270,7 +233,7 @@ async def reconcile_memories(
 
             _, unresolved_incumbents = _unresolved_component(relation_entries, set(assessed.blocked_candidates))
             refiners_by_incumbent = _supported_revision_candidates(
-                [entry for entry in relation_entries if entry.incumbent_id not in unresolved_incumbents], audits,
+                [entry for entry in relation_entries if entry.incumbent_id not in unresolved_incumbents], support_audits,
             )
             conditional_pairs = tuple(
                 MemoryPair(challenger=transient_candidates[left], candidate=transient_candidates[right])
@@ -303,7 +266,7 @@ async def reconcile_memories(
                 new_extractions=new_extractions,
                 existing_memories=existing_memories,
                 relations=relation_entries,
-                support_audits=audits,
+                support_audits=support_audits,
                 revision_proofs=proofs,
                 blocked_candidates=assessed.blocked_candidates,
             )
@@ -559,63 +522,6 @@ def _bind_relation_entries(
             )
         )
     return entries
-
-
-async def _audit_incumbent_support(
-    *,
-    incumbents: list[Memory],
-    structured_llm_client,
-    llm_model: str,
-    doc_type: str,
-    updated_document: str | None,
-    update_mode: str,
-    changed_hunks: str | None,
-    update_plan_stats: dict | None,
-) -> tuple[list[SupportAuditEntry], int, float]:
-    results: list[SupportAuditEntry] = []
-    calls = 0
-    elapsed = 0.0
-    for offset in range(0, len(incumbents), RECONCILIATION_INCUMBENT_BATCH_SIZE):
-        batch = incumbents[offset : offset + RECONCILIATION_INCUMBENT_BATCH_SIZE]
-        prompt = INCUMBENT_SUPPORT_AUDIT_PROMPT.format(
-            update_mode=update_mode,
-            diff_stats=json.dumps(update_plan_stats or {}, ensure_ascii=False),
-            changed_hunks=changed_hunks or "",
-            doc_type=doc_type,
-            updated_document=updated_document or "",
-            incumbents=json.dumps(
-                [
-                    {"request_position": index, "content": memory.content, "memory_type": memory.memory_type}
-                    for index, memory in enumerate(batch)
-                ],
-                ensure_ascii=False,
-            ),
-        )
-        for attempt in range(RECONCILIATION_BATCH_VALIDATION_ATTEMPTS):
-            calls += 1
-            call_started = perf_counter()
-            try:
-                response = await structured_llm_client.audit_incumbent_support(
-                    prompt,
-                    max_tokens=4096,
-                    model=llm_model,
-                )
-            finally:
-                elapsed += perf_counter() - call_started
-            if len(response.decisions) == len(batch):
-                break
-            if attempt + 1 == RECONCILIATION_BATCH_VALIDATION_ATTEMPTS:
-                raise ReconciliationContractError(
-                    "support_response_incomplete",
-                    f"incumbent support response count {len(response.decisions)} "
-                    f"does not match expected count {len(batch)}"
-                )
-            prompt += "\nReturn the complete ordered support ledger; the previous response count was invalid."
-        results.extend(
-            SupportAuditEntry(incumbent_id=memory.id, supported=bool(decision.supported), reason=decision.reason)
-            for memory, decision in zip(batch, response.decisions, strict=True)
-        )
-    return results, calls, elapsed
 
 
 def _supported_revision_candidates(

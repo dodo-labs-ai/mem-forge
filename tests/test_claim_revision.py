@@ -133,7 +133,8 @@ async def test_duplicate_edge_and_missing_candidate_fail_closed():
     client.calls = 0
     result = await reconcile_memories(**args)
     assert result.failure is not None and not result.operations
-    assert client.calls == 1
+    # One bounded correction with the same input, then fail closed.
+    assert client.calls == 2
 
 
 @pytest.mark.asyncio
@@ -266,6 +267,41 @@ async def test_large_pair_group_subdivides_without_losing_pairs():
     assert result.decisions == ()
     assert {m["id"] for p in client.prompts for m in catalog_payload(p)["existing_claims"]} == {f"MEM-{i:04d}" for i in range(1, 6)}
     assert len(client.prompts) == 3
+
+
+@pytest.mark.asyncio
+async def test_chunked_incumbents_merge_and_insufficient_evidence_in_any_chunk_blocks_the_candidate():
+    from dataclasses import replace
+    from memforge.llm.structured import ClaimRevisionWireResponse
+    from memforge.pipeline.claim_revision import assess_claim_pairs
+
+    class ChunkClient(Client):
+        def request_fits(self, prompt, **kwargs):
+            return len(catalog_payload(prompt)["existing_claims"]) <= 1
+
+        async def assess_claim_revisions(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            data = catalog_payload(prompt)
+            [new], [old] = data["new_claims"], data["existing_claims"]
+            second = old["id"] == "MEM-0002"
+            return ClaimRevisionWireResponse.model_validate({"results": [{
+                "candidate_id": new["id"],
+                "evidence_status": "insufficient" if second else "entailed",
+                "relations": [] if second else [{"existing_id": old["id"], "relation": "equivalent", "reason": "Same rule"}],
+                "uncertain_existing_ids": [old["id"]] if second else [],
+            }]})
+
+    client = ChunkClient("equivalent")
+    olds = [replace(memory(), id=f"memory-{i}") for i in range(2)]
+    result = await assess_claim_pairs(
+        candidates=[candidate()], incumbents=olds,
+        support_audits=[SupportAuditEntry(old.id, True) for old in olds], client=client, model="fixture",
+    )
+    assert len(client.prompts) == 2
+    assert result.blocked_candidates == (0,)
+    assert [(incumbent, decision.status) for _, incumbent, decision in result.decisions] == [
+        ("memory-0", "insufficient"), ("memory-1", "insufficient"),
+    ]
 
 
 @pytest.mark.asyncio

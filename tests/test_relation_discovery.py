@@ -18,7 +18,6 @@ from memforge.memory.relation_candidate_retrieval import (
 from memforge.memory.relation_classifier import (
     MemoryPairClassification,
     MemoryPairClassificationError,
-    MemoryPairClassificationPlan,
     MemoryPairDecision,
     MemoryRelationType,
 )
@@ -51,13 +50,6 @@ def _memory(memory_id: str, content: str) -> Memory:
 class _Classifier:
     def __init__(self) -> None:
         self.classified_pair_ids: tuple[str, ...] = ()
-
-    def plan(self, pairs):
-        return MemoryPairClassificationPlan(
-            pair_count=len(pairs),
-            llm_calls=1 if pairs else 0,
-            prompt_chars=10 * len(pairs),
-        )
 
     async def classify(self, pairs):
         self.classified_pair_ids = tuple(pair.candidate.id for pair in pairs)

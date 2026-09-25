@@ -3,16 +3,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import partial
 import json
 import math
-import logging
 
 import litellm
-from memforge.llm.structured import litellm_model_name
-from memforge.llm.failure_trace import failure_trace_context, validation_trace
 
-from memforge.derivation_work import DerivationWork, DerivationWorkStore, payload_hash
-from memforge.llm.structured import SupportAssessmentWireResponse as AssessmentResponse, SupportAssessmentResponse, SupportAssessmentResult
+from memforge.derivation_work import DerivationWork, DerivationWorkJournal, DerivationWorkStore, payload_hash
+from memforge.llm.batch_runner import (
+    ChainStep,
+    ChainTask,
+    ItemCapacityExceeded,
+    ItemFailure,
+    ItemTask,
+    LlmBatchRunner,
+    LlmRequest,
+)
+from memforge.llm.failure_trace import failure_trace_context
+from memforge.llm.structured import (
+    StructuredLlmError,
+    SupportAssessmentResult,
+    SupportAssessmentWireResponse as AssessmentResponse,
+    litellm_model_name,
+)
+from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
+from memforge.models import Memory, RawMemory
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
     FragmentSelectionErrorCode,
@@ -21,9 +36,9 @@ from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitationCode,
 )
 from memforge.pipeline.revision_assessment import (
+    REVISION_SUPPORT_CONTRACT,
     RevisionAssessmentContext,
     SupportAssessment,
-    REVISION_SUPPORT_CONTRACT,
 )
 from memforge.pipeline.revision_input import (
     InputCandidate,
@@ -32,8 +47,6 @@ from memforge.pipeline.revision_input import (
     RevisionInputPlanner,
     SupportInputTask,
 )
-from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
-from memforge.models import Memory, RawMemory
 from memforge.pipeline.support_wire import SupportWireAliases
 
 ASSESS_PROMPT = """Assess EVERY fixed claim against the supplied revision changes.
@@ -80,6 +93,17 @@ Headings and table headers are ordinary selectable Evidence when they establish 
 Do not mix independent Supports or mistake unrelated changes for permission to extract.
 <assessment>{payload}</assessment>"""
 
+SUPPORT_ASSESSMENT_CONTRACT = "support-delta-assessment-v3"
+
+# Requested output: one judgment row per work item plus a dense allowance of
+# selected refs per supplied Fragment, and room for the carried state to grow.
+# This is an allowance, not a requirement to emit every pair; the runner bounds
+# it by the route's output capacity and splits work whose output is truncated.
+_MIN_OUTPUT_TOKENS = 1024
+_ITEM_OUTPUT_TOKENS = 384
+_REF_OUTPUT_TOKENS = 16
+_STATE_OUTPUT_GROWTH = 1.25
+
 
 @dataclass(frozen=True)
 class SupportWorkItem:
@@ -110,16 +134,24 @@ class AssessmentRange:
     selection_reason: str = "legacy_delegated"
     estimated_cost: InputCost | None = None
 
+    @property
+    def units(self) -> tuple:
+        """Current Fragments, then removed historical parts, in reading order."""
+        return tuple(("current", fragment) for fragment in self.catalog.fragments) + tuple(
+            ("historical", part) for part in self.removed
+        )
+
 
 class _SupportRequestPolicy:
+    """Price a Delta or Full candidate by packing it exactly as it would run."""
+
     def __init__(self, executor, items):
         self.executor = executor
         self.items = items
 
-    @staticmethod
-    def _scope(candidate):
-        return AssessmentRange(
-            context=None,
+    def _material(self, candidate, *, load_images):
+        scope = AssessmentRange(
+            context=self.items[0].context,
             catalog=candidate.catalog,
             removed=tuple(
                 {"ref": f"h{index:06d}", **part}
@@ -129,78 +161,27 @@ class _SupportRequestPolicy:
             include_history=candidate.include_history,
             reading_indexes=candidate.reading_indexes,
         )
-
-    def _material(self, candidate, *, load_images):
-        scope = replace(self._scope(candidate), context=self.items[0].context)
-        units = [("current", fragment) for fragment in scope.catalog.fragments] + [
-            ("historical", part) for part in scope.removed
-        ]
-        states = {item.id: self.executor._initial(scope, item) for item in self.items}
-        remaining = list(self.items)
-        input_tokens = output_tokens = image_count = image_bytes = request_count = 0
-        while remaining:
-            try:
-                group = self.executor._group(
-                    scope, units, remaining, states, load_images=load_images
-                )
-            except SupportRevalidationLimitation:
-                return None
-            while True:
-                position = 0
-                group_input = group_output = group_image_count = group_image_bytes = group_requests = 0
-                restart_with_smaller_group = False
-                while True:
-                    chunk = self.executor._chunk(
-                        scope,
-                        units[position:],
-                        group,
-                        states,
-                        position,
-                        len(units),
-                        load_images=load_images,
-                    )
-                    if position < len(units) and not chunk and len(group) > 1:
-                        group = group[: max(1, len(group) // 2)]
-                        restart_with_smaller_group = True
-                        break
-                    if position < len(units) and not chunk:
-                        return None
-                    prompt, catalog, output = self.executor._request(
-                        scope, chunk, group, states, position, len(units)
-                    )
-                    images = self.executor._catalog_images(scope, catalog) if load_images else ()
-                    if not self.executor._fits(prompt, AssessmentResponse, output, images):
-                        return None
-                    group_input += self.executor.client.request_tokens(
-                        prompt,
-                        response_format=AssessmentResponse,
-                        model=self.executor.model,
-                        images=images,
-                    )
-                    group_output += output
-                    group_image_count += len(images)
-                    group_image_bytes += sum(len(image.body) for image in images)
-                    group_requests += 1
-                    position += len(chunk)
-                    if position == len(units):
-                        break
-                if restart_with_smaller_group:
-                    continue
-                input_tokens += group_input
-                output_tokens += group_output
-                image_count += group_image_count
-                image_bytes += group_image_bytes
-                request_count += group_requests
-                break
-            remaining = remaining[len(group) :]
+        executor = self.executor
+        try:
+            requests = executor._plan(executor._chain_task(scope, self.items, load_images=load_images))
+        except (ItemCapacityExceeded, SupportRevalidationLimitation):
+            # A claim that cannot fit, or current material that cannot be supplied,
+            # makes this candidate unexecutable; the planner weighs the other one.
+            return None
         has_images = any(fragment.kind.value == "artifact" for fragment in candidate.catalog.fragments)
         return PlannedTransport(
             InputCost(
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                request_count=request_count,
-                image_count=image_count,
-                image_bytes=image_bytes,
+                input_tokens=sum(
+                    executor.client.request_tokens(
+                        request.prompt, response_format=request.response_format,
+                        model=executor.model, images=request.images,
+                    )
+                    for request in requests
+                ),
+                output_tokens=sum(request.max_tokens for request in requests),
+                request_count=len(requests),
+                image_count=sum(len(request.images) for request in requests),
+                image_bytes=sum(len(image.body) for request in requests for image in request.images),
                 complete=load_images or not has_images,
             ),
             scope,
@@ -214,21 +195,48 @@ class _SupportRequestPolicy:
         return self._material(candidate, load_images=True)
 
 
+class _OperationWorkStore:
+    """Echo works without persisting them when no derivation owns this operation."""
+
+    async def stage_derivation_work(self, *, derivation_id, work):
+        return work
+
+    async def record_derivation_work(self, *, derivation_id, work):
+        return work
+
+
 class RevisionWorkExecutor:
-    """Assess changes in bounded requests; commit only a complete cumulative result."""
+    """Assess every claim over its complete range; commit only complete cumulative results."""
 
     def __init__(
         self, *, client, model: str, store: DerivationWorkStore | None = None, derivation_id: str | None = None
     ):
         self.client, self.model = client, model
-        self.store, self.derivation_id = store, derivation_id
-        self.calls = self.prompt_chars = self.reused = 0
-        self.completed = {}
+        self.store = store if derivation_id is not None else _OperationWorkStore()
+        self.derivation_id = derivation_id
         self.final_work_ids = []
-        self.stage_counts = {"support_assess": 0}
         self.covered_source_claim_pairs = 0
-        self.work_aliases = {}
-        self._planner_image_cache = {}
+        self._runner = LlmBatchRunner(client, model=model)
+        self._work_aliases = {}
+        self._images_by_catalog = {}
+
+    @property
+    def calls(self) -> int:
+        return self._runner.stats.calls
+
+    @property
+    def prompt_chars(self) -> int:
+        return self._runner.stats.prompt_chars
+
+    @property
+    def reused(self) -> int:
+        return self._runner.stats.reused
+
+    @property
+    def stage_counts(self) -> dict[str, int]:
+        stats = self._runner.stats
+        # One per distinct request: calls sent, less corrections, plus requests reused from the journal.
+        return {"support_assess": stats.calls - stats.corrections + stats.reused}
 
     @staticmethod
     def _identity(items):
@@ -250,16 +258,6 @@ class RevisionWorkExecutor:
             for item in items
         ]
 
-    def _fits(self, prompt, schema, output, images=(), *, reserve_correction=True):
-        return self.client.request_fits(
-            prompt,
-            response_format=schema,
-            max_tokens=output,
-            model=self.model,
-            images=images,
-            reserve_correction=reserve_correction,
-        )
-
     @staticmethod
     def _prompt(template, payload):
         return template.format(payload=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
@@ -269,21 +267,11 @@ class RevisionWorkExecutor:
             model=litellm_model_name(self.model),
             text=json.dumps([state.model_dump(mode="json") for state in states], ensure_ascii=False),
         )
-        # Output is one judgment and its selected refs per work item. The dense
-        # upper estimate is an allowance, not a requirement to emit every pair.
-        # The provider bounds generation; truncated output never completes work.
-        requested = max(1024, len(items) * (384 + 16 * fragments) + math.ceil(state_tokens * 1.25))
-        minimum = litellm.token_counter(
-            model=litellm_model_name(self.model),
-            text=json.dumps({"results": [
-                {"work_id": self.work_aliases.get(item.id, f"WRK-{index:04d}"),
-                 "status": "insufficient", "primary_ref": None, "required_refs": [], "reason": ""}
-                for index, item in enumerate(items)
-            ]}, separators=(",", ":")),
+        return max(
+            _MIN_OUTPUT_TOKENS,
+            len(items) * (_ITEM_OUTPUT_TOKENS + _REF_OUTPUT_TOKENS * fragments)
+            + math.ceil(state_tokens * _STATE_OUTPUT_GROWTH),
         )
-        # A mandatory result row per task must still fit. Optional ref density
-        # cannot force splitting, but an impossible minimum response can.
-        return max(minimum, self.client.request_budget(self.model).output_reserve(requested))
 
     @staticmethod
     def _subset(catalog, refs):
@@ -314,6 +302,9 @@ class RevisionWorkExecutor:
             },
         )
 
+    def _step_catalog(self, scope, units):
+        return self._evidence_subset(scope, [unit.reference for kind, unit in units if kind == "current"])
+
     def _source_payload(self, scope, catalog, removed=()):
         aliases = {}
         groups = {}
@@ -340,125 +331,6 @@ class RevisionWorkExecutor:
             ),
         }
 
-    async def _call(self, kind, prompt, schema, output, *, identity, dependencies=(), images=(), validate, decode):
-        if not self._fits(prompt, schema, output, images):
-            raise SupportRevalidationLimitation(
-                SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
-                "indivisible assessment work exceeds configured capability",
-            )
-        budget_identity = self.client.input_policy_identity_for(self.model)
-        manifest = {
-            "contract": "support-delta-assessment-v3",
-            "scope": identity,
-            "prompt_hash": payload_hash(prompt),
-            "schema": payload_hash(schema.model_json_schema()),
-            "budget": budget_identity,
-            "model": self.model,
-            "output": output,
-            "dependencies": [[work.id, work.result_hash] for work in dependencies],
-        }
-        self.stage_counts[kind] += 1
-        work = DerivationWork.create(kind, manifest)
-        if self.derivation_id is not None:
-            work = await self.store.stage_derivation_work(derivation_id=self.derivation_id, work=work)
-        if work.status == "completed":
-            response = SupportAssessmentResponse.model_validate(work.result)
-            validate(response)
-            self.reused += 1
-            self.completed[work.id] = work
-            return response, work
-        if work.permanent:
-            raise SupportRevalidationLimitation(
-                SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
-                "unchanged assessment capability cannot execute this work",
-            )
-        current_prompt = prompt
-        failed_captures = []
-        try:
-            for attempt in range(2):
-                if not self._fits(current_prompt, schema, output, images, reserve_correction=not attempt):
-                    raise SupportRevalidationLimitation(
-                        SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
-                        "assessment correction exceeds configured capability",
-                    )
-                self.calls += 1
-                self.prompt_chars += len(current_prompt)
-                with failure_trace_context(derivation_id=self.derivation_id, work_id=work.id,
-                        correction_attempt=attempt + 1):
-                    response = await self.client.evaluate_revision_work(
-                        current_prompt, response_format=schema, max_tokens=output, model=self.model, images=images
-                    )
-                capture = None
-                try:
-                    async with validation_trace(response, work_id=work.id) as capture:
-                        response = decode(response)
-                        validate(response)
-                    for failed_capture in failed_captures:
-                        await failed_capture.recovered()
-                    break
-                except (ValueError, FragmentSelectionError) as error:
-                    if capture is not None:
-                        failed_captures.append(capture)
-                    logging.getLogger(__name__).warning(
-                        "support_assessment_validation work_id=%s attempt=%s error_class=%s rule=%s expected_items=%s",
-                        work.id, attempt + 1, type(error).__name__,
-                        error.code.value if isinstance(error, FragmentSelectionError) else "coverage_mismatch",
-                        len(identity["work_items"]),
-                    )
-                    if attempt:
-                        from memforge.pipeline.reconciler import ReconciliationContractError
-
-                        code = (
-                            "revision_support_selection_exhausted"
-                            if isinstance(error, FragmentSelectionError)
-                            else "revision_support_response_incomplete"
-                        )
-                        raise ReconciliationContractError(
-                            code, f"bounded assessment correction exhausted: {error}"
-                        ) from error
-                    current_prompt = (
-                        prompt
-                        + "\nCorrection: "
-                        + str(error)
-                        + ". Return all requested IDs once. Use only supplied current or previous-state refs "
-                        "for Evidence; historical text is explanation only. Preserve cumulative judgments."
-                    )
-            work = replace(
-                work,
-                status="completed",
-                result=response.model_dump(mode="json"),
-                result_hash=payload_hash(response.model_dump(mode="json")),
-                error_code=None,
-            )
-        except Exception as error:
-            failed = replace(
-                work,
-                status="retryable_failure",
-                error_code=type(error).__name__,
-                permanent=isinstance(error, SupportRevalidationLimitation),
-            )
-            if self.derivation_id is not None:
-                await self.store.record_derivation_work(derivation_id=self.derivation_id, work=failed)
-            raise
-        if self.derivation_id is not None:
-            work = await self.store.record_derivation_work(derivation_id=self.derivation_id, work=work)
-            response = SupportAssessmentResponse.model_validate(work.result)
-            validate(response)
-        self.completed[work.id] = work
-        return response, work
-
-    @staticmethod
-    def _coverage(results, items):
-        by_id = {}
-        for result in results:
-            previous = by_id.get(result.work_id)
-            if previous is not None and previous != result:
-                raise ValueError("conflicting assessment work results")
-            by_id[result.work_id] = result
-        if set(by_id) != {item.id for item in items}:
-            raise ValueError("assessment work coverage mismatch")
-        results[:] = by_id.values()
-
     @staticmethod
     def _previous_evidence(items, catalog):
         # Share exact historical identities, never merge the alternative Supports.
@@ -482,54 +354,19 @@ class RevisionWorkExecutor:
             supports.append({"work_id": item.id, "parts": parts})
         return {"previous_evidence": supports, "historical_evidence": historical}
 
-    def _catalog_images(self, scope, catalog):
-        key = catalog.digest
-        if key not in self._planner_image_cache:
-            self._planner_image_cache[key] = scope.context.images_for(catalog)
-        return self._planner_image_cache[key]
-
-    def _fits_catalog(self, scope, catalog, prompt, schema, output, *, load_images=True):
-        from memforge.pipeline.projection_images import ProjectionImageLoadError
-
-        if not self._fits(prompt, schema, output):
-            return False
-        try:
-            images = self._catalog_images(scope, catalog) if load_images else ()
-        except ProjectionImageLoadError as error:
-            if error.error_code == "image_batch_too_large":
-                return False
-            raise
-        return self._fits(prompt, schema, output, images)
-
-    @staticmethod
-    def _prefix(items, fits):
-        low, high = 0, len(items)
-        while low < high:
-            middle = (low + high + 1) // 2
-            if fits(items[:middle]):
-                low = middle
-            else:
-                high = middle - 1
-        return items[:low]
+    def _catalog_images(self, context, catalog):
+        # Planning and execution render the same step catalogs; read their bytes once.
+        if catalog.digest not in self._images_by_catalog:
+            self._images_by_catalog[catalog.digest] = context.images_for(catalog)
+        return self._images_by_catalog[catalog.digest]
 
     def _range(self, items):
-        context = items[0].context
         plan = RevisionInputPlanner.plan(
-            context=context,
+            context=items[0].context,
             task=SupportInputTask(tuple(item.support for item in items)),
             request_policy=_SupportRequestPolicy(self, items),
         )
-        scope = plan.transport
-        removed = tuple(
-            {"ref": f"h{index:06d}", **part}
-            for index, part in enumerate(plan.removed_historical)
-        )
-        return replace(
-            scope,
-            removed=removed,
-            selection_reason=plan.selection_reason,
-            estimated_cost=plan.estimated_cost,
-        )
+        return replace(plan.transport, selection_reason=plan.selection_reason, estimated_cost=plan.estimated_cost)
 
     @staticmethod
     def _state_refs(state):
@@ -561,7 +398,7 @@ class RevisionWorkExecutor:
         )
 
     def _input(self, scope, units, items, states, position, total):
-        catalog = self._evidence_subset(scope, [u.reference for kind, u in units if kind == "current"])
+        catalog = self._step_catalog(scope, units)
         removed = [u for kind, u in units if kind == "historical"]
         payload = {
             **self._source_payload(scope, catalog, removed),
@@ -576,190 +413,133 @@ class RevisionWorkExecutor:
         }
         if scope.include_history:
             payload.update(self._previous_evidence(items, catalog))
-        return self._prompt(ASSESS_PROMPT, self._wire(scope, items).encode(payload)), catalog
+        return self._prompt(ASSESS_PROMPT, self._wire(scope).encode(payload)), catalog
 
-    def _wire(self, scope, items):
-        works = self.work_aliases or {item.id: f"WRK-{index:04d}" for index, item in enumerate(items)}
-        return SupportWireAliases(scope.catalog, scope.removed, works)
+    def _wire(self, scope):
+        return SupportWireAliases(scope.catalog, scope.removed, self._work_aliases)
 
-    def _request(self, scope, units, items, states, position, total):
-        prompt, catalog = self._input(scope, units, items, states, position, total)
-        output = self._output(
-            items,
-            len(catalog.fragments),
-            [states[i.id] for i in items],
+    def _chain_task(self, scope, items, *, load_images=True, journal=None) -> ChainTask:
+        """Every claim reads the complete range in order, carrying its compact judgment."""
+        by_id = {item.id: item for item in items}
+        wire = self._wire(scope)
+        current_refs = {fragment.reference for fragment in scope.catalog.fragments}
+
+        def render(step: ChainStep) -> LlmRequest:
+            group = [by_id[item_id] for item_id in step.item_ids]
+            prompt, catalog = self._input(scope, step.parts, group, step.states, step.position, step.total)
+            request = LlmRequest(prompt, AssessmentResponse, self._output(group, len(catalog.fragments), step.states.values()))
+            if not load_images:
+                return request
+            return scope.context.attach_images(
+                request, catalog, fits=self._runner.fits,
+                load=lambda selected: self._catalog_images(scope.context, selected),
+            )
+
+        def decode(response, step: ChainStep):
+            decoded = wire.decode(response)
+            supplied = {fragment.reference for fragment in self._step_catalog(scope, step.parts).fragments}
+            prior = set().union(*(self._state_refs(step.states[item_id]) for item_id in step.item_ids))
+            allowed = (supplied | prior) & current_refs
+            for row in decoded.results:
+                unavailable = self._state_refs(row) - allowed
+                if unavailable:
+                    raise FragmentSelectionError(
+                        FragmentSelectionErrorCode.UNKNOWN_REF,
+                        f"assessment selected unavailable current Evidence for {wire.works[row.work_id]}: "
+                        + ", ".join(sorted(wire.refs[ref] for ref in unavailable)),
+                    )
+                if row.status == "supported":
+                    scope.catalog.resolve_selection(primary_ref=row.primary_ref, required_refs=_required_refs(row))
+            return [(row.work_id, row) for row in decoded.results]
+
+        return ChainTask(
+            initial_states={item.id: self._initial(scope, item) for item in items},
+            parts=scope.units,
+            render=render,
+            decode=decode,
+            call=partial(self.client.evaluate_revision_work, response_format=AssessmentResponse),
+            journal=journal,
         )
-        if (
-            scope.mode == "full"
-            and scope.include_history
-            and not self._fits_catalog(scope, catalog, prompt, AssessmentResponse, output)
-        ):
-            # Unknown-baseline history is a clue, not a prerequisite for
-            # establishing current support. Budget actual current work first.
-            prompt, catalog = self._input(replace(scope, include_history=False), units, items, states, position, total)
-        return prompt, catalog, output
 
-    def _chunk(self, scope, units, items, states, position, total, *, load_images=True):
-        def fits(trial):
-            prompt, catalog, output = self._request(scope, trial, items, states, position, total)
-            return self._fits_catalog(
-                scope, catalog, prompt, AssessmentResponse, output, load_images=load_images
-            )
+    def _plan(self, chain: ChainTask) -> tuple[LlmRequest, ...]:
+        if chain.parts:
+            return self._runner.plan_chain(chain)
+        task = _final_judgment_task(chain)
+        return tuple(planned.request for planned in self._runner.plan_items(task.item_ids, task.render))
 
-        return self._prefix(units, fits)
+    async def _run(self, chain: ChainTask):
+        if chain.parts:
+            return await self._runner.run_chain(chain)
+        outcomes = await self._runner.run_items(_final_judgment_task(chain))
+        return {
+            item_id: outcome if isinstance(outcome, ItemFailure) else outcome[0]
+            for item_id, outcome in outcomes.items()
+        }
 
-    def _group(self, scope, units, items, states, *, load_images=True):
-        # Compare a few transport packings instead of filling a request with
-        # claims at the expense of repeatedly sending tiny Source slices.
-        prompt, catalog, output = self._request(scope, units, items, states, 0, len(units))
-        if self._fits_catalog(
-            scope, catalog, prompt, AssessmentResponse, output, load_images=load_images
-        ):
-            return items
-        sizes = [1]
-        while sizes[-1] < len(items):
-            sizes.append(min(len(items), sizes[-1] * 2))
-        best = None
-        for size in sizes:
-            group = items[:size]
-            chunk = self._chunk(
-                scope, units, group, states, 0, len(units), load_images=load_images
-            ) if units else []
-            prompt, cat, output = self._request(scope, chunk, group, states, 0, len(units))
-            if (units and not chunk) or not self._fits_catalog(
-                scope, cat, prompt, AssessmentResponse, output, load_images=load_images
-            ):
-                continue
-            cost = (
-                self.client.request_tokens(
-                    prompt,
-                    response_format=AssessmentResponse,
-                    model=self.model,
-                    images=self._catalog_images(scope, cat) if load_images else (),
-                )
-                + output
-            )
-            score = size * max(1, len(chunk)) / max(1, cost)
-            if best is None or score > best[0]:
-                best = score, group
-        if best is None:
-            raise SupportRevalidationLimitation(
-                SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
-                "one assessment structure and its Support context exceed capability",
-            )
-        return best[1]
+    def _journal(self, scope, items) -> DerivationWorkJournal:
+        cost = scope.estimated_cost
+        return DerivationWorkJournal(
+            store=self.store,
+            derivation_id=self.derivation_id,
+            kind="support_assess",
+            scope={
+                "contract": SUPPORT_ASSESSMENT_CONTRACT,
+                **self._scope_identity(scope, items),
+                "input_plan": {
+                    "mode": scope.mode,
+                    "selection_reason": scope.selection_reason,
+                    "estimated_cost": cost.as_payload() if cost is not None else None,
+                },
+            },
+            budget_identity=self.client.input_policy_identity_for(self.model),
+            model=self.model,
+        )
+
+    def _scope_identity(self, scope, items):
+        return {
+            "catalog": scope.catalog.digest,
+            "baseline": scope.context.base.source_unit_revisions[0].id if scope.context.base else None,
+            "target": scope.context.projection.source_unit_revisions[0].id,
+            "work_items": self._identity(items),
+        }
 
     async def assess_many(self, items: list[SupportWorkItem]) -> dict[str, SupportAssessment]:
-        self.work_aliases = {item.id: f"WRK-{index:04d}" for index, item in enumerate(items)}
-        groups = {}
+        self._work_aliases = {item.id: f"WRK-{index:04d}" for index, item in enumerate(items)}
+        by_baseline = {}
         for item in items:
-            groups.setdefault(id(item.context), []).append(item)
+            by_baseline.setdefault(id(item.context), []).append(item)
         results = {}
-        for same_baseline in groups.values():
-            scope = self._range(same_baseline)
-            units = [("current", f) for f in scope.catalog.fragments] + [("historical", p) for p in scope.removed]
-            states = {i.id: self._initial(scope, i) for i in same_baseline}
-            remaining = list(same_baseline)
-            while remaining:
-                group = self._group(scope, units, remaining, states)
-                results.update(await self._assess_group(scope, units, group, states))
-                remaining = remaining[len(group) :]
+        with failure_trace_context(derivation_id=self.derivation_id):
+            for same_baseline in by_baseline.values():
+                results.update(await self._assess_range(same_baseline))
         return results
 
-    async def _assess_group(self, scope, units, group, states, position=0, parents=None):
-        parents = list(parents or ())
-        while True:
-            chunk = self._chunk(scope, units[position:], group, states, position, len(units))
-            if position < len(units) and not chunk and len(group) > 1:
-                middle = len(group) // 2
-                results = await self._assess_group(scope, units, group[:middle], states, position, list(parents))
-                results.update(await self._assess_group(scope, units, group[middle:], states, position, list(parents)))
-                return results
-            if position < len(units) and not chunk:
-                raise SupportRevalidationLimitation(
-                    SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
-                    "cumulative assessment and one structure exceed capability",
-                )
-            prompt, catalog, output = self._request(scope, chunk, group, states, position, len(units))
-            current = {f.reference for f in catalog.fragments}
-            prior_refs = set().union(*(self._state_refs(states[item.id]) for item in group))
-            all_current = {f.reference for f in scope.catalog.fragments}
-            allowed = (current | prior_refs) & all_current
-            wire = self._wire(scope, group)
-
-            def validate(response):
-                self._coverage(response.results, group)
-                for r in response.results:
-                    selected = set(r.required_refs) | ({r.primary_ref} if r.primary_ref else set())
-                    unavailable = selected - allowed
-                    if unavailable:
-                        raise FragmentSelectionError(
-                            FragmentSelectionErrorCode.UNKNOWN_REF,
-                            f"assessment selected unavailable current Evidence for {wire.works[r.work_id]}: "
-                            + ", ".join(sorted(wire.refs[ref] for ref in unavailable)),
-                        )
-                    if r.status == "supported":
-                        scope.catalog.resolve_selection(
-                            primary_ref=r.primary_ref,
-                            required_refs=tuple(dict.fromkeys(x for x in r.required_refs if x != r.primary_ref)),
-                        )
-
-            response, work = await self._call(
-                "support_assess",
-                prompt,
-                AssessmentResponse,
-                output,
-                identity={
-                    "catalog": scope.catalog.digest,
-                    "baseline": scope.context.base.source_unit_revisions[0].id if scope.context.base else None,
-                    "target": scope.context.projection.source_unit_revisions[0].id,
-                    "work_items": self._identity(group),
-                    "start": position,
-                    "count": len(chunk),
-                    "total": len(units),
-                    "input_plan": {
-                        "mode": scope.mode,
-                        "selection_reason": scope.selection_reason,
-                        "estimated_cost": (
-                            {
-                                "input_tokens": scope.estimated_cost.input_tokens,
-                                "output_tokens": scope.estimated_cost.output_tokens,
-                                "request_count": scope.estimated_cost.request_count,
-                                "image_count": scope.estimated_cost.image_count,
-                                "image_bytes": scope.estimated_cost.image_bytes,
-                                "total_tokens": scope.estimated_cost.total_tokens,
-                            }
-                            if scope.estimated_cost is not None
-                            else None
-                        ),
-                    },
-                },
-                dependencies=parents[-1:],
-                images=self._catalog_images(scope, catalog),
-                validate=validate,
-                decode=wire.decode,
-            )
-            for result in response.results:
-                states[result.work_id] = result
-            parents.append(work)
-            position += len(chunk)
-            if position == len(units):
-                break
-        self.covered_source_claim_pairs += len(units) * len(group)
-        assessed = self._results(scope, group, [states[i.id] for i in group])
-        await self._complete(scope, group, states, parents, len(units))
+    async def _assess_range(self, items):
+        scope = self._range(items)
+        journal = self._journal(scope, items)
+        outcomes = await self._run(self._chain_task(scope, items, journal=journal))
+        for item in items:
+            if isinstance(outcomes[item.id], ItemFailure):
+                _raise_failure(outcomes[item.id])
+        total = len(scope.units)
+        self.covered_source_claim_pairs += total * len(items)
+        assessed = self._results(scope, items, [outcomes[item.id] for item in items])
+        # Claims that read the same requests share one completion receipt.
+        readers = {}
+        for item in items:
+            works = journal.works_for(item.id)
+            readers.setdefault(tuple((work.id, work.result_hash) for work in works), []).append(item)
+        for dependencies, group in readers.items():
+            await self._complete(scope, group, outcomes, dependencies, total)
         return assessed
 
-    async def _complete(self, scope, items, states, parents, total):
+    async def _complete(self, scope, items, states, dependencies, total):
         # This is a program completion receipt, not another inference call.
         manifest = {
-            "contract": "support-delta-assessment-v3",
+            "contract": SUPPORT_ASSESSMENT_CONTRACT,
             "completion": "program",
             "scope": {
-                "catalog": scope.catalog.digest,
-                "baseline": scope.context.base.source_unit_revisions[0].id if scope.context.base else None,
-                "target": scope.context.projection.source_unit_revisions[0].id,
-                "work_items": self._identity(items),
+                **self._scope_identity(scope, items),
                 "input_plan": {
                     "mode": scope.mode,
                     "selection_reason": scope.selection_reason,
@@ -769,20 +549,18 @@ class RevisionWorkExecutor:
                 },
             },
             "coverage": {"source_items": total, "work_ids": [i.id for i in items]},
-            "dependencies": [[w.id, w.result_hash] for w in parents],
+            "dependencies": [list(dependency) for dependency in dependencies],
         }
         result = {"results": [states[i.id].model_dump(mode="json") for i in items]}
-        work = DerivationWork.create("support_finalize", manifest)
-        if self.derivation_id is not None:
-            work = await self.store.stage_derivation_work(derivation_id=self.derivation_id, work=work)
+        work = await self.store.stage_derivation_work(
+            derivation_id=self.derivation_id, work=DerivationWork.create("support_finalize", manifest)
+        )
         if work.status != "completed":
             work = replace(work, status="completed", result=result, result_hash=payload_hash(result))
-            if self.derivation_id is not None:
-                work = await self.store.record_derivation_work(derivation_id=self.derivation_id, work=work)
+            work = await self.store.record_derivation_work(derivation_id=self.derivation_id, work=work)
         if work.result_hash != payload_hash(result):
             raise ValueError("assessment completion differs from its dependencies")
         self.final_work_ids.append(work.id)
-        self.completed[work.id] = work
 
     def _results(self, scope, items, decisions):
         catalog = scope.catalog
@@ -792,10 +570,7 @@ class RevisionWorkExecutor:
             raw = None
             if result.status == "supported":
                 selection = catalog.resolve_selection(
-                    primary_ref=result.primary_ref,
-                    required_refs=tuple(
-                        dict.fromkeys(ref for ref in result.required_refs if ref != result.primary_ref)
-                    ),
+                    primary_ref=result.primary_ref, required_refs=_required_refs(result),
                 )
                 primary = next(part for part in selection.parts if part.role is EvidenceRole.PRIMARY)
                 memory = by_id[result.work_id].memory
@@ -837,6 +612,43 @@ class RevisionWorkExecutor:
                 )
             results[result.work_id] = SupportAssessment(
                 None if result.status == "insufficient" else result.status == "supported",
-                result.reason, raw, scope.mode, 0, 0
+                result.reason, raw, scope.mode,
             )
         return results
+
+
+def _required_refs(state) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(ref for ref in state.required_refs if ref != state.primary_ref))
+
+
+def _final_judgment_task(chain: ChainTask) -> ItemTask:
+    """A range with nothing to read still ends in one judgment per claim."""
+
+    def step(item_ids) -> ChainStep:
+        return ChainStep(tuple(item_ids), (), {item_id: chain.initial_states[item_id] for item_id in item_ids}, 0, 0)
+
+    return ItemTask(
+        item_ids=tuple(chain.initial_states),
+        render=lambda item_ids, _context: chain.render(step(item_ids)),
+        decode=lambda response, item_ids, _context: chain.decode(response, step(item_ids)),
+        call=chain.call,
+        journal=chain.journal,
+    )
+
+
+def _raise_failure(failure: ItemFailure):
+    if failure.category == "capacity_exceeded":
+        raise SupportRevalidationLimitation(
+            SupportRevalidationLimitationCode.CAPACITY_EXCEEDED,
+            "one assessment structure and its Support context exceed capability",
+        )
+    if isinstance(failure.error, StructuredLlmError):
+        raise failure.error
+    from memforge.pipeline.reconciler import ReconciliationContractError
+
+    code = (
+        "revision_support_selection_exhausted"
+        if isinstance(failure.error, FragmentSelectionError)
+        else "revision_support_response_incomplete"
+    )
+    raise ReconciliationContractError(code, f"bounded assessment correction exhausted: {failure.error}") from failure.error

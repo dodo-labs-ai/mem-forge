@@ -5,17 +5,17 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 
-from tests.revision_client_fixture import RevisionClientFixture
+from tests.revision_client_fixture import (
+    RevisionClientFixture,
+    RevisionProof,
+    RevisionProofs,
+)
 
 import pytest
 
 from memforge.llm.structured import (
-    IncumbentSupportAuditDecision,
-    IncumbentSupportAuditResponse,
     MemoryRelationDecision,
     MemoryRelationResponse,
-    RevisionCompositionDecision,
-    RevisionCompositionResponse,
     StructuredLlmError,
 )
 from memforge.memory.evidence import RelationDirection
@@ -109,23 +109,12 @@ async def test_supported_incumbent_and_unrelated_case25_keep_and_add() -> None:
                 ]
             )
 
-        async def audit_incumbent_support(self, prompt: str, **kwargs):
-            del prompt, kwargs
-            return IncumbentSupportAuditResponse(
-                decisions=[
-                    IncumbentSupportAuditDecision(
-                        supported=True,
-                        reason="Cases 20 through 24 remain in the current Source Unit.",
-                    )
-                ]
-            )
-
     result = await reconcile_memories(
         new_extractions=[case25],
         existing_memories=[incumbent],
+        support_audits=[SupportAuditEntry(incumbent.id, True)],
         doc_type="component_test",
         structured_llm_client=RelationFirstClient(),
-        updated_document="Cases 20 through 25 are documented independently.",
         include_metadata=True,
     )
 
@@ -168,19 +157,14 @@ async def test_additive_refinement_with_complete_current_evidence_is_revision() 
                 ]
             )
 
-        async def audit_incumbent_support(self, prompt: str, **kwargs):
-            del prompt, kwargs
-            return IncumbentSupportAuditResponse(
-                decisions=[IncumbentSupportAuditDecision(supported=True, reason="The timeout remains current.")]
-            )
 
-        async def prove_revision_compositions(self, prompt: str, **kwargs):
+        async def prove_revisions(self, prompt: str, **kwargs):
             del kwargs
             assert '"type": "fact"' in prompt
             assert '"valid_from": null' in prompt
-            return RevisionCompositionResponse(
+            return RevisionProofs(
                 decisions=[
-                    RevisionCompositionDecision(
+                    RevisionProof(
                         pair_index=0,
                         same_memory_identity=True,
                         preserves_incumbent_truth=True,
@@ -194,9 +178,9 @@ async def test_additive_refinement_with_complete_current_evidence_is_revision() 
     result = await reconcile_memories(
         new_extractions=[refinement],
         existing_memories=[incumbent],
+        support_audits=[SupportAuditEntry(incumbent.id, True)],
         doc_type="design",
         structured_llm_client=RevisionClient(),
-        updated_document=refinement.content,
         include_metadata=True,
     )
 
@@ -226,19 +210,15 @@ async def test_revision_response_failure_cannot_fall_back_to_add() -> None:
             del prompt, kwargs
             return _single_refines_response()
 
-        async def audit_incumbent_support(self, prompt: str, **kwargs):
-            del prompt, kwargs
-            return IncumbentSupportAuditResponse(
-                decisions=[IncumbentSupportAuditDecision(supported=True)]
-            )
 
-        async def prove_revision_compositions(self, prompt: str, **kwargs):
+        async def prove_revisions(self, prompt: str, **kwargs):
             del prompt, kwargs
             raise StructuredLlmError("revision proof unavailable")
 
     result = await reconcile_memories(
         new_extractions=[refinement],
         existing_memories=[incumbent],
+        support_audits=[SupportAuditEntry(incumbent.id, True)],
         doc_type="design",
         structured_llm_client=ProofFailureClient(),
         include_metadata=True,
@@ -266,18 +246,13 @@ async def test_revision_evidence_that_supports_only_added_detail_falls_back() ->
             del prompt, kwargs
             return _single_refines_response()
 
-        async def audit_incumbent_support(self, prompt: str, **kwargs):
-            del prompt, kwargs
-            return IncumbentSupportAuditResponse(
-                decisions=[IncumbentSupportAuditDecision(supported=True)]
-            )
 
-        async def prove_revision_compositions(self, prompt: str, **kwargs):
+        async def prove_revisions(self, prompt: str, **kwargs):
             del kwargs
             assert '"excerpt": "Configurable with CLIENT_TIMEOUT."' in prompt
-            return RevisionCompositionResponse(
+            return RevisionProofs(
                 decisions=[
-                    RevisionCompositionDecision(
+                    RevisionProof(
                         pair_index=0,
                         same_memory_identity=True,
                         preserves_incumbent_truth=True,
@@ -291,6 +266,7 @@ async def test_revision_evidence_that_supports_only_added_detail_falls_back() ->
     result = await reconcile_memories(
         new_extractions=[refinement],
         existing_memories=[incumbent],
+        support_audits=[SupportAuditEntry(incumbent.id, True)],
         doc_type="design",
         structured_llm_client=IncompleteEvidenceClient(),
         include_metadata=True,
@@ -323,21 +299,17 @@ async def test_missing_conditional_assessment_preserves_incumbent() -> None:
             del prompt, kwargs
             return _single_refines_response()
 
-        async def audit_incumbent_support(self, prompt: str, **kwargs):
-            del prompt, kwargs
-            return IncumbentSupportAuditResponse(
-                decisions=[IncumbentSupportAuditDecision(supported=True)]
-            )
 
-        async def prove_revision_compositions(self, prompt: str, **kwargs):
+        async def prove_revisions(self, prompt: str, **kwargs):
             del prompt, kwargs
             self.proof_calls += 1
-            return RevisionCompositionResponse(decisions=[])
+            return RevisionProofs(decisions=[])
 
     client = IncompleteProofClient()
     result = await reconcile_memories(
         new_extractions=[refinement],
         existing_memories=[incumbent],
+        support_audits=[SupportAuditEntry(incumbent.id, True)],
         doc_type="design",
         structured_llm_client=client,
         include_metadata=True,
@@ -369,18 +341,13 @@ async def test_unprovided_required_evidence_blocks_revision() -> None:
             del prompt, kwargs
             return _single_refines_response()
 
-        async def audit_incumbent_support(self, prompt: str, **kwargs):
-            del prompt, kwargs
-            return IncumbentSupportAuditResponse(
-                decisions=[IncumbentSupportAuditDecision(supported=True)]
-            )
 
-        async def prove_revision_compositions(self, prompt: str, **kwargs):
+        async def prove_revisions(self, prompt: str, **kwargs):
             del kwargs
             assert '"current_evidence": []' in prompt
-            return RevisionCompositionResponse(
+            return RevisionProofs(
                 decisions=[
-                    RevisionCompositionDecision(
+                    RevisionProof(
                         pair_index=0,
                         same_memory_identity=True,
                         preserves_incumbent_truth=True,
@@ -393,6 +360,7 @@ async def test_unprovided_required_evidence_blocks_revision() -> None:
     result = await reconcile_memories(
         new_extractions=[refinement],
         existing_memories=[incumbent],
+        support_audits=[SupportAuditEntry(incumbent.id, True)],
         doc_type="design",
         structured_llm_client=RequiredEvidenceClient(),
         include_metadata=True,
@@ -677,58 +645,6 @@ def test_runbook_candidate_with_multiple_incumbents_falls_back_to_keep_and_add()
 
 
 @pytest.mark.asyncio
-async def test_support_audit_batches_all_incumbents_without_candidates(monkeypatch) -> None:
-    from types import SimpleNamespace
-    from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
-
-    incumbents = [_memory(f"mem-{index:08d}", f"Stable claim {index}") for index in range(65)]
-    batch_sizes = []
-
-    async def provider(**kwargs):
-        prompt = kwargs["messages"][0]["content"]
-        incumbents_json = prompt.split("<incumbents>", 1)[1].split("</incumbents>", 1)[0]
-        size = len(json.loads(incumbents_json))
-        batch_sizes.append(size)
-        payload = IncumbentSupportAuditResponse(
-            decisions=[IncumbentSupportAuditDecision(supported=True) for _ in range(size)]
-        ).model_dump_json()
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=payload),
-                    finish_reason="stop",
-                )
-            ],
-            usage=None,
-        )
-
-    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", provider)
-    monkeypatch.setattr("memforge.llm.structured.litellm.supports_response_schema", lambda **_: False)
-    client = LiteLlmStructuredClient(
-        StructuredLlmConfig(
-            model="anthropic/test",
-            base_url=None,
-            api_key=None,
-            timeout_s=1,
-            num_retries=0,
-        )
-    )
-    result = await reconcile_memories(
-        new_extractions=[],
-        existing_memories=incumbents,
-        doc_type="design",
-        structured_llm_client=client,
-        include_metadata=True,
-    )
-
-    assert isinstance(result, ReconciliationResult)
-    assert result.failure is None
-    assert batch_sizes == [30, 30, 5]
-    assert result.metrics.structured_llm_calls == 3
-    assert len(result.operations) == 65
-
-
-@pytest.mark.asyncio
 async def test_incomplete_relation_ledger_retries_then_fails_closed() -> None:
     class IncompleteClient(RevisionClientFixture):
         def __init__(self) -> None:
@@ -753,7 +669,7 @@ async def test_incomplete_relation_ledger_retries_then_fails_closed() -> None:
     assert isinstance(result, ReconciliationResult)
     assert result.operations == []
     assert result.failure is not None
-    assert client.calls == 1
+    assert client.calls == 2  # the first response and its one correction
 
 
 @pytest.mark.asyncio
@@ -769,6 +685,7 @@ async def test_relation_provider_failure_fails_closed_with_incumbents() -> None:
         doc_type="design",
         structured_llm_client=FailingClient(),
         include_metadata=True,
+        support_audits=[SupportAuditEntry(incumbent_id="mem-old", supported=True)],
     )
 
     assert isinstance(result, ReconciliationResult)

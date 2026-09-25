@@ -84,8 +84,11 @@ async def test_explicit_uncertainty_preserves_incumbent_and_consumes_candidate()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("finish", ["length", "max_tokens", "content_filter"])
-async def test_valid_json_with_incomplete_finish_is_not_empty_success(monkeypatch, finish):
+@pytest.mark.parametrize(
+    ("finish", "error_code"),
+    [("length", "output_truncated"), ("max_tokens", "output_truncated"), ("content_filter", "claim_response_incomplete")],
+)
+async def test_valid_json_with_incomplete_finish_is_not_empty_success(monkeypatch, finish, error_code):
     from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
     from tests.test_structured_llm import CompletionResponse
     async def provider(**kwargs):
@@ -97,7 +100,7 @@ async def test_valid_json_with_incomplete_finish_is_not_empty_success(monkeypatc
         timeout_s=5, num_retries=0, native_schema_transport="response_format"))
     with pytest.raises(StructuredLlmError) as caught:
         await client.assess_claim_revisions("fixture", max_tokens=512)
-    assert caught.value.error_code == "claim_response_incomplete"
+    assert caught.value.error_code == error_code
 
 
 @pytest.mark.asyncio

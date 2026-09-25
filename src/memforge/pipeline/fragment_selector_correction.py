@@ -7,11 +7,11 @@ import json
 from collections import Counter
 from typing import Any
 
+from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import (
+    LiteLlmStructuredClient,
     ProjectionFragmentMemoryCandidate,
     ProjectionFragmentSelectorCorrectionResponse,
-    SourceSupportStructuredClient,
-    StructuredLlmError,
     StructuredLlmImage,
 )
 from memforge.llm.failure_trace import record_validation_failure
@@ -57,7 +57,7 @@ async def correct_fragment_selectors_once(
     candidates: list[ProjectionFragmentMemoryCandidate],
     *,
     catalog: ProjectionFragmentCatalog,
-    client: SourceSupportStructuredClient,
+    client: LiteLlmStructuredClient,
     extraction_prompt: str,
     max_tokens: int,
     model: str | None,
@@ -112,24 +112,24 @@ async def correct_fragment_selectors_once(
         "candidate indices and refs, each candidate at most once. An empty corrections list is valid.\n"
     ) + json.dumps(list(rejected.values()), ensure_ascii=False, separators=(",", ":"))
 
+    runner = LlmBatchRunner(client, model=model)
+    request = LlmRequest(prompt, ProjectionFragmentSelectorCorrectionResponse, max_tokens, tuple(images))
     try:
-        if not client.request_fits(
-            prompt, response_format=ProjectionFragmentSelectorCorrectionResponse,
-            max_tokens=max_tokens, model=model, images=images,
-        ):
-            metrics["selector_correction_outcome"] = "capacity_skipped"
-            return candidates, metrics
-        metrics["selector_correction_calls"] = 1
-        response = await client.correct_projection_fragment_selectors(
-            prompt, max_tokens=max_tokens, model=model, images=images,
-        )
+        response = await runner.run_one(request, call=client.correct_projection_fragment_selectors)
     except Exception as error:
         # This optional call must not discard successful extraction. Cancellation
         # remains a BaseException and propagates to the owning sync task.
+        metrics["selector_correction_calls"] = runner.stats.calls
         metrics["selector_correction_outcome"] = "call_failed"
-        metrics["selector_correction_error_code"] = (
-            error.error_code if isinstance(error, StructuredLlmError) else type(error).__name__
+        metrics["selector_correction_error_code"] = type(error).__name__
+        return candidates, metrics
+    metrics["selector_correction_calls"] = runner.stats.calls
+    if isinstance(response, ItemFailure):
+        metrics["selector_correction_outcome"] = (
+            "capacity_skipped" if response.category == "capacity_exceeded" else "call_failed"
         )
+        if response.error is not None:
+            metrics["selector_correction_error_code"] = response.error_code
         return candidates, metrics
 
     corrected = list(candidates)

@@ -133,6 +133,7 @@ async def _admit_run(
                     "memory_type": "procedure",
                 }
             ],
+            "support_audits": [{"incumbent_id": "mem-1", "supported": True}],
             "updated_document": "Tracing starts with traceId.",
         },
         promotion_policy_version="manual-v1",

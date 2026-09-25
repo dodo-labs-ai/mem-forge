@@ -4,6 +4,7 @@ import json
 import pytest
 import litellm
 
+from memforge.llm.request_budget import RequestBudget
 from memforge.llm.structured import (
     ClaimRevisionWireDecision, LiteLlmStructuredClient, RerankResponse, StructuredLlmConfig,
 )
@@ -225,8 +226,14 @@ async def test_optional_selector_correction_keeps_rejected_extraction_trace(monk
         def resolve_selection(self, **kwargs):
             raise FragmentSelectionError(FragmentSelectionErrorCode.UNKNOWN_REF, "unknown selector")
     class CorrectionClient:
+        def request_budget(self, model=None):
+            return RequestBudget("fixture", 200000, 200000, 64000, 0.8, "fixture")
+
         def request_fits(self, *args, **kwargs):
             return False
+
+        async def correct_projection_fragment_selectors(self, *args, **kwargs):
+            raise AssertionError("a correction that does not fit is never sent")
     candidate = ProjectionFragmentMemoryCandidate(content="fixed claim", memory_type="fact", primary_ref="unknown")
     _, metrics = await correct_fragment_selectors_once([candidate], catalog=Catalog(), client=CorrectionClient(),
         extraction_prompt="original extraction", max_tokens=100, model=None, images=(), source_response=source_response)
@@ -279,8 +286,14 @@ async def test_multiple_selector_errors_preserve_original_row_and_field_indices(
             raise FragmentSelectionError(FragmentSelectionErrorCode.UNKNOWN_REF, "unknown selector",
                 location="required_refs[0]", received=kwargs["required_refs"][0], allowed_refs=["p2"])
     class CorrectionClient:
+        def request_budget(self, model=None):
+            return RequestBudget("fixture", 200000, 200000, 64000, 0.8, "fixture")
+
         def request_fits(self, *args, **kwargs):
             return False
+
+        async def correct_projection_fragment_selectors(self, *args, **kwargs):
+            raise AssertionError("a correction that does not fit is never sent")
     candidates = [ProjectionFragmentMemoryCandidate(content=f"claim {i}", memory_type="fact", primary_ref="p2",
         required_refs=["p2", f"unknown-{i}", f"unknown-{i}"]) for i in range(2)]
     await correct_fragment_selectors_once(candidates, catalog=Catalog(), client=CorrectionClient(),

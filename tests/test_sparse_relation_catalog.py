@@ -7,7 +7,7 @@ import pytest
 
 from memforge.llm.relation_catalog import RelationCoverage, RequestCatalog, request_ref
 from memforge.llm.structured import MemoryRelationCatalogResponse, StructuredLlmError
-from memforge.memory.relation_classifier import MemoryPair, MemoryPairClassificationError, MemoryPairClassificationPolicy
+from memforge.memory.relation_classifier import MemoryPair, MemoryPairClassificationError
 from memforge.memory.relation_classifier import MEMORY_RELATION_PROMPT, _grouped_pair_payload
 from memforge.memory.sparse_relation_classifier import SparseMemoryRelationClassifier
 from memforge.models import Memory, content_hash
@@ -47,13 +47,11 @@ async def test_five_by_ten_becomes_fifteen_records_and_five_completions():
     old = [memory(f"old-{i}", f"old text {i}") for i in range(10)]
     pairs = tuple(MemoryPair(n, o) for n in new for o in old)
     client = Client()
-    classifier = SparseMemoryRelationClassifier(client=client, model="fixture",
-        policy=MemoryPairClassificationPolicy(max_pairs_per_call=1))
+    classifier = SparseMemoryRelationClassifier(client=client, model="fixture")
     result = await classifier.classify(pairs)
     data = payload(client.prompts[0])
     assert result.decisions == ()
     assert result.llm_calls == 1
-    assert classifier.plan(pairs).llm_calls == 1
     assert len(data["new_claims"]) == 5 and len(data["existing_claims"]) == 10
     assert sum(map(len, data["allowed_existing_ids"].values())) == 50
     assert data["new_claims"][0]["id"] == "NEW-0001"
@@ -89,8 +87,7 @@ async def test_four_discovered_edges_replace_fifty_dense_decisions():
     dense = dict(decisions=[dict(pair_index=i, classification="unrelated", direction="symmetric",
         same_subject_and_scope=False, incompatible_assertions="", reason="no discovered relationship") for i in range(50)])
     assert len(json.dumps(wire)) < len(json.dumps(dense)) * 0.4
-    baseline = MEMORY_RELATION_PROMPT.format(groups_json=_grouped_pair_payload(
-        tuple(enumerate(pairs)), max_content_chars=4000))
+    baseline = MEMORY_RELATION_PROMPT.format(groups_json=_grouped_pair_payload(tuple(enumerate(pairs))))
     assert len(client.prompts[0]) < len(baseline)
 
 
@@ -107,13 +104,12 @@ async def test_capacity_subdivision_keeps_the_complete_allowed_workset():
 
 
 @pytest.mark.asyncio
-async def test_conflicting_snapshot_beyond_prompt_truncation_is_rejected():
+async def test_conflicting_catalog_snapshot_is_rejected():
     pairs = (MemoryPair(memory("n1", "A"), memory("same-id", "shared prefix first")),
              MemoryPair(memory("n2", "B"), memory("same-id", "shared prefix second")))
     client = Client()
     with pytest.raises(MemoryPairClassificationError, match="conflicting catalog snapshots"):
-        await SparseMemoryRelationClassifier(client=client, model="fixture",
-            policy=MemoryPairClassificationPolicy(max_memory_content_chars=6)).classify(pairs)
+        await SparseMemoryRelationClassifier(client=client, model="fixture").classify(pairs)
     assert client.prompts == []
 
 
@@ -138,6 +134,8 @@ async def test_invalid_completion_never_becomes_empty_success(kind):
     with pytest.raises(MemoryPairClassificationError) as error:
         await SparseMemoryRelationClassifier(client=client, model="fixture").classify(pairs)
     assert error.value.pair_count == 2 and error.value.llm_calls == 2
+    assert error.value.error_code == "output_invalid"
+    assert "<correction>" in client.prompts[1]
 
 
 @pytest.mark.asyncio
@@ -163,6 +161,26 @@ async def test_provider_failure_is_not_replaced_by_completion():
         await SparseMemoryRelationClassifier(client=Failing(), model="fixture").classify((
             MemoryPair(memory("n", "A"), memory("m", "B")),))
     assert error.value.error_code == "deadline_exceeded"
+    assert error.value.terminal_category == "deadline_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_timeout_halves_the_catalog_until_every_pair_completes():
+    pairs = tuple(MemoryPair(memory(f"n{i}", f"new {i}"), memory(f"m{i}", f"old {i}")) for i in range(4))
+
+    class SlowForLargeCatalogs(Client):
+        async def discover_memory_relations(self, prompt, **kwargs):
+            if len(payload(prompt)["new_claims"]) > 1:
+                self.prompts.append(prompt)
+                raise StructuredLlmError("deadline", error_code="logical_deadline_exceeded",
+                                         terminal_category="deadline_exceeded")
+            return await super().discover_memory_relations(prompt, **kwargs)
+
+    client = SlowForLargeCatalogs(lambda data: dict(results=[
+        dict(candidate_id=c["id"], relations=[edge("MEM-0001")]) for c in data["new_claims"]]))
+    result = await SparseMemoryRelationClassifier(client=client, model="fixture").classify(pairs)
+    assert [d.pair.key for d in result.decisions] == [pair.key for pair in pairs]
+    assert result.llm_calls == 7
 
 
 def test_prefixes_overflow_and_conflicting_snapshots():

@@ -22,8 +22,10 @@ from memforge.evals.agent_evaluation import (
     AgentAssessmentLabel,
     assessment_public_payload,
 )
+from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
+from memforge.llm.structured import OfflineSemanticJudgeResponse
 from memforge.models import Memory, MemoryExtractionResult, RawMemory, ReconcileOperation
-from memforge.pipeline.reconciler import ReconciliationResult, reconcile_memories
+from memforge.pipeline.reconciler import ReconciliationResult, SupportAuditEntry, reconcile_memories
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.projection_context import ProjectionExtractionBatch
 from memforge.source_derivation import (
@@ -57,6 +59,8 @@ Evaluation input:
 SEMANTIC_JUDGE_PROMPT_HASH = hashlib.sha256(
     _SEMANTIC_JUDGE_PROMPT_TEMPLATE.encode("utf-8")
 ).hexdigest()
+# The judge answers with two enum fields; this leaves room for provider framing.
+_SEMANTIC_JUDGE_MAX_OUTPUT_TOKENS = 512
 
 
 class AgentEvaluationCaseKind(str, Enum):
@@ -752,7 +756,16 @@ class StructuredOfflineSemanticJudge:
         method = getattr(self._client, "judge_offline_semantics", None)
         if not callable(method):
             raise TypeError("structured client does not support offline semantic judging")
-        response = await method(prompt, model=spec.model)
+        response = await LlmBatchRunner(self._client, model=spec.model).run_one(
+            LlmRequest(
+                prompt=prompt,
+                response_format=OfflineSemanticJudgeResponse,
+                max_tokens=_SEMANTIC_JUDGE_MAX_OUTPUT_TOKENS,
+            ),
+            call=method,
+        )
+        if isinstance(response, ItemFailure):
+            raise response.error or RuntimeError(f"semantic judge request failed: {response.error_code}")
         labels: dict[str, AgentAssessmentLabel] = {
             "criterion_satisfied": "pass",
             "criterion_not_satisfied": "fail",
@@ -861,7 +874,12 @@ class ProductionSourceUnitDerivationReplayExecutor:
 
 
 class SourceUnitReconciliationReplayExecutor:
-    """Replay relation classification/reduction without applying a lifecycle plan."""
+    """Replay claim assessment and reduction against the case's pinned Support ledger.
+
+    Production reconciliation receives the Support results of the same sync;
+    a case pins them as ``support_audits`` so replay judges the same inputs
+    without applying a lifecycle plan.
+    """
 
     def __init__(self, structured_llm_client: object) -> None:
         self._structured_llm_client = structured_llm_client
@@ -885,13 +903,8 @@ class SourceUnitReconciliationReplayExecutor:
             doc_type=str(manifest.get("doc_type") or "document"),
             structured_llm_client=self._structured_llm_client,
             llm_model=str(candidate_manifest.get("model") or manifest.get("model") or ""),
-            updated_document=_optional_str(manifest.get("updated_document")),
-            update_mode=str(manifest.get("update_mode") or "full_document"),
-            changed_hunks=_optional_str(manifest.get("changed_hunks")),
-            update_plan_stats=(
-                dict(value) if isinstance((value := manifest.get("update_plan_stats")), Mapping) else None
-            ),
             include_metadata=True,
+            support_audits=_pinned_support_audits(manifest),
         )
         if not isinstance(result, ReconciliationResult):
             raise TypeError("offline reconciliation requires metadata result")
@@ -2545,6 +2558,30 @@ def _validate_case_manifest(
         incumbents = _mapping_list(manifest, "incumbents")
         if not incumbents:
             raise ValueError("reconciliation case requires pinned incumbents")
+        _pinned_support_audits(manifest)
+
+
+def _pinned_support_audits(manifest: Mapping[str, object]) -> list[SupportAuditEntry]:
+    """Read the pinned Support ledger: exactly one judgment for every incumbent."""
+
+    if "support_audits" not in manifest:
+        raise ValueError("reconciliation case requires pinned support_audits")
+    audits = []
+    for item in _mapping_list(manifest, "support_audits"):
+        supported = item.get("supported")
+        if not isinstance(supported, bool):
+            raise ValueError("support_audits supported must be a boolean")
+        audits.append(
+            SupportAuditEntry(
+                incumbent_id=str(item.get("incumbent_id") or ""),
+                supported=supported,
+                reason=str(item.get("reason") or ""),
+            )
+        )
+    incumbent_ids = sorted(str(item.get("id") or "") for item in _mapping_list(manifest, "incumbents"))
+    if sorted(audit.incumbent_id for audit in audits) != incumbent_ids:
+        raise ValueError("support_audits must cover every pinned incumbent exactly once")
+    return audits
 
 
 def _validate_candidate_manifest(manifest: Mapping[str, object]) -> None:

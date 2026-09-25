@@ -23,11 +23,13 @@ from memforge.agent_session_contract import (
 from memforge.config import AppConfig
 from memforge.agent_knowledge import (
     AgentKnowledgeBundleService,
+    AgentKnowledgePatchModelResponse,
     AgentKnowledgePatchProposal,
     render_agent_session_authority_prompt,
     render_agent_knowledge_patch_prompt,
 )
 from memforge.memory.project_resolver import resolve_project_key
+from memforge.llm.batch_runner import OUTPUT_INVALID, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import AgentSessionAuthorityResponse
 from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
 from memforge.repo_identity import normalize_repo_identifier
@@ -169,8 +171,9 @@ _TOOL_RESULT_TYPES = {
     "custom_tool_call_output",
 }
 _MAX_CANONICAL_EVENT_TEXT_CHARS = 4_000
-AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE = 16
-AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS = 4096
+# Requested output: one short decision per candidate, with a floor for the envelope.
+AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS = 256
+AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS = 1024
 
 
 def _now_iso() -> str:
@@ -347,59 +350,13 @@ def _primary_agent_session_evidence_ids(events: list[dict[str, Any]]) -> set[str
     }
 
 
-def _candidate_agent_session_authority_ids(events: list[dict[str, Any]]) -> set[str]:
-    return {
-        str(event["evidence_id"])
+def _with_authority_roles(events: list[dict[str, Any]], authoritative_ids: set[str]) -> list[dict[str, Any]]:
+    """Return events with each one's evidence role set from the authority decisions."""
+
+    return [
+        {**event, "evidence_role": "primary" if event.get("evidence_id") in authoritative_ids else "supporting"}
         for event in events
-        if event.get("authority_candidate") and event.get("evidence_id")
-    }
-
-
-def _apply_agent_session_authority_response(
-    events: list[dict[str, Any]],
-    response: AgentSessionAuthorityResponse,
-) -> list[dict[str, Any]]:
-    """Return events with semantic authority decisions applied."""
-    candidate_ids = _candidate_agent_session_authority_ids(events)
-    seen_ids: set[str] = set()
-    authoritative_ids: set[str] = set()
-    unknown_ids: set[str] = set()
-    duplicate_ids: set[str] = set()
-    for decision in response.decisions:
-        evidence_id = decision.evidence_id.strip()
-        if evidence_id in seen_ids:
-            duplicate_ids.add(evidence_id)
-            continue
-        seen_ids.add(evidence_id)
-        if evidence_id not in candidate_ids:
-            unknown_ids.add(evidence_id)
-            continue
-        if decision.is_authoritative:
-            authoritative_ids.add(evidence_id)
-    missing_ids = candidate_ids - seen_ids
-    if missing_ids:
-        raise ValueError(
-            "authority classifier omitted candidate evidence ids: "
-            + ", ".join(sorted(missing_ids))
-        )
-    if unknown_ids:
-        raise ValueError(
-            "authority classifier returned non-candidate evidence ids: "
-            + ", ".join(sorted(unknown_ids))
-        )
-    if duplicate_ids:
-        raise ValueError(
-            "authority classifier returned duplicate evidence ids: "
-            + ", ".join(sorted(duplicate_ids))
-        )
-    classified_events = []
-    for event in events:
-        classified = dict(event)
-        classified["evidence_role"] = (
-            "primary" if classified.get("evidence_id") in authoritative_ids else "supporting"
-        )
-        classified_events.append(classified)
-    return classified_events
+    ]
 
 
 async def _classify_agent_session_authority(
@@ -422,18 +379,8 @@ async def _classify_agent_session_authority(
     if not candidate_ids:
         return events
 
-    decisions = []
-    for start in range(0, len(candidate_ids), AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE):
-        batch_ids = set(
-            candidate_ids[start : start + AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE]
-        )
-        batch_events = [
-            {
-                **event,
-                "authority_candidate": event.get("evidence_id") in batch_ids,
-            }
-            for event in events
-        ]
+    def render(evidence_ids: tuple[str, ...], _context: tuple) -> LlmRequest:
+        requested = set(evidence_ids)
         prompt = render_agent_session_authority_prompt(
             owner_user_id=owner_user_id,
             client=client,
@@ -442,24 +389,47 @@ async def _classify_agent_session_authority(
             workspace=workspace,
             repo_identifier=repo_identifier,
             branch=branch,
-            events=batch_events,
+            # Every request carries the whole window; only its own candidates are asked.
+            events=[
+                {**event, "authority_candidate": event.get("evidence_id") in requested}
+                for event in events
+            ],
         )
-        generated = await structured_llm_client.classify_agent_session_evidence_authority(
-            prompt,
-            max_tokens=AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS,
+        max_tokens = max(
+            AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS,
+            AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS * len(evidence_ids),
         )
+        return LlmRequest(prompt, AgentSessionAuthorityResponse, max_tokens)
+
+    def decode(generated: Any, _evidence_ids: tuple[str, ...], _context: tuple):
         response = (
             generated
             if isinstance(generated, AgentSessionAuthorityResponse)
             else AgentSessionAuthorityResponse.model_validate(generated)
         )
-        _apply_agent_session_authority_response(batch_events, response)
-        decisions.extend(response.decisions)
+        return ((decision.evidence_id.strip(), decision) for decision in response.decisions)
 
-    return _apply_agent_session_authority_response(
-        events,
-        AgentSessionAuthorityResponse(decisions=decisions),
-    )
+    # The window client is built for this route, so its configured model applies.
+    runner = LlmBatchRunner(structured_llm_client, model=None)
+    outcomes = await runner.run_items(ItemTask(
+        item_ids=tuple(dict.fromkeys(candidate_ids)), render=render, decode=decode,
+        call=structured_llm_client.classify_agent_session_evidence_authority,
+    ))
+    authoritative_ids = set()
+    for evidence_id, outcome in outcomes.items():
+        if isinstance(outcome, ItemFailure):
+            raise outcome.error or ValueError(
+                f"authority classification failed for evidence {evidence_id}: {outcome.error_code}"
+            )
+        if outcome[0].is_authoritative:
+            authoritative_ids.add(evidence_id)
+    return _with_authority_roles(events, authoritative_ids)
+
+
+def _patch_proposal(generated: Any) -> AgentKnowledgePatchProposal:
+    if isinstance(generated, AgentKnowledgePatchProposal):
+        return generated
+    return AgentKnowledgePatchProposal.model_validate(generated)
 
 
 def _agent_patch_primary_evidence_error(
@@ -1123,36 +1093,34 @@ async def submit_agent_session_window(
             events=canonical_events,
             transcript_markdown=transcript_fallback,
         )
-        try:
-            generated = await structured_llm_client.generate_agent_knowledge_patch(
-                prompt,
-                max_tokens=min(
-                    config.llm.enrichment_max_tokens,
-                    AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS,
-                ),
-            )
-        except Exception as exc:
+        request = LlmRequest(
+            prompt,
+            AgentKnowledgePatchModelResponse,
+            min(config.llm.enrichment_max_tokens, AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS),
+        )
+
+        async def record_failure(exc: BaseException) -> None:
             await _record_window_outcome(
                 db=db,
                 **outcome_identity,
                 outcome="failed",
                 reason=f"{type(exc).__name__}: {exc}"[:500],
             )
+
+        try:
+            # The window client is built for this route, so its configured model applies.
+            proposal = await LlmBatchRunner(structured_llm_client, model=None).run_one(
+                request, call=structured_llm_client.generate_agent_knowledge_patch, decode=_patch_proposal,
+            )
+        except Exception as exc:
+            await record_failure(exc)
             raise
-        try:
-            proposal = (
-                generated
-                if isinstance(generated, AgentKnowledgePatchProposal)
-                else AgentKnowledgePatchProposal.model_validate(generated)
-            )
-        except Exception as exc:
-            await _record_window_outcome(
-                db=db,
-                **outcome_identity,
-                outcome="failed",
-                reason=f"{type(exc).__name__}: {exc}"[:500],
-            )
-            raise ValueError(f"agent knowledge patch validation failed: {exc}") from exc
+        if isinstance(proposal, ItemFailure):
+            cause = proposal.error or ValueError(f"agent knowledge patch request failed: {proposal.error_code}")
+            await record_failure(cause)
+            if proposal.error_code == OUTPUT_INVALID:
+                raise ValueError(f"agent knowledge patch validation failed: {cause}") from cause
+            raise cause
         if citation not in proposal.citations:
             proposal.citations.append(citation)
         primary_evidence_error = _agent_patch_primary_evidence_error(

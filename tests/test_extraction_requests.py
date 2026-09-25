@@ -10,6 +10,12 @@ from tests.test_projection_fragments import _projection, _batch
 from tests.test_revision_work import Client
 
 
+def bounded_output(extractor, catalog):
+    """The output a planned request is sent with: requested, then bounded by the route."""
+    budget = extractor.structured_llm_client.request_budget(extractor.model)
+    return budget.output_reserve(extractor.fragment_output_tokens(catalog))
+
+
 @pytest.mark.parametrize(("representation", "rows"), [("markdown", 1_200), ("html", 1_200), ("html", 3_000)])
 def test_large_complete_table_reaches_actual_request_budget(representation, rows):
     from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, ProjectionFragmentMemoryExtractionResponse
@@ -70,7 +76,7 @@ def test_large_complete_table_reaches_actual_request_budget(representation, rows
             assert [f.presentation_text for f in tables] == [table]
             assert all(client.request_fits(r.prepared_prompt,
                        response_format=ProjectionFragmentMemoryExtractionResponse,
-                       max_tokens=extractor.fragment_output_tokens(r.prepared_catalog)) for r in requests)
+                       max_tokens=bounded_output(extractor, r.prepared_catalog)) for r in requests)
 
 
 def test_first_import_over_old_catalog_limit_batches_complete_requests_and_keeps_heading_refs():
@@ -235,7 +241,7 @@ def test_small_real_window_packs_whole_tables_without_fixed_output_reservation(m
     seen = []
     for request in requests:
         assert client.request_fits(request.prepared_prompt, response_format=ProjectionFragmentMemoryExtractionResponse,
-                                   max_tokens=extractor.fragment_output_tokens(request.prepared_catalog))
+                                   max_tokens=bounded_output(extractor, request.prepared_catalog))
         for f in request.prepared_catalog.fragments:
             if f.fragment_type == "markdown-table" and f.primary_eligible:
                 seen.append(f.presentation_text)

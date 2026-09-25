@@ -3,9 +3,9 @@
 from dataclasses import replace
 import hashlib
 
+from memforge.llm.batch_runner import ItemCapacityExceeded, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import ProjectionFragmentMemoryExtractionResponse
 from memforge.pipeline.memory_extractor import MemoryExtractor
-from memforge.pipeline.projection_images import ProjectionImageLoadError
 from memforge.pipeline.revision_input import (
     ExtractionInputTask,
     InputCandidate,
@@ -17,6 +17,8 @@ from memforge.pipeline.revision_input import (
 
 
 class _ExtractionRequestPolicy:
+    """Pack the authorized Primary Fragments into the fewest requests that fit."""
+
     def __init__(self, batch, catalog, *, context, extractor, source_type, doc_type):
         self.batch = batch
         self.authorized = catalog
@@ -24,6 +26,7 @@ class _ExtractionRequestPolicy:
         self.extractor = extractor
         self.source_type = source_type
         self.doc_type = doc_type
+        self.runner = LlmBatchRunner(extractor.structured_llm_client, model=extractor.model)
 
     def _prompt(self, selected, mode):
         return MemoryExtractor.projection_fragment_prompt(
@@ -36,46 +39,22 @@ class _ExtractionRequestPolicy:
             mode=mode.value,
         )
 
-    def _request(self, selected, mode, *, load_images):
-        text = self._prompt(selected, mode)
-        kwargs = dict(
-            response_format=ProjectionFragmentMemoryExtractionResponse,
-            max_tokens=self.extractor.fragment_output_tokens(selected),
-            model=self.extractor.model,
+    def _request(self, selected, mode, *, load_images) -> LlmRequest:
+        request = LlmRequest(
+            self._prompt(selected, mode),
+            ProjectionFragmentMemoryExtractionResponse,
+            self.extractor.fragment_output_tokens(selected),
         )
-        client = self.extractor.structured_llm_client
-        if not client.request_fits(text, **kwargs):
-            return None
-        images = ()
         if not load_images:
-            return text, images, kwargs
-        try:
-            images = self.context.images_for(selected)
-        except ProjectionImageLoadError as error:
-            if error.error_code == "image_batch_too_large":
-                return None
-            raise
-        return (text, images, kwargs) if client.request_fits(text, images=images, **kwargs) else None
+            return request
+        return self.context.attach_images(request, selected, fits=self.runner.fits)
 
-    def _selected_catalog(
-        self,
-        candidate,
-        selected_fragments,
-        *,
-        authorize_primary=True,
-        include_persistent_context=True,
-    ):
-        selected_by_anchor = {
-            fragment.anchor: (
-                fragment if authorize_primary else replace(fragment, primary_eligible=False)
-            )
-            for fragment in selected_fragments
-        }
+    def _selected_catalog(self, candidate, selected_fragments):
         selected = {
             fragment.anchor: fragment
             for fragment in self.authorized.fragments
             if not fragment.primary_eligible
-        } if include_persistent_context else {}
+        }
         for index in candidate.reading_indexes:
             scoped = tuple(
                 fragment
@@ -88,7 +67,7 @@ class _ExtractionRequestPolicy:
             for fragment in expansion.fragments:
                 if fragment.anchor in expansion.context_anchors:
                     selected[fragment.anchor] = replace(fragment, primary_eligible=False)
-        selected.update(selected_by_anchor)
+        selected.update({fragment.anchor: fragment for fragment in selected_fragments})
         return self.context.catalog(
             tuple(
                 selected[fragment.anchor]
@@ -98,56 +77,51 @@ class _ExtractionRequestPolicy:
         )
 
     def _pack(self, candidate, *, load_images):
-        primary = [fragment for fragment in self.authorized.fragments if fragment.primary_eligible]
-        if candidate.mode is RevisionInputMode.FULL and self.context.base is not None:
-            selections = [candidate.catalog]
-            remaining = []
-        elif not primary:
-            selections = [candidate.catalog]
-            remaining = []
-        else:
-            selections = []
-            remaining = list(primary)
-        while remaining:
-            low, high = 0, len(remaining)
-            while low < high:
-                middle = (low + high + 1) // 2
-                selected = self._selected_catalog(candidate, remaining[:middle])
-                if self._request(selected, candidate.mode, load_images=load_images) is not None:
-                    low = middle
-                else:
-                    high = middle - 1
-            if not low:
+        primary = {fragment.reference: fragment for fragment in self.authorized.fragments if fragment.primary_eligible}
+        # A full revision over a known baseline, or work without Primary authority, is one indivisible request.
+        indivisible = not primary or (candidate.mode is RevisionInputMode.FULL and self.context.base is not None)
+
+        def request_for(selected) -> LlmRequest:
+            return self._request(selected, candidate.mode, load_images=load_images)
+
+        if indivisible:
+            request = self.runner.fit(lambda: request_for(candidate.catalog))
+            if request is None:
                 return None
-            selections.append(self._selected_catalog(candidate, remaining[:low]))
-            remaining = remaining[low:]
+            planned = ((candidate.catalog, request),)
+        else:
+            def selected_catalog(refs):
+                return self._selected_catalog(candidate, [primary[ref] for ref in refs])
+
+            try:
+                packed = self.runner.plan_items(
+                    tuple(primary), lambda refs, _context: request_for(selected_catalog(refs)),
+                )
+            except ItemCapacityExceeded:
+                return None
+            planned = tuple((selected_catalog(entry.item_ids), entry.request) for entry in packed)
 
         requests = []
         input_tokens = output_tokens = image_count = image_bytes = 0
-        for selected in selections:
-            request = self._request(selected, candidate.mode, load_images=load_images)
-            if request is None:
-                return None
-            text, images, kwargs = request
-            output = kwargs["max_tokens"]
+        for selected, request in planned:
             input_tokens += self.extractor.structured_llm_client.request_tokens(
-                text,
-                response_format=ProjectionFragmentMemoryExtractionResponse,
+                request.prompt,
+                response_format=request.response_format,
                 model=self.extractor.model,
-                images=images,
+                images=request.images,
             )
-            output_tokens += output
-            image_count += len(images)
-            image_bytes += sum(len(image.body) for image in images)
+            output_tokens += request.max_tokens
+            image_count += len(request.images)
+            image_bytes += sum(len(image.body) for image in request.images)
             identity = hashlib.sha256(
-                (self.batch.id + selected.digest + text).encode()
+                (self.batch.id + selected.digest + request.prompt).encode()
             ).hexdigest()
             requests.append(
                 replace(
                     self.batch,
                     id="request-" + identity,
                     prepared_catalog=selected,
-                    prepared_prompt=text,
+                    prepared_prompt=request.prompt,
                 )
             )
 
@@ -200,14 +174,7 @@ def plan_fragment_requests(batch, catalog, *, context, extractor, source_type, d
         task=ExtractionInputTask(catalog, named_baseline_revision_id=baseline),
         request_policy=policy,
     )
-    cost = {
-        "input_tokens": plan.estimated_cost.input_tokens,
-        "output_tokens": plan.estimated_cost.output_tokens,
-        "request_count": plan.estimated_cost.request_count,
-        "image_count": plan.estimated_cost.image_count,
-        "image_bytes": plan.estimated_cost.image_bytes,
-        "total_tokens": plan.estimated_cost.total_tokens,
-    }
+    cost = plan.estimated_cost.as_payload()
     return tuple(
         replace(
             request,

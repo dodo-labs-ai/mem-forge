@@ -7,7 +7,16 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from tests.revision_client_fixture import RevisionClientFixture
+from tests.llm_fixture import FixtureBudgetClient
+from tests.revision_client_fixture import (
+    EvidenceSelection,
+    RequiredSelection,
+    RevisionClientFixture,
+    RevisionProof,
+    RevisionProofs,
+    SupportJudgment,
+    SupportJudgments,
+)
 
 import pytest
 from memforge.llm.structured import SupportAssessmentResponse, SupportAssessmentWireResponse
@@ -17,14 +26,8 @@ import pytest_asyncio
 from memforge.llm.structured import (
     CandidateLedgerDecision,
     CandidateLedgerResponse,
-    IncumbentSupportAuditDecision,
-    IncumbentSupportAuditResponse,
     MemoryRelationDecision,
     MemoryRelationResponse,
-    MemorySupportValidationRequiredEvidence,
-    MemorySupportValidationResponse,
-    RevisionCompositionDecision,
-    RevisionCompositionResponse,
     StructuredLlmError,
 )
 from memforge.evals.agent_evaluation import (
@@ -97,7 +100,6 @@ from memforge.memory.relation_candidate_retrieval import (
 )
 from memforge.memory.relation_classifier import (
     MemoryPairClassification,
-    MemoryPairClassificationPlan,
     MemoryPairDecision,
     MemoryRelationType,
 )
@@ -377,9 +379,9 @@ def _jira_projection(
 
 
 def _audit_response(
-    *decisions: IncumbentSupportAuditDecision,
-) -> IncumbentSupportAuditResponse:
-    return IncumbentSupportAuditResponse(decisions=list(decisions))
+    *decisions: SupportJudgment,
+) -> SupportJudgments:
+    return SupportJudgments(decisions=list(decisions))
 
 
 def _uniform_relation_response(
@@ -425,10 +427,10 @@ class _ReplacementClient(RevisionClientFixture):
             reason="The source now retains A7.",
         )
 
-    async def audit_incumbent_support(self, prompt: str, **kwargs):
+    async def judge_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         return _audit_response(
-            IncumbentSupportAuditDecision(
+            SupportJudgment(
                 supported=False,
                 reason="The old claim is replaced.",
             )
@@ -444,10 +446,10 @@ class _ConflictingReplacementClient(RevisionClientFixture):
             reason="The candidate appears to replace the incumbent.",
         )
 
-    async def audit_incumbent_support(self, prompt: str, **kwargs):
+    async def judge_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         return _audit_response(
-            IncumbentSupportAuditDecision(
+            SupportJudgment(
                 supported=True,
                 reason="The incumbent still appears supported.",
             )
@@ -475,20 +477,20 @@ class _AdditiveRevisionClient(RevisionClientFixture):
             ]
         )
 
-    async def audit_incumbent_support(self, prompt: str, **kwargs):
+    async def judge_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         return _audit_response(
-            IncumbentSupportAuditDecision(
+            SupportJudgment(
                 supported=True,
                 reason="The 30 second timeout remains current.",
             )
         )
 
-    async def prove_revision_compositions(self, prompt: str, **kwargs):
+    async def prove_revisions(self, prompt: str, **kwargs):
         del prompt, kwargs
-        return RevisionCompositionResponse(
+        return RevisionProofs(
             decisions=[
-                RevisionCompositionDecision(
+                RevisionProof(
                     pair_index=0,
                     same_memory_identity=True,
                     preserves_incumbent_truth=True,
@@ -522,12 +524,12 @@ class _RunbookComponentFallbackClient(RevisionClientFixture):
             ]
         )
 
-    async def audit_incumbent_support(self, prompt: str, **kwargs):
+    async def judge_support(self, prompt: str, **kwargs):
         del kwargs
         incumbents_json = prompt.split("<incumbents>", 1)[1].split("</incumbents>", 1)[0]
         return _audit_response(
             *(
-                IncumbentSupportAuditDecision(
+                SupportJudgment(
                     supported=True,
                     reason="The branch remains supported in the current runbook.",
                 )
@@ -535,10 +537,10 @@ class _RunbookComponentFallbackClient(RevisionClientFixture):
             )
         )
 
-    async def prove_revision_compositions(self, prompt: str, **kwargs):
+    async def prove_revisions(self, prompt: str, **kwargs):
         del kwargs
         pairs = json.loads(prompt.split("<refinement_pairs>")[1].split("</refinement_pairs>")[0])
-        return RevisionCompositionResponse(decisions=[RevisionCompositionDecision(
+        return RevisionProofs(decisions=[RevisionProof(
             pair_index=index, same_memory_identity=False, preserves_incumbent_truth=False,
             candidate_is_canonical_composite=False, current_evidence_entails_candidate=True,
             reason="Resolved separate procedure; not a lossless replacement.",
@@ -546,15 +548,15 @@ class _RunbookComponentFallbackClient(RevisionClientFixture):
 
 
 class _RunbookComponentRevisionClient(_RunbookComponentFallbackClient):
-    async def prove_revision_compositions(self, prompt: str, **kwargs):
+    async def prove_revisions(self, prompt: str, **kwargs):
         del kwargs
         pairs_json = prompt.split("<refinement_pairs>", 1)[1].split(
             "</refinement_pairs>",
             1,
         )[0]
-        return RevisionCompositionResponse(
+        return RevisionProofs(
             decisions=[
-                RevisionCompositionDecision(
+                RevisionProof(
                     pair_index=item["pair_index"],
                     same_memory_identity=True,
                     preserves_incumbent_truth=True,
@@ -571,10 +573,10 @@ class _NoopClient(RevisionClientFixture):
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
 
-    async def audit_incumbent_support(self, prompt: str, **kwargs):
+    async def judge_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         return _audit_response(
-            IncumbentSupportAuditDecision(
+            SupportJudgment(
                 supported=True,
                 reason="The exact claim remains in the revised page.",
             )
@@ -585,10 +587,10 @@ class _DeleteClient(RevisionClientFixture):
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
 
-    async def audit_incumbent_support(self, prompt: str, **kwargs):
+    async def judge_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         return _audit_response(
-            IncumbentSupportAuditDecision(
+            SupportJudgment(
                 supported=False,
                 reason="The incomplete rendering appears to omit the claim.",
             )
@@ -658,7 +660,7 @@ async def test_lifecycle_commit_rejection_returns_failure_bundle_without_success
         )
     ) == []
 
-    async def audit_incumbent_support(self, prompt: str, **kwargs):
+    async def judge_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         raise AssertionError("proven-disjoint incumbent must not require LLM reconciliation")
 
@@ -868,7 +870,9 @@ async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branc
         db=db,
         memory_store=_AuditedOutboxDrainer(db),
         structured_llm_client=_CandidateLedgerClient(
-            _candidate_ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in branch_claims))
+            _candidate_ledger_response(
+                *(CandidateLedgerDecision(candidate_index=index, action="KEEP") for index in range(len(branch_claims)))
+            )
         ),
     )
     await initial_engine.prepare_and_commit_projected_lifecycle(
@@ -967,7 +971,9 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
         db=db,
         memory_store=_AuditedOutboxDrainer(db),
         structured_llm_client=_CandidateLedgerClient(
-            _candidate_ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in branch_claims))
+            _candidate_ledger_response(
+                *(CandidateLedgerDecision(candidate_index=index, action="KEEP") for index in range(len(branch_claims)))
+            )
         ),
     )
     await initial_engine.prepare_and_commit_projected_lifecycle(
@@ -1251,7 +1257,7 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
         prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     class RemovedArtifactClient(RevisionClientFixture):
-        async def assess_revision_support(self, prompt, **kwargs):
+        async def assess_support(self, prompt, **kwargs):
             from memforge.llm.structured import RevisionSupportResponse
             return RevisionSupportResponse(status="unsupported", reason="Required diagram was removed")
 
@@ -1300,10 +1306,10 @@ class _RecordingAddClient(RevisionClientFixture):
             reason="The changed observation states a separate durable claim.",
         )
 
-    async def audit_incumbent_support(self, prompt: str, **kwargs):
+    async def judge_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         return _audit_response(
-            IncumbentSupportAuditDecision(
+            SupportJudgment(
                 supported=True,
                 reason="The unchanged incumbent remains supported.",
             )
@@ -1315,7 +1321,7 @@ class _PersistentlyIncompleteAuditClient(RevisionClientFixture):
         self.incumbent_id = incumbent_id
         self.calls = 0
 
-    async def audit_incumbent_support(self, prompt: str, **kwargs):
+    async def judge_support(self, prompt: str, **kwargs):
         del prompt, kwargs
         self.calls += 1
         return _audit_response()
@@ -1395,15 +1401,16 @@ class _AuditedOutboxDrainer(_OutboxDrainer):
         await self.audit_logger.emit(event_type, status, **fields)
 
 
-class _CandidateLedgerClient:
+class _CandidateLedgerClient(FixtureBudgetClient):
     def __init__(self, response: CandidateLedgerResponse) -> None:
-        self.response = response
-        self.calls = 0
+        super().__init__(respond=lambda _prompt: response)
 
-    async def select_memory_candidates(self, prompt: str, **kwargs):
-        del prompt, kwargs
-        self.calls += 1
-        return self.response
+    @property
+    def calls(self) -> int:
+        return len(self.prompts)
+
+    async def select_memory_candidates(self, prompt: str, *, max_tokens: int, model=None):
+        return await self.call(prompt, max_tokens=max_tokens, model=model)
 
 
 def _candidate_ledger_response(
@@ -1562,8 +1569,9 @@ async def test_projected_lifecycle_records_low_value_admission_without_content(
     )
     client = _CandidateLedgerClient(
         _candidate_ledger_response(
-            CandidateLedgerDecision(action="KEEP"),
+            CandidateLedgerDecision(candidate_index=0, action="KEEP"),
             CandidateLedgerDecision(
+                candidate_index=1,
                 action="DROP_LOW_VALUE",
                 reason=f"Do not persist: {instance_content}",
             ),
@@ -1647,6 +1655,53 @@ async def test_projected_create_persists_validity_as_dates(db: Database) -> None
 
 
 @pytest.mark.asyncio
+async def test_entity_resolution_reads_each_mention_with_its_own_memory_text(db: Database) -> None:
+    projection = _projection(
+        run_id="projection-entity-context",
+        body="Release notes for the quarter follow. The payroll service posts runs to the ledger.",
+    )
+    revision = projection.observation_revisions[0]
+    payroll = RawMemory(
+        content="The payroll service posts runs to the ledger.",
+        memory_type="fact",
+        entity_refs=["payroll service", "ledger"],
+        evidence_quote="The payroll service posts runs to the ledger.",
+        source_observation_id=projection.observations[0].id,
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=None,
+    )
+    received: list[dict[str, list[str]]] = []
+    resolve_many = engine.entity_resolver.resolve_many
+
+    async def recording_resolve_many(mentions, *, scope):
+        received.append({mention: list(texts) for mention, texts in mentions.items()})
+        return await resolve_many(mentions, scope=scope)
+
+    engine.entity_resolver.resolve_many = recording_resolve_many  # type: ignore[method-assign]
+
+    await engine.prepare_and_commit_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=[payroll],
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=revision.content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    assert received == [{"payroll service": [payroll.content], "ledger": [payroll.content]}]
+
+
+@pytest.mark.asyncio
 async def test_incomplete_candidate_ledger_is_audited_as_fallback_and_keeps_memories(
     db: Database,
 ) -> None:
@@ -1655,7 +1710,9 @@ async def test_incomplete_candidate_ledger_is_audited_as_fallback_and_keeps_memo
         body="The trigger remained OPEN. The trigger was not processed.",
     )
     observation_id = projection.observations[0].id
-    client = _CandidateLedgerClient(_candidate_ledger_response(CandidateLedgerDecision(action="KEEP")))
+    client = _CandidateLedgerClient(
+        _candidate_ledger_response(CandidateLedgerDecision(candidate_index=0, action="KEEP"))
+    )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
@@ -1711,9 +1768,9 @@ class _SemanticEquivalentClient(RevisionClientFixture):
     def __init__(self) -> None:
         self.relation_calls = 0
 
-    async def audit_incumbent_support(self, prompt: str, **kwargs):
+    async def judge_support(self, prompt: str, **kwargs):
         del prompt, kwargs
-        return _audit_response(IncumbentSupportAuditDecision(supported=True, reason="still supported"))
+        return _audit_response(SupportJudgment(supported=True, reason="still supported"))
 
     async def classify_memory_relations(self, prompt: str, **kwargs):
         del kwargs
@@ -1759,7 +1816,7 @@ class _SupportValidatingNoopClient(_NoopClient):
         self.prefer_artifact_primary = prefer_artifact_primary
         self.validation_calls = 0
 
-    async def validate_memory_support(self, prompt: str, **kwargs):
+    async def select_support_evidence(self, prompt: str, **kwargs):
         del kwargs
         self.validation_calls += 1
         assert '"memory_claim"' in prompt
@@ -1801,12 +1858,12 @@ class _SupportValidatingNoopClient(_NoopClient):
                         "f999999",
                     )
                 required_evidence.append(
-                    MemorySupportValidationRequiredEvidence(
+                    RequiredSelection(
                         selector=item["selector"],
                         evidence_ref=selected_ref,
                     )
                 )
-        return MemorySupportValidationResponse(
+        return EvidenceSelection(
             supported=self.supported,
             primary_ref=primary_ref,
             required_evidence=required_evidence,
@@ -1819,7 +1876,7 @@ class _SupportValidatingNoopClient(_NoopClient):
 
 
 class _UnavailableSupportValidatingNoopClient(_NoopClient):
-    async def validate_memory_support(self, prompt: str, **kwargs):
+    async def select_support_evidence(self, prompt: str, **kwargs):
         del prompt, kwargs
         raise StructuredLlmError(
             "provider unavailable",
@@ -1833,7 +1890,7 @@ class _FragmentSelectingSupportClient(_NoopClient):
         super().__init__("multiple-incumbents")
         self.validation_prompts: list[str] = []
 
-    async def audit_incumbent_support(self, prompt: str, **kwargs):
+    async def judge_support(self, prompt: str, **kwargs):
         del kwargs
         incumbents_json = prompt.split("<incumbents>", 1)[1].split(
             "</incumbents>",
@@ -1841,7 +1898,7 @@ class _FragmentSelectingSupportClient(_NoopClient):
         )[0]
         return _audit_response(
             *(
-                IncumbentSupportAuditDecision(
+                SupportJudgment(
                     supported=True,
                     reason="The exact claim remains supported.",
                 )
@@ -1849,7 +1906,7 @@ class _FragmentSelectingSupportClient(_NoopClient):
             )
         )
 
-    async def validate_memory_support(self, prompt: str, **kwargs):
+    async def select_support_evidence(self, prompt: str, **kwargs):
         del kwargs
         self.validation_prompts.append(prompt)
         payload = json.loads(
@@ -1859,7 +1916,7 @@ class _FragmentSelectingSupportClient(_NoopClient):
             )[0]
         )
         candidate = next(item for item in payload["primary_candidates"] if item["text"] == payload["memory_claim"])
-        return MemorySupportValidationResponse.model_validate(
+        return EvidenceSelection.model_validate(
             {
                 "supported": True,
                 "reason": "The selected current Fragment still entails the claim.",
@@ -1870,8 +1927,8 @@ class _FragmentSelectingSupportClient(_NoopClient):
 
 
 class _DuplicateRequiredSelectorClient(_SupportValidatingNoopClient):
-    async def validate_memory_support(self, prompt: str, **kwargs):
-        response = await super().validate_memory_support(prompt, **kwargs)
+    async def select_support_evidence(self, prompt: str, **kwargs):
+        response = await super().select_support_evidence(prompt, **kwargs)
         [required] = response.required_evidence
         return response.model_copy(update={"required_evidence": [required, required]})
 
@@ -1881,7 +1938,7 @@ class _InvalidThenValidSupportClient(_NoopClient):
         super().__init__(memory_id)
         self.validation_prompts: list[str] = []
 
-    async def validate_memory_support(self, prompt: str, **kwargs):
+    async def select_support_evidence(self, prompt: str, **kwargs):
         del kwargs
         self.validation_prompts.append(prompt)
         payload = json.loads(
@@ -1907,7 +1964,7 @@ class _InvalidThenValidSupportClient(_NoopClient):
             if len(self.validation_prompts) == 1
             else payload["primary_candidates"][0]["ref"]
         )
-        return MemorySupportValidationResponse(
+        return EvidenceSelection(
             supported=True,
             primary_ref=primary_ref,
             required_evidence=[],
@@ -7954,13 +8011,6 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
 
 
 class _DeterministicRefinementClassifier:
-    def plan(self, pairs):
-        return MemoryPairClassificationPlan(
-            pair_count=len(pairs),
-            llm_calls=1 if pairs else 0,
-            prompt_chars=123 if pairs else 0,
-        )
-
     async def classify(self, pairs):
         return MemoryPairClassification(
             decisions=tuple(
@@ -7978,13 +8028,6 @@ class _DeterministicRefinementClassifier:
 
 
 class _DeterministicContradictionClassifier:
-    def plan(self, pairs):
-        return MemoryPairClassificationPlan(
-            pair_count=len(pairs),
-            llm_calls=1 if pairs else 0,
-            prompt_chars=123 if pairs else 0,
-        )
-
     async def classify(self, pairs):
         return MemoryPairClassification(
             decisions=tuple(

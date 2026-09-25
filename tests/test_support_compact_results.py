@@ -69,40 +69,34 @@ async def test_live_client_contract_uses_compact_schema_and_rejects_truncated_js
 
 
 @pytest.mark.asyncio
-async def test_correction_records_rule_without_source_content(caplog):
+async def test_correction_log_names_the_rule_class_without_source_content(caplog):
     from memforge.pipeline.revision_work import RevisionWorkExecutor
     from tests.test_revision_work import Client, Store, work_items
     class WrongRef(Client):
-        async def evaluate_revision_work(self, prompt, **kwargs):
-            result = await super().evaluate_revision_work(prompt, **kwargs)
-            result.results[0].primary_ref = 'PRM-9999'
-            return result
+        def judge(self, prompt):
+            results = super().judge(prompt)
+            results[0].primary_ref = 'PRM-9999'
+            return results
     executor = RevisionWorkExecutor(client=WrongRef(limit=50000), model='gpt-4o', store=Store(), derivation_id='root')
     with pytest.raises(Exception, match='bounded assessment correction exhausted'):
         await executor.assess_many(work_items('Two reviewers approve US releases.'))
-    records = [r.message for r in caplog.records if r.message.startswith('support_assessment_validation')]
+    records = [r.message for r in caplog.records if r.message.startswith('llm_batch_output_rejected')]
     assert len(records) == 2
-    assert all('unknown_ref' in r and 'expected_items=1' in r for r in records)
+    assert all('FragmentSelectionError' in r and 'items=1' in r for r in records)
     assert all('reviewers' not in r and 'PRM-9999' not in r for r in records)
 
 
 @pytest.mark.asyncio
-async def test_pipeline_compact_wire_and_cached_canonical_result():
+async def test_pipeline_reuses_the_compact_wire_result_and_decodes_it_again():
     from memforge.pipeline.revision_work import RevisionWorkExecutor
     from tests.test_revision_work import Client, Store, work_items
-    class CompactClient(Client):
-        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-            legacy = await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
-            return response_format.model_validate({'results': [
-                {k: v for k, v in r.model_dump().items() if k != 'reason' or r.status != 'supported'}
-                for r in legacy.results
-            ]})
-    client, store = CompactClient(limit=50000), Store()
+    client, store = Client(limit=50000), Store()
     items = work_items('Two reviewers approve US releases.', 2)
     first = RevisionWorkExecutor(client=client, model='openai/gpt-4o', store=store, derivation_id='root')
     assert all(r.supported for r in (await first.assess_many(items)).values())
     second = RevisionWorkExecutor(client=client, model='openai/gpt-4o', store=store, derivation_id='root')
-    assert all(r.supported for r in (await second.assess_many(items)).values())
+    reused = await second.assess_many(items)
+    assert all(r.supported and r.reason == 'Supported by selected current Evidence.' for r in reused.values())
     assert len(client.prompts) == 1 and second.reused == 1
     work = next(w for w in store.works.values() if w.kind == 'support_assess')
-    assert all(r['reason'] == 'Supported by selected current Evidence.' for r in work.result['results'])
+    assert all('reason' not in r and r['work_id'].startswith('WRK-') for r in work.result['results'])

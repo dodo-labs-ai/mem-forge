@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import json
-from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
 
-from memforge.llm.structured import MemoryRelationResponse, StructuredLlmError, structured_llm_max_concurrent
+from memforge.llm.batch_runner import BatchStats, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.structured import MemoryRelationResponse, StructuredLlmError
 from memforge.memory.evidence import RelationDirection
 from memforge.models import Memory
-from memforge.pipeline.bounded_work import collect_bounded
 
 
 class MemoryPairClassificationError(RuntimeError):
@@ -86,19 +85,7 @@ class MemoryPairClassification:
     prompt_chars: int
 
 
-@dataclass(frozen=True, slots=True)
-class MemoryPairClassificationPlan:
-    pair_count: int
-    llm_calls: int
-    prompt_chars: int
-
-
 class MemoryPairClassifier(Protocol):
-    def plan(
-        self,
-        pairs: tuple[MemoryPair, ...],
-    ) -> MemoryPairClassificationPlan: ...
-
     async def classify(
         self,
         pairs: tuple[MemoryPair, ...],
@@ -107,20 +94,17 @@ class MemoryPairClassifier(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class MemoryPairClassificationPolicy:
-    max_pairs_per_call: int = 64
-    max_prompt_chars: int = 120_000
+    """Task shape of a relation request; capacity packing belongs to the batch runner.
+
+    Every Memory is shown in full, and ``max_output_tokens`` caps the output one
+    request asks for.
+    """
+
     max_output_tokens: int = 32_768
-    max_memory_content_chars: int = 4_000
 
     def __post_init__(self) -> None:
-        if self.max_pairs_per_call < 1:
-            raise ValueError("max_pairs_per_call must be positive")
-        if self.max_prompt_chars < 1:
-            raise ValueError("max_prompt_chars must be positive")
         if self.max_output_tokens < 1:
             raise ValueError("max_output_tokens must be positive")
-        if self.max_memory_content_chars < 1:
-            raise ValueError("max_memory_content_chars must be positive")
 
 
 MEMORY_RELATION_RULES = """Use these definitions strictly:
@@ -171,19 +155,50 @@ Return exactly one decision for every pair_index and no other pair_index.
 """
 
 
-def _coverage_retry_prompt(
-    prompt: str,
-    *,
-    expected_indices: tuple[int, ...],
-    failure: str,
-) -> str:
-    return (
-        f"{prompt}\n\n"
-        "<coverage_correction>\n"
-        f"The previous response was invalid: {failure}\n"
-        "Regenerate the complete decisions array. Return each of these pair_index values "
-        f"exactly once and no others: {json.dumps(expected_indices)}.\n"
-        "</coverage_correction>"
+# Requested output per relation request: a response envelope plus one decision per pair.
+_RELATION_OUTPUT_BASE_TOKENS = 512
+_RELATION_OUTPUT_TOKENS_PER_PAIR = 768
+
+
+def relation_output_tokens(policy: MemoryPairClassificationPolicy, pair_count: int) -> int:
+    """The output a relation request asks for; the runner bounds it by the route."""
+
+    return min(policy.max_output_tokens, _RELATION_OUTPUT_BASE_TOKENS + _RELATION_OUTPUT_TOKENS_PER_PAIR * pair_count)
+
+
+async def run_pair_items(runner: LlmBatchRunner, task: ItemTask, *, pair_count: int, label: str) -> list[Any]:
+    """Return one result per pair, or raise for the first pair left without one."""
+
+    try:
+        outcomes = await runner.run_items(task)
+    except Exception as error:
+        raise MemoryPairClassificationError(
+            f"{label} failed: {error}", pair_count=pair_count,
+            llm_calls=runner.stats.calls, prompt_chars=runner.stats.prompt_chars,
+        ) from error
+    results = []
+    for outcome in outcomes.values():
+        if isinstance(outcome, ItemFailure):
+            raise _classification_error(outcome, pair_count=pair_count, stats=runner.stats)
+        results.append(outcome[0])
+    return results
+
+
+def _classification_error(
+    failure: ItemFailure, *, pair_count: int, stats: BatchStats,
+) -> MemoryPairClassificationError:
+    """Report one unfinished relation item with the usage spent on the whole ledger."""
+
+    error = failure.error
+    detail = f": {error}" if error is not None else ""
+    provider = error if isinstance(error, StructuredLlmError) else None
+    return MemoryPairClassificationError(
+        f"memory relation classification failed ({failure.error_code}){detail}",
+        pair_count=pair_count,
+        llm_calls=stats.calls,
+        prompt_chars=stats.prompt_chars,
+        terminal_category=provider.terminal_category if provider else None,
+        error_code=failure.error_code,
     )
 
 
@@ -201,14 +216,10 @@ def _prompt_memory(
     memory: Memory,
     *,
     context: MemoryPairContext | None,
-    max_content_chars: int,
 ) -> dict[str, object]:
-    content = memory.content
-    if len(content) > max_content_chars:
-        content = content[:max_content_chars] + "\n[truncated]"
     payload: dict[str, object] = {
         "id": memory.id,
-        "content": content,
+        "content": memory.content,
         "type": memory.memory_type,
         "visibility": memory.visibility,
         "project_key": memory.project_key,
@@ -227,33 +238,21 @@ def _prompt_memory(
     return payload
 
 
-def _grouped_pair_payload(
-    indexed_pairs: tuple[tuple[int, MemoryPair], ...],
-    *,
-    max_content_chars: int,
-) -> str:
+def _grouped_pair_payload(indexed_pairs: tuple[tuple[int, MemoryPair], ...]) -> str:
     groups: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for pair_index, pair in indexed_pairs:
         challenger_id = pair.challenger.id
         if challenger_id not in groups:
             groups[challenger_id] = {
-                "challenger": _prompt_memory(
-                    pair.challenger,
-                    context=pair.challenger_context,
-                    max_content_chars=max_content_chars,
-                ),
+                "challenger": _prompt_memory(pair.challenger, context=pair.challenger_context),
                 "candidates": [],
             }
             order.append(challenger_id)
         groups[challenger_id]["candidates"].append(
             {
                 "pair_index": pair_index,
-                "candidate": _prompt_memory(
-                    pair.candidate,
-                    context=pair.candidate_context,
-                    max_content_chars=max_content_chars,
-                ),
+                "candidate": _prompt_memory(pair.candidate, context=pair.candidate_context),
             }
         )
     return json.dumps([groups[challenger_id] for challenger_id in order], ensure_ascii=False)
@@ -279,175 +278,29 @@ class StructuredMemoryPairClassifier:
     ) -> MemoryPairClassification:
         if not pairs:
             return MemoryPairClassification(decisions=(), llm_calls=0, prompt_chars=0)
-        batches = self._batches(pairs)
-        attempted_pairs = sum(len(indexed_pairs) for indexed_pairs, _ in batches)
-        llm_calls = len(batches)
-        prompt_chars = sum(len(prompt) for _, prompt in batches)
-        coverage_retry_calls = 0
-        coverage_retry_prompt_chars = 0
-        try:
+        runner = LlmBatchRunner(self._client, model=self._model)
 
-            async def classify_batch(
-                batch: tuple[tuple[tuple[int, MemoryPair], ...], str],
-            ) -> tuple[tuple[int, MemoryPairDecision], ...]:
-                nonlocal coverage_retry_calls, coverage_retry_prompt_chars
-                indexed_pairs, prompt = batch
-                batch_indices = tuple(index for index, _ in indexed_pairs)
-                request_prompt = prompt
-                for attempt in range(2):
-                    if not self._request_fits(request_prompt, len(indexed_pairs), reserve_correction=not attempt):
-                        raise MemoryPairClassificationError("one complete pair request exceeds configured capability")
-                    response = await self._client.classify_memory_relations(
-                        request_prompt,
-                        max_tokens=self._output_tokens(len(indexed_pairs)),
-                        model=self._model,
-                    )
-                    raw_decisions = tuple(response.decisions)
-                    try:
-                        by_index = self._first_decisions_by_index(
-                            raw_decisions,
-                            expected_indices=batch_indices,
-                        )
-                    except MemoryPairClassificationError as error:
-                        if attempt == 1:
-                            raise
-                        request_prompt = _coverage_retry_prompt(
-                            prompt,
-                            expected_indices=batch_indices,
-                            failure=str(error),
-                        )
-                        coverage_retry_calls += 1
-                        coverage_retry_prompt_chars += len(request_prompt)
-                        continue
-                    break
-                return tuple(
-                    (
-                        pair_index,
-                        MemoryPairDecision(
-                            pair=pair,
-                            relation_type=MemoryRelationType(by_index[pair_index].classification),
-                            direction=RelationDirection(by_index[pair_index].direction),
-                            reason=_auditable_relation_reason(by_index[pair_index]),
-                        ),
-                    )
-                    for pair_index, pair in indexed_pairs
+        def render(item_ids: tuple[str, ...], _context: tuple) -> LlmRequest:
+            indexed_pairs = tuple((int(item_id), pairs[int(item_id)]) for item_id in item_ids)
+            prompt = MEMORY_RELATION_PROMPT.format(groups_json=_grouped_pair_payload(indexed_pairs))
+            return LlmRequest(prompt, MemoryRelationResponse, relation_output_tokens(self._policy, len(item_ids)))
+
+        def decode(response: MemoryRelationResponse, _item_ids: tuple[str, ...], _context: tuple):
+            for decision in response.decisions:
+                pair_index = int(decision.pair_index)
+                if not 0 <= pair_index < len(pairs):
+                    raise ValueError(f"unknown pair_index {pair_index}")
+                yield str(pair_index), MemoryPairDecision(
+                    pair=pairs[pair_index],
+                    relation_type=MemoryRelationType(decision.classification),
+                    direction=RelationDirection(decision.direction),
+                    reason=_auditable_relation_reason(decision),
                 )
 
-            batch_decisions = await collect_bounded(
-                batches,
-                classify_batch,
-                max_concurrent=structured_llm_max_concurrent(self._client),
-            )
-            decisions_by_index: dict[int, MemoryPairDecision] = {}
-            for decisions in batch_decisions:
-                for pair_index, decision in decisions:
-                    if pair_index in decisions_by_index:
-                        raise MemoryPairClassificationError(f"duplicate decision for pair index {pair_index}")
-                    decisions_by_index[pair_index] = decision
-            return MemoryPairClassification(
-                decisions=tuple(decisions_by_index[index] for index in range(len(pairs))),
-                llm_calls=llm_calls + coverage_retry_calls,
-                prompt_chars=prompt_chars + coverage_retry_prompt_chars,
-            )
-        except MemoryPairClassificationError as error:
-            if not (attempted_pairs or llm_calls or prompt_chars):
-                raise
-            raise MemoryPairClassificationError(
-                str(error),
-                pair_count=attempted_pairs,
-                llm_calls=llm_calls + coverage_retry_calls,
-                prompt_chars=prompt_chars + coverage_retry_prompt_chars,
-            ) from error
-        except StructuredLlmError as error:
-            raise MemoryPairClassificationError(
-                str(error),
-                pair_count=attempted_pairs,
-                llm_calls=llm_calls + coverage_retry_calls,
-                prompt_chars=prompt_chars + coverage_retry_prompt_chars,
-                terminal_category=error.terminal_category,
-                error_code=error.error_code,
-            ) from error
-        except Exception as error:
-            raise MemoryPairClassificationError(
-                f"memory relation classification failed: {error}",
-                pair_count=attempted_pairs,
-                llm_calls=llm_calls + coverage_retry_calls,
-                prompt_chars=prompt_chars + coverage_retry_prompt_chars,
-            ) from error
-
-    def plan(
-        self,
-        pairs: tuple[MemoryPair, ...],
-    ) -> MemoryPairClassificationPlan:
-        batches = self._batches(pairs)
-        return MemoryPairClassificationPlan(
-            pair_count=len(pairs),
-            llm_calls=len(batches),
-            prompt_chars=sum(len(prompt) for _, prompt in batches),
+        decisions = await run_pair_items(runner, ItemTask(
+            item_ids=tuple(str(index) for index in range(len(pairs))), render=render, decode=decode,
+            call=self._client.classify_memory_relations,
+        ), pair_count=len(pairs), label="memory relation classification")
+        return MemoryPairClassification(
+            decisions=tuple(decisions), llm_calls=runner.stats.calls, prompt_chars=runner.stats.prompt_chars,
         )
-
-    def _output_tokens(self, count: int) -> int:
-        return self._client.request_budget(self._model).output_reserve(
-            min(self._policy.max_output_tokens, 512 + 768 * count)
-        )
-
-    def _request_fits(self, prompt: str, count: int, *, reserve_correction: bool = True) -> bool:
-        return self._client.request_fits(
-            prompt, response_format=MemoryRelationResponse, model=self._model,
-            max_tokens=self._output_tokens(count), reserve_correction=reserve_correction,
-        )
-
-    def _batches(
-        self,
-        pairs: tuple[MemoryPair, ...],
-    ) -> tuple[tuple[tuple[tuple[int, MemoryPair], ...], str], ...]:
-        batches: list[tuple[tuple[tuple[int, MemoryPair], ...], str]] = []
-        start = 0
-        while start < len(pairs):
-            end = min(len(pairs), start + self._policy.max_pairs_per_call)
-            while True:
-                indexed_pairs = tuple((index, pairs[index]) for index in range(start, end))
-                prompt = MEMORY_RELATION_PROMPT.format(
-                    groups_json=_grouped_pair_payload(
-                        indexed_pairs,
-                        max_content_chars=self._policy.max_memory_content_chars,
-                    )
-                )
-                if len(prompt) <= self._policy.max_prompt_chars and self._request_fits(prompt, len(indexed_pairs)):
-                    batches.append((indexed_pairs, prompt))
-                    start = end
-                    break
-                if end - start == 1:
-                    raise MemoryPairClassificationError("one Memory pair exceeds the configured prompt budget")
-                end = start + max(1, (end - start) // 2)
-        return tuple(batches)
-
-    @staticmethod
-    def _first_decisions_by_index(
-        decisions: tuple[Any, ...],
-        *,
-        expected_indices: tuple[int, ...],
-    ) -> dict[int, Any]:
-        expected_index_set = set(expected_indices)
-        actual_indices: list[int] = []
-        first_by_index: dict[int, Any] = {}
-        for decision in decisions:
-            index = int(decision.pair_index)
-            actual_indices.append(index)
-            if index in expected_index_set and index not in first_by_index:
-                first_by_index[index] = decision
-        counts = Counter(actual_indices)
-        duplicate_indices = {index for index, count in counts.items() if count > 1}
-        actual_index_set = set(actual_indices)
-        missing_indices = expected_index_set - first_by_index.keys()
-        unexpected_indices = actual_index_set - expected_index_set
-        if missing_indices or unexpected_indices:
-            raise MemoryPairClassificationError(
-                "memory relation decision coverage invalid: "
-                f"expected_count={len(expected_indices)}, "
-                f"actual_count={len(decisions)}, "
-                f"missing_count={len(missing_indices)}, "
-                f"duplicate_count={len(duplicate_indices)}, "
-                f"unexpected_count={len(unexpected_indices)}"
-            )
-        return first_by_index

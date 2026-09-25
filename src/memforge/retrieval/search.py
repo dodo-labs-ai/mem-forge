@@ -23,7 +23,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, DEFAULT_SEARCH_TOP_K, RetrievalConfig
-from memforge.llm.structured import StructuredLlmError
+from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
+from memforge.llm.structured import RerankResponse
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
@@ -86,6 +87,8 @@ _CODE_SYMBOL_RE = re.compile(
 )
 _QUOTED_IDENTITY_RE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
 _MAX_QUOTED_IDENTITY_LENGTH = 256
+# Requested output for one listwise ranking: a short array of memory numbers.
+_RERANK_OUTPUT_TOKENS = 256
 
 
 # ---------------------------------------------------------------------------
@@ -1129,14 +1132,20 @@ class SearchEngine:
             'Return format: {"ranking": [3, 0, 7, 1]}'
         )
 
+        if self._structured_llm_client is None:
+            return candidates
         try:
-            if self._structured_llm_client is None:
-                return candidates
-            response = await self._structured_llm_client.rerank_memories(
-                prompt,
-                max_tokens=256,
-                model=self._config.rerank_model,
+            # The ranking is one indivisible request; any failure keeps the fused order.
+            response = await LlmBatchRunner(self._structured_llm_client, model=self._config.rerank_model).run_one(
+                LlmRequest(prompt, RerankResponse, _RERANK_OUTPUT_TOKENS),
+                call=self._structured_llm_client.rerank_memories,
             )
+            if isinstance(response, ItemFailure):
+                logger.warning(
+                    "LLM reranking failed (%s), falling back to RRF ranking", response.error_code,
+                    exc_info=response.error,
+                )
+                return candidates
             ranking = response.ranking
 
             # Rebuild candidate list in LLM-ranked order
@@ -1161,7 +1170,7 @@ class SearchEngine:
             reranked.extend(remainder)
             return reranked
 
-        except (StructuredLlmError, Exception):
+        except Exception:
             logger.warning("LLM reranking failed, falling back to RRF ranking", exc_info=True)
             return candidates
 

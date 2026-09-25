@@ -6,11 +6,16 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Generic, Hashable, Mapping, TypeVar
 
+from memforge.llm.batch_runner import RequestTooLarge
+from memforge.llm.structured import INPUT_CAPACITY_EXCEEDED
+
 T = TypeVar("T")
 
 
-class CatalogCapacityError(ValueError):
-    error_code = "input_capacity_exceeded"
+class CatalogCapacityError(RequestTooLarge, ValueError):
+    """A request catalog outgrew its reference format; a smaller request fits."""
+
+    error_code = INPUT_CAPACITY_EXCEEDED
 
 
 def request_ref(prefix: str, ordinal: int) -> str:
