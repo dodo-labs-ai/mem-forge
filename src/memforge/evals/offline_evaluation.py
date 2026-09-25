@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from time import perf_counter
@@ -24,6 +24,12 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import OfflineSemanticJudgeResponse
+from memforge.memory.cross_document_relation import (
+    CrossDocumentRelationLabel,
+    CrossDocumentRelationPair,
+    RelationSubject,
+    StructuredCrossDocumentRelationClassifier,
+)
 from memforge.models import Memory, MemoryExtractionResult, RawMemory, ReconcileOperation
 from memforge.pipeline.reconciler import ReconciliationResult, SupportAuditEntry, reconcile_memories
 from memforge.pipeline.memory_extractor import MemoryExtractor
@@ -61,11 +67,16 @@ SEMANTIC_JUDGE_PROMPT_HASH = hashlib.sha256(
 ).hexdigest()
 # The judge answers with two enum fields; this leaves room for provider framing.
 _SEMANTIC_JUDGE_MAX_OUTPUT_TOKENS = 512
+# The deterministic criterion of a cross-document relation case; its reason
+# code is "expected:actual".
+RELATION_LABEL_CRITERION = "relation_label"
+_RELATION_LABELS = frozenset(label.value for label in CrossDocumentRelationLabel)
 
 
 class AgentEvaluationCaseKind(str, Enum):
     SOURCE_UNIT_DERIVATION = "source_unit_derivation_v1"
     SOURCE_UNIT_RECONCILIATION = "source_unit_reconciliation_v1"
+    CROSS_DOCUMENT_RELATION = "cross_document_relation_v1"
 
 
 class AgentEvaluationPopulation(str, Enum):
@@ -571,6 +582,10 @@ class AgentEvaluationRunReport:
     error_result_count: int
     check_counts: Mapping[str, int]
     population_summaries: Mapping[str, Mapping[str, int]]
+    # Cross-document relation cases only: per-label counts and precision/recall,
+    # and "expected:actual" confusion counts.
+    label_metrics: Mapping[str, Mapping[str, float | int | None]] = field(default_factory=dict)
+    label_confusion: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -924,6 +939,33 @@ class SourceUnitReconciliationReplayExecutor:
                 "revision_proof_count": result.metrics.revision_proof_count,
                 "revision_proof_failure_count": result.metrics.revision_proof_failure_count,
             },
+        }
+
+
+class CrossDocumentRelationReplayExecutor:
+    """Label one pinned Memory pair with the production cross-document classifier."""
+
+    def __init__(self, structured_llm_client: object) -> None:
+        self._structured_llm_client = structured_llm_client
+
+    async def execute(
+        self,
+        case: AgentEvaluationCase,
+        candidate_manifest: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        pair = CrossDocumentRelationPair(
+            challenger=RelationSubject.from_manifest(_mapping(case.manifest, "challenger")),
+            candidate=RelationSubject.from_manifest(_mapping(case.manifest, "candidate")),
+        )
+        classification = await StructuredCrossDocumentRelationClassifier(
+            client=self._structured_llm_client,
+            model=str(candidate_manifest["model"]),
+        ).classify((pair,))
+        judgment = classification.judgments[0]
+        return {
+            "case_kind": case.case_kind.value,
+            "label": judgment.label.value,
+            "reason": judgment.reason,
         }
 
 
@@ -1938,6 +1980,11 @@ class OfflineAgentEvaluation:
             )
             if label in population_summaries[population]:
                 population_summaries[population][label] += 1
+        label_metrics, label_confusion = relation_label_metrics(
+            assessment.reason_code
+            for assessment in code_assessments
+            if assessment.criterion == RELATION_LABEL_CRITERION
+        )
         return AgentEvaluationRunReport(
             run=run,
             results=results,
@@ -1950,6 +1997,8 @@ class OfflineAgentEvaluation:
             ),
             check_counts=counts,
             population_summaries=population_summaries,
+            label_metrics=label_metrics,
+            label_confusion=label_confusion,
         )
 
     async def read_semantic_calibration_report(
@@ -2307,7 +2356,25 @@ def deterministic_checks(
             reason_code="typed_output_valid",
         )
     ]
-    if case.case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
+    if case.case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION:
+        expected = str(ground_truth.rubric.get("expected_label") or "")
+        actual = str(output.get("label") or "")
+        if actual not in _RELATION_LABELS:
+            return (
+                DeterministicCheck(
+                    criterion="typed_output",
+                    label=DeterministicCheckLabel.FAIL,
+                    reason_code="relation_output_invalid",
+                ),
+            )
+        checks.append(
+            DeterministicCheck(
+                criterion=RELATION_LABEL_CRITERION,
+                label=DeterministicCheckLabel.PASS if actual == expected else DeterministicCheckLabel.FAIL,
+                reason_code=f"{expected}:{actual}",
+            )
+        )
+    elif case.case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
         extraction = output.get("extraction")
         memories = extraction.get("memories") if isinstance(extraction, Mapping) else None
         if not isinstance(memories, list):
@@ -2421,6 +2488,34 @@ def deterministic_checks(
                     )
                 )
     return tuple(checks)
+
+
+def relation_label_metrics(
+    reason_codes: Iterable[str],
+) -> tuple[dict[str, dict[str, float | int | None]], dict[str, int]]:
+    """Per-label precision and recall from "expected:actual" relation checks.
+
+    A metric is None when its denominator is zero.
+    """
+
+    confusion: dict[str, int] = {}
+    for code in reason_codes:
+        expected, _, actual = code.partition(":")
+        if expected in _RELATION_LABELS and actual in _RELATION_LABELS:
+            confusion[code] = confusion.get(code, 0) + 1
+    metrics: dict[str, dict[str, float | int | None]] = {}
+    for label in sorted(_RELATION_LABELS):
+        expected_count = sum(count for code, count in confusion.items() if code.split(":")[0] == label)
+        predicted_count = sum(count for code, count in confusion.items() if code.split(":")[1] == label)
+        correct_count = confusion.get(f"{label}:{label}", 0)
+        metrics[label] = {
+            "expected": expected_count,
+            "predicted": predicted_count,
+            "correct": correct_count,
+            "precision": correct_count / predicted_count if predicted_count else None,
+            "recall": correct_count / expected_count if expected_count else None,
+        }
+    return metrics, confusion
 
 
 def _derivation_evidence_resolves(
@@ -2550,7 +2645,17 @@ def _validate_case_manifest(
     case_kind: AgentEvaluationCaseKind,
     manifest: Mapping[str, object],
 ) -> None:
-    if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
+    if case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION:
+        subjects = [
+            RelationSubject.from_manifest(_mapping(manifest, side))
+            for side in ("challenger", "candidate")
+        ]
+        if subjects[0].memory_id == subjects[1].memory_id:
+            raise ValueError("relation case requires two different Memories")
+        origin = _mapping(manifest, "origin")
+        if not origin.get("review_id"):
+            raise ValueError("relation case origin requires review_id")
+    elif case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
         _mapping(manifest, "projection")
         _mapping(manifest, "context")
     else:
@@ -2606,6 +2711,9 @@ def _validate_rubric(
         raise ValueError("accepted ground truth rubric cannot be empty")
     if "required_claims" in rubric and not isinstance(rubric["required_claims"], list):
         raise ValueError("required_claims must be a list")
+    if case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION:
+        if rubric.get("expected_label") not in _RELATION_LABELS:
+            raise ValueError("relation rubric requires one expected_label of " + ", ".join(sorted(_RELATION_LABELS)))
     if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION:
         forbidden = rubric.get("forbidden_destructive_memory_ids", [])
         if not isinstance(forbidden, list):
@@ -3015,6 +3123,10 @@ def agent_evaluation_report_public_payload(
                 population: dict(summary)
                 for population, summary in report.population_summaries.items()
             },
+            "label_metrics": {
+                label: dict(metrics) for label, metrics in report.label_metrics.items()
+            },
+            "label_confusion": dict(report.label_confusion),
         },
         "results": [agent_evaluation_result_to_payload(result) for result in report.results],
         "assessments": [

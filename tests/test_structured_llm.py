@@ -1101,6 +1101,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "CandidateLedgerResponse": '{"decisions":[]}',
         "MemoryRelationResponse": '{"decisions":[]}',
         "MemoryRelationCatalogResponse": '{"results":[]}',
+        "CrossDocumentRelationResponse": '{"decisions":[]}',
         "EntityBatchValidationResponse": '{"decisions":[]}',
         "RerankResponse": '{"ranking":[]}',
             "AgentKnowledgePatchModelResponse": '{"action":"no_output"}',
@@ -1147,6 +1148,9 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "select_memory_candidates": lambda: client.select_memory_candidates("prompt"),
         "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
         "discover_memory_relations": lambda: client.discover_memory_relations("prompt"),
+        "classify_cross_document_relations": lambda: client.classify_cross_document_relations(
+            "prompt", max_tokens=512,
+        ),
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
         "rerank_memories": lambda: client.rerank_memories("prompt"),
         "generate_agent_knowledge_patch": lambda: client.generate_agent_knowledge_patch("prompt"),
@@ -2444,3 +2448,51 @@ def test_sap_route_uses_sdk_bedrock_metadata_and_preserves_operator_caps(monkeyp
     runner = LlmBatchRunner(client, model=config.model)
     planned = runner.fit(lambda: LlmRequest("extract", ProjectionFragmentMemoryExtractionResponse, requested))
     assert planned.max_tokens == config.max_output_tokens
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("finish_reason", "error_code"),
+    [
+        ("content_filter", "cross_document_relation_response_incomplete"),
+        ("refusal", "cross_document_relation_response_incomplete"),
+    ],
+)
+async def test_cross_document_relations_reject_a_refused_empty_reply(
+    monkeypatch, finish_reason, error_code,
+):
+    response = CompletionResponse('{"decisions":[]}')
+    response.choices[0].finish_reason = finish_reason
+
+    async def fake_acompletion(**_kwargs):
+        return response
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(StructuredLlmConfig(
+        model="anthropic--claude-sonnet-latest", base_url=None, api_key=None,
+        timeout_s=1.0, num_retries=1,
+    ))
+    with pytest.raises(StructuredLlmError) as error:
+        await client.classify_cross_document_relations("prompt", max_tokens=512)
+    assert error.value.error_code == error_code
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        {"pair_index": 0, "label": "refines", "reason": "narrower"},
+        {"pair_index": 0, "label": "none", "reason": "", "direction": "symmetric"},
+        {"pair_index": -1, "label": "none", "reason": ""},
+    ],
+)
+def test_cross_document_relation_schema_accepts_only_the_closed_labels(decision) -> None:
+    from pydantic import ValidationError
+
+    from memforge.llm.structured import CrossDocumentRelationResponse
+
+    with pytest.raises(ValidationError):
+        CrossDocumentRelationResponse.model_validate({"decisions": [decision]})
+    assert CrossDocumentRelationResponse.model_validate(
+        {"decisions": [{"pair_index": 0, "label": "updates", "reason": "a later decision"}]}
+    ).decisions[0].label == "updates"
