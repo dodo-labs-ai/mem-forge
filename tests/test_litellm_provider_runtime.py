@@ -47,7 +47,7 @@ async def test_structured_client_omits_empty_base_url_and_api_key(monkeypatch):
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
-                    message=SimpleNamespace(content='{"entity_ids": [42]}'),
+                    message=SimpleNamespace(content='{"ranking": [42]}'),
                 )
             ]
         )
@@ -63,9 +63,9 @@ async def test_structured_client_omits_empty_base_url_and_api_key(monkeypatch):
         )
     )
 
-    response = await client.detect_query_entities("Find the matching entity")
+    response = await client.rerank_memories("Rank the matching memories")
 
-    assert response.entity_ids == [42]
+    assert response.ranking == [42]
     assert captured["model"] == "provider/chat-model"
     assert "api_base" not in captured
     assert "api_key" not in captured

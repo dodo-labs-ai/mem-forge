@@ -48,6 +48,16 @@ class InputCost:
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
+    def as_payload(self) -> dict[str, int]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "request_count": self.request_count,
+            "image_count": self.image_count,
+            "image_bytes": self.image_bytes,
+            "total_tokens": self.total_tokens,
+        }
+
 
 @dataclass(frozen=True)
 class InputCandidate:

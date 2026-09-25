@@ -5,7 +5,6 @@ from dataclasses import replace
 
 import pytest
 
-from memforge.llm.structured import RevisionSupportResponse
 from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
 from memforge.models import Memory, content_hash
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
@@ -57,11 +56,21 @@ def memory():
     return Memory(id="memory", content=claim, content_hash=content_hash(claim), memory_type="fact")
 
 
+def payload(prompt):
+    return json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
+
+
 class Client:
-    def __init__(self, mode="full", status="supported", invalid=0):
-        self.mode, self.status, self.invalid = mode, status, invalid
+    """Select the reviewer rule as Primary and its scope conditions as Required."""
+
+    def __init__(self, mode="full", invalid=0):
+        self.mode, self.invalid = mode, invalid
         self.prompts = []
-        self.budgets = []
+        self.images = []
+
+    def request_budget(self, model=None):
+        from memforge.llm.request_budget import RequestBudget
+        return RequestBudget(model or "fixture", 200000, 200000, 64000, 0.8, "fixture")
 
     def request_fits(self, prompt, **kwargs):
         return self.mode == "full" or '"input_mode":"delta"' in prompt
@@ -69,16 +78,29 @@ class Client:
     def request_tokens(self, prompt, **kwargs):
         return len(prompt)
 
-    async def assess_revision_support(self, prompt, **kwargs):
+    def input_policy_identity_for(self, model=None):
+        return "fixture-policy"
+
+    async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
         self.prompts.append(prompt)
-        self.budgets.append(kwargs["max_tokens"])
+        self.images.append(kwargs.get("images", ()))
+        current = payload(prompt)["current"]
+        rows = current["primary_candidates"] + current["required_only_candidates"]
+        primary = next(row for row in current["primary_candidates"] if "reviewers" in row[1].lower())
+        required = [row[0] for row in rows if row[1].startswith(("Country:", "Payroll type:"))]
         if len(self.prompts) <= self.invalid:
-            return RevisionSupportResponse(status="supported", primary_ref="invented")
-        payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
-        refs = payload["current"]["primary_candidates"]
-        primary = next(item for item in refs if "reviewers" in item[1].lower())
-        required = [item[0] for item in refs if item[1].startswith(("Country:", "Payroll type:"))]
-        return RevisionSupportResponse(status=self.status, primary_ref=primary[0], required_refs=required)
+            primary = ["PRM-9999"]
+        return response_format.model_validate({"results": [
+            {"work_id": claim["work_id"], "status": "supported", "primary_ref": primary[0], "required_refs": required}
+            for claim in payload(prompt)["claims"]
+        ]})
+
+
+async def assess(context, base, client):
+    from memforge.pipeline.revision_work import RevisionWorkExecutor, SupportWorkItem
+
+    item = SupportWorkItem("w0", memory(), old_support(base), context)
+    return (await RevisionWorkExecutor(client=client, model="test").assess_many([item]))["w0"]
 
 
 @pytest.mark.asyncio
@@ -90,7 +112,7 @@ async def test_moved_rewritten_primary_and_split_required_select_current_coordin
     )
     context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
     client = Client(mode)
-    result = await context.assess(memory=memory(), support=old_support(base), client=client, model="test")
+    result = await assess(context, base, client)
     assert result.supported and result.input_mode == mode
     assert (
         len(result.memory.resolved_evidence_selection.parts) >= 3
@@ -106,13 +128,13 @@ async def test_complete_delta_includes_remote_exception_and_unchanged_heading():
         "Two reviewers approve US releases.\n\n# Europe\n\nOne reviewer is sufficient.\n",
     )
     ctx = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
-    _, prompt, mode, _ = ctx.input_for(memory=memory(), support=old_support(base), client=Client("delta"), model="test")
-    assert mode == "delta"
-    payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
-    exception = next(item for item in payload["current"]["primary_candidates"] if "One reviewer" in item[1])
-    group = next(group for group in payload["current"]["structural_groups"] if exception[0] in group["refs"])
+    client = Client("delta")
+    assert (await assess(ctx, base, client)).input_mode == "delta"
+    request = payload(client.prompts[0])
+    exception = next(item for item in request["current"]["primary_candidates"] if "One reviewer" in item[1])
+    group = next(group for group in request["current"]["structural_groups"] if exception[0] in group["refs"])
     assert any("Europe" in title for title in group["heading_context"])
-    assert any("Old note" in item["text"] for item in payload["removed_historical"])
+    assert any("Old note" in row[1] for row in request["removed_historical"])
 
 
 @pytest.mark.asyncio
@@ -123,17 +145,18 @@ async def test_current_selection_has_one_local_correction(invalid):
     client = Client(invalid=invalid)
     if invalid == 2:
         with pytest.raises(ReconciliationContractError, match="correction exhausted"):
-            await ctx.assess(memory=memory(), support=old_support(base), client=client, model="test")
+            await assess(ctx, base, client)
     else:
-        assert (await ctx.assess(memory=memory(), support=old_support(base), client=client, model="test")).supported
+        assert (await assess(ctx, base, client)).supported
     assert len(client.prompts) == 2
 
 
-def test_missing_baseline_never_becomes_empty_delta():
+@pytest.mark.asyncio
+async def test_missing_baseline_never_becomes_empty_delta():
     base, current = revisions("Two reviewers approve US releases.\n", "Two reviewers approve US releases today.\n")
     ctx = RevisionAssessmentContext(projection=current, base=None, access_context_hash="scope")
     with pytest.raises(SupportRevalidationLimitation):
-        ctx.input_for(memory=memory(), support=old_support(base), client=Client("delta"), model="test")
+        await assess(ctx, base, Client("delta"))
 
 
 def test_partial_projection_keeps_exact_carried_member():
@@ -150,7 +173,8 @@ def test_partial_projection_keeps_exact_carried_member():
     assert not any(item["observation_id"] == "obs-context" for item in ctx.delta()[1])
 
 
-def test_large_unchanged_artifacts_do_not_block_text_delta_or_get_read(monkeypatch):
+@pytest.mark.asyncio
+async def test_large_unchanged_artifacts_do_not_block_text_delta_or_get_read(monkeypatch):
     from types import SimpleNamespace
     from memforge.pipeline.projection_images import load_projection_images
     from tests.test_projected_lifecycle_integration import _projection_with_artifact
@@ -184,12 +208,12 @@ def test_large_unchanged_artifacts_do_not_block_text_delta_or_get_read(monkeypat
             document_store=SimpleNamespace(read_artifact=lambda uri: reads.append(uri)),
         ),
     )
-    catalog, prompt, mode, images = ctx.input_for(
-        memory=memory(), support=old_support(base), client=Client(), model="test"
-    )
-    assert mode == "delta" and images == () and reads == []
-    assert "New unrelated note." in prompt
-    assert all(f.kind.value != "artifact" for f in catalog.fragments)
+    client = Client()
+    assert (await assess(ctx, base, client)).input_mode == "delta"
+    assert client.images == [()] and reads == []
+    assert "New unrelated note." in client.prompts[0]
+    assert all(len(row) < 3 or "image_source_observation_id" not in row[2]
+               for row in payload(client.prompts[0])["current"]["primary_candidates"])
 
 
 @pytest.mark.asyncio
@@ -230,8 +254,8 @@ async def test_changed_artifact_bytes_are_supplied_to_the_selected_delta():
             projection=target, observation_ids=ids, document_store=SimpleNamespace(read_artifact=read)
         ),
     )
-    _, _, mode, images = ctx.input_for(memory=memory(), support=old_support(base), client=client, model="test")
-    assert mode == "delta" and len(reads) == 1
+    assert (await assess(ctx, base, client)).input_mode == "delta" and len(reads) == 1
+    [images] = client.images
     assert len(images) == 1 and isinstance(images[0], StructuredLlmImage) and images[0].body == b"new"
 
 

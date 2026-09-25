@@ -1275,10 +1275,6 @@ class MemoryEngine:
                 doc_type=doc_type,
                 structured_llm_client=self.structured_llm_client,
                 llm_model=self.llm_model,
-                updated_document=document_content,
-                update_mode=update_mode,
-                changed_hunks=changed_hunks,
-                update_plan_stats=update_plan_stats,
                 include_metadata=True,
                 support_audits=support_audits,
                 image_loader=assessment_image_loader,
@@ -1443,10 +1439,13 @@ class MemoryEngine:
         identity_claim_hashes: list[str] = []
         identity_requests: list[IdentityResolutionRequest] = []
         operation_memories = tuple(operation.memory for operation in operations if operation.memory is not None)
+        memory_texts_by_mention: dict[str, list[str]] = {}
+        for raw_memory in operation_memories:
+            for entity_ref in raw_memory.entity_refs:
+                memory_texts_by_mention.setdefault(entity_ref, []).append(raw_memory.content)
         entity_resolution = await self.entity_resolver.resolve_many(
-            tuple(entity_ref for raw_memory in operation_memories for entity_ref in raw_memory.entity_refs),
+            memory_texts_by_mention,
             scope=EntityResolutionScope(access_context_hash=access_context_hash),
-            doc_context=document_content[:2000],
         )
         stats.update(
             {

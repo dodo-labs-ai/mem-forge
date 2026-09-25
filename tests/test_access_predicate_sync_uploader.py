@@ -138,15 +138,6 @@ class _SpyMemoryEngine:
         }
 
 
-class _SpySourceSupportDetector:
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-
-    async def detect_and_persist(self, **kwargs):
-        self.calls.append(kwargs)
-        return {"added": 0, "updated": 0, "removed_stale": 0}
-
-
 async def _submit_and_normalize(
     *,
     db: Database,

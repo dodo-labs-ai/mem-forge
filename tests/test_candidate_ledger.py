@@ -1,16 +1,26 @@
 from __future__ import annotations
 
-import asyncio
 import json
+from dataclasses import dataclass
 
 import pytest
 
-from memforge.llm.structured import CandidateLedgerDecision, CandidateLedgerResponse
+from memforge.llm.structured import (
+    OUTPUT_TRUNCATED,
+    CandidateLedgerDecision,
+    CandidateLedgerResponse,
+    StructuredLlmError,
+)
 from memforge.memory.candidate_ledger import (
+    _CANDIDATE_LEDGER_PROMPT,
     CandidateLedgerError,
     select_unique_memory_candidates,
 )
 from memforge.models import RawMemory
+from tests.llm_fixture import FixtureBudgetClient
+
+# Each "Durable candidate NN with distinct content." adds five prompt words.
+_WORDS_PER_CANDIDATE = 5
 
 
 def _candidate(
@@ -28,105 +38,97 @@ def _candidate(
     )
 
 
+def _distinct_candidates(count: int) -> list[RawMemory]:
+    return [
+        _candidate(f"Durable candidate {index:03d} with distinct content.", observation_id=f"obs-{index}")
+        for index in range(count)
+    ]
+
+
+def _capacity(candidates_per_request: int) -> int:
+    return len(_CANDIDATE_LEDGER_PROMPT.split()) + _WORDS_PER_CANDIDATE * candidates_per_request
+
+
 def _ledger_response(
     *decisions: CandidateLedgerDecision,
 ) -> CandidateLedgerResponse:
     return CandidateLedgerResponse(decisions=list(decisions))
 
 
-class _LedgerClient:
-    def __init__(self, *responses: CandidateLedgerResponse) -> None:
-        self.responses = list(responses)
-        self.prompts: list[str] = []
-
-    async def select_memory_candidates(self, prompt: str, **kwargs) -> CandidateLedgerResponse:
-        del kwargs
-        self.prompts.append(prompt)
-        return self.responses.pop(0)
+def _indices(prompt: str) -> list[int]:
+    candidates = json.loads(prompt.split("<candidates>\n", 1)[1].split("\n</candidates>", 1)[0])
+    return [candidate["index"] for candidate in candidates]
 
 
-class _IntermittentLedgerClient:
-    def __init__(
-        self,
-        *outcomes: CandidateLedgerResponse | Exception,
-    ) -> None:
-        self.outcomes = list(outcomes)
-        self.prompts: list[str] = []
-
-    async def select_memory_candidates(self, prompt: str, **kwargs) -> CandidateLedgerResponse:
-        del kwargs
-        self.prompts.append(prompt)
-        outcome = self.outcomes.pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
+def _keep(index: int) -> CandidateLedgerDecision:
+    return CandidateLedgerDecision(candidate_index=index, action="KEEP")
 
 
-class _ConcurrentLedgerClient:
-    max_concurrent = 2
+def _keep_all(prompt: str) -> CandidateLedgerResponse:
+    return _ledger_response(*(_keep(index) for index in _indices(prompt)))
 
-    def __init__(self) -> None:
-        self.active = 0
-        self.max_active = 0
-        self.two_admitted = asyncio.Event()
-        self.release = asyncio.Event()
 
-    async def select_memory_candidates(self, prompt: str, **kwargs) -> CandidateLedgerResponse:
-        del kwargs
-        self.active += 1
-        self.max_active = max(self.max_active, self.active)
-        if self.active == 2:
-            self.two_admitted.set()
-        try:
-            await self.release.wait()
-            candidates = json.loads(
-                prompt.split("<candidates>\n", 1)[1].split("\n</candidates>", 1)[0]
-            )
-            return _ledger_response(
-                *(CandidateLedgerDecision(action="KEEP") for _ in candidates)
-            )
-        finally:
-            self.active -= 1
+@dataclass
+class _LedgerClient(FixtureBudgetClient):
+    async def select_memory_candidates(self, prompt: str, *, max_tokens: int, model=None):
+        return await self.call(prompt, max_tokens=max_tokens, model=model)
+
+
+def _queued(*responses: CandidateLedgerResponse) -> _LedgerClient:
+    pending = list(responses)
+    return _LedgerClient(respond=lambda _prompt: pending.pop(0))
 
 
 @pytest.mark.asyncio
-async def test_candidate_ledger_runs_independent_batches_with_bounded_concurrency():
-    candidates = [
-        _candidate(
-            f"Durable candidate {index:02d} with distinct content.",
-            observation_id=f"obs-{index}",
-        )
-        for index in range(55)
-    ]
-    client = _ConcurrentLedgerClient()
-    selection = asyncio.create_task(
-        select_unique_memory_candidates(
-            candidates,
-            structured_llm_client=client,
-            llm_model=None,
-        )
-    )
+async def test_candidate_ledger_packs_requests_by_route_capacity_with_bounded_concurrency():
+    candidates = _distinct_candidates(55)
+    client = _LedgerClient(respond=_keep_all, input_tokens=_capacity(20), max_concurrent=2)
 
-    await asyncio.wait_for(client.two_admitted.wait(), timeout=0.5)
-    client.release.set()
-    result = await selection
+    result = await select_unique_memory_candidates(candidates, structured_llm_client=client, llm_model=None)
 
     assert result.candidates == tuple(candidates)
+    assert [_indices(prompt) for prompt in client.prompts] == [
+        list(range(0, 20)), list(range(20, 40)), list(range(40, 55)),
+    ]
     assert result.structured_llm_calls == 3
-    assert client.max_active == 2
+    assert client.peak_in_flight == 2
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_has_no_fixed_item_cap_when_the_route_has_room():
+    candidates = _distinct_candidates(205)
+    client = _LedgerClient(respond=_keep_all)
+
+    result = await select_unique_memory_candidates(candidates, structured_llm_client=client, llm_model=None)
+
+    assert result.candidates == tuple(candidates)
+    assert result.structured_llm_calls == 1
+    assert _indices(client.prompts[0]) == list(range(205))
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_halves_a_truncated_request_until_every_candidate_is_judged():
+    candidates = _distinct_candidates(8)
+
+    def respond(prompt: str) -> CandidateLedgerResponse:
+        if len(_indices(prompt)) > 2:
+            raise StructuredLlmError("truncated", terminal_category="invalid_response", error_code=OUTPUT_TRUNCATED)
+        return _keep_all(prompt)
+
+    client = _LedgerClient(respond=respond)
+
+    result = await select_unique_memory_candidates(candidates, structured_llm_client=client, llm_model=None)
+
+    assert result.candidates == tuple(candidates)
+    assert result.fallback_batch_count == 0
+    assert sorted(index for prompt in client.prompts if len(_indices(prompt)) <= 2 for index in _indices(prompt)) == list(range(8))
 
 
 @pytest.mark.asyncio
 async def test_candidate_ledger_retries_once_when_decision_coverage_is_incomplete():
     first = _candidate("The trigger remained OPEN.", observation_id="obs-1")
     second = _candidate("The trigger was not processed.", observation_id="obs-2")
-    client = _LedgerClient(
-        _ledger_response(CandidateLedgerDecision(action="KEEP")),
-        _ledger_response(
-            CandidateLedgerDecision(action="KEEP"),
-            CandidateLedgerDecision(action="KEEP"),
-        ),
-    )
+    client = _queued(_ledger_response(_keep(0)), _ledger_response(_keep(0), _keep(1)))
 
     result = await select_unique_memory_candidates(
         [first, second],
@@ -136,7 +138,7 @@ async def test_candidate_ledger_retries_once_when_decision_coverage_is_incomplet
 
     assert result.candidates == (first, second)
     assert len(client.prompts) == 2
-    assert "<validation_feedback>" in client.prompts[1]
+    assert "<correction>" in client.prompts[1]
     assert result.structured_llm_calls == 2
     assert result.validation_retries == 1
     assert result.prompt_chars == sum(len(prompt) for prompt in client.prompts)
@@ -147,16 +149,9 @@ async def test_candidate_ledger_retries_once_when_decision_coverage_is_incomplet
 async def test_candidate_ledger_retries_once_when_decision_coverage_is_excessive():
     first = _candidate("The trigger remained OPEN.", observation_id="obs-1")
     second = _candidate("The trigger was not processed.", observation_id="obs-2")
-    client = _LedgerClient(
-        _ledger_response(
-            CandidateLedgerDecision(action="KEEP"),
-            CandidateLedgerDecision(action="KEEP"),
-            CandidateLedgerDecision(action="KEEP"),
-        ),
-        _ledger_response(
-            CandidateLedgerDecision(action="KEEP"),
-            CandidateLedgerDecision(action="KEEP"),
-        ),
+    client = _queued(
+        _ledger_response(_keep(0), _keep(1), _keep(2)),
+        _ledger_response(_keep(0), _keep(1)),
     )
 
     result = await select_unique_memory_candidates(
@@ -167,7 +162,7 @@ async def test_candidate_ledger_retries_once_when_decision_coverage_is_excessive
 
     assert result.candidates == (first, second)
     assert len(client.prompts) == 2
-    assert "expected 2, got 3" in client.prompts[1]
+    assert "not requested" in client.prompts[1]
     assert result.structured_llm_calls == 2
     assert result.validation_retries == 1
 
@@ -178,8 +173,8 @@ async def test_candidate_ledger_keeps_batch_after_second_invalid_ledger():
         _candidate("The trigger remained OPEN.", observation_id="obs-1"),
         _candidate("The trigger was not processed.", observation_id="obs-2"),
     ]
-    incomplete = _ledger_response(CandidateLedgerDecision(action="KEEP"))
-    client = _LedgerClient(incomplete, incomplete)
+    incomplete = _ledger_response(_keep(0))
+    client = _queued(incomplete, incomplete)
 
     result = await select_unique_memory_candidates(
         candidates,
@@ -200,7 +195,7 @@ async def test_candidate_ledger_keeps_batch_after_second_invalid_ledger():
 async def test_candidate_ledger_collapses_exact_duplicates_without_an_llm_call():
     first = _candidate("The trigger remained OPEN.", observation_id="obs-1")
     duplicate = _candidate("  The   trigger remained OPEN. ", observation_id="obs-2")
-    client = _LedgerClient()
+    client = _queued()
 
     result = await select_unique_memory_candidates(
         [first, duplicate],
@@ -231,60 +226,18 @@ async def test_candidate_ledger_does_not_exact_collapse_case_sensitive_identifie
 
 
 @pytest.mark.asyncio
-async def test_candidate_ledger_bounds_calls_independently_from_source_unit_cardinality():
+async def test_candidate_ledger_fails_closed_when_one_candidate_exceeds_route_capacity():
     candidates = [
-        _candidate(
-            f"Durable candidate {index:03d} with distinct content.",
-            observation_id=f"obs-{index}",
-        )
-        for index in range(205)
+        _candidate(" ".join(["A"] * 200), observation_id="obs-1"),
+        _candidate(" ".join(["B"] * 200), observation_id="obs-2"),
     ]
-    client = _LedgerClient(
-        *(
-            _ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in range(start, stop)))
-            for start, stop in (
-                (0, 24),
-                (24, 48),
-                (48, 72),
-                (72, 96),
-                (96, 120),
-                (120, 144),
-                (144, 168),
-                (168, 192),
-                (192, 205),
-            )
-        )
-    )
+    client = _LedgerClient(respond=_keep_all, input_tokens=_capacity(20))
 
-    result = await select_unique_memory_candidates(
-        candidates,
-        structured_llm_client=client,
-        llm_model=None,
-    )
-
-    assert result.candidates == tuple(candidates)
-    assert result.structured_llm_calls == 9
-    assert len(client.prompts) == 9
-    assert '"index":0' in client.prompts[0]
-    assert '"index":192' in client.prompts[-1]
-    assert '"index":204' not in client.prompts[0]
-    assert '"index":204' in client.prompts[-1]
-
-
-@pytest.mark.asyncio
-async def test_candidate_ledger_rejects_oversized_context_before_calling_llm():
-    candidates = [
-        _candidate("A" * 200, observation_id="obs-1"),
-        _candidate("B" * 200, observation_id="obs-2"),
-    ]
-    client = _LedgerClient()
-
-    with pytest.raises(CandidateLedgerError, match="context") as exc_info:
+    with pytest.raises(CandidateLedgerError, match="capacity") as exc_info:
         await select_unique_memory_candidates(
             candidates,
             structured_llm_client=client,
             llm_model=None,
-            max_context_chars=200,
         )
 
     assert exc_info.value.error_type == "budget_exceeded"
@@ -292,88 +245,73 @@ async def test_candidate_ledger_rejects_oversized_context_before_calling_llm():
 
 
 @pytest.mark.asyncio
-async def test_candidate_ledger_shrinks_request_batch_to_context_budget():
-    first = _candidate("A" * 800, observation_id="obs-1")
-    second = _candidate("B" * 800, observation_id="obs-2")
-    client = _LedgerClient(
-        _ledger_response(CandidateLedgerDecision(action="KEEP")),
-        _ledger_response(CandidateLedgerDecision(action="KEEP")),
-    )
+async def test_candidate_ledger_keeps_failed_admission_request_and_continues():
+    candidates = _distinct_candidates(55)
 
-    result = await select_unique_memory_candidates(
-        [first, second],
-        structured_llm_client=client,
-        llm_model=None,
-        max_context_chars=3_000,
-    )
+    def respond(prompt: str) -> CandidateLedgerResponse:
+        if 20 in _indices(prompt):
+            raise StructuredLlmError("provider unavailable", terminal_category="provider_error", error_code="provider_error")
+        return _keep_all(prompt)
 
-    assert result.candidates == (first, second)
-    assert len(client.prompts) == 2
-    assert all(len(prompt) <= 3_000 for prompt in client.prompts)
-    assert '"index":0' in client.prompts[0]
-    assert '"index":1' not in client.prompts[0]
-    assert '"index":1' in client.prompts[1]
+    client = _LedgerClient(respond=respond, input_tokens=_capacity(20))
 
-
-@pytest.mark.asyncio
-async def test_candidate_ledger_composes_bounded_decision_batches():
-    candidates = [
-        _candidate(
-            f"Durable candidate {index:02d} with distinct content.",
-            observation_id=f"obs-{index}",
-        )
-        for index in range(55)
-    ]
-    client = _LedgerClient(
-        *(
-            _ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in range(start, stop)))
-            for start, stop in ((0, 24), (24, 48), (48, 55))
-        )
-    )
-
-    result = await select_unique_memory_candidates(
-        candidates,
-        structured_llm_client=client,
-        llm_model=None,
-    )
-
-    assert result.candidates == tuple(candidates)
-    assert result.structured_llm_calls == 3
-    assert len(client.prompts) == 3
-    assert '"index":0' in client.prompts[0]
-    assert '"index":24' in client.prompts[1]
-    assert '"index":48' in client.prompts[2]
-    assert '"index":54' not in client.prompts[0]
-    assert '"index":54' in client.prompts[2]
-
-
-@pytest.mark.asyncio
-async def test_candidate_ledger_keeps_failed_admission_batch_and_continues():
-    candidates = [
-        _candidate(
-            f"Durable candidate {index:02d} with distinct content.",
-            observation_id=f"obs-{index}",
-        )
-        for index in range(55)
-    ]
-    client = _IntermittentLedgerClient(
-        _ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in range(24))),
-        RuntimeError("provider returned invalid structured output"),
-        _ledger_response(*(CandidateLedgerDecision(action="KEEP") for _ in range(48, 55))),
-    )
-
-    result = await select_unique_memory_candidates(
-        candidates,
-        structured_llm_client=client,
-        llm_model=None,
-    )
+    result = await select_unique_memory_candidates(candidates, structured_llm_client=client, llm_model=None)
 
     assert result.candidates == tuple(candidates)
     assert result.structured_llm_calls == 3
     assert result.fallback_batch_count == 1
-    assert result.fallback_candidate_count == 24
+    assert result.fallback_candidate_count == 20
     assert len(client.prompts) == 3
-    assert '"index":48' in client.prompts[-1]
+
+
+@dataclass
+class _UnbudgetedLedgerClient(_LedgerClient):
+    def request_budget(self, model=None):
+        raise ValueError("route has no resolvable request budget")
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_admits_every_candidate_when_the_route_has_no_request_budget():
+    candidates = _distinct_candidates(3)
+    client = _UnbudgetedLedgerClient(respond=_keep_all)
+
+    result = await select_unique_memory_candidates(candidates, structured_llm_client=client, llm_model=None)
+
+    assert result.candidates == tuple(candidates)
+    assert result.fallback_batch_count == 1
+    assert result.fallback_candidate_count == 3
+    assert client.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_does_not_hide_a_client_programming_error():
+    def respond(_prompt: str) -> CandidateLedgerResponse:
+        raise RuntimeError("client transport broke")
+
+    with pytest.raises(RuntimeError, match="transport broke"):
+        await select_unique_memory_candidates(
+            _distinct_candidates(3), structured_llm_client=_LedgerClient(respond=respond), llm_model=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_candidate_ledger_binds_decisions_by_index_not_position():
+    first = _candidate("The trigger remained OPEN.", observation_id="obs-1")
+    second = _candidate("The trigger was not processed.", observation_id="obs-2")
+    low_value = CandidateLedgerDecision(candidate_index=1, action="DROP_LOW_VALUE")
+    client = _queued(
+        # Omits index 0 and repeats index 1: the same row count, so only IDs expose it.
+        _ledger_response(low_value, low_value),
+        _ledger_response(low_value, _keep(0)),
+    )
+
+    result = await select_unique_memory_candidates([first, second], structured_llm_client=client, llm_model=None)
+
+    assert "more than once" in client.prompts[1]
+    assert result.validation_retries == 1
+    [drop] = result.drops
+    judged = json.loads(client.prompts[0].split("<candidates>\n", 1)[1].split("\n</candidates>", 1)[0])
+    assert drop.candidate.content == judged[1]["content"]
 
 
 @pytest.mark.asyncio
@@ -381,17 +319,11 @@ async def test_candidate_ledger_normalizes_lower_index_canonical_chains():
     longest = _candidate("A specific durable fact with details.", observation_id="obs-1")
     middle = _candidate("A durable fact with details.", observation_id="obs-2")
     shortest = _candidate("A durable fact.", observation_id="obs-3")
-    client = _LedgerClient(
+    client = _queued(
         _ledger_response(
-            CandidateLedgerDecision(action="KEEP"),
-            CandidateLedgerDecision(
-                action="DROP_REDUNDANT",
-                canonical_index=0,
-            ),
-            CandidateLedgerDecision(
-                action="DROP_REDUNDANT",
-                canonical_index=1,
-            ),
+            _keep(0),
+            CandidateLedgerDecision(candidate_index=1, action="DROP_REDUNDANT", canonical_index=0),
+            CandidateLedgerDecision(candidate_index=2, action="DROP_REDUNDANT", canonical_index=1),
         )
     )
 
@@ -416,10 +348,10 @@ async def test_candidate_ledger_drops_only_explicit_low_value_admission_decision
         "Test case 17 returned 204 rows in this run.",
         observation_id="obs-2",
     )
-    client = _LedgerClient(
+    client = _queued(
         _ledger_response(
-            CandidateLedgerDecision(action="KEEP"),
-            CandidateLedgerDecision(action="DROP_LOW_VALUE"),
+            _keep(0),
+            CandidateLedgerDecision(candidate_index=1, action="DROP_LOW_VALUE"),
         )
     )
 
@@ -441,10 +373,10 @@ async def test_candidate_ledger_drops_only_explicit_low_value_admission_decision
 async def test_candidate_ledger_ignores_canonical_index_outside_redundant_action():
     first = _candidate("A durable fact with details.", observation_id="obs-1")
     second = _candidate("A different durable fact.", observation_id="obs-2")
-    client = _LedgerClient(
+    client = _queued(
         _ledger_response(
-            CandidateLedgerDecision(action="KEEP"),
-            CandidateLedgerDecision(action="KEEP", canonical_index=0),
+            _keep(0),
+            CandidateLedgerDecision(candidate_index=1, action="KEEP", canonical_index=0),
         )
     )
 
@@ -461,29 +393,18 @@ async def test_candidate_ledger_ignores_canonical_index_outside_redundant_action
 
 @pytest.mark.asyncio
 async def test_candidate_ledger_keeps_batch_when_canonical_target_stays_outside_visible_batch():
-    candidates = [_candidate("X" * (100 - index), observation_id=f"obs-{index}") for index in range(26)]
-    first_batch = [CandidateLedgerDecision(action="KEEP") for _ in range(24)]
-    first_batch[1] = CandidateLedgerDecision(
-        action="DROP_REDUNDANT",
-        canonical_index=0,
-    )
-    client = _LedgerClient(
-        _ledger_response(*first_batch),
-        _ledger_response(
-            CandidateLedgerDecision(
-                action="DROP_REDUNDANT",
-                canonical_index=1,
-            ),
-            CandidateLedgerDecision(action="KEEP"),
-        ),
-        _ledger_response(
-            CandidateLedgerDecision(
-                action="DROP_REDUNDANT",
-                canonical_index=1,
-            ),
-            CandidateLedgerDecision(action="KEEP"),
-        ),
-    )
+    candidates = _distinct_candidates(26)
+
+    def respond(prompt: str) -> CandidateLedgerResponse:
+        indices = _indices(prompt)
+        decisions = [_keep(index) for index in indices]
+        if indices[0] == 0:
+            decisions[1] = CandidateLedgerDecision(candidate_index=1, action="DROP_REDUNDANT", canonical_index=0)
+        else:
+            decisions[0] = CandidateLedgerDecision(candidate_index=indices[0], action="DROP_REDUNDANT", canonical_index=1)
+        return _ledger_response(*decisions)
+
+    client = _LedgerClient(respond=respond, input_tokens=_capacity(24))
 
     result = await select_unique_memory_candidates(
         candidates,
@@ -491,8 +412,8 @@ async def test_candidate_ledger_keeps_batch_when_canonical_target_stays_outside_
         llm_model=None,
     )
 
+    assert [_indices(prompt) for prompt in client.prompts] == [list(range(24)), [24, 25], [24, 25]]
     assert result.candidates == tuple(candidate for index, candidate in enumerate(candidates) if index != 1)
     assert result.fallback_batch_count == 1
     assert result.fallback_candidate_count == 2
-    assert len(client.prompts) == 3
-    assert "<validation_feedback>" in client.prompts[-1]
+    assert "<correction>" in client.prompts[-1]

@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 
 from memforge.pipeline.revision_work import RevisionWorkExecutor, SupportWorkItem
-from memforge.llm.structured import SupportAssessmentResponse, SupportAssessmentResult, SupportAssessmentWireResponse
+from memforge.llm.structured import SupportAssessmentResult, SupportAssessmentWireResponse
 from tests.test_revision_assessment import revisions, old_support, memory
 
 
@@ -35,6 +35,10 @@ class Client:
         if self.fail_at == len(self.prompts):
             self.fail_at = None
             raise TimeoutError("fixture interruption")
+        return wire_response(self.judge(prompt))
+
+    def judge(self, prompt):
+        """Return this request's cumulative judgments before wire encoding."""
         payload = json.loads(prompt.split("<assessment>")[1].split("</assessment>")[0])
         rows = payload["current"]["primary_candidates"] + payload["current"]["required_only_candidates"]
         previous = {r["work_id"]: r for r in payload["previous_state"]}
@@ -55,10 +59,20 @@ class Client:
             if exception:
                 state.status = "unsupported"
             elif state.status != "unsupported":
-                state.status = "supported" if state.primary_ref else "insufficient"
+                # Supported wire rows carry no reason, so partial exception
+                # facts stay in an unresolved judgment until they resolve.
+                pending = any(term in combined for term in ("Cedar", "Alder", "Birch"))
+                state.status = "supported" if state.primary_ref and not pending else "insufficient"
             state.reason = " ".join(facts)
             results.append(state)
-        return SupportAssessmentResponse(results=results)
+        return results
+
+
+def wire_response(states):
+    """Encode judgments as the provider wire does: supported rows carry no reason."""
+    return SupportAssessmentWireResponse.model_validate({"results": [
+        state.model_dump(exclude={"reason"} if state.status == "supported" else set()) for state in states
+    ]})
 
 
 class Store:
@@ -173,16 +187,16 @@ async def test_retry_reuses_completed_assessments_without_replaying_their_model_
 @pytest.mark.asyncio
 async def test_unknown_selector_gets_one_local_correction_not_a_completed_receipt():
     class InvalidClient(Client):
-        async def evaluate_revision_work(self, prompt, **kwargs):
-            result = await super().evaluate_revision_work(prompt, **kwargs)
-            result.results[0].primary_ref = "not-supplied"
-            return result
+        def judge(self, prompt):
+            results = super().judge(prompt)
+            results[0].primary_ref = "not-supplied"
+            return results
 
     client = InvalidClient()
     executor = RevisionWorkExecutor(client=client, model="fixture")
     with pytest.raises(Exception, match="bounded assessment correction exhausted"):
         await executor.assess_many(work_items("Two reviewers approve US releases."))
-    assert len(client.prompts) == 2 and "Correction:" in client.prompts[-1]
+    assert len(client.prompts) == 2 and "<correction>" in client.prompts[-1]
     assert not executor.final_work_ids
 
 
@@ -229,21 +243,24 @@ def test_previous_evidence_uses_current_ref_only_for_exact_current_anchor_and_te
 
 @pytest.mark.asyncio
 async def test_growing_shared_state_splits_only_unprocessed_tail_and_resumes():
+    grown_reason = "Important cumulative interpretation. " * 25
+
     class GrowingClient(Client):
         def request_fits(self, prompt, **kwargs):
             data = payload(prompt)
             states = data["previous_state"]
-            if len(states) > 1 and any(len(s["reason"]) > 1000 for s in states):
+            if len(states) > 1 and any(s["reason"] == grown_reason for s in states):
                 return False
             if data["coverage"]["batch_size"] > 12:
                 return False
             return super().request_fits(prompt, **kwargs)
 
-        async def evaluate_revision_work(self, prompt, **kwargs):
-            result = await super().evaluate_revision_work(prompt, **kwargs)
-            for r in result.results:
-                r.reason = "Important cumulative interpretation. " * 45
-            return result
+        def judge(self, prompt):
+            results = super().judge(prompt)
+            if not payload(prompt)["coverage"]["complete_after_batch"]:
+                for r in results:
+                    r.status, r.reason = "insufficient", grown_reason
+            return results
 
     items = work_items(
         "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Routine note {i}." for i in range(70)), 2
@@ -267,29 +284,28 @@ async def test_growing_shared_state_splits_only_unprocessed_tail_and_resumes():
     assert receipts[0].manifest["dependencies"][0] == receipts[1].manifest["dependencies"][0]
 
 
-def test_output_allowance_saturates_provider_capacity_without_limiting_refs():
+def test_output_allowance_is_requested_in_full_and_bounded_only_by_the_route():
     items = work_items("Two reviewers approve US releases.", 32)
     executor = RevisionWorkExecutor(client=Client(), model="gpt-4o")
-    assert executor._output(items, 300) == executor.client.request_budget().output_reserve(999999)
+    assert executor._output(items, 300) > executor.client.request_budget().output_limit
 
 
-def test_deleted_text_counts_as_input_but_never_as_selectable_output_refs():
+@pytest.mark.asyncio
+async def test_deleted_text_counts_as_input_but_never_as_selectable_output_refs():
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 
     previous = "Two reviewers approve US releases.\n\n" + "\n\n".join(f"Deleted condition {i}." for i in range(250))
     base, target = revisions(previous, "Two reviewers approve US releases.")
     context = RevisionAssessmentContext(projection=target, base=base, access_context_hash="scope")
     items = [SupportWorkItem(f"w{i}", replace(memory(), id=f"m{i}"), old_support(base), context) for i in range(3)]
-    executor = RevisionWorkExecutor(client=Client(limit=100000), model="gpt-4o")
-    scope = executor._range(items)
-    states = {i.id: executor._initial(scope, i) for i in items}
-    assert scope.mode == "full"
-    assert scope.selection_reason == "full_has_lower_total_request_cost"
-    units = [("historical", part) for part in scope.removed]
-    prompt, catalog, budget = executor._request(scope, units, items, states, 0, len(units))
-    assert units == []
-    assert "Deleted condition 249" not in prompt
-    assert budget == executor._output(items, len(catalog.fragments), states.values())
+    client, store = Client(limit=100000), Store()
+    executor = RevisionWorkExecutor(client=client, model="gpt-4o", store=store, derivation_id="root")
+    results = await executor.assess_many(items)
+    assert all(result.supported and result.input_mode == "full" for result in results.values())
+    [work] = [w for w in store.works.values() if w.kind == "support_assess"]
+    assert work.manifest["scope"]["input_plan"]["selection_reason"] == "full_has_lower_total_request_cost"
+    assert len(client.prompts) == 1 and "Deleted condition 249" not in client.prompts[0]
+    assert payload(client.prompts[0])["removed_historical"] == []
 
 
 @pytest.mark.asyncio
@@ -311,11 +327,11 @@ async def test_optional_history_cannot_block_current_full_structure():
 @pytest.mark.asyncio
 async def test_insufficient_is_preserved_in_complete_receipt_without_current_evidence():
     class InsufficientClient(Client):
-        async def evaluate_revision_work(self, prompt, **kwargs):
-            result = await super().evaluate_revision_work(prompt, **kwargs)
-            result.results[0].status = "insufficient"
-            result.results[0].reason = "Cannot establish the remaining condition"
-            return result
+        def judge(self, prompt):
+            results = super().judge(prompt)
+            results[0].status = "insufficient"
+            results[0].reason = "Cannot establish the remaining condition"
+            return results
 
     client, store = InsufficientClient(limit=16000), Store()
     executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
@@ -355,7 +371,7 @@ async def test_claim_can_select_current_evidence_carried_by_another_claim_in_sam
                 self.borrowed = True
             for state in states.values():
                 state.reason = "The same approval rule supports both fixed claims"
-            return SupportAssessmentResponse(results=list(states.values()))
+            return wire_response(states.values())
 
     client = SharedEvidenceClient()
     items = work_items("Two reviewers approve US releases.\n\n" + "\n\n".join(f"Routine note {i}." for i in range(300)), 2)
@@ -364,4 +380,22 @@ async def test_claim_can_select_current_evidence_carried_by_another_claim_in_sam
     assert client.borrowed and len(client.prompts) > 1
     assert all(result.supported is True for result in results.values())
     assert all(result.memory is not None for result in results.values())
-    assert not any("Correction:" in prompt for prompt in client.prompts)
+    assert not any("<correction>" in prompt for prompt in client.prompts)
+
+
+@pytest.mark.asyncio
+async def test_range_without_units_still_ends_in_one_judgment_per_claim():
+    from memforge.pipeline.revision_work import AssessmentRange
+
+    items = work_items("Two reviewers approve US releases.\n", 2)
+    client = Client(limit=16000)
+    executor = RevisionWorkExecutor(client=client, model="fixture")
+    executor._work_aliases = {item.id: f"WRK-{index:04d}" for index, item in enumerate(items)}
+    context = items[0].context
+    scope = AssessmentRange(context=context, catalog=context.catalog(()), removed=(), mode="full", include_history=False)
+    outcomes = await executor._run(executor._chain_task(scope, items))
+    assert len(client.prompts) == 1
+    assert payload(client.prompts[0])["coverage"] == {
+        "processed_before": 0, "batch_size": 0, "total": 0, "complete_after_batch": True,
+    }
+    assert set(outcomes) == {"w0", "w1"} and all(state.status == "insufficient" for state in outcomes.values())

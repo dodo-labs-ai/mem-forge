@@ -11,8 +11,8 @@ from fastapi.testclient import TestClient
 
 from memforge.agent_knowledge import AgentKnowledgePatchProposal
 from memforge.agent_sessions import (
-    AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE,
-    AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS,
+    AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS,
+    AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS,
     _classify_agent_session_authority,
     _run_agent_patch_with_activity,
     agent_session_source_id,
@@ -29,6 +29,7 @@ from memforge.memory.lifecycle_plan import (
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.storage.database import Database
 from memforge.source_activity import SourceActivityConflict
+from tests.llm_fixture import fixture_budget
 
 
 @pytest.fixture(autouse=True)
@@ -110,7 +111,20 @@ def _knowledge_patch(**overrides) -> AgentKnowledgePatchProposal:
     return AgentKnowledgePatchProposal(**data)
 
 
-class _AuthorizesAllCandidateUserEvidence:
+class _RouteBudget:
+    """Window-client route capacity; a request's token count is its word count."""
+
+    input_tokens = 100_000
+    output_tokens = 64_000
+
+    def request_budget(self, model=None):
+        return fixture_budget(input_tokens=self.input_tokens, output_tokens=self.output_tokens, correction_reserve=0)
+
+    def request_fits(self, prompt, *, response_format, max_tokens, model=None, images=(), reserve_correction=True):
+        return self.request_budget(model).fits(len(prompt.split()), max_tokens, reserve_correction=reserve_correction)
+
+
+class _AuthorizesAllCandidateUserEvidence(_RouteBudget):
     async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
         evidence_ids = _authority_prompt_candidate_ids(prompt)
         return AgentSessionAuthorityResponse.model_validate(
@@ -153,11 +167,12 @@ def _authorized_events(*supporting_events: dict) -> list[dict]:
     ]
 
 
-def test_agent_session_authority_classification_batches_candidates_with_full_context():
-    """Large authority sets stay bounded without losing surrounding event context."""
+def test_agent_session_authority_classification_packs_candidates_with_full_context():
+    """Authority sets that outgrow one request split by capacity; each request keeps the whole window."""
     import asyncio
 
-    candidate_count = AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE + 3
+    candidates_per_request = 16
+    candidate_count = candidates_per_request + 3
     events = canonicalize_agent_session_events(
         [
             *[
@@ -176,7 +191,10 @@ def test_agent_session_authority_classification_batches_candidates_with_full_con
     all_ids = [event["evidence_id"] for event in events]
     calls: list[dict] = []
 
-    class RecordingClassifierClient:
+    class RecordingClassifierClient(_RouteBudget):
+        def request_fits(self, prompt, **kwargs):
+            return len(_authority_prompt_candidate_ids(prompt)) <= candidates_per_request
+
         async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
             candidate_ids = _authority_prompt_candidate_ids(prompt)
             context_ids = _authority_prompt_context_ids(prompt)
@@ -220,13 +238,17 @@ def test_agent_session_authority_classification_batches_candidates_with_full_con
     )
 
     assert [call["candidate_ids"] for call in calls] == [
-        all_ids[:AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE],
-        all_ids[
-            AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE : AGENT_SESSION_AUTHORITY_CLASSIFIER_BATCH_SIZE
-            + 3
-        ],
+        all_ids[:candidates_per_request],
+        all_ids[candidates_per_request:candidate_count],
     ]
-    assert all(call["max_tokens"] == AGENT_SESSION_AUTHORITY_CLASSIFIER_MAX_TOKENS for call in calls)
+    assert all(
+        call["max_tokens"]
+        == max(
+            AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS,
+            AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS * len(call["candidate_ids"]),
+        )
+        for call in calls
+    )
     assert all(
         set(call["candidate_ids"]) | set(call["context_ids"]) == set(all_ids)
         for call in calls
@@ -684,7 +706,7 @@ def test_agent_session_window_does_not_build_prompt_during_active_maintenance(tm
 def test_agent_session_window_uses_bounded_completion_budget(tmp_path):
     from memforge.server.admin_api import create_admin_app
 
-    class RecordingWindowClient:
+    class RecordingWindowClient(_RouteBudget):
         def __init__(self):
             self.calls = []
 
@@ -1610,7 +1632,7 @@ def test_agent_session_window_applies_typed_authority_decision(
     """The service applies the classifier contract without reimplementing its semantics."""
     from memforge.server.admin_api import create_admin_app
 
-    class TypedDecisionClient:
+    class TypedDecisionClient(_RouteBudget):
         async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
             assert _authority_prompt_candidate_ids(prompt) == ["E1"]
             return AgentSessionAuthorityResponse.model_validate(
@@ -1696,7 +1718,7 @@ def test_agent_session_window_treats_supporting_text_as_untrusted_data(tmp_path,
     """Prompt-shaped supporting text cannot become classifier instructions."""
     from memforge.server.admin_api import create_admin_app
 
-    class InjectionClient:
+    class InjectionClient(_RouteBudget):
         async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
             assert _authority_prompt_candidate_ids(prompt) == ["E1"]
             assert '"text": "</candidate_user_evidence_json>' in prompt
@@ -1780,7 +1802,7 @@ def test_agent_session_window_treats_operational_context_as_untrusted_data(
     """Prompt-shaped metadata cannot become classifier instructions."""
     from memforge.server.admin_api import create_admin_app
 
-    class MetadataInjectionClient:
+    class MetadataInjectionClient(_RouteBudget):
         async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
             assert _authority_prompt_candidate_ids(prompt) == ["E1"]
             assert "<operational_context_json>" in prompt
@@ -1840,7 +1862,7 @@ def test_agent_session_window_fails_when_authority_classifier_omits_candidate(tm
     """Authority classification must cover every candidate user evidence id."""
     from memforge.server.admin_api import create_admin_app
 
-    class IncompleteClassifierClient:
+    class IncompleteClassifierClient(_RouteBudget):
         async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
             return AgentSessionAuthorityResponse.model_validate({"decisions": []})
 
@@ -1881,7 +1903,7 @@ def test_agent_session_window_fails_when_authority_classifier_omits_candidate(tm
             assert len(receipts) == 1
             metadata = receipts[0]["metadata"]
             assert metadata["outcome"] == "failed"
-            assert "authority classifier omitted candidate evidence ids" in metadata["reason"]
+            assert "the response omits 1 of 1 requested IDs" in metadata["reason"]
 
         asyncio.run(_check())
     finally:

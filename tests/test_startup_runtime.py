@@ -141,7 +141,6 @@ async def test_default_runtime_provider_uses_one_structured_client_seam_for_sear
     assert sync_runtime.structured_llm_client is structured_client
     assert sync_runtime.memory_extractor.structured_llm_client is structured_client
     assert sync_runtime.memory_engine.structured_llm_client is structured_client
-    assert sync_runtime.source_support_detector.structured_llm_client is structured_client
     assert calls == [
         (config.llm.enrichment_model, config.llm.enrichment_max_concurrent),
         (config.llm.enrichment_model, config.llm.enrichment_max_concurrent),
@@ -232,7 +231,7 @@ async def test_sync_runtime_bounds_structured_request_timeout(db, tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_build_sync_runtime_wires_litellm_structured_source_support_client(db, tmp_path, monkeypatch):
+async def test_build_sync_runtime_wires_configured_litellm_structured_client(db, tmp_path, monkeypatch):
     from memforge.config import AppConfig
     from memforge.runtime import build_sync_runtime
 
@@ -242,9 +241,6 @@ async def test_build_sync_runtime_wires_litellm_structured_source_support_client
         def __init__(self, config):
             captured["config"] = config
             captured["client"] = self
-
-        async def verify_source_support(self, prompt: str):
-            raise AssertionError("not called during runtime construction")
 
     monkeypatch.setattr("memforge.runtime.LiteLlmStructuredClient", RecordingStructuredClient)
     monkeypatch.setattr("memforge.runtime.get_chroma_collection", lambda **kwargs: FakeCollection())
@@ -260,8 +256,7 @@ async def test_build_sync_runtime_wires_litellm_structured_source_support_client
 
     runtime = await build_sync_runtime(db, config)
 
-    assert runtime.source_support_detector is not None
-    assert runtime.source_support_detector.structured_llm_client is captured["client"]
+    assert runtime.structured_llm_client is captured["client"]
     assert runtime.memory_extractor.structured_llm_client is captured["client"]
     assert runtime.memory_engine.structured_llm_client is captured["client"]
     assert captured["config"].model == "anthropic--claude-sonnet-latest"
@@ -331,7 +326,6 @@ def test_sync_runtime_uses_injected_orchestrator_factory():
         memory_engine=object(),
         structured_llm_client=None,
         llm_model="test-model",
-        source_support_detector=None,
         orchestrator_factory=lambda _runtime: sentinel,
     )
 
@@ -373,7 +367,7 @@ async def test_health_reports_recent_audit_failures_as_warning(db, tmp_path):
 
     await db.insert_memory_audit_event(
         MemoryAuditEvent(
-            event_type="source_support_verification_failed",
+            event_type="reconciliation_failed",
             status="failed",
             doc_id="jira-PAY-176425",
             error="Extra data: line 9 column 1 (char 256)",
@@ -390,7 +384,7 @@ async def test_health_reports_recent_audit_failures_as_warning(db, tmp_path):
     assert payload["status"] == "healthy"
     assert payload["audit_failures"]["status"] == "warning"
     assert payload["audit_failures"]["payload"]["window_hours"] == 24
-    assert payload["audit_failures"]["payload"]["counts_by_event_type"] == {"source_support_verification_failed": 1}
+    assert payload["audit_failures"]["payload"]["counts_by_event_type"] == {"reconciliation_failed": 1}
     assert payload["audit_failures"]["payload"]["total"] == 1
     assert payload["audit_failures"]["payload"]["last_seen_at"]
 
@@ -404,7 +398,7 @@ async def test_health_ignores_old_audit_failures(db, tmp_path):
 
     await db.insert_memory_audit_event(
         MemoryAuditEvent(
-            event_type="source_support_verification_failed",
+            event_type="reconciliation_failed",
             status="failed",
             doc_id="jira-PAY-old",
             error="Extra data: line 9 column 1 (char 256)",

@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, RetrievalConfig
-from memforge.llm.structured import RerankResponse
+from memforge.llm.structured import RerankResponse, StructuredLlmError
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.search import SearchEngine, _quoted_identity_query
 from memforge.storage.database import Database
 from memforge.storage.adapters.protocols import EntityLinkCandidate, KeywordCandidate
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from tests.llm_fixture import FixtureBudgetClient
 
 
 class FakeCollection:
@@ -36,13 +39,16 @@ class FakeCollection:
         return {"ids": []}
 
 
-class RecordingRerankClient:
-    def __init__(self) -> None:
-        self.prompt: str | None = None
+@dataclass
+class RecordingRerankClient(FixtureBudgetClient):
+    respond: Callable[[str], RerankResponse] = lambda _prompt: RerankResponse(ranking=[0])
 
-    async def rerank_memories(self, prompt: str, **kwargs):
-        self.prompt = prompt
-        return RerankResponse(ranking=[0])
+    @property
+    def prompt(self) -> str | None:
+        return self.prompts[-1] if self.prompts else None
+
+    async def rerank_memories(self, prompt: str, *, max_tokens: int, model: str | None = None):
+        return await self.call(prompt, max_tokens=max_tokens, model=model)
 
 
 class QueryScoredKeyword:
@@ -659,6 +665,55 @@ async def test_rerank_prompt_includes_metadata_evidence_for_metadata_hits(db, mo
     assert "Retrieval evidence:" in reranker.prompt
     assert "Create Blocker Hint in On Demand Lifecycle Assignment" in reranker.prompt
     assert "jira:SFPAY-179397" in reranker.prompt
+
+
+_RERANK_MEMORIES = (("m-first", "Lifecycle assignment first note"), ("m-second", "Lifecycle assignment second note"))
+
+
+async def _insert_rerank_memories(db) -> None:
+    for memory_id, content in _RERANK_MEMORIES:
+        await db.insert_memory(_memory(memory_id, content))
+
+
+async def _rerank_search(db, reranker: RecordingRerankClient) -> list[str]:
+    adapters = build_sqlite_adapters(db, FakeCollection(["m-first", "m-second"], [0.01, 0.02]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embed_cfg={},
+        config=RetrievalConfig(enable_reranking=True, rerank_candidates=10),
+        structured_llm_client=reranker,
+    )
+    engine._get_or_compute_embedding = lambda query: [0.1]
+    result = await engine.search("lifecycle assignment", top_k=10)
+    return [r.memory_id for r in result["results"]]
+
+
+@pytest.mark.asyncio
+async def test_rerank_is_one_request_that_keeps_fused_order_on_timeout(db):
+    await _insert_rerank_memories(db)
+    baseline = await _rerank_search(db, RecordingRerankClient(respond=lambda _prompt: RerankResponse(ranking=[])))
+    assert sorted(baseline) == sorted(memory_id for memory_id, _ in _RERANK_MEMORIES)
+
+    def timeout(_prompt: str) -> RerankResponse:
+        raise StructuredLlmError("deadline", terminal_category="deadline_exceeded", error_code="logical_deadline_exceeded")
+
+    reranker = RecordingRerankClient(respond=timeout)
+
+    assert await _rerank_search(db, reranker) == baseline
+    assert len(reranker.prompts) == 1
+
+
+@pytest.mark.asyncio
+async def test_rerank_over_route_capacity_keeps_fused_order_without_a_call(db):
+    await _insert_rerank_memories(db)
+    baseline = await _rerank_search(db, RecordingRerankClient(respond=lambda _prompt: RerankResponse(ranking=[])))
+    assert sorted(baseline) == sorted(memory_id for memory_id, _ in _RERANK_MEMORIES)
+    reranker = RecordingRerankClient(input_tokens=1)
+
+    assert await _rerank_search(db, reranker) == baseline
+    assert reranker.prompts == []
 
 
 @pytest.mark.asyncio

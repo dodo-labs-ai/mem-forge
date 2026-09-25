@@ -124,7 +124,6 @@ if TYPE_CHECKING:
     from memforge.memory.store import MemoryStore
     from memforge.models import ContentItem, Memory
     from memforge.pipeline.memory_extractor import MemoryExtractor
-    from memforge.pipeline.source_support_detector import SourceSupportDetector
     from memforge.storage.database import Database
     from memforge.storage.document_store import DocumentStore
 
@@ -640,7 +639,6 @@ class GeneSyncOrchestrator:
         memory_extractor: MemoryExtractor,
         memory_engine: MemoryEngine,
         memory_store: MemoryStore,
-        source_support_detector: SourceSupportDetector | None = None,
         max_concurrent: int = 3,
         extraction_pool: ExtractionWorkPool | None = None,
         document_lifecycle_admission: DocumentLifecycleAdmission | None = None,
@@ -656,7 +654,6 @@ class GeneSyncOrchestrator:
         self.memory_extractor = memory_extractor
         self.memory_engine = memory_engine
         self.memory_store = memory_store
-        self.source_support_detector = source_support_detector
         self.max_concurrent = max(1, max_concurrent)
         self.extraction_pool = extraction_pool or ExtractionWorkPool(self.max_concurrent)
         self.document_lifecycle_admission = document_lifecycle_admission

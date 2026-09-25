@@ -13,7 +13,7 @@ import weakref
 import litellm
 import pytest
 from PIL import Image
-from pydantic import ValidationError
+from pydantic import ConfigDict, ValidationError
 
 from memforge.evals.agent_evaluation import QualitySignalCollector, quality_signal_scope
 from memforge.llm.structured import (
@@ -23,33 +23,39 @@ from memforge.llm.structured import (
     CandidateLedgerResponse,
     EntityBatchValidationDecision,
     EntityBatchValidationResponse,
-    EntityValidationResponse,
-    IncumbentSupportAuditDecision,
-    IncumbentSupportAuditResponse,
     LiteLlmStructuredClient,
     MemoryCandidate,
     MemoryExtractionResponse,
     MemoryRelationResponse,
-    MemorySupportValidationResponse,
     OfflineSemanticJudgeResponse,
     ProjectionFragmentMemoryExtractionResponse,
     ProjectionFragmentSelectorCorrectionResponse,
     ProjectionMemoryExtractionResponse,
     RevisionSupportResponse,
-    RevisionCompositionDecision,
-    RevisionCompositionResponse,
     RerankResponse,
-    SourceSupportDecision,
-    SourceSupportResponse,
     StructuredLlmCallTelemetry,
     StructuredLlmConfig,
     StructuredLlmError,
     StructuredLlmMetricsCollector,
     StructuredLlmMetricsSummary,
     StructuredLlmImage,
+    StructuredResponseModel,
     litellm_model_name,
 )
 
+
+
+class SupportVerdictResponse(StructuredResponseModel):
+    """Small schema for transport cases that only exercise JSON recovery."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    supported: bool
+    reason: str = ""
+
+
+async def validate_support_verdict(client: LiteLlmStructuredClient) -> SupportVerdictResponse:
+    return await client.evaluate_revision_work("prompt", response_format=SupportVerdictResponse, max_tokens=512)
 
 def _png_bytes(*, width: int = 1, height: int = 1) -> bytes:
     output = BytesIO()
@@ -102,26 +108,6 @@ def test_text_memory_schema_requires_transient_evidence_block_authority() -> Non
                     ]
                 }
             )
-
-
-def test_support_validation_schema_preserves_complete_required_coverage() -> None:
-    required = [
-        {
-            "selector": f"r{index:06d}",
-            "evidence_ref": f"f{index + 1:06d}",
-        }
-        for index in range(1, 34)
-    ]
-
-    response = MemorySupportValidationResponse.model_validate(
-        {
-            "supported": True,
-            "primary_ref": "f000001",
-            "required_evidence": required,
-        }
-    )
-
-    assert len(response.required_evidence) == 33
 
 
 def test_projection_memory_schema_rejects_missing_authority() -> None:
@@ -297,7 +283,7 @@ async def test_structured_llm_admission_is_shared_across_client_instances(
         max_concurrent=2,
     )
     clients = (LiteLlmStructuredClient(config), LiteLlmStructuredClient(config))
-    tasks = [asyncio.create_task(clients[index % 2].verify_source_support(f"prompt-{index}")) for index in range(6)]
+    tasks = [asyncio.create_task(clients[index % 2].select_memory_candidates(f"prompt-{index}")) for index in range(6)]
 
     await asyncio.wait_for(two_admitted.wait(), timeout=0.5)
     await asyncio.sleep(0)
@@ -422,35 +408,6 @@ def set_native_schema_support(monkeypatch, supported: bool) -> None:
         "memforge.llm.structured.litellm.supports_response_schema",
         fake_supports_response_schema,
     )
-
-
-def test_source_support_response_accepts_decision_list():
-    response = SourceSupportResponse.model_validate(
-        {
-            "decisions": [
-                {
-                    "memory_id": "mem-1",
-                    "supported": True,
-                    "excerpt": "The document states the rule.",
-                    "reason": "direct statement",
-                }
-            ]
-        }
-    )
-
-    assert response.decisions == [
-        SourceSupportDecision(
-            memory_id="mem-1",
-            supported=True,
-            excerpt="The document states the rule.",
-            reason="direct statement",
-        )
-    ]
-
-
-def test_source_support_response_rejects_top_level_array():
-    with pytest.raises(ValidationError):
-        SourceSupportResponse.model_validate([{"memory_id": "mem-1", "supported": True}])
 
 
 def test_agent_session_authority_response_accepts_typed_decisions():
@@ -606,7 +563,7 @@ async def test_litellm_structured_client_uses_response_schema_for_source_support
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         return CompletionResponse(
-            '{"decisions":[{"memory_id":"mem-1","supported":true,"excerpt":"Exact text","reason":"match"}]}'
+            '{"decisions":[]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -620,15 +577,15 @@ async def test_litellm_structured_client_uses_response_schema_for_source_support
         )
     )
 
-    response = await client.verify_source_support("prompt")
+    response = await client.classify_agent_session_evidence_authority("prompt")
 
-    assert response.decisions[0].memory_id == "mem-1"
+    assert response.decisions == []
     assert calls[0]["model"] == "anthropic/anthropic--claude-sonnet-latest"
     assert calls[0]["api_base"] == "http://localhost:6655/anthropic"
     assert calls[0]["api_key"] == "local-key"
     assert calls[0]["timeout"] == pytest.approx(120.0, abs=0.01)
     assert calls[0]["messages"] == [{"role": "user", "content": "prompt"}]
-    assert calls[0]["response_format"] is SourceSupportResponse
+    assert calls[0]["response_format"] is AgentSessionAuthorityResponse
     assert "tools" not in calls[0]
     assert "tool_choice" not in calls[0]
     assert calls[0]["max_tokens"] == 4096
@@ -1098,7 +1055,7 @@ async def test_litellm_structured_client_uses_explicit_json_schema_response_form
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         return CompletionResponse(
-            '{"decisions":[{"action":"KEEP","canonical_index":null,"reason":"unique"}]}'
+            '{"decisions":[{"candidate_index":0,"action":"KEEP","canonical_index":null,"reason":"unique"}]}'
         )
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
@@ -1137,20 +1094,14 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
     payloads = {
         "RevisionSupportResponse": '{"status":"unsupported"}',
         "ClaimRevisionWireResponse": '{"results":[]}',
-        "SourceSupportResponse": '{"decisions":[]}',
             "MemoryExtractionResponse": '{"memories":[]}',
             "ProjectionMemoryExtractionResponse": '{"memories":[]}',
             "ProjectionFragmentMemoryExtractionResponse": '{"memories":[]}',
         "ProjectionFragmentSelectorCorrectionResponse": '{"corrections":[]}',
         "CandidateLedgerResponse": '{"decisions":[]}',
-        "IncumbentSupportAuditResponse": '{"decisions":[]}',
-        "RevisionCompositionResponse": '{"decisions":[]}',
         "MemoryRelationResponse": '{"decisions":[]}',
         "MemoryRelationCatalogResponse": '{"results":[]}',
-        "MemorySupportValidationResponse": '{"supported":true}',
-        "EntityValidationResponse": '{}',
         "EntityBatchValidationResponse": '{"decisions":[]}',
-        "QueryEntityDetectionResponse": '{"entity_ids":[]}',
         "RerankResponse": '{"ranking":[]}',
             "AgentKnowledgePatchModelResponse": '{"action":"no_output"}',
         "AgentSessionAuthorityResponse": '{"decisions":[]}',
@@ -1178,9 +1129,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
     )
     operations = {
         "evaluate_revision_work": lambda: client.evaluate_revision_work("prompt", response_format=RevisionSupportResponse, max_tokens=512),
-        "assess_revision_support": lambda: client.assess_revision_support("prompt"),
         "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
-        "verify_source_support": lambda: client.verify_source_support("prompt"),
         "extract_memories": lambda: client.extract_memories("prompt", max_tokens=512),
             "extract_projection_memories": lambda: client.extract_projection_memories(
                 "prompt",
@@ -1196,14 +1145,9 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
             "prompt", max_tokens=512,
         ),
         "select_memory_candidates": lambda: client.select_memory_candidates("prompt"),
-        "audit_incumbent_support": lambda: client.audit_incumbent_support("prompt"),
-        "prove_revision_compositions": lambda: client.prove_revision_compositions("prompt"),
         "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
         "discover_memory_relations": lambda: client.discover_memory_relations("prompt"),
-        "validate_memory_support": lambda: client.validate_memory_support("prompt"),
-        "validate_entity_match": lambda: client.validate_entity_match("prompt"),
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
-        "detect_query_entities": lambda: client.detect_query_entities("prompt"),
         "rerank_memories": lambda: client.rerank_memories("prompt"),
         "generate_agent_knowledge_patch": lambda: client.generate_agent_knowledge_patch("prompt"),
         "classify_agent_session_evidence_authority": (
@@ -1230,7 +1174,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
     assert [
         call["response_format"]["json_schema"]["name"]
         for call in calls
-    ] == ["RevisionSupportResponse", *payloads]
+    ] == list(payloads)
     assert all("output_config" not in call for call in calls)
 
 
@@ -1317,7 +1261,7 @@ async def test_litellm_structured_client_does_not_repair_missing_json_delimiter(
     )
 
     with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response"):
-        await client.validate_memory_support("prompt")
+        await validate_support_verdict(client)
 
     assert len(calls) == 3
 
@@ -1342,7 +1286,7 @@ async def test_litellm_structured_client_does_not_guess_ambiguous_terminal_quote
     )
 
     with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response"):
-        await client.validate_memory_support("prompt")
+        await validate_support_verdict(client)
 
     assert len(calls) == 3
 
@@ -1416,7 +1360,7 @@ async def test_litellm_structured_client_accepts_one_schema_valid_json_object_wi
         )
     )
 
-    response = await client.validate_memory_support("prompt")
+    response = await validate_support_verdict(client)
 
     assert response.supported is True
     assert len(calls) == 1
@@ -1444,7 +1388,7 @@ async def test_litellm_structured_client_rejects_ambiguous_schema_valid_json_obj
     )
 
     with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
-        await client.validate_memory_support("prompt")
+        await validate_support_verdict(client)
     assert len(calls) == 2
     assert raised.value.error_code == "ValueError"
 
@@ -1492,23 +1436,13 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     async def fake_acompletion(**kwargs):
         calls.append(kwargs)
         schema = kwargs["response_format"]
-        if schema is IncumbentSupportAuditResponse:
-            return CompletionResponse(
-                '{"decisions":[{"supported":true,"reason":"supported"}]}'
-            )
-        if schema is RevisionCompositionResponse:
-            return CompletionResponse(
-                '{"decisions":[{"pair_index":0,"same_memory_identity":true,'
-                '"preserves_incumbent_truth":true,"candidate_is_canonical_composite":true,'
-                '"current_evidence_entails_candidate":true}]}'
-            )
         if schema is CandidateLedgerResponse:
             return CompletionResponse(
-                '{"decisions":[{"action":"KEEP"}]}'
+                '{"decisions":[{"candidate_index":0,"action":"KEEP"}]}'
             )
         if schema is EntityBatchValidationResponse:
             return CompletionResponse(
-                '{"decisions":[{"matched_id":7,"confidence":0.95}]}'
+                '{"decisions":[{"mention":"acme","matched_id":7,"confidence":0.95}]}'
             )
         if schema is MemoryRelationResponse:
             return CompletionResponse(
@@ -1516,10 +1450,6 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
                 '"direction":"challenger_to_candidate","same_subject_and_scope":true,'
                 '"incompatible_assertions":"","reason":"adds a condition"}]}'
             )
-        if schema is MemorySupportValidationResponse:
-            return CompletionResponse('{"supported":true,"reason":"still entailed"}')
-        if schema is EntityValidationResponse:
-            return CompletionResponse('{"same_entity":true,"matched_id":7,"confidence":0.95}')
         if schema is RerankResponse:
             return CompletionResponse('{"ranking":[2,0,1]}')
         raise AssertionError(f"unexpected schema {schema}")
@@ -1536,38 +1466,16 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     )
 
     assert (await client.select_memory_candidates("prompt")).decisions[0].action == "KEEP"
-    assert (await client.audit_incumbent_support("prompt")).decisions[0].supported is True
-    assert (await client.prove_revision_compositions("prompt")).decisions[0].same_memory_identity is True
     assert (await client.classify_memory_relations("prompt")).decisions[0].direction == "challenger_to_candidate"
-    assert (await client.validate_memory_support("prompt")).supported is True
-    assert (await client.validate_entity_match("prompt")).matched_id == 7
     assert (await client.validate_entity_batch("prompt")).decisions[0].matched_id == 7
     assert (await client.rerank_memories("prompt")).ranking == [2, 0, 1]
 
     assert [call["response_format"] for call in calls] == [
         CandidateLedgerResponse,
-        IncumbentSupportAuditResponse,
-        RevisionCompositionResponse,
         MemoryRelationResponse,
-        MemorySupportValidationResponse,
-        EntityValidationResponse,
         EntityBatchValidationResponse,
         RerankResponse,
     ]
-
-
-def test_relation_first_support_schema_rejects_lifecycle_actions() -> None:
-    audit_payload = {
-        "decisions": [
-            {
-                "action": "ADD",
-                "index": 0,
-                "reason": "candidate row in incumbent audit",
-            }
-        ]
-    }
-    with pytest.raises(ValidationError):
-        IncumbentSupportAuditResponse.model_validate(audit_payload)
 
 
 def test_memory_relation_schema_requires_scope_proof_for_contradiction() -> None:
@@ -1604,52 +1512,33 @@ def test_memory_relation_schema_requires_scope_proof_for_contradiction() -> None
     assert accepted.decisions[0].classification == "contradicts"
 
 
-def test_candidate_ledger_schema_rejects_model_owned_candidate_index() -> None:
-    payload = {"decisions": [{"index": 0, "action": "KEEP"}]}
-
+def test_batch_decisions_name_the_item_they_judge() -> None:
     with pytest.raises(ValidationError):
-        CandidateLedgerResponse.model_validate(payload)
+        CandidateLedgerResponse.model_validate({"decisions": [{"action": "KEEP"}]})
+    with pytest.raises(ValidationError):
+        EntityBatchValidationResponse.model_validate({"decisions": [{"matched_id": 7, "confidence": 0.99}]})
+    with pytest.raises(ValidationError):
+        CandidateLedgerResponse.model_validate({"decisions": [{"index": 0, "action": "KEEP"}]})
 
 
-def test_transient_batch_schemas_use_ordered_decision_arrays() -> None:
+def test_transient_batch_schemas_use_decision_arrays() -> None:
     ledger = CandidateLedgerResponse(
-        decisions=[CandidateLedgerDecision(action="KEEP")]
+        decisions=[CandidateLedgerDecision(candidate_index=0, action="KEEP")]
     )
     entities = EntityBatchValidationResponse(
         decisions=[
-            EntityBatchValidationDecision(matched_id=7, confidence=0.99)
-        ]
-    )
-    incumbent_audits = IncumbentSupportAuditResponse(
-        decisions=[IncumbentSupportAuditDecision(supported=True)]
-    )
-    revision_proofs = RevisionCompositionResponse(
-        decisions=[
-            RevisionCompositionDecision(
-                pair_index=0,
-                same_memory_identity=True,
-                preserves_incumbent_truth=True,
-                candidate_is_canonical_composite=True,
-                current_evidence_entails_candidate=True,
-            )
+            EntityBatchValidationDecision(mention="acme", matched_id=7, confidence=0.99)
         ]
     )
 
     assert ledger.decisions[0].action == "KEEP"
     assert entities.decisions[0].matched_id == 7
-    assert incumbent_audits.decisions[0].supported is True
-    assert revision_proofs.decisions[0].same_memory_identity is True
     assert set(CandidateLedgerResponse.model_json_schema()["properties"]) == {
         "decisions"
     }
     assert set(EntityBatchValidationResponse.model_json_schema()["properties"]) == {
         "decisions"
     }
-    assert set(IncumbentSupportAuditResponse.model_json_schema()["properties"]) == {
-        "decisions"
-    }
-    assert set(RevisionCompositionResponse.model_json_schema()["properties"]) == {"decisions"}
-    assert json.dumps(IncumbentSupportAuditResponse.model_json_schema()).count('"anyOf"') <= 16
     with pytest.raises(ValidationError):
         CandidateLedgerResponse.model_validate({"slot_00": {"action": "KEEP"}})
     with pytest.raises(ValidationError):
@@ -1731,8 +1620,17 @@ async def test_litellm_structured_client_fails_closed_after_both_strategies_are_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("finish_reason", ["length", "content_filter", "refusal"])
-async def test_sparse_catalog_rejects_valid_json_from_unfinished_provider_response(monkeypatch, finish_reason):
+@pytest.mark.parametrize(
+    ("finish_reason", "error_code"),
+    [
+        ("length", "output_truncated"),
+        ("content_filter", "memory_relation_response_incomplete"),
+        ("refusal", "memory_relation_response_incomplete"),
+    ],
+)
+async def test_sparse_catalog_rejects_valid_json_from_unfinished_provider_response(
+    monkeypatch, finish_reason, error_code,
+):
     response = CompletionResponse('{"results":[{"candidate_id":"NEW-0001","relations":[]}]}')
     response.choices[0].finish_reason = finish_reason
 
@@ -1747,11 +1645,11 @@ async def test_sparse_catalog_rejects_valid_json_from_unfinished_provider_respon
     ))
     with pytest.raises(StructuredLlmError) as error:
         await client.discover_memory_relations("prompt")
-    assert error.value.error_code == "memory_relation_response_incomplete"
+    assert error.value.error_code == error_code
 
 
 @pytest.mark.asyncio
-async def test_litellm_structured_client_records_each_invalid_provider_attempt(monkeypatch):
+async def test_litellm_structured_client_does_not_resend_truncated_output(monkeypatch):
     collector = QualitySignalCollector()
     response = CompletionResponse("{")
     response.id = "msg-provider-123"
@@ -1782,34 +1680,27 @@ async def test_litellm_structured_client_records_each_invalid_provider_attempt(m
     )
 
     with quality_signal_scope(collector):
-        with pytest.raises(StructuredLlmError):
+        with pytest.raises(StructuredLlmError) as raised:
             await client.extract_memories("prompt", max_tokens=32_768)
 
-    attempts = [
+    assert raised.value.error_code == "output_truncated"
+    assert raised.value.terminal_category == "invalid_response"
+    [attempt] = [
         signal
         for signal in collector.snapshot()
         if signal.event_name == "structured_llm_attempt_outcome"
     ]
-    assert len(attempts) == 3
-    assert [attempt.attempt_index for attempt in attempts] == [1, 2, 3]
-    assert [attempt.structured_mode for attempt in attempts] == [
-        "native_schema",
-        "json_text",
-        "json_text",
-    ]
-    assert attempts[0].schema_transport == "auto"
-    assert attempts[1].schema_transport == "json_text"
-    assert all(attempt.requested_max_tokens == 32_768 for attempt in attempts)
-    assert all(attempt.finish_reason == "max_tokens" for attempt in attempts)
-    assert all(attempt.stop_reason == "max_tokens" for attempt in attempts)
-    assert all(attempt.provider_request_id == "sap-request-456" for attempt in attempts)
-    assert all(attempt.completion_tokens == 32_768 for attempt in attempts)
-    assert all(attempt.response_chars == 1 for attempt in attempts)
-    assert all(len(attempt.response_hash or "") == 64 for attempt in attempts)
-    assert all(attempt.validation_location == "$" for attempt in attempts)
-    assert all(attempt.validation_rule == "json_invalid" for attempt in attempts)
-    assert all(attempt.json_error_line == 1 for attempt in attempts)
-    assert all(attempt.json_error_column is not None for attempt in attempts)
+    assert attempt.attempt_index == 1
+    assert attempt.structured_mode == "native_schema"
+    assert attempt.schema_transport == "auto"
+    assert attempt.error_code == "output_truncated"
+    assert attempt.requested_max_tokens == 32_768
+    assert attempt.finish_reason == "max_tokens"
+    assert attempt.stop_reason == "max_tokens"
+    assert attempt.provider_request_id == "sap-request-456"
+    assert attempt.completion_tokens == 32_768
+    assert attempt.response_chars == 1
+    assert len(attempt.response_hash or "") == 64
 
 
 @pytest.mark.asyncio
@@ -1995,7 +1886,7 @@ async def test_litellm_structured_client_fails_closed_when_litellm_rejects_schem
     )
 
     with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
-        await client.verify_source_support("prompt")
+        await client.select_memory_candidates("prompt")
     assert raised.value.error_code == "Exception"
 
 
@@ -2015,7 +1906,7 @@ async def test_litellm_structured_client_fails_closed_on_missing_content(monkeyp
     )
 
     with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
-        await client.verify_source_support("prompt")
+        await client.select_memory_candidates("prompt")
     assert raised.value.error_code == "structured_llm_error"
 
 
@@ -2293,6 +2184,55 @@ async def test_litellm_structured_client_classifies_remote_disconnect_without_le
     assert telemetry[0].error_code == "APIConnectionError.remote_disconnect"
 
 
+class _PayloadTooLargeError(Exception):
+    status_code = 413
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_error", "error_code"),
+    [
+        (lambda: _PayloadTooLargeError("request body rejected"), "payload_too_large"),
+        (
+            lambda: litellm.APIConnectionError(
+                message="HTTP/1.1 413 Request Entity Too Large", llm_provider="sap", model="deployment",
+            ),
+            "payload_too_large",
+        ),
+        (
+            lambda: litellm.ContextWindowExceededError(
+                message="prompt is too long", model="deployment", llm_provider="sap",
+            ),
+            "input_capacity_exceeded",
+        ),
+    ],
+    ids=["status-413", "flattened-413", "context-window"],
+)
+async def test_litellm_structured_client_reports_request_size_rejections_without_json_fallback(
+    monkeypatch, provider_error, error_code,
+):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        raise provider_error()
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, True)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="anthropic--claude-sonnet-latest", base_url=None, api_key=None, timeout_s=1.0, num_retries=0,
+        )
+    )
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await client.extract_memories("prompt", max_tokens=1024)
+
+    assert raised.value.error_code == error_code
+    assert raised.value.terminal_category == "provider_error"
+    assert len(calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_litellm_structured_client_distinguishes_provider_timeout_from_logical_deadline(
     monkeypatch,
@@ -2339,7 +2279,7 @@ async def test_litellm_structured_client_fails_closed_on_invalid_schema(monkeypa
     )
 
     with pytest.raises(StructuredLlmError):
-        await client.verify_source_support("prompt")
+        await client.select_memory_candidates("prompt")
 
 
 @pytest.mark.asyncio
@@ -2358,7 +2298,7 @@ async def test_litellm_structured_client_fails_closed_when_decisions_missing(mon
     )
 
     with pytest.raises(StructuredLlmError):
-        await client.verify_source_support("prompt")
+        await client.select_memory_candidates("prompt")
 
 
 @pytest.mark.asyncio
@@ -2463,7 +2403,13 @@ def test_sap_route_uses_sdk_bedrock_metadata_and_preserves_operator_caps(monkeyp
     budget = client.request_budget()
     assert seen == ["bedrock/anthropic.claude-sonnet-4-6"]
     assert (budget.input_limit, budget.context_limit, budget.output_limit) == (10000, 16000, 1024)
+    from memforge.llm.batch_runner import LlmBatchRunner, LlmRequest
     from memforge.pipeline.memory_extractor import MemoryExtractor
     from types import SimpleNamespace
+    monkeypatch.setattr("memforge.llm.structured.litellm.token_counter", lambda **kwargs: 100)
     catalog = SimpleNamespace(fragments=[SimpleNamespace(primary_eligible=True, presentation_text="Small claim.")])
-    assert MemoryExtractor(structured_llm_client=client, model=config.model).fragment_output_tokens(catalog) == 1024
+    requested = MemoryExtractor(structured_llm_client=client, model=config.model).fragment_output_tokens(catalog)
+    assert requested > config.max_output_tokens
+    runner = LlmBatchRunner(client, model=config.model)
+    planned = runner.fit(lambda: LlmRequest("extract", ProjectionFragmentMemoryExtractionResponse, requested))
+    assert planned.max_tokens == config.max_output_tokens

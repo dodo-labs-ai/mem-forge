@@ -2,9 +2,17 @@
 
 These methods assemble fixture responses, not provider calls. Dedicated model
 contract tests assert the actual single-call boundary and complete input shape.
+
+Scenarios state their judgments through three optional hooks, each taking a
+fixture prompt and returning one of the fixture models below:
+``judge_support`` (does the current Source Unit still support an incumbent),
+``select_support_evidence`` (which current Fragments carry that support) and
+``prove_revisions`` (which REFINES pairs are eligible revisions).
 """
 
 import json
+
+from pydantic import BaseModel, Field
 
 from memforge.llm.structured import (
     ClaimRevisionDecision,
@@ -12,6 +20,40 @@ from memforge.llm.structured import (
     RevisionAssessment,
     RevisionSupportResponse,
 )
+
+
+class SupportJudgment(BaseModel):
+    supported: bool
+    reason: str = ""
+
+
+class SupportJudgments(BaseModel):
+    decisions: list[SupportJudgment]
+
+
+class RevisionProof(BaseModel):
+    pair_index: int
+    same_memory_identity: bool
+    preserves_incumbent_truth: bool
+    candidate_is_canonical_composite: bool
+    current_evidence_entails_candidate: bool
+    reason: str = ""
+
+
+class RevisionProofs(BaseModel):
+    decisions: list[RevisionProof]
+
+
+class RequiredSelection(BaseModel):
+    selector: str
+    evidence_ref: str
+
+
+class EvidenceSelection(BaseModel):
+    supported: bool
+    reason: str = ""
+    primary_ref: str | None = None
+    required_evidence: list[RequiredSelection] = Field(default_factory=list)
 
 
 def catalog_payload(prompt):
@@ -169,9 +211,9 @@ class RevisionClientFixture:
                         )
             legacy = {**payload, **claim, "previous_evidence": previous}
             assessment_prompt = "<assessment>" + json.dumps(legacy) + "</assessment>"
-            if "Correction:" in prompt:
+            if "<correction>" in prompt:
                 assessment_prompt += "previous selection used invalid refs"
-            result = await self.assess_revision_support(assessment_prompt, **kwargs)
+            result = await self.assess_support(assessment_prompt, **kwargs)
             results.append(FinalResult(work_id=claim["work_id"], **result.model_dump()))
         return FinalResponse.model_validate({'results': [
             {k: v for k, v in r.model_dump().items() if k != 'reason' or r.status != 'supported'}
@@ -200,8 +242,8 @@ class RevisionClientFixture:
             for pair, relation in zip(pairs, relations.decisions)
             if relation.classification == "refines" and relation.direction == "challenger_to_candidate"
         ]
-        if requests and hasattr(self, "prove_revision_compositions"):
-            response = await self.prove_revision_compositions(
+        if requests and hasattr(self, "prove_revisions"):
+            response = await self.prove_revisions(
                 "<refinement_pairs>" + json.dumps(requests) + "</refinement_pairs>", **kwargs
             )
             proofs = {proof.pair_index: proof for proof in response.decisions}
@@ -225,7 +267,7 @@ class RevisionClientFixture:
                             challenger_is_complete_current_claim=False,
                             current_evidence_entails_challenger=False,
                         )
-                        if not hasattr(self, "prove_revision_compositions")
+                        if not hasattr(self, "prove_revisions")
                         and relation.classification == "refines"
                         and relation.direction == "challenger_to_candidate"
                         else None
@@ -234,14 +276,14 @@ class RevisionClientFixture:
                 for relation in relations.decisions
             ])
 
-    async def assess_revision_support(self, prompt, **kwargs):
+    async def assess_support(self, prompt, **kwargs):
         payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
         old_prompt = (
             "<incumbents>"
             + json.dumps([{"request_position": 0, "content": payload["claim"], "memory_type": payload["memory_type"]}])
             + "</incumbents>"
         )
-        audit = await self.audit_incumbent_support(old_prompt, **kwargs)
+        audit = await self.judge_support(old_prompt, **kwargs)
         if len(audit.decisions) != 1:
             from memforge.pipeline.reconciler import ReconciliationContractError
 
@@ -267,7 +309,7 @@ class RevisionClientFixture:
                 current[0],
             ),
         )
-        if hasattr(self, "validate_memory_support"):
+        if hasattr(self, "select_support_evidence"):
             refs = {item["ref"]: f"f{index:06d}" for index, item in enumerate(current, 1)}
             reverse = {value: key for key, value in refs.items()}
             legacy = {
@@ -304,7 +346,7 @@ class RevisionClientFixture:
                     )
                     + "\n</selection_correction>"
                 )
-            validation = await self.validate_memory_support(legacy_prompt, **kwargs)
+            validation = await self.select_support_evidence(legacy_prompt, **kwargs)
             return RevisionSupportResponse(
                 status="supported" if validation.supported else "unsupported",
                 primary_ref=reverse.get(validation.primary_ref, validation.primary_ref),

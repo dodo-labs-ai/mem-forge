@@ -32,7 +32,7 @@ class PairClient(Client):
 
 
 @pytest.mark.asyncio
-async def test_last_of_32_claim_requests_resumes_after_database_reopen(tmp_path):
+async def test_last_of_24_claim_requests_resumes_after_database_reopen(tmp_path):
     from memforge.storage.database import Database
     path = tmp_path / "claim.db"
     db, root = await prepare_database(path)
@@ -40,11 +40,12 @@ async def test_last_of_32_claim_requests_resumes_after_database_reopen(tmp_path)
     kwargs = dict(candidates=[replace(candidate(), content=f"claim {i}") for i in range(8)], incumbents=olds,
         support_audits=[SupportAuditEntry(old.id, True) for old in olds], model="fixture",
         derivation_id=root.id, operation_input_hash="a" * 64)
-    first = PairClient(fail_at=32)
+    # Each candidate reads its 183 incumbents in the longest fitting chunks: 64 + 64 + 55.
+    first = PairClient(fail_at=24)
     try:
         with pytest.raises(StructuredLlmError, match="fixture deadline"):
             await assess_claim_pairs(**kwargs, client=first, store=db)
-        assert first.calls == 32
+        assert first.calls == 24
     finally:
         await db.close()
     db = Database(str(path))
@@ -55,12 +56,12 @@ async def test_last_of_32_claim_requests_resumes_after_database_reopen(tmp_path)
         assert retry.calls == 1
         assert len(result.decisions) == 0
         assert result.blocked_candidates == ()
-        assert len(result.work_ids) == 32
+        assert len(result.work_ids) == 24
         cursor = await db.db.execute("SELECT id FROM lifecycle_plans")
         assert not await cursor.fetchall()
         changed = PairClient()
         await assess_claim_pairs(**{**kwargs, "operation_input_hash": "b" * 64}, client=changed, store=db)
-        assert changed.calls == 32
+        assert changed.calls == 24
     finally:
         await db.close()
 

@@ -1,14 +1,13 @@
 """Model-wire and real request-budget boundaries; no provider or source writes."""
 
 import json
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from memforge.llm.request_budget import RequestBudget
 from memforge.llm.structured import (
-    LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError,
+    OUTPUT_TRUNCATED, LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError,
     SupportAssessmentResponse, SupportAssessmentResult,
 )
 from memforge.pipeline.revision_work import RevisionWorkExecutor
@@ -39,24 +38,27 @@ async def test_complete_catalog_first_despite_dense_output_estimate():
     assert len(results) == 183 and all(row.supported for row in results.values())
     work = next(w for w in store.works.values() if w.kind == 'support_assess')
     assert work.manifest['output'] == 64000
-    assert work.manifest['contract'] == 'support-delta-assessment-v3'
-    assert all(row['work_id'].startswith('w') for row in work.result['results'])
-    assert all(row['primary_ref'].startswith('p') for row in work.result['results'])
+    assert work.manifest['scope']['contract'] == 'support-delta-assessment-v3'
+    # The journal keeps the provider's aliased wire response; reuse decodes it again.
+    assert all(row['work_id'].startswith('WRK-') for row in work.result['results'])
+    assert all(row['primary_ref'].startswith('PRM-') for row in work.result['results'])
     assert all(row['work_id'].startswith('WRK-') for row in request['claims'])
 
 
-def test_mandatory_output_rows_still_reject_impossible_whole_group():
-    class SmallOutput(BudgetClient):
-        def request_budget(self, model=None):
-            return replace(super().request_budget(model), output_limit=128)
-    client = SmallOutput()
+@pytest.mark.asyncio
+async def test_truncated_multi_claim_output_is_halved_until_each_request_completes():
+    class TruncatingClient(BudgetClient):
+        async def evaluate_revision_work(self, prompt, **kwargs):
+            if len(payload(prompt)['claims']) > 1:
+                self.prompts.append(prompt)
+                raise StructuredLlmError('fixture truncation', error_code=OUTPUT_TRUNCATED)
+            return await super().evaluate_revision_work(prompt, **kwargs)
+    client = TruncatingClient()
     executor = RevisionWorkExecutor(client=client, model='gpt-4o')
-    items = work_items('Two reviewers approve US releases.', 32)
-    assert executor._output(items, 1) > 128
-    scope = executor._range(items)
-    units = [('current', f) for f in scope.catalog.fragments]
-    states = {i.id: executor._initial(scope, i) for i in items}
-    assert len(executor._group(scope, units, items, states)) < len(items)
+    results = await executor.assess_many(work_items('Two reviewers approve US releases.', 4))
+    assert all(row.supported for row in results.values())
+    assert [len(payload(p)['claims']) for p in client.prompts] == [4, 2, 1, 1, 2, 1, 1]
+    assert executor.calls == 7 and len(executor.final_work_ids) == 4
 
 
 def test_aliases_preserve_text_and_role_eligibility_and_expand_four_digits():
@@ -85,10 +87,10 @@ def test_aliases_preserve_text_and_role_eligibility_and_expand_four_digits():
 @pytest.mark.asyncio
 async def test_wire_id_text_is_not_rewritten_and_unknown_namespace_fails_closed():
     class CanonicalIDClient(Client):
-        async def evaluate_revision_work(self, prompt, **kwargs):
-            result = await super().evaluate_revision_work(prompt, **kwargs)
-            result.results[0].primary_ref = 'p000001'
-            return result
+        def judge(self, prompt):
+            results = super().judge(prompt)
+            results[0].primary_ref = 'p000001'
+            return results
     items = work_items('Two reviewers approve US releases.\n\nLiteral p000001 and w000068 are source text.')
     client, store = CanonicalIDClient(limit=50000), Store()
     executor = RevisionWorkExecutor(client=client, model='gpt-4o', store=store, derivation_id='root')

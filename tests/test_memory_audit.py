@@ -68,7 +68,7 @@ async def test_insert_memory_audit_event_normalizes_occurred_at_to_utc(db: Datab
         MemoryAuditEvent(
             event_id="evt-tz",
             operation_id="op-tz",
-            event_type="source_support_verification_failed",
+            event_type="reconciliation_failed",
             status="failed",
             occurred_at=datetime(2026, 5, 26, 6, 0, tzinfo=timezone(timedelta(hours=2))),
         )

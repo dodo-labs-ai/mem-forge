@@ -2053,7 +2053,7 @@ async def test_selector_correction_preserves_success_and_fixed_claims(mode) -> N
             assert self.budget_checks[-1][0] == prompt
             assert self.budget_checks[-1][1]["model"] == kwargs["model"]
             assert self.budget_checks[-1][1]["max_tokens"] == kwargs["max_tokens"]
-            assert self.budget_checks[-1][1]["images"] == kwargs["images"]
+            assert self.budget_checks[-1][1]["images"] == kwargs.get("images", ())
             if mode == "provider_failure":
                 raise StructuredLlmError("private provider text", error_code="provider_unavailable")
             if mode == "unexpected_failure":

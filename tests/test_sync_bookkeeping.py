@@ -116,6 +116,7 @@ from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.source_sync_manifest import SourceSyncManifestStore
 from memforge.scheduler import SOURCE_SCHEDULE_SCAN_JOB_ID, SyncScheduler
+from tests.llm_fixture import FIXTURE_CONTEXT_WINDOW, fixture_budget
 
 
 @pytest.fixture
@@ -3396,15 +3397,6 @@ class NoopMemoryEngine:
         return {"retired": 0, "pending_review": 0, "can_delete_document": True}
 
 
-class RecordingSourceSupportDetector:
-    async def detect_and_persist(self, **kwargs):
-        return {
-            "added": 1,
-            "updated": 0,
-            "removed_stale": 0,
-        }
-
-
 class FailingDocumentDeleteMemoryStore:
     async def delete_projected_document(self, doc_id: str, **kwargs):
         raise RuntimeError("delete document failed")
@@ -3930,6 +3922,9 @@ class NoopMemoryExtractor:
     model = "fixture"
     max_tokens = 8192
     structured_llm_client = SimpleNamespace(
+        request_budget=lambda model=None: fixture_budget(
+            input_tokens=FIXTURE_CONTEXT_WINDOW, output_tokens=8192, correction_reserve=0,
+        ),
         request_fits=lambda *args, **kwargs: True,
         request_tokens=lambda prompt, **kwargs: max(1, len(prompt) // 4),
     )
@@ -6389,7 +6384,6 @@ async def test_sync_memory_observer_records_discovery_and_document_stages(db: Da
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
-        source_support_detector=RecordingSourceSupportDetector(),
         max_concurrent=1,
         memory_observer=observer,
     )
@@ -6419,7 +6413,6 @@ async def test_sync_memory_observer_records_discovery_and_document_stages(db: Da
     assert discovery["item_count"] == 1
     assert discovery["indexed_doc_count"] == 0
     assert discovery["full_sync"] is True
-    assert "after_source_support" not in stages
 
 
 @pytest.mark.asyncio
@@ -6449,7 +6442,6 @@ async def test_document_lifecycle_reclaims_process_memory_after_each_document(
         memory_extractor=NoopMemoryExtractor(),
         memory_engine=NoopMemoryEngine(),
         memory_store=None,
-        source_support_detector=RecordingSourceSupportDetector(),
         max_concurrent=1,
         memory_observer=observer,
         memory_reclaimer=reclaimer,
@@ -12730,7 +12722,7 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
 
     class AuditingEngine(NoopMemoryEngine):
         async def prepare_and_commit_projected_lifecycle(self, **kwargs):
-            await client.audit_incumbent_support("audit", max_tokens=32)
+            await client.classify_memory_relations("audit", max_tokens=32)
             raise AssertionError("failed mandatory audit must not commit")
 
     orchestrator = GeneSyncOrchestrator(

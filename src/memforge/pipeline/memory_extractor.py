@@ -11,6 +11,7 @@ from typing import Any
 
 from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
 from memforge.evals.agent_evaluation import QualitySignal, record_quality_signal
+from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
     ProjectionFragmentMemoryExtractionResponse,
@@ -47,6 +48,12 @@ logger = logging.getLogger(__name__)
 __all__ = ["MemoryExtractor"]
 
 _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT = 16
+
+# Requested extraction output: a response envelope plus, per authorized Primary
+# Fragment, room for its claims (at least one claim, else about half its text).
+_FRAGMENT_OUTPUT_BASE_TOKENS = 512
+_FRAGMENT_OUTPUT_MIN_TOKENS = 768
+_FRAGMENT_OUTPUT_CHARS_PER_TOKEN = 2
 
 
 # ---------------------------------------------------------------------------
@@ -288,13 +295,12 @@ class MemoryExtractor:
     """
 
     def fragment_output_tokens(self, catalog) -> int:
-        """Reserve output for this request's authorized content, not a full document."""
-        requested = 512 + sum(
-            max(768, len(fragment.presentation_text) // 2)
+        """Request output for this request's authorized content, not a full document."""
+        requested = _FRAGMENT_OUTPUT_BASE_TOKENS + sum(
+            max(_FRAGMENT_OUTPUT_MIN_TOKENS, len(fragment.presentation_text) // _FRAGMENT_OUTPUT_CHARS_PER_TOKEN)
             for fragment in catalog.fragments if fragment.primary_eligible
         )
-        budget = self.structured_llm_client.request_budget(self.model)
-        return budget.output_reserve(min(self.max_tokens, requested))
+        return min(self.max_tokens, requested)
 
     def __init__(
         self,
@@ -758,67 +764,51 @@ class MemoryExtractor:
                 RevisionInputPlanner,
             )
 
-            extractor = self
+            runner = LlmBatchRunner(self.structured_llm_client, model=self.model)
+
+            def plan_request(candidate: InputCandidate, *, load_images: bool) -> LlmRequest | None:
+                """Bound one whole-catalog request, or None when it cannot fit."""
+
+                def render():
+                    request = LlmRequest(
+                        make_prompt(candidate.catalog, candidate.mode.value),
+                        ProjectionFragmentMemoryExtractionResponse,
+                        self.fragment_output_tokens(candidate.catalog),
+                    )
+                    if not load_images:
+                        return request
+                    return revision_context.attach_images(request, candidate.catalog, fits=runner.fits)
+
+                return runner.fit(render)
+
+            def request_cost(request: LlmRequest, *, complete: bool = True) -> InputCost:
+                return InputCost(
+                    input_tokens=self.structured_llm_client.request_tokens(
+                        request.prompt, response_format=request.response_format,
+                        model=self.model, images=request.images,
+                    ),
+                    output_tokens=request.max_tokens,
+                    request_count=1,
+                    image_count=len(request.images),
+                    image_bytes=sum(len(image.body) for image in request.images),
+                    complete=complete,
+                )
 
             class RequestPolicy:
                 @staticmethod
-                def _prompt(candidate):
-                    return make_prompt(candidate.catalog, candidate.mode.value)
-
-                @staticmethod
                 def lower_bound(candidate: InputCandidate):
-                    text = RequestPolicy._prompt(candidate)
-                    output = extractor.fragment_output_tokens(candidate.catalog)
-                    if not extractor.structured_llm_client.request_fits(
-                        text,
-                        response_format=ProjectionFragmentMemoryExtractionResponse,
-                        max_tokens=output,
-                        model=extractor.model,
-                    ):
+                    request = plan_request(candidate, load_images=False)
+                    if request is None:
                         return None
-                    return InputCost(
-                        input_tokens=extractor.structured_llm_client.request_tokens(
-                            text,
-                            response_format=ProjectionFragmentMemoryExtractionResponse,
-                            model=extractor.model,
-                        ),
-                        output_tokens=output,
-                        request_count=1,
-                        complete=not any(
-                            fragment.kind.value == "artifact"
-                            for fragment in candidate.catalog.fragments
-                        ),
-                    )
+                    has_images = any(fragment.kind.value == "artifact" for fragment in candidate.catalog.fragments)
+                    return request_cost(request, complete=not has_images)
 
                 @staticmethod
                 def materialize(candidate: InputCandidate):
-                    text = RequestPolicy._prompt(candidate)
-                    output = extractor.fragment_output_tokens(candidate.catalog)
-                    selected_images = revision_context.fitting_images(
-                        candidate.catalog,
-                        text,
-                        client=extractor.structured_llm_client,
-                        response_format=ProjectionFragmentMemoryExtractionResponse,
-                        max_tokens=output,
-                        model=extractor.model,
-                    )
-                    if selected_images is None:
+                    request = plan_request(candidate, load_images=True)
+                    if request is None:
                         return None
-                    return PlannedTransport(
-                        InputCost(
-                            input_tokens=extractor.structured_llm_client.request_tokens(
-                                text,
-                                response_format=ProjectionFragmentMemoryExtractionResponse,
-                                model=extractor.model,
-                                images=selected_images,
-                            ),
-                            output_tokens=output,
-                            request_count=1,
-                            image_count=len(selected_images),
-                            image_bytes=sum(len(image.body) for image in selected_images),
-                        ),
-                        (candidate.catalog, text, selected_images),
-                    )
+                    return PlannedTransport(request_cost(request), (candidate.catalog, request.prompt, request.images))
 
             baseline = (
                 revision_context.projection.deltas[0].previous_unit_revision_id
@@ -840,17 +830,7 @@ class MemoryExtractor:
             catalog, prompt, images = plan.transport
             input_mode = plan.mode.value
             input_selection_reason = plan.selection_reason
-            estimated_input_cost = {
-                "input_tokens": plan.estimated_cost.input_tokens,
-                "output_tokens": plan.estimated_cost.output_tokens,
-                "request_count": plan.estimated_cost.request_count,
-                "image_count": plan.estimated_cost.image_count,
-                "image_bytes": plan.estimated_cost.image_bytes,
-                "total_tokens": plan.estimated_cost.total_tokens,
-            }
-        if not self.structured_llm_client.request_fits(prompt, response_format=ProjectionFragmentMemoryExtractionResponse,
-            max_tokens=self.fragment_output_tokens(catalog), model=self.model, images=images):
-            return MemoryExtractionResult(error_type="input_capacity_exceeded", error="planned extraction request exceeds configured capability")
+            estimated_input_cost = plan.estimated_cost.as_payload()
         started = perf_counter()
         metrics = {
             "structured_llm_calls": 1,
@@ -866,30 +846,12 @@ class MemoryExtractor:
             "catalog_digest": catalog.digest,
             "catalog_fragment_count": len(catalog.fragments),
         }
+        runner = LlmBatchRunner(self.structured_llm_client, model=self.model)
+        request = LlmRequest(
+            prompt, ProjectionFragmentMemoryExtractionResponse, self.fragment_output_tokens(catalog), tuple(images),
+        )
         try:
-            call_kwargs = {
-                "max_tokens": self.fragment_output_tokens(catalog),
-                "model": self.model,
-            }
-            if images:
-                call_kwargs["images"] = images
-            response = await invoke(prompt, **call_kwargs)
-        except StructuredLlmError as error:
-            return MemoryExtractionResult(
-                error_type="structured_llm_error",
-                error=str(error),
-                metadata={
-                    **metrics,
-                    "safe_error_code": error.error_code,
-                    "safe_validation_fields": [
-                        {"location": location, "type": rule_type}
-                        for location, rule_type in error.validation_fields
-                    ],
-                    "structured_llm_elapsed_ms": max(
-                        0, round((perf_counter() - started) * 1000)
-                    ),
-                },
-            )
+            response = await runner.run_one(request, call=invoke)
         except Exception as error:
             logger.error("Unexpected projection Fragment extraction error: %s", error)
             return MemoryExtractionResult(
@@ -897,6 +859,29 @@ class MemoryExtractor:
                 error=str(error),
                 metadata={
                     **metrics,
+                    "structured_llm_elapsed_ms": max(
+                        0, round((perf_counter() - started) * 1000)
+                    ),
+                },
+            )
+        if isinstance(response, ItemFailure):
+            if response.category == "capacity_exceeded":
+                return MemoryExtractionResult(
+                    error_type="input_capacity_exceeded",
+                    error="planned extraction request exceeds configured capability",
+                )
+            error = response.error
+            validation_fields = error.validation_fields if isinstance(error, StructuredLlmError) else ()
+            return MemoryExtractionResult(
+                error_type="structured_llm_error",
+                error=str(error),
+                metadata={
+                    **metrics,
+                    "safe_error_code": response.error_code,
+                    "safe_validation_fields": [
+                        {"location": location, "type": rule_type}
+                        for location, rule_type in validation_fields
+                    ],
                     "structured_llm_elapsed_ms": max(
                         0, round((perf_counter() - started) * 1000)
                     ),
