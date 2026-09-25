@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 
 import pytest
 
@@ -14,14 +15,24 @@ from memforge.memory.cross_document_relation import (
     CROSS_DOCUMENT_RELATION_RULES,
     CrossDocumentRelationLabel,
     CrossDocumentRelationPair,
-    RELATION_SUBJECT_EXCERPT_CHARS,
     RelationSubject,
     StructuredCrossDocumentRelationClassifier,
     load_relation_subjects,
 )
+from memforge.memory.evidence import EvidencePartKind, EvidenceRole
 from memforge.memory.relation_classifier import MemoryPairClassificationError
 from memforge.models import Memory, content_hash
+from memforge.pipeline.evidence_fragments import DEFAULT_MAX_PRESENTATION_CHARS
+from memforge.source_projection import AnchorKind, SourceAnchor, SourceObservationRevision
+from memforge.source_representation import (
+    MARKDOWN_STRUCTURAL_PROFILE,
+    representation_profile_for_observation_contract,
+)
 from tests.llm_fixture import FIXTURE_MODEL, fixture_budget
+from tests.relation_evidence_fixture import (
+    primary_evidence_unit_fixture,
+    primary_observation_revision_fixture,
+)
 
 
 def _subject(memory_id: str, statement: str) -> RelationSubject:
@@ -32,7 +43,8 @@ def _subject(memory_id: str, statement: str) -> RelationSubject:
         memory_type="decision",
         source_type="jira",
         document_title=f"Ticket for {memory_id}",
-        primary_excerpt=f"Excerpt for {memory_id}",
+        evidence_time="2026-03-25",
+        evidence=(f"Evidence for {memory_id}",),
     )
 
 
@@ -167,49 +179,101 @@ async def test_classifier_halves_a_request_that_exceeds_the_route_capacity() -> 
 
 
 @pytest.mark.asyncio
-async def test_prompt_shows_statements_without_identity_sources_or_dates() -> None:
+async def test_prompt_shows_statement_context_without_identity() -> None:
     client = _Client()
     challenger = replace(
         _subject("mem-challenger-secret-id", "Payroll runs weekly."),
         document_title="Payroll design",
-        primary_excerpt="Payroll runs weekly for all employees.",
+        evidence_time="2026-04-10",
+        evidence=("Payroll runs weekly for all employees.",),
     )
     candidate = replace(
         _subject("mem-candidate-secret-id", "Payroll runs monthly."),
         document_title="Payroll ticket",
-        primary_excerpt=None,
+        evidence_time=None,
+        evidence=(),
     )
 
     await _classifier(client).classify((CrossDocumentRelationPair(challenger=challenger, candidate=candidate),))
 
     [prompt] = client.prompts
-    for shown in ("Payroll runs weekly.", "Payroll runs monthly.", "Payroll design", "Payroll runs weekly for all"):
-        assert shown in prompt
-    for hidden in ("secret-id", "memory_id", "content_hash", "source_id", "primary_excerpt\": null", "2026-"):
+    groups = json.loads(prompt.split("<statement_pair_groups>\n", 1)[1].split("\n</statement_pair_groups>", 1)[0])
+    assert groups == [
+        {
+            "statement": {
+                "statement": "Payroll runs weekly.",
+                "memory_type": "decision",
+                "source_type": "jira",
+                "document_title": "Payroll design",
+                "evidence_time": "2026-04-10",
+                "evidence": ["Payroll runs weekly for all employees."],
+            },
+            "compared_with": [
+                {
+                    "pair_index": 0,
+                    "statement": {
+                        "statement": "Payroll runs monthly.",
+                        "memory_type": "decision",
+                        "source_type": "jira",
+                        "document_title": "Payroll ticket",
+                        "evidence_time": None,
+                        "evidence": [],
+                    },
+                }
+            ],
+        }
+    ]
+    for hidden in ("secret-id", "memory_id", "content_hash", "source_id"):
         assert hidden not in prompt
 
 
-def test_rules_are_domain_neutral_and_prefer_none_when_unsure() -> None:
-    rules = CROSS_DOCUMENT_RELATION_RULES.lower()
+def test_rules_define_the_same_situation_domain_neutrally_and_prefer_none() -> None:
+    rules = " ".join(CROSS_DOCUMENT_RELATION_RULES.lower().split())
     for label in CrossDocumentRelationLabel:
         assert f"- {label.value}:" in rules
+    for condition in (
+        "the same object",
+        "the same scope",
+        "the same kind of statement",
+        "the same occurrence",
+        "the same lasting state or decision are about the same situation",
+        "or the inputs do not establish it",
+        "the later statement replaces the earlier one",
+        "neither replaces the other over time",
+    ):
+        assert condition in rules
     assert "when you are not certain, the label is none" in rules
+    assert "both can hold without stating the same knowledge" in rules
     assert "more specific than the other" in rules
+    assert "judge the statements themselves" not in rules
     for dimension in ("version", "country", "environment", "ticket"):
         assert dimension not in rules
 
 
-def test_subject_manifest_round_trips() -> None:
+def test_subject_manifest_round_trips_and_requires_the_evidence_fields() -> None:
     subject = _subject("mem-1", "Payroll runs weekly.")
+    manifest = subject.to_manifest()
 
-    assert RelationSubject.from_manifest(subject.to_manifest()) == subject
+    assert RelationSubject.from_manifest(manifest) == subject
+    assert RelationSubject.from_manifest({**manifest, "evidence_time": None}).evidence_time is None
+    for field_name in ("evidence_time", "evidence"):
+        with pytest.raises(KeyError):
+            RelationSubject.from_manifest({key: value for key, value in manifest.items() if key != field_name})
+
+
+class _Document:
+    def __init__(self, title: str, last_modified: datetime) -> None:
+        self.title = title
+        self.last_modified = last_modified
 
 
 class _SubjectStore:
-    def __init__(self, units, documents) -> None:
+    def __init__(self, units, documents, revisions=None) -> None:
         self.units = units
         self.documents = documents
+        self.revisions = revisions or {}
         self.document_reads: list[str] = []
+        self.revision_reads: list[str] = []
 
     async def get_memory_evidence_units(self, memory_id):
         return self.units.get(memory_id, ())
@@ -218,31 +282,234 @@ class _SubjectStore:
         self.document_reads.append(doc_id)
         return self.documents.get(doc_id)
 
+    async def get_current_source_observation_revisions(self, source_unit_id):
+        self.revision_reads.append(source_unit_id)
+        return self.revisions.get(source_unit_id, {})
+
+
+def _canonical_json(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _jira_revision(memory_id: str, observation_type: str, value, observed_at: str | None) -> SourceObservationRevision:
+    return replace(
+        primary_observation_revision_fixture(memory_id),
+        content=_canonical_json(value),
+        observed_at=observed_at,
+        evidence_profile=representation_profile_for_observation_contract(
+            source_type="jira",
+            observation_type=observation_type,
+        ),
+    )
+
+
+def _memory(memory_id: str) -> Memory:
+    return Memory(id=memory_id, memory_type="fact", content=memory_id, content_hash=content_hash(memory_id))
+
+
+SYNC_TIME = datetime(2026, 7, 17, 3, 0, tzinfo=timezone.utc)
+
 
 @pytest.mark.asyncio
-async def test_subjects_come_from_the_current_primary_evidence_and_bound_the_excerpt() -> None:
-    from tests.relation_evidence_fixture import primary_evidence_unit_fixture
+async def test_subject_shows_readable_record_fields_and_the_observation_revision_time() -> None:
+    history = {
+        "author": {"displayName": "Dev", "avatarUrls": {"48x48": "https://avatars.example.test/dev.png"}},
+        "created": "2026-03-25T23:30:00.000-0800",
+        "items": [{"field": "status", "fromString": "Open", "toString": "Closed", "from": "1", "to": "6"}],
+    }
+    core = {
+        "summary": "Rename the enumeration",
+        "description": "The enumeration is **RETRO_CHAIN**.",
+        "assignee": {"accountId": "acc-1", "displayName": "Dev", "avatarUrls": {"48x48": "https://avatars.example.test/a.png"}},
+        "labels": ["payroll"],
+    }
+    unit = primary_evidence_unit_fixture("mem-jira")
+    primary = unit.items[0]
+    required = replace(
+        primary,
+        reference_id="ref-required",
+        role=EvidenceRole.REQUIRED,
+        anchor=replace(primary.anchor, observation_id="obs-core", observation_revision_id="rev-core"),
+    )
+    store = _SubjectStore(
+        units={"mem-jira": (replace(unit, items=(primary, required)),)},
+        documents={"doc-mem-jira": _Document("PAY-1: Rename", SYNC_TIME)},
+        revisions={
+            "unit-mem-jira": {
+                "obs-mem-jira": _jira_revision("mem-jira", "changelog", history, history["created"]),
+                "obs-core": replace(_jira_revision("mem-jira", "issue_core", core, None), id="rev-core", observation_id="obs-core"),
+            }
+        },
+    )
 
-    long_unit = primary_evidence_unit_fixture("mem-long")
-    long_item = replace(long_unit.items[0], excerpt="x" * (RELATION_SUBJECT_EXCERPT_CHARS + 1))
-    stale_unit = replace(primary_evidence_unit_fixture("mem-long"), evidence_unit_id="eu-old", current=False, doc_id="doc-old")
+    subject = (await load_relation_subjects(store, (_memory("mem-jira"),)))["mem-jira"]
+
+    assert subject.document_title == "PAY-1: Rename"
+    assert subject.evidence_time == "2026-03-26"
+    assert subject.evidence == (
+        "created: 2026-03-25T23:30:00.000-0800\n"
+        "items/0/field: status\n"
+        "items/0/fromString: Open\n"
+        "items/0/toString: Closed",
+        "assignee: accountId=acc-1, displayName=Dev\n"
+        "description: The enumeration is **RETRO_CHAIN**.\n"
+        "labels: payroll\n"
+        "summary: Rename the enumeration",
+    )
+    assert "avatar" not in json.dumps(subject.to_manifest())
+
+
+@pytest.mark.asyncio
+async def test_record_fields_keep_each_array_item_together_and_skip_empty_values() -> None:
+    history = {
+        "created": "2026-04-27T04:22:39.861+0000",
+        "items": [
+            {"field": "Defect Review Status", "fromString": None, "toString": "Fixed"},
+            {"field": "status", "fromString": "Work In Progress", "toString": "Resolved"},
+        ],
+    }
+    core = {"summary": "Improper error message", "labels": []}
+    unit = primary_evidence_unit_fixture("mem-jira")
+    primary = unit.items[0]
+    required = replace(
+        primary,
+        reference_id="ref-required",
+        role=EvidenceRole.REQUIRED,
+        anchor=replace(primary.anchor, observation_id="obs-core", observation_revision_id="rev-core"),
+    )
+    store = _SubjectStore(
+        units={"mem-jira": (replace(unit, items=(primary, required)),)},
+        documents={"doc-mem-jira": _Document("PAY-2: Error message", SYNC_TIME)},
+        revisions={
+            "unit-mem-jira": {
+                "obs-mem-jira": _jira_revision("mem-jira", "changelog", history, history["created"]),
+                "obs-core": replace(_jira_revision("mem-jira", "issue_core", core, None), id="rev-core", observation_id="obs-core"),
+            }
+        },
+    )
+
+    subject = (await load_relation_subjects(store, (_memory("mem-jira"),)))["mem-jira"]
+
+    assert subject.evidence == (
+        "created: 2026-04-27T04:22:39.861+0000\n"
+        "items/0/field: Defect Review Status\n"
+        "items/0/toString: Fixed\n"
+        "items/1/field: status\n"
+        "items/1/fromString: Work In Progress\n"
+        "items/1/toString: Resolved",
+        "summary: Improper error message",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_type", "evidence_time"),
+    [("confluence", "2026-04-10"), ("github_repo", None), ("jira", None)],
+)
+async def test_document_time_counts_only_where_it_is_the_revision_time(source_type: str, evidence_time) -> None:
+    unit = replace(primary_evidence_unit_fixture("mem-page"), source_type=source_type)
+    store = _SubjectStore(
+        units={"mem-page": (unit,)},
+        documents={"doc-mem-page": _Document("Page", datetime(2026, 4, 10, 9, 0, tzinfo=timezone.utc))},
+        revisions={"unit-mem-page": {"obs-mem-page": replace(primary_observation_revision_fixture("mem-page"), observed_at=None)}},
+    )
+
+    subject = (await load_relation_subjects(store, (_memory("mem-page"),)))["mem-page"]
+
+    assert subject.evidence_time == evidence_time
+    assert subject.evidence == ("Evidence for mem-page.",)
+
+
+@pytest.mark.asyncio
+async def test_document_time_needs_the_anchored_revision_to_be_current() -> None:
+    unit = replace(primary_evidence_unit_fixture("mem-page"), source_type="confluence")
+    newer = replace(primary_observation_revision_fixture("mem-page"), id="rev-newer", observed_at=None)
+    store = _SubjectStore(
+        units={"mem-page": (unit,)},
+        documents={"doc-mem-page": _Document("Page", datetime(2026, 4, 10, 9, 0, tzinfo=timezone.utc))},
+        revisions={"unit-mem-page": {"obs-mem-page": newer}},
+    )
+
+    subject = (await load_relation_subjects(store, (_memory("mem-page"),)))["mem-page"]
+
+    assert subject.evidence_time is None
+    assert subject.evidence == ()
+
+
+@pytest.mark.asyncio
+async def test_a_non_text_primary_or_an_observation_beyond_the_fragment_catalog_shows_no_evidence_text() -> None:
+    image = primary_evidence_unit_fixture("mem-image")
+    page = primary_evidence_unit_fixture("mem-page")
+    oversized = "\n\n".join(
+        f"Paragraph {index}." for index in range(DEFAULT_MAX_PRESENTATION_CHARS // len("Paragraph 0.") + 1)
+    )
     store = _SubjectStore(
         units={
-            "mem-long": (stale_unit, replace(long_unit, items=(long_item,))),
-            "mem-plain": (),
+            "mem-image": (replace(image, items=(replace(image.items[0], kind=EvidencePartKind.ARTIFACT),)),),
+            "mem-page": (page,),
         },
-        documents={"doc-mem-long": type("Doc", (), {"title": "Current page"})()},
-    )
-    memories = (
-        Memory(id="mem-long", memory_type="fact", content="Long", content_hash=content_hash("Long")),
-        Memory(id="mem-plain", memory_type="fact", content="Plain", content_hash=content_hash("Plain")),
+        documents={},
+        revisions={
+            "unit-mem-image": {"obs-mem-image": primary_observation_revision_fixture("mem-image")},
+            "unit-mem-page": {"obs-mem-page": replace(primary_observation_revision_fixture("mem-page"), content=oversized)},
+        },
     )
 
-    subjects = await load_relation_subjects(store, memories)
+    subjects = await load_relation_subjects(store, (_memory("mem-image"), _memory("mem-page")))
 
-    assert subjects["mem-long"].document_title == "Current page"
-    assert len(subjects["mem-long"].primary_excerpt) == RELATION_SUBJECT_EXCERPT_CHARS
+    assert subjects["mem-image"].evidence == ()
+    assert subjects["mem-page"].evidence == ()
+
+
+@pytest.mark.asyncio
+async def test_evidence_without_its_exact_revision_keeps_only_a_range_excerpt() -> None:
+    whole = primary_evidence_unit_fixture("mem-old")
+    ranged_item = replace(
+        whole.items[0],
+        anchor=SourceAnchor(
+            kind=AnchorKind.REVISION_RANGE,
+            observation_id="obs-mem-old",
+            observation_revision_id="rev-mem-old",
+            range_start=0,
+            range_end=len("Raw observation for mem-old"),
+        ),
+    )
+    changed = replace(primary_observation_revision_fixture("mem-old"), id="rev-newer")
+    store = _SubjectStore(
+        units={
+            "mem-old": (replace(whole, current=False),),
+            "mem-ranged": (replace(whole, current=False, items=(ranged_item,)),),
+        },
+        documents={"doc-mem-old": _Document("Page", SYNC_TIME)},
+        revisions={"unit-mem-old": {"obs-mem-old": changed}},
+    )
+
+    subjects = await load_relation_subjects(store, (_memory("mem-old"), _memory("mem-ranged")))
+
+    assert subjects["mem-old"].evidence == ()
+    assert subjects["mem-old"].evidence_time is None
+    assert subjects["mem-ranged"].evidence == ("Raw observation for mem-old",)
+    assert store.document_reads == ["doc-mem-old"]
+    assert store.revision_reads == ["unit-mem-old"]
+
+
+@pytest.mark.asyncio
+async def test_subjects_come_from_the_current_evidence_unit() -> None:
+    current = primary_evidence_unit_fixture("mem-a")
+    stale = replace(current, evidence_unit_id="eu-old", current=False, doc_id="doc-old")
+    page = replace(primary_observation_revision_fixture("mem-a"), evidence_profile=MARKDOWN_STRUCTURAL_PROFILE)
+    store = _SubjectStore(
+        units={"mem-a": (stale, current), "mem-plain": ()},
+        documents={"doc-mem-a": _Document("Current page", SYNC_TIME)},
+        revisions={"unit-mem-a": {"obs-mem-a": page}},
+    )
+
+    subjects = await load_relation_subjects(store, (_memory("mem-a"), _memory("mem-plain")))
+
+    assert subjects["mem-a"].document_title == "Current page"
+    assert subjects["mem-a"].evidence == ("Evidence for mem-a.",)
+    assert subjects["mem-a"].evidence_time == "2026-03-25"
     assert subjects["mem-plain"] == RelationSubject(
-        memory_id="mem-plain", content_hash=content_hash("Plain"), statement="Plain", memory_type="fact",
+        memory_id="mem-plain", content_hash=content_hash("mem-plain"), statement="mem-plain", memory_type="fact",
     )
-    assert store.document_reads == ["doc-mem-long"]
+    assert store.document_reads == ["doc-mem-a"]
