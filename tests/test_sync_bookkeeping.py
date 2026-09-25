@@ -33,7 +33,6 @@ from memforge.memory.engine import (
     SourceUnitLifecycleDeferred,
     SourceUnitLifecycleExecutionError,
 )
-from memforge.memory.evidence import SupportScopeVersion
 from memforge.memory.lifecycle_planner import (
     lifecycle_access_context_hash,
     lifecycle_plan_id,
@@ -3329,9 +3328,6 @@ class NoopMemoryEngine:
             stale_guard=StaleGuard(
                 observation_revision_ids=(),
                 support_set_hashes={},
-                support_scope_version=(
-                    await self.db.get_support_scope_version()
-                ),
             ),
             mutations=(),
         )
@@ -5266,11 +5262,6 @@ async def _stage_completed_v9_recovery_attempt(
         access_policy="workspace",
         owner_user_id="dev",
     )
-    await db.db.execute(
-        "UPDATE system_contract_markers SET marker_value = ? WHERE marker_key = 'support_scope_version'",
-        (SupportScopeVersion.EVIDENCE_UNIT_SET_V2.value,),
-    )
-    await db.db.commit()
     body = "# Current rule\n\nUse the active extraction contract for recovery.\n"
     now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
     item = ContentItem(
@@ -12735,17 +12726,9 @@ async def test_new_document_lifecycle_retry_reuses_staged_document(
         access_policy="workspace",
         owner_user_id="dev",
     )
-    legacy_delete_calls = 0
-
-    async def reject_legacy_delete(doc_id: str) -> list[str]:
-        nonlocal legacy_delete_calls
-        legacy_delete_calls += 1
-        raise ValueError("direct configured-source Memory write rejected after cutover; projected lifecycle required")
-
     async def reject_projected_delete(doc_id: str) -> None:
         raise AssertionError(f"sync retry must not delete staged Document {doc_id}")
 
-    monkeypatch.setattr(db, "delete_document", reject_legacy_delete)
     monkeypatch.setattr(db, "delete_projected_document", reject_projected_delete)
 
     class FailOnceProjectedMemoryEngine(NoopMemoryEngine):
@@ -12778,7 +12761,6 @@ async def test_new_document_lifecycle_retry_reuses_staged_document(
     assert state.docs_processed == 1
     assert state.docs_failed == 0
     assert engine.calls == 2
-    assert legacy_delete_calls == 0
     assert source_unit is not None
     assert await db.get_current_source_unit_revision(source_unit.id) is not None
 

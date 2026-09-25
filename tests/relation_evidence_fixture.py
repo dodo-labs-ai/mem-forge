@@ -7,7 +7,6 @@ from memforge.memory.evidence import (
     EvidenceRole,
     MemoryEvidenceItemProjection,
     MemoryEvidenceUnitProjection,
-    SupportScopeVersion,
 )
 from memforge.source_projection import AnchorKind, SourceAnchor, SourceObservationRevision
 from memforge.source_representation import MARKDOWN_STRUCTURAL_PROFILE
@@ -36,7 +35,6 @@ def primary_evidence_unit_fixture(memory_id: str) -> MemoryEvidenceUnitProjectio
     return MemoryEvidenceUnitProjection(
         evidence_unit_id=f"eu-{memory_id}",
         support_ids=(f"support-{memory_id}",),
-        support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
         source_id=f"src-{memory_id}",
         source_type="jira",
         source_unit_id=f"unit-{memory_id}",

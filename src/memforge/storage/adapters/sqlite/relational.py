@@ -24,10 +24,8 @@ from memforge.memory.evidence import (
     CandidateMemory,
     EvidenceReference,
     EvidenceUnit,
-    MemorySupportAssertion,
     MemoryEvidenceUnitProjection,
     MemoryUnitSupportAssertion,
-    SupportScopeVersion,
     RelationOutcomeBundle,
 )
 from memforge.memory.lifecycle_plan import (
@@ -59,7 +57,7 @@ from memforge.models import (
 from memforge.retrieval.access_predicate import visible_sql
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.source_activity import SourceActivityLease
-from memforge.source_artifacts import SourceArtifactEvidence, SourceArtifactRevision
+from memforge.source_artifacts import SourceArtifactRevision
 from memforge.source_projection import (
     SourceObservationRevision,
     SourceProjection,
@@ -742,12 +740,6 @@ class SqliteRelationalStore:
     ) -> SourceArtifactRevision | None:
         return await self._db.get_source_artifact_revision(observation_revision_id)
 
-    async def get_memory_source_artifacts(
-        self,
-        memory_id: str,
-    ) -> tuple[SourceArtifactEvidence, ...]:
-        return await self._db.get_memory_source_artifacts(memory_id)
-
     async def get_memory_evidence_units(
         self,
         memory_id: str,
@@ -1023,17 +1015,6 @@ class SqliteRelationalStore:
             references,
         )
 
-    async def upsert_memory_support_assertion(
-        self,
-        assertion: MemorySupportAssertion,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> None:
-        await self._db.upsert_memory_support_assertion(
-            assertion,
-            source_activity=source_activity,
-        )
-
     async def upsert_memory_unit_support_assertion(
         self,
         assertion: MemoryUnitSupportAssertion,
@@ -1045,28 +1026,8 @@ class SqliteRelationalStore:
             source_activity=source_activity,
         )
 
-    async def get_support_scope_version(self) -> SupportScopeVersion:
-        return await self._db.get_support_scope_version()
-
-    async def report_support_scope_cutover(self):
-        return await self._db.report_support_scope_cutover()
-
-    async def apply_support_scope_v2_cutover(
-        self,
-        *,
-        expected_report_id: str,
-        owner_id: str,
-    ):
-        return await self._db.apply_support_scope_v2_cutover(
-            expected_report_id=expected_report_id,
-            owner_id=owner_id,
-        )
-
     async def get_memory_support_set_hash(self, memory_id: str) -> str:
         return await self._db.get_memory_support_set_hash(memory_id)
-
-    async def get_active_memory_support_reference_ids(self, memory_id: str) -> tuple[str, ...]:
-        return await self._db.get_active_memory_support_reference_ids(memory_id)
 
     async def get_active_memory_support_unit_ids(self, memory_id: str) -> tuple[str, ...]:
         return await self._db.get_active_memory_support_unit_ids(memory_id)
@@ -1109,12 +1070,6 @@ class SqliteRelationalStore:
             memory_ids,
             source_id=source_id,
         )
-
-    async def get_source_unit_support_reference_ids(
-        self,
-        source_unit_id: str,
-    ) -> dict[str, tuple[str, ...]]:
-        return dict(await self._db.get_source_unit_support_reference_ids(source_unit_id))
 
     async def get_source_unit_support_unit_ids(
         self,
@@ -1448,21 +1403,6 @@ class SqliteRelationalStore:
             excerpt,
             support_kind=support_kind,
             source_updated_at=source_updated_at,
-        )
-
-    async def remove_memory_source(
-        self,
-        memory_id: str,
-        doc_id: str,
-        *,
-        source_id: str,
-        retire_reason: str = "source_deleted",
-    ) -> bool:
-        return await self._db.remove_memory_source(
-            memory_id,
-            doc_id,
-            source_id=source_id,
-            retire_reason=retire_reason,
         )
 
     async def promote_to_workspace(

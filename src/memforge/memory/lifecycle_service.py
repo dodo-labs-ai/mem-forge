@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
@@ -35,6 +36,8 @@ from memforge.models import (
     generate_memory_id,
 )
 from memforge.storage.database import Database
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryLifecycleError(Exception):
@@ -208,7 +211,7 @@ class MemoryLifecycleService:
                 raise MemoryLifecycleConflict(exc.code) from exc
             return RetireMemoryResult(memory_id=memory.id, status="retired")
         support_state = (await self.db.get_active_memory_support_states((memory.id,)))[memory.id]
-        if support_state.support_ids:
+        if support_state.unit_ids:
             raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review")
         try:
             await self.memory_store.retire_memory(memory.id, reason=reason)
@@ -279,7 +282,7 @@ class MemoryLifecycleService:
                 disposition = "not_private"
             else:
                 support_state = (await self.db.get_active_memory_support_states((memory.id,)))[memory.id]
-                if support_state.support_ids:
+                if support_state.unit_ids:
                     disposition = "active_support"
                 else:
                     try:
@@ -490,7 +493,7 @@ class MemoryLifecycleService:
             new_memory.id = replacement_id
         else:
             support_state = (await self.db.get_active_memory_support_states((old.id,)))[old.id]
-            if support_state.support_ids:
+            if support_state.unit_ids:
                 raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review")
             correction_doc_id = f"correction-{new_memory.id}"
             await self._write_correction_document(
@@ -518,7 +521,7 @@ class MemoryLifecycleService:
                 # A concurrent projected write may attach support after the
                 # preflight.  Remove the not-yet-authoritative correction
                 # document and return the same explicit conflict.
-                await self.db.delete_document(correction_doc_id)
+                await self._discard_correction_document(correction_doc_id)
                 if "active source support" in str(exc):
                     raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review") from exc
                 raise
@@ -587,9 +590,9 @@ class MemoryLifecycleService:
             )
 
         support_state = (await self.db.get_active_memory_support_states((old.id,)))[old.id]
-        expected_support_set_hash = support_state.support_set_hash if support_state.support_ids else None
+        expected_support_set_hash = support_state.support_set_hash if support_state.unit_ids else None
         legacy_configured_source_ids: tuple[str, ...] = ()
-        if not support_state.support_ids:
+        if not support_state.unit_ids:
             memory_sources = await self.db.get_memory_sources(old.id)
             legacy_configured_source_ids = tuple(
                 sorted(
@@ -606,7 +609,7 @@ class MemoryLifecycleService:
             supporting_source_ids=support_state.source_ids,
             legacy_configured_source_ids=legacy_configured_source_ids,
         )
-        if not can_apply and not support_state.support_ids and not legacy_configured_source_ids:
+        if not can_apply and not support_state.unit_ids and not legacy_configured_source_ids:
             raise MemoryLifecycleConflict("workspace_memory_correction_requires_management_authority")
 
         now = datetime.now(timezone.utc)
@@ -665,7 +668,7 @@ class MemoryLifecycleService:
                     review=review,
                 )
             except Exception:
-                await self.db.delete_document(correction_doc_id)
+                await self._discard_correction_document(correction_doc_id)
                 raise
             return ProposeMemoryCorrectionResult(
                 memory_id=old.id,
@@ -778,6 +781,19 @@ class MemoryLifecycleService:
         **kwargs,
     ) -> None:
         await self.db.upsert_document(self._build_correction_document(**kwargs))
+
+    async def _discard_correction_document(self, doc_id: str) -> None:
+        """Remove a correction document whose Memory write did not commit.
+
+        The failed write left the document without Memory provenance, so the
+        projected document deletion applies. A cleanup failure is logged and
+        never replaces the error that caused the rollback.
+        """
+
+        try:
+            await self.db.delete_projected_document(doc_id)
+        except Exception:
+            logger.exception("Failed to discard uncommitted correction document %s", doc_id)
 
     async def _write_user_memory_document(
         self,

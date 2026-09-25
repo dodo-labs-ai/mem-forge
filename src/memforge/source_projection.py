@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Mapping, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from memforge.models import ContentItem, NormalizedContent, RawContent
     from memforge.source_artifacts import (
-        SourceArtifactEvidence,
         SourceArtifactRevision,
         StoredSourceArtifact,
         SourceArtifactSummary,
@@ -570,10 +569,6 @@ class ProjectionStore(Protocol):
         self,
         observation_revision_id: str,
     ) -> SourceArtifactRevision | None: ...
-    async def get_memory_source_artifacts(
-        self,
-        memory_id: str,
-    ) -> tuple[SourceArtifactEvidence, ...]: ...
     async def find_source_unit_by_document_id(
         self,
         source_id: str,

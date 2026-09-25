@@ -648,12 +648,15 @@ async def test_lifecycle_commit_rejection_returns_failure_bundle_without_success
         await engine.prepare_and_commit_projected_lifecycle(
             projection=projection,
             doc_id="confluence-123",
-            raw_memories=[
-                RawMemory(
-                    content="Service uses PostgreSQL 15.",
-                    memory_type="fact",
-                )
-            ],
+            raw_memories=_selected(
+                projection,
+                [
+                    RawMemory(
+                        content="Service uses PostgreSQL 15.",
+                        memory_type="fact",
+                    )
+                ],
+            ),
             doc_type="design-doc",
             project_key="ENG",
             repo_identifier=None,
@@ -2310,68 +2313,6 @@ async def _add_same_unit_support_alternative(
         ),
     )
     return unit_id
-
-
-def test_exact_unique_quote_materializes_revision_range_primary_anchor() -> None:
-    projection = _projection(
-        run_id="projection-exact-range",
-        body="Intro.\n\nA7 is removed.\n\nClosing note.",
-    )
-    quote = "A7 is removed."
-    evidence = build_projected_claim_evidence(
-        projection=projection,
-        raw_memories=(
-            RawMemory(
-                content="A7 is removed.",
-                memory_type="decision",
-                evidence_quote=quote,
-            ),
-        ),
-        doc_id="confluence-123",
-        source_type="confluence",
-        project_key="ENG",
-        visibility="workspace",
-        owner_user_id=None,
-        repo_identifier=None,
-        access_context_hash="workspace-eng",
-        extractor_run_id=projection.run_id,
-    )
-
-    [primary] = [reference for reference in evidence.references if reference.role is EvidenceRole.PRIMARY]
-    revision = projection.observation_revisions[0]
-    expected_start = revision.content.index(quote)
-    assert primary.anchor.kind is AnchorKind.REVISION_RANGE
-    assert primary.anchor.observation_revision_id == revision.id
-    assert primary.anchor.range_start == expected_start
-    assert primary.anchor.range_end == expected_start + len(quote)
-
-
-def test_repeated_quote_keeps_conservative_whole_observation_anchor() -> None:
-    projection = _projection(
-        run_id="projection-ambiguous-range",
-        body="Repeated fact.\n\nRepeated fact.",
-    )
-    evidence = build_projected_claim_evidence(
-        projection=projection,
-        raw_memories=(
-            RawMemory(
-                content="Repeated fact.",
-                memory_type="fact",
-                evidence_quote="Repeated fact.",
-            ),
-        ),
-        doc_id="confluence-123",
-        source_type="confluence",
-        project_key="ENG",
-        visibility="workspace",
-        owner_user_id=None,
-        repo_identifier=None,
-        access_context_hash="workspace-eng",
-        extractor_run_id=projection.run_id,
-    )
-
-    [primary] = [reference for reference in evidence.references if reference.role is EvidenceRole.PRIMARY]
-    assert primary.anchor.kind is AnchorKind.WHOLE_OBSERVATION
 
 
 @pytest.mark.asyncio

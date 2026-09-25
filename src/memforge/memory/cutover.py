@@ -15,11 +15,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from memforge.memory.evidence import (
-    EvidenceContentProvenance,
-    EvidenceReference,
     EvidenceRole,
-    EvidenceUnit,
-    MemorySupportAssertion,
 )
 from memforge.memory.lifecycle_plan import (
     CutoverFindingReason,
@@ -41,8 +37,6 @@ from memforge.models import (
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_activity import SourceActivityConflict, SourceActivityLease
 from memforge.source_projection import (
-    AnchorKind,
-    SourceAnchor,
     SourceObservationRevision,
     SourceProjection,
 )
@@ -865,70 +859,8 @@ async def _persist_backfill_lineage(
     repair_metadata: Mapping[str, object] | None = None,
     lifecycle_job_id: str | None = None,
 ) -> None:
-    activity = await _renew_lifecycle_authority(db, lifecycle_job_id)
-    evidence_unit_id = _stable_id("eu-backfill", source_id, memory_id, revision.id)
-    access_hash = _access_context_hash(provenance)
-    legacy_excerpt = provenance.excerpt or ""
-    exact_excerpt = (
-        legacy_excerpt
-        if legacy_excerpt and legacy_excerpt in revision.content
-        else None
-    )
-    unit = EvidenceUnit(
-        id=evidence_unit_id,
-        source_id=source_id,
-        doc_id=provenance.doc_id,
-        doc_revision_id=revision.id,
-        source_type=provenance.source_type,
-        source_anchor=observation_id,
-        source_lineage_id=source_unit_id,
-        project_key=provenance.project_key,
-        visibility=provenance.visibility,
-        owner_user_id=provenance.owner_user_id,
-        repo_identifier=provenance.repo_identifier,
-        content=exact_excerpt or "",
-        excerpt=exact_excerpt,
-        evidence_provenance=(
-            EvidenceContentProvenance.SOURCE_EXCERPT
-            if exact_excerpt
-            else EvidenceContentProvenance.LEGACY_LIMITED
-        ),
-        source_metadata={
-            "backfill": True,
-            "source_unit_id": source_unit_id,
-            **dict(repair_metadata or {}),
-        },
-        access_context_hash=access_hash,
-    )
-    await db.upsert_evidence_unit(
-        unit,
-        source_activity=activity,
-    )
-    references = await db.record_evidence_references(
-        unit.id,
-        (
-            EvidenceReference(
-                role=EvidenceRole.PRIMARY,
-                anchor=SourceAnchor(
-                    kind=AnchorKind.WHOLE_OBSERVATION,
-                    observation_id=observation_id,
-                    observation_revision_id=revision.id,
-                ),
-                evidence_unit_id=unit.id,
-            ),
-        ),
-        source_activity=activity,
-    )
-    reference = references[0]
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id=_stable_id("support", memory_id, reference.id),
-            memory_id=memory_id,
-            evidence_reference_id=reference.id or "",
-            source_id=source_id,
-            access_context_hash=access_hash,
-        ),
-        source_activity=activity,
+    raise ValueError(
+        "lifecycle backfill cannot record Support: it only produced reference-scoped Support"
     )
 
 
@@ -994,20 +926,6 @@ def _historical_item_extra(
     if message_index + 1 < len(parts):
         extra["conversation_id"] = parts[message_index + 1]
     return extra
-
-
-def _access_context_hash(provenance: LegacyMemoryProvenance) -> str:
-    payload = json.dumps(
-        {
-            "visibility": provenance.visibility,
-            "owner_user_id": provenance.owner_user_id,
-            "project_key": provenance.project_key,
-            "repo_identifier": provenance.repo_identifier,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _stable_id(prefix: str, *values: object) -> str:

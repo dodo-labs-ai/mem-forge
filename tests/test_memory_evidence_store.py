@@ -1376,39 +1376,6 @@ async def test_purge_memory_does_not_delete_non_materializing_evidence_unit(db: 
 
 
 @pytest.mark.asyncio
-async def test_remove_memory_source_preserves_shared_evidence_audit(db: Database) -> None:
-    await db.upsert_source(
-        id="src-1",
-        type="confluence",
-        name="src-1",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="owner-1",
-    )
-    await db.upsert_document(_document("doc-1"))
-    await db.upsert_evidence_unit(_unit())
-    await db.insert_memory(_memory("mem-source-evidence"))
-    await db.insert_memory(_memory("mem-other-evidence"))
-    await db.add_memory_source("mem-source-evidence", "doc-1", "confluence", source_updated_at=None)
-    await _record_run(db, action=LifecycleAction.ATTACH_SUPPORT, result_memory_id="mem-source-evidence")
-    await db.replace_evidence_relations(
-        "eu-1",
-        [
-            _relation("mem-source-evidence"),
-            _relation("mem-other-evidence"),
-        ],
-    )
-
-    await db.remove_memory_source("mem-source-evidence", "doc-1", source_id="src-1")
-
-    assert await db.get_evidence_unit("eu-1") is not None
-    assert await db.get_relation_run("rel-run-1") is not None
-    assert [item.memory_id for item in await db.get_evidence_relations("eu-1")] == [
-        "mem-other-evidence"
-    ]
-
-
-@pytest.mark.asyncio
 async def test_mark_pending_review_with_case_is_idempotent_for_same_review_id(db: Database) -> None:
     await db.insert_memory(_memory("mem-incumbent"))
     await db.insert_memory(_memory("mem-review-repeat"))

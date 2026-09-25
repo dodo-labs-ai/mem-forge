@@ -104,7 +104,8 @@ from memforge.source_derivation import (
 )
 from memforge.pipeline.extraction_contract import (
     CONTRACT_SUPERSEDED,
-    active_projection_extraction_contract,
+    PROJECTION_EXTRACTION_V9,
+    projection_extraction_contract,
 )
 from memforge.pipeline.projection_fragments import (
     compile_projection_fragment_catalog,
@@ -1724,9 +1725,7 @@ class GeneSyncOrchestrator:
                 "completed",
             ),
         )
-        active_contract = active_projection_extraction_contract(
-            await self.db.get_support_scope_version()
-        )
+        active_contract = projection_extraction_contract(PROJECTION_EXTRACTION_V9)
         latest_by_projection: dict[
             tuple[int | None, str, str, str],
             SourceDerivationAttempt,
@@ -3198,9 +3197,7 @@ class GeneSyncOrchestrator:
     ) -> MemoryExtractionResult:
         """Execute durable extraction work for one Source Unit revision."""
 
-        active_contract = active_projection_extraction_contract(
-            await self.db.get_support_scope_version()
-        )
+        active_contract = projection_extraction_contract(PROJECTION_EXTRACTION_V9)
         extraction_contract_version = active_contract.version
         visibility, owner_user_id = await memory_visibility_for_source_id(
             self.db,

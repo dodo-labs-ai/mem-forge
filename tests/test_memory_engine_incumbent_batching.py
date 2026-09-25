@@ -8,7 +8,6 @@ from memforge.memory.engine import MemoryEngine
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
     EvidenceRole,
-    SupportScopeVersion,
 )
 from memforge.models import Memory
 from memforge.source_projection import (
@@ -26,12 +25,9 @@ class _IncumbentStore:
         self.memory_batches: list[tuple[str, ...]] = []
         self.evidence_batches: list[tuple[tuple[str, ...], str | None]] = []
 
-    async def get_source_unit_support_reference_ids(self, source_unit_id: str):
+    async def get_source_unit_support_unit_ids(self, source_unit_id: str):
         assert source_unit_id == "unit-1"
-        return {memory_id: (f"ref-{memory_id}",) for memory_id in self.memory_ids}
-
-    async def get_support_scope_version(self):
-        return SupportScopeVersion.REFERENCE_SET_V1
+        return {memory_id: (f"eu-{memory_id}",) for memory_id in self.memory_ids}
 
     async def list_active_memories(self, memory_ids):
         requested = tuple(memory_ids)

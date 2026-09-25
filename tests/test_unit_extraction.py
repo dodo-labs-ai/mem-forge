@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
 
 import pytest
 
 from memforge.llm.structured import MemoryCandidate, MemoryExtractionResponse
-from memforge.models import ContentItem, NormalizedContent, RawContent, content_hash
 from memforge.pipeline.document_units import ExtractionContext, ExtractionUnit
 from memforge.pipeline.extraction_contract import DURABLE_MEMORY_QUALITY_RULES
 from memforge.pipeline.memory_extractor import (
@@ -16,8 +14,6 @@ from memforge.pipeline.memory_extractor import (
     UNIT_MEMORY_EXTRACTION_PROMPT,
     MemoryExtractor,
 )
-from memforge.pipeline.projection_evidence import build_projected_claim_evidence
-from memforge.pipeline.source_projection_adapters import project_source_item
 
 
 class RecordingStructuredMemoryClient:
@@ -128,43 +124,9 @@ async def test_structural_block_fallback_keeps_nonempty_projected_excerpt():
     result = await MemoryExtractor(
         structured_llm_client=client
     ).extract_unit_memories(context, doc_type="reference")
-    item = ContentItem(
-        item_id="confluence-1",
-        title="Rule",
-        source_url="https://confluence.example.test/pages/1",
-        last_modified=datetime(2026, 8, 12, tzinfo=timezone.utc),
-        version="1",
-        extra={"page_id": "1", "space_key": "ENG"},
-    )
-    projection = project_source_item(
-        source_id="src-confluence",
-        source_type="confluence",
-        run_id="run-confluence",
-        item=item,
-        raw=RawContent(item=item, body=body.encode(), content_type="text/html"),
-        normalized=NormalizedContent(item=item, markdown_body=body),
-    )
-
-    staged = build_projected_claim_evidence(
-        projection=projection,
-        raw_memories=result.memories,
-        doc_id=item.item_id,
-        source_type="confluence",
-        project_key=None,
-        visibility="workspace",
-        owner_user_id=None,
-        repo_identifier=None,
-        access_context_hash="workspace",
-        extractor_run_id="run-confluence",
-    )
-
     assert result.memories[0].evidence_resolved_from_block is True
     assert result.memories[0].evidence_range_start is None
-    assert staged.units[0].excerpt == body
-    canonical = staged.canonical_memories_by_claim_hash[
-        content_hash(result.memories[0].content)
-    ]
-    assert canonical.evidence_quote == body
+    assert result.memories[0].evidence_quote == body
 
 
 @pytest.mark.asyncio

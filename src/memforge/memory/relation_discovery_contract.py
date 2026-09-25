@@ -8,16 +8,6 @@ from enum import Enum
 from hashlib import sha256
 
 
-CURRENT_RELATION_EVIDENCE_PREDICATE_SQL = """
-msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
-AND er.role = 'primary'
-AND eu.source_id = ? AND eu.source_lineage_id = ?
-AND so.source_id = eu.source_id
-AND so.source_unit_id = eu.source_lineage_id
-AND er.observation_revision_id = so.current_revision_id
-""".strip()
-
-
 # Stored failure text is bounded; the error code carries the stable classification.
 RELATION_DISCOVERY_ERROR_MAX_CHARS = 4000
 # Audit event recorded for each work item an operator re-runs, before it is reset.

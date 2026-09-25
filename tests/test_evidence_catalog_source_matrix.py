@@ -17,7 +17,6 @@ from memforge.pipeline.projection_context import (
 from memforge.pipeline.projection_fragments import (
     compile_projection_fragment_catalog,
 )
-from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 from memforge.pipeline.source_projection_adapters import (
     BUILTIN_SPECIALIZED_SOURCE_TYPES,
     project_source_item,
@@ -374,34 +373,3 @@ async def test_textual_source_matrix_binds_blocks_to_current_stable_observations
             ]
             == memory.evidence_quote
         )
-
-    staged = build_projected_claim_evidence(
-        projection=second,
-        raw_memories=result.memories,
-        doc_id=second_item.item_id,
-        source_type=source_type,
-        project_key=None,
-        visibility="workspace",
-        owner_user_id=None,
-        repo_identifier=None,
-        access_context_hash="workspace",
-        extractor_run_id="run-2",
-    )
-    primary_references = [
-        reference
-        for reference in staged.references
-        if reference.role.value == "primary"
-    ]
-
-    assert {unit.excerpt for unit in staged.units} == {
-        exact.evidence_quote,
-        fallback.evidence_quote,
-    }
-    assert len(primary_references) == 2
-    assert all(
-        primary.anchor.observation_id == second_observation.id
-        and primary.anchor.observation_revision_id == second_revision.id
-        and primary.anchor.observation_revision_id != first_revision.id
-        and primary.anchor.kind.value == "revision_range"
-        for primary in primary_references
-    )

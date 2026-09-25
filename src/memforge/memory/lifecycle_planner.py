@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from memforge.memory.evidence import (
     EvidenceReference,
     EvidenceUnit,
-    SupportScopeVersion,
 )
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
@@ -61,15 +60,10 @@ def build_lifecycle_plan(
     gate_state: LifecycleGateState,
     operations: Sequence[ReconcileOperation],
     incumbents: Mapping[str, Memory],
-    source_support_reference_ids: Mapping[str, tuple[str, ...]] | None = None,
-    all_active_support_reference_ids: Mapping[str, tuple[str, ...]] | None = None,
+    source_support_unit_ids: Mapping[str, tuple[str, ...]],
+    all_active_support_unit_ids: Mapping[str, tuple[str, ...]],
     support_set_hashes: Mapping[str, str],
     observation_revision_ids: tuple[str, ...],
-    new_evidence_reference_ids: tuple[str, ...] = (),
-    evidence_reference_ids_by_claim_hash: Mapping[str, tuple[str, ...]] | None = None,
-    support_scope_version: SupportScopeVersion = SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
-    source_support_unit_ids: Mapping[str, tuple[str, ...]] | None = None,
-    all_active_support_unit_ids: Mapping[str, tuple[str, ...]] | None = None,
     new_evidence_unit_ids: tuple[str, ...] = (),
     evidence_unit_ids_by_claim_hash: Mapping[str, tuple[str, ...]] | None = None,
     corroboration_targets_by_claim_hash: Mapping[str, Memory] | None = None,
@@ -156,32 +150,11 @@ def build_lifecycle_plan(
         )
 
     def support_ids_for(raw: RawMemory) -> tuple[str, ...]:
-        claim_hash = content_hash(raw.content.strip())
-        if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2:
-            if evidence_unit_ids_by_claim_hash is not None:
-                units = evidence_unit_ids_by_claim_hash.get(claim_hash, ())
-                if units:
-                    return units
-            return new_evidence_unit_ids
-        if evidence_reference_ids_by_claim_hash is not None:
-            references = evidence_reference_ids_by_claim_hash.get(claim_hash, ())
-            if references:
-                return references
-        return new_evidence_reference_ids
-
-    def support_identity(ids: tuple[str, ...]) -> dict[str, tuple[str, ...]]:
-        return (
-            {"evidence_unit_ids": ids}
-            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else {"evidence_reference_ids": ids}
-        )
-
-    def scoped_support_ids(memory_id: str) -> tuple[str, ...]:
-        return (
-            (source_support_unit_ids or {}).get(memory_id, ())
-            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else (source_support_reference_ids or {}).get(memory_id, ())
-        )
+        if evidence_unit_ids_by_claim_hash is not None:
+            units = evidence_unit_ids_by_claim_hash.get(content_hash(raw.content.strip()), ())
+            if units:
+                return units
+        return new_evidence_unit_ids
 
     def memory_creation_mutations(raw: RawMemory) -> tuple[str, tuple[LifecycleMutation, ...]]:
         memory_id = _new_memory_id(scope.id, raw)
@@ -201,7 +174,7 @@ def build_lifecycle_plan(
                     LifecycleMutationType.ATTACH_SUPPORT,
                     memory_id=memory_id,
                     source_id=scope.source_id,
-                    **support_identity(support_ids),
+                    evidence_unit_ids=support_ids,
                     payload={
                         "access_context_hash": defaults.access_context_hash,
                         "source_updated_at": defaults.source_updated_at,
@@ -240,7 +213,7 @@ def build_lifecycle_plan(
         if incumbent_operation is not None and incumbent_operation.support_revalidation_skipped:
             # Corroboration may reuse the identity, but cannot revalidate an old
             # assertion by upserting its same Evidence ID under the new Plan.
-            preserved = set(scoped_support_ids(target.id))
+            preserved = set(source_support_unit_ids.get(target.id, ()))
             support_ids = tuple(support_id for support_id in support_ids if support_id not in preserved)
             if not support_ids:
                 continue
@@ -267,7 +240,7 @@ def build_lifecycle_plan(
                     LifecycleMutationType.ATTACH_SUPPORT,
                     memory_id=target.id,
                     source_id=scope.source_id,
-                    **support_identity(support_ids),
+                    evidence_unit_ids=support_ids,
                     payload={
                         "access_context_hash": defaults.access_context_hash,
                         "source_updated_at": defaults.source_updated_at,
@@ -285,12 +258,8 @@ def build_lifecycle_plan(
 
     for memory_id in incumbent_ids:
         operation = by_incumbent[memory_id]
-        current_source_support = scoped_support_ids(memory_id)
-        all_support = (
-            (all_active_support_unit_ids or {}).get(memory_id, ())
-            if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else (all_active_support_reference_ids or {}).get(memory_id, ())
-        )
+        current_source_support = source_support_unit_ids.get(memory_id, ())
+        all_support = all_active_support_unit_ids.get(memory_id, ())
         external_support = set(all_support).difference(current_source_support)
 
         if operation.support_revalidation_skipped and (
@@ -307,7 +276,7 @@ def build_lifecycle_plan(
                             LifecycleMutationType.REMOVE_SUPPORT,
                             memory_id=memory_id,
                             source_id=scope.source_id,
-                            **support_identity(current_source_support),
+                            evidence_unit_ids=current_source_support,
                         )
                     )
                 proposed_mutations.append(
@@ -315,7 +284,7 @@ def build_lifecycle_plan(
                         LifecycleMutationType.ATTACH_SUPPORT,
                         memory_id=memory_id,
                         source_id=scope.source_id,
-                        **support_identity(support_ids),
+                        evidence_unit_ids=support_ids,
                         payload={
                             "access_context_hash": defaults.access_context_hash,
                             "source_updated_at": defaults.source_updated_at,
@@ -359,7 +328,7 @@ def build_lifecycle_plan(
                             LifecycleMutationType.REMOVE_SUPPORT,
                             memory_id=memory_id,
                             source_id=scope.source_id,
-                            **support_identity(current_source_support),
+                            evidence_unit_ids=current_source_support,
                             payload={"document_id": defaults.doc_id},
                         )
                     )
@@ -414,7 +383,7 @@ def build_lifecycle_plan(
                         LifecycleMutationType.REMOVE_SUPPORT,
                         memory_id=memory_id,
                         source_id=scope.source_id,
-                        **support_identity(current_source_support),
+                        evidence_unit_ids=current_source_support,
                         payload={"document_id": defaults.doc_id},
                     )
                 )
@@ -460,7 +429,7 @@ def build_lifecycle_plan(
                             LifecycleMutationType.REMOVE_SUPPORT,
                             memory_id=memory_id,
                             source_id=scope.source_id,
-                            **support_identity(current_source_support),
+                            evidence_unit_ids=current_source_support,
                             payload={"document_id": defaults.doc_id},
                         )
                     )
@@ -536,7 +505,7 @@ def build_lifecycle_plan(
                         LifecycleMutationType.REMOVE_SUPPORT,
                         memory_id=memory_id,
                         source_id=scope.source_id,
-                        **support_identity(current_source_support),
+                        evidence_unit_ids=current_source_support,
                         payload={"document_id": defaults.doc_id},
                     )
                 )
@@ -580,7 +549,6 @@ def build_lifecycle_plan(
                 )
                 for memory_id in (*incumbent_ids, *sorted(attached_target_ids))
             },
-            support_scope_version=support_scope_version,
         ),
         mutations=tuple(mutations),
         evidence_units=tuple(evidence_units),
@@ -674,7 +642,6 @@ def _serialize_mutation(mutation: LifecycleMutation) -> dict[str, object]:
         "mutation_type": mutation.mutation_type.value,
         "memory_id": mutation.memory_id,
         "source_id": mutation.source_id,
-        "evidence_reference_ids": list(mutation.evidence_reference_ids),
         "evidence_unit_ids": list(mutation.evidence_unit_ids),
         "replacement_memory_id": mutation.replacement_memory_id,
         "payload": dict(mutation.payload),

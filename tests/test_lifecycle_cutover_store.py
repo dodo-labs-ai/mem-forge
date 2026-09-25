@@ -917,21 +917,6 @@ async def test_document_owned_corroboration_preserves_an_overlapping_source_proj
 
 
 @pytest.mark.asyncio
-async def test_remove_memory_source_is_noop_for_missing_memory(db: Database) -> None:
-    retired = await db.remove_memory_source(
-        "mem-missing",
-        "missing-doc",
-        source_id="src-1",
-    )
-
-    assert retired is False
-    async with db.db.execute(
-        "SELECT COUNT(*) FROM lifecycle_plans WHERE reconciliation_scope_id = 'direct_support_removal'"
-    ) as cursor:
-        assert int((await cursor.fetchone())[0]) == 0
-
-
-@pytest.mark.asyncio
 async def test_delete_source_preserves_a_document_projected_by_another_configured_source(
     db: Database,
 ) -> None:
