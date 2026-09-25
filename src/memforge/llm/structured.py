@@ -520,6 +520,28 @@ class MemoryRelationCatalogResponse(StructuredResponseModel):
     results: list[MemoryRelationCatalogResult]
 
 
+# One sentence of reasoning per pair keeps the output small and auditable.
+CROSS_DOCUMENT_RELATION_REASON_MAX_CHARS = 500
+
+
+class CrossDocumentRelationDecision(StructuredResponseModel):
+    """One closed relation label for one application-issued pair slot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pair_index: int = Field(ge=0)
+    label: Literal["none", "equivalent", "updates", "contradicts"]
+    reason: str = Field(max_length=CROSS_DOCUMENT_RELATION_REASON_MAX_CHARS)
+
+
+class CrossDocumentRelationResponse(StructuredResponseModel):
+    """Exactly one decision for every cross-document pair in the request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[CrossDocumentRelationDecision]
+
+
 class RevisionAssessment(StructuredResponseModel):
     """Conditions for revising the incumbent with the current challenger."""
 
@@ -1676,6 +1698,7 @@ _REFUSAL_FINISH_REASONS = frozenset({"content_filter", "refusal"})
 # refused reply must fail instead.
 _REFUSAL_ERROR_CODES: dict[type[BaseModel], str] = {
     ClaimRevisionWireResponse: "claim_response_incomplete",
+    CrossDocumentRelationResponse: "cross_document_relation_response_incomplete",
     MemoryRelationCatalogResponse: "memory_relation_response_incomplete",
     SupportAssessmentResponse: "support_response_incomplete",
     SupportAssessmentWireResponse: "support_response_incomplete",
@@ -1887,6 +1910,14 @@ class LiteLlmStructuredClient:
     ) -> MemoryRelationCatalogResponse:
         return await self._call_schema(
             prompt=prompt, response_format=MemoryRelationCatalogResponse,
+            max_tokens=max_tokens, model=model,
+        )
+
+    async def classify_cross_document_relations(
+        self, prompt: str, *, max_tokens: int, model: str | None = None,
+    ) -> CrossDocumentRelationResponse:
+        return await self._call_schema(
+            prompt=prompt, response_format=CrossDocumentRelationResponse,
             max_tokens=max_tokens, model=model,
         )
 

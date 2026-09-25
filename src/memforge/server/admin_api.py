@@ -57,6 +57,7 @@ from memforge.genes.atlassian_auth import (
 )
 from memforge.github_repo_utils import github_extension_allowed, github_include_extensions
 from memforge.memory.audit import AuditContext
+from memforge.memory.cross_document_relation import CrossDocumentRelationLabel
 from memforge.memory.lifecycle import normalize_memory_status
 from memforge.memory.cutover import run_with_lifecycle_activity_heartbeat
 from memforge.memory.lifecycle_service import (
@@ -1781,6 +1782,16 @@ class AgentEvaluationRunCreateRequest(BaseModel):
     replicate_count: int = Field(default=1, ge=1)
     baseline_run_id: str | None = None
     semantic_judge: dict[str, object] | None = None
+
+
+class RelationCaseSeedRequest(BaseModel):
+    """Human relabels of decided Cross-Source Conflict Reviews, by Review id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label_overrides: dict[str, Literal["none", "equivalent", "updates", "contradicts"]] = Field(
+        default_factory=dict
+    )
 
 
 class AgentEvaluationLangfusePolicyRequest(BaseModel):
@@ -5336,6 +5347,39 @@ def create_admin_app(
             logger.exception("Langfuse annotation import failed")
             raise HTTPException(status_code=502, detail="Langfuse annotation import failed") from exc
         return external_annotation_task_to_payload(imported)
+
+    @evaluation_router.post("/relation-cases/seed")
+    async def seed_relation_evaluation_cases(
+        body: RelationCaseSeedRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Pin decided Cross-Source Conflict Reviews as labeled cases and freeze their cohort."""
+
+        from memforge.evals.cross_document_relation_cases import seed_cross_document_relation_cases
+        from memforge.evals.offline_evaluation import OfflineAgentEvaluation
+
+        actor = _require_maintenance_operator(request)
+        try:
+            report = await seed_cross_document_relation_cases(
+                db,
+                OfflineAgentEvaluation(db, executors={}),
+                actor=actor,
+                label_overrides={
+                    review_id: CrossDocumentRelationLabel(label)
+                    for review_id, label in body.label_overrides.items()
+                },
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "cohort_id": report.cohort_id,
+            "pinned_case_count": report.pinned_case_count,
+            "label_counts": dict(report.label_counts),
+            "skipped": dict(report.skipped),
+        }
 
     @evaluation_router.post("/runs", status_code=202)
     async def admit_agent_evaluation_run(
