@@ -3,6 +3,7 @@
 from copy import deepcopy
 
 from memforge.llm.structured import (
+    ChangeImpactWireResponse,
     ContinueReadingWireResult,
     SupportAssessmentWireResponse,
     SupportedWireResult,
@@ -12,7 +13,7 @@ from memforge.pipeline.projection_fragments import FragmentSelectionError, Fragm
 
 
 class SupportWireAliases:
-    """Keep task and Evidence names stable across one ordered Support reading."""
+    """Keep task and Evidence names stable across one revision's Change Impact and Support reading."""
 
     def __init__(self, catalog, removed, works):
         self.works = works
@@ -26,22 +27,27 @@ class SupportWireAliases:
         self._work_ids = {alias: original for original, alias in works.items()}
         self._ref_ids = {alias: original for original, alias in self.refs.items()}
 
-    def encode(self, payload):
-        """Translate identifier fields only, never source text."""
+    def _encode_source(self, payload, row_lists):
+        """Translate the identifier fields of the supplied source text, never the text itself."""
         result = deepcopy(payload)
         current = result['current']
-        for key in ('primary_candidates', 'required_only_candidates'):
+        for key in row_lists:
             current[key] = [(self.refs[row[0]], *row[1:]) for row in current[key]]
         for group in current['structural_groups']:
             group['refs'] = [self.refs[ref] for ref in group['refs']]
-        result['carried_witness_catalog'] = [
-            (self.refs[row[0]], *row[1:]) for row in result['carried_witness_catalog']
-        ]
         result['removed_historical'] = [
             [self.history[row[0]], *row[1:]] for row in result['removed_historical']
         ]
         for group in result['removed_groups']:
             group['refs'] = [self.history[ref] for ref in group['refs']]
+        return result
+
+    def encode(self, payload):
+        """An ordered Support reading request: source, carried witnesses and per-work state."""
+        result = self._encode_source(payload, ('primary_candidates', 'required_only_candidates'))
+        result['carried_witness_catalog'] = [
+            (self.refs[row[0]], *row[1:]) for row in result['carried_witness_catalog']
+        ]
         for work in result['works']:
             work['work_id'] = self.works[work['work_id']]
             for part in work['prior_evidence']:
@@ -50,6 +56,14 @@ class SupportWireAliases:
             state = work['previous_state']
             for key in ('support_witness_refs', 'opposing_witness_refs'):
                 state[key] = [self.refs[ref] for ref in state[key]]
+        return result
+
+    def encode_changes(self, payload):
+        """A Change Impact request: the changes, which of their refs changed, and the works."""
+        result = self._encode_source(payload, ('fragments',))
+        result['changed_refs'] = [self.refs[ref] for ref in result['changed_refs']]
+        for work in result['works']:
+            work['work_id'] = self.works[work['work_id']]
         return result
 
     def _ref(self, alias, location, *, allowed=None):
@@ -69,17 +83,27 @@ class SupportWireAliases:
     def _refs(self, aliases, location):
         return [self._ref(alias, f"{location}[{index}]") for index, alias in enumerate(aliases)]
 
+    def _work(self, alias, location):
+        if alias not in self._work_ids:
+            raise FragmentSelectionError(
+                FragmentSelectionErrorCode.UNKNOWN_REF, f"unknown supplied task ID: {alias}",
+                location=location, received=alias, allowed_refs=sorted(self._work_ids),
+            )
+        return self._work_ids[alias]
+
+    def decode_impacts(self, response: ChangeImpactWireResponse) -> list[tuple[str, str]]:
+        """Each row's canonical work id with its impact label."""
+        return [
+            (self._work(row.work_id, f"results[{index}].work_id"), row.impact)
+            for index, row in enumerate(response.results)
+        ]
+
     def decode(self, response):
         """Return the same response with canonical work ids and catalog refs."""
         rows = []
         for index, row in enumerate(response.results):
             at = f"results[{index}]"
-            if row.work_id not in self._work_ids:
-                raise FragmentSelectionError(
-                    FragmentSelectionErrorCode.UNKNOWN_REF, f"unknown supplied task ID: {row.work_id}",
-                    location=f"{at}.work_id", received=row.work_id, allowed_refs=sorted(self._work_ids),
-                )
-            work_id = self._work_ids[row.work_id]
+            work_id = self._work(row.work_id, f"{at}.work_id")
             if isinstance(row, ContinueReadingWireResult):
                 delta = row.witness_delta
                 rows.append(row.model_copy(update={"work_id": work_id, "witness_delta": SupportWitnessDelta(

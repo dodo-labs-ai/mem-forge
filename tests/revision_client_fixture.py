@@ -8,6 +8,8 @@ fixture prompt and returning one of the fixture models below:
 ``judge_support`` (does the current Source Unit still support an incumbent),
 ``select_support_evidence`` (which current Fragments carry that support) and
 ``prove_revisions`` (which REFINES pairs are eligible revisions).
+``judge_change_impact`` labels one Change Impact work; it answers ``affected``
+unless a scenario overrides it, so an exact Support is read like any other.
 """
 
 import json
@@ -62,6 +64,20 @@ class EvidenceSelection(BaseModel):
     reason: str = ""
     primary_ref: str | None = None
     required_evidence: list[RequiredSelection] = Field(default_factory=list)
+
+
+def change_impact_payload(prompt):
+    return json.loads(prompt.split("<change_impact>", 1)[1].split("</change_impact>", 1)[0])
+
+
+def change_impact_response(prompt, judge=lambda work, payload: "affected"):
+    """One Change Impact row per work, labelled by ``judge(work, payload)``."""
+    from memforge.llm.structured import ChangeImpactWireResponse
+
+    payload = change_impact_payload(prompt)
+    return ChangeImpactWireResponse.model_validate({"results": [
+        {"work_id": work["work_id"], "impact": judge(work, payload)} for work in payload["works"]
+    ]})
 
 
 def catalog_payload(prompt):
@@ -151,8 +167,10 @@ class RevisionClientFixture:
         claim's work fields, its prior Evidence as text, and the carried witnesses
         merged back into the current candidates.
         """
-        from memforge.llm.structured import SupportAssessmentWireResponse
+        from memforge.llm.structured import ChangeImpactWireResponse, SupportAssessmentWireResponse
 
+        if response_format is ChangeImpactWireResponse:
+            return change_impact_response(prompt, self.judge_change_impact)
         assert response_format is SupportAssessmentWireResponse
         payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
         groups = [{**group, **payload["current"].get("observations", {}).get(group.get("source"), {})} for group in payload["current"]["structural_groups"]]
@@ -196,6 +214,9 @@ class RevisionClientFixture:
             else:
                 results.append(continued(work))
         return SupportAssessmentWireResponse.model_validate({"results": results})
+
+    def judge_change_impact(self, work, payload):
+        return "affected"
 
     def _configured_previous(self, work, rows, sources, groups):
         """Prior Evidence that is no longer exactly current: follow the scenario's configured quotes."""

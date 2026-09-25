@@ -19,7 +19,7 @@ from tests.revision_client_fixture import (
 )
 
 import pytest
-from memforge.llm.structured import SupportAssessmentWireResponse
+from memforge.llm.structured import ChangeImpactWireResponse, SupportAssessmentWireResponse
 import pytest_asyncio
 
 
@@ -10020,6 +10020,8 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
             return response
 
         async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            if response_format is ChangeImpactWireResponse:
+                return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
             assert response_format is SupportAssessmentWireResponse
             payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
             self.assessments.append(payload)
@@ -10194,10 +10196,12 @@ class _CountingSupportClient(_NoopClient):
     def __init__(self, incumbent_id: str) -> None:
         super().__init__(incumbent_id)
         self.support_prompts: list[str] = []
+        self.impact_prompts: list[str] = []
 
-    async def evaluate_revision_work(self, prompt, **kwargs):
-        self.support_prompts.append(prompt)
-        return await super().evaluate_revision_work(prompt, **kwargs)
+    async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+        prompts = self.impact_prompts if response_format is ChangeImpactWireResponse else self.support_prompts
+        prompts.append(prompt)
+        return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
 
 
 async def _exact_support_engine(
@@ -10263,6 +10267,65 @@ async def test_program_rebind_commits_without_support_call(db):
     assert (await db.get_memory(incumbent.id)).status == "active"
 
 
+class _UnaffectedClient(_CountingSupportClient):
+    """Once exact digests exist, Change Impact finds every change unrelated and no Support is read."""
+
+    read_support = True
+
+    def judge_change_impact(self, work, payload):
+        return "unaffected"
+
+    async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+        if response_format is SupportAssessmentWireResponse and not self.read_support:
+            raise AssertionError("an UNAFFECTED exact Support is rebound without reading")
+        return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_unaffected_change_rebinds_and_commits_with_its_receipt(db):
+    claim = "B8 requires approval."
+    body = f"{claim}\n\nEdition 1."
+    first = _projection(run_id="unaffected-v1", body=body)
+    incumbent, client, advance = await _exact_support_engine(
+        db, claim=claim, first=first, memory_id="mem-unaffected", client_type=_UnaffectedClient,
+    )
+    second_body = body.replace("Edition 1.", "Edition 2.")
+    second = _projection(
+        run_id="unaffected-v2", body=second_body, prior=first.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in first.observation_revisions},
+    )
+    # The legacy Support has no digests yet, so this advance reads it and records them.
+    await advance(second, second_body, 2)
+    established = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    assert established[0].raw_content_sha256 and client.support_prompts
+
+    client.read_support = False
+    client.support_prompts.clear()
+    client.impact_prompts.clear()
+    third_body = f"{second_body}\n\nThe team reviewed dashboards."
+    third = _projection(
+        run_id="unaffected-v3", body=third_body, prior=second.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in second.observation_revisions},
+    )
+    stats = await advance(third, third_body, 3)
+
+    assert client.support_prompts == [] and len(client.impact_prompts) == 1
+    assert stats["support_revalidation_change_impact_request_count"] == 1
+    assert stats["support_revalidation_change_impact_unaffected_count"] == 1
+    assert stats["support_revalidation_change_impact_affected_count"] == 0
+    assert stats["support_revalidation_change_impact_failed_count"] == 0
+    assert stats["support_revalidation_program_rebind_count"] == 0
+    assert stats["support_revalidation_model_call_count"] == 1
+    # The UNAFFECTED conclusion carries its program receipt, and the revision commits.
+    assert stats["support_revalidation_completion_count"] == 1
+    unit_id = first.source_units[0].id
+    assert (await db.get_current_source_unit_revision(unit_id)).id == third.source_unit_revisions[0].id
+    rebound = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    assert {part.validation_unit_revision_id for part in rebound} == {third.source_unit_revisions[0].id}
+    assert {part.validation_plan_id for part in rebound}.isdisjoint({part.validation_plan_id for part in established})
+    assert (await db.get_memory(incumbent.id)).status == "active"
+
+
 @pytest.mark.asyncio
 async def test_unusable_baseline_snapshot_is_assessed_with_diagnostic(db, monkeypatch, caplog):
     caplog.set_level("WARNING", logger="memforge.memory.engine")
@@ -10317,13 +10380,13 @@ async def test_transient_support_failure_leaves_revision_uncommitted_and_retry_c
     class FlakySupportClient(_CountingSupportClient):
         fail = True
 
-        async def evaluate_revision_work(self, prompt, **kwargs):
-            if self.fail:
+        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            if self.fail and response_format is SupportAssessmentWireResponse:
                 self.support_prompts.append(prompt)
                 raise StructuredLlmError(
                     "deadline", terminal_category="deadline_exceeded", error_code="logical_deadline_exceeded",
                 )
-            return await super().evaluate_revision_work(prompt, **kwargs)
+            return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
 
         async def classify_memory_relations(self, prompt, **kwargs):
             return _uniform_relation_response(prompt, classification="unrelated", reason="Distinct approval rules")
