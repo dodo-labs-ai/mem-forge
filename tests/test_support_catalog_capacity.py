@@ -10,7 +10,7 @@ from memforge.llm.structured import (
     OUTPUT_TRUNCATED, LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError,
     SupportAssessmentWireResponse,
 )
-from memforge.pipeline.revision_work import RevisionWorkExecutor
+from memforge.pipeline.revision_work import SUPPORT_ASSESSMENT_CONTRACT, RevisionWorkExecutor
 from memforge.pipeline.support_wire import SupportWireAliases
 from tests.test_revision_work import CHANGED, Client, Store, payload, work_items
 
@@ -37,7 +37,7 @@ async def test_ordered_reading_fits_one_request_despite_dense_output_estimate():
     assert len(results) == 183 and all(row.supported for row in results.values())
     work = next(w for w in store.works.values() if w.kind == 'support_assess')
     assert work.manifest['output'] == 64000
-    assert work.manifest['scope']['contract'] == 'support-ordered-reading-v1'
+    assert work.manifest['scope']['contract'] == SUPPORT_ASSESSMENT_CONTRACT
     # The journal keeps the provider's aliased wire response; reuse decodes it again.
     assert all(row['work_id'].startswith('WRK-') for row in work.result['results'])
     assert all(row['primary_ref'].startswith('PRM-') for row in work.result['results'])

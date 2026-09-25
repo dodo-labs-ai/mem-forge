@@ -146,6 +146,9 @@ async def test_first_part_includes_remote_exception_and_unchanged_heading():
     group = next(group for group in request["current"]["structural_groups"] if exception[0] in group["refs"])
     assert any("Europe" in title for title in group["heading_context"])
     assert any("Old note" in row[1] for row in request["removed_historical"])
+    # The model reads text by ref and request-local source alias; no store identity is sent.
+    assert set(request) == {"last", "current", "removed_historical", "removed_groups", "carried_witness_catalog", "works"}
+    assert set(request["current"]) == {"primary_candidates", "required_only_candidates", "structural_groups"}
 
 
 @pytest.mark.asyncio
@@ -316,7 +319,7 @@ def test_changelog_delta_keeps_before_after_field_identity_and_event_context():
     import hashlib
     from dataclasses import replace
     from memforge.source_representation import representation_profile_for_observation_contract
-    from memforge.pipeline.revision_work import RevisionWorkExecutor
+    from memforge.pipeline.revision_work import _reading_source
     old, new = revisions("old", "new")
     profile = representation_profile_for_observation_contract(source_type="jira", observation_type="changelog")
     def canonical(projection, value):
@@ -341,7 +344,7 @@ def test_changelog_delta_keeps_before_after_field_identity_and_event_context():
         if f.anchor in expansion.context_anchors
     }
     assert added == {"# US payroll", "description", "2026-09-08"}
-    payload = RevisionWorkExecutor._source_payload(context, context.catalog(()), [{**removed_claim, "ref": "d000001"}])
+    payload = _reading_source(context, context.catalog(()), [{**removed_claim, "ref": "d000001"}])
     assert payload["removed_historical"][0][2] == {
         "field": "/items/0/toString", "context": removed_claim["context"],
     }
