@@ -12,6 +12,10 @@ dismissed, unless the report and apply requests relabel it by Review id.
 | labeled ``none``, a Memory changed | nothing; a dismissal of old content hides nothing |
 | labeled otherwise with a changed Memory, pending or stale | re-run of the challenger's discovery |
 
+A Review converts by its Memories' content alone and never reads their Sources:
+a relation and a dismissal are read under the reader's access to both Memories,
+so a private, changing or deleted Source never holds back the conversion.
+
 A Review labeled ``none`` found that both statements hold, so it dismisses both
 labels that say they cannot. A person who has already undone such a dismissal
 keeps that decision: the conversion never writes a dismissal again for a pair,
