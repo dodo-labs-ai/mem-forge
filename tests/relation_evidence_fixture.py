@@ -1,4 +1,4 @@
-"""A current Evidence Unit projection with one Primary text item, for relation tests."""
+"""A current Evidence Unit with one Primary text item and its Observation Revision, for relation tests."""
 
 from __future__ import annotations
 
@@ -9,9 +9,22 @@ from memforge.memory.evidence import (
     MemoryEvidenceUnitProjection,
     SupportScopeVersion,
 )
-from memforge.source_projection import AnchorKind, SourceAnchor
+from memforge.source_projection import AnchorKind, SourceAnchor, SourceObservationRevision
+from memforge.source_representation import MARKDOWN_STRUCTURAL_PROFILE
 
 _UNUSED_SHA256 = "0" * 64
+PRIMARY_OBSERVED_AT = "2026-03-25T10:00:00.000+0000"
+
+
+def primary_observation_revision_fixture(memory_id: str) -> SourceObservationRevision:
+    return SourceObservationRevision(
+        id=f"rev-{memory_id}",
+        observation_id=f"obs-{memory_id}",
+        semantic_hash=_UNUSED_SHA256,
+        content=f"Evidence for {memory_id}.",
+        observed_at=PRIMARY_OBSERVED_AT,
+        evidence_profile=MARKDOWN_STRUCTURAL_PROFILE,
+    )
 
 
 def primary_evidence_unit_fixture(memory_id: str) -> MemoryEvidenceUnitProjection:
@@ -37,7 +50,7 @@ def primary_evidence_unit_fixture(memory_id: str) -> MemoryEvidenceUnitProjectio
                 role=EvidenceRole.PRIMARY,
                 kind=EvidencePartKind.TEXT,
                 anchor=anchor,
-                excerpt=f"Excerpt for {memory_id}",
+                excerpt=f"Raw observation for {memory_id}",
                 raw_content_sha256=_UNUSED_SHA256,
                 presentation_sha256=_UNUSED_SHA256,
                 current=True,
