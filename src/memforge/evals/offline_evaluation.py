@@ -25,6 +25,7 @@ from memforge.evals.agent_evaluation import (
 from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import OfflineSemanticJudgeResponse
 from memforge.memory.cross_document_relation import (
+    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
     CrossDocumentRelationLabel,
     CrossDocumentRelationPair,
     RelationSubject,
@@ -589,6 +590,21 @@ class AgentEvaluationRunReport:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentEvaluationCaseOutput:
+    """One run result with the protected content needed to analyze it.
+
+    It holds the case's pinned input, its accepted rubric, the candidate output
+    (for a relation case, the label and the model's reason) and the code checks.
+    """
+
+    case: AgentEvaluationCase
+    population: AgentEvaluationPopulation
+    rubric: Mapping[str, object]
+    result: AgentEvaluationResult
+    checks: tuple[AgentAssessment, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SemanticJudgeCalibrationReport:
     """Aggregate judge/human comparison after independent labels are accepted."""
 
@@ -943,7 +959,11 @@ class SourceUnitReconciliationReplayExecutor:
 
 
 class CrossDocumentRelationReplayExecutor:
-    """Label one pinned Memory pair with the production cross-document classifier."""
+    """Label one pinned Memory pair with the production cross-document classifier.
+
+    A case pinned for another classifier contract holds another input shape, so
+    it fails instead of being replayed with this contract.
+    """
 
     def __init__(self, structured_llm_client: object) -> None:
         self._structured_llm_client = structured_llm_client
@@ -953,6 +973,7 @@ class CrossDocumentRelationReplayExecutor:
         case: AgentEvaluationCase,
         candidate_manifest: Mapping[str, object],
     ) -> Mapping[str, object]:
+        _require_current_relation_contract(case.manifest)
         pair = CrossDocumentRelationPair(
             challenger=RelationSubject.from_manifest(_mapping(case.manifest, "challenger")),
             candidate=RelationSubject.from_manifest(_mapping(case.manifest, "candidate")),
@@ -964,6 +985,7 @@ class CrossDocumentRelationReplayExecutor:
         judgment = classification.judgments[0]
         return {
             "case_kind": case.case_kind.value,
+            "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
             "label": judgment.label.value,
             "reason": judgment.reason,
         }
@@ -1914,24 +1936,42 @@ class OfflineAgentEvaluation:
             run = replace(run, created_by=existing.created_by, status=existing.status)
         return cohort, run
 
-    async def read_report(
+    async def _authorized_run(
         self,
         run_id: str,
-        *,
         requesting_user_id: str,
-    ) -> AgentEvaluationRunReport:
+    ) -> tuple[AgentEvaluationRun, AgentEvaluationCohort, Mapping[str, AgentEvaluationCase]]:
+        """Load a run with its cohort's cases once the requester may read every case's Source.
+
+        Only an unknown run raises KeyError; a run whose cohort or cases are
+        missing is inconsistent stored state and raises RuntimeError.
+        """
+
         run = await self._store.get_agent_evaluation_run(run_id)
         if run is None:
             raise KeyError(f"unknown evaluation run: {run_id}")
         cohort = await self._store.get_agent_evaluation_cohort(run.cohort_id)
         if cohort is None:
             raise RuntimeError("evaluation run cohort is unavailable")
+        cases: dict[str, AgentEvaluationCase] = {}
         for item in cohort.items:
-            case = await self._require_case(item.case_id)
+            case = await self._store.get_agent_evaluation_case(item.case_id)
+            if case is None:
+                raise RuntimeError(f"evaluation cohort case is unavailable: {item.case_id}")
             await self._store.authorize_agent_evaluation_source(
                 case.source_id,
                 requesting_user_id,
             )
+            cases[case.case_id] = case
+        return run, cohort, cases
+
+    async def read_report(
+        self,
+        run_id: str,
+        *,
+        requesting_user_id: str,
+    ) -> AgentEvaluationRunReport:
+        run, cohort, _cases = await self._authorized_run(run_id, requesting_user_id)
         stored_results = tuple(await self._store.list_agent_evaluation_results(run_id))
         results = tuple(replace(result, output=None) for result in stored_results)
         assessments = tuple(
@@ -2000,6 +2040,45 @@ class OfflineAgentEvaluation:
             label_metrics=label_metrics,
             label_confusion=label_confusion,
         )
+
+    async def read_case_outputs(
+        self,
+        run_id: str,
+        *,
+        requesting_user_id: str,
+    ) -> tuple[AgentEvaluationCaseOutput, ...]:
+        """Return every result of one run with its pinned case, rubric and output.
+
+        Unlike the report, this view carries protected case content and
+        candidate output, for failure analysis by an authorized operator.
+        """
+
+        _run, cohort, cases = await self._authorized_run(run_id, requesting_user_id)
+        items = {item.case_id: item for item in cohort.items}
+        checks: dict[str, list[AgentAssessment]] = {}
+        for assessment in await self._store.list_agent_assessments_for_run(run_id):
+            if assessment.annotator_kind == "code" and assessment.target_result_id:
+                checks.setdefault(assessment.target_result_id, []).append(assessment)
+        outputs: list[AgentEvaluationCaseOutput] = []
+        for result in await self._store.list_agent_evaluation_results(run_id):
+            item = items.get(result.case_id)
+            if item is None:
+                raise RuntimeError(f"evaluation result is outside its run cohort: {result.result_id}")
+            ground_truth = await self._store.get_accepted_ground_truth_revision(
+                result.ground_truth_revision_id
+            )
+            if ground_truth is None:
+                raise RuntimeError("frozen cohort ground truth is unavailable")
+            outputs.append(
+                AgentEvaluationCaseOutput(
+                    case=cases[item.case_id],
+                    population=item.population,
+                    rubric=ground_truth.rubric,
+                    result=result,
+                    checks=tuple(checks.get(result.result_id, ())),
+                )
+            )
+        return tuple(outputs)
 
     async def read_semantic_calibration_report(
         self,
@@ -2646,6 +2725,7 @@ def _validate_case_manifest(
     manifest: Mapping[str, object],
 ) -> None:
     if case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION:
+        _require_current_relation_contract(manifest)
         subjects = [
             RelationSubject.from_manifest(_mapping(manifest, side))
             for side in ("challenger", "candidate")
@@ -2664,6 +2744,15 @@ def _validate_case_manifest(
         if not incumbents:
             raise ValueError("reconciliation case requires pinned incumbents")
         _pinned_support_audits(manifest)
+
+
+def _require_current_relation_contract(manifest: Mapping[str, object]) -> None:
+    pinned = manifest.get("classifier_version")
+    if pinned != CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION:
+        raise ValueError(
+            f"relation case is pinned for classifier {pinned!r}, "
+            f"not {CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION}"
+        )
 
 
 def _pinned_support_audits(manifest: Mapping[str, object]) -> list[SupportAuditEntry]:
@@ -3132,6 +3221,32 @@ def agent_evaluation_report_public_payload(
         "assessments": [
             dict(assessment_public_payload(assessment))
             for assessment in report.assessments
+        ],
+    }
+
+
+def agent_evaluation_case_outputs_payload(
+    run_id: str,
+    outputs: Sequence[AgentEvaluationCaseOutput],
+) -> dict[str, object]:
+    """Serialize protected per-case content for an authorized failure analysis."""
+
+    return {
+        "run_id": run_id,
+        "cases": [
+            {
+                "case_id": output.case.case_id,
+                "case_kind": output.case.case_kind.value,
+                "population": output.population.value,
+                "manifest": dict(output.case.manifest),
+                "rubric": dict(output.rubric),
+                "result": agent_evaluation_result_to_payload(output.result),
+                "checks": [
+                    dict(assessment_public_payload(assessment))
+                    for assessment in output.checks
+                ],
+            }
+            for output in outputs
         ],
     }
 
