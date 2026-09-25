@@ -21,6 +21,9 @@ from memforge.sync_progress import normalize_sync_progress_snapshot
 
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
+# Error bodies are small JSON documents; a larger body is kept as bounded text.
+ERROR_BODY_MAX_BYTES = 64_000
+ERROR_TEXT_MAX_CHARS = 1000
 
 
 class NoRedirectHandler(HTTPRedirectHandler):
@@ -354,12 +357,7 @@ class ToolClient:
                 raw = response.read()
                 return json.loads(raw.decode("utf-8")) if raw else {}
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:1000]
-            return {
-                "error": "MemForge API request failed",
-                "status_code": exc.code,
-                "detail": detail,
-            }
+            return http_error_payload(exc, "MemForge API request failed")
         except (OSError, URLError, json.JSONDecodeError) as exc:
             return {
                 "error": "MemForge API unavailable",
@@ -804,6 +802,10 @@ class ToolClient:
             body,
         )
 
+    def list_workspaces(self) -> dict[str, Any]:
+        """List the workspaces the caller can select; this control-plane call takes no workspace."""
+        return self._http_json("GET", self.target.resource_url("/workspaces"), None)
+
     def get_jira_session(self, base_url: str) -> dict[str, Any]:
         return self._resource_json("GET", f"/auth/jira-session?base_url={quote(base_url, safe='')}", None)
 
@@ -878,13 +880,7 @@ class ToolClient:
                 max_chars=parsed_max_chars,
             )
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:1000]
-            return {
-                "error": "resource fetch failed",
-                "status_code": exc.code,
-                "url": target.relative_url,
-                "detail": detail,
-            }
+            return {**http_error_payload(exc, "resource fetch failed"), "url": target.relative_url}
         except (OSError, URLError) as exc:
             return {"error": "resource fetch failed", "url": target.relative_url, "detail": str(exc)}
 
@@ -917,8 +913,7 @@ class ToolClient:
                     return {}
                 return json.loads(raw.decode("utf-8"))
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:1000]
-            return {"error": "MemForge API request failed", "status_code": exc.code, "detail": detail}
+            return http_error_payload(exc, "MemForge API request failed")
         except (OSError, URLError, json.JSONDecodeError) as exc:
             return {
                 "error": "MemForge API unavailable",
@@ -1011,6 +1006,36 @@ class ToolClient:
             if tmp_path is not None:
                 tmp_path.unlink(missing_ok=True)
             raise
+
+
+def http_error_payload(exc: HTTPError, error: str) -> dict[str, Any]:
+    """Describe one HTTP error response with its machine-readable code.
+
+    Services report a code either at the top level of the body (workspace
+    routing) or inside a structured ``detail`` object (route errors). Both are
+    surfaced as ``code``; ``detail`` keeps the parsed value, and any other
+    top-level fields, such as selectable ``workspace_ids``, are carried through.
+    """
+    raw = exc.read(ERROR_BODY_MAX_BYTES).decode("utf-8", errors="replace")
+    try:
+        body = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        body = None
+    if not isinstance(body, dict):
+        return {"error": error, "status_code": exc.code, "code": None, "detail": raw[:ERROR_TEXT_MAX_CHARS]}
+    detail = body["detail"] if "detail" in body else body.get("error")
+    code = body.get("code")
+    if not isinstance(code, str) and isinstance(detail, dict):
+        code = detail.get("code")
+    extras = {key: value for key, value in body.items() if key not in {"code", "detail", "error", "status_code"}}
+    return {
+        **extras,
+        "error": error,
+        "status_code": exc.code,
+        "code": code if isinstance(code, str) else None,
+        "detail": detail,
+    }
+
 
 def _parse_resource_url(
     url: str,

@@ -13,6 +13,7 @@ from memforge.agent_knowledge import AgentKnowledgePatchProposal
 from memforge.agent_sessions import (
     AGENT_SESSION_AUTHORITY_DECISION_OUTPUT_TOKENS,
     AGENT_SESSION_AUTHORITY_MIN_OUTPUT_TOKENS,
+    AGENT_SESSION_WINDOW_RETRY_AFTER_SECONDS,
     _classify_agent_session_authority,
     _run_agent_patch_with_activity,
     agent_session_source_id,
@@ -21,7 +22,7 @@ from memforge.agent_sessions import (
     ensure_agent_session_source,
 )
 from memforge.config import AppConfig
-from memforge.llm.structured import AgentSessionAuthorityResponse
+from memforge.llm.structured import AgentSessionAuthorityResponse, StructuredLlmError
 from memforge.memory.lifecycle_plan import (
     LifecycleBackfillJob,
     LifecycleBackfillJobStatus,
@@ -1161,7 +1162,11 @@ def test_agent_session_window_api_reports_missing_llm(tmp_path):
             )
 
         assert response.status_code == 503
-        assert "LLM unavailable" in response.json()["detail"]
+        assert response.headers["Retry-After"] == str(AGENT_SESSION_WINDOW_RETRY_AFTER_SECONDS)
+        detail = response.json()["detail"]
+        assert detail["code"] == "agent_session_llm_failed"
+        assert detail["category"] == "unavailable"
+        assert detail["error_code"] == "llm_unavailable"
     finally:
         asyncio.run(database.close())
 
@@ -1198,8 +1203,12 @@ def test_agent_session_window_api_records_failed_outcome_for_invalid_patch(tmp_p
                 },
             )
 
-        assert response.status_code == 400
-        assert "agent knowledge patch validation failed" in response.json()["detail"]
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == str(AGENT_SESSION_WINDOW_RETRY_AFTER_SECONDS)
+        detail = response.json()["detail"]
+        assert detail["code"] == "agent_session_llm_failed"
+        assert detail["category"] == "invalid_response"
+        assert detail["error_code"] == "output_invalid"
 
         async def _assert_failed_receipt():
             summary = await database.summarize_agent_session_outcomes(session_id="sess-window-bad-patch")
@@ -1207,6 +1216,100 @@ def test_agent_session_window_api_records_failed_outcome_for_invalid_patch(tmp_p
             assert summary["latest_failure"]["reason"].startswith("ValidationError:")
 
         asyncio.run(_assert_failed_receipt())
+    finally:
+        asyncio.run(database.close())
+
+
+class _ProviderRejectsPatch(_AuthorizesAllCandidateUserEvidence):
+    def __init__(self):
+        self.failed_calls = 0
+
+    async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+        self.failed_calls += 1
+        raise StructuredLlmError(
+            "structured LLM returned an invalid response",
+            terminal_category="invalid_response",
+            error_code="ValidationError",
+        )
+
+
+class _ProviderRejectsAuthority(_RouteBudget):
+    def __init__(self):
+        self.failed_calls = 0
+
+    async def classify_agent_session_evidence_authority(self, prompt: str, **kwargs):
+        self.failed_calls += 1
+        raise StructuredLlmError(
+            "structured LLM provider request failed",
+            terminal_category="provider_error",
+            error_code="provider_error",
+        )
+
+    async def generate_agent_knowledge_patch(self, prompt: str, **kwargs):
+        raise AssertionError("patch generation must not run after authority classification fails")
+
+
+@pytest.mark.parametrize(
+    ("llm_client", "category", "error_code"),
+    [
+        (_ProviderRejectsPatch, "invalid_response", "ValidationError"),
+        (_ProviderRejectsAuthority, "provider_error", "provider_error"),
+    ],
+)
+def test_agent_session_window_api_returns_retryable_503_for_provider_failures(
+    tmp_path, llm_client, category, error_code
+):
+    """Provider-side model failures are a retryable service condition, not a server crash."""
+    from memforge.server.admin_api import create_admin_app
+
+    cfg = _config(tmp_path)
+    database = Database(str(tmp_path / "api.db"))
+
+    import asyncio
+
+    async def _setup():
+        await database.connect()
+        # An existing Source makes the patch run under a Source activity lease.
+        await ensure_agent_session_source(database, cfg, client="codex", owner_user_id="dev")
+
+    asyncio.run(_setup())
+    window = {
+        "client": "codex",
+        "session_id": f"sess-provider-{category}",
+        "trigger": "Stop",
+        "workspace": "/workspace/mem-forge",
+        "events": _authorized_events({"role": "tool", "name": "apply_patch", "summary": "Edited code."}),
+    }
+    try:
+        app = create_admin_app(db=database, config=cfg)
+        model = llm_client()
+        app.state.agent_session_window_client = model
+        with TestClient(app, raise_server_exceptions=False) as client:
+            first = client.post("/api/v1/agent-sessions/windows", json=window)
+            calls_after_first = model.failed_calls
+            # The failed window released its Source activity, so a resubmission runs the model again.
+            second = client.post("/api/v1/agent-sessions/windows", json=window)
+
+        assert calls_after_first > 0
+        assert model.failed_calls == 2 * calls_after_first
+
+        for response in (first, second):
+            assert response.status_code == 503, response.text
+            assert response.headers["Retry-After"] == str(AGENT_SESSION_WINDOW_RETRY_AFTER_SECONDS)
+            detail = response.json()["detail"]
+            assert {key: detail[key] for key in ("code", "category", "error_code")} == {
+                "code": "agent_session_llm_failed",
+                "category": category,
+                "error_code": error_code,
+            }
+            assert error_code in detail["message"]
+
+        async def _check():
+            summary = await database.summarize_agent_session_outcomes(session_id=window["session_id"])
+            assert summary["counts"]["failed"] == 1
+            assert error_code in summary["latest_failure"]["reason"]
+
+        asyncio.run(_check())
     finally:
         asyncio.run(database.close())
 
@@ -1896,7 +1999,8 @@ def test_agent_session_window_fails_when_authority_classifier_omits_candidate(tm
                 },
             )
 
-        assert response.status_code == 400
+        assert response.status_code == 503
+        assert response.json()["detail"]["category"] == "invalid_response"
 
         async def _check():
             receipts = await database.list_agent_session_receipts(session_id="sess-incomplete-authority-classifier")

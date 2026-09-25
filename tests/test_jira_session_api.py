@@ -77,6 +77,8 @@ def test_upload_principal_change_returns_409(client):
         json={"base_url": "https://jira.example.test", "cookie_header": "SESSION=other"},
     )
     assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == jira_auth.JIRA_PRINCIPAL_CHANGED_CODE
+    assert resp.json()["detail"]["old_principal_id"] == "user-123"
     assert resp.json()["detail"]["new_principal_id"] == "user-999"
 
 

@@ -56,6 +56,10 @@ class JiraAuthSessionMissingError(JiraAuthSessionError, BrowserSessionMissingErr
     """Raised when no usable Jira browser session exists for an origin."""
 
 
+# The API error code a client uses to tell a principal change from other conflicts.
+JIRA_PRINCIPAL_CHANGED_CODE = "jira_principal_changed"
+
+
 class JiraPrincipalChangedError(JiraAuthSessionError, BrowserSessionPrincipalChangedError):
     """Raised when a refreshed browser session belongs to a different user."""
 

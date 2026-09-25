@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 try:
     from .repo_identity import normalize_repo_identifier
@@ -61,10 +61,22 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
         configured_target = _config_module.configured_target
 
 try:
-    from .workspace_bindings import resolve_workspace_binding
+    from .workspace_bindings import (
+        WORKSPACE_BINDING_ERROR_CODES,
+        WORKSPACE_NOT_FOUND_CODE,
+        WORKSPACE_SELECTION_REQUIRED_CODE,
+        WorkspaceBindingError,
+        resolve_workspace_binding,
+    )
 except ImportError:  # pragma: no cover - copied plugin package or direct file load
     try:
-        from memforge_workspace_bindings import resolve_workspace_binding
+        from memforge_workspace_bindings import (
+            WORKSPACE_BINDING_ERROR_CODES,
+            WORKSPACE_NOT_FOUND_CODE,
+            WORKSPACE_SELECTION_REQUIRED_CODE,
+            WorkspaceBindingError,
+            resolve_workspace_binding,
+        )
     except ImportError:
         import importlib.util
 
@@ -80,6 +92,10 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
         _workspace_bindings_module = importlib.util.module_from_spec(_workspace_bindings_spec)
         sys.modules[_workspace_bindings_spec.name] = _workspace_bindings_module
         _workspace_bindings_spec.loader.exec_module(_workspace_bindings_module)
+        WORKSPACE_BINDING_ERROR_CODES = _workspace_bindings_module.WORKSPACE_BINDING_ERROR_CODES
+        WORKSPACE_NOT_FOUND_CODE = _workspace_bindings_module.WORKSPACE_NOT_FOUND_CODE
+        WORKSPACE_SELECTION_REQUIRED_CODE = _workspace_bindings_module.WORKSPACE_SELECTION_REQUIRED_CODE
+        WorkspaceBindingError = _workspace_bindings_module.WorkspaceBindingError
         resolve_workspace_binding = _workspace_bindings_module.resolve_workspace_binding
 
 try:
@@ -93,10 +109,18 @@ DEFAULT_AGENT_QUEUE_DB = Path.home() / ".memforge-agent" / "queue.sqlite"
 MAX_TRANSCRIPT_CHARS = 60000
 MAX_EVENTS = 40
 WORKER_LEASE_BUFFER_SECONDS = 60.0
+# A failed upload is retried after an exponential delay: the base doubles per
+# consecutive failure up to the maximum. A capture that cannot select a
+# workspace waits the maximum and is retried only once local resolution succeeds.
 CAPTURE_RETRY_INTERVAL_SECONDS = 60.0
+CAPTURE_RETRY_MAX_INTERVAL_SECONDS = 3600.0
+# Captures that waited for a workspace are uploaded only while their transcript
+# changed within this age; older backlog is dropped and recorded on the row.
+WORKSPACE_BACKLOG_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+WORKSPACE_BACKLOG_EXPIRED = "workspace_backlog_expired"
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.61"
+PLUGIN_VERSION = "0.1.62"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -142,7 +166,26 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 
 class WorkspaceSelectionRequiredError(RuntimeError):
-    """The principal has multiple workspaces and no usable default."""
+    """The service cannot use this request's workspace selector.
+
+    ``code`` is ``workspace_selection_required`` when the principal has several
+    workspaces and none was selected, or ``workspace_not_found_or_inaccessible``
+    when the selected workspace cannot be used.
+    """
+
+    def __init__(self, code: str = WORKSPACE_SELECTION_REQUIRED_CODE) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+# Queue ``last_error`` values that mean the capture is waiting for a workspace.
+WORKSPACE_WAIT_CODES = frozenset(
+    {WORKSPACE_SELECTION_REQUIRED_CODE, WORKSPACE_NOT_FOUND_CODE, *WORKSPACE_BINDING_ERROR_CODES}
+)
+WORKSPACE_BINDING_HINT = (
+    "MemForge automatic capture is waiting for a local workspace binding. "
+    "Use the memforge-setup skill to bind this project or configure the hook fallback."
+)
 
 
 STOP_SIGNAL_TERMS = (
@@ -279,7 +322,12 @@ def main(argv: list[str] | None = None) -> int:
 def _run_context(payload: dict[str, Any], *, client: str, timeout: float) -> int:
     event_name = _event_name(payload)
     if event_name == "SessionStart":
-        _emit_additional_context(event_name, SESSION_START_USAGE_GUIDANCE)
+        try:
+            binding_hint = _workspace_binding_hint(payload)
+        except Exception as exc:
+            binding_hint = None
+            print(f"MemForge binding check deferred: {_safe_exception_message(exc)}", file=sys.stderr)
+        _emit_additional_context(event_name, SESSION_START_USAGE_GUIDANCE, system_message=binding_hint)
         try:
             schedule_capture(payload, client=client, policy=RECOVER_TRIGGER)
         except Exception as exc:
@@ -316,18 +364,17 @@ def _run_context(payload: dict[str, Any], *, client: str, timeout: float) -> int
     return 0
 
 
-def _emit_additional_context(event_name: str, context: str) -> None:
-    print(
-        json.dumps(
-            {
-                "continue": True,
-                "hookSpecificOutput": {
-                    "hookEventName": event_name,
-                    "additionalContext": context,
-                },
-            }
-        )
-    )
+def _emit_additional_context(event_name: str, context: str, *, system_message: str | None = None) -> None:
+    output: dict[str, Any] = {
+        "continue": True,
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": context,
+        },
+    }
+    if system_message:
+        output["systemMessage"] = system_message
+    print(json.dumps(output))
 
 
 def _run_submit_session(payload: dict[str, Any], *, client: str, timeout: float) -> int:
@@ -446,7 +493,9 @@ def request_session_capture(
 
     Setting the flag is idempotent, so any number of hooks firing before the
     worker runs collapse into a single pending capture. A REQUIRED_CAPTURE
-    request wins over a GATED_CAPTURE request for the same session.
+    request wins over a GATED_CAPTURE request for the same session. When a
+    session that had no workspace now resolves one, its retry wait is cleared
+    so the worker uploads it on the next pass.
     """
     trigger = _normalize_capture_trigger(trigger) or trigger
     db_path = _agent_queue_db_path(queue_db_path)
@@ -471,6 +520,10 @@ def request_session_capture(
             ON CONFLICT(client, session_id) DO UPDATE SET
                 transcript_path = excluded.transcript_path,
                 workspace = excluded.workspace,
+                retry_after = CASE
+                    WHEN session_cursor.workspace_id IS NULL AND excluded.workspace_id IS NOT NULL THEN NULL
+                    ELSE session_cursor.retry_after
+                END,
                 workspace_id = COALESCE(session_cursor.workspace_id, excluded.workspace_id),
                 capture_pending = 1,
                 wake_requested_at = COALESCE(session_cursor.wake_requested_at, excluded.wake_requested_at),
@@ -695,27 +748,60 @@ def _finish_capture_drain(db_path: Path, lock, drain: _CaptureDrain) -> bool:
             raise
 
 
-def _pending_capture_rows(connection: sqlite3.Connection, *, max_sessions: int, drain: _CaptureDrain) -> list[tuple]:
+class _PendingCapture(NamedTuple):
+    client: str
+    session_id: str
+    transcript_path: str | None
+    workspace: str | None
+    workspace_id: str | None
+    captured_through: int | None
+    pending_trigger: str | None
+    request_seq: int | None
+    wake_requested_at: str | None
+    last_error: str | None
+    failure_count: int
+
+
+class _ClaimedCapture(NamedTuple):
+    client: str
+    session_id: str
+    transcript_path: str | None
+    workspace: str | None
+    workspace_id: str | None
+    captured_through: int | None
+    pending_trigger: str | None
+    request_seq: int | None
+    last_error: str | None
+    failure_count: int
+    lease_token: str
+
+
+def _pending_capture_rows(
+    connection: sqlite3.Connection, *, max_sessions: int, drain: _CaptureDrain
+) -> list[_PendingCapture]:
     now = _now_iso()
-    retry_before = (datetime.fromisoformat(now) - timedelta(seconds=CAPTURE_RETRY_INTERVAL_SECONDS)).isoformat()
     query = (
         "SELECT client, session_id, transcript_path, workspace, workspace_id, "
-        "captured_through, pending_trigger, request_seq, wake_requested_at "
+        "captured_through, pending_trigger, request_seq, wake_requested_at, last_error, failure_count "
         "FROM session_cursor WHERE capture_pending = 1 "
         "AND (lease_until IS NULL OR lease_until < ?) "
-        "AND (last_error IS NULL OR last_attempt_at IS NULL OR last_attempt_at <= ?) "
+        "AND (retry_after IS NULL OR retry_after <= ?) "
     )
-    params: list[Any] = [now, retry_before]
+    params: list[Any] = [now, now]
     connection.create_function("capture_failed", 2, lambda client, session: (client, session) in drain.failed)
     query += "AND NOT capture_failed(client, session_id) "
-    fresh = connection.execute(
-        query + "AND wake_requested_at IS NOT NULL ORDER BY wake_requested_at, client, session_id LIMIT ?",
-        (*params, max_sessions),
-    ).fetchall()
+    fresh = [
+        _PendingCapture(*row)
+        for row in connection.execute(
+            query + "AND wake_requested_at IS NOT NULL ORDER BY wake_requested_at, client, session_id LIMIT ?",
+            (*params, max_sessions),
+        ).fetchall()
+    ]
     remaining = min(max_sessions - len(fresh), drain.background_remaining)
     if remaining:
         fresh.extend(
-            connection.execute(
+            _PendingCapture(*row)
+            for row in connection.execute(
                 query + "AND wake_requested_at IS NULL ORDER BY updated_at, client, session_id LIMIT ?",
                 (*params, remaining),
             ).fetchall()
@@ -729,7 +815,7 @@ def _claim_pending_sessions(
     timeout: float,
     max_sessions: int,
     drain: _CaptureDrain | None = None,
-) -> tuple[list[tuple], str]:
+) -> tuple[list[_ClaimedCapture], str]:
     """Claim one bounded round, consuming wakes atomically with lease creation."""
     drain = drain if drain is not None else _CaptureDrain(background_remaining=max_sessions)
     now = _now_iso()
@@ -743,11 +829,25 @@ def _claim_pending_sessions(
             connection.execute(
                 "UPDATE session_cursor SET lease_until = ?, lease_token = ?, updated_at = ?, "
                 "wake_requested_at = NULL WHERE client = ? AND session_id = ?",
-                (lease_until, lease_token, now, row[0], row[1]),
+                (lease_until, lease_token, now, row.client, row.session_id),
             )
-            claimed.append((*row[:8], lease_token))
+            claimed.append(
+                _ClaimedCapture(
+                    client=row.client,
+                    session_id=row.session_id,
+                    transcript_path=row.transcript_path,
+                    workspace=row.workspace,
+                    workspace_id=row.workspace_id,
+                    captured_through=row.captured_through,
+                    pending_trigger=row.pending_trigger,
+                    request_seq=row.request_seq,
+                    last_error=row.last_error,
+                    failure_count=int(row.failure_count or 0),
+                    lease_token=lease_token,
+                )
+            )
         connection.execute("COMMIT")
-        drain.background_remaining -= sum(row[8] is None for row in rows)
+        drain.background_remaining -= sum(row.wake_requested_at is None for row in rows)
     except Exception:
         connection.execute("ROLLBACK")
         raise
@@ -772,20 +872,16 @@ def _process_session_captures(
             drain=drain,
         )
         submitted = 0
-        for (
-            client,
-            session_id,
-            transcript_path,
-            workspace,
-            workspace_id,
-            captured_through,
-            trigger,
-            request_seq,
-            lease_token,
-        ) in claimed:
+        for capture in claimed:
+            client = capture.client
+            session_id = capture.session_id
+            transcript_path = capture.transcript_path
+            workspace = capture.workspace
+            workspace_id = capture.workspace_id
+            lease_token = capture.lease_token
             now = _now_iso()
-            captured_through = int(captured_through or 0)
-            request_seq = int(request_seq or 0)
+            captured_through = int(capture.captured_through or 0)
+            request_seq = int(capture.request_seq or 0)
             try:
                 if not transcript_path or not Path(transcript_path).exists():
                     raise FileNotFoundError("transcript unavailable")
@@ -815,7 +911,20 @@ def _process_session_captures(
                         ),
                     )
                     continue
-                trigger = _normalize_capture_trigger(trigger) or GATED_CAPTURE_TRIGGER
+                if capture.last_error in WORKSPACE_WAIT_CODES:
+                    if _workspace_backlog_expired(transcript_path):
+                        _drop_workspace_backlog(connection, capture, count=count)
+                        continue
+                    # A waiting capture is sent only after local context selects a workspace.
+                    workspace_id = _resolve_capture_workspace(workspace)
+                    if workspace_id is None:
+                        raise WorkspaceSelectionRequiredError
+                    connection.execute(
+                        "UPDATE session_cursor SET workspace_id = ? "
+                        "WHERE client = ? AND session_id = ? AND lease_token = ?",
+                        (workspace_id, client, session_id, lease_token),
+                    )
+                trigger = _normalize_capture_trigger(capture.pending_trigger) or GATED_CAPTURE_TRIGGER
                 window_payload = _session_window_payload(
                     client=client,
                     session_id=session_id,
@@ -837,14 +946,7 @@ def _process_session_captures(
             except Exception as exc:
                 if drain is not None:
                     drain.failed.add((client, session_id))
-                now = _now_iso()
-                # Keep capture_pending set so the next pass retries; release the lease.
-                connection.execute(
-                    "UPDATE session_cursor SET lease_until = NULL, lease_token = NULL, last_error = ?, "
-                    "last_attempt_at = ?, updated_at = ? "
-                    "WHERE client = ? AND session_id = ? AND lease_token = ?",
-                    (_queue_error_message(exc), now, now, client, session_id, lease_token),
-                )
+                _record_capture_failure(connection, capture, exc)
                 continue
             # Confirmed upload: only the worker holding this lease token may
             # finish the row. If a hook requested another capture mid-upload,
@@ -858,7 +960,7 @@ def _process_session_captures(
                 "pending_trigger = CASE WHEN ? < ? THEN pending_trigger WHEN request_seq = ? THEN NULL ELSE pending_trigger END, "
                 "wake_requested_at = CASE WHEN ? < ? THEN COALESCE(wake_requested_at, ?) ELSE wake_requested_at END, "
                 "lease_until = NULL, lease_token = NULL, last_error = NULL, "
-                "last_attempt_at = ?, updated_at = ? "
+                "failure_count = 0, retry_after = NULL, last_attempt_at = ?, updated_at = ? "
                 "WHERE client = ? AND session_id = ? AND lease_token = ?",
                 (
                     count,
@@ -886,6 +988,131 @@ def _process_session_captures(
         return submitted
     finally:
         connection.close()
+
+
+def _resolve_capture_workspace(workspace: str | None) -> str | None:
+    """Resolve a capture's workspace from its session directory, hook fallback included."""
+    return resolve_workspace_binding(
+        origin=configured_target().origin,
+        working_directory=workspace,
+        allow_hook_default=True,
+    ).workspace_id
+
+
+def _workspace_wait_code(exc: Exception) -> str | None:
+    """Return the queue code when the failure means no workspace can be selected."""
+    if isinstance(exc, (WorkspaceSelectionRequiredError, WorkspaceBindingError)):
+        return exc.code
+    return None
+
+
+def _capture_retry_delay_seconds(failure_count: int) -> float:
+    """Delay after a failed upload, given the consecutive failures before it."""
+    delay = CAPTURE_RETRY_INTERVAL_SECONDS
+    for _ in range(failure_count):
+        delay *= 2
+        if delay >= CAPTURE_RETRY_MAX_INTERVAL_SECONDS:
+            return CAPTURE_RETRY_MAX_INTERVAL_SECONDS
+    return delay
+
+
+def _record_capture_failure(connection: sqlite3.Connection, capture: _ClaimedCapture, exc: Exception) -> None:
+    """Keep the capture pending, release its lease and schedule its next attempt.
+
+    A capture that cannot select a workspace waits the maximum interval and keeps
+    its failure count, because retrying cannot help until local context changes.
+    Any other failure backs off exponentially.
+    """
+    now = _now_iso()
+    wait_code = _workspace_wait_code(exc)
+    if wait_code is not None:
+        connection.execute(
+            "UPDATE session_cursor SET lease_until = NULL, lease_token = NULL, last_error = ?, "
+            "last_attempt_at = ?, retry_after = ?, updated_at = ? "
+            "WHERE client = ? AND session_id = ? AND lease_token = ?",
+            (
+                wait_code,
+                now,
+                _iso_after(CAPTURE_RETRY_MAX_INTERVAL_SECONDS),
+                now,
+                capture.client,
+                capture.session_id,
+                capture.lease_token,
+            ),
+        )
+        return
+    connection.execute(
+        "UPDATE session_cursor SET lease_until = NULL, lease_token = NULL, last_error = ?, "
+        "last_attempt_at = ?, failure_count = failure_count + 1, retry_after = ?, updated_at = ? "
+        "WHERE client = ? AND session_id = ? AND lease_token = ?",
+        (
+            _queue_error_message(exc),
+            now,
+            _iso_after(_capture_retry_delay_seconds(capture.failure_count)),
+            now,
+            capture.client,
+            capture.session_id,
+            capture.lease_token,
+        ),
+    )
+
+
+def _workspace_backlog_expired(transcript_path: str) -> bool:
+    modified_at = datetime.fromtimestamp(Path(transcript_path).stat().st_mtime, timezone.utc)
+    age = datetime.fromisoformat(_now_iso()) - modified_at
+    return age > timedelta(seconds=WORKSPACE_BACKLOG_MAX_AGE_SECONDS)
+
+
+def _drop_workspace_backlog(connection: sqlite3.Connection, capture: _ClaimedCapture, *, count: int) -> None:
+    """Skip a capture that waited for a workspace past the backlog age, and record why."""
+    now = _now_iso()
+    request_seq = int(capture.request_seq or 0)
+    connection.execute(
+        "UPDATE session_cursor SET captured_through = ?, "
+        "capture_pending = CASE WHEN request_seq = ? THEN 0 ELSE 1 END, "
+        "pending_trigger = CASE WHEN request_seq = ? THEN NULL ELSE pending_trigger END, "
+        "last_error = ?, last_attempt_at = ?, failure_count = 0, retry_after = NULL, "
+        "lease_until = NULL, lease_token = NULL, updated_at = ? "
+        "WHERE client = ? AND session_id = ? AND lease_token = ?",
+        (
+            count,
+            request_seq,
+            request_seq,
+            WORKSPACE_BACKLOG_EXPIRED,
+            now,
+            now,
+            capture.client,
+            capture.session_id,
+            capture.lease_token,
+        ),
+    )
+    print(
+        f"MemForge dropped the uncaptured tail of {capture.client} session {capture.session_id}: "
+        "it waited for a workspace longer than the backlog age.",
+        file=sys.stderr,
+    )
+
+
+def _workspace_binding_hint(payload: dict[str, Any]) -> str | None:
+    """Return the binding hint when this project is unbound and captures wait for a workspace."""
+    db_path = _agent_queue_db_path()
+    if not db_path.exists():
+        return None
+    wait_codes = tuple(sorted(WORKSPACE_WAIT_CODES))
+    with sqlite3.connect(db_path) as connection:
+        _ensure_session_cursor(connection)
+        waiting = connection.execute(
+            "SELECT 1 FROM session_cursor WHERE capture_pending = 1 "
+            f"AND last_error IN ({', '.join('?' for _ in wait_codes)}) LIMIT 1",
+            wait_codes,
+        ).fetchone()
+    if waiting is None:
+        return None
+    try:
+        workspace_id = _resolve_capture_workspace(_workspace(payload))
+    except WorkspaceBindingError:
+        return WORKSPACE_BINDING_HINT
+    return WORKSPACE_BINDING_HINT if workspace_id is None else None
 
 
 def _read_hook_payload() -> dict[str, Any]:
@@ -996,13 +1223,13 @@ def _post_json(
             response_body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        if exc.code == 409:
-            try:
-                error_payload = json.loads(detail)
-            except json.JSONDecodeError:
-                error_payload = None
-            if isinstance(error_payload, dict) and error_payload.get("code") == "workspace_selection_required":
-                raise WorkspaceSelectionRequiredError from exc
+        try:
+            error_payload = json.loads(detail)
+        except json.JSONDecodeError:
+            error_payload = None
+        code = error_payload.get("code") if isinstance(error_payload, dict) else None
+        if code in {WORKSPACE_SELECTION_REQUIRED_CODE, WORKSPACE_NOT_FOUND_CODE}:
+            raise WorkspaceSelectionRequiredError(code) from exc
         raise RuntimeError(f"{path} returned HTTP {exc.code}: {detail}") from exc
     if not response_body:
         return {}
@@ -1764,6 +1991,8 @@ def _ensure_session_cursor(connection: sqlite3.Connection) -> None:
             last_error TEXT,
             last_attempt_at TEXT,
             wake_requested_at TEXT,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            retry_after TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (client, session_id)
@@ -1774,6 +2003,8 @@ def _ensure_session_cursor(connection: sqlite3.Connection) -> None:
     _ensure_column(connection, "session_cursor", "request_seq", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(connection, "session_cursor", "workspace_id", "TEXT")
     _ensure_column(connection, "session_cursor", "wake_requested_at", "TEXT")
+    _ensure_column(connection, "session_cursor", "failure_count", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(connection, "session_cursor", "retry_after", "TEXT")
 
 
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -1816,10 +2047,7 @@ def _safe_exception_message(exc: Exception) -> str:
 
 def _hook_system_message(exc: Exception) -> str:
     if isinstance(exc, WorkspaceSelectionRequiredError):
-        return (
-            "MemForge automatic capture is waiting for a local workspace binding. "
-            "Use the memforge-setup skill to bind this project or configure the hook fallback."
-        )
+        return WORKSPACE_BINDING_HINT
     return f"MemForge hook skipped: {_safe_exception_message(exc)}"
 
 

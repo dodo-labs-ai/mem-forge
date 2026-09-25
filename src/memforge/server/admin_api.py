@@ -39,6 +39,7 @@ from memforge.auth import browser_session
 from memforge.auth.jira_auth import (
     JiraAuthSessionError,
     JiraAuthSessionService,
+    JIRA_PRINCIPAL_CHANGED_CODE,
     JiraPrincipalChangedError,
     canonical_jira_origin,
     effective_jira_auth_mode,
@@ -3732,6 +3733,7 @@ def create_admin_app(
             raise HTTPException(
                 status_code=409,
                 detail={
+                    "code": JIRA_PRINCIPAL_CHANGED_CODE,
                     "message": str(exc),
                     "origin": exc.origin,
                     "old_principal_id": exc.old_principal_id,
@@ -7787,7 +7789,13 @@ def create_admin_app(
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         """Submit a client transcript window for private agent-knowledge patching."""
-        from memforge.agent_sessions import agent_session_source_id, submit_agent_session_window
+        from memforge.agent_sessions import (
+            AGENT_SESSION_LLM_FAILED_CODE,
+            AGENT_SESSION_WINDOW_RETRY_AFTER_SECONDS,
+            AgentSessionWindowLlmError,
+            agent_session_source_id,
+            submit_agent_session_window,
+        )
 
         if req.schema_version != "agent-session-window/v1":
             raise HTTPException(status_code=400, detail=f"unsupported schema_version: {req.schema_version}")
@@ -7832,11 +7840,19 @@ def create_admin_app(
             )
         except SourceActivityConflict as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
+        except AgentSessionWindowLlmError as e:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": AGENT_SESSION_LLM_FAILED_CODE,
+                    "category": e.category,
+                    "error_code": e.error_code,
+                    "message": str(e),
+                },
+                headers={"Retry-After": str(AGENT_SESSION_WINDOW_RETRY_AFTER_SECONDS)},
+            ) from e
         except ValueError as e:
-            detail = str(e)
-            if "LLM unavailable" in detail:
-                raise HTTPException(status_code=503, detail=detail)
-            raise HTTPException(status_code=400, detail=detail)
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
         return {
             **result,
