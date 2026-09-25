@@ -117,6 +117,7 @@ async def test_pipeline_reuses_the_compact_wire_result_and_decodes_it_again():
     second = RevisionWorkExecutor(client=client, model='openai/gpt-4o', store=store, derivation_id='root')
     reused = await second.assess_many(items)
     assert all(r.supported and r.memory is not None for r in reused.values())
-    assert len(client.prompts) == 1 and second.reused == 1
+    # Both the Change Impact request and the reading request are reused without a call.
+    assert len(client.impact_prompts) == 1 and len(client.prompts) == 1 and second.reused == 2
     work = next(w for w in store.works.values() if w.kind == 'support_assess')
     assert all('reason' not in r and r['work_id'].startswith('WRK-') for r in work.result['results'])

@@ -15,6 +15,7 @@ from memforge.llm.batch_runner import LlmRequest, RequestTooLarge
 from memforge.models import RawMemory
 from memforge.pipeline.evidence_fragments import (
     EvidenceFragment,
+    EvidenceFragmentKind,
     RevisionFragmentIndex,
     build_revision_fragment_index,
     canonical_record_field_ranges,
@@ -35,7 +36,7 @@ from memforge.source_projection import SourceObservationRevision, SourceProjecti
 
 # Versions how a fixed Support is revalidated against a revision: it enters the
 # reconciliation manifest and each revalidated Support's ``support_validation``.
-REVISION_SUPPORT_CONTRACT = "revision-support-v3"
+REVISION_SUPPORT_CONTRACT = "revision-support-v4"
 # Versions how revision Fragments are compiled into catalogs and how Claim
 # Extraction chooses its reading scope. Every catalog this context composes,
 # for extraction or for Support, carries it in its identity.
@@ -116,6 +117,7 @@ class RevisionAssessmentContext:
         self.image_loader = image_loader
         self.indexes: dict[str, RevisionFragmentIndex] = indexes if indexes is not None else {}
         self.reading_indexes = {}
+        self._images = {}
         self.current = {
             r.observation_id: r
             for r in projection.observation_revisions
@@ -151,7 +153,8 @@ class RevisionAssessmentContext:
             for revision in (*self.previous.values(), *self.current.values())
             if revision.evidence_profile and revision.evidence_profile.name == "canonical-record"
         }
-        for revision in self.current.values():
+        # Both sides, so removed old text keeps its heading path too.
+        for revision in {r.id: r for r in (*self.previous.values(), *self.current.values())}.values():
             if revision.evidence_profile and revision.evidence_profile.name == "markdown-structural":
                 units = revision_structural_ranges(revision)
                 identities = _revision_structural_identities(revision, units)
@@ -175,19 +178,25 @@ class RevisionAssessmentContext:
         }}
 
     def images_for(self, catalog):
-        ids = {f.anchor.observation_id for f in catalog.fragments if f.kind.value == "artifact"}
+        """The current bytes of the catalog's Artifacts, read once per set for this operation.
+
+        Split, corrected and repeated requests render the same Artifacts again.
+        """
+        ids = frozenset(f.anchor.observation_id for f in catalog.fragments if f.kind is EvidenceFragmentKind.ARTIFACT)
         if not ids:
             return ()
-        images = self.image_loader(ids) if self.image_loader is not None else self.images
-        images = tuple(image for image in images if image.source_observation_id in ids)
-        if ids != {image.source_observation_id for image in images}:
-            raise SupportRevalidationLimitation(
-                SupportRevalidationLimitationCode.UNSUPPORTED_REPRESENTATION,
-                "selected current Artifact bytes were not supplied",
-            )
-        return images
+        if ids not in self._images:
+            images = self.image_loader(set(ids)) if self.image_loader is not None else self.images
+            images = tuple(image for image in images if image.source_observation_id in ids)
+            if ids != {image.source_observation_id for image in images}:
+                raise SupportRevalidationLimitation(
+                    SupportRevalidationLimitationCode.UNSUPPORTED_REPRESENTATION,
+                    "selected current Artifact bytes were not supplied",
+                )
+            self._images[ids] = images
+        return self._images[ids]
 
-    def attach_images(self, request: LlmRequest, catalog, *, fits, load=None) -> LlmRequest:
+    def attach_images(self, request: LlmRequest, catalog, *, fits) -> LlmRequest:
         """Attach the catalog's Artifact images to a request whose text already fits.
 
         Text alone can reject a request without reading attachments. An image
@@ -196,26 +205,44 @@ class RevisionAssessmentContext:
         if not fits(request):
             raise RequestTooLarge("request text exceeds input capacity")
         try:
-            images = (load or self.images_for)(catalog)
+            images = self.images_for(catalog)
         except ProjectionImageLoadError as error:
             if error.error_code != "image_batch_too_large":
                 raise
             raise RequestTooLarge(error.error_code) from error
         return replace(request, images=images)
 
+    def heading_context(self, fragment) -> tuple[str, ...]:
+        """The Markdown heading path a current or baseline Fragment sits under; empty elsewhere."""
+        anchor = fragment.anchor
+        return tuple(next(
+            (headings for start, end, headings in self.structural_context.get(
+                anchor.observation_revision_id, ()
+            ) if start <= (anchor.range_start or 0) < end), ()
+        ))
+
+    def _scope(self, fragment) -> tuple[tuple[str, ...], str | None]:
+        """A Fragment's heading path and canonical record field, when its representation has them."""
+        anchor = fragment.anchor
+        field = next((field.descriptor.json_pointer for field in self.canonical_fields.get(anchor.observation_revision_id, ())
+                      if field.start <= (anchor.range_start or 0) and (anchor.range_end or 0) <= field.end), None)
+        return self.heading_context(fragment), field
+
+    def fragment_scope(self, fragment) -> dict:
+        """Where a Fragment sits, for a reader who sees its text without its neighbours."""
+        headings, field = self._scope(fragment)
+        return {
+            **({"heading_context": list(headings)} if headings else {}),
+            **({"field": field} if field is not None else {}),
+        }
+
     def model_payload(self, catalog):
         payload = dict(catalog.model_payload())
         groups: dict[tuple[str, str, tuple[str, ...], str | None], list[str]] = {}
         for fragment in catalog.fragments:
             anchor = fragment.anchor
-            headings = next(
-                (headings for start, end, headings in self.structural_context.get(
-                    anchor.observation_revision_id, ()
-                ) if start <= (anchor.range_start or 0) < end), ()
-            )
-            field = next((field.descriptor.json_pointer for field in self.canonical_fields.get(anchor.observation_revision_id, ())
-                          if field.start <= (anchor.range_start or 0) and (anchor.range_end or 0) <= field.end), None)
-            key = (anchor.observation_id, anchor.observation_revision_id, tuple(headings), field)
+            headings, field = self._scope(fragment)
+            key = (anchor.observation_id, anchor.observation_revision_id, headings, field)
             groups.setdefault(key, []).append(fragment.reference)
         # Ancestor text is supplementary structure. The original heading Fragment
         # remains selectable in its authorized role; groups never create Evidence.
@@ -269,7 +296,8 @@ class RevisionAssessmentContext:
             max_presentation_chars=max(1, sum(len(f.presentation_text) for f in fragments)),
         )
 
-    def delta(self):
+    def delta_fragments(self) -> tuple[tuple[EvidenceFragment, ...], tuple[EvidenceFragment, ...]]:
+        """The added or modified current Fragments, and the baseline Fragments this revision removed."""
         if self._delta is not None:
             return self._delta
         if self.base is None:
@@ -287,11 +315,21 @@ class RevisionAssessmentContext:
             if key in self.members and current is None and key not in self.tombstoned:
                 continue
             ranges = _changed_ranges(current, old) if current else None
-            removed.extend(
-                {"observation_id": key, "revision_id": old.id, "text": f.presentation_text,
-                 **self.canonical_context(f)}
-                for f in self.index(old).fragments
-                if _in_ranges(f, ranges)
-            )
-        self._delta = tuple(changed), removed
+            removed.extend(f for f in self.index(old).fragments if _in_ranges(f, ranges))
+        self._delta = tuple(changed), tuple(removed)
         return self._delta
+
+    def removed_entry(self, fragment) -> dict:
+        """One removed baseline Fragment's old text, with its canonical record field and event identity."""
+        anchor = fragment.anchor
+        return {
+            "observation_id": anchor.observation_id,
+            "revision_id": anchor.observation_revision_id,
+            "text": fragment.presentation_text,
+            **self.canonical_context(fragment),
+        }
+
+    def delta(self):
+        """The changed current Fragments and the removed old text, as Claim Extraction reads them."""
+        changed, removed = self.delta_fragments()
+        return changed, [self.removed_entry(fragment) for fragment in removed]

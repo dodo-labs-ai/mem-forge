@@ -47,17 +47,18 @@ async def test_ordered_reading_fits_one_request_despite_dense_output_estimate():
 @pytest.mark.asyncio
 async def test_truncated_multi_claim_output_is_halved_until_each_request_completes():
     class TruncatingClient(BudgetClient):
-        async def evaluate_revision_work(self, prompt, **kwargs):
-            if len(payload(prompt)['works']) > 1:
+        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            if response_format is SupportAssessmentWireResponse and len(payload(prompt)['works']) > 1:
                 self.prompts.append(prompt)
                 raise StructuredLlmError('fixture truncation', error_code=OUTPUT_TRUNCATED)
-            return await super().evaluate_revision_work(prompt, **kwargs)
+            return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
     client = TruncatingClient()
     executor = RevisionWorkExecutor(client=client, model='gpt-4o')
     results = await executor.assess_many(work_items(CHANGED, 4))
     assert all(row.supported for row in results.values())
     assert [len(payload(p)['works']) for p in client.prompts] == [4, 2, 1, 1, 2, 1, 1]
-    assert executor.calls == 7 and len(executor.final_work_ids) == 4
+    # One Change Impact request judged all four AFFECTED before the seven reading requests.
+    assert len(client.impact_prompts) == 1 and executor.calls == 8 and len(executor.final_work_ids) == 4
 
 
 def test_aliases_preserve_text_and_role_eligibility_and_expand_four_digits():
@@ -101,7 +102,7 @@ async def test_wire_id_text_is_not_rewritten_and_unknown_namespace_fails_closed(
         await executor.assess_many(items)
     assert len(client.prompts) == 2
     assert 'Literal p000001 and w000068 are source text.' in client.prompts[0]
-    assert all(w.status != 'completed' for w in store.works.values())
+    assert all(w.status != 'completed' for w in store.works.values() if w.kind == 'support_assess')
 
 
 @pytest.mark.asyncio

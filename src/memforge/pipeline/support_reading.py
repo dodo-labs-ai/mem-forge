@@ -1,9 +1,14 @@
-"""Exact prior Evidence correspondence, whole-Support routing and reading order for one revision.
+"""Exact prior Evidence correspondence, whole-Support routing, ChangeBundle and reading order for one revision.
 
 Everything here is program-only and recomputed for every base/target pair from
 the persisted Evidence digests, the target membership, its coverage and its
 reading structure. No correspondence status is stored, no semantic similarity
 is consulted, and no cost comparison decides what a Support reads.
+
+A revision's changes are its changed current ReadingGroups followed by the old
+text of what it removed. A list that only lost items is a changed group too.
+They are the ChangeBundle that Change Impact judges an exactly unchanged Support
+against, and the start of every reading order.
 """
 
 from __future__ import annotations
@@ -66,6 +71,7 @@ class SupportRoute(str, Enum):
     """What happens to one whole Support in this revision."""
 
     REBIND_SUPPORT = "rebind_support"
+    CHANGE_IMPACT = "change_impact"
     SUPPORT_ASSESSMENT = "support_assessment"
     UNRESOLVED_PARTIAL_COVERAGE = "unresolved_partial_coverage"
 
@@ -125,7 +131,7 @@ class SupportReadingOrder:
 
     @property
     def removed(self) -> tuple[Mapping[str, Any], ...]:
-        return tuple(part.removed for part in self.parts if part.removed is not None)
+        return removed_entries(self.parts)
 
     @property
     def has_current_content(self) -> bool:
@@ -134,11 +140,45 @@ class SupportReadingOrder:
 
 @dataclass(frozen=True)
 class SupportRevisionPlan:
+    context: RevisionAssessmentContext
     # The complete current Support catalog; every current ref here belongs to it.
     catalog: ProjectionFragmentCatalog
     supports: tuple[SupportPlan, ...]
-    # Present when any Support routes to Support Assessment.
-    reading: SupportReadingOrder | None
+    # Current ReadingGroups in document order: one outermost list, or one Fragment, each.
+    groups: tuple[tuple[EvidenceFragment, ...], ...]
+    # What this revision changed: the changed current ReadingGroups in document order,
+    # then the old text of each removed Fragment. Empty without a usable baseline.
+    changes: tuple[ReadingPart, ...]
+    # Catalog refs of the added or modified current Fragments inside ``changes``;
+    # the other Fragments of a changed group are unchanged context.
+    changed_refs: frozenset[str]
+
+    def reading_order(self, assessed: Sequence[SupportPlan]) -> SupportReadingOrder:
+        """Changes and the assessed Supports' own prior Evidence first; then the rest, in document order."""
+        if self.context.base is None:
+            # Nothing is known to be unchanged, so every Support's first part is the whole revision.
+            parts = tuple(ReadingPart(fragments=group) for group in self.groups)
+            return SupportReadingOrder(parts, {support.item.id: len(parts) for support in assessed})
+        own_anchors = {
+            fragment.anchor for support in assessed for correspondence in support.parts for fragment in correspondence.current
+        }
+        changed_anchors = {fragment.anchor for part in self.changes for fragment in part.fragments}
+        unchanged = [group for group in self.groups if not any(f.anchor in changed_anchors for f in group)]
+        own = [group for group in unchanged if any(f.anchor in own_anchors for f in group)]
+        rest = [group for group in unchanged if not any(f.anchor in own_anchors for f in group)]
+        parts = (*self.changes, *(ReadingPart(fragments=group) for group in (*own, *rest)))
+        position = {
+            fragment.anchor: index for index, part in enumerate(parts) for fragment in part.fragments
+        }
+
+        def first_part_end(support: SupportPlan) -> int:
+            own_ends = (
+                position[fragment.anchor] + 1 for correspondence in support.parts for fragment in correspondence.current
+            )
+            # Prior Evidence travels with the first part, so every Support reads at least one part before concluding.
+            return max((1, len(self.changes), *own_ends))
+
+        return SupportReadingOrder(parts, {support.item.id: first_part_end(support) for support in assessed})
 
 
 def plan_support_revision(
@@ -153,19 +193,17 @@ def plan_support_revision(
     correspondences = [
         tuple(_correspond(part, context, returned, by_observation) for part in item.support) for item in items
     ]
-    # Changed content only matters for a Support that is exactly unchanged against a usable baseline.
-    changed_content = (
-        context.base is not None
-        and any(_all_exact(parts) for parts in correspondences)
-        and _has_changed_content(context)
+    # Only a Support with an UNKNOWN part neither judges nor reads the revision.
+    reads_revision = any(not _any_unknown(parts) for parts in correspondences)
+    groups = _current_reading_groups(context, catalog) if reads_revision else ()
+    changes, changed_refs = (
+        _changes(context, catalog, groups) if context.base is not None and reads_revision else ((), frozenset())
     )
     supports = tuple(
-        SupportPlan(item, parts, _route(parts, context, changed_content))
+        SupportPlan(item, parts, _route(parts, context, bool(changes)))
         for item, parts in zip(items, correspondences, strict=True)
     )
-    assessed = tuple(support for support in supports if support.route is SupportRoute.SUPPORT_ASSESSMENT)
-    reading = _reading_order(context, catalog, assessed) if assessed else None
-    return SupportRevisionPlan(catalog, supports, reading)
+    return SupportRevisionPlan(context, catalog, supports, groups, changes, changed_refs)
 
 
 def _correspond(
@@ -228,69 +266,75 @@ def _all_exact(parts: tuple[PartCorrespondence, ...]) -> bool:
     return all(correspondence.status is EvidenceCorrespondence.EXACT_UNCHANGED for correspondence in parts)
 
 
-def _has_changed_content(context: RevisionAssessmentContext) -> bool:
-    changed, removed = context.delta()
-    # Removed old text is changed content: it may have qualified the claim.
-    return bool(changed) or bool(removed)
+def _any_unknown(parts: tuple[PartCorrespondence, ...]) -> bool:
+    return any(correspondence.status is EvidenceCorrespondence.UNKNOWN for correspondence in parts)
 
 
-def _route(
-    parts: tuple[PartCorrespondence, ...],
-    context: RevisionAssessmentContext,
-    changed_content: bool,
-) -> SupportRoute:
+def _route(parts: tuple[PartCorrespondence, ...], context: RevisionAssessmentContext, changed: bool) -> SupportRoute:
     # An UNKNOWN part never reaches the model, so it decides the whole Support.
-    if any(correspondence.status is EvidenceCorrespondence.UNKNOWN for correspondence in parts):
+    if _any_unknown(parts):
         return SupportRoute.UNRESOLVED_PARTIAL_COVERAGE
     # Without a usable baseline nothing is known to be unchanged: read the whole revision.
-    if context.base is None or not _all_exact(parts) or changed_content:
+    if context.base is None or not _all_exact(parts):
         return SupportRoute.SUPPORT_ASSESSMENT
-    return SupportRoute.REBIND_SUPPORT
+    return SupportRoute.CHANGE_IMPACT if changed else SupportRoute.REBIND_SUPPORT
 
 
-def _reading_order(
+def _changes(
     context: RevisionAssessmentContext,
     catalog: ProjectionFragmentCatalog,
-    assessed: tuple[SupportPlan, ...],
-) -> SupportReadingOrder:
-    """Changed content, removed old text and own prior Evidence first; then the rest, in document order."""
-    groups = _current_reading_groups(context, catalog)
-    if context.base is None:
-        # Nothing is known to be unchanged, so every Support's first part is the whole revision.
-        parts = tuple(ReadingPart(fragments=group) for group in groups)
-        return SupportReadingOrder(parts, {support.item.id: len(parts) for support in assessed})
-
-    changed_fragments, removed_entries = context.delta()
+    groups: tuple[tuple[EvidenceFragment, ...], ...],
+) -> tuple[tuple[ReadingPart, ...], frozenset[str]]:
+    """The changed current ReadingGroups, whole, then removed old text: it may have qualified a claim."""
+    changed_fragments, removed = context.delta_fragments()
     changed_anchors = {fragment.anchor for fragment in changed_fragments}
-    own_anchors = {
-        fragment.anchor for support in assessed for correspondence in support.parts for fragment in correspondence.current
-    }
-    changed = [index for index, group in enumerate(groups) if any(f.anchor in changed_anchors for f in group)]
-    first = set(changed)
-    own = [index for index, group in enumerate(groups) if index not in first and any(f.anchor in own_anchors for f in group)]
-    first.update(own)
-    rest = [index for index in range(len(groups)) if index not in first]
-    removed = tuple(
-        ReadingPart(removed={"ref": f"h{index:06d}", **entry}) for index, entry in enumerate(removed_entries)
+    # A list that lost an item changed, so its remaining items are read with the removal.
+    touched = changed_anchors | _remaining_list_items(context, catalog, removed)
+    changed_groups = tuple(group for group in groups if any(f.anchor in touched for f in group))
+    changes = (
+        *(ReadingPart(fragments=group) for group in changed_groups),
+        *(
+            ReadingPart(removed={"ref": f"h{index:06d}", **context.removed_entry(fragment), **_headings(context, fragment)})
+            for index, fragment in enumerate(removed)
+        ),
     )
-    parts = (
-        *(ReadingPart(fragments=groups[index]) for index in changed),
-        *removed,
-        *(ReadingPart(fragments=groups[index]) for index in (*own, *rest)),
-    )
-    changed_end = len(changed) + len(removed)
-    position = {
-        fragment.anchor: index for index, part in enumerate(parts) for fragment in part.fragments
-    }
+    changed_refs = frozenset(fragment.reference for fragment in catalog.fragments if fragment.anchor in changed_anchors)
+    return changes, changed_refs
 
-    def first_part_end(support: SupportPlan) -> int:
-        own_ends = (
-            position[fragment.anchor] + 1 for correspondence in support.parts for fragment in correspondence.current
-        )
-        # Prior Evidence travels with the first part, so every Support reads at least one part before concluding.
-        return max((1, changed_end, *own_ends))
 
-    return SupportReadingOrder(parts, {support.item.id: first_part_end(support) for support in assessed})
+def _remaining_list_items(
+    context: RevisionAssessmentContext, catalog: ProjectionFragmentCatalog, removed: tuple[EvidenceFragment, ...]
+) -> set[SourceAnchor]:
+    """Current anchors of the items still present from a baseline list that lost some of its items.
+
+    An item is found by its exact digests in the same Observation, like prior Evidence.
+    Identical text elsewhere in that Observation is read too; it only adds context.
+    """
+    removed_anchors = {fragment.anchor for fragment in removed}
+    baselines = {fragment.anchor.observation_revision_id: context.previous[fragment.anchor.observation_id] for fragment in removed}
+    remaining = set()
+    for baseline in baselines.values():
+        reading = context.reading_index(baseline)
+        by_anchor = {fragment.anchor: fragment for fragment in reading.fragments}
+        for group in reading.lists:
+            if not removed_anchors.isdisjoint(group.trigger_anchors):
+                remaining.update(_digests(by_anchor[anchor]) for anchor in group.trigger_anchors if anchor not in removed_anchors)
+    return {fragment.anchor for fragment in catalog.fragments if _digests(fragment) in remaining}
+
+
+def _digests(fragment: EvidenceFragment) -> tuple[str, str, str]:
+    return fragment.anchor.observation_id, fragment.raw_content_sha256, fragment.presentation_sha256
+
+
+def _headings(context: RevisionAssessmentContext, fragment: EvidenceFragment) -> dict:
+    """The heading path removed Markdown text sat under in its baseline."""
+    headings = context.heading_context(fragment)
+    return {"heading_context": list(headings)} if headings else {}
+
+
+def removed_entries(parts: Sequence[ReadingPart]) -> tuple[Mapping[str, Any], ...]:
+    """The removed old text among some reading parts, in order."""
+    return tuple(part.removed for part in parts if part.removed is not None)
 
 
 def _current_reading_groups(
