@@ -29,7 +29,7 @@ from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryWorkSelection,
     RelationDiscoveryWorkState,
 )
-from memforge.models import Memory, MemoryReview, ReviewStatus, content_hash
+from memforge.models import DocumentRecord, Memory, MemoryReview, ReviewStatus, content_hash
 from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 from memforge.storage.database import Database
 
@@ -667,6 +667,94 @@ async def test_converted_reviews_are_deleted_only_after_apply_and_a_frozen_relat
     assert deleted.json() == {"report_id": report["report_id"], "deleted_review_count": 5}
     assert await db.list_memory_reviews(kind=CROSS_SOURCE_CONFLICT_REVIEW_KIND) == []
     assert await db.db.execute_fetchall("SELECT 1 FROM memory_review_related_challengers") == []
+
+
+async def _shown_from(db: Database, memory_id: str, source_id: str) -> None:
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id=f"doc-{memory_id}",
+            source=source_id,
+            source_url=f"https://example.test/{memory_id}",
+            title=f"Page {memory_id}",
+            space_or_project="PAY",
+            author=None,
+            last_modified=REVIEWED_AT,
+            labels=[],
+            version="1",
+            content_hash=f"doc-hash-{memory_id}",
+            token_count=1,
+            raw_content_uri=None,
+            raw_content_type="text/markdown",
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=REVIEWED_AT,
+        )
+    )
+    await db.add_memory_source(memory_id, f"doc-{memory_id}", "confluence", source_updated_at=None)
+
+
+@pytest.mark.asyncio
+async def test_conversion_decides_pairs_from_unreadable_or_missing_sources_by_memory_content(
+    db: Database,
+    tmp_path,
+) -> None:
+    """A Review converts by its Memories' content; a Source's access never fails the conversion.
+
+    Relations are read under each reader's access to both Memories, so the
+    conversion writes them without reading any Source.
+    """
+
+    for source_id in ("src-private", "src-changing", "src-gone"):
+        await db.upsert_source(
+            id=source_id,
+            type="confluence",
+            name=source_id,
+            config_json="{}",
+            access_policy="workspace",
+            owner_user_id=LOCAL_DEV_USER_ID,
+        )
+    memories = {}
+    for memory_id, source_id in (
+        ("p1", "src-private"),
+        ("p2", "src-private"),
+        ("c1", "src-changing"),
+        ("c2", "src-changing"),
+        ("m1", "src-gone"),
+        ("m2", "src-gone"),
+        ("m3", "src-gone"),
+    ):
+        memories[memory_id] = await _memory(db, memory_id)
+        await _shown_from(db, memory_id, source_id)
+    await db.db.execute(
+        "UPDATE sources SET access_policy = 'private', owner_user_id = 'someone-else' WHERE id = 'src-private'"
+    )
+    await db.db.execute("UPDATE memories SET visibility = 'private', owner_user_id = 'someone-else' WHERE id IN ('p1', 'p2')")
+    await db.db.execute("UPDATE sources SET access_state = 'changing' WHERE id = 'src-changing'")
+    await db.db.execute("DELETE FROM sources WHERE id = 'src-gone'")
+    await db.db.commit()
+    await _review(db, "rev-private", ReviewStatus.APPROVED, challenger=memories["p1"], incumbent=memories["p2"])
+    await _review(db, "rev-changing", ReviewStatus.REJECTED, challenger=memories["c1"], incumbent=memories["c2"])
+    await _review(db, "rev-gone", ReviewStatus.APPROVED, challenger=memories["m1"], incumbent=memories["m2"])
+    await _review(db, "rev-gone-pending", ReviewStatus.PENDING, challenger=memories["m3"], incumbent=memories["m2"])
+    await _work(db, memories["m3"], status="completed", attempts=1, classifier_version="memory-relation-v4-sparse")
+
+    with _client(db, tmp_path) as client:
+        report = client.post("/api/v1/memories/cross-source-review-conversion/report")
+        applied = client.post(
+            "/api/v1/memories/cross-source-review-conversion/apply",
+            json={"report_id": report.json()["report_id"]},
+        )
+
+    assert report.status_code == 200
+    assert report.json()["relation_labels"] == {"rev-gone": "contradicts", "rev-private": "contradicts"}
+    assert report.json()["dismissal_review_ids"] == ["rev-changing"]
+    assert report.json()["rerun_review_ids"] == ["rev-gone-pending"]
+    assert applied.status_code == 200
+    assert applied.json()["complete"] is True
+    relations = await db.db.execute_fetchall(
+        "SELECT memory_low_id, memory_high_id FROM cross_document_relations ORDER BY memory_low_id"
+    )
+    assert [(row["memory_low_id"], row["memory_high_id"]) for row in relations] == [("m1", "m2"), ("p1", "p2")]
 
 
 @pytest.mark.asyncio

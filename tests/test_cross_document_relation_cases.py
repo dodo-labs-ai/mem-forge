@@ -64,7 +64,8 @@ def _review(review_id: str, status: str, challenger: str, incumbent: str) -> Mem
 
 
 class _ReviewStore:
-    def __init__(self, memories: list[Memory], reviews: list[MemoryReview]) -> None:
+    def __init__(self, db: Database, memories: list[Memory], reviews: list[MemoryReview]) -> None:
+        self.db = db
         self.memories = {memory.id: memory for memory in memories}
         self.reviews = reviews
         self.units = {memory.id: (replace(primary_evidence_unit_fixture(memory.id), source_id="src-teams"),) for memory in memories}
@@ -86,6 +87,9 @@ class _ReviewStore:
         memory_id = source_unit_id.removeprefix("unit-")
         return {f"obs-{memory_id}": primary_observation_revision_fixture(memory_id)}
 
+    async def get_source(self, source_id):
+        return await self.db.get_source(source_id)
+
 
 @pytest.fixture
 async def db(tmp_path):
@@ -103,7 +107,7 @@ async def db(tmp_path):
     await database.close()
 
 
-def _review_store() -> _ReviewStore:
+def _review_store(db: Database) -> _ReviewStore:
     memories = [
         _memory("mem-a", "Payroll runs weekly."),
         _memory("mem-b", "Payroll runs monthly."),
@@ -115,6 +119,7 @@ def _review_store() -> _ReviewStore:
         _memory("mem-h", "Changed statement.", updated_at=datetime(2026, 8, 1, tzinfo=timezone.utc)),
     ]
     store = _ReviewStore(
+        db,
         memories,
         [
             _review("rev-confirmed", "approved", "mem-a", "mem-b"),
@@ -130,7 +135,7 @@ def _review_store() -> _ReviewStore:
 
 @pytest.mark.asyncio
 async def test_seed_pins_decided_reviews_with_labels_and_is_repeatable(db: Database) -> None:
-    store = _review_store()
+    store = _review_store(db)
     evaluation = OfflineAgentEvaluation(db, executors={})
     overrides = {"rev-updated": CrossDocumentRelationLabel.UPDATES}
 
@@ -143,6 +148,7 @@ async def test_seed_pins_decided_reviews_with_labels_and_is_repeatable(db: Datab
     assert report.skipped == {
         RelationCaseSkip.MEMORY_CHANGED.value: 1,
         RelationCaseSkip.PRIVATE_MEMORY.value: 1,
+        RelationCaseSkip.SOURCE_UNAVAILABLE.value: 0,
         RelationCaseSkip.NO_SOURCE_EVIDENCE.value: 0,
     }
     cohort = await db.get_agent_evaluation_cohort(report.cohort_id)
@@ -172,7 +178,7 @@ async def test_seed_pins_decided_reviews_with_labels_and_is_repeatable(db: Datab
 
 @pytest.mark.asyncio
 async def test_seed_skips_a_pair_without_source_evidence_and_rejects_unknown_relabels(db: Database) -> None:
-    store = _review_store()
+    store = _review_store(db)
     store.units["mem-a"] = ()
     evaluation = OfflineAgentEvaluation(db, executors={})
 
@@ -186,6 +192,76 @@ async def test_seed_skips_a_pair_without_source_evidence_and_rejects_unknown_rel
             actor=ACTOR,
             label_overrides={"rev-pending": CrossDocumentRelationLabel.UPDATES},
         )
+
+
+UNREADABLE_SOURCE_ID = "src-unreadable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("shown_memory_id", "source", "reason"),
+    [
+        # rev-confirmed pairs challenger mem-a with candidate mem-b.
+        ("mem-a", {"access_policy": "private", "owner_user_id": "someone-else"}, RelationCaseSkip.PRIVATE_MEMORY),
+        ("mem-b", {"access_policy": "private", "owner_user_id": "someone-else"}, RelationCaseSkip.PRIVATE_MEMORY),
+        ("mem-a", {"access_policy": "workspace", "access_state": "changing"}, RelationCaseSkip.SOURCE_UNAVAILABLE),
+        ("mem-b", {"access_policy": "workspace", "access_state": "changing"}, RelationCaseSkip.SOURCE_UNAVAILABLE),
+        ("mem-a", None, RelationCaseSkip.SOURCE_UNAVAILABLE),
+        ("mem-b", None, RelationCaseSkip.SOURCE_UNAVAILABLE),
+    ],
+    ids=[
+        "private-challenger",
+        "private-candidate",
+        "changing-challenger",
+        "changing-candidate",
+        "missing-challenger",
+        "missing-candidate",
+    ],
+)
+async def test_seed_skips_a_pair_shown_from_an_unreadable_or_missing_source(
+    db: Database,
+    shown_memory_id: str,
+    source: dict[str, str] | None,
+    reason: RelationCaseSkip,
+) -> None:
+    if source is not None:
+        await db.upsert_source(
+            id=UNREADABLE_SOURCE_ID,
+            type="teams",
+            name="Unreadable",
+            config_json="{}",
+            owner_user_id=source.get("owner_user_id", "owner-1"),
+            access_policy=source["access_policy"],
+            access_state=source.get("access_state", "active"),
+        )
+    store = _review_store(db)
+    store.units[shown_memory_id] = (
+        replace(primary_evidence_unit_fixture(shown_memory_id), source_id=UNREADABLE_SOURCE_ID),
+    )
+
+    report = await seed_cross_document_relation_cases(
+        store,
+        OfflineAgentEvaluation(db, executors={}),
+        actor=ACTOR,
+        label_overrides={},
+    )
+
+    expected_skips = {
+        RelationCaseSkip.MEMORY_CHANGED.value: 1,
+        RelationCaseSkip.PRIVATE_MEMORY.value: 1,
+        RelationCaseSkip.SOURCE_UNAVAILABLE.value: 0,
+        RelationCaseSkip.NO_SOURCE_EVIDENCE.value: 0,
+    }
+    expected_skips[reason.value] += 1
+    assert report.skipped == expected_skips
+    assert report.pinned_case_count == 2
+    cohort = await db.get_agent_evaluation_cohort(report.cohort_id)
+    pinned_reviews = set()
+    for item in cohort.items:
+        case = await db.get_agent_evaluation_case(item.case_id)
+        pinned_reviews.add(case.manifest["origin"]["review_id"])
+        assert shown_memory_id not in {case.manifest["challenger"]["memory_id"], case.manifest["candidate"]["memory_id"]}
+    assert pinned_reviews == {"rev-updated", "rev-dismissed"}
 
 
 class _LabelClient:
@@ -204,7 +280,7 @@ class _LabelClient:
 
 @pytest.mark.asyncio
 async def test_relation_run_reports_label_precision_and_recall(db: Database) -> None:
-    store = _review_store()
+    store = _review_store(db)
     seed = await seed_cross_document_relation_cases(
         store,
         OfflineAgentEvaluation(db, executors={}),
@@ -274,14 +350,14 @@ async def test_seed_route_requires_a_maintenance_operator(db: Database, tmp_path
             "cohort_id": None,
             "pinned_case_count": 0,
             "label_counts": {"none": 0, "equivalent": 0, "updates": 0, "contradicts": 0},
-            "skipped": {"memory_changed": 0, "private_memory": 0, "no_source_evidence": 0},
+            "skipped": {"memory_changed": 0, "private_memory": 0, "source_unavailable": 0, "no_source_evidence": 0},
         }
         assert unknown.status_code == 400
 
 
 async def _executed_relation_run(db: Database) -> str:
     seed = await seed_cross_document_relation_cases(
-        _review_store(),
+        _review_store(db),
         OfflineAgentEvaluation(db, executors={}),
         actor=ACTOR,
         label_overrides={},
