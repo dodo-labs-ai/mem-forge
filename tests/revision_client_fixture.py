@@ -173,7 +173,7 @@ class RevisionClientFixture:
             return change_impact_response(prompt, self.judge_change_impact)
         assert response_format is SupportAssessmentWireResponse
         payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
-        groups = [{**group, **payload["current"].get("observations", {}).get(group.get("source"), {})} for group in payload["current"]["structural_groups"]]
+        groups = payload["current"]["structural_groups"]
         sources = {ref: group for group in groups for ref in group["refs"]}
         rows = [
             *payload["current"]["primary_candidates"],
@@ -319,7 +319,7 @@ class RevisionClientFixture:
             )
         supported = audit.decisions[0].supported
         current = [*payload["current"]["primary_candidates"], *payload["current"]["required_only_candidates"]]
-        groups = {ref: {**group, **payload["current"].get("observations", {}).get(group.get("source"), {})} for group in payload["current"]["structural_groups"] for ref in group["refs"]}
+        groups = {ref: group for group in payload["current"]["structural_groups"] for ref in group["refs"]}
         current = [
             {"ref": row[0], "text": row[1],
              "kind": "artifact" if len(row) > 2 and "image_source_observation_id" in row[2] else "text",
@@ -345,7 +345,7 @@ class RevisionClientFixture:
                 "primary_candidates": [
                     {**item, "ref": refs[item["ref"]]}
                     for item in current
-                    if primary_old["observation_id"] in {None, item["observation_id"]}
+                    if primary_old["source"] in {None, item["source"]}
                 ],
                 "required": [
                     {
@@ -354,7 +354,7 @@ class RevisionClientFixture:
                         "candidates": [
                             {**item, "ref": refs[item["ref"]]}
                             for item in current
-                            if old["observation_id"] in {None, item["observation_id"]}
+                            if old["source"] in {None, item["source"]}
                         ],
                     }
                     for index, old in enumerate((item for item in previous if item["role"] == "required"), 1)
@@ -417,6 +417,5 @@ def unsupported(work):
 
 
 def _source(group):
-    """Observation identity of a supplied ref; carried and historical text have none."""
-    return {"observation_id": group.get("observation_id") if group else None,
-            "revision_id": group.get("revision_id") if group else None}
+    """The request-local source alias of a supplied ref; carried and historical text have none."""
+    return {"source": group.get("source") if group else None}
