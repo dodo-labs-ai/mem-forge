@@ -19,7 +19,7 @@ from tests.revision_client_fixture import (
 )
 
 import pytest
-from memforge.llm.structured import SupportAssessmentResponse, SupportAssessmentWireResponse
+from memforge.llm.structured import SupportAssessmentWireResponse
 import pytest_asyncio
 
 
@@ -327,6 +327,7 @@ def _jira_projection(
     run_id: str,
     description: str,
     comment_body: str = "Decision: retain A7",
+    comment_id: str = "502",
     comments_truncated: bool = False,
     source_id: str = "src-1",
     item_id: str = "confluence-123",
@@ -356,7 +357,7 @@ def _jira_projection(
             "resolution": None,
             "updated": "2026-07-15T10:00:00Z",
         },
-        "_comments": [{"id": "502", "body": comment_body}],
+        "_comments": [{"id": comment_id, "body": comment_body}],
         "_comments_included": True,
         "_comments_total": 2 if comments_truncated else 1,
         "changelog": {"startAt": 0, "histories": [], "total": 0},
@@ -1259,8 +1260,8 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
     )
     class RemovedArtifactClient(RevisionClientFixture):
         async def assess_support(self, prompt, **kwargs):
-            from memforge.llm.structured import RevisionSupportResponse
-            return RevisionSupportResponse(status="unsupported", reason="Required diagram was removed")
+            from tests.revision_client_fixture import FixtureSupport
+            return FixtureSupport(status="unsupported")
 
     reviewing_engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters),
@@ -3465,7 +3466,7 @@ def test_source_derivation_diagnostics_reject_content_and_bound_field_count() ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("skip_revalidation", [False, True])
-async def test_noop_preserves_stale_support_only_with_explicit_insufficient_skip(
+async def test_noop_preserves_stale_support_only_with_explicit_unresolved_skip(
     db: Database, skip_revalidation: bool,
 ) -> None:
     first = _projection(run_id="projection-stale-1", body="A7 is removed.")
@@ -3499,7 +3500,7 @@ async def test_noop_preserves_stale_support_only_with_explicit_insufficient_skip
             ReconcileOperation(
                 action=ReconcileAction.NOOP,
                 memory_id=incumbent.id,
-                reason="Support assessment was insufficient" if skip_revalidation else "kept without current evidence",
+                reason="Support assessment was unresolved" if skip_revalidation else "kept without current evidence",
                 support_revalidation_skipped=skip_revalidation,
             ),
         ),
@@ -4734,7 +4735,7 @@ async def test_v2_noop_revalidation_uses_bounded_fragment_refs_for_large_revisio
     assert stats["support_revalidation_work_item_count"] == 2
     assert stats["support_revalidation_model_call_count"] == 1
     assert stats["support_revalidation_revision_index_count"] == 1
-    assert stats["support_revalidation_auto_rebind_count"] == 2
+    assert stats["support_revalidation_supported_count"] == 2
     assert len(client.validation_prompts) == 2
     assert all(unrelated_marker in prompt for prompt in client.validation_prompts)
     assert all('"primary_candidates"' in prompt for prompt in client.validation_prompts)
@@ -5189,10 +5190,168 @@ async def test_partial_jira_projection_assesses_changes_outside_old_evidence(
     )
     assert sample["reconciliation_incumbent_count"] == 1
     assert sample["reconciliation_model_incumbent_count"] == 1
-    assert sample["reconciliation_disjoint_keep_count"] == 0
     assert sample["reconciliation_llm_call_count"] == 0
     assert await db.get_active_memory_support_reference_ids(incumbent.id)
     assert stats["support_revalidation_model_call_count"] == 1
+
+
+class _NoSupportCallClient(_NoopClient):
+    async def evaluate_revision_work(self, prompt, **kwargs):
+        raise AssertionError("a Support with an UNKNOWN part never reaches the model")
+
+
+@pytest.mark.asyncio
+async def test_partial_jira_projection_keeps_support_on_an_unreturned_comment_without_a_call(db: Database) -> None:
+    await _set_fixture_source_type(db, "jira")
+    first = _jira_projection(
+        run_id="projection-jira-unknown-1",
+        description="Initial issue description.",
+        comment_id="501",
+        comment_body="Decision: retain A7",
+    )
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(
+        db,
+        projection=first,
+        memory_id="mem-jira-unknown",
+        memory_content="Decision: retain A7",
+        observation_index=1,
+        source_type="jira",
+    )
+    await db.enable_lifecycle_gate("src-1")
+    [before] = (await db.get_active_memory_support_evidence_many((incumbent.id,), source_id="src-1"))[incumbent.id]
+    # The provider returns a newer comment page that leaves out the comment holding the old Evidence.
+    second = _jira_projection(
+        run_id="projection-jira-unknown-2",
+        description="Changed issue description.",
+        comment_id="502",
+        comment_body="Unrelated follow-up.",
+        comments_truncated=True,
+        prior=first.source_unit_revisions[0],
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
+    )
+    assert second.coverage.value == "partial_projection"
+    assert before.anchor.observation_id not in {observation.id for observation in second.observations}
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_NoSupportCallClient(incumbent.id),
+    )
+
+    stats = await engine.prepare_and_commit_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="PAY-12 changed description",
+        update_mode="diff_guided",
+        changed_hunks="description changed; comment page is truncated",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "active"
+    assert stats["deleted"] == 0 and stats["noop"] == 1
+    assert stats["support_revalidation_model_call_count"] == 0
+    assert stats["support_revalidation_unresolved_partial_coverage_count"] == 1
+    assert stats["support_revalidation_skipped_memory_count"] == 1
+    # The revision commits, but the Support keeps its old Evidence and validation baseline.
+    committed = await db.get_current_source_unit_projection(second.source_unit_revisions[0].source_unit_id)
+    assert committed.source_unit_revisions[0].id == second.source_unit_revisions[0].id
+    [after] = (await db.get_active_memory_support_evidence_many((incumbent.id,), source_id="src-1"))[incumbent.id]
+    assert (after.evidence_unit_id, after.anchor) == (before.evidence_unit_id, before.anchor)
+    assert (after.validation_plan_id, after.validation_unit_revision_id) == (
+        before.validation_plan_id, before.validation_unit_revision_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_jira_projection_keeps_a_validated_support_on_an_unreturned_comment(db: Database) -> None:
+    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+
+    await _set_fixture_source_type(db, "jira")
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(expected_report_id=cutover.id, owner_id="test-partial-validated")
+    await db.enable_lifecycle_gate("src-1")
+    claim, evidence = "A7 is retained for regular payroll.", "Decision: retain A7"
+    first = _jira_projection(
+        run_id="projection-jira-validated-1",
+        description="Initial issue description.",
+        comment_id="501",
+        comment_body=evidence,
+    )
+    context = RevisionAssessmentContext(
+        projection=first, base=None,
+        access_context_hash=lifecycle_access_context_hash(
+            visibility="workspace", owner_user_id=None, project_key="ENG", repo_identifier=None,
+        ),
+    )
+    catalog = context.catalog(context.full_fragments)
+    [fragment] = [fragment for fragment in catalog.fragments if fragment.presentation_text == evidence]
+    added = RawMemory(
+        content=claim, memory_type="decision", evidence_quote=evidence,
+        source_observation_id=fragment.anchor.observation_id,
+        resolved_evidence_selection=catalog.resolve_selection(primary_ref=fragment.reference),
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_NoSupportCallClient(""),
+    )
+
+    async def commit(projection: SourceProjection, raw_memories: list[RawMemory], day: int):
+        return await engine.prepare_and_commit_projected_lifecycle(
+            projection=projection,
+            doc_id="confluence-123",
+            raw_memories=raw_memories,
+            doc_type="ticket",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content="PAY-12",
+            update_mode="diff_guided",
+            changed_hunks=None,
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, day, tzinfo=timezone.utc),
+        )
+
+    assert (await commit(first, [added], 15))["added"] == 1
+    [memory] = await db.list_memories()
+    before = await db.get_active_memory_support_evidence(memory.id, source_id="src-1")
+    # The ADD recorded the first revision as the Support's validation baseline.
+    assert before and all(part.validation_plan_id for part in before)
+    assert {part.validation_unit_revision_id for part in before} == {first.source_unit_revisions[0].id}
+    assert {part.anchor.observation_id for part in before} == {fragment.anchor.observation_id}
+
+    # The provider returns a newer comment page that leaves out the comment holding the old Evidence.
+    second = _jira_projection(
+        run_id="projection-jira-validated-2",
+        description="Changed issue description.",
+        comment_id="502",
+        comment_body="Unrelated follow-up.",
+        comments_truncated=True,
+        prior=first.source_unit_revisions[0],
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
+    )
+    assert second.coverage.value == "partial_projection"
+    assert fragment.anchor.observation_id not in {observation.id for observation in second.observations}
+    stats = await commit(second, [], 16)
+
+    assert stats["support_revalidation_model_call_count"] == 0
+    assert stats["support_revalidation_unresolved_partial_coverage_count"] == 1
+    assert stats["support_revalidation_skipped_memory_count"] == 1
+    assert stats["deleted"] == 0 and stats["pending_review"] == 0
+    assert await db.get_memory(memory.id) == memory
+    # Same Evidence, same validation baseline: the next revision still compares against the first.
+    assert await db.get_active_memory_support_evidence(memory.id, source_id="src-1") == before
+    committed = await db.get_current_source_unit_projection(second.source_unit_revisions[0].source_unit_id)
+    assert committed.source_unit_revisions[0].id == second.source_unit_revisions[0].id
 
 
 @pytest.mark.asyncio
@@ -5306,7 +5465,6 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
     )
     assert sample["reconciliation_incumbent_count"] == 1
     assert sample["reconciliation_model_incumbent_count"] == 1
-    assert sample["reconciliation_disjoint_keep_count"] == 0
     assert sample["reconciliation_llm_batch_count"] == 1
     assert sample["reconciliation_llm_call_count"] == 1
     assert stats["support_revalidation_model_call_count"] == 1
@@ -6666,7 +6824,7 @@ async def test_v2_noop_propagates_bounded_revalidation_operational_limitation(
         )
 
     monkeypatch.setattr(
-        "memforge.pipeline.revision_work.RevisionWorkExecutor._range",
+        "memforge.pipeline.revision_work.plan_support_revision",
         raise_limitation,
     )
     adapters = build_sqlite_adapters(db, object())
@@ -9822,7 +9980,7 @@ async def test_reused_evidence_advances_only_support_validation_plan_across_revi
     (False, False, "support"), (True, False, "support"), (False, True, "support"),
     (True, False, "claim"), (False, True, "claim"),
 ])
-async def test_insufficient_support_preserves_its_baseline_and_resumes_after_source_advances(
+async def test_unresolved_support_preserves_its_baseline_and_resumes_after_source_advances(
     db, equivalent_candidate, mixed_supports, skip_stage,
 ):
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
@@ -9833,14 +9991,17 @@ async def test_insufficient_support_preserves_its_baseline_and_resumes_after_sou
     class SelectiveSupportClient(_FragmentSelectingSupportClient):
         skip_claim = False
         skipped_claim_statuses = None
+        capacity_work_id = None
 
-        def request_tokens(self, prompt, **kwargs):
-            # This scenario exercises baseline-specific resume behavior. Keep
-            # the delta plan selected even when the tiny fixture's current-full
-            # payload would otherwise be a few tokens cheaper.
-            return len(prompt) + (
-                1_000_000 if '"input_mode":"full"' in prompt else 0
-            )
+        def request_fits(self, prompt, **kwargs):
+            # The skipped claim's first Support fits no request: a ReadingGroup alone exceeds capacity.
+            if "<assessment>" in prompt and self.skip_claim and skip_stage == "support":
+                payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
+                skipped_works = [work["work_id"] for work in payload["works"] if work["claim"] == skipped_claim]
+                self.capacity_work_id = self.capacity_work_id or min(skipped_works, default=None)
+                if self.capacity_work_id in skipped_works:
+                    return False
+            return super().request_fits(prompt, **kwargs)
 
         async def classify_memory_relations(self, prompt, **kwargs):
             return _uniform_relation_response(
@@ -9862,27 +10023,27 @@ async def test_insufficient_support_preserves_its_baseline_and_resumes_after_sou
             assert response_format is SupportAssessmentWireResponse
             payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
             self.assessments.append(payload)
-            rows = payload["current"]["primary_candidates"]
+            rows = [*payload["current"]["primary_candidates"], *payload["carried_witness_catalog"]]
             results = []
-            for claim in payload["claims"]:
-                skip = self.skip_claim and skip_stage == "support" and claim["claim"] == skipped_claim
-                if skip:
-                    skip = not mixed_supports or not self.skipped_claim_statuses
-                    self.skipped_claim_statuses.append("insufficient" if skip else "supported")
-                primary_ref = next((ref for ref, text, *_ in rows if text == claim["claim"]), None)
-                status = "insufficient" if skip else ("supported" if primary_ref else "unsupported")
-                results.append({
-                    "work_id": claim["work_id"],
-                    "status": status,
-                    "reason": {
-                        "insufficient": "Interpretation unresolved",
-                        "supported": "Exact current statement supports the claim",
-                        "unsupported": "The alternate statement was removed",
-                    }[status],
-                    "primary_ref": None if skip else primary_ref,
-                    "required_refs": [],
-                })
-            return SupportAssessmentResponse.model_validate({"results": results})
+            for work in payload["works"]:
+                primary_ref = next((ref for ref, text, *_ in rows if text == work["claim"]), None)
+                if self.skip_claim and work["claim"] == skipped_claim and skip_stage == "support":
+                    self.skipped_claim_statuses.append("supported")
+                if primary_ref and work["may_conclude"]:
+                    results.append({
+                        "work_id": work["work_id"], "status": "supported", "primary_ref": primary_ref,
+                        "required_refs": [], "omitted_matched_refs": [
+                            part["current_ref"] for part in work["prior_evidence"]
+                            if part.get("current_ref") not in (None, primary_ref)
+                        ],
+                    })
+                elif payload["last"]:
+                    results.append({"work_id": work["work_id"], "status": "unsupported"})
+                else:
+                    results.append({"work_id": work["work_id"], "status": "continue", "witness_delta": {
+                        "support_witness_refs": [primary_ref] if primary_ref else [], "opposing_witness_refs": [],
+                    }})
+            return SupportAssessmentWireResponse.model_validate({"results": results})
 
     body = f"{skipped_claim}\n\n{continued_claim}\n\nEdition 1."
     first = _projection(run_id="skip-baseline-v1", body=body)
@@ -9975,9 +10136,11 @@ async def test_insufficient_support_preserves_its_baseline_and_resumes_after_sou
     old_memory = await db.get_memory(skipped.id)
     client.skip_claim = True
     client.skipped_claim_statuses = []
+    client.capacity_work_id = None
     third, stats = await advance(second, 3, [skipped_claim] if equivalent_candidate or skip_stage == "claim" else [])
-    assert client.skipped_claim_statuses == ([] if skip_stage == "claim" else
-        (["insufficient", "supported"] if mixed_supports else ["insufficient"]))
+    # With two Supports, only the first one is unreadable; the other is still judged.
+    assert client.skipped_claim_statuses == (["supported"] if skip_stage == "support" and mixed_supports else [])
+    assert stats["support_revalidation_unresolved_capacity_count"] == (1 if skip_stage == "support" else 0)
 
     assert (await db.get_current_source_unit_revision(first.source_units[0].id)).id == third.source_unit_revisions[0].id
     remaining_support = await db.get_active_memory_support_evidence(skipped.id, source_id="src-1")
@@ -10019,9 +10182,199 @@ async def test_insufficient_support_preserves_its_baseline_and_resumes_after_sou
     # The skipped Support compares v2→v4, while the other Memory compares v3→v4.
     for claim, old_edition in ((skipped_claim, "Edition 2."), (continued_claim, "Edition 3.")):
         assert any(
-            any(item["claim"] == claim for item in payload["claims"])
+            any(item["claim"] == claim for item in payload["works"])
             and any(text == old_edition for _, text, *_ in payload["removed_historical"])
             for payload in client.assessments
         )
     for unit_id, unit in old_units.items():
         assert await db.get_evidence_unit(unit_id) == unit
+
+
+class _CountingSupportClient(_NoopClient):
+    def __init__(self, incumbent_id: str) -> None:
+        super().__init__(incumbent_id)
+        self.support_prompts: list[str] = []
+
+    async def evaluate_revision_work(self, prompt, **kwargs):
+        self.support_prompts.append(prompt)
+        return await super().evaluate_revision_work(prompt, **kwargs)
+
+
+async def _exact_support_engine(
+    db, *, claim: str, first: SourceProjection, memory_id: str, client_type=_CountingSupportClient,
+):
+    """Seed legacy Support on ``first`` and return an engine; the first advance records exact digests."""
+    await db.record_source_projection(first)
+    incumbent = await _seed_exact_incumbent_support(db, projection=first, memory_id=memory_id, memory_content=claim)
+    cutover = await db.report_support_scope_cutover()
+    await db.apply_support_scope_v2_cutover(expected_report_id=cutover.id, owner_id="test-exact-support")
+    await db.enable_lifecycle_gate("src-1")
+    client = client_type(incumbent.id)
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters), db=db,
+        memory_store=_OutboxDrainer(db), structured_llm_client=client,
+    )
+
+    async def advance(projection: SourceProjection, body: str, hour: int, raw_memories=(), owner_id=None):
+        return await engine.prepare_and_commit_projected_lifecycle(
+            projection=projection, doc_id="confluence-123", raw_memories=list(raw_memories), doc_type="design-doc",
+            project_key="ENG", repo_identifier=None, document_content=body,
+            update_mode="diff_guided", changed_hunks=body, update_plan_stats=None,
+            source_updated_at=datetime(2026, 9, 25, hour, tzinfo=timezone.utc),
+            lifecycle_execution_owner_id=owner_id,
+        )
+
+    return incumbent, client, advance
+
+
+@pytest.mark.asyncio
+async def test_program_rebind_commits_without_support_call(db):
+    claim = "B8 requires approval."
+    body = f"{claim}\n\nEdition 1."
+
+    def page(run_id, text, payload, provider_revision, prior=None):
+        return _projection_with_artifact(
+            run_id=run_id, payload=payload, provider_revision=provider_revision, inference_eligible=False, body=text,
+            prior=prior.source_unit_revisions[0] if prior else None,
+            prior_observations={r.observation_id: r for r in prior.observation_revisions} if prior else None,
+        )
+
+    first = page("rebind-v1", body, b"diagram-1", "1")
+    incumbent, client, advance = await _exact_support_engine(db, claim=claim, first=first, memory_id="mem-rebind")
+    second_body = body.replace("Edition 1.", "Edition 2.")
+    second = page("rebind-v2", second_body, b"diagram-1", "1", prior=first)
+    await advance(second, second_body, 2)
+    established = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    assert established[0].raw_content_sha256 and client.support_prompts
+
+    # Only an Artifact that is not inference eligible changed: no readable content changed.
+    client.support_prompts.clear()
+    third = page("rebind-v3", second_body, b"diagram-2", "2", prior=second)
+    assert third.source_unit_revisions[0].id != second.source_unit_revisions[0].id
+    stats = await advance(third, second_body, 3)
+
+    assert client.support_prompts == []
+    assert stats["support_revalidation_model_call_count"] == 0
+    assert stats["support_revalidation_program_rebind_count"] == 1
+    rebound = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    assert {part.validation_unit_revision_id for part in rebound} == {third.source_unit_revisions[0].id}
+    assert {part.validation_plan_id for part in rebound}.isdisjoint({part.validation_plan_id for part in established})
+    assert (await db.get_memory(incumbent.id)).status == "active"
+
+
+@pytest.mark.asyncio
+async def test_unusable_baseline_snapshot_is_assessed_with_diagnostic(db, monkeypatch, caplog):
+    caplog.set_level("WARNING", logger="memforge.memory.engine")
+    claim = "B8 requires approval."
+    body = f"{claim}\n\nEdition 1."
+    first = _projection(run_id="unusable-v1", body=body)
+    incumbent, client, advance = await _exact_support_engine(db, claim=claim, first=first, memory_id="mem-unusable")
+    second_body = body.replace("Edition 1.", "Edition 2.")
+    second = _projection(
+        run_id="unusable-v2", body=second_body, prior=first.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in first.observation_revisions},
+    )
+    await advance(second, second_body, 2)
+
+    # The Support names a baseline snapshot that the store cannot return.
+    stored = db.get_active_memory_support_evidence_many
+
+    async def missing_baseline(*args, **kwargs):
+        return {
+            memory_id: tuple(replace(part, validation_unit_revision_id="unitrev-missing") for part in parts)
+            for memory_id, parts in (await stored(*args, **kwargs)).items()
+        }
+
+    monkeypatch.setattr(db, "get_active_memory_support_evidence_many", missing_baseline)
+    client.support_prompts.clear()
+    third_body = second_body.replace("Edition 2.", "Edition 3.")
+    third = _projection(
+        run_id="unusable-v3", body=third_body, prior=second.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in second.observation_revisions},
+    )
+    stats = await advance(third, third_body, 3)
+
+    assert stats["support_revalidation_unusable_baseline_count"] == 1
+    assert any(
+        "support_baseline_unusable" in record.getMessage() and incumbent.id in record.getMessage()
+        and "unitrev-missing" in record.getMessage()
+        for record in caplog.records
+    )
+    # Without a usable baseline nothing is compared: the whole current revision is read.
+    [request] = client.support_prompts
+    assessed = json.loads(request.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
+    assert not assessed["removed_historical"]
+    monkeypatch.setattr(db, "get_active_memory_support_evidence_many", stored)
+    renewed = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    assert {part.validation_unit_revision_id for part in renewed} == {third.source_unit_revisions[0].id}
+
+
+@pytest.mark.asyncio
+async def test_transient_support_failure_leaves_revision_uncommitted_and_retry_commits(db):
+    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+
+    class FlakySupportClient(_CountingSupportClient):
+        fail = True
+
+        async def evaluate_revision_work(self, prompt, **kwargs):
+            if self.fail:
+                self.support_prompts.append(prompt)
+                raise StructuredLlmError(
+                    "deadline", terminal_category="deadline_exceeded", error_code="logical_deadline_exceeded",
+                )
+            return await super().evaluate_revision_work(prompt, **kwargs)
+
+        async def classify_memory_relations(self, prompt, **kwargs):
+            return _uniform_relation_response(prompt, classification="unrelated", reason="Distinct approval rules")
+
+    claim = "B8 requires approval."
+    body = f"{claim}\n\nEdition 1."
+    first = _projection(run_id="transient-v1", body=body)
+    incumbent, client, advance = await _exact_support_engine(
+        db, claim=claim, first=first, memory_id="mem-transient", client_type=FlakySupportClient,
+    )
+    client.fail = False
+    second_body = body.replace("Edition 1.", "Edition 2.")
+    second = _projection(
+        run_id="transient-v2", body=second_body, prior=first.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in first.observation_revisions},
+    )
+    await advance(second, second_body, 2)
+
+    candidate_text = "C9 needs a release note."
+    third_body = f"{second_body}\n\n{candidate_text}"
+    third = _projection(
+        run_id="transient-v3", body=third_body, prior=second.source_unit_revisions[0],
+        prior_observations={r.observation_id: r for r in second.observation_revisions},
+    )
+    context = RevisionAssessmentContext(
+        projection=third, base=second,
+        access_context_hash=lifecycle_access_context_hash(
+            visibility="workspace", owner_user_id=None, project_key="ENG", repo_identifier=None,
+        ),
+    )
+    catalog = context.catalog(context.full_fragments)
+    ref = next(f.reference for f in catalog.fragments if f.presentation_text == candidate_text)
+    candidate = RawMemory(
+        content=candidate_text, memory_type="decision", evidence_quote=candidate_text,
+        source_observation_id=third.observations[0].id,
+        resolved_evidence_selection=catalog.resolve_selection(primary_ref=ref),
+    )
+
+    client.fail = True
+    with pytest.raises(SourceUnitLifecycleExecutionError) as failure:
+        await advance(third, third_body, 3, [candidate], owner_id="sync-transient:lease-1")
+    assert isinstance(failure.value.__cause__, StructuredLlmError) and client.support_prompts
+    unit_id = first.source_units[0].id
+    assert (await db.get_current_source_unit_revision(unit_id)).id == second.source_unit_revisions[0].id
+    assert len(await db.db.execute_fetchall("SELECT id FROM memories")) == 1
+
+    # The next sync retries the same revision; nothing from the failed attempt was lost.
+    client.fail = False
+    await advance(third, third_body, 4, [candidate], owner_id="sync-transient:lease-2")
+    assert (await db.get_current_source_unit_revision(unit_id)).id == third.source_unit_revisions[0].id
+    contents = {row["content"] for row in await db.db.execute_fetchall("SELECT content FROM memories")}
+    assert contents == {claim, candidate_text}
+    renewed = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    assert {part.validation_unit_revision_id for part in renewed} == {third.source_unit_revisions[0].id}

@@ -1049,7 +1049,11 @@ class MemoryEngine:
             "support_revalidation_model_call_count": 0,
             "support_revalidation_revision_index_count": 0,
             "support_revalidation_prompt_chars": 0,
-            "support_revalidation_auto_rebind_count": 0,
+            "support_revalidation_supported_count": 0,
+            "support_revalidation_program_rebind_count": 0,
+            "support_revalidation_unresolved_partial_coverage_count": 0,
+            "support_revalidation_unresolved_capacity_count": 0,
+            "support_revalidation_unusable_baseline_count": 0,
         }
         filtered_memories: list[RawMemory] = []
         for raw in raw_memories:
@@ -1148,7 +1152,6 @@ class MemoryEngine:
         assessment_image_loader = None
         required_derivation_work_ids = ()
         model_incumbent_count = 0
-        deterministic_disjoint_keep_count = 0
         model_batch_count = 0
         structured_llm_call_count = 0
         structured_llm_elapsed_ms = 0
@@ -1169,14 +1172,8 @@ class MemoryEngine:
                 for memory in sorted(incumbents, key=lambda item: item.id)
             )
         else:
-            deterministic_disjoint_ids = frozenset()
-            model_incumbents = [
-                memory
-                for memory in incumbents
-                if memory.id not in (deterministic_disjoint_ids | derivation_protected_ids)
-            ]
+            model_incumbents = [memory for memory in incumbents if memory.id not in derivation_protected_ids]
             model_incumbent_count = len(model_incumbents)
-            deterministic_disjoint_keep_count = len(deterministic_disjoint_ids)
             if model_incumbents and not self.structured_llm_client:
                 raise RuntimeError("complete lifecycle reconciliation requires an LLM client")
             if model_incumbents:
@@ -1199,11 +1196,23 @@ class MemoryEngine:
                 assessment_context = RevisionAssessmentContext(
                     projection=projection, base=base, access_context_hash=access_context_hash, image_loader=assessment_image_loader,
                 )
+
+                def assessment_context_for(baseline):
+                    """Assess against another baseline, sharing this operation's Fragment indexes.
+
+                    The committed revision still describes carried Observations the baseline may predate.
+                    """
+                    return RevisionAssessmentContext(
+                        projection=projection, base=baseline, access_context_hash=access_context_hash,
+                        image_loader=assessment_image_loader, indexes=assessment_context.indexes,
+                        known_observations=base.observations if base is not None else (),
+                    )
                 contexts_by_revision = {base.source_unit_revisions[0].id: assessment_context} if base else {}
                 evidence_by_memory = await self.db.get_active_memory_support_evidence_many(
                     tuple(memory.id for memory in model_incumbents), source_id=projection.source_id,
                 )
-                from memforge.pipeline.revision_work import RevisionWorkExecutor, SupportWorkItem
+                from memforge.pipeline.revision_work import RevisionWorkExecutor
+                from memforge.pipeline.support_reading import SupportWorkItem
                 work_items = []
                 work_by_memory = {}
                 for memory in model_incumbents:
@@ -1216,32 +1225,40 @@ class MemoryEngine:
                         raise ReconciliationContractError("revision_support_missing", "incumbent has no complete scoped support")
                     work_by_memory[memory.id] = []
                     for evidence_unit_id, support in groups.items():
-                        plan_ids = {item.validation_plan_id for item in support}
-                        baseline_ids = {item.validation_unit_revision_id for item in support}
-                        if len(plan_ids) != 1 or len(baseline_ids) != 1:
-                            raise ReconciliationContractError("revision_support_baseline_invalid", "Support validation association is inconsistent")
-                        baseline_id = next(iter(baseline_ids))
-                        if next(iter(plan_ids)) is not None and baseline_id is None:
-                            raise ReconciliationContractError("revision_support_baseline_invalid", "Support validation Plan is not applied to this Source Unit")
-                        context = contexts_by_revision.get(baseline_id)
-                        if context is None:
-                            historical = (
-                                await self.db.get_source_unit_revision_projection(scope.source_unit_id, baseline_id)
-                                if baseline_id is not None else None
+                        baseline_id, unusable = _support_validation_baseline(support)
+                        context = contexts_by_revision.get(baseline_id) if unusable is None else None
+                        if context is None and baseline_id is not None:
+                            historical = await self.db.get_source_unit_revision_projection(
+                                scope.source_unit_id, baseline_id
                             )
-                            if baseline_id is not None and (
+                            if (
                                 historical is None
                                 or historical.source_id != projection.source_id
                                 or len(historical.source_unit_revisions) != 1
                                 or historical.source_unit_revisions[0].source_unit_id != scope.source_unit_id
                                 or historical.source_unit_revisions[0].id != baseline_id
                             ):
-                                raise ReconciliationContractError("revision_support_baseline_invalid", "Support validation snapshot is unavailable or inconsistent")
-                            context = RevisionAssessmentContext(
-                                projection=projection, base=historical, access_context_hash=access_context_hash,
-                                image_loader=assessment_image_loader, indexes=assessment_context.indexes,
-                            )
-                            contexts_by_revision[baseline_id] = context
+                                unusable = "validation snapshot is unavailable or inconsistent"
+                            else:
+                                context = assessment_context_for(historical)
+                                contexts_by_revision[baseline_id] = context
+                        if context is None:
+                            # No usable baseline: the whole current revision is read without
+                            # assuming the old Support is still valid. A named but unusable
+                            # baseline is a data defect worth a diagnostic, not a failure.
+                            if unusable is not None:
+                                logger.warning(
+                                    "support_baseline_unusable memory_id=%s evidence_unit_id=%s "
+                                    "baseline_unit_revision_ids=%s reason=%s",
+                                    memory.id, evidence_unit_id,
+                                    ",".join(sorted({str(item.validation_unit_revision_id) for item in support})),
+                                    unusable,
+                                )
+                                stats["support_revalidation_unusable_baseline_count"] += 1
+                            context = contexts_by_revision.get(None)
+                            if context is None:
+                                context = assessment_context_for(None)
+                                contexts_by_revision[None] = context
                         work_id = f"w{len(work_items):06d}"
                         work_items.append(SupportWorkItem(work_id, memory, tuple(support), context))
                         work_by_memory[memory.id].append(work_id)
@@ -1257,9 +1274,17 @@ class MemoryEngine:
                     stats["support_revalidation_prompt_chars"] += evaluator.prompt_chars
                     stats["support_revalidation_reused_work_count"] = evaluator.reused
                     stats["support_revalidation_covered_source_claim_pairs"] = evaluator.covered_source_claim_pairs
+                    stats["support_revalidation_program_rebind_count"] = evaluator.program_rebind_count
                     _runtime_context.model_call_count += evaluator.calls
                 stats["support_revalidation_completion_count"] = len(evaluator.final_work_ids)
                 required_derivation_work_ids = tuple(evaluator.final_work_ids) if derivation_id else ()
+                unresolved_stats = {
+                    "partial_coverage": "support_revalidation_unresolved_partial_coverage_count",
+                    "capacity": "support_revalidation_unresolved_capacity_count",
+                }
+                for result in assessed.values():
+                    if result.unresolved is not None:
+                        stats[unresolved_stats[result.unresolved]] += 1
                 for memory in model_incumbents:
                     results = [assessed[work_id] for work_id in work_by_memory[memory.id]]
                     if any(result.supported is None for result in results):
@@ -1268,7 +1293,7 @@ class MemoryEngine:
                         )
                         continue
                     current = [result.memory for result in results if result.supported and result.memory is not None]
-                    stats["support_revalidation_auto_rebind_count"] += len(current)
+                    stats["support_revalidation_supported_count"] += len(current)
                     assessed_evidence[memory.id] = current
                     support_audits.append(SupportAuditEntry(
                         incumbent_id=memory.id, supported=bool(current),
@@ -1350,7 +1375,7 @@ class MemoryEngine:
                 ReconcileOperation(
                     action=ReconcileAction.NOOP,
                     memory_id=memory_id,
-                    reason=reason or "Support revalidation insufficient; preserve existing evidence",
+                    reason=reason or "Support revalidation unresolved; preserve existing evidence",
                     support_revalidation_skipped=True,
                 )
                 for memory_id, reason in skipped_revalidation.items()
@@ -1388,7 +1413,6 @@ class MemoryEngine:
                     "reconciliation_new_candidate_count": len(filtered_memories),
                     "reconciliation_incumbent_count": len(incumbents),
                     "reconciliation_model_incumbent_count": model_incumbent_count,
-                    "reconciliation_disjoint_keep_count": (deterministic_disjoint_keep_count),
                     "reconciliation_llm_batch_count": model_batch_count,
                     "reconciliation_llm_call_count": structured_llm_call_count,
                     "reconciliation_llm_elapsed_ms": structured_llm_elapsed_ms,
@@ -1962,6 +1986,21 @@ def _observation_semantic_class(
         value = revision.metadata.get("semantic_class")
         return str(value) if isinstance(value, str) and value else None
     return None
+
+
+def _support_validation_baseline(support) -> tuple[str | None, str | None]:
+    """Return one Evidence Unit's recorded baseline Source Unit revision, or why it is unusable.
+
+    ``(None, None)`` means no baseline was ever recorded for this Support.
+    """
+    plan_ids = {item.validation_plan_id for item in support}
+    baseline_ids = {item.validation_unit_revision_id for item in support}
+    if len(plan_ids) != 1 or len(baseline_ids) != 1:
+        return None, "validation association is inconsistent"
+    baseline_id = next(iter(baseline_ids))
+    if next(iter(plan_ids)) is not None and baseline_id is None:
+        return None, "validation Plan is not applied to this Source Unit"
+    return baseline_id, None
 
 
 def _candidate_ledger_audit_payload(result: CandidateLedgerResult) -> dict[str, Any]:

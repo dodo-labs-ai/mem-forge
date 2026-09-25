@@ -34,6 +34,8 @@ class ReadingGroup:
     trigger_anchors: tuple[SourceAnchor, ...]
     context_anchors: tuple[SourceAnchor, ...]
     owner: str | None = None
+    # An outermost list: its member Fragments are read as one unit.
+    is_list: bool = False
 
     @property
     def fragment_anchors(self) -> tuple[SourceAnchor, ...]:
@@ -58,6 +60,12 @@ class RevisionReadingIndex:
     observation_revision_id: str
     fragments: tuple[EvidenceFragment, ...]
     groups: tuple[ReadingGroup, ...]
+
+    @property
+    def lists(self) -> tuple[ReadingGroup, ...]:
+        """The outermost lists, in source order; no two of them share a Fragment."""
+
+        return tuple(group for group in self.groups if group.is_list)
 
     def expand(self, selected: Sequence[EvidenceFragment]) -> ReadingExpansion:
         """Add representation-owned context without altering Fragment authority.
@@ -365,6 +373,7 @@ def _list_groups(
                 trigger_anchors=members,
                 context_anchors=_ordered_unique((*lead_in, *members)),
                 owner=owner,
+                is_list=True,
             )
         )
     return tuple(groups)

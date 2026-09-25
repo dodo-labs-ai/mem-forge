@@ -11,6 +11,7 @@ fixture prompt and returning one of the fixture models below:
 """
 
 import json
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -18,8 +19,15 @@ from memforge.llm.structured import (
     ClaimRevisionDecision,
     MemoryRelationAssessment,
     RevisionAssessment,
-    RevisionSupportResponse,
 )
+
+
+class FixtureSupport(BaseModel):
+    """One scenario Support judgment before it is written as an ordered-reading wire row."""
+
+    status: Literal["supported", "unsupported"]
+    primary_ref: str | None = None
+    required_refs: list[str] = Field(default_factory=list)
 
 
 class SupportJudgment(BaseModel):
@@ -135,90 +143,88 @@ class RevisionClientFixture:
         return MemoryRelationCatalogResponse.model_validate(dict(results=list(rows.values())))
 
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
-        from memforge.llm.structured import SupportAssessmentWireResponse as FinalResponse, SupportAssessmentResult as FinalResult
-        assert response_format is FinalResponse
+        """Answer an ordered Support reading from the scenario's ``assess_support`` judgment.
+
+        A work that may not conclude yet continues; a concluding one is supported
+        or, once the last reading group is read, unsupported. ``assess_support``
+        judges one claim from a scenario payload: the request payload with that
+        claim's work fields, its prior Evidence as text, and the carried witnesses
+        merged back into the current candidates.
+        """
+        from memforge.llm.structured import SupportAssessmentWireResponse
+
+        assert response_format is SupportAssessmentWireResponse
         payload = json.loads(prompt.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
-        results = []
         groups = [{**group, **payload["current"].get("observations", {}).get(group.get("source"), {})} for group in payload["current"]["structural_groups"]]
-        for claim in payload["claims"]:
-            previous = next((group["parts"] for group in payload.get("previous_evidence", []) if group["work_id"] == claim["work_id"]), None)
-            rows = [
+        sources = {ref: group for group in groups for ref in group["refs"]}
+        rows = [
+            *payload["current"]["primary_candidates"],
+            *payload["current"]["required_only_candidates"],
+            *payload["carried_witness_catalog"],
+        ]
+        texts = {row[0]: row[1] for row in rows}
+        results = []
+        for work in payload["works"]:
+            if not work["may_conclude"]:
+                results.append(continued(work))
+                continue
+            prior = work["prior_evidence"]
+            if all("current_ref" in part for part in prior):
+                previous = [
+                    {"role": part["role"], "excerpt": texts[part["current_ref"]],
+                     **_source(sources.get(part["current_ref"]))}
+                    for part in prior
+                ]
+            else:
+                previous = self._configured_previous(work, rows, sources, groups)
+            scenario_payload = {**payload, **work, "claims": [work], "previous_evidence": previous}
+            scenario_payload["current"] = {**payload["current"], "primary_candidates": [
                 *payload["current"]["primary_candidates"],
+                *(row for row in payload["carried_witness_catalog"] if row[0].startswith("PRM-")),
+            ], "required_only_candidates": [
                 *payload["current"]["required_only_candidates"],
-            ]
-            sources = {
-                ref: group for group in groups for ref in group["refs"]
-            }
-            if previous is not None:
-                history = payload.get("historical_evidence", [])
-                current_parts = {}
-                for row in rows:
-                    current_parts[row[0]] = {"ref": row[0], "excerpt": row[1],
-                                       "observation_id": sources[row[0]]["observation_id"], "revision_id": sources[row[0]]["revision_id"]}
-                previous = [{**(history[part["historical_index"]] if "historical_index" in part else current_parts[part["current_ref"]]), "role": part["role"]} for part in previous]
-            if previous is None:
-                configured_primary = getattr(self, "evidence_quote", "")
-                if getattr(self, "prefer_artifact_primary", False):
-                    primary_row = next(
-                        (
-                            row
-                            for row in rows
-                            if len(row) > 2
-                            and "image_source_observation_id" in row[2]
-                        ),
-                        None,
-                    )
-                else:
-                    primary_row = next(
-                        (
-                            row
-                            for row in rows
-                            if configured_primary
-                            and configured_primary in row[1]
-                        ),
-                        None,
-                    )
-                    if primary_row is None:
-                        primary_row = next(
-                            (row for row in rows if row[1] == claim["claim"]),
-                            None,
-                        )
-                if primary_row is None:
-                    previous = [{"role": "primary", "excerpt": claim["claim"],
-                                 "observation_id": groups[0]["observation_id"], "revision_id": groups[0]["revision_id"]}]
-                else:
-                    primary_source = sources[primary_row[0]]
-                    previous = [{
-                        "role": "primary",
-                        "excerpt": primary_row[1],
-                        "observation_id": primary_source["observation_id"],
-                        "revision_id": primary_source["revision_id"],
-                    }]
-                configured_required = tuple(getattr(self, "required_evidence_quotes", ()))
-                single_required = getattr(self, "required_evidence_quote", "")
-                if single_required:
-                    configured_required = (*configured_required, single_required)
-                for quote in configured_required:
-                    row = next((row for row in rows if quote in row[1]), None)
-                    if row is not None:
-                        previous.append(
-                            {
-                                "role": "required",
-                                "excerpt": row[1],
-                                "observation_id": sources[row[0]]["observation_id"],
-                                "revision_id": sources[row[0]]["revision_id"],
-                            }
-                        )
-            legacy = {**payload, **claim, "previous_evidence": previous}
-            assessment_prompt = "<assessment>" + json.dumps(legacy) + "</assessment>"
+                *(row for row in payload["carried_witness_catalog"] if row[0].startswith("REQ-")),
+            ]}
+            assessment_prompt = "<assessment>" + json.dumps(scenario_payload) + "</assessment>"
             if "<correction>" in prompt:
                 assessment_prompt += "previous selection used invalid refs"
             result = await self.assess_support(assessment_prompt, **kwargs)
-            results.append(FinalResult(work_id=claim["work_id"], **result.model_dump()))
-        return FinalResponse.model_validate({'results': [
-            {k: v for k, v in r.model_dump().items() if k != 'reason' or r.status != 'supported'}
-            for r in results
-        ]})
+            if result.status == "supported":
+                results.append(supported(work, result.primary_ref, result.required_refs))
+            elif payload["last"]:
+                results.append(unsupported(work))
+            else:
+                results.append(continued(work))
+        return SupportAssessmentWireResponse.model_validate({"results": results})
+
+    def _configured_previous(self, work, rows, sources, groups):
+        """Prior Evidence that is no longer exactly current: follow the scenario's configured quotes."""
+        configured_primary = getattr(self, "evidence_quote", "")
+        if getattr(self, "prefer_artifact_primary", False):
+            primary_row = next(
+                (row for row in rows if len(row) > 2 and "image_source_observation_id" in row[2]),
+                None,
+            )
+        else:
+            primary_row = next(
+                (row for row in rows if configured_primary and configured_primary in row[1]),
+                None,
+            )
+            if primary_row is None:
+                primary_row = next((row for row in rows if row[1] == work["claim"]), None)
+        if primary_row is None:
+            previous = [{"role": "primary", "excerpt": work["claim"], **_source(groups[0] if groups else None)}]
+        else:
+            previous = [{"role": "primary", "excerpt": primary_row[1], **_source(sources.get(primary_row[0]))}]
+        configured_required = tuple(getattr(self, "required_evidence_quotes", ()))
+        single_required = getattr(self, "required_evidence_quote", "")
+        if single_required:
+            configured_required = (*configured_required, single_required)
+        for quote in configured_required:
+            row = next((row for row in rows if quote in row[1]), None)
+            if row is not None:
+                previous.append({"role": "required", "excerpt": row[1], **_source(sources.get(row[0]))})
+        return previous
 
     async def assess_claim_revisions(self, prompt, **kwargs):
         start, end = "<memory_pair_groups>\n", "\n</memory_pair_groups>"
@@ -297,7 +303,7 @@ class RevisionClientFixture:
             {"ref": row[0], "text": row[1],
              "kind": "artifact" if len(row) > 2 and "image_source_observation_id" in row[2] else "text",
              "type": row[2].get("format", "artifact") if len(row) > 2 else ("markdown-heading" if row[1].startswith("#") else "text"),
-             **{key: groups[row[0]][key] for key in ("observation_id", "revision_id")}}
+             **_source(groups.get(row[0]))}
             for row in current
         ]
         previous = payload["previous_evidence"]
@@ -318,7 +324,7 @@ class RevisionClientFixture:
                 "primary_candidates": [
                     {**item, "ref": refs[item["ref"]]}
                     for item in current
-                    if item["observation_id"] == primary_old["observation_id"]
+                    if primary_old["observation_id"] in {None, item["observation_id"]}
                 ],
                 "required": [
                     {
@@ -327,7 +333,7 @@ class RevisionClientFixture:
                         "candidates": [
                             {**item, "ref": refs[item["ref"]]}
                             for item in current
-                            if item["observation_id"] == old["observation_id"]
+                            if old["observation_id"] in {None, item["observation_id"]}
                         ],
                     }
                     for index, old in enumerate((item for item in previous if item["role"] == "required"), 1)
@@ -347,13 +353,12 @@ class RevisionClientFixture:
                     + "\n</selection_correction>"
                 )
             validation = await self.select_support_evidence(legacy_prompt, **kwargs)
-            return RevisionSupportResponse(
+            return FixtureSupport(
                 status="supported" if validation.supported else "unsupported",
                 primary_ref=reverse.get(validation.primary_ref, validation.primary_ref),
                 required_refs=[
                     reverse.get(item.evidence_ref, item.evidence_ref) for item in validation.required_evidence
                 ],
-                reason=validation.reason,
             )
         required = [
             item["ref"]
@@ -362,9 +367,35 @@ class RevisionClientFixture:
             for item in current
             if item["text"] == old["excerpt"]
         ]
-        return RevisionSupportResponse(
+        return FixtureSupport(
             status="supported" if supported else "unsupported",
             primary_ref=primary["ref"],
             required_refs=required,
-            reason=audit.decisions[0].reason,
         )
+
+
+def continued(work, support=(), opposing=()):
+    """A wire row that keeps reading, adding the given witness refs."""
+    return {"work_id": work["work_id"], "status": "continue",
+            "witness_delta": {"support_witness_refs": list(support), "opposing_witness_refs": list(opposing)}}
+
+
+def supported(work, primary, required=()):
+    """A wire row that concludes supported, omitting every matched prior ref it does not select."""
+    selected = {primary, *required}
+    return {
+        "work_id": work["work_id"], "status": "supported", "primary_ref": primary, "required_refs": list(required),
+        "omitted_matched_refs": [
+            p["current_ref"] for p in work["prior_evidence"] if "current_ref" in p and p["current_ref"] not in selected
+        ],
+    }
+
+
+def unsupported(work):
+    return {"work_id": work["work_id"], "status": "unsupported"}
+
+
+def _source(group):
+    """Observation identity of a supplied ref; carried and historical text have none."""
+    return {"observation_id": group.get("observation_id") if group else None,
+            "revision_id": group.get("revision_id") if group else None}

@@ -656,15 +656,6 @@ class ClaimRevisionWireResponse(StructuredResponseModel):
         return self
 
 
-class RevisionSupportResponse(StructuredResponseModel):
-    """Fixed-claim judgment and a complete current selection, with variable Required."""
-
-    status: Literal["supported", "unsupported", "insufficient"]
-    primary_ref: str | None = None
-    required_refs: list[str] = Field(default_factory=list)
-    reason: str = Field(default="", max_length=1000)
-
-
 class EntityBatchValidationDecision(StructuredResponseModel):
     """One semantic judgment for the mention it names."""
 
@@ -1019,40 +1010,45 @@ class _StructuredCallState:
         )
 
 
-class SupportAssessmentResult(RevisionSupportResponse):
-    """Cumulative fixed-claim judgment over the processed revision range."""
+class SupportWitnessDelta(BaseModel):
+    """Current refs this request read that support or oppose the claim."""
 
+    model_config = ConfigDict(extra="forbid")
+    support_witness_refs: list[str]
+    opposing_witness_refs: list[str]
+
+
+class ContinueReadingWireResult(BaseModel):
+    """The claim is not yet completely supported; keep reading."""
+
+    model_config = ConfigDict(extra="forbid")
     work_id: str
-    reason: str = ""
+    status: Literal["continue"]
+    witness_delta: SupportWitnessDelta
 
 
-class SupportAssessmentResponse(BaseModel):
-    results: list[SupportAssessmentResult]
-
-
-class SupportedAssessmentWireResult(BaseModel):
-    """Current support is explained by its selected Evidence, without generated prose."""
+class SupportedWireResult(BaseModel):
+    """One complete current Evidence Unit supports the claim, without generated prose."""
 
     model_config = ConfigDict(extra="forbid")
     work_id: str
     status: Literal["supported"]
     primary_ref: str
     required_refs: list[str]
+    # Current refs of the prior Evidence that this selection does not use.
+    omitted_matched_refs: list[str]
 
 
-class UnresolvedAssessmentWireResult(BaseModel):
-    """A negative or uncertain judgment retains its decisive diagnostic basis."""
+class UnsupportedWireResult(BaseModel):
+    """The complete revision was read and no complete current Evidence Unit supports the claim."""
 
     model_config = ConfigDict(extra="forbid")
     work_id: str
-    status: Literal["unsupported", "insufficient"]
-    primary_ref: str | None
-    required_refs: list[str]
-    reason: str = Field(max_length=1000)
+    status: Literal["unsupported"]
 
 
 class SupportAssessmentWireResponse(BaseModel):
-    results: list[SupportedAssessmentWireResult | UnresolvedAssessmentWireResult]
+    results: list[ContinueReadingWireResult | SupportedWireResult | UnsupportedWireResult]
 
 
 class StructuredLlmError(RuntimeError):
@@ -1700,7 +1696,6 @@ _REFUSAL_ERROR_CODES: dict[type[BaseModel], str] = {
     ClaimRevisionWireResponse: "claim_response_incomplete",
     CrossDocumentRelationResponse: "cross_document_relation_response_incomplete",
     MemoryRelationCatalogResponse: "memory_relation_response_incomplete",
-    SupportAssessmentResponse: "support_response_incomplete",
     SupportAssessmentWireResponse: "support_response_incomplete",
 }
 

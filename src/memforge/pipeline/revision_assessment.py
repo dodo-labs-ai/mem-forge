@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import hashlib
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from memforge.llm.batch_runner import LlmRequest, RequestTooLarge
 from memforge.models import RawMemory
@@ -32,7 +33,12 @@ from memforge.pipeline.projection_fragments import (
 )
 from memforge.source_projection import SourceObservationRevision, SourceProjection
 
-REVISION_SUPPORT_CONTRACT = "revision-support-v2"
+# Versions how a fixed Support is revalidated against a revision: it enters the
+# reconciliation manifest and each revalidated Support's ``support_validation``.
+REVISION_SUPPORT_CONTRACT = "revision-support-v3"
+# Versions how revision Fragments are compiled into catalogs and how Claim
+# Extraction chooses its reading scope. Every catalog this context composes,
+# for extraction or for Support, carries it in its identity.
 REVISION_INPUT_POLICY = "revision-input-v6"
 
 
@@ -55,7 +61,9 @@ class SupportAssessment:
     supported: bool | None
     reason: str
     memory: RawMemory | None
-    input_mode: str
+    # Why a kept claim could not be judged: an UNKNOWN Evidence part under partial
+    # coverage, or one ReadingGroup that alone exceeds the model's capacity.
+    unresolved: Literal["partial_coverage", "capacity"] | None = None
 
 
 def _changed_ranges(base: SourceObservationRevision, target: SourceObservationRevision):
@@ -97,7 +105,10 @@ class RevisionAssessmentContext:
         images: tuple = (),
         image_loader=None,
         indexes: dict | None = None,
+        known_observations: tuple = (),
     ):
+        """``known_observations`` describe carried Observations that neither the target
+        nor the baseline returns, such as those of the committed Source Unit revision."""
         self.projection = projection
         self.base = base
         self.access_context_hash = access_context_hash
@@ -110,7 +121,7 @@ class RevisionAssessmentContext:
             for r in projection.observation_revisions
             if r.id in projection.source_unit_revisions[0].observation_revision_ids
         }
-        observations = {o.id: o for o in (base.observations if base else ())}
+        observations = {o.id: o for o in (*known_observations, *(base.observations if base else ()))}
         observations.update({o.id: o for o in projection.observations})
         if set(self.current) - set(observations):
             raise SupportRevalidationLimitation(

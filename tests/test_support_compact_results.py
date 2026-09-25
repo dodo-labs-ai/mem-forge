@@ -8,50 +8,70 @@ from pydantic import ValidationError
 from memforge.llm.structured import SupportAssessmentWireResponse
 from memforge.pipeline.support_wire import SupportWireAliases
 
+SUPPORTED = {
+    'work_id': 'WRK-0001', 'status': 'supported', 'primary_ref': 'PRM-0002',
+    'required_refs': ['REQ-0003'], 'omitted_matched_refs': [],
+}
+CONTINUE = {
+    'work_id': 'WRK-0001', 'status': 'continue',
+    'witness_delta': {'support_witness_refs': ['PRM-0002'], 'opposing_witness_refs': ['REQ-0003']},
+}
 
-def test_success_schema_has_no_reason_and_decodes_to_canonical_result():
-    result = SupportAssessmentWireResponse.model_validate({'results': [{
-        'work_id': 'WRK-0001', 'status': 'supported', 'primary_ref': 'PRM-0002',
-        'required_refs': ['REQ-0003'],
-    }]})
-    assert 'reason' not in result.results[0].model_dump()
-    wire = SupportWireAliases(SimpleNamespace(fragments=[
+
+def wire():
+    return SupportWireAliases(SimpleNamespace(fragments=[
         SimpleNamespace(reference='p000002', primary_eligible=True),
         SimpleNamespace(reference='r000003', primary_eligible=False),
     ]), [], {'w000001': 'WRK-0001'})
-    row = wire.decode(result).results[0]
-    assert row.work_id == 'w000001' and row.primary_ref == 'p000002'
-    assert row.required_refs == ['r000003']
-    assert row.reason == 'Supported by selected current Evidence.'
+
+
+def row_schema(status):
     schema = SupportAssessmentWireResponse.model_json_schema()
-    success = next(v for v in schema['$defs'].values() if v.get('properties', {}).get('status', {}).get('const') == 'supported')
-    assert 'reason' not in success['properties']
+    return next(v for v in schema['$defs'].values() if v.get('properties', {}).get('status', {}).get('const') == status)
+
+
+def test_supported_row_has_no_prose_and_decodes_to_canonical_refs():
+    result = SupportAssessmentWireResponse.model_validate({'results': [SUPPORTED]})
+    row = wire().decode(result).results[0]
+    assert row.work_id == 'w000001' and row.primary_ref == 'p000002'
+    assert row.required_refs == ['r000003'] and row.omitted_matched_refs == []
+    success = row_schema('supported')
+    assert set(success['properties']) == {'work_id', 'status', 'primary_ref', 'required_refs', 'omitted_matched_refs'}
     assert success['additionalProperties'] is False
-
-
-def test_negative_judgment_preserves_bounded_explanation():
-    for status in ('insufficient', 'unsupported'):
-        row = {'work_id': 'WRK-0001', 'status': status, 'primary_ref': None,
-               'required_refs': [], 'reason': 'Current text omits the required scope.'}
-        assert SupportAssessmentWireResponse.model_validate({'results': [row]}).results[0].reason == row['reason']
-        row['reason'] = 'x' * 1001
-        with pytest.raises(ValidationError):
-            SupportAssessmentWireResponse.model_validate({'results': [row]})
-
-
-def test_success_output_cannot_emit_prose():
-    row = {'work_id': 'WRK-0001', 'status': 'supported', 'primary_ref': 'PRM-0002',
-           'required_refs': [], 'reason': 'A long explanation'}
     with pytest.raises(ValidationError):
-        SupportAssessmentWireResponse.model_validate({'results': [row]})
+        SupportAssessmentWireResponse.model_validate({'results': [{**SUPPORTED, 'reason': 'A long explanation'}]})
+
+
+def test_unsupported_row_carries_no_refs_or_prose():
+    assert set(row_schema('unsupported')['properties']) == {'work_id', 'status'}
+    for extra in ({'primary_ref': 'PRM-0002'}, {'reason': 'Current text omits the required scope.'}):
+        with pytest.raises(ValidationError):
+            SupportAssessmentWireResponse.model_validate(
+                {'results': [{'work_id': 'WRK-0001', 'status': 'unsupported', **extra}]}
+            )
+
+
+def test_continue_row_carries_only_its_witness_delta():
+    assert set(row_schema('continue')['properties']) == {'work_id', 'status', 'witness_delta'}
+    row = wire().decode(SupportAssessmentWireResponse.model_validate({'results': [CONTINUE]})).results[0]
+    assert row.witness_delta.support_witness_refs == ['p000002']
+    assert row.witness_delta.opposing_witness_refs == ['r000003']
+    with pytest.raises(ValidationError):
+        SupportAssessmentWireResponse.model_validate({'results': [{**CONTINUE, 'primary_ref': 'PRM-0002'}]})
+
+
+def test_every_schema_property_is_required_for_strict_transport():
+    for status in ('continue', 'supported', 'unsupported'):
+        schema = row_schema(status)
+        assert set(schema['required']) == set(schema['properties'])
+    assert 'oneOf' not in json.dumps(SupportAssessmentWireResponse.model_json_schema())
+
 
 @pytest.mark.asyncio
 async def test_live_client_contract_uses_compact_schema_and_rejects_truncated_json(monkeypatch):
     from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, StructuredLlmError
     from tests.test_structured_llm import CompletionResponse, set_native_schema_support
-    reply = CompletionResponse(json.dumps({'results': [{
-        'work_id': 'WRK-0001', 'status': 'supported', 'primary_ref': 'PRM-0002', 'required_refs': [],
-    }]}))
+    reply = CompletionResponse(json.dumps({'results': [{**SUPPORTED, 'required_refs': []}]}))
     seen = []
     async def completion(**kwargs):
         seen.append(kwargs)
@@ -71,15 +91,15 @@ async def test_live_client_contract_uses_compact_schema_and_rejects_truncated_js
 @pytest.mark.asyncio
 async def test_correction_log_names_the_rule_class_without_source_content(caplog):
     from memforge.pipeline.revision_work import RevisionWorkExecutor
-    from tests.test_revision_work import Client, Store, work_items
+    from tests.test_revision_work import CHANGED, Client, Store, work_items
     class WrongRef(Client):
         def judge(self, prompt):
             results = super().judge(prompt)
-            results[0].primary_ref = 'PRM-9999'
+            results[0]['primary_ref'] = 'PRM-9999'
             return results
     executor = RevisionWorkExecutor(client=WrongRef(limit=50000), model='gpt-4o', store=Store(), derivation_id='root')
     with pytest.raises(Exception, match='bounded assessment correction exhausted'):
-        await executor.assess_many(work_items('Two reviewers approve US releases.'))
+        await executor.assess_many(work_items(CHANGED))
     records = [r.message for r in caplog.records if r.message.startswith('llm_batch_output_rejected')]
     assert len(records) == 2
     assert all('FragmentSelectionError' in r and 'items=1' in r for r in records)
@@ -89,14 +109,14 @@ async def test_correction_log_names_the_rule_class_without_source_content(caplog
 @pytest.mark.asyncio
 async def test_pipeline_reuses_the_compact_wire_result_and_decodes_it_again():
     from memforge.pipeline.revision_work import RevisionWorkExecutor
-    from tests.test_revision_work import Client, Store, work_items
+    from tests.test_revision_work import CHANGED, Client, Store, work_items
     client, store = Client(limit=50000), Store()
-    items = work_items('Two reviewers approve US releases.', 2)
+    items = work_items(CHANGED, 2)
     first = RevisionWorkExecutor(client=client, model='openai/gpt-4o', store=store, derivation_id='root')
     assert all(r.supported for r in (await first.assess_many(items)).values())
     second = RevisionWorkExecutor(client=client, model='openai/gpt-4o', store=store, derivation_id='root')
     reused = await second.assess_many(items)
-    assert all(r.supported and r.reason == 'Supported by selected current Evidence.' for r in reused.values())
+    assert all(r.supported and r.memory is not None for r in reused.values())
     assert len(client.prompts) == 1 and second.reused == 1
     work = next(w for w in store.works.values() if w.kind == 'support_assess')
     assert all('reason' not in r and r['work_id'].startswith('WRK-') for r in work.result['results'])
