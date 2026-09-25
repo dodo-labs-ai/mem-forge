@@ -8,7 +8,7 @@ adapter's job, never the caller's.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 import hashlib
 import json
 from typing import Any, Mapping, Protocol, Sequence, TypedDict, runtime_checkable
@@ -124,8 +124,6 @@ class ActiveMemorySupportState:
     unit_ids: tuple[str, ...] = ()
     current_unit_ids: tuple[str, ...] = ()
     support_scope_version: SupportScopeVersion = SupportScopeVersion.REFERENCE_SET_V1
-    # Newest source revision time among the current Support; None without one.
-    latest_source_revision_at: str | None = None
 
     @property
     def support_ids(self) -> tuple[str, ...]:
@@ -153,7 +151,6 @@ class ActiveMemorySupportRow:
     source_id: str
     access_context_hash: str
     is_current: bool
-    source_revision_at: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,30 +162,6 @@ class ActiveMemoryUnitSupportRow:
     access_context_hash: str
     part_set_digest: str
     is_current: bool
-    source_revision_at: str | None
-
-
-def parse_source_revision_time(value: str | None) -> datetime | None:
-    """Parse one stored source revision time; a time without a zone is UTC.
-
-    Source adapters supply these times. One that is not ISO 8601 is unknown,
-    like a missing one, so it neither orders an ``updates`` pair nor fails a read.
-    """
-
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
-
-
-def latest_source_revision_at(values: Sequence[str | None]) -> str | None:
-    """The newest of several stored source revision times, as stored."""
-
-    dated = [(parsed, value) for value in values if (parsed := parse_source_revision_time(value)) is not None]
-    return max(dated)[1] if dated else None
 
 
 def build_active_memory_support_states(
@@ -200,7 +173,6 @@ def build_active_memory_support_states(
     ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
     grouped: dict[str, list[tuple[str, str, str]]] = {memory_id: [] for memory_id in ids}
     current_grouped: dict[str, list[tuple[str, str, str]]] = {memory_id: [] for memory_id in ids}
-    current_times: dict[str, list[str | None]] = {memory_id: [] for memory_id in ids}
     for row in sorted(
         rows,
         key=lambda item: (
@@ -215,7 +187,6 @@ def build_active_memory_support_states(
             grouped[row.memory_id].append(value)
             if row.is_current:
                 current_grouped[row.memory_id].append(value)
-                current_times[row.memory_id].append(row.source_revision_at)
     return {
         memory_id: ActiveMemorySupportState(
             reference_ids=tuple(reference_id for reference_id, _source_id, _access_hash in state_rows),
@@ -225,7 +196,6 @@ def build_active_memory_support_states(
             ),
             current_support_set_hash=active_support_rows_hash(current_grouped[memory_id]),
             source_ids=tuple(dict.fromkeys(source_id for _reference_id, source_id, _access_hash in state_rows)),
-            latest_source_revision_at=latest_source_revision_at(current_times[memory_id]),
         )
         for memory_id, state_rows in grouped.items()
     }
@@ -248,7 +218,6 @@ def build_active_memory_unit_support_states(
     current_grouped: dict[str, list[tuple[str, str, str, str, str]]] = {
         memory_id: [] for memory_id in ids
     }
-    current_times: dict[str, list[str | None]] = {memory_id: [] for memory_id in ids}
     for row in sorted(
         rows,
         key=lambda item: (
@@ -272,7 +241,6 @@ def build_active_memory_unit_support_states(
         grouped[row.memory_id].append(value)
         if row.is_current:
             current_grouped[row.memory_id].append(value)
-            current_times[row.memory_id].append(row.source_revision_at)
 
     def digest(values: Sequence[tuple[str, str, str, str, str]]) -> str:
         return hashlib.sha256(
@@ -297,7 +265,6 @@ def build_active_memory_unit_support_states(
                 for _sid, unit_id, _source, _access, _part in current_grouped[memory_id]
             ),
             support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
-            latest_source_revision_at=latest_source_revision_at(current_times[memory_id]),
         )
         for memory_id, values in grouped.items()
     }

@@ -24,9 +24,3 @@ export function relationSentence(relation: Pick<MemoryRelation, "label" | "role"
 export function relatedMemorySources(memory: RelatedMemory): string {
   return memory.sources.map((source) => source.name ?? source.source_type).join(", ");
 }
-
-export function relationRevisionDate(memory: RelatedMemory): string | null {
-  if (!memory.revision_at) return null;
-  const revised = new Date(memory.revision_at);
-  return Number.isNaN(revised.getTime()) ? null : revised.toLocaleDateString();
-}

@@ -59,7 +59,8 @@ export interface RelatedMemory {
   summary: string;
   content_hash: string;
   sources: MemorySourceRef[];
-  revision_at: string | null;
+  /** UTC date (YYYY-MM-DD) on which the source recorded the Evidence the relation was decided on. */
+  evidence_time: string | null;
 }
 
 export interface MemoryRelation {

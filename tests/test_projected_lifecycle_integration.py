@@ -8547,7 +8547,11 @@ async def test_relation_discovery_records_relation_after_lifecycle_commit(
     low_id, high_id = sorted((challenger.id, candidate.id))
     [relation] = await db.db.execute_fetchall("SELECT * FROM cross_document_relations")
     assert (relation["memory_low_id"], relation["memory_high_id"]) == (low_id, high_id)
-    assert relation["label"] == "updates"
+    # The candidate has no Evidence time, so the judged updates is recorded as contradicts.
+    assert relation["label"] == "contradicts"
+    evidence_times = {low_id: relation["low_evidence_time"], high_id: relation["high_evidence_time"]}
+    # The Confluence page time of the challenger's current revision; the candidate has none.
+    assert evidence_times == {challenger.id: "2026-07-15", candidate.id: None}
     assert relation["decided_by"] == "classifier"
     assert relation["classifier_version"] == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
     assert {relation["low_content_hash"], relation["high_content_hash"]} == {
@@ -8567,35 +8571,6 @@ async def test_relation_discovery_records_relation_after_lifecycle_commit(
     source_ids = await db.get_memory_source_ids_many((candidate.id,))
     expected_sources = () if candidate_source_type.startswith("user_") else (candidate_source_id,)
     assert source_ids[candidate.id] == expected_sources
-
-
-@pytest.mark.asyncio
-async def test_support_states_report_the_newest_current_source_revision_time_in_both_scopes(
-    db: Database,
-) -> None:
-    _projection_row, memory = await _create_relation_discovery_fixture(db, run_id="projection-revision-time")
-    revision_time = "2026-07-14T09:30:00Z"
-    await db.db.execute("UPDATE source_observation_revisions SET observed_at = ?", (revision_time,))
-    await db.db.commit()
-
-    v1_state = (await db.get_active_memory_support_states((memory.id,)))[memory.id]
-
-    assert v1_state.support_scope_version is SupportScopeVersion.REFERENCE_SET_V1
-    assert v1_state.latest_source_revision_at == revision_time
-
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(expected_report_id=cutover.id, owner_id="revision-time")
-    [unit_time] = await db.db.execute_fetchall(
-        """SELECT eu.observed_at FROM memory_unit_support_assertions msa
-             JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
-            WHERE msa.memory_id = ? AND msa.active = 1""",
-        (memory.id,),
-    )
-
-    v2_state = (await db.get_active_memory_support_states((memory.id,)))[memory.id]
-
-    assert v2_state.support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-    assert v2_state.latest_source_revision_at == unit_time["observed_at"] == "2026-07-15T11:00:00+00:00"
 
 
 async def _relation_pair_fixture(db: Database, *, run_id: str) -> tuple[Memory, Memory]:
@@ -8689,18 +8664,21 @@ async def _insert_review_relation(
     label: CrossDocumentRelationLabel = CrossDocumentRelationLabel.CONTRADICTS,
 ) -> None:
     by_id = {challenger.id: challenger, candidate.id: candidate}
+    evidence_times = {challenger.id: "2026-07-15", candidate.id: "2026-07-01"}
     low_id, high_id = sorted(by_id)
     await db.db.execute(
         """INSERT INTO cross_document_relations (
                memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
-               reason, decided_by, decided_at
-           ) VALUES (?, ?, ?, ?, ?, 'confirmed by a reviewer', 'review', ?)""",
+               low_evidence_time, high_evidence_time, reason, decided_by, decided_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed by a reviewer', 'review', ?)""",
         (
             low_id,
             high_id,
             label.value,
             by_id[low_id].content_hash,
             by_id[high_id].content_hash,
+            evidence_times[low_id],
+            evidence_times[high_id],
             "2026-07-20T00:00:00+00:00",
         ),
     )
@@ -8748,11 +8726,11 @@ async def test_relation_discovery_replaces_a_confirmed_relation_after_a_memory_c
     )
     await db.db.commit()
 
-    result = await _run_relation_discovery(db, revised, CrossDocumentRelationLabel.UPDATES)
+    result = await _run_relation_discovery(db, revised, CrossDocumentRelationLabel.EQUIVALENT)
 
     assert result.completed_work == 1
     [row] = await _stored_relations(db)
-    assert (row["label"], row["decided_by"]) == ("updates", "classifier")
+    assert (row["label"], row["decided_by"]) == ("equivalent", "classifier")
     assert revised.content_hash in {row["low_content_hash"], row["high_content_hash"]}
 
 

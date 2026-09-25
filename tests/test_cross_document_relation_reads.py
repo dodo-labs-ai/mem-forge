@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,27 +18,29 @@ from memforge.memory.cross_document_relation import (
     CurrentCrossDocumentRelation,
     RelationDismissalConflict,
     pair_key,
+    recorded_relation_label,
 )
 from memforge.memory.cross_document_relation_reader import (
     RelationGraph,
+    RelationRole,
     dismiss_relation,
     list_relation_pairs,
     load_relation_graph,
     order_by_relations,
-    readable_relation,
+    read_memory_relations,
     relation_notice,
+    relation_role,
 )
 from memforge.models import DocumentRecord, Memory, MemoryRelationContext, MemorySourceRef, RelatedMemory, content_hash
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.adapters.context import LOCAL_DEV_USER_ID, AccessScope
-from memforge.storage.adapters.protocols import ActiveMemorySupportState, latest_source_revision_at
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.adapters.sqlite.relational import SqliteRelationalStore
 from memforge.storage.database import Database
 
 OTHER_USER_ID = "someone-else"
-EARLIER = "2026-07-01T00:00:00+00:00"
-LATER = "2026-08-01T00:00:00+00:00"
+EARLIER = "2026-07-01"
+LATER = "2026-08-01"
 CONTRADICTS = CrossDocumentRelationLabel.CONTRADICTS
 UPDATES = CrossDocumentRelationLabel.UPDATES
 EQUIVALENT = CrossDocumentRelationLabel.EQUIVALENT
@@ -76,22 +79,29 @@ async def _relate(
     second: Memory,
     label: CrossDocumentRelationLabel,
     *,
+    times: Mapping[str, str] | None = None,
     decided_at: str = EARLIER,
     reason: str = "Both statements govern the same case.",
 ) -> None:
+    """Store a relation with the Evidence time of each Memory in ``times``."""
+
     by_id = {first.id: first, second.id: second}
     low_id, high_id = pair_key(first.id, second.id)
+    evidence_times = times or {}
     await db.db.execute(
         """INSERT INTO cross_document_relations (
                memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
+               low_evidence_time, high_evidence_time,
                reason, classifier_version, relation_run_id, discovery_work_id, decided_by, decided_at
-           ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)""",
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)""",
         (
             low_id,
             high_id,
             label.value,
             by_id[low_id].content_hash,
             by_id[high_id].content_hash,
+            evidence_times.get(low_id),
+            evidence_times.get(high_id),
             reason,
             CrossDocumentRelationDecider.CLASSIFIER.value,
             decided_at,
@@ -145,24 +155,6 @@ async def _attach_source(db: Database, memory_id: str, source_id: str, source_ty
     await db.db.commit()
 
 
-def _support_times(store, times: dict[str, str | None]) -> None:
-    """Fix each Memory's newest current source revision time for a test."""
-
-    async def states(memory_ids):
-        return {
-            memory_id: ActiveMemorySupportState(
-                reference_ids=(),
-                support_set_hash="",
-                current_reference_ids=(),
-                current_support_set_hash="",
-                latest_source_revision_at=times.get(memory_id),
-            )
-            for memory_id in memory_ids
-        }
-
-    store.get_active_memory_support_states = states
-
-
 @pytest.fixture
 async def db(tmp_path):
     database = Database(str(tmp_path / "relations.db"))
@@ -175,11 +167,13 @@ async def db(tmp_path):
 
 
 async def _pair(db: Database, label=CONTRADICTS) -> tuple[Memory, Memory]:
+    """Two related Memories; the first one's Evidence is the later one."""
+
     first = _memory("mem-rel-a", "Payroll closes on the 20th.")
     second = _memory("mem-rel-b", "Payroll closes on the 25th.")
     await db.insert_memory(first)
     await db.insert_memory(second)
-    await _relate(db, first, second, label)
+    await _relate(db, first, second, label, times={first.id: LATER, second.id: EARLIER})
     return first, second
 
 
@@ -245,17 +239,22 @@ async def test_relations_per_memory_are_bounded_most_consequential_first(db):
 
 
 @pytest.mark.asyncio
-async def test_relation_view_filters_by_the_label_a_reader_sees_and_pages(db):
+async def test_relation_view_filters_by_label_and_pages(db):
     center = _memory("mem-view-center")
     await db.insert_memory(center)
     others = []
-    for index, label in enumerate((CONTRADICTS, UPDATES, UPDATES, EQUIVALENT)):
+    for index, label in enumerate((CONTRADICTS, UPDATES, CONTRADICTS, EQUIVALENT)):
         other = _memory(f"mem-view-{index}")
         others.append(other)
         await db.insert_memory(other)
-        await _relate(db, center, other, label, decided_at=f"2026-07-0{index + 1}T00:00:00+00:00")
-    # mem-view-1 is ordered by source revision time; mem-view-2 has no time and reads as a conflict.
-    _support_times(db, {center.id: EARLIER, others[1].id: LATER})
+        await _relate(
+            db,
+            center,
+            other,
+            label,
+            times={center.id: EARLIER, other.id: LATER},
+            decided_at=f"2026-07-0{index + 1}T00:00:00+00:00",
+        )
 
     conflicts, conflict_total = await list_relation_pairs(db, _scope(), label=CONTRADICTS, limit=1, offset=0)
     next_conflicts, _ = await list_relation_pairs(db, _scope(), label=CONTRADICTS, limit=1, offset=1)
@@ -267,7 +266,10 @@ async def test_relation_view_filters_by_the_label_a_reader_sees_and_pages(db):
     assert {view.label for view in (*conflicts, *next_conflicts)} == {CONTRADICTS.value}
     [update] = updates
     assert (update.label, update.newer_memory_id) == (UPDATES.value, others[1].id)
-    assert len(await db.list_current_cross_document_relations(_scope(), labels=(UPDATES,))) == 2
+    assert [(memory.memory_id, memory.evidence_time) for memory in update.memories] == [
+        (others[1].id, LATER),
+        (center.id, EARLIER),
+    ]
 
 
 @pytest.mark.asyncio
@@ -328,7 +330,7 @@ async def _relate_replacing(db: Database, first: Memory, second: Memory, label) 
         "DELETE FROM cross_document_relations WHERE memory_low_id = ? AND memory_high_id = ?",
         (low_id, high_id),
     )
-    await _relate(db, first, second, label)
+    await _relate(db, first, second, label, times={first.id: LATER, second.id: EARLIER})
 
 
 @pytest.mark.asyncio
@@ -399,73 +401,83 @@ async def test_restore_undoes_the_dismissal_and_is_audited(db):
 # ---------------------------------------------------------------- reader
 
 
-def _stored(first: str, second: str, label: CrossDocumentRelationLabel) -> CurrentCrossDocumentRelation:
+def _stored(
+    first: str,
+    second: str,
+    label: CrossDocumentRelationLabel,
+    times: Mapping[str, str] | None = None,
+) -> CurrentCrossDocumentRelation:
     low_id, high_id = pair_key(first, second)
+    evidence_times = times or {}
     return CurrentCrossDocumentRelation(
         memory_low_id=low_id,
         memory_high_id=high_id,
         label=label,
         low_content_hash="low",
         high_content_hash="high",
+        low_evidence_time=evidence_times.get(low_id),
+        high_evidence_time=evidence_times.get(high_id),
         reason="",
         decided_by=CrossDocumentRelationDecider.CLASSIFIER,
         decided_at=EARLIER,
     )
 
 
-def _graph(relations: list[CurrentCrossDocumentRelation], times: dict[str, str]) -> RelationGraph:
+def _graph(relations: list[CurrentCrossDocumentRelation]) -> RelationGraph:
     by_memory: dict[str, list] = {}
     for relation in relations:
-        readable = readable_relation(relation, times)
         for memory_id in (relation.memory_low_id, relation.memory_high_id):
-            by_memory.setdefault(memory_id, []).append(readable)
-    return RelationGraph(relations={key: tuple(value) for key, value in by_memory.items()}, revision_at=times)
+            by_memory.setdefault(memory_id, []).append(relation)
+    return RelationGraph(relations={key: tuple(value) for key, value in by_memory.items()})
 
 
-def test_updates_is_ordered_by_source_revision_time_and_otherwise_reads_as_contradicts():
-    relation = _stored("mem-a", "mem-b", UPDATES)
+def test_updates_is_ordered_by_evidence_time_and_otherwise_recorded_as_contradicts():
+    ordered = _stored("mem-a", "mem-b", UPDATES, {"mem-a": LATER, "mem-b": EARLIER})
 
-    ordered = readable_relation(relation, {"mem-a": LATER, "mem-b": EARLIER})
-    same_time = readable_relation(relation, {"mem-a": EARLIER, "mem-b": "2026-07-01T02:00:00+02:00"})
-    missing_time = readable_relation(relation, {"mem-a": LATER})
-
-    assert (ordered.label, ordered.newer_memory_id) == (UPDATES, "mem-a")
-    assert ordered.role_of("mem-b").value == "older"
-    assert (same_time.label, same_time.newer_memory_id) == (CONTRADICTS, None)
-    assert (missing_time.label, missing_time.newer_memory_id) == (CONTRADICTS, None)
-
-
-def test_a_source_revision_time_that_is_not_iso_is_unknown():
-    relation = _stored("mem-a", "mem-b", UPDATES)
-
-    malformed = readable_relation(relation, {"mem-a": "Tue, 03 Jun 2025 10:00:00 GMT", "mem-b": EARLIER})
-
-    assert (malformed.label, malformed.newer_memory_id) == (CONTRADICTS, None)
-    assert latest_source_revision_at(["not a time", EARLIER, None]) == EARLIER
+    assert ordered.newer_memory_id == "mem-a"
+    assert relation_role(ordered, "mem-b") is RelationRole.OLDER
+    assert _stored("mem-a", "mem-b", CONTRADICTS, {"mem-a": LATER, "mem-b": EARLIER}).newer_memory_id is None
+    for low_time, high_time in ((EARLIER, EARLIER), (LATER, None), ("Tue, 03 Jun 2025", EARLIER)):
+        assert recorded_relation_label(UPDATES, "mem-a", "mem-b", low_time, high_time) is CONTRADICTS
+        with pytest.raises(ValueError, match="order the pair"):
+            _stored("mem-a", "mem-b", UPDATES, {"mem-a": low_time, "mem-b": high_time})
+    assert recorded_relation_label(EQUIVALENT, "mem-a", "mem-b", None, None) is EQUIVALENT
 
 
 def test_window_order_puts_each_memory_after_every_newer_one_in_an_updates_chain():
-    oldest, middle, newest = "2026-06-01T00:00:00+00:00", EARLIER, LATER
+    times = {"mem-1": "2026-06-01", "mem-2": EARLIER, "mem-3": LATER}
     graph = _graph(
         [
-            _stored("mem-1", "mem-2", UPDATES),
-            _stored("mem-2", "mem-3", UPDATES),
-            _stored("mem-1", "mem-3", UPDATES),
-        ],
-        {"mem-1": oldest, "mem-2": middle, "mem-3": newest},
+            _stored("mem-1", "mem-2", UPDATES, times),
+            _stored("mem-2", "mem-3", UPDATES, times),
+            _stored("mem-1", "mem-3", UPDATES, times),
+        ]
     )
 
     assert order_by_relations(["mem-1", "mem-0", "mem-2", "mem-3"], graph) == ["mem-3", "mem-2", "mem-1", "mem-0"]
+
+
+def test_window_order_ends_when_relations_decided_at_different_times_form_a_cycle():
+    graph = _graph(
+        [
+            _stored("mem-1", "mem-2", UPDATES, {"mem-1": EARLIER, "mem-2": LATER}),
+            _stored("mem-2", "mem-3", UPDATES, {"mem-2": EARLIER, "mem-3": LATER}),
+            _stored("mem-1", "mem-3", UPDATES, {"mem-3": EARLIER, "mem-1": LATER}),
+        ]
+    )
+
+    ordered = order_by_relations(["mem-1", "mem-2", "mem-3"], graph)
+
+    assert sorted(ordered) == ["mem-1", "mem-2", "mem-3"]
 
 
 def test_window_order_drops_equivalents_of_kept_memories_and_puts_newer_first():
     graph = _graph(
         [
             _stored("mem-1", "mem-2", EQUIVALENT),
-            _stored("mem-3", "mem-4", UPDATES),
+            _stored("mem-3", "mem-4", UPDATES, {"mem-3": EARLIER, "mem-4": LATER}),
             _stored("mem-2", "mem-5", EQUIVALENT),
-        ],
-        {"mem-3": EARLIER, "mem-4": LATER},
+        ]
     )
 
     assert order_by_relations(["mem-1", "mem-2", "mem-3", "mem-4", "mem-5"], graph) == [
@@ -482,7 +494,7 @@ def test_notice_names_conflicts_and_newer_memories_only():
         summary="Payroll closes on the 25th.",
         content_hash="hash",
         sources=(MemorySourceRef("src-jira", "jira", "Payroll Jira"),),
-        revision_at=LATER,
+        evidence_time=LATER,
     )
 
     def context(label: str, role: str) -> MemoryRelationContext:
@@ -490,30 +502,28 @@ def test_notice_names_conflicts_and_newer_memories_only():
 
     assert relation_notice([context("equivalent", "peer"), context("updates", "newer")]) is None
     assert relation_notice([context("updates", "older")]) == (
-        "Updated by the newer Memory mem-new from Payroll Jira (revised 2026-08-01)."
+        "Updated by the newer Memory mem-new from Payroll Jira (recorded 2026-08-01)."
     )
     assert relation_notice([context("contradicts", "peer")]) == (
-        "Conflicts with Memory mem-new from Payroll Jira (revised 2026-08-01)."
+        "Conflicts with Memory mem-new from Payroll Jira (recorded 2026-08-01)."
     )
 
 
 @pytest.mark.asyncio
-async def test_support_change_moves_the_updates_order_but_keeps_the_relation(db):
+async def test_updates_reads_in_the_order_and_dates_it_was_decided_on(db):
     first, second = await _pair(db, UPDATES)
-    store = SqliteRelationalStore(db)
 
-    _support_times(store, {first.id: LATER, second.id: EARLIER})
-    before = await load_relation_graph(store, (first.id,), _scope())
-    _support_times(store, {first.id: EARLIER, second.id: LATER})
-    after = await load_relation_graph(store, (first.id,), _scope())
+    graph = await load_relation_graph(SqliteRelationalStore(db), (first.id,), _scope())
+    contexts = await read_memory_relations(db, (second.id,), _scope())
 
-    assert before.relations_of(first.id)[0].newer_memory_id == first.id
-    assert after.relations_of(first.id)[0].newer_memory_id == second.id
+    assert graph.relations_of(first.id)[0].newer_memory_id == first.id
+    [context] = contexts[second.id]
+    assert (context.label, context.role) == (UPDATES.value, RelationRole.OLDER.value)
+    assert context.counterpart.evidence_time == LATER
 
 
 @pytest.mark.asyncio
-async def test_dismissing_a_shown_label_records_the_stored_label(db):
-    # Without source revision times an updates pair reads as contradicts.
+async def test_dismissal_names_the_label_the_reader_sees(db):
     first, second = await _pair(db, UPDATES)
 
     with pytest.raises(RelationDismissalConflict):
@@ -521,7 +531,7 @@ async def test_dismissing_a_shown_label_records_the_stored_label(db):
             db,
             memory_id=first.id,
             counterpart_memory_id=second.id,
-            label=UPDATES,
+            label=CONTRADICTS,
             expected_content_hash=first.content_hash,
             counterpart_expected_content_hash=second.content_hash,
             actor="reader-1",
@@ -531,7 +541,7 @@ async def test_dismissing_a_shown_label_records_the_stored_label(db):
         db,
         memory_id=first.id,
         counterpart_memory_id=second.id,
-        label=CONTRADICTS,
+        label=UPDATES,
         expected_content_hash=first.content_hash,
         counterpart_expected_content_hash=second.content_hash,
         actor="reader-1",
@@ -553,9 +563,8 @@ class _VectorHits:
         return {"ids": [self.ids], "distances": [[0.01 for _ in self.ids]]}
 
 
-def _engine(db: Database, tmp_path: Path, vector_ids: list[str], times: dict[str, str | None]) -> SearchEngine:
+def _engine(db: Database, tmp_path: Path, vector_ids: list[str]) -> SearchEngine:
     adapters = build_sqlite_adapters(db, _VectorHits(vector_ids))
-    _support_times(adapters.relational, times)
     engine = SearchEngine(
         relational=adapters.relational,
         keyword=adapters.keyword,
@@ -571,7 +580,7 @@ def _engine(db: Database, tmp_path: Path, vector_ids: list[str], times: dict[str
 async def test_search_attaches_a_conflict_to_both_memories(db, tmp_path):
     first, second = await _pair(db)
     await _attach_source(db, second.id, "src-jira", "jira")
-    engine = _engine(db, tmp_path, [first.id, second.id], {first.id: EARLIER, second.id: LATER})
+    engine = _engine(db, tmp_path, [first.id, second.id])
 
     result = await engine.search("Payroll closes", top_k=2)
 
@@ -580,7 +589,8 @@ async def test_search_attaches_a_conflict_to_both_memories(db, tmp_path):
     assert (context.label, context.role) == ("contradicts", "peer")
     assert context.counterpart.memory_id == second.id
     assert context.counterpart.sources == (MemorySourceRef("src-jira", "jira", "Payroll Jira"),)
-    assert context.counterpart.revision_at == LATER
+    assert context.counterpart.evidence_time == EARLIER
+    assert by_id[second.id].relations[0].counterpart.evidence_time == LATER
     assert by_id[first.id].relation_notice.startswith(f"Conflicts with Memory {second.id} from Payroll Jira")
     assert by_id[first.id].follow_up == {"suggested_tool": "get_memory", "reason": "result_has_relation_notice"}
     assert by_id[second.id].relations[0].counterpart.memory_id == first.id
@@ -592,8 +602,8 @@ async def test_search_ranks_the_newer_memory_ahead_and_notes_the_older(db, tmp_p
     newer = _memory("mem-newer", "Salary cutoff moved to the 25th.")
     await db.insert_memory(older)
     await db.insert_memory(newer)
-    await _relate(db, older, newer, UPDATES)
-    engine = _engine(db, tmp_path, [older.id, newer.id], {older.id: EARLIER, newer.id: LATER})
+    await _relate(db, older, newer, UPDATES, times={older.id: EARLIER, newer.id: LATER})
+    engine = _engine(db, tmp_path, [older.id, newer.id])
 
     result = await engine.search("Payroll closes", top_k=2)
 
@@ -605,24 +615,6 @@ async def test_search_ranks_the_newer_memory_ahead_and_notes_the_older(db, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_search_keeps_the_rank_of_an_updates_pair_without_a_revision_time(db, tmp_path):
-    first = _memory("mem-untimed-a", "Payroll closes on the 20th.")
-    second = _memory("mem-untimed-b", "Salary cutoff moved to the 25th.")
-    await db.insert_memory(first)
-    await db.insert_memory(second)
-    await _relate(db, first, second, UPDATES)
-    engine = _engine(db, tmp_path, [first.id, second.id], {second.id: LATER})
-
-    result = await engine.search("Payroll closes", top_k=2)
-
-    assert [item.memory_id for item in result["results"]] == [first.id, second.id]
-    for item in result["results"]:
-        [context] = item.relations
-        assert (context.label, context.role) == ("contradicts", "peer")
-        assert item.relation_notice.startswith("Conflicts with Memory ")
-
-
-@pytest.mark.asyncio
 async def test_search_returns_one_of_an_equivalent_pair_and_pages_stably(db, tmp_path):
     kept = _memory("mem-kept", "Payroll closes on the 20th.")
     same = _memory("mem-same", "Payroll closing day is the 20th.")
@@ -630,7 +622,7 @@ async def test_search_returns_one_of_an_equivalent_pair_and_pages_stably(db, tmp
     for memory in (kept, same, other):
         await db.insert_memory(memory)
     await _relate(db, kept, same, EQUIVALENT)
-    engine = _engine(db, tmp_path, [kept.id, same.id, other.id], {})
+    engine = _engine(db, tmp_path, [kept.id, same.id, other.id])
 
     first_page = await engine.search("Payroll", top_k=1)
     second_page = await engine.search("Payroll", top_k=1, offset=1)

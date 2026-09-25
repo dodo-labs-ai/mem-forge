@@ -1,16 +1,16 @@
 """Read Cross-Document Relations for a caller.
 
-Storage returns the relations that are current for the caller. This module
-decides how each one reads: an ``updates`` pair is ordered by the newest source
-revision time of each Memory's current Support, and reads as ``contradicts``
-when those times do not order it. Search, Memory detail and the relation view
-all read relations here, so every surface shows the same label and order.
+Storage returns the relations that are current for the caller, each with the
+label it was recorded with and the Evidence time of both Memories it was
+decided on. An ``updates`` pair is ordered by those times. Search, Memory
+detail and the relation view all read relations here, so every surface shows
+the same label, order and dates.
 """
 
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Protocol
 
@@ -23,7 +23,6 @@ from memforge.memory.cross_document_relation import (
 )
 from memforge.models import Memory, MemoryRelationContext, MemorySourceRef, RelatedMemory
 from memforge.storage.adapters.context import AccessScope
-from memforge.storage.adapters.protocols import ActiveMemorySupportState, parse_source_revision_time
 
 
 class RelationReadStore(Protocol):
@@ -32,11 +31,6 @@ class RelationReadStore(Protocol):
         memory_ids: Sequence[str],
         scope: AccessScope,
     ) -> Mapping[str, tuple[CurrentCrossDocumentRelation, ...]]: ...
-
-    async def get_active_memory_support_states(
-        self,
-        memory_ids: Sequence[str],
-    ) -> Mapping[str, ActiveMemorySupportState]: ...
 
     async def list_memories_by_ids(self, memory_ids: Sequence[str]) -> list[Memory]: ...
 
@@ -78,72 +72,20 @@ class RelationRole(str, Enum):
     PEER = "peer"
 
 
-@dataclass(frozen=True, slots=True)
-class ReadableRelation:
-    """A current relation with the label a reader sees."""
-
-    relation: CurrentCrossDocumentRelation
-    label: CrossDocumentRelationLabel
-    # Set only when ``label`` is updates.
-    newer_memory_id: str | None = None
-
-    def role_of(self, memory_id: str) -> RelationRole:
-        if self.newer_memory_id is None:
-            return RelationRole.PEER
-        return RelationRole.NEWER if memory_id == self.newer_memory_id else RelationRole.OLDER
-
-
-def relation_reading(
-    label: CrossDocumentRelationLabel,
-    memory_low_id: str,
-    memory_high_id: str,
-    revision_at: Mapping[str, str | None],
-) -> tuple[CrossDocumentRelationLabel, str | None]:
-    """How a stored label reads, and the newer Memory when it reads as ``updates``."""
-
-    if label is not CrossDocumentRelationLabel.UPDATES:
-        return label, None
-    low_time = parse_source_revision_time(revision_at.get(memory_low_id))
-    high_time = parse_source_revision_time(revision_at.get(memory_high_id))
-    if low_time is None or high_time is None or low_time == high_time:
-        return CrossDocumentRelationLabel.CONTRADICTS, None
-    return CrossDocumentRelationLabel.UPDATES, memory_low_id if low_time > high_time else memory_high_id
-
-
-def readable_relation(
-    relation: CurrentCrossDocumentRelation,
-    revision_at: Mapping[str, str | None],
-) -> ReadableRelation:
-    label, newer_memory_id = relation_reading(
-        relation.label,
-        relation.memory_low_id,
-        relation.memory_high_id,
-        revision_at,
-    )
-    return ReadableRelation(relation=relation, label=label, newer_memory_id=newer_memory_id)
-
-
-async def source_revision_times(
-    store: RelationReadStore,
-    memory_ids: Sequence[str],
-) -> dict[str, str | None]:
-    """The newest source revision time of each Memory's current Support."""
-
-    ids = tuple(dict.fromkeys(memory_ids))
-    if not ids:
-        return {}
-    support = await store.get_active_memory_support_states(ids)
-    return {memory_id: state.latest_source_revision_at for memory_id, state in support.items()}
+def relation_role(relation: CurrentCrossDocumentRelation, memory_id: str) -> RelationRole:
+    newer_memory_id = relation.newer_memory_id
+    if newer_memory_id is None:
+        return RelationRole.PEER
+    return RelationRole.NEWER if memory_id == newer_memory_id else RelationRole.OLDER
 
 
 @dataclass(frozen=True, slots=True)
 class RelationGraph:
-    """The current relations of a set of Memories, as they read."""
+    """The current relations of a set of Memories."""
 
-    relations: Mapping[str, tuple[ReadableRelation, ...]]
-    revision_at: Mapping[str, str | None]
+    relations: Mapping[str, tuple[CurrentCrossDocumentRelation, ...]]
 
-    def relations_of(self, memory_id: str) -> tuple[ReadableRelation, ...]:
+    def relations_of(self, memory_id: str) -> tuple[CurrentCrossDocumentRelation, ...]:
         return self.relations.get(memory_id, ())
 
 
@@ -152,23 +94,7 @@ async def load_relation_graph(
     memory_ids: Sequence[str],
     scope: AccessScope,
 ) -> RelationGraph:
-    stored = await store.list_cross_document_relations(memory_ids, scope)
-    involved = tuple(
-        dict.fromkeys(
-            memory_id
-            for relations in stored.values()
-            for relation in relations
-            for memory_id in (relation.memory_low_id, relation.memory_high_id)
-        )
-    )
-    revision_at = await source_revision_times(store, involved)
-    return RelationGraph(
-        relations={
-            memory_id: tuple(readable_relation(relation, revision_at) for relation in relations)
-            for memory_id, relations in stored.items()
-        },
-        revision_at=revision_at,
-    )
+    return RelationGraph(relations=await store.list_cross_document_relations(memory_ids, scope))
 
 
 def order_by_relations(memory_ids: Sequence[str], graph: RelationGraph) -> list[str]:
@@ -183,9 +109,9 @@ def order_by_relations(memory_ids: Sequence[str], graph: RelationGraph) -> list[
     kept_ids: set[str] = set()
     for memory_id in memory_ids:
         if any(
-            item.label is CrossDocumentRelationLabel.EQUIVALENT
-            and item.relation.counterpart_of(memory_id) in kept_ids
-            for item in graph.relations_of(memory_id)
+            relation.label is CrossDocumentRelationLabel.EQUIVALENT
+            and relation.counterpart_of(memory_id) in kept_ids
+            for relation in graph.relations_of(memory_id)
         ):
             continue
         kept.append(memory_id)
@@ -194,34 +120,36 @@ def order_by_relations(memory_ids: Sequence[str], graph: RelationGraph) -> list[
     newer_first = {
         memory_id: sorted(
             (
-                item.newer_memory_id
-                for item in graph.relations_of(memory_id)
-                if item.newer_memory_id is not None
-                and item.newer_memory_id != memory_id
-                and item.newer_memory_id in rank
+                relation.newer_memory_id
+                for relation in graph.relations_of(memory_id)
+                if relation.newer_memory_id is not None
+                and relation.newer_memory_id != memory_id
+                and relation.newer_memory_id in rank
             ),
             key=rank.__getitem__,
         )
         for memory_id in kept
     }
-    # Source revision times strictly order every updates pair, so the
-    # newer-than graph has no cycle and each Memory follows all newer ones.
+    # Each relation keeps the Evidence times it was decided on, so relations
+    # decided at different times can form a newer-than cycle. A Memory already
+    # being placed is not waited for again, so each Memory is placed once.
     ordered: list[str] = []
     placed: set[str] = set()
     for memory_id in kept:
-        pending = [memory_id]
-        while pending:
-            current = pending[-1]
-            if current in placed:
-                pending.pop()
+        if memory_id in placed:
+            continue
+        entered = {memory_id}
+        stack = [(memory_id, iter(newer_first[memory_id]))]
+        while stack:
+            current, newer = stack[-1]
+            waiting = next((newer_id for newer_id in newer if newer_id not in placed and newer_id not in entered), None)
+            if waiting is None:
+                stack.pop()
+                placed.add(current)
+                ordered.append(current)
                 continue
-            waiting = [newer_id for newer_id in newer_first[current] if newer_id not in placed]
-            if waiting:
-                pending.extend(reversed(waiting))
-                continue
-            pending.pop()
-            placed.add(current)
-            ordered.append(current)
+            entered.add(waiting)
+            stack.append((waiting, iter(newer_first[waiting])))
     return ordered
 
 
@@ -229,8 +157,9 @@ async def related_memories(
     store: RelationReadStore,
     memory_ids: Sequence[str],
     scope: AccessScope,
-    revision_at: Mapping[str, str | None],
 ) -> Mapping[str, RelatedMemory]:
+    """The caller's view of each Memory, without a date; each relation dates its own Memories."""
+
     ids = tuple(dict.fromkeys(memory_ids))
     if not ids:
         return {}
@@ -242,10 +171,13 @@ async def related_memories(
             summary=memory.content,
             content_hash=memory.content_hash,
             sources=sources.get(memory_id, ()),
-            revision_at=revision_at.get(memory_id),
         )
         for memory_id, memory in memories.items()
     }
+
+
+def _dated(memory: RelatedMemory, relation: CurrentCrossDocumentRelation) -> RelatedMemory:
+    return replace(memory, evidence_time=relation.evidence_time_of(memory.memory_id))
 
 
 async def relation_contexts(
@@ -257,24 +189,23 @@ async def relation_contexts(
     counterparts = await related_memories(
         store,
         [
-            item.relation.counterpart_of(memory_id)
+            relation.counterpart_of(memory_id)
             for memory_id in memory_ids
-            for item in graph.relations_of(memory_id)
+            for relation in graph.relations_of(memory_id)
         ],
         scope,
-        graph.revision_at,
     )
     return {
         memory_id: tuple(
             MemoryRelationContext(
-                label=item.label.value,
-                role=item.role_of(memory_id).value,
-                counterpart=counterparts[item.relation.counterpart_of(memory_id)],
-                reason=item.relation.reason,
-                decided_by=item.relation.decided_by.value,
+                label=relation.label.value,
+                role=relation_role(relation, memory_id).value,
+                counterpart=_dated(counterparts[relation.counterpart_of(memory_id)], relation),
+                reason=relation.reason,
+                decided_by=relation.decided_by.value,
             )
-            for item in graph.relations_of(memory_id)
-            if item.relation.counterpart_of(memory_id) in counterparts
+            for relation in graph.relations_of(memory_id)
+            if relation.counterpart_of(memory_id) in counterparts
         )
         for memory_id in memory_ids
     }
@@ -306,9 +237,8 @@ def _describe(memory: RelatedMemory) -> str:
     text = f"Memory {memory.memory_id}"
     if sources:
         text += f" from {sources}"
-    revised = parse_source_revision_time(memory.revision_at)
-    if revised is not None:
-        text += f" (revised {revised.date().isoformat()})"
+    if memory.evidence_time:
+        text += f" (recorded {memory.evidence_time})"
     return text
 
 
@@ -316,8 +246,8 @@ def _describe(memory: RelatedMemory) -> str:
 class DismissedRelationView:
     """The dismissals in force for one pair, read from one of its Memories so they can be undone.
 
-    ``labels`` are the dismissed labels as they would read now; the newest
-    dismissal gives the actor, time and note.
+    ``labels`` are the dismissed labels; the newest dismissal gives the actor,
+    time and note.
     """
 
     counterpart: RelatedMemory
@@ -340,21 +270,17 @@ async def dismissed_relation_views(
     by_counterpart: dict[str, list[CrossDocumentRelationDismissal]] = {}
     for dismissal in sorted(dismissals, key=lambda item: (item.dismissed_at, item.id), reverse=True):
         by_counterpart.setdefault(dismissal.counterpart_of(memory_id), []).append(dismissal)
-    revision_at = await source_revision_times(store, (memory_id, *by_counterpart))
-    counterparts = await related_memories(store, tuple(by_counterpart), scope, revision_at)
+    counterparts = await related_memories(store, tuple(by_counterpart), scope)
     views: list[DismissedRelationView] = []
     for counterpart_id, pair_dismissals in by_counterpart.items():
         if counterpart_id not in counterparts:
             continue
-        read_labels = {
-            relation_reading(item.label, item.memory_low_id, item.memory_high_id, revision_at)[0]
-            for item in pair_dismissals
-        }
+        dismissed_labels = {item.label for item in pair_dismissals}
         newest = pair_dismissals[0]
         views.append(
             DismissedRelationView(
                 counterpart=counterparts[counterpart_id],
-                labels=tuple(label.value for label in RELATION_READ_ORDER if label in read_labels),
+                labels=tuple(label.value for label in RELATION_READ_ORDER if label in dismissed_labels),
                 dismissed_by=newest.dismissed_by,
                 dismissed_at=newest.dismissed_at,
                 note=newest.note,
@@ -375,17 +301,6 @@ class RelationPairView:
     memories: tuple[RelatedMemory, RelatedMemory]
 
 
-# The stored labels that can read as each label.
-_STORED_LABELS_READ_AS = {
-    CrossDocumentRelationLabel.EQUIVALENT: (CrossDocumentRelationLabel.EQUIVALENT,),
-    CrossDocumentRelationLabel.UPDATES: (CrossDocumentRelationLabel.UPDATES,),
-    CrossDocumentRelationLabel.CONTRADICTS: (
-        CrossDocumentRelationLabel.CONTRADICTS,
-        CrossDocumentRelationLabel.UPDATES,
-    ),
-}
-
-
 async def list_relation_pairs(
     store: RelationViewStore,
     scope: AccessScope,
@@ -394,47 +309,34 @@ async def list_relation_pairs(
     limit: int,
     offset: int,
 ) -> tuple[tuple[RelationPairView, ...], int]:
-    """One page of the relations current for the caller, and their total.
-
-    ``label`` filters by the label a reader sees, so an ``updates`` pair that
-    source revision times do not order is listed with the conflicts.
-    """
+    """One page of the relations current for the caller, and their total."""
 
     relations = await store.list_current_cross_document_relations(
         scope,
-        labels=_STORED_LABELS_READ_AS[label] if label is not None else None,
+        labels=(label,) if label is not None else None,
     )
-    revision_at = await source_revision_times(
+    page = relations[offset : offset + limit]
+    memories = await related_memories(
         store,
-        [
-            memory_id
-            for relation in relations
-            if relation.label is CrossDocumentRelationLabel.UPDATES
-            for memory_id in (relation.memory_low_id, relation.memory_high_id)
-        ],
+        [memory_id for relation in page for memory_id in (relation.memory_low_id, relation.memory_high_id)],
+        scope,
     )
-    readable = [readable_relation(relation, revision_at) for relation in relations]
-    matching = [item for item in readable if label is None or item.label is label]
-    page = matching[offset : offset + limit]
-    page_ids = [
-        memory_id
-        for item in page
-        for memory_id in (item.relation.memory_low_id, item.relation.memory_high_id)
-    ]
-    memories = await related_memories(store, page_ids, scope, await source_revision_times(store, page_ids))
     views = tuple(
         RelationPairView(
-            label=item.label.value,
-            newer_memory_id=item.newer_memory_id,
-            reason=item.relation.reason,
-            decided_by=item.relation.decided_by.value,
-            decided_at=item.relation.decided_at,
-            memories=(memories[item.relation.memory_low_id], memories[item.relation.memory_high_id]),
+            label=relation.label.value,
+            newer_memory_id=relation.newer_memory_id,
+            reason=relation.reason,
+            decided_by=relation.decided_by.value,
+            decided_at=relation.decided_at,
+            memories=(
+                _dated(memories[relation.memory_low_id], relation),
+                _dated(memories[relation.memory_high_id], relation),
+            ),
         )
-        for item in page
-        if item.relation.memory_low_id in memories and item.relation.memory_high_id in memories
+        for relation in page
+        if relation.memory_low_id in memories and relation.memory_high_id in memories
     )
-    return views, len(matching)
+    return views, len(relations)
 
 
 async def dismiss_relation(
@@ -451,19 +353,17 @@ async def dismiss_relation(
 ) -> CrossDocumentRelationDismissal:
     """Dismiss the relation the caller sees between two Memories.
 
-    ``label`` is the label the caller saw. The dismissal records the stored
-    label, so it keeps hiding the relation however its ``updates`` order reads.
-    Raises LookupError when the caller sees no such relation and
-    RelationDismissalConflict when it now reads differently or either content
-    changed.
+    ``label`` is the label the caller saw. Raises LookupError when the caller
+    sees no such relation and RelationDismissalConflict when it now carries
+    another label or either content changed.
     """
 
     graph = await load_relation_graph(store, (memory_id,), scope)
     shown = next(
         (
-            item
-            for item in graph.relations_of(memory_id)
-            if item.relation.counterpart_of(memory_id) == counterpart_memory_id
+            relation
+            for relation in graph.relations_of(memory_id)
+            if relation.counterpart_of(memory_id) == counterpart_memory_id
         ),
         None,
     )
@@ -474,7 +374,7 @@ async def dismiss_relation(
     return await store.record_cross_document_relation_dismissal(
         memory_id=memory_id,
         counterpart_memory_id=counterpart_memory_id,
-        label=shown.relation.label,
+        label=label,
         expected_content_hash=expected_content_hash,
         counterpart_expected_content_hash=counterpart_expected_content_hash,
         actor=actor,

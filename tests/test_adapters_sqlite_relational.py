@@ -1658,54 +1658,6 @@ async def test_relation_work_migration_backfills_codes_and_classifier_versions(d
     }
 
 
-def test_support_state_builders_take_the_newest_time_of_current_support_only() -> None:
-    from memforge.storage.adapters.protocols import (
-        ActiveMemorySupportRow,
-        ActiveMemoryUnitSupportRow,
-        build_active_memory_support_states,
-        build_active_memory_unit_support_states,
-    )
-
-    def reference_row(reference_id: str, at: str | None, *, current: bool = True) -> ActiveMemorySupportRow:
-        return ActiveMemorySupportRow(
-            memory_id="mem-1",
-            evidence_reference_id=reference_id,
-            source_id="src-1",
-            access_context_hash="ctx",
-            is_current=current,
-            source_revision_at=at,
-        )
-
-    def unit_row(unit_id: str, at: str | None, *, current: bool = True) -> ActiveMemoryUnitSupportRow:
-        return ActiveMemoryUnitSupportRow(
-            memory_id="mem-1",
-            support_id=f"support-{unit_id}",
-            evidence_unit_id=unit_id,
-            source_id="src-1",
-            access_context_hash="ctx",
-            part_set_digest="digest",
-            is_current=current,
-            source_revision_at=at,
-        )
-
-    times = ("2026-07-01T10:00:00", "2026-07-01T09:30:00-02:00", None)
-    stale_time = "2026-09-01T00:00:00Z"
-    reference_states = build_active_memory_support_states(
-        ("mem-1", "mem-empty"),
-        [reference_row(f"ref-{index}", at) for index, at in enumerate(times)]
-        + [reference_row("ref-stale", stale_time, current=False)],
-    )
-    unit_states = build_active_memory_unit_support_states(
-        ("mem-1",),
-        [unit_row(f"eu-{index}", at) for index, at in enumerate(times)]
-        + [unit_row("eu-stale", stale_time, current=False)],
-    )
-
-    assert reference_states["mem-1"].latest_source_revision_at == "2026-07-01T09:30:00-02:00"
-    assert unit_states["mem-1"].latest_source_revision_at == "2026-07-01T09:30:00-02:00"
-    assert reference_states["mem-empty"].latest_source_revision_at is None
-
-
 @pytest.mark.asyncio
 async def test_purging_a_memory_removes_its_relations_and_dismissals(db: Database) -> None:
     low, high, other = _memory("mem-a"), _memory("mem-b"), _memory("mem-c")
