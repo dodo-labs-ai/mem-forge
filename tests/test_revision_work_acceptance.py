@@ -2,11 +2,11 @@
 
 import json
 import pytest
-from memforge.llm.structured import SupportAssessmentResponse, SupportAssessmentResult
+from memforge.llm.structured import SupportAssessmentWireResponse
 from memforge.pipeline.revision_work import RevisionWorkExecutor
 from memforge.storage.database import Database
 from tests.test_derivation_work import prepare_database
-from tests.test_revision_work import Client, work_items, payload
+from tests.test_revision_work import Client, continued, payload, supported, work_items
 
 
 @pytest.mark.asyncio
@@ -56,7 +56,7 @@ async def test_artifact_bytes_bound_to_first_assessment_and_carried_refs():
     from types import SimpleNamespace
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
     from memforge.pipeline.projection_images import load_projection_images
-    from memforge.pipeline.revision_work import SupportWorkItem
+    from memforge.pipeline.support_reading import SupportWorkItem
     from tests.test_revision_assessment import old_support, memory
     from tests.test_projected_lifecycle_integration import _projection_with_artifact
 
@@ -98,34 +98,30 @@ async def test_artifact_bytes_bound_to_first_assessment_and_carried_refs():
         image_stages = set()
 
         async def evaluate_revision_work(self, prompt, *, response_format, images=(), **kwargs):
-            tag = "assessment"
             data = payload(prompt)
-            rows = data["current"]["primary_candidates"] + data["current"]["required_only_candidates"]
+            rows = [
+                *data["current"]["primary_candidates"], *data["current"]["required_only_candidates"],
+                *data["carried_witness_catalog"],
+            ]
             image_rows = [
                 r for r in rows if any(isinstance(m, dict) and "image_source_observation_id" in m for m in r[2:])
             ]
+            # Current and carried Artifact refs both arrive with their exact bytes.
             assert len(images) == len(image_rows)
-            if image_rows:
-                self.image_stages.add(tag)
-                assert all(image.body == b"new" for image in images)
-                assert {image.source_observation_id for image in images} == {
-                    r[-1]["image_source_observation_id"] for r in image_rows
-                }
-            if image_rows:
-                return SupportAssessmentResponse(
-                    results=[
-                        SupportAssessmentResult(
-                            work_id=c["work_id"],
-                            status="supported",
-                            primary_ref=image_rows[0][0],
-                            reason="Fixture judgment based on the current diagram.",
-                        )
-                        for c in data["claims"]
-                    ]
+            if not image_rows:
+                return await super().evaluate_revision_work(
+                    prompt, response_format=response_format, images=images, **kwargs
                 )
-            return await super().evaluate_revision_work(
-                prompt, response_format=response_format, images=images, **kwargs
-            )
+            self.image_stages.add("assessment")
+            assert all(image.body == b"new" for image in images)
+            assert {image.source_observation_id for image in images} == {
+                r[-1]["image_source_observation_id"] for r in image_rows
+            }
+            diagram = image_rows[0][0]
+            return SupportAssessmentWireResponse.model_validate({"results": [
+                supported(work, diagram) if work["may_conclude"] else continued(work, [diagram])
+                for work in data["works"]
+            ]})
 
     client = ArtifactClient()
     result = await RevisionWorkExecutor(client=client, model="fixture").assess_many(
@@ -156,7 +152,7 @@ async def test_completed_assessments_cannot_commit_after_concurrent_state_change
     )
     from tests.test_derivation_work import staged_fixture
     from tests.test_revision_assessment import old_support, memory
-    from memforge.pipeline.revision_work import SupportWorkItem
+    from memforge.pipeline.support_reading import SupportWorkItem
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
     from memforge.pipeline.source_projection_adapters import project_source_item
     from memforge.models import ContentItem, RawContent, NormalizedContent

@@ -93,8 +93,49 @@ def carry(response, step: ChainStep):
 
 
 def chain_task(client, item_ids, chain_parts, **overrides) -> ChainTask:
-    fields = {"render": render_step, "decode": carry, "call": client.call, **overrides}
+    """Every item reads every part; its state is the parts it read."""
+    fields = {
+        "render": render_step, "decode": carry, "call": client.call,
+        "first_part_end": dict.fromkeys(item_ids, len(chain_parts)),
+        "finished": lambda state: len(state) == len(chain_parts),
+        **overrides,
+    }
     return ChainTask(initial_states={item_id: () for item_id in item_ids}, parts=chain_parts, **fields)
+
+
+def one_part_per_step(step: ChainStep) -> LlmRequest:
+    if len(step.parts) > 1:
+        raise RequestTooLarge("fixture reads one part per step")
+    return render_step(step)
+
+
+class Mark(BaseModel):
+    id: str
+    read: list[str]
+    done: bool
+
+
+class Marks(BaseModel):
+    rows: list[Mark]
+
+
+def carry_marks(response, step: ChainStep):
+    return [(row.id, step.states[row.id] + tuple(row.read) + (("done",) if row.done else ())) for row in response.rows]
+
+
+def marked(done: Callable[[str, str], bool]) -> Callable[[str], Marks]:
+    """Answer every requested item, marking it done when ``done(item_id, prompt)`` holds."""
+    def respond(prompt: str) -> Marks:
+        request = prompt.split("<correction>")[0]
+        return Marks(rows=[
+            Mark(id=item_id, read=prompt_parts(request), done=done(item_id, prompt)) for item_id in prompt_ids(request)
+        ])
+
+    return respond
+
+
+def is_done(state) -> bool:
+    return bool(state) and state[-1] == "done"
 
 
 def deadline() -> StructuredLlmError:
@@ -328,7 +369,99 @@ async def test_chain_single_item_single_part_failure_leaves_other_lanes_complete
 
     results = await runner.run_chain(chain_task(client, ids(2), parts(1)))
 
-    assert results == {"i00": ("p0",), "i01": ItemFailure("deadline_exceeded", error.error_code, error)}
+    assert results == {"i00": ("p0",), "i01": ItemFailure("deadline_exceeded", error.error_code, error, part=0)}
+
+
+async def test_chain_item_exits_only_after_its_first_part():
+    def done(item_id, prompt):
+        read = prompt_parts(prompt.split("<correction>")[0])
+        premature = item_id == "i01" and read == ["p0"] and "<correction>" not in prompt
+        return item_id == "i00" or read == ["p3"] or premature
+
+    client = FixtureBudgetClient(respond=marked(done))
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+    task = chain_task(
+        client, ids(2), parts(4), render=one_part_per_step, decode=carry_marks, finished=is_done,
+        first_part_end={"i00": 1, "i01": 3},
+    )
+
+    results = await runner.run_chain(task)
+
+    # i01 tried to finish inside its first part, so the first step was corrected once.
+    assert "<correction>" in client.prompts[1] and runner.stats.corrections == 1
+    assert results == {"i00": ("p0", "done"), "i01": ("p0", "p1", "p2", "p3", "done")}
+    # A finished item leaves the chain: later requests no longer carry it.
+    assert [prompt_ids(prompt) for prompt in client.prompts[2:]] == [["i01"]] * 3
+    assert "i00" not in "".join(client.prompts[2:])
+
+
+async def test_chain_reads_the_lane_first_parts_together_before_the_rest():
+    client = FixtureBudgetClient(respond=marked(lambda item_id, prompt: item_id == "i00" or "p3" in prompt_parts(prompt)))
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+    task = chain_task(
+        client, ids(2), parts(4), decode=carry_marks, finished=is_done, first_part_end={"i00": 1, "i01": 3},
+    )
+
+    results = await runner.run_chain(task)
+
+    # The first step ends at the farthest first-part boundary; the rest follows once.
+    assert [prompt_parts(prompt) for prompt in client.prompts] == [["p0", "p1", "p2"], ["p3"]]
+    assert results == {"i00": ("p0", "p1", "p2", "done"), "i01": ("p0", "p1", "p2", "p3", "done")}
+
+
+async def test_chain_items_with_different_first_parts_share_one_request_when_they_fit():
+    item_ids = ids(20)
+    client = FixtureBudgetClient(respond=marked(lambda _item, _prompt: True))
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+    task = chain_task(
+        client, item_ids, parts(24), decode=carry_marks, finished=is_done,
+        first_part_end={item_id: index + 1 for index, item_id in enumerate(item_ids)},
+    )
+
+    results = await runner.run_chain(task)
+
+    assert len(client.prompts) == 1 and prompt_parts(client.prompts[0]) == list(parts(20))
+    assert all(state[-1] == "done" for state in results.values())
+
+
+async def test_chain_rejects_a_first_part_outside_the_parts():
+    client = FixtureBudgetClient(respond=answer)
+    task = chain_task(client, ids(1), parts(2), first_part_end={"i00": 3})
+
+    with pytest.raises(ValueError, match="outside the 2 chain parts: i00"):
+        await LlmBatchRunner(client, model=FIXTURE_MODEL).run_chain(task)
+    assert client.prompts == []
+
+
+async def test_chain_last_step_must_finish_every_item():
+    client = FixtureBudgetClient(respond=marked(lambda _item, prompt: "<correction>" in prompt))
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+    task = chain_task(client, ids(1), parts(2), render=one_part_per_step, decode=carry_marks, finished=is_done)
+
+    assert await runner.run_chain(task) == {"i00": ("p0", "p1", "done")}
+    assert "<correction>" in client.prompts[-1] and "<correction>" not in client.prompts[-2]
+
+    client = FixtureBudgetClient(respond=marked(lambda _item, _prompt: False))
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+    task = chain_task(client, ids(1), parts(2), render=one_part_per_step, decode=carry_marks, finished=is_done)
+    [failure] = (await runner.run_chain(task)).values()
+    assert (failure.category, failure.error_code, failure.part) == ("invalid_response", OUTPUT_INVALID, 1)
+
+
+async def test_chain_capacity_failure_names_the_part():
+    padding = " pad" * 50
+
+    def padded(step: ChainStep) -> LlmRequest:
+        request = render_step(step)
+        return replace(request, prompt=request.prompt + (padding if "p2" in step.parts else ""))
+
+    client = FixtureBudgetClient(respond=answer, input_tokens=20)
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    [failure] = (await runner.run_chain(chain_task(client, ids(1), parts(4), render=padded))).values()
+
+    assert (failure.category, failure.part) == ("capacity_exceeded", 2)
+    assert [prompt_parts(prompt) for prompt in client.prompts] == [["p0", "p1"]]
 
 
 async def test_concurrency_stays_bounded_while_requests_split():
@@ -354,14 +487,9 @@ async def test_plans_match_the_requests_that_are_sent():
     await runner.run_items(task)
     assert [entry.request.prompt for entry in planned] == client.prompts
 
-    client.prompts.clear()
-    chain_plan = runner.plan_chain(chain_task(client, ids(4), parts(3)))
-    await runner.run_chain(chain_task(client, ids(4), parts(3)))
-    assert [request.prompt for request in chain_plan] == client.prompts
-
     with pytest.raises(ItemCapacityExceeded):
-        LlmBatchRunner(FixtureBudgetClient(respond=answer, input_tokens=2), model=None).plan_chain(
-            chain_task(client, ids(1), parts(1)))
+        LlmBatchRunner(FixtureBudgetClient(respond=answer, input_tokens=2), model=None).plan_items(
+            ids(1), render, parts(1))
 
 
 async def test_journal_reuses_completed_requests_and_records_failures():
