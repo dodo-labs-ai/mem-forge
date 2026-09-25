@@ -15,7 +15,7 @@ assert.match(
 
 assert.match(
   memoriesSource,
-  /enabled: true,/,
+  /enabled: !relationView,/,
   "the Memories page should load the all-project result set without requiring a selected project",
 );
 

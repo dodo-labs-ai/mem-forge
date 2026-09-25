@@ -5,7 +5,9 @@ A case pins both Memories as the classifier sees them, together with the
 classifier contract version whose input it holds, so the set survives the
 removal of the Reviews and any later change of either Memory, and a case is
 replayed only by the contract it was pinned for. A decision is pinned only
-while both Memories still hold the version it was made for.
+while both Memories still hold the version it was made for, and only when both
+come from active workspace Sources: the set is shared workspace content, and a
+decision it cannot pin is counted by reason, never read.
 """
 
 from __future__ import annotations
@@ -30,20 +32,18 @@ from memforge.memory.cross_document_relation import (
     primary_evidence_unit,
 )
 from memforge.memory.cross_source_conflict_reviews import (
+    REVIEW_DECISION_LABELS,
     CrossSourceConflictReviewStore,
+    decided_review_labels,
     list_cross_source_conflict_reviews,
     review_memories_unchanged,
 )
 from memforge.models import Memory, MemoryReview, ReviewStatus, Visibility
+from memforge.source_access import SourceAccessPolicy, SourceAccessState
 
 RELATION_CASE_POLICY_VERSION = "cross-document-relation-cases-v2"
 RELATION_CASE_GROUP_KEY = "cross_document_relation"
 
-# A person's decision on a Cross-Source Conflict Review, as a relation label.
-_REVIEW_DECISION_LABELS = {
-    ReviewStatus.APPROVED.value: CrossDocumentRelationLabel.CONTRADICTS,
-    ReviewStatus.REJECTED.value: CrossDocumentRelationLabel.NONE,
-}
 # A dismissed finding is a recorded false positive; a confirmed one is a
 # representative true finding.
 _REVIEW_DECISION_POPULATIONS = {
@@ -53,13 +53,21 @@ _REVIEW_DECISION_POPULATIONS = {
 
 
 class RelationCaseSkip(str, Enum):
+    """Why a decided Review is not pinned."""
+
+    # A Memory is gone or no longer holds the version the decision was made for.
     MEMORY_CHANGED = "memory_changed"
+    # A Memory or the Source it is shown from is private.
     PRIVATE_MEMORY = "private_memory"
+    # The Source a Memory is shown from is gone or its access is changing.
+    SOURCE_UNAVAILABLE = "source_unavailable"
     NO_SOURCE_EVIDENCE = "no_source_evidence"
 
 
 class RelationCaseStore(RelationSubjectStore, CrossSourceConflictReviewStore, Protocol):
     async def list_memories_by_ids(self, memory_ids: Sequence[str]) -> list[Memory]: ...
+
+    async def get_source(self, source_id: str) -> Mapping[str, Any] | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,12 +102,10 @@ async def seed_cross_document_relation_cases(
 
     reviews = [
         review
-        for status in _REVIEW_DECISION_LABELS
+        for status in REVIEW_DECISION_LABELS
         for review in await list_cross_source_conflict_reviews(store, status=status)
     ]
-    unknown = sorted(set(label_overrides) - {review.id for review in reviews})
-    if unknown:
-        raise ValueError("label overrides name no decided cross-source Review: " + ", ".join(unknown))
+    labels = decided_review_labels(reviews, label_overrides)
     pinned: list[_PinnedCase] = []
     skipped = {reason.value: 0 for reason in RelationCaseSkip}
     for review in reviews:
@@ -108,7 +114,7 @@ async def seed_cross_document_relation_cases(
             evaluation,
             review=review,
             actor=actor,
-            label=label_overrides.get(review.id, _REVIEW_DECISION_LABELS[review.status]),
+            label=labels[review.id],
         )
         if isinstance(outcome, RelationCaseSkip):
             skipped[outcome.value] += 1
@@ -197,6 +203,12 @@ async def _pin_case(
     unit = primary_evidence_unit(await store.get_memory_evidence_units(challenger.id))
     if unit is None or not unit.doc_id:
         return RelationCaseSkip.NO_SOURCE_EVIDENCE
+    candidate_unit = primary_evidence_unit(await store.get_memory_evidence_units(candidate.id))
+    shown_units = (unit, candidate_unit) if candidate_unit is not None else (unit,)
+    for source_id in sorted({shown.source_id for shown in shown_units}):
+        skip = _source_skip(await store.get_source(source_id))
+        if skip is not None:
+            return skip
     subjects = await load_relation_subjects(store, (challenger, candidate))
     case = await evaluation.curate_case(
         case_kind=AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION,
@@ -223,3 +235,17 @@ async def _pin_case(
         label=label,
         population=population,
     )
+
+
+def _source_skip(source: Mapping[str, Any] | None) -> RelationCaseSkip | None:
+    """Why a Source keeps the Memories shown from it out of the set, if it does.
+
+    Only an active workspace Source's content is shared with every operator of
+    the workspace.
+    """
+
+    if source is None or source.get("access_state") != SourceAccessState.ACTIVE:
+        return RelationCaseSkip.SOURCE_UNAVAILABLE
+    if source.get("access_policy") != SourceAccessPolicy.WORKSPACE:
+        return RelationCaseSkip.PRIVATE_MEMORY
+    return None

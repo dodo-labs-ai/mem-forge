@@ -118,8 +118,11 @@ class AdapterOnlyEntityDb:
     async def get_memory_entity_names(self, memory_id: str) -> list[str]:
         return [self.entity.canonical_name] if memory_id == self.memory.id else []
 
-    async def list_memory_conflict_contexts(self, memory_ids, scope):
+    async def list_cross_document_relations(self, memory_ids, scope):
         return {memory_id: () for memory_id in memory_ids}
+
+    async def list_active_cross_document_relation_dismissals(self, memory_id, scope, *, limit):
+        return ()
 
     async def get_origin_source_pairs(
         self, memory_ids: list[str]

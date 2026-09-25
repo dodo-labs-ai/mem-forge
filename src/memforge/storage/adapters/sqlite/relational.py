@@ -41,16 +41,16 @@ from memforge.memory.lifecycle_plan import (
     LifecycleReviewStatus,
     LifecycleVectorTask,
 )
-from memforge.memory.relation_discovery_contract import RelationDiscoveryWork
+from memforge.memory.cross_document_relation import CrossDocumentRelationOutcome, CurrentCrossDocumentRelation
+from memforge.memory.relation_discovery_contract import RelationDiscoveryWork, RelationDiscoveryWorkSelection
 from memforge.memory.review_decision import ReviewVectorTask
 from memforge.models import (
     DocumentRecord,
     Entity,
     EntityAlias,
     Memory,
-    MemoryConflictContext,
-    MemoryReview,
     MemorySource,
+    MemorySourceRef,
     Project,
     SourceLifecycleResetResult,
     Visibility,
@@ -433,12 +433,19 @@ class SqliteRelationalStore:
     ) -> Mapping[str, tuple[str, ...]]:
         return await self._db.get_memory_source_ids_many(memory_ids)
 
-    async def list_memory_conflict_contexts(
+    async def get_memory_source_refs_many(
         self,
         memory_ids: Sequence[str],
         scope: AccessScope,
-    ) -> Mapping[str, tuple[MemoryConflictContext, ...]]:
-        return await self._db.list_memory_conflict_contexts(memory_ids, scope)
+    ) -> Mapping[str, tuple[MemorySourceRef, ...]]:
+        return await self._db.get_memory_source_refs_many(memory_ids, scope)
+
+    async def list_cross_document_relations(
+        self,
+        memory_ids: Sequence[str],
+        scope: AccessScope,
+    ) -> Mapping[str, tuple[CurrentCrossDocumentRelation, ...]]:
+        return await self._db.list_cross_document_relations(memory_ids, scope)
 
     async def list_active_memories(
         self,
@@ -1365,15 +1372,15 @@ class SqliteRelationalStore:
         *,
         worker_id: str,
         lease_token: str,
-        relation_outcome: RelationOutcomeBundle,
-        reviews: Sequence[MemoryReview] = (),
+        relation_run: RelationOutcomeBundle,
+        document_relations: CrossDocumentRelationOutcome,
     ) -> None:
         await self._db.complete_relation_discovery_work(
             work_id,
             worker_id=worker_id,
             lease_token=lease_token,
-            relation_outcome=relation_outcome,
-            reviews=reviews,
+            relation_run=relation_run,
+            document_relations=document_relations,
         )
 
     async def fail_relation_discovery_work(
@@ -1383,6 +1390,7 @@ class SqliteRelationalStore:
         worker_id: str,
         lease_token: str,
         error: str,
+        error_code: str,
         next_attempt_at: str | None,
         exhausted: bool,
     ) -> None:
@@ -1391,9 +1399,13 @@ class SqliteRelationalStore:
             worker_id=worker_id,
             lease_token=lease_token,
             error=error,
+            error_code=error_code,
             next_attempt_at=next_attempt_at,
             exhausted=exhausted,
         )
+
+    async def count_relation_discovery_work(self, selection: RelationDiscoveryWorkSelection) -> int:
+        return await self._db.count_relation_discovery_work(selection)
 
     async def obsolete_relation_discovery_work(
         self,

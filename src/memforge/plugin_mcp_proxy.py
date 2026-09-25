@@ -87,7 +87,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.1.62"
+SERVER_VERSION = "0.1.63"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Local project context is optional. MemForge uses negotiated request-scoped host context when "
@@ -279,8 +279,8 @@ TOOLS: list[dict[str, Any]] = [
             "when explicitly requested. Use list_recent_memories for deterministic source/time listings. "
             "Send a self-contained query in the user's language; preserve identifiers and domain terms, "
             "without retrieval-only translation or keyword stuffing. Use total_candidates and offset only "
-            "within the ranked window; ranked queries are not exhaustive. In conflict_contexts, confirmed "
-            "means reviewed contradiction and dismissed means reviewed non-conflict; neither retires a claim. "
+            "within the ranked window; ranked queries are not exhaustive. relation_notice flags a "
+            "conflicting or newer Memory from another document (see relations[] and get_memory). "
             "Call get_memory for provenance."
         ),
         "inputSchema": {
@@ -495,8 +495,13 @@ TOOLS: list[dict[str, Any]] = [
             "Fetch full memory detail by ID when a search result is insufficient. Returns "
             "canonical content together with grouped Evidence in evidence[], explicit "
             "Primary/Required/Context roles, document and Artifact resource locators, "
-            "entity links, lifecycle metadata, and "
-            "visibility-safe cross-source Review dispositions in conflict_contexts."
+            "entity links, lifecycle metadata, and cross-document relations[] with relation_notice: "
+            "contradicts means both statements cannot hold, so weigh both and their sources; updates "
+            "means the knowledge changed over time and role older marks the outdated statement; "
+            "equivalent means another source states the same. Relations never retire or hide a "
+            "Memory; the user may dismiss a wrong relation (dismiss_memory_relation, with both "
+            "content hashes) or correct or retire the outdated Memory. dismissed_relations[] lists "
+            "dismissals in force, which restore_memory_relation undoes."
         ),
         "inputSchema": {
             "type": "object",
@@ -620,6 +625,76 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "dismiss_memory_relation",
+        "description": (
+            "Dismiss a cross-document relation the user says is wrong (not a conflict, not an update, "
+            "not the same). It only hides that relation until either Memory changes; it retires, "
+            "corrects or hides no Memory. Users need not name this tool. First fetch the Memory with "
+            "get_memory, show both statements and the relation label, then get explicit confirmation "
+            "via request_user_input if available, else a concise text question. Never dismiss "
+            "silently. When the user says which statement is right, propose a correction instead."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "The Memory the relation was read from."},
+                "counterpart_memory_id": {
+                    "type": "string",
+                    "description": "relations[].counterpart.memory_id from get_memory.",
+                },
+                "label": {
+                    "type": "string",
+                    "enum": ["equivalent", "updates", "contradicts"],
+                    "description": "relations[].label as shown.",
+                },
+                "expected_content_hash": {
+                    "type": "string",
+                    "description": "content_hash of memory_id from get_memory, used as a stale guard.",
+                },
+                "counterpart_expected_content_hash": {
+                    "type": "string",
+                    "description": "relations[].counterpart.content_hash from get_memory.",
+                },
+                "note": {"type": "string", "description": "Optional user-facing reason."},
+            },
+            "required": [
+                "memory_id",
+                "counterpart_memory_id",
+                "label",
+                "expected_content_hash",
+                "counterpart_expected_content_hash",
+            ],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+        },
+    },
+    {
+        "name": "restore_memory_relation",
+        "description": (
+            "Undo the dismissals of the relation between two Memories so it shows again; "
+            "get_memory lists them in dismissed_relations[]. Get explicit user confirmation first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "The Memory the dismissal was read from."},
+                "counterpart_memory_id": {
+                    "type": "string",
+                    "description": "dismissed_relations[].counterpart.memory_id from get_memory.",
+                },
+            },
+            "required": ["memory_id", "counterpart_memory_id"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+        },
+    },
+    {
         "name": "propose_memory_correction",
         "description": (
             "Propose a correction when conversation context shows a Memory should be corrected, "
@@ -699,7 +774,6 @@ TOOLS: list[dict[str, Any]] = [
                     "default": "open",
                 },
                 "origin": {"type": "string", "enum": ["memory", "lifecycle"]},
-                "kind": {"type": "string", "enum": ["supersede", "cross_source_conflict"]},
                 "source_id": {"type": "string", "minLength": 1},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
@@ -724,8 +798,7 @@ TOOLS: list[dict[str, Any]] = [
         "name": "resolve_memory_review",
         "description": (
             "Resolve one Review after explicit user confirmation using the exact action shown "
-            "in presentation.actions. Consequences vary by Review kind: lifecycle decisions may "
-            "change Memory state, while cross-source conflict decisions keep both Memories active. "
+            "in presentation.actions. A decision may change Memory state. "
             "Never resolve silently and never reuse a stale decision_fingerprint."
         ),
         "inputSchema": {
@@ -1061,6 +1134,31 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             target=call_context.target,
             workspace_id=workspace_id,
         )
+    if name in {"dismiss_memory_relation", "restore_memory_relation"}:
+        try:
+            memory_id = _required_string_arg(args, "memory_id")
+            counterpart_memory_id = _required_string_arg(args, "counterpart_memory_id")
+            body = None
+            if name == "dismiss_memory_relation":
+                body = {
+                    "label": _required_string_arg(args, "label"),
+                    "expected_content_hash": _required_string_arg(args, "expected_content_hash"),
+                    "counterpart_expected_content_hash": _required_string_arg(
+                        args, "counterpart_expected_content_hash"
+                    ),
+                }
+                note = _optional_string_arg(args, "note")
+                if note:
+                    body["note"] = note
+        except ValueError as exc:
+            return {"error": str(exc)}
+        return _http_json(
+            "POST" if body is not None else "DELETE",
+            f"/memories/{quote(memory_id, safe='')}/relations/{quote(counterpart_memory_id, safe='')}/dismissal",
+            body,
+            target=call_context.target,
+            workspace_id=workspace_id,
+        )
     if name == "propose_memory_correction":
         try:
             memory_id = _required_string_arg(args, "memory_id")
@@ -1084,7 +1182,7 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
             workspace_id=workspace_id,
         )
     if name == "list_memory_reviews":
-        allowed = {"status", "origin", "kind", "source_id", "limit", "offset"}
+        allowed = {"status", "origin", "source_id", "limit", "offset"}
         unknown = sorted(set(args) - allowed)
         if unknown:
             return {"error": "Unsupported list_memory_reviews parameter(s): " + ", ".join(unknown)}
@@ -1100,7 +1198,6 @@ def _call_tool(name: str, args: dict[str, Any], *, request_meta: Any = None) -> 
                 for key, value in {
                     "status": str(args.get("status") or "open"),
                     "origin": _optional_string_arg(args, "origin"),
-                    "kind": _optional_string_arg(args, "kind"),
                     "source_id": _optional_string_arg(args, "source_id"),
                     "limit": limit,
                     "offset": offset,
@@ -1724,8 +1821,8 @@ def _compact_search_result(result: dict[str, Any]) -> dict[str, Any]:
         "relevance_score",
         "freshness",
         "status",
-        "contradiction_warning",
-        "conflict_contexts",
+        "relation_notice",
+        "relations",
         "follow_up",
     ):
         if key in result:
@@ -1746,7 +1843,9 @@ def _compact_memory_response(payload: dict[str, Any]) -> dict[str, Any]:
         "confidence",
         "status",
         "entity_refs",
-        "conflict_contexts",
+        "relation_notice",
+        "relations",
+        "dismissed_relations",
     ):
         if key in payload:
             compact[key] = payload[key]

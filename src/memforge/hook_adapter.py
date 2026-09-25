@@ -120,7 +120,7 @@ WORKSPACE_BACKLOG_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 WORKSPACE_BACKLOG_EXPIRED = "workspace_backlog_expired"
 QUEUE_BUSY_TIMEOUT_MS = 5000  # how long a queue connection waits on a busy lock
 WINDOW_SCHEMA_VERSION = "agent-session-window/v1"
-PLUGIN_VERSION = "0.1.62"
+PLUGIN_VERSION = "0.1.63"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"
     "MemForge is long-term memory for prior decisions, conventions, debugging "
@@ -152,7 +152,9 @@ SESSION_START_USAGE_GUIDANCE = (
     "confirmation details, test/deploy notes, and why-the-tool-was-called out "
     "of content; put source evidence/details in `provenance`.\n"
     "- Never mutate memory silently. Before `create_memory`, `propose_memory_correction`, "
-    "`retire_memory`, or `resolve_memory_review`, confirm via `request_user_input` if available; "
+    "`retire_memory`, `dismiss_memory_relation`, `restore_memory_relation`, or "
+    "`resolve_memory_review`, confirm via "
+    "`request_user_input` if available; "
     "otherwise ask a concise text question. Do not show raw tool arguments unless needed.\n"
     "- If no relevant memory is found, continue normally and say so only when it "
     "matters to the user.\n"

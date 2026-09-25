@@ -4,37 +4,36 @@ from dataclasses import replace
 
 import pytest
 
+from memforge.memory.cross_document_relation import (
+    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+    CrossDocumentRelationClassification,
+    CrossDocumentRelationJudgment,
+    CrossDocumentRelationLabel,
+)
 from memforge.memory.evidence import (
-    AuthorityCase,
     CandidateMemory,
     EvidenceContentProvenance,
     EvidenceUnit,
-    RelationDirection,
+    LifecycleAction,
 )
 from memforge.memory.relation_candidate_retrieval import (
     CrossDocumentCandidateSelection,
     RetrievedRelationCandidate,
 )
-from memforge.memory.relation_classifier import (
-    MemoryPairClassification,
-    MemoryPairClassificationError,
-    MemoryPairDecision,
-    MemoryRelationType,
-)
+from memforge.memory.relation_classifier import MemoryPairClassificationError
 from memforge.memory.relation_discovery import RelationDiscovery, RelationDiscoveryBudget
-from memforge.memory.sparse_relation_classifier import SPARSE_MEMORY_CLASSIFIER_VERSION as MEMORY_PAIR_CLASSIFIER_VERSION
-from memforge.memory.lifecycle_planner import lifecycle_access_context_hash
 from memforge.memory.relation_discovery_contract import (
-    PreclassifiedRelationDecision,
     RelationDiscoveryRequest,
     RelationDiscoveryWork,
+    RelationDiscoveryWorkState,
     RelationDiscoveryWorkStatus,
 )
-from memforge.models import Memory, MemoryStatus, content_hash
+from memforge.models import DocumentRecord, Memory, MemoryStatus, content_hash
 from memforge.storage.adapters.protocols import (
     ActiveMemorySupportState,
     active_support_rows_hash,
 )
+from tests.relation_evidence_fixture import primary_evidence_unit_fixture, primary_observation_revision_fixture
 
 
 def _memory(memory_id: str, content: str) -> Memory:
@@ -48,17 +47,23 @@ def _memory(memory_id: str, content: str) -> Memory:
 
 
 class _Classifier:
-    def __init__(self) -> None:
-        self.classified_pair_ids: tuple[str, ...] = ()
+    """Label every pair none unless its candidate has a label."""
+
+    def __init__(self, labels: dict[str, CrossDocumentRelationLabel] | None = None) -> None:
+        self.labels = labels or {}
+        self.pairs: tuple = ()
+
+    @property
+    def classified_pair_ids(self) -> tuple[str, ...]:
+        return tuple(pair.candidate.memory_id for pair in self.pairs)
 
     async def classify(self, pairs):
-        self.classified_pair_ids = tuple(pair.candidate.id for pair in pairs)
-        return MemoryPairClassification(
-            decisions=tuple(
-                MemoryPairDecision(
+        self.pairs = pairs
+        return CrossDocumentRelationClassification(
+            judgments=tuple(
+                CrossDocumentRelationJudgment(
                     pair=pair,
-                    relation_type=MemoryRelationType.UNRELATED,
-                    direction=RelationDirection.SYMMETRIC,
+                    label=self.labels.get(pair.candidate.memory_id, CrossDocumentRelationLabel.NONE),
                     reason="deterministic fixture",
                 )
                 for pair in pairs
@@ -118,9 +123,13 @@ class _Store:
         self.candidates = candidates
         self.leased = False
         self.completed = None
-        self.reviews = ()
+        self.completed_run = None
+        self.completion_kwargs: dict | None = None
         self.disabled_lookup_user_id = None
         self.lease_kwargs = None
+        self.exhausted_selection = None
+        # Source time of each Memory's Primary Evidence; the fixture time otherwise.
+        self.observed_at: dict[str, str] = {}
         self.work = RelationDiscoveryWork(
             request=RelationDiscoveryRequest(
                 id="work-1",
@@ -174,6 +183,36 @@ class _Store:
     async def get_memory_entity_ids(self, _memory_id):
         return []
 
+    async def get_memory_evidence_units(self, memory_id):
+        return (primary_evidence_unit_fixture(memory_id),)
+
+    async def get_current_source_observation_revisions(self, source_unit_id):
+        memory_id = source_unit_id.removeprefix("unit-")
+        revision = primary_observation_revision_fixture(memory_id)
+        if memory_id in self.observed_at:
+            revision = replace(revision, observed_at=self.observed_at[memory_id])
+        return {f"obs-{memory_id}": revision}
+
+    async def get_document(self, doc_id):
+        return DocumentRecord(
+            doc_id=doc_id,
+            source="jira",
+            source_url="",
+            title=f"Title of {doc_id}",
+            space_or_project="",
+            author=None,
+            last_modified=None,  # type: ignore[arg-type]
+            labels=[],
+            version="1",
+            content_hash="",
+            token_count=None,
+            raw_content_uri=None,
+            raw_content_type=None,
+            normalized_content_uri=None,
+            pdf_content_uri=None,
+            last_synced=None,  # type: ignore[arg-type]
+        )
+
     async def get_active_memory_support_states(self, memory_ids):
         return {
             memory_id: ActiveMemorySupportState(
@@ -186,14 +225,19 @@ class _Store:
         }
 
     async def complete_relation_discovery_work(self, _work_id, **kwargs):
-        self.completed = kwargs["relation_outcome"]
-        self.reviews = kwargs["reviews"]
+        self.completion_kwargs = kwargs
+        self.completed_run = kwargs["relation_run"]
+        self.completed = kwargs["document_relations"]
 
     async def fail_relation_discovery_work(self, *_args, **_kwargs):
         pytest.fail("work should not fail")
 
     async def obsolete_relation_discovery_work(self, *_args, **_kwargs):
         pytest.fail("work should not become obsolete")
+
+    async def count_relation_discovery_work(self, selection):
+        self.exhausted_selection = selection
+        return 7
 
 
 class _FailingStore(_Store):
@@ -219,30 +263,26 @@ class _CompletionFailingStore(_FailingStore):
 
 
 class _UsageReportingFailureClassifier(_Classifier):
+    def __init__(self, error_code: str | None = "output_invalid") -> None:
+        super().__init__()
+        self.error_code = error_code
+
     async def classify(self, pairs):
         raise MemoryPairClassificationError(
             "second classifier batch failed",
             pair_count=len(pairs),
             llm_calls=2,
             prompt_chars=321,
+            error_code=self.error_code,
         )
 
 
-class _ConflictClassifier(_Classifier):
-    async def classify(self, pairs):
-        return MemoryPairClassification(
-            decisions=tuple(
-                MemoryPairDecision(
-                    pair=pair,
-                    relation_type=MemoryRelationType.CONTRADICTS,
-                    direction=RelationDirection.SYMMETRIC,
-                    reason="deterministic conflict",
-                )
-                for pair in pairs
-            ),
-            llm_calls=1 if pairs else 0,
-            prompt_chars=10 * len(pairs),
-        )
+def _discovery(store: _Store, candidates: tuple[Memory, ...], classifier: _Classifier, **kwargs) -> RelationDiscovery:
+    return RelationDiscovery(
+        store=store,  # type: ignore[arg-type]
+        candidate_retriever=_Candidates(candidates, **kwargs),  # type: ignore[arg-type]
+        pair_classifier=classifier,
+    )
 
 
 @pytest.mark.asyncio
@@ -251,20 +291,16 @@ async def test_relation_discovery_finishes_one_selected_ledger_before_slice_budg
     candidates = tuple(_memory(f"candidate-{index}", f"Candidate {index}") for index in range(3))
     store = _Store(challenger, candidates)
 
-    result = await RelationDiscovery(
-        store=store,  # type: ignore[arg-type]
-        candidate_retriever=_Candidates(candidates),  # type: ignore[arg-type]
-        pair_classifier=_Classifier(),
-    ).process_slice(
+    result = await _discovery(store, candidates, _Classifier()).process_slice(
         worker_id="worker-1",
         budget=RelationDiscoveryBudget(max_candidate_pairs=1, max_llm_calls=1),
     )
 
     assert result.completed_work == 1
     assert result.checked_candidate_pairs == 3
-    assert store.completed is not None
-    assert store.completed.relation_run.result_memory_id == challenger.id
-    assert {item.memory_id for item in store.completed.candidates} == {
+    assert store.completed_run is not None
+    assert store.completed_run.relation_run.result_memory_id == challenger.id
+    assert {item.memory_id for item in store.completed_run.candidates} == {
         "candidate-0",
         "candidate-1",
         "candidate-2",
@@ -276,11 +312,7 @@ async def test_relation_discovery_can_scope_leases_to_one_source() -> None:
     challenger = _memory("challenger", "Current claim")
     store = _Store(challenger, ())
 
-    await RelationDiscovery(
-        store=store,  # type: ignore[arg-type]
-        candidate_retriever=_Candidates(()),  # type: ignore[arg-type]
-        pair_classifier=_Classifier(),
-    ).process_slice(
+    await _discovery(store, (), _Classifier()).process_slice(
         worker_id="controlled-recovery",
         source_id="src-challenger",
     )
@@ -290,126 +322,175 @@ async def test_relation_discovery_can_scope_leases_to_one_source() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("relation_type,direction", [(MemoryRelationType.UNRELATED, RelationDirection.SYMMETRIC), (None, None)])
-async def test_relation_discovery_reuses_current_identity_pair_and_only_classifies_new_candidates(relation_type, direction) -> None:
-    challenger = _memory("challenger", "Current claim")
+async def test_relation_discovery_records_one_relation_per_labeled_pair_and_no_review() -> None:
+    challenger = _memory("mem-m", "Current claim")
     candidates = (
-        _memory("candidate-reused", "Previously classified claim"),
-        _memory("candidate-new", "Newly recalled claim"),
+        _memory("mem-a", "Unrelated claim"),
+        _memory("mem-b", "Same claim elsewhere"),
+        _memory("mem-y", "Earlier value"),
+        _memory("mem-z", "Opposite claim"),
     )
     store = _Store(challenger, candidates)
-    store.work = replace(
-        store.work,
-        request=replace(
-            store.work.request,
-            preclassified_decisions=(
-                PreclassifiedRelationDecision(
-                    candidate_memory_id=candidates[0].id,
-                    expected_candidate_content_hash=candidates[0].content_hash,
-                    expected_candidate_support_set_hash=active_support_rows_hash(()),
-                    expected_candidate_access_context_hash=lifecycle_access_context_hash(
-                        visibility=candidates[0].visibility,
-                        owner_user_id=candidates[0].owner_user_id,
-                        project_key=candidates[0].project_key,
-                        repo_identifier=candidates[0].repo_identifier,
-                    ),
-                    expected_challenger_access_context_hash=lifecycle_access_context_hash(
-                        visibility=challenger.visibility,
-                        owner_user_id=challenger.owner_user_id,
-                        project_key=challenger.project_key,
-                        repo_identifier=challenger.repo_identifier,
-                    ),
-                    relation_type=relation_type,
-                    direction=direction,
-                    reason="identity stage already checked this pair",
-                    classifier_version=MEMORY_PAIR_CLASSIFIER_VERSION,
-                ),
-            ),
-        ),
+    store.observed_at = {"mem-m": "2026-04-02T09:00:00+00:00", "mem-y": "2026-03-01T09:00:00+00:00"}
+    classifier = _Classifier(
+        {
+            "mem-b": CrossDocumentRelationLabel.EQUIVALENT,
+            "mem-y": CrossDocumentRelationLabel.UPDATES,
+            "mem-z": CrossDocumentRelationLabel.CONTRADICTS,
+        }
     )
-    classifier = _Classifier()
 
-    result = await RelationDiscovery(
-        store=store,  # type: ignore[arg-type]
-        candidate_retriever=_Candidates(candidates),  # type: ignore[arg-type]
-        pair_classifier=classifier,
+    result = await _discovery(store, candidates, classifier).process_slice(worker_id="worker-1")
+
+    assert result.completed_work == 1
+    assert store.completion_kwargs is not None
+    assert set(store.completion_kwargs) == {"worker_id", "lease_token", "relation_run", "document_relations"}
+    bundle = store.completed_run
+    assert bundle.relations == ()
+    outcome = store.completed
+    assert outcome.challenger_id == challenger.id
+    assert outcome.challenger_content_hash == challenger.content_hash
+    assert outcome.judged_content_hashes == {candidate.id: candidate.content_hash for candidate in candidates}
+    by_pair = {(record.memory_low_id, record.memory_high_id): record for record in outcome.relations}
+    assert set(by_pair) == {("mem-b", "mem-m"), ("mem-m", "mem-y"), ("mem-m", "mem-z")}
+    assert by_pair["mem-b", "mem-m"].label is CrossDocumentRelationLabel.EQUIVALENT
+    assert by_pair["mem-b", "mem-m"].low_content_hash == candidates[1].content_hash
+    assert by_pair["mem-b", "mem-m"].high_content_hash == challenger.content_hash
+    assert by_pair["mem-m", "mem-y"].label is CrossDocumentRelationLabel.UPDATES
+    assert (by_pair["mem-m", "mem-y"].low_evidence_time, by_pair["mem-m", "mem-y"].high_evidence_time) == (
+        "2026-04-02",
+        "2026-03-01",
+    )
+    assert by_pair["mem-m", "mem-z"].label is CrossDocumentRelationLabel.CONTRADICTS
+    for record in outcome.relations:
+        assert record.classifier_version == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+        assert record.relation_run_id == bundle.relation_run.id
+        assert record.discovery_work_id == "work-1"
+    run = bundle.relation_run
+    assert run.lifecycle_action is LifecycleAction.NONE
+    assert run.review_case is None
+    assert run.status == "checked"
+    assert run.classifier_version == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+    assert run.audit["labels"] == {
+        "mem-a": "none",
+        "mem-b": "equivalent",
+        "mem-y": "updates",
+        "mem-z": "contradicts",
+    }
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_records_updates_as_contradicts_when_evidence_times_do_not_order_the_pair() -> None:
+    challenger = _memory("mem-m", "Current claim")
+    same_day = _memory("mem-s", "Claim recorded the same day")
+    untimed = _memory("mem-u", "Claim without a source time")
+    store = _Store(challenger, (same_day, untimed))
+    store.observed_at = {"mem-u": ""}
+
+    await _discovery(
+        store,
+        (same_day, untimed),
+        _Classifier({"mem-s": CrossDocumentRelationLabel.UPDATES, "mem-u": CrossDocumentRelationLabel.UPDATES}),
     ).process_slice(worker_id="worker-1")
 
-    assert result.checked_candidate_pairs == 2
-    assert result.reused_candidate_pairs == 1
-    assert result.llm_calls == 1
-    assert classifier.classified_pair_ids == ("candidate-new",)
-    assert store.completed is not None
-    assert store.completed.relation_run.audit["reused_identity_pair_count"] == 1
-    assert store.completed.relations == ()
+    assert [record.label for record in store.completed.relations] == [
+        CrossDocumentRelationLabel.CONTRADICTS,
+        CrossDocumentRelationLabel.CONTRADICTS,
+    ]
+    assert store.completed_run.relation_run.audit["labels"] == {"mem-s": "updates", "mem-u": "updates"}
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_judges_other_units_of_the_same_source() -> None:
+    challenger = _memory("challenger", "Current claim")
+    sibling = _memory("sibling", "Conflicting sibling ticket claim")
+    store = _Store(challenger, (sibling,))
+
+    await _discovery(
+        store,
+        (sibling,),
+        _Classifier({"sibling": CrossDocumentRelationLabel.CONTRADICTS}),
+        source_ids=("src-challenger",),
+    ).process_slice(worker_id="worker-1")
+
+    assert [record.label for record in store.completed.relations] == [
+        CrossDocumentRelationLabel.CONTRADICTS
+    ]
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_shows_the_classifier_statements_titles_time_and_evidence() -> None:
+    challenger = _memory("challenger", "Current claim")
+    candidate = _memory("candidate", "Other claim")
+    store = _Store(challenger, (candidate,))
+    classifier = _Classifier()
+
+    await _discovery(store, (candidate,), classifier).process_slice(worker_id="worker-1")
+
+    (pair,) = classifier.pairs
+    assert pair.challenger.statement == "Current claim"
+    assert pair.candidate.document_title == "Title of doc-candidate"
+    assert pair.candidate.evidence == ("Evidence for candidate.",)
+    assert pair.candidate.evidence_time == "2026-03-25"
+    assert pair.candidate.source_type == "jira"
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_run_id_changes_with_each_operator_rerun() -> None:
+    challenger = _memory("challenger", "Current claim")
+    candidate = _memory("candidate", "Other claim")
+    first = _Store(challenger, (candidate,))
+    rerun = _Store(challenger, (candidate,))
+    rerun.work = replace(rerun.work, run_generation=1)
+
+    await _discovery(first, (candidate,), _Classifier()).process_slice(worker_id="worker-1")
+    await _discovery(rerun, (candidate,), _Classifier()).process_slice(worker_id="worker-1")
+
+    assert first.completed_run.relation_run.id != rerun.completed_run.relation_run.id
+    assert rerun.completed_run.relation_run.audit["run_generation"] == 1
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_reports_exhausted_work_after_attempting_work() -> None:
+    challenger = _memory("challenger", "Current claim")
+    store = _Store(challenger, ())
+
+    result = await _discovery(store, (), _Classifier()).process_slice(
+        worker_id="worker-1",
+        budget=RelationDiscoveryBudget(max_attempts=3),
+    )
+
+    assert result.exhausted_work == 7
+    assert store.exhausted_selection.state is RelationDiscoveryWorkState.EXHAUSTED
+    assert store.exhausted_selection.max_attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_idle_relation_discovery_slice_does_not_count_exhausted_work() -> None:
+    challenger = _memory("challenger", "Current claim")
+    store = _Store(challenger, ())
+    store.leased = True
+
+    result = await _discovery(store, (), _Classifier()).process_slice(worker_id="worker-1")
+
+    assert result.attempted_work == 0
+    assert result.exhausted_work == 0
+    assert store.exhausted_selection is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "stale_field",
-    ("expected_candidate_support_set_hash", "expected_candidate_access_context_hash",
-     "expected_candidate_content_hash", "expected_challenger_access_context_hash", "classifier_version"),
+    ("error_code", "recorded_code"),
+    [("output_invalid", "output_invalid"), (None, "MemoryPairClassificationError")],
 )
-@pytest.mark.parametrize("omitted", [False, True])
-async def test_relation_discovery_reclassifies_identity_seed_with_stale_context(
-    stale_field: str, omitted: bool,
+async def test_failed_classification_usage_counts_against_slice_budget(
+    error_code: str | None, recorded_code: str
 ) -> None:
-    challenger = _memory("challenger", "Current claim")
-    candidate = _memory("candidate", "Previously classified claim")
-    store = _Store(challenger, (candidate,))
-    seed = PreclassifiedRelationDecision(
-        candidate_memory_id=candidate.id,
-        expected_candidate_content_hash=candidate.content_hash,
-        expected_candidate_support_set_hash=active_support_rows_hash(()),
-        expected_candidate_access_context_hash=lifecycle_access_context_hash(
-            visibility=candidate.visibility,
-            owner_user_id=candidate.owner_user_id,
-            project_key=candidate.project_key,
-            repo_identifier=candidate.repo_identifier,
-        ),
-        expected_challenger_access_context_hash=lifecycle_access_context_hash(
-            visibility=challenger.visibility,
-            owner_user_id=challenger.owner_user_id,
-            project_key=challenger.project_key,
-            repo_identifier=challenger.repo_identifier,
-        ),
-        relation_type=None if omitted else MemoryRelationType.UNRELATED,
-        direction=None if omitted else RelationDirection.SYMMETRIC,
-        reason="identity stage already checked this pair",
-        classifier_version=MEMORY_PAIR_CLASSIFIER_VERSION,
-    )
-    store.work = replace(
-        store.work,
-        request=replace(
-            store.work.request,
-            preclassified_decisions=(replace(seed, **{stale_field: "stale"}),),
-        ),
-    )
-    classifier = _Classifier()
-
-    result = await RelationDiscovery(
-        store=store,  # type: ignore[arg-type]
-        candidate_retriever=_Candidates((candidate,)),  # type: ignore[arg-type]
-        pair_classifier=classifier,
-    ).process_slice(worker_id="worker-1")
-
-    assert result.reused_candidate_pairs == 0
-    assert classifier.classified_pair_ids == ("candidate",)
-    assert store.completed is not None
-    assert store.completed.relation_run.audit["reused_identity_pair_count"] == 0
-
-
-@pytest.mark.asyncio
-async def test_failed_classification_usage_counts_against_slice_budget() -> None:
     challenger = _memory("challenger", "Current claim")
     candidates = tuple(_memory(f"candidate-{index}", f"Candidate {index}") for index in range(3))
     store = _FailingStore(challenger, candidates)
 
-    result = await RelationDiscovery(
-        store=store,  # type: ignore[arg-type]
-        candidate_retriever=_Candidates(candidates),  # type: ignore[arg-type]
-        pair_classifier=_UsageReportingFailureClassifier(),
-    ).process_slice(
+    result = await _discovery(store, candidates, _UsageReportingFailureClassifier(error_code)).process_slice(
         worker_id="worker-1",
         budget=RelationDiscoveryBudget(max_candidate_pairs=1, max_llm_calls=1),
     )
@@ -419,6 +500,8 @@ async def test_failed_classification_usage_counts_against_slice_budget() -> None
     assert result.llm_calls == 2
     assert result.prompt_chars == 321
     assert store.failure is not None
+    assert store.failure["error_code"] == recorded_code
+    assert store.failure["error"].startswith("MemoryPairClassificationError: ")
 
 
 @pytest.mark.asyncio
@@ -427,11 +510,7 @@ async def test_completion_guard_failure_keeps_classification_usage_in_slice_budg
     candidates = tuple(_memory(f"candidate-{index}", f"Candidate {index}") for index in range(3))
     store = _CompletionFailingStore(challenger, candidates)
 
-    result = await RelationDiscovery(
-        store=store,  # type: ignore[arg-type]
-        candidate_retriever=_Candidates(candidates),  # type: ignore[arg-type]
-        pair_classifier=_Classifier(),
-    ).process_slice(
+    result = await _discovery(store, candidates, _Classifier()).process_slice(
         worker_id="worker-1",
         budget=RelationDiscoveryBudget(max_candidate_pairs=1, max_llm_calls=1),
     )
@@ -441,11 +520,12 @@ async def test_completion_guard_failure_keeps_classification_usage_in_slice_budg
     assert result.llm_calls == 1
     assert result.prompt_chars == 30
     assert store.failure is not None
+    assert store.failure["error_code"] == "ValueError"
     assert store.lease_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_private_relation_discovery_without_explicit_actor_builds_valid_cross_source_review() -> None:
+async def test_private_relation_discovery_without_explicit_actor_runs_as_the_owner() -> None:
     challenger = replace(
         _memory("challenger", "Current claim"),
         visibility="private",
@@ -466,52 +546,12 @@ async def test_private_relation_discovery_without_explicit_actor_builds_valid_cr
     result = await RelationDiscovery(
         store=store,  # type: ignore[arg-type]
         candidate_retriever=candidates,  # type: ignore[arg-type]
-        pair_classifier=_ConflictClassifier(),
-    ).process_slice(
-        worker_id="worker-1",
-        budget=RelationDiscoveryBudget(max_candidate_pairs=1, max_llm_calls=1),
-    )
+        pair_classifier=_Classifier({"incumbent": CrossDocumentRelationLabel.CONTRADICTS}),
+    ).process_slice(worker_id="worker-1")
 
     assert result.completed_work == 1
-    assert result.failed_work == 0
     assert store.disabled_lookup_user_id == "user-1"
     assert candidates.actor_user_id == "user-1"
-    assert store.completed is not None
-    assert store.completed.relations[0].authority_case is AuthorityCase.CROSS_SOURCE_CONFLICT
-    assert len(store.reviews) == 1
-    assert store.reviews[0].status == "pending"
-
-
-@pytest.mark.asyncio
-async def test_mixed_relation_run_creates_review_only_for_cross_source_conflict() -> None:
-    challenger = _memory("challenger", "Current claim")
-    cross_source = _memory("cross-source", "Conflicting external claim")
-    same_source = _memory("same-source", "Conflicting sibling document claim")
-    candidates = (cross_source, same_source)
-    store = _Store(challenger, candidates)
-
-    result = await RelationDiscovery(
-        store=store,  # type: ignore[arg-type]
-        candidate_retriever=_Candidates(
-            candidates,
-            source_ids=("src-external", "src-challenger"),
-        ),  # type: ignore[arg-type]
-        pair_classifier=_ConflictClassifier(),
-    ).process_slice(
-        worker_id="worker-1",
-        budget=RelationDiscoveryBudget(max_candidate_pairs=2, max_llm_calls=1),
-    )
-
-    assert result.completed_work == 1
-    assert store.completed is not None
-    assert store.completed.relation_run.lifecycle_action == "create_review"
-    assert store.completed.relation_run.review_case == "cross_source_conflict"
-    assert {
-        relation.memory_id: relation.authority_case for relation in store.completed.relations
-    } == {
-        cross_source.id: AuthorityCase.CROSS_SOURCE_CONFLICT,
-        same_source.id: AuthorityCase.INDEPENDENT_CONFLICT,
-    }
-    assert len(store.reviews) == 1
-    assert store.reviews[0].incumbent_memory_id == cross_source.id
-    assert store.reviews[0].challenger_memory_id == challenger.id
+    assert [record.label for record in store.completed.relations] == [
+        CrossDocumentRelationLabel.CONTRADICTS
+    ]

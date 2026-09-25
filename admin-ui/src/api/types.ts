@@ -16,7 +16,6 @@ export interface Memory {
   project_key: string | null;
   confidence: number;
   corroboration_count: number;
-  contradiction_count: number;
   status: "active" | "superseded" | "retired" | "decayed" | "pending_review";
   retirement_reason: string | null;
   retired_at: string | null;
@@ -38,6 +37,56 @@ export interface Memory {
    * correct single brand mark.
    */
   origin_client?: string | null;
+  /** Current Cross-Document Relations; present on Memory detail. */
+  relations?: MemoryRelation[];
+  relation_notice?: string | null;
+  /** Relation Dismissals in force that the caller can undo; present on Memory detail. */
+  dismissed_relations?: DismissedRelation[];
+}
+
+// Cross-Document Relations
+
+export type RelationLabel = "equivalent" | "updates" | "contradicts";
+
+export interface MemorySourceRef {
+  source_id: string;
+  source_type: string;
+  name: string | null;
+}
+
+export interface RelatedMemory {
+  memory_id: string;
+  summary: string;
+  content_hash: string;
+  sources: MemorySourceRef[];
+  /** UTC date (YYYY-MM-DD) on which the source recorded the Evidence the relation was decided on. */
+  evidence_time: string | null;
+}
+
+export interface MemoryRelation {
+  label: RelationLabel;
+  role: "newer" | "older" | "peer";
+  counterpart: RelatedMemory;
+  reason: string;
+  decided_by: "classifier" | "review";
+}
+
+/** The dismissals in force for one pair; their labels read as they would now. */
+export interface DismissedRelation {
+  counterpart: RelatedMemory;
+  labels: RelationLabel[];
+  dismissed_by: string;
+  dismissed_at: string;
+  note: string | null;
+}
+
+export interface RelationPair {
+  label: RelationLabel;
+  newer_memory_id: string | null;
+  reason: string;
+  decided_by: "classifier" | "review";
+  decided_at: string;
+  memories: RelatedMemory[];
 }
 
 export interface MemoryEvidenceDocument {
@@ -784,12 +833,8 @@ export interface TeamsAuthStatus {
 
 export type MemoryReviewStatus = "pending" | "approved" | "rejected" | "stale";
 export type MemoryReviewKind = "supersede";
-export type MemoryReviewActionKey =
-  | "use_latest_state"
-  | "keep_current_state"
-  | "confirm_conflict"
-  | "not_a_conflict";
-export type MemoryReviewDecisionLabel = "Updated" | "Support removed" | "Conflict";
+export type MemoryReviewActionKey = "use_latest_state" | "keep_current_state";
+export type MemoryReviewDecisionLabel = "Updated" | "Support removed";
 
 export interface MemoryReviewActionPresentation {
   key: MemoryReviewActionKey;

@@ -25,6 +25,13 @@ from typing import Any, Callable
 from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, DEFAULT_SEARCH_TOP_K, RetrievalConfig
 from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import RerankResponse
+from memforge.memory.cross_document_relation_reader import (
+    RelationGraph,
+    load_relation_graph,
+    order_by_relations,
+    relation_contexts,
+    relation_notice,
+)
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
 from memforge.retrieval.embeddings import EmbeddingCache, embed_texts
@@ -279,13 +286,13 @@ def _weighted_rrf_fusion(
 def _search_follow_up_for_memory(
     memory: Memory,
     *,
-    contradiction_warning: str | None,
+    relation_notice: str | None,
 ) -> dict[str, str] | None:
     """Return a small next-tool hint when summary-only use is likely weak."""
-    if contradiction_warning:
+    if relation_notice:
         return {
             "suggested_tool": "get_memory",
-            "reason": "result_has_contradiction_warning",
+            "reason": "result_has_relation_notice",
         }
     if memory.status != "active":
         return {
@@ -748,13 +755,28 @@ class SearchEngine:
         # ----- 6b. Optional cross-encoder rerank -----
         ranked = await self._rerank_with_llm(query, ranked, top_k)
 
-        # ----- 7. Collapse duplicate families and apply the requested page -----
+        # ----- 7. Apply cross-document relations to the window, then page -----
+        relation_graph = await load_relation_graph(
+            self._relational,
+            [c.memory_id for c in ranked],
+            scope,
+        )
+        candidate_by_id = {c.memory_id: c for c in ranked}
+        ranked = [
+            candidate_by_id[memory_id]
+            for memory_id in order_by_relations([c.memory_id for c in ranked], relation_graph)
+        ]
         ranked_count = len(ranked)
         ranked = ranked[offset : offset + top_k]
 
         # ----- 8. Enrich results -----
         memory_ids = [c.memory_id for c in ranked]
-        results = await self._enrich_results(memory_ids, ranked, scope=scope)
+        results = await self._enrich_results(
+            memory_ids,
+            ranked,
+            scope=scope,
+            relation_graph=relation_graph,
+        )
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
 
@@ -1184,16 +1206,21 @@ class SearchEngine:
         ranked: list[_RankedCandidate],
         *,
         scope: AccessScope,
+        relation_graph: RelationGraph | None = None,
     ) -> list[SearchResult]:
-        """Fetch full Memory objects for each result."""
+        """Fetch full Memory objects for each result and attach its relations."""
         if not memory_ids:
             return []
 
         # Build a lookup of candidate scores
         score_map = {c.memory_id: c for c in ranked}
-        conflict_contexts_by_memory = await self.list_memory_conflict_contexts(
+        if relation_graph is None:
+            relation_graph = await load_relation_graph(self._relational, memory_ids, scope)
+        relations_by_memory = await relation_contexts(
+            self._relational,
+            relation_graph,
             memory_ids,
-            scope=scope,
+            scope,
         )
 
         results: list[SearchResult] = []
@@ -1221,22 +1248,8 @@ class SearchEngine:
             # Determine freshness
             freshness = _compute_freshness(memory, has_source)
 
-            # Contradiction warning
-            conflict_contexts = conflict_contexts_by_memory.get(mid, ())
-            confirmed_conflicts = sum(item.disposition == "confirmed" for item in conflict_contexts)
-            pending_conflicts = sum(item.disposition == "pending" for item in conflict_contexts)
-            contradiction_warning = None
-            if confirmed_conflicts:
-                contradiction_warning = (
-                    f"This memory has {confirmed_conflicts} reviewed cross-source conflict(s). See conflict_contexts."
-                )
-            elif pending_conflicts:
-                contradiction_warning = (
-                    f"This memory has {pending_conflicts} pending cross-source "
-                    f"conflict review(s). See conflict_contexts."
-                )
-            elif memory.contradiction_count > 0:
-                contradiction_warning = f"This memory has {memory.contradiction_count} contradiction(s) recorded."
+            relations = relations_by_memory.get(mid, ())
+            notice = relation_notice(relations)
 
             results.append(
                 SearchResult(
@@ -1248,29 +1261,19 @@ class SearchEngine:
                     corroborated_by=memory.corroboration_count,
                     last_observed_at=(memory.updated_at.isoformat() if memory.updated_at else None),
                     freshness=freshness,
-                    contradiction_warning=contradiction_warning,
-                    conflict_contexts=conflict_contexts,
+                    relation_notice=notice,
+                    relations=relations,
                     status=memory.status,
                     repo_identifier=candidate.repo_identifier or memory.repo_identifier,
                     follow_up=_search_follow_up_for_memory(
                         memory,
-                        contradiction_warning=contradiction_warning,
+                        relation_notice=notice,
                     ),
                     retrieval_evidence=candidate.retrieval_evidence,
                 )
             )
 
         return results
-
-    async def list_memory_conflict_contexts(
-        self,
-        memory_ids: list[str] | tuple[str, ...],
-        *,
-        scope: AccessScope,
-    ):
-        """Expose the adapter-owned, visibility-safe conflict read model."""
-
-        return await self._relational.list_memory_conflict_contexts(memory_ids, scope)
 
     # ==================================================================
     # Query expansion

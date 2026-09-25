@@ -32,7 +32,7 @@ from memforge.models import (
 )
 from memforge.storage.adapters.context import AccessScope
 
-__all__ = ["is_visible", "visible_chroma_where", "visible_sql"]
+__all__ = ["is_visible", "readable_source_sql", "visible_chroma_where", "visible_sql"]
 
 
 def _project_mode_keys(scope: AccessScope) -> tuple[str, ...]:
@@ -91,6 +91,7 @@ def visible_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:
         params.append(scope.user_id)
 
     parts.append("(" + " OR ".join(branches) + ")")
+    readable_source, readable_source_params = readable_source_sql(scope, "source_access_source")
     virtual_source_placeholders = ",".join("?" for _ in VIRTUAL_DOCUMENT_SOURCE_IDS)
     parts.append(
         f"""(
@@ -110,31 +111,43 @@ def visible_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:
                 FROM memory_sources source_access_support
                 JOIN sources source_access_source
                   ON source_access_source.id = source_access_support.source_id
-                LEFT JOIN source_subscriptions source_access_subscription
-                  ON source_access_subscription.source_id = source_access_source.id
-                 AND source_access_subscription.user_id = ?
                 WHERE source_access_support.memory_id = {alias}.id
-                  AND COALESCE(source_access_subscription.enabled, 1) = 1
-                  AND source_access_source.access_state <> 'orphaned_private'
-                  AND (
-                      (
-                          source_access_source.access_state = 'active'
-                          AND (
-                              source_access_source.access_policy = 'workspace'
-                              OR source_access_source.owner_user_id = ?
-                          )
-                      )
-                      OR (
-                          source_access_source.access_state = 'changing'
-                          AND source_access_source.owner_user_id = ?
-                      )
-                  )
+                  AND {readable_source}
             )
         )"""
     )
     params.extend(sorted(VIRTUAL_DOCUMENT_SOURCE_IDS))
-    params.extend([scope.user_id, scope.user_id, scope.user_id])
+    params.extend(readable_source_params)
     return "(" + " AND ".join(parts) + ")", params
+
+
+def readable_source_sql(scope: AccessScope, alias: str) -> tuple[str, list[Any]]:
+    """Return (sql_fragment, params) that admits a configured Source row the caller may read.
+
+    The caller must not have unsubscribed from it, and it must be workspace
+    readable or the caller's own; a Source changing access is readable only by
+    its owner, and an orphaned private Source by nobody.
+    """
+    return (
+        f"""(
+            NOT EXISTS (
+                SELECT 1
+                FROM source_subscriptions {alias}_subscription
+                WHERE {alias}_subscription.source_id = {alias}.id
+                  AND {alias}_subscription.user_id = ?
+                  AND {alias}_subscription.enabled = 0
+            )
+            AND {alias}.access_state <> 'orphaned_private'
+            AND (
+                (
+                    {alias}.access_state = 'active'
+                    AND ({alias}.access_policy = 'workspace' OR {alias}.owner_user_id = ?)
+                )
+                OR ({alias}.access_state = 'changing' AND {alias}.owner_user_id = ?)
+            )
+        )""",
+        [scope.user_id, scope.user_id, scope.user_id],
+    )
 
 
 def visible_chroma_where(

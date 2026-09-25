@@ -15,10 +15,10 @@ import sqlite3
 import uuid
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 
 import aiosqlite
 
@@ -61,11 +61,11 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
-    MemoryConflictContext,
     MemoryExtractionResult,
     MemoryReview,
     MemoryReviewRelatedChallenger,
     MemorySource,
+    MemorySourceRef,
     Project,
     ReplacementKind,
     SHARED_PROJECT_KEY,
@@ -76,9 +76,9 @@ from memforge.models import (
     SourceSyncRun,
     SyncState,
     UNSORTED_PROJECT_KEY,
+    VIRTUAL_DOCUMENT_SOURCE_IDS,
     Visibility,
     canonicalize_entity_name,
-    conflict_disposition_for_review_status,
     content_hash,
     slugify,
     source_artifact_cleanup_task_id,
@@ -106,7 +106,6 @@ from memforge.memory.evidence import (
     RelationCandidateRecord,
     RelationDirection,
     RelationOutcomeBundle,
-    RelationProjectionPlane,
     RelationRunRecord,
     RelationType,
     ReviewCase,
@@ -153,12 +152,39 @@ from memforge.memory.lifecycle_plan import (
     validate_unprovable_cutover_evidence,
 )
 from memforge.memory.origin import references_source_row
+from memforge.memory.cross_document_relation import (
+    MAX_RELATIONS_PER_MEMORY,
+    RELATION_READ_ORDER,
+    CrossDocumentRelationDecider,
+    CrossDocumentRelationDismissal,
+    CrossDocumentRelationLabel,
+    CrossDocumentRelationOutcome,
+    CurrentCrossDocumentRelation,
+    RelationDismissalConflict,
+    pair_key,
+)
+from memforge.memory.cross_source_conflict_reviews import CROSS_SOURCE_CONFLICT_REVIEW_KIND
+from memforge.memory.cross_source_review_conversion import (
+    CONVERSION_APPLIED_EVENT,
+    CONVERSION_RERUN_REASON,
+    CONVERTED_REVIEWS_DELETED_EVENT,
+    DISMISSED_REVIEW_LABELS,
+    ConversionCount,
+    ConvertedReviewDecision,
+    CrossSourceReviewConversionConflict,
+    CrossSourceReviewConversionPlan,
+    CrossSourceReviewConversionReceipt,
+)
 from memforge.memory.relation_discovery_contract import (
     CURRENT_RELATION_EVIDENCE_PREDICATE_SQL,
-    PreclassifiedRelationDecision,
+    RELATION_DISCOVERY_ERROR_MAX_CHARS,
+    RELATION_DISCOVERY_RERUN_EVENT,
     RelationDiscoveryRequest,
     RelationDiscoveryWork,
+    RelationDiscoveryWorkSelection,
     RelationDiscoveryWorkStatus,
+    relation_discovery_work_selection_sql,
+    rerunnable_relation_discovery_work_sql,
     resolve_relation_discovery_actor_user_id,
 )
 from memforge.memory.audit import MemoryAuditEvent
@@ -205,13 +231,7 @@ from memforge.evals.offline_evaluation import (
 )
 from memforge.memory.lifecycle import allowed_search_statuses, normalize_memory_status
 from memforge.memory.review_decision import ReviewVectorTask
-from memforge.memory.review_contract import (
-    CrossSourceReviewMemorySnapshot,
-    CrossSourceReviewSupportSnapshot,
-    validate_cross_source_review_write,
-    validate_pending_review_retry,
-)
-from memforge.retrieval.access_predicate import visible_sql
+from memforge.retrieval.access_predicate import readable_source_sql, visible_sql
 from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
 from memforge.source_access import infer_legacy_source_access
 from memforge.source_derivation import (
@@ -386,6 +406,117 @@ AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED = "knowledge_patched"
 AGENT_SESSION_OUTCOME_LEGACY_PACKAGE_CREATED = "package_created"
 AGENT_SESSION_OUTCOME_NO_OUTPUT = "no_output"
 AGENT_SESSION_OUTCOME_FAILED = "failed"
+
+
+def _current_cross_document_relation_sql(scope) -> tuple[str, list[Any]]:
+    """FROM and WHERE for relations current for the caller, with the relation aliased ``r``.
+
+    Both Memories are active and visible, both contents equal the judged
+    contents, and no dismissal in force hides the label.
+    """
+
+    low_visibility_sql, low_visibility_params = visible_sql(scope, "relation_low")
+    high_visibility_sql, high_visibility_params = visible_sql(scope, "relation_high")
+    return (
+        f"""FROM cross_document_relations r
+            JOIN memories relation_low ON relation_low.id = r.memory_low_id
+            JOIN memories relation_high ON relation_high.id = r.memory_high_id
+           WHERE relation_low.status = 'active' AND relation_high.status = 'active'
+             AND relation_low.content_hash = r.low_content_hash
+             AND relation_high.content_hash = r.high_content_hash
+             AND {low_visibility_sql}
+             AND {high_visibility_sql}
+             AND NOT EXISTS (
+                 SELECT 1 FROM cross_document_relation_dismissals dismissal
+                  WHERE dismissal.memory_low_id = r.memory_low_id
+                    AND dismissal.memory_high_id = r.memory_high_id
+                    AND dismissal.label = r.label
+                    AND dismissal.low_content_hash = r.low_content_hash
+                    AND dismissal.high_content_hash = r.high_content_hash
+                    AND dismissal.restored_at IS NULL
+             )""",
+        [*low_visibility_params, *high_visibility_params],
+    )
+
+
+# Dismissals in force, aliased ``d``: not undone and bound to both current contents.
+_ACTIVE_RELATION_DISMISSAL_SQL = """FROM cross_document_relation_dismissals d
+    JOIN memories dismissed_low ON dismissed_low.id = d.memory_low_id
+    JOIN memories dismissed_high ON dismissed_high.id = d.memory_high_id
+   WHERE d.restored_at IS NULL
+     AND dismissed_low.content_hash = d.low_content_hash
+     AND dismissed_high.content_hash = d.high_content_hash"""
+
+
+def _relation_read_order_sql(label_column: str) -> tuple[str, list[str]]:
+    cases = " ".join(f"WHEN ? THEN {rank}" for rank, _label in enumerate(RELATION_READ_ORDER))
+    return (
+        f"CASE {label_column} {cases} ELSE {len(RELATION_READ_ORDER)} END",
+        [label.value for label in RELATION_READ_ORDER],
+    )
+
+
+def _row_to_current_cross_document_relation(row: Any) -> CurrentCrossDocumentRelation:
+    return CurrentCrossDocumentRelation(
+        memory_low_id=str(row["memory_low_id"]),
+        memory_high_id=str(row["memory_high_id"]),
+        label=CrossDocumentRelationLabel(row["label"]),
+        low_content_hash=str(row["low_content_hash"]),
+        high_content_hash=str(row["high_content_hash"]),
+        low_evidence_time=row["low_evidence_time"],
+        high_evidence_time=row["high_evidence_time"],
+        reason=str(row["reason"] or ""),
+        decided_by=CrossDocumentRelationDecider(row["decided_by"]),
+        decided_at=str(row["decided_at"]),
+    )
+
+
+def _row_to_cross_document_relation_dismissal(row: Any) -> CrossDocumentRelationDismissal:
+    return CrossDocumentRelationDismissal(
+        id=str(row["id"]),
+        memory_low_id=str(row["memory_low_id"]),
+        memory_high_id=str(row["memory_high_id"]),
+        label=CrossDocumentRelationLabel(row["label"]),
+        low_content_hash=str(row["low_content_hash"]),
+        high_content_hash=str(row["high_content_hash"]),
+        dismissed_by=str(row["dismissed_by"]),
+        dismissed_at=str(row["dismissed_at"]),
+        note=row["note"],
+    )
+
+
+# Relation rows that cross-document discovery wrote into the Evidence Unit
+# projection; Lifecycle writes are the projection's only owner.
+_LEGACY_DISCOVERY_RELATION_SQL = """er.is_authoritative_support = 0
+AND er.relation_run_id IN (
+    SELECT rr.id FROM relation_runs rr
+     WHERE json_extract(rr.audit_json, '$.source') = 'relation_discovery'
+)"""
+
+
+def _relation_dismissal_audit_event(
+    event_type: str,
+    dismissal: CrossDocumentRelationDismissal,
+    *,
+    memory_id: str,
+    actor: str,
+) -> MemoryAuditEvent:
+    return MemoryAuditEvent(
+        event_type=event_type,
+        status="committed",
+        actor_type="user",
+        actor_id=actor,
+        memory_id=memory_id,
+        payload={
+            "dismissal_id": dismissal.id,
+            "memory_low_id": dismissal.memory_low_id,
+            "memory_high_id": dismissal.memory_high_id,
+            "label": dismissal.label.value,
+            "low_content_hash": dismissal.low_content_hash,
+            "high_content_hash": dismissal.high_content_hash,
+            "note": dismissal.note,
+        },
+    )
 
 
 def _with_relation_snapshot_audit(bundle: RelationOutcomeBundle) -> RelationOutcomeBundle:
@@ -697,6 +828,59 @@ def _enabled_source_visibility_condition(
 # Schema (v1)
 # ---------------------------------------------------------------------------
 
+# Cross-document relations between two Memories, bound to both contents, and
+# the dismissals people record for them. A pair is stored lower Memory id first.
+# Each side keeps the Evidence time (a UTC date) the relation was decided on;
+# an updates pair is stored only when those dates order it.
+_CROSS_DOCUMENT_RELATION_DDL = """
+CREATE TABLE IF NOT EXISTS cross_document_relations (
+    memory_low_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    memory_high_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    label               TEXT NOT NULL CHECK (label IN ('equivalent', 'updates', 'contradicts')),
+    low_content_hash    TEXT NOT NULL,
+    high_content_hash   TEXT NOT NULL,
+    low_evidence_time   TEXT,
+    high_evidence_time  TEXT,
+    reason              TEXT NOT NULL DEFAULT '',
+    classifier_version  TEXT,
+    relation_run_id     TEXT,
+    discovery_work_id   TEXT,
+    decided_by          TEXT NOT NULL CHECK (decided_by IN ('classifier', 'review')),
+    decided_at          TEXT NOT NULL,
+    PRIMARY KEY (memory_low_id, memory_high_id),
+    CHECK (memory_low_id < memory_high_id),
+    CHECK (
+        label <> 'updates'
+        OR (low_evidence_time IS NOT NULL AND high_evidence_time IS NOT NULL
+            AND low_evidence_time <> high_evidence_time)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_cross_document_relations_high
+    ON cross_document_relations(memory_high_id);
+
+CREATE TABLE IF NOT EXISTS cross_document_relation_dismissals (
+    id                  TEXT PRIMARY KEY,
+    memory_low_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    memory_high_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    label               TEXT NOT NULL CHECK (label IN ('equivalent', 'updates', 'contradicts')),
+    low_content_hash    TEXT NOT NULL,
+    high_content_hash   TEXT NOT NULL,
+    dismissed_by        TEXT NOT NULL,
+    dismissed_at        TEXT NOT NULL,
+    note                TEXT,
+    restored_by         TEXT,
+    restored_at         TEXT,
+    CHECK (memory_low_id < memory_high_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cross_document_relation_dismissals_active
+    ON cross_document_relation_dismissals(
+        memory_low_id, memory_high_id, label, low_content_hash, high_content_hash
+    ) WHERE restored_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_cross_document_relation_dismissals_high
+    ON cross_document_relation_dismissals(memory_high_id);
+"""
+
+
 SCHEMA = """
 -- ---------------------------------------------------------------
 -- Documents
@@ -779,7 +963,6 @@ CREATE TABLE IF NOT EXISTS memories (
     repo_identifier     TEXT,
     confidence          REAL NOT NULL DEFAULT 0.7,
     corroboration_count INTEGER NOT NULL DEFAULT 1,
-    contradiction_count INTEGER NOT NULL DEFAULT 0,
     valid_from          TEXT,
     valid_until         TEXT,
     superseded_by       TEXT REFERENCES memories(id),
@@ -1425,7 +1608,6 @@ CREATE TABLE IF NOT EXISTS relation_discovery_work (
     doc_id                   TEXT NOT NULL,
     actor_user_id            TEXT,
     entity_ids_json          TEXT NOT NULL DEFAULT '[]',
-    preclassified_decisions_json TEXT NOT NULL DEFAULT '[]',
     status                   TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed','obsolete')),
     attempts                 INTEGER NOT NULL DEFAULT 0,
     lease_owner              TEXT,
@@ -1433,6 +1615,9 @@ CREATE TABLE IF NOT EXISTS relation_discovery_work (
     lease_until              TEXT,
     next_attempt_at          TEXT,
     error                    TEXT,
+    error_code               TEXT,
+    run_generation           INTEGER NOT NULL DEFAULT 0,
+    classifier_version       TEXT,
     created_at               TEXT NOT NULL,
     updated_at               TEXT NOT NULL,
     completed_at             TEXT,
@@ -1440,6 +1625,8 @@ CREATE TABLE IF NOT EXISTS relation_discovery_work (
 );
 CREATE INDEX IF NOT EXISTS idx_relation_discovery_work_status
     ON relation_discovery_work(status, lease_until, created_at);
+CREATE INDEX IF NOT EXISTS idx_relation_discovery_work_state
+    ON relation_discovery_work(status, updated_at);
 
 CREATE TABLE IF NOT EXISTS source_deletion_vector_outbox (
     id          TEXT PRIMARY KEY,
@@ -1813,18 +2000,6 @@ CREATE INDEX IF NOT EXISTS idx_agent_concepts_owner_repo ON agent_concepts(owner
 CREATE INDEX IF NOT EXISTS idx_agent_claims_concept ON agent_claims(concept_id);
 CREATE INDEX IF NOT EXISTS idx_agent_claims_memory ON agent_claims(memory_id);
 CREATE INDEX IF NOT EXISTS idx_relation_runs_result_memory ON relation_runs(result_memory_id);
--- Cross-document contradiction tracking
-CREATE TABLE IF NOT EXISTS memory_contradictions (
-    memory_id_a    TEXT NOT NULL REFERENCES memories(id),
-    memory_id_b    TEXT NOT NULL REFERENCES memories(id),
-    classification TEXT NOT NULL,
-    resolution     TEXT DEFAULT 'pending',
-    detected_at    TEXT NOT NULL DEFAULT (datetime('now')),
-    resolved_at    TEXT,
-    reason         TEXT,
-    PRIMARY KEY (memory_id_a, memory_id_b)
-);
-
 -- ---------------------------------------------------------------
 -- Memory reviews - human-gated lifecycle decisions
 -- ---------------------------------------------------------------
@@ -2138,7 +2313,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_assessment_criterion
     ON agent_assessments(criterion, label, created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_assessment_input_fingerprint
     ON agent_assessments(input_fingerprint, status, created_at, assessment_id);
-"""
+""" + _CROSS_DOCUMENT_RELATION_DDL
 
 # ---------------------------------------------------------------------------
 # Migrations - empty for v1; start from v2 onwards.
@@ -4334,6 +4509,32 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     PRIMARY KEY (derivation_id, work_id)
 );
 """]),
+    (
+        95,
+        "Record cross-document discovery as relations with re-runnable work",
+        [
+            "ALTER TABLE relation_discovery_work ADD COLUMN error_code TEXT",
+            "ALTER TABLE relation_discovery_work ADD COLUMN run_generation INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE relation_discovery_work ADD COLUMN classifier_version TEXT",
+            "ALTER TABLE relation_discovery_work DROP COLUMN preclassified_decisions_json",
+            """UPDATE relation_discovery_work
+                  SET classifier_version = (
+                      SELECT rr.classifier_version FROM relation_runs rr
+                       WHERE json_extract(rr.audit_json, '$.work_id') = relation_discovery_work.id
+                       ORDER BY rr.completed_at DESC, rr.id DESC
+                       LIMIT 1
+                  )
+                WHERE status = 'completed' AND classifier_version IS NULL""",
+            """UPDATE relation_discovery_work
+                  SET error_code = substr(error, 1, instr(error, ':') - 1)
+                WHERE status = 'failed' AND error_code IS NULL AND instr(error, ':') > 1""",
+        ],
+    ),
+    (
+        96,
+        "Remove contradiction counts superseded by cross-document relations",
+        ["DROP TABLE IF EXISTS memory_contradictions"],
+    ),
 ]
 
 
@@ -4562,11 +4763,9 @@ class Database:
                     else:
                         raise
             if version == 53:
-                async with self.db.execute("PRAGMA table_info(memories)") as cursor:
-                    memory_columns = {str(row[1]) async for row in cursor}
-                for column_name in ("curation_cluster_id", "memory_level"):
-                    if column_name in memory_columns:
-                        await self.db.execute(f"ALTER TABLE memories DROP COLUMN {column_name}")
+                await self._drop_memory_columns_if_present_unlocked("curation_cluster_id", "memory_level")
+            if version == 96:
+                await self._drop_memory_columns_if_present_unlocked("contradiction_count")
             if version == 26:
                 await self._backfill_relation_run_snapshot_audit()
             if version in (30, 31, 66):
@@ -4575,8 +4774,6 @@ class Database:
                 await self._migrate_source_access_policy_unlocked()
             if version == 45:
                 await self._partition_legacy_agent_session_sources_unlocked()
-            if version == 62:
-                await self._reset_legacy_contradiction_summaries_unlocked()
             if version == 88:
                 profile_report = await self._backfill_evidence_representation_profiles_unlocked()
                 logger.info(
@@ -4706,13 +4903,13 @@ class Database:
             unresolved_revision_ids=tuple(unresolved),
         )
 
-    async def _reset_legacy_contradiction_summaries_unlocked(self) -> None:
-        """Discard directional summary residue without assuming every legacy cache column exists."""
-        await self.db.execute("DELETE FROM memory_contradictions")
+    async def _drop_memory_columns_if_present_unlocked(self, *column_names: str) -> None:
+        """Drop Memory columns that a database created before their removal still has."""
         async with self.db.execute("PRAGMA table_info(memories)") as cursor:
-            columns = {str(row[1]) async for row in cursor}
-        if "contradiction_count" in columns:
-            await self.db.execute("UPDATE memories SET contradiction_count = 0 WHERE contradiction_count <> 0")
+            memory_columns = {str(row[1]) async for row in cursor}
+        for column_name in column_names:
+            if column_name in memory_columns:
+                await self.db.execute(f"ALTER TABLE memories DROP COLUMN {column_name}")
 
     async def _migrate_source_access_policy_unlocked(self) -> None:
         """Materialize legacy Source access without guessing.
@@ -10767,7 +10964,6 @@ class Database:
                 if relation_outcome is not None:
                     await self._record_relation_outcome_bundle_unlocked(
                         relation_outcome,
-                        projection_plane=RelationProjectionPlane.LIFECYCLE,
                     )
                 if concept_projection is not None:
                     await self._upsert_agent_concept_unlocked(
@@ -11960,10 +12156,10 @@ class Database:
             """INSERT OR IGNORE INTO relation_discovery_work (
                    id, lifecycle_plan_id, memory_id, expected_content_hash,
                    source_id, source_unit_id, source_unit_revision_id, doc_id,
-                   actor_user_id, entity_ids_json, preclassified_decisions_json, status, attempts,
+                   actor_user_id, entity_ids_json, status, attempts,
                    lease_owner, lease_token, lease_until, error,
                    created_at, updated_at, completed_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0,
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0,
                          NULL, NULL, NULL, NULL, ?, ?, NULL)""",
             (
                 request.id,
@@ -11976,11 +12172,6 @@ class Database:
                 request.doc_id,
                 request.actor_user_id,
                 json.dumps(list(request.entity_ids)),
-                json.dumps(
-                    [item.to_payload() for item in request.preclassified_decisions],
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
                 now,
                 now,
             ),
@@ -12494,10 +12685,10 @@ class Database:
         *,
         worker_id: str,
         lease_token: str,
-        relation_outcome: RelationOutcomeBundle,
-        reviews: Sequence[MemoryReview] = (),
+        relation_run: RelationOutcomeBundle,
+        document_relations: CrossDocumentRelationOutcome,
     ) -> None:
-        """Atomically publish one relation result and fence its leased work."""
+        """Atomically record one discovery run's relations and fence its leased work."""
 
         async with self._write_lock:
             try:
@@ -12509,70 +12700,25 @@ class Database:
                 )
                 await self._assert_relation_discovery_outcome_current_unlocked(
                     row,
-                    relation_outcome,
+                    relation_run,
+                    document_relations,
                 )
-                await self._record_relation_outcome_bundle_unlocked(
-                    relation_outcome,
-                    projection_plane=RelationProjectionPlane.DISCOVERY,
-                    update_evidence_unit=False,
-                )
-                for review in reviews:
-                    if review.kind == "cross_source_conflict":
-                        memories, supports = await self._load_cross_source_review_snapshots_unlocked(review)
-                        validate_cross_source_review_write(
-                            review,
-                            relation_outcome,
-                            memories=memories,
-                            supports=supports,
-                        )
-                    async with self.db.execute(
-                        "SELECT * FROM memory_reviews WHERE id = ?",
-                        (review.id,),
-                    ) as cursor:
-                        existing_review = await cursor.fetchone()
-                    if existing_review is not None:
-                        validate_pending_review_retry(
-                            review,
-                            self._row_to_review(existing_review),
-                        )
-                        continue
-                    now = _now_iso()
-                    await self.db.execute(
-                        """INSERT INTO memory_reviews (
-                            id, kind, status, incumbent_memory_id,
-                            challenger_memory_id, reason, review_note, reviewer,
-                            expected_incumbent_updated_at,
-                            expected_challenger_updated_at, expected_support_set_hash,
-                            replacement_kind,
-                            created_at, resolved_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            review.id,
-                            review.kind,
-                            review.status,
-                            review.incumbent_memory_id,
-                            review.challenger_memory_id,
-                            review.reason,
-                            review.review_note,
-                            review.reviewer,
-                            review.expected_incumbent_updated_at,
-                            review.expected_challenger_updated_at,
-                            review.expected_support_set_hash,
-                            _validate_replacement_kind(review.replacement_kind),
-                            review.created_at.isoformat() if review.created_at else now,
-                            review.resolved_at.isoformat() if review.resolved_at else None,
-                        ),
-                    )
+                bundle = _with_relation_snapshot_audit(relation_run)
+                if not await self._relation_run_recorded_unlocked(bundle):
+                    await self._insert_relation_run_unlocked(bundle)
+                    await self._record_cross_document_relations_unlocked(document_relations)
                 completed_at = _now_iso()
                 cursor = await self.db.execute(
                     """UPDATE relation_discovery_work
                           SET status = 'completed', lease_owner = NULL,
                               lease_token = NULL, lease_until = NULL,
-                              next_attempt_at = NULL, error = NULL,
+                              next_attempt_at = NULL, error = NULL, error_code = NULL,
+                              classifier_version = ?,
                               updated_at = ?, completed_at = ?
                         WHERE id = ? AND status = 'running'
                           AND lease_owner = ? AND lease_token = ?""",
                     (
+                        bundle.relation_run.classifier_version,
                         completed_at,
                         completed_at,
                         work_id,
@@ -12587,6 +12733,77 @@ class Database:
                 await self.db.rollback()
                 raise
 
+    async def _record_cross_document_relations_unlocked(self, outcome: CrossDocumentRelationOutcome) -> None:
+        """Apply one discovery run's labels to the pairs it judged.
+
+        The completion guard has checked that both contents of every judged
+        pair are current. The run's label replaces the stored relation, and a
+        pair judged none loses it, unless a person confirmed the stored relation
+        for these same contents.
+        """
+
+        found = {(record.memory_low_id, record.memory_high_id): record for record in outcome.relations}
+        decided_at = _now_iso()
+        for memory_id, judged_content_hash in outcome.judged_content_hashes.items():
+            low_id, high_id = pair_key(outcome.challenger_id, memory_id)
+            hashes = {outcome.challenger_id: outcome.challenger_content_hash, memory_id: judged_content_hash}
+            record = found.get((low_id, high_id))
+            if record is None:
+                await self.db.execute(
+                    """DELETE FROM cross_document_relations
+                        WHERE memory_low_id = ? AND memory_high_id = ?
+                          AND NOT (decided_by = ? AND low_content_hash = ? AND high_content_hash = ?)""",
+                    (
+                        low_id,
+                        high_id,
+                        CrossDocumentRelationDecider.REVIEW.value,
+                        hashes[low_id],
+                        hashes[high_id],
+                    ),
+                )
+                continue
+            await self.db.execute(
+                """INSERT INTO cross_document_relations (
+                       memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
+                       low_evidence_time, high_evidence_time,
+                       reason, classifier_version, relation_run_id, discovery_work_id,
+                       decided_by, decided_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(memory_low_id, memory_high_id) DO UPDATE SET
+                       label = excluded.label,
+                       low_content_hash = excluded.low_content_hash,
+                       high_content_hash = excluded.high_content_hash,
+                       low_evidence_time = excluded.low_evidence_time,
+                       high_evidence_time = excluded.high_evidence_time,
+                       reason = excluded.reason,
+                       classifier_version = excluded.classifier_version,
+                       relation_run_id = excluded.relation_run_id,
+                       discovery_work_id = excluded.discovery_work_id,
+                       decided_by = excluded.decided_by,
+                       decided_at = excluded.decided_at
+                   WHERE NOT (
+                       cross_document_relations.decided_by = ?
+                       AND cross_document_relations.low_content_hash = excluded.low_content_hash
+                       AND cross_document_relations.high_content_hash = excluded.high_content_hash
+                   )""",
+                (
+                    record.memory_low_id,
+                    record.memory_high_id,
+                    record.label.value,
+                    record.low_content_hash,
+                    record.high_content_hash,
+                    record.low_evidence_time,
+                    record.high_evidence_time,
+                    record.reason,
+                    record.classifier_version,
+                    record.relation_run_id,
+                    record.discovery_work_id,
+                    CrossDocumentRelationDecider.CLASSIFIER.value,
+                    decided_at,
+                    CrossDocumentRelationDecider.REVIEW.value,
+                ),
+            )
+
     async def fail_relation_discovery_work(
         self,
         work_id: str,
@@ -12594,6 +12811,7 @@ class Database:
         worker_id: str,
         lease_token: str,
         error: str,
+        error_code: str,
         next_attempt_at: str | None,
         exhausted: bool,
     ) -> None:
@@ -12603,8 +12821,354 @@ class Database:
             lease_token=lease_token,
             status=RelationDiscoveryWorkStatus.FAILED,
             message=error,
+            error_code=error_code,
             next_attempt_at=None if exhausted else next_attempt_at,
         )
+
+    async def count_relation_discovery_work(self, selection: RelationDiscoveryWorkSelection) -> int:
+        predicate, params = relation_discovery_work_selection_sql(selection)
+        rows = await self.db.execute_fetchall(
+            f"SELECT COUNT(*) AS work_count FROM relation_discovery_work WHERE {predicate}",
+            params,
+        )
+        return int(rows[0]["work_count"])
+
+    async def list_relation_discovery_work(
+        self,
+        selection: RelationDiscoveryWorkSelection,
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> tuple[RelationDiscoveryWork, ...]:
+        """Selected work, most recently updated first."""
+
+        if limit < 1 or offset < 0:
+            raise ValueError("relation discovery listing requires a positive limit and non-negative offset")
+        predicate, params = relation_discovery_work_selection_sql(selection)
+        rows = await self.db.execute_fetchall(
+            f"""SELECT * FROM relation_discovery_work WHERE {predicate}
+                ORDER BY updated_at DESC, id LIMIT ? OFFSET ?""",
+            (*params, limit, offset),
+        )
+        return tuple(self._row_to_relation_discovery_work(row) for row in rows)
+
+    async def get_latest_relation_discovery_work(
+        self,
+        memory_id: str,
+        expected_content_hash: str,
+    ) -> RelationDiscoveryWork | None:
+        """The newest work for one Memory content, whatever its state."""
+
+        rows = await self.db.execute_fetchall(
+            """SELECT * FROM relation_discovery_work
+                WHERE memory_id = ? AND expected_content_hash = ?
+                ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (memory_id, expected_content_hash),
+        )
+        return self._row_to_relation_discovery_work(rows[0]) if rows else None
+
+    async def rerun_relation_discovery_work(
+        self,
+        selection: RelationDiscoveryWorkSelection,
+        *,
+        actor: str,
+    ) -> int:
+        """Queue the selected completed or exhausted work again; returns how many."""
+
+        if not selection.rerunnable:
+            raise ValueError("only completed or exhausted relation discovery work can be re-run")
+        predicate, params = relation_discovery_work_selection_sql(selection)
+        async with self._write_lock:
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                rows = await self.db.execute_fetchall(
+                    f"SELECT * FROM relation_discovery_work WHERE {predicate} ORDER BY id",
+                    params,
+                )
+                rerun = await self._rerun_relation_discovery_work_unlocked(
+                    rows,
+                    actor=actor,
+                    operation_id=f"relation-rerun-{uuid.uuid4().hex}",
+                    reason=None,
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return rerun
+
+    async def _rerun_relation_discovery_work_unlocked(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        actor: str,
+        operation_id: str,
+        reason: str | None,
+    ) -> int:
+        """Record each work item's last state, then queue it as a new generation."""
+
+        now = _now_iso()
+        for row in rows:
+            await self._insert_memory_audit_event_unlocked(
+                MemoryAuditEvent(
+                    event_type=RELATION_DISCOVERY_RERUN_EVENT,
+                    status="committed",
+                    operation_id=operation_id,
+                    actor_type="maintenance_operator",
+                    actor_id=actor,
+                    memory_id=str(row["memory_id"]),
+                    reason=reason,
+                    before_snapshot={
+                        key: row[key]
+                        for key in (
+                            "status",
+                            "error",
+                            "error_code",
+                            "attempts",
+                            "run_generation",
+                            "classifier_version",
+                        )
+                    },
+                    payload={"work_id": str(row["id"])},
+                )
+            )
+            cursor = await self.db.execute(
+                """UPDATE relation_discovery_work
+                      SET status = 'pending', attempts = 0, run_generation = run_generation + 1,
+                          lease_owner = NULL, lease_token = NULL, lease_until = NULL,
+                          next_attempt_at = NULL, error = NULL, error_code = NULL,
+                          completed_at = NULL, updated_at = ?
+                    WHERE id = ? AND status = ? AND attempts = ? AND run_generation = ?""",
+                (now, row["id"], row["status"], row["attempts"], row["run_generation"]),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("relation discovery work changed while it was re-run")
+        return len(rows)
+
+    async def count_legacy_discovery_evidence_relations(self) -> int:
+        """Relation rows that discovery wrote into the Evidence Unit projection."""
+
+        rows = await self.db.execute_fetchall(
+            f"SELECT COUNT(*) AS relation_count FROM evidence_relations er WHERE {_LEGACY_DISCOVERY_RELATION_SQL}"
+        )
+        return int(rows[0]["relation_count"])
+
+    async def get_cross_source_review_conversion(
+        self,
+        report_id: str,
+    ) -> CrossSourceReviewConversionReceipt | None:
+        rows = await self.db.execute_fetchall(
+            """SELECT payload FROM memory_audit_events
+                WHERE event_type = ? AND operation_id = ?
+                ORDER BY occurred_at LIMIT 1""",
+            (CONVERSION_APPLIED_EVENT, report_id),
+        )
+        return CrossSourceReviewConversionReceipt.from_payload(json.loads(rows[0]["payload"])) if rows else None
+
+    async def apply_cross_source_review_conversion(
+        self,
+        plan: CrossSourceReviewConversionPlan,
+        *,
+        actor: str,
+    ) -> CrossSourceReviewConversionReceipt:
+        """Write one conversion plan atomically, each row guarded by its planned content."""
+
+        async with self._write_lock:
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                if await self.db.execute_fetchall(
+                    "SELECT 1 FROM memory_audit_events WHERE event_type = ? AND operation_id = ? LIMIT 1",
+                    (CONVERSION_APPLIED_EVENT, plan.report_id),
+                ):
+                    raise CrossSourceReviewConversionConflict("conversion report is already applied")
+                decisions = (*plan.relations, *plan.dismissals)
+                current = await self._current_content_hashes_unlocked(
+                    tuple(
+                        dict.fromkeys(
+                            memory_id
+                            for decision in decisions
+                            for memory_id in (decision.memory_low_id, decision.memory_high_id)
+                        )
+                    )
+                )
+
+                def unchanged(decision: ConvertedReviewDecision) -> bool:
+                    return (
+                        current.get(decision.memory_low_id) == decision.low_content_hash
+                        and current.get(decision.memory_high_id) == decision.high_content_hash
+                    )
+
+                applied_at = _now_iso()
+                relations_written = 0
+                for decision in plan.relations:
+                    if not unchanged(decision):
+                        continue
+                    await self.db.execute(
+                        """INSERT INTO cross_document_relations (
+                               memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
+                               low_evidence_time, high_evidence_time, reason, decided_by, decided_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(memory_low_id, memory_high_id) DO UPDATE SET
+                               label = excluded.label,
+                               low_content_hash = excluded.low_content_hash,
+                               high_content_hash = excluded.high_content_hash,
+                               low_evidence_time = excluded.low_evidence_time,
+                               high_evidence_time = excluded.high_evidence_time,
+                               reason = excluded.reason,
+                               classifier_version = NULL,
+                               relation_run_id = NULL,
+                               discovery_work_id = NULL,
+                               decided_by = excluded.decided_by,
+                               decided_at = excluded.decided_at""",
+                        (
+                            decision.memory_low_id,
+                            decision.memory_high_id,
+                            decision.label.value,
+                            decision.low_content_hash,
+                            decision.high_content_hash,
+                            decision.low_evidence_time,
+                            decision.high_evidence_time,
+                            decision.reason,
+                            CrossDocumentRelationDecider.REVIEW.value,
+                            decision.resolved_at or applied_at,
+                        ),
+                    )
+                    relations_written += 1
+                dismissals_written = 0
+                for decision in plan.dismissals:
+                    if not unchanged(decision):
+                        continue
+                    for label in DISMISSED_REVIEW_LABELS:
+                        # A dismissal already recorded for this pair, label and
+                        # contents stands, including one a person has undone.
+                        await self.db.execute(
+                            """INSERT INTO cross_document_relation_dismissals (
+                                   id, memory_low_id, memory_high_id, label,
+                                   low_content_hash, high_content_hash,
+                                   dismissed_by, dismissed_at, note
+                               )
+                               SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+                                WHERE NOT EXISTS (
+                                    SELECT 1 FROM cross_document_relation_dismissals
+                                     WHERE memory_low_id = ? AND memory_high_id = ? AND label = ?
+                                       AND low_content_hash = ? AND high_content_hash = ?
+                                )""",
+                            (
+                                f"rdm-{uuid.uuid4().hex}",
+                                decision.memory_low_id,
+                                decision.memory_high_id,
+                                label.value,
+                                decision.low_content_hash,
+                                decision.high_content_hash,
+                                decision.reviewer or actor,
+                                decision.resolved_at or applied_at,
+                                decision.note,
+                                decision.memory_low_id,
+                                decision.memory_high_id,
+                                label.value,
+                                decision.low_content_hash,
+                                decision.high_content_hash,
+                            ),
+                        )
+                        dismissals_written += 1
+                rerun_rows: list[Any] = []
+                rerunnable, rerunnable_params = rerunnable_relation_discovery_work_sql(plan.max_attempts)
+                for offset in range(0, len(plan.rerun_work_ids), STORAGE_BIND_CHUNK_SIZE):
+                    chunk = plan.rerun_work_ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    rerun_rows.extend(
+                        await self.db.execute_fetchall(
+                            f"""SELECT * FROM relation_discovery_work
+                                WHERE id IN ({placeholders}) AND {rerunnable} ORDER BY id""",
+                            (*chunk, *rerunnable_params),
+                        )
+                    )
+                reruns_written = await self._rerun_relation_discovery_work_unlocked(
+                    rerun_rows,
+                    actor=actor,
+                    operation_id=plan.report_id,
+                    reason=CONVERSION_RERUN_REASON,
+                )
+                cursor = await self.db.execute(
+                    f"DELETE FROM evidence_relations AS er WHERE {_LEGACY_DISCOVERY_RELATION_SQL}"
+                )
+                receipt = CrossSourceReviewConversionReceipt(
+                    report_id=plan.report_id,
+                    applied_by=actor,
+                    applied_at=applied_at,
+                    planned=plan.planned_counts,
+                    written={
+                        ConversionCount.RELATIONS.value: relations_written,
+                        ConversionCount.DISMISSALS.value: dismissals_written,
+                        ConversionCount.RERUNS.value: reruns_written,
+                        ConversionCount.LEGACY_DISCOVERY_RELATIONS.value: max(cursor.rowcount, 0),
+                    },
+                    review_ids=plan.review_ids,
+                )
+                await self._insert_memory_audit_event_unlocked(
+                    MemoryAuditEvent(
+                        event_type=CONVERSION_APPLIED_EVENT,
+                        status="committed",
+                        operation_id=plan.report_id,
+                        actor_type="maintenance_operator",
+                        actor_id=actor,
+                        payload={
+                            **receipt.to_payload(),
+                            "relations": [asdict(item) for item in plan.relations],
+                            "dismissals": [asdict(item) for item in plan.dismissals],
+                            "discarded_review_ids": list(plan.discarded_review_ids),
+                            "rerun_review_ids": list(plan.rerun_review_ids),
+                            "nothing_to_rerun_review_ids": list(plan.nothing_to_rerun_review_ids),
+                            "rerun_work_ids": [str(row["id"]) for row in rerun_rows],
+                        },
+                    )
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return receipt
+
+    async def delete_cross_source_conflict_reviews(
+        self,
+        receipt: CrossSourceReviewConversionReceipt,
+        *,
+        actor: str,
+    ) -> int:
+        """Delete the Cross-Source Conflict Review rows an applied conversion names."""
+
+        async with self._write_lock:
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                deleted = 0
+                for offset in range(0, len(receipt.review_ids), STORAGE_BIND_CHUNK_SIZE):
+                    chunk = receipt.review_ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    kind_filter = f"SELECT id FROM memory_reviews WHERE kind = ? AND id IN ({placeholders})"
+                    await self.db.execute(
+                        f"DELETE FROM memory_review_related_challengers WHERE review_id IN ({kind_filter})",
+                        (CROSS_SOURCE_CONFLICT_REVIEW_KIND, *chunk),
+                    )
+                    cursor = await self.db.execute(
+                        f"DELETE FROM memory_reviews WHERE kind = ? AND id IN ({placeholders})",
+                        (CROSS_SOURCE_CONFLICT_REVIEW_KIND, *chunk),
+                    )
+                    deleted += max(cursor.rowcount, 0)
+                await self._insert_memory_audit_event_unlocked(
+                    MemoryAuditEvent(
+                        event_type=CONVERTED_REVIEWS_DELETED_EVENT,
+                        status="committed",
+                        operation_id=receipt.report_id,
+                        actor_type="maintenance_operator",
+                        actor_id=actor,
+                        payload={"review_ids": list(receipt.review_ids), "deleted": deleted},
+                    )
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return deleted
 
     async def obsolete_relation_discovery_work(
         self,
@@ -12620,6 +13184,7 @@ class Database:
             lease_token=lease_token,
             status=RelationDiscoveryWorkStatus.OBSOLETE,
             message=reason,
+            error_code=None,
             next_attempt_at=None,
         )
 
@@ -12631,20 +13196,28 @@ class Database:
         lease_token: str,
         status: RelationDiscoveryWorkStatus,
         message: str,
+        error_code: str | None,
         next_attempt_at: str | None,
     ) -> None:
+        """Fence and finish leased work; each failure replaces the recorded error.
+
+        An obsolete finish records its reason only when no failure is recorded.
+        """
         if status not in {
             RelationDiscoveryWorkStatus.FAILED,
             RelationDiscoveryWorkStatus.OBSOLETE,
         }:
             raise ValueError("invalid relation discovery terminal status")
+        failed = status is RelationDiscoveryWorkStatus.FAILED
         now = _now_iso()
         async with self._write_lock:
             cursor = await self.db.execute(
                 """UPDATE relation_discovery_work
                       SET status = ?, lease_owner = NULL, lease_token = NULL,
                           lease_until = NULL, next_attempt_at = ?,
-                          error = COALESCE(error, ?), updated_at = ?,
+                          error = CASE WHEN ? THEN ? ELSE COALESCE(error, ?) END,
+                          error_code = CASE WHEN ? THEN ? ELSE error_code END,
+                          updated_at = ?,
                           completed_at = CASE WHEN ? = 'obsolete' THEN ? ELSE NULL END
                     WHERE id = ? AND status = 'running'
                       AND lease_owner = ? AND lease_token = ?
@@ -12652,7 +13225,11 @@ class Database:
                 (
                     status.value,
                     next_attempt_at,
-                    message[:4000],
+                    failed,
+                    message[:RELATION_DISCOVERY_ERROR_MAX_CHARS],
+                    message[:RELATION_DISCOVERY_ERROR_MAX_CHARS],
+                    failed,
+                    error_code,
                     now,
                     status.value,
                     now,
@@ -12690,7 +13267,13 @@ class Database:
         self,
         work_row,
         outcome: RelationOutcomeBundle,
+        document_relations: CrossDocumentRelationOutcome,
     ) -> None:
+        """Fence a run by the contents it judged and the challenger's current evidence.
+
+        A newer Source Unit revision that leaves the challenger's evidence
+        current does not make the run stale: relations bind to Memory content.
+        """
         async with self.db.execute(
             """SELECT status, content_hash, visibility, owner_user_id,
                       repo_identifier
@@ -12702,16 +13285,11 @@ class Database:
             challenger is None
             or challenger["status"] != "active"
             or challenger["content_hash"] != work_row["expected_content_hash"]
+            or document_relations.challenger_id != work_row["memory_id"]
+            or document_relations.challenger_content_hash != work_row["expected_content_hash"]
         ):
             raise ValueError("relation discovery challenger is stale")
         unit = outcome.evidence_unit
-        async with self.db.execute(
-            "SELECT current_revision_id FROM source_units WHERE id = ? AND source_id = ?",
-            (work_row["source_unit_id"], work_row["source_id"]),
-        ) as cursor:
-            source_unit = await cursor.fetchone()
-        if source_unit is None or source_unit["current_revision_id"] != work_row["source_unit_revision_id"]:
-            raise ValueError("relation discovery Source Unit revision is stale")
         if (
             unit.id != outcome.relation_run.evidence_unit_id
             or unit.source_id != work_row["source_id"]
@@ -12733,6 +13311,8 @@ class Database:
         if current_unit is None or current_unit.id != unit.id:
             raise ValueError("relation discovery evidence is no longer current")
         candidate_ids = tuple(dict.fromkeys(candidate.memory_id for candidate in outcome.candidates))
+        if not set(document_relations.judged_content_hashes).issubset(candidate_ids):
+            raise ValueError("relation discovery judged a Memory outside its candidates")
         if not candidate_ids:
             return
         expected_support_hashes = dict(outcome.expected_candidate_support_set_hashes)
@@ -12746,19 +13326,21 @@ class Database:
             raise ValueError("relation discovery candidate current Support is stale")
         placeholders = ", ".join("?" for _ in candidate_ids)
         rows = await self.db.execute_fetchall(
-            f"""SELECT id, status, visibility, owner_user_id, repo_identifier
+            f"""SELECT id, status, content_hash, visibility, owner_user_id, repo_identifier
                   FROM memories WHERE id IN ({placeholders})""",
             candidate_ids,
         )
         by_id = {row["id"]: row for row in rows}
         for memory_id in candidate_ids:
             candidate = by_id.get(memory_id)
+            judged_content_hash = document_relations.judged_content_hashes.get(memory_id)
             if (
                 candidate is None
                 or candidate["status"] != "active"
                 or candidate["visibility"] != challenger["visibility"]
                 or candidate["owner_user_id"] != challenger["owner_user_id"]
                 or candidate["repo_identifier"] != challenger["repo_identifier"]
+                or (judged_content_hash is not None and candidate["content_hash"] != judged_content_hash)
             ):
                 raise ValueError("relation discovery candidate is stale")
         selected_provenance = {
@@ -12835,10 +13417,6 @@ class Database:
             doc_id=str(row["doc_id"]),
             actor_user_id=row["actor_user_id"],
             entity_ids=tuple(int(value) for value in json.loads(row["entity_ids_json"])),
-            preclassified_decisions=tuple(
-                PreclassifiedRelationDecision.from_payload(item)
-                for item in json.loads(row["preclassified_decisions_json"] or "[]")
-            ),
         )
         return RelationDiscoveryWork(
             request=request,
@@ -12850,6 +13428,9 @@ class Database:
             lease_until=row["lease_until"],
             next_attempt_at=row["next_attempt_at"],
             error=row["error"],
+            error_code=row["error_code"],
+            run_generation=int(row["run_generation"]),
+            classifier_version=row["classifier_version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             completed_at=row["completed_at"],
@@ -13492,79 +14073,140 @@ class Database:
             try:
                 await self._record_relation_outcome_bundle_unlocked(
                     bundle,
-                    projection_plane=RelationProjectionPlane.LIFECYCLE,
                 )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
                 raise
 
-    async def _record_relation_outcome_bundle_unlocked(
-        self,
-        bundle: RelationOutcomeBundle,
-        *,
-        projection_plane: RelationProjectionPlane,
-        update_evidence_unit: bool = True,
-    ) -> None:
+    async def _record_relation_outcome_bundle_unlocked(self, bundle: RelationOutcomeBundle) -> None:
+        """Record a Lifecycle relation run and replace its Evidence Unit's relation projection."""
+
         bundle = _with_relation_snapshot_audit(bundle)
+        if await self._relation_run_recorded_unlocked(bundle):
+            return
+        await self._upsert_evidence_unit_unlocked(bundle.evidence_unit)
+        await self._insert_relation_run_unlocked(bundle)
         unit = bundle.evidence_unit
-        run = bundle.relation_run
+        now = _now_iso()
+        await self.db.execute("DELETE FROM evidence_relations WHERE evidence_unit_id = ?", (unit.id,))
+        for relation in bundle.relations:
+            validate_persisted_evidence_relation(relation)
+            await self.db.execute(
+                """INSERT INTO relation_run_relations (
+                            relation_run_id, evidence_unit_id, memory_id, relation_type, relation_direction,
+                            authority_case, is_authoritative_support, source_lineage_id,
+                            confidence, reason, proposed_memory_content, excerpt,
+                            classifier_version, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    relation.relation_run_id,
+                    relation.evidence_unit_id,
+                    relation.memory_id,
+                    relation.relation_type.value,
+                    relation.direction.value if relation.direction is not None else None,
+                    relation.authority_case.value,
+                    1 if relation.is_authoritative_support else 0,
+                    relation.source_lineage_id,
+                    relation.confidence,
+                    relation.reason,
+                    relation.proposed_memory_content,
+                    relation.excerpt,
+                    relation.classifier_version,
+                    relation.created_at or now,
+                ),
+            )
+            await self.db.execute(
+                """INSERT INTO evidence_relations (
+                            evidence_unit_id, memory_id, relation_type, relation_direction, authority_case,
+                            is_authoritative_support, source_lineage_id, confidence,
+                            reason, proposed_memory_content, excerpt, classifier_version,
+                            relation_run_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    relation.evidence_unit_id,
+                    relation.memory_id,
+                    relation.relation_type.value,
+                    relation.direction.value if relation.direction is not None else None,
+                    relation.authority_case.value,
+                    1 if relation.is_authoritative_support else 0,
+                    relation.source_lineage_id,
+                    relation.confidence,
+                    relation.reason,
+                    relation.proposed_memory_content,
+                    relation.excerpt,
+                    relation.classifier_version,
+                    relation.relation_run_id,
+                    relation.created_at or now,
+                ),
+            )
+
+    async def _relation_run_recorded_unlocked(self, bundle: RelationOutcomeBundle) -> bool:
+        """Whether this relation run is already recorded; a retry must match it exactly."""
+
         async with self.db.execute(
             "SELECT * FROM relation_runs WHERE id = ?",
-            (run.id,),
+            (bundle.relation_run.id,),
         ) as cursor:
             existing_run = await cursor.fetchone()
-        if existing_run is not None:
-            _assert_relation_run_retry_matches(existing_run, run)
-            existing_audit = json.loads(existing_run["audit_json"] or "{}")
-            await self._assert_relation_bundle_retry_matches_unlocked(bundle, existing_audit)
-            return
+        if existing_run is None:
+            return False
+        _assert_relation_run_retry_matches(existing_run, bundle.relation_run)
+        existing_audit = json.loads(existing_run["audit_json"] or "{}")
+        await self._assert_relation_bundle_retry_matches_unlocked(bundle, existing_audit)
+        return True
 
-        lifecycle_action = run.lifecycle_action.value if run.lifecycle_action is not None else None
-        review_case = run.review_case.value if run.review_case is not None else None
+    async def _upsert_evidence_unit_unlocked(self, unit: EvidenceUnit) -> None:
         provenance = (
             unit.evidence_provenance.value
             if isinstance(unit.evidence_provenance, EvidenceContentProvenance)
             else str(unit.evidence_provenance)
         )
         now = _now_iso()
-        if update_evidence_unit:
-            await self.db.execute(
-                """INSERT INTO evidence_units (
-                        id, source_id, doc_id, doc_revision_id, source_type, client,
-                        repo_identifier, source_anchor, source_lineage_id,
-                        source_metadata_json, project_key, visibility, owner_user_id,
-                        observed_at, extractor_run_id, access_context_hash,
-                        content, excerpt, evidence_provenance, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        observed_at=excluded.observed_at,
-                        access_context_hash=excluded.access_context_hash,
-                        updated_at=excluded.updated_at""",
-                (
-                    unit.id,
-                    unit.source_id,
-                    unit.doc_id,
-                    unit.doc_revision_id,
-                    unit.source_type,
-                    unit.client,
-                    unit.repo_identifier,
-                    unit.source_anchor,
-                    unit.source_lineage_id,
-                    json.dumps(dict(unit.source_metadata), sort_keys=True),
-                    _normalize_project_key(unit.project_key),
-                    unit.visibility,
-                    unit.owner_user_id,
-                    unit.observed_at,
-                    unit.extractor_run_id,
-                    unit.access_context_hash,
-                    unit.content,
-                    unit.excerpt,
-                    provenance,
-                    now,
-                    now,
-                ),
-            )
+        await self.db.execute(
+            """INSERT INTO evidence_units (
+                    id, source_id, doc_id, doc_revision_id, source_type, client,
+                    repo_identifier, source_anchor, source_lineage_id,
+                    source_metadata_json, project_key, visibility, owner_user_id,
+                    observed_at, extractor_run_id, access_context_hash,
+                    content, excerpt, evidence_provenance, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    observed_at=excluded.observed_at,
+                    access_context_hash=excluded.access_context_hash,
+                    updated_at=excluded.updated_at""",
+            (
+                unit.id,
+                unit.source_id,
+                unit.doc_id,
+                unit.doc_revision_id,
+                unit.source_type,
+                unit.client,
+                unit.repo_identifier,
+                unit.source_anchor,
+                unit.source_lineage_id,
+                json.dumps(dict(unit.source_metadata), sort_keys=True),
+                _normalize_project_key(unit.project_key),
+                unit.visibility,
+                unit.owner_user_id,
+                unit.observed_at,
+                unit.extractor_run_id,
+                unit.access_context_hash,
+                unit.content,
+                unit.excerpt,
+                provenance,
+                now,
+                now,
+            ),
+        )
+
+    async def _insert_relation_run_unlocked(self, bundle: RelationOutcomeBundle) -> None:
+        """Record one relation run and its candidates."""
+
+        run = bundle.relation_run
+        lifecycle_action = run.lifecycle_action.value if run.lifecycle_action is not None else None
+        review_case = run.review_case.value if run.review_case is not None else None
+        now = _now_iso()
         await self.db.execute(
             """INSERT INTO relation_runs (
                         id, evidence_unit_id, access_context_hash, candidate_count,
@@ -13616,76 +14258,7 @@ class Database:
                     candidate.reason,
                 ),
             )
-        preserve_authoritative_relations = projection_plane is RelationProjectionPlane.DISCOVERY
-        if preserve_authoritative_relations and any(relation.is_authoritative_support for relation in bundle.relations):
-            raise ValueError("relation discovery cannot publish authoritative support")
-        relation_delete_sql = "DELETE FROM evidence_relations WHERE evidence_unit_id = ?"
-        if preserve_authoritative_relations:
-            relation_delete_sql += " AND is_authoritative_support = 0"
-        await self.db.execute(relation_delete_sql, (unit.id,))
-        for relation in bundle.relations:
-            validate_persisted_evidence_relation(relation)
-            await self.db.execute(
-                """INSERT INTO relation_run_relations (
-                            relation_run_id, evidence_unit_id, memory_id, relation_type, relation_direction,
-                            authority_case, is_authoritative_support, source_lineage_id,
-                            confidence, reason, proposed_memory_content, excerpt,
-                            classifier_version, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    relation.relation_run_id,
-                    relation.evidence_unit_id,
-                    relation.memory_id,
-                    relation.relation_type.value,
-                    relation.direction.value if relation.direction is not None else None,
-                    relation.authority_case.value,
-                    1 if relation.is_authoritative_support else 0,
-                    relation.source_lineage_id,
-                    relation.confidence,
-                    relation.reason,
-                    relation.proposed_memory_content,
-                    relation.excerpt,
-                    relation.classifier_version,
-                    relation.created_at or now,
-                ),
-            )
-            current_relation_insert = "INSERT INTO evidence_relations"
-            current_relation_values = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            current_relation_guard: tuple[object, ...] = ()
-            if preserve_authoritative_relations:
-                current_relation_values = (
-                    "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
-                    "WHERE NOT EXISTS ("
-                    "SELECT 1 FROM evidence_relations "
-                    "WHERE evidence_unit_id = ? AND memory_id = ? "
-                    "AND is_authoritative_support = 1)"
-                )
-                current_relation_guard = (relation.evidence_unit_id, relation.memory_id)
-            await self.db.execute(
-                f"""{current_relation_insert} (
-                            evidence_unit_id, memory_id, relation_type, relation_direction, authority_case,
-                            is_authoritative_support, source_lineage_id, confidence,
-                            reason, proposed_memory_content, excerpt, classifier_version,
-                            relation_run_id, created_at
-                        ) {current_relation_values}""",
-                (
-                    relation.evidence_unit_id,
-                    relation.memory_id,
-                    relation.relation_type.value,
-                    relation.direction.value if relation.direction is not None else None,
-                    relation.authority_case.value,
-                    1 if relation.is_authoritative_support else 0,
-                    relation.source_lineage_id,
-                    relation.confidence,
-                    relation.reason,
-                    relation.proposed_memory_content,
-                    relation.excerpt,
-                    relation.classifier_version,
-                    relation.relation_run_id,
-                    relation.created_at or now,
-                    *current_relation_guard,
-                ),
-            )
+        return True
 
     async def _assert_relation_bundle_retry_matches_unlocked(
         self,
@@ -13760,11 +14333,11 @@ class Database:
                 id, memory_type, content, content_hash, visibility, owner_user_id,
                 project_key, repo_identifier,
                 confidence, corroboration_count,
-                contradiction_count, valid_from, valid_until,
+                valid_from, valid_until,
                 superseded_by, status, retirement_reason, retired_at,
                 superseded_at, replacement_reason, replacement_kind, extraction_context,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 mem.id,
                 mem.memory_type,
@@ -13776,7 +14349,6 @@ class Database:
                 mem.repo_identifier,
                 mem.confidence,
                 mem.corroboration_count,
-                mem.contradiction_count,
                 mem.valid_from.isoformat() if mem.valid_from else None,
                 mem.valid_until.isoformat() if mem.valid_until else None,
                 mem.superseded_by,
@@ -13808,11 +14380,11 @@ class Database:
                 id, memory_type, content, content_hash, visibility, owner_user_id,
                 project_key, repo_identifier,
                 confidence, corroboration_count,
-                contradiction_count, valid_from, valid_until,
+                valid_from, valid_until,
                 superseded_by, status, retirement_reason, retired_at,
                 superseded_at, replacement_reason, replacement_kind, extraction_context,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 memory_type=excluded.memory_type,
                 content=excluded.content,
@@ -13823,7 +14395,6 @@ class Database:
                 repo_identifier=excluded.repo_identifier,
                 confidence=excluded.confidence,
                 corroboration_count=excluded.corroboration_count,
-                contradiction_count=excluded.contradiction_count,
                 valid_from=excluded.valid_from,
                 valid_until=excluded.valid_until,
                 superseded_by=excluded.superseded_by,
@@ -13846,7 +14417,6 @@ class Database:
                 mem.repo_identifier,
                 mem.confidence,
                 mem.corroboration_count,
-                mem.contradiction_count,
                 mem.valid_from.isoformat() if mem.valid_from else None,
                 mem.valid_until.isoformat() if mem.valid_until else None,
                 mem.superseded_by,
@@ -13898,7 +14468,6 @@ class Database:
                 if relation_outcome is not None:
                     await self._record_relation_outcome_bundle_unlocked(
                         relation_outcome,
-                        projection_plane=RelationProjectionPlane.LIFECYCLE,
                     )
                 if related_review_id is not None:
                     now = _now_iso()
@@ -14031,7 +14600,6 @@ class Database:
                 if relation_outcome is not None:
                     await self._record_relation_outcome_bundle_unlocked(
                         relation_outcome,
-                        projection_plane=RelationProjectionPlane.LIFECYCLE,
                     )
                 if concept_projection is not None:
                     await self._upsert_agent_concept_unlocked(**concept_projection, observed=observed)
@@ -14613,7 +15181,6 @@ class Database:
                 )
                 await self._record_relation_outcome_bundle_unlocked(
                     relation_outcome,
-                    projection_plane=RelationProjectionPlane.LIFECYCLE,
                 )
                 await self.db.commit()
             except Exception:
@@ -14693,10 +15260,6 @@ class Database:
                 (now, now, memory_id),
             )
             await self.db.execute(
-                "DELETE FROM memory_contradictions WHERE memory_id_a = ? OR memory_id_b = ?",
-                (memory_id, memory_id),
-            )
-            await self.db.execute(
                 "DELETE FROM memory_sources WHERE memory_id = ?",
                 (memory_id,),
             )
@@ -14763,7 +15326,7 @@ class Database:
                     visibility = ?, owner_user_id = ?, project_key = ?,
                     repo_identifier = ?,
                     confidence = ?,
-                    corroboration_count = ?, contradiction_count = ?,
+                    corroboration_count = ?,
                     valid_from = ?, valid_until = ?, superseded_by = ?,
                     status = ?, retirement_reason = ?, retired_at = ?,
                     superseded_at = ?, replacement_reason = ?, replacement_kind = ?, extraction_context = ?,
@@ -14779,7 +15342,6 @@ class Database:
                     memory.repo_identifier,
                     memory.confidence,
                     memory.corroboration_count,
-                    memory.contradiction_count,
                     memory.valid_from.isoformat() if memory.valid_from else None,
                     memory.valid_until.isoformat() if memory.valid_until else None,
                     memory.superseded_by,
@@ -14853,7 +15415,6 @@ class Database:
                 )
                 await self._record_relation_outcome_bundle_unlocked(
                     relation_outcome,
-                    projection_plane=RelationProjectionPlane.LIFECYCLE,
                 )
                 await self.db.commit()
                 return outcome
@@ -15125,7 +15686,6 @@ class Database:
                 if relation_outcome is not None:
                     await self._record_relation_outcome_bundle_unlocked(
                         relation_outcome,
-                        projection_plane=RelationProjectionPlane.LIFECYCLE,
                     )
                 await self.db.commit()
             except Exception:
@@ -15776,98 +16336,287 @@ class Database:
                         grouped[str(row["memory_id"])].append(source_id)
         return {memory_id: tuple(dict.fromkeys(grouped[memory_id])) for memory_id in ids}
 
-    async def list_memory_conflict_contexts(
+    async def get_memory_source_refs_many(
         self,
         memory_ids: Sequence[str],
         scope,
-    ) -> Mapping[str, tuple[MemoryConflictContext, ...]]:
-        """Return bounded cross-source Review dispositions visible at both ends."""
+    ) -> Mapping[str, tuple[MemorySourceRef, ...]]:
+        """Return the Sources of many Memories that the caller may read."""
 
-        ordered_ids = tuple(dict.fromkeys(memory_ids))
-        if not ordered_ids:
-            return {}
-        contexts: dict[str, list[MemoryConflictContext]] = {
+        ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
+        grouped: dict[str, list[MemorySourceRef]] = {memory_id: [] for memory_id in ids}
+        readable_sql, readable_params = readable_source_sql(scope, "source")
+        virtual_ids = sorted(VIRTUAL_DOCUMENT_SOURCE_IDS)
+        virtual_placeholders = ", ".join("?" for _ in virtual_ids)
+        for offset in range(0, len(ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = ids[offset : offset + STORAGE_BIND_CHUNK_SIZE]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = await self.db.execute_fetchall(
+                f"""SELECT ms.memory_id, ms.source_id, MIN(ms.source_type) AS source_type,
+                           source.name AS source_name
+                      FROM memory_sources ms
+                      LEFT JOIN sources source ON source.id = ms.source_id
+                     WHERE ms.memory_id IN ({placeholders})
+                       AND (
+                           ms.source_id IN ({virtual_placeholders})
+                           OR (source.id IS NOT NULL AND {readable_sql})
+                       )
+                     GROUP BY ms.memory_id, ms.source_id, source.name
+                     ORDER BY ms.memory_id, ms.source_id""",
+                [*chunk, *virtual_ids, *readable_params],
+            )
+            for row in rows:
+                grouped[str(row["memory_id"])].append(
+                    MemorySourceRef(
+                        source_id=str(row["source_id"]),
+                        source_type=str(row["source_type"]),
+                        name=row["source_name"],
+                    )
+                )
+        return {memory_id: tuple(refs) for memory_id, refs in grouped.items()}
+
+    async def list_cross_document_relations(
+        self,
+        memory_ids: Sequence[str],
+        scope,
+    ) -> Mapping[str, tuple[CurrentCrossDocumentRelation, ...]]:
+        """Return the current relations of each Memory, most consequential label first."""
+
+        ordered_ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
+        relations: dict[str, list[CurrentCrossDocumentRelation]] = {
             memory_id: [] for memory_id in ordered_ids
         }
-        target_visibility_sql, target_visibility_params = visible_sql(scope, "target")
-        counterpart_visibility_sql, counterpart_visibility_params = visible_sql(scope, "counterpart")
+        current_sql, current_params = _current_cross_document_relation_sql(scope)
+        order_sql, order_params = _relation_read_order_sql("sides.label")
         for start in range(0, len(ordered_ids), STORAGE_BIND_CHUNK_SIZE):
             batch = ordered_ids[start : start + STORAGE_BIND_CHUNK_SIZE]
             placeholders = ",".join("?" for _ in batch)
-            sql = f"""
-                WITH review_participants AS (
-                    SELECT r.id AS review_id,
-                           r.incumbent_memory_id AS memory_id,
-                           r.challenger_memory_id AS counterpart_memory_id,
-                           r.status AS review_status,
-                           r.reason, r.review_note, r.reviewer,
-                           r.expected_incumbent_updated_at AS expected_memory_updated_at,
-                           r.expected_challenger_updated_at AS expected_counterpart_updated_at,
-                           r.created_at, r.resolved_at
-                      FROM memory_reviews r
-                     WHERE r.kind = 'cross_source_conflict'
+            rows = await self.db.execute_fetchall(
+                f"""
+                WITH current_relations AS (
+                    SELECT r.* {current_sql}
+                       AND (r.memory_low_id IN ({placeholders}) OR r.memory_high_id IN ({placeholders}))
+                ), sides AS (
+                    SELECT cr.memory_low_id AS memory_id, cr.*
+                      FROM current_relations cr WHERE cr.memory_low_id IN ({placeholders})
                     UNION ALL
-                    SELECT r.id AS review_id,
-                           r.challenger_memory_id AS memory_id,
-                           r.incumbent_memory_id AS counterpart_memory_id,
-                           r.status AS review_status,
-                           r.reason, r.review_note, r.reviewer,
-                           r.expected_challenger_updated_at AS expected_memory_updated_at,
-                           r.expected_incumbent_updated_at AS expected_counterpart_updated_at,
-                           r.created_at, r.resolved_at
-                      FROM memory_reviews r
-                     WHERE r.kind = 'cross_source_conflict'
-                ), visible_pairs AS (
-                    SELECT rp.review_id, rp.memory_id, rp.counterpart_memory_id,
-                           CASE WHEN rp.review_status = 'pending' AND (
-                               (rp.expected_memory_updated_at IS NOT NULL
-                                AND rp.expected_memory_updated_at <> target.updated_at)
-                               OR (rp.expected_counterpart_updated_at IS NOT NULL
-                                   AND rp.expected_counterpart_updated_at <> counterpart.updated_at)
-                           ) THEN 'stale' ELSE rp.review_status END AS review_status,
-                           rp.reason, rp.review_note, rp.reviewer,
-                           rp.created_at, rp.resolved_at,
-                           counterpart.content AS counterpart_summary
-                      FROM review_participants rp
-                      JOIN memories target ON target.id = rp.memory_id
-                      JOIN memories counterpart ON counterpart.id = rp.counterpart_memory_id
-                     WHERE rp.memory_id IN ({placeholders})
-                       AND {target_visibility_sql}
-                       AND {counterpart_visibility_sql}
+                    SELECT cr.memory_high_id AS memory_id, cr.*
+                      FROM current_relations cr WHERE cr.memory_high_id IN ({placeholders})
                 ), ranked AS (
-                    SELECT visible_pairs.*,
+                    SELECT sides.*,
                            ROW_NUMBER() OVER (
-                               PARTITION BY memory_id
-                               ORDER BY created_at DESC, review_id
+                               PARTITION BY sides.memory_id
+                               ORDER BY {order_sql}, sides.decided_at DESC,
+                                        sides.memory_low_id, sides.memory_high_id
                            ) AS position
-                      FROM visible_pairs
+                      FROM sides
                 )
                 SELECT * FROM ranked
-                 WHERE position <= 10
-                 ORDER BY memory_id, created_at DESC, review_id
-            """
-            params = [
-                *batch,
-                *target_visibility_params,
-                *counterpart_visibility_params,
-            ]
-            async with self.db.execute(sql, params) as cursor:
-                async for row in cursor:
-                    review_status = str(row["review_status"])
-                    contexts[str(row["memory_id"])].append(
-                        MemoryConflictContext(
-                            review_id=str(row["review_id"]),
-                            counterpart_memory_id=str(row["counterpart_memory_id"]),
-                            counterpart_summary=str(row["counterpart_summary"]),
-                            review_status=review_status,
-                            disposition=conflict_disposition_for_review_status(review_status),
-                            reason=row["reason"],
-                            review_note=row["review_note"],
-                            reviewer=row["reviewer"],
-                            resolved_at=row["resolved_at"],
+                 WHERE position <= ?
+                 ORDER BY memory_id, position
+                """,
+                [
+                    *current_params,
+                    *batch,
+                    *batch,
+                    *batch,
+                    *batch,
+                    *order_params,
+                    MAX_RELATIONS_PER_MEMORY,
+                ],
+            )
+            for row in rows:
+                relations[str(row["memory_id"])].append(_row_to_current_cross_document_relation(row))
+        return {memory_id: tuple(items) for memory_id, items in relations.items()}
+
+    async def list_current_cross_document_relations(
+        self,
+        scope,
+        *,
+        labels: Collection[CrossDocumentRelationLabel] | None = None,
+    ) -> tuple[CurrentCrossDocumentRelation, ...]:
+        """Every relation current for the caller, newest decision first.
+
+        ``labels`` keeps the relations stored with one of these labels.
+        """
+
+        current_sql, current_params = _current_cross_document_relation_sql(scope)
+        label_sql, label_params = "", []
+        if labels is not None:
+            label_sql = f"AND r.label IN ({', '.join('?' for _ in labels)})"
+            label_params = [label.value for label in labels]
+        rows = await self.db.execute_fetchall(
+            f"""SELECT r.* {current_sql} {label_sql}
+                 ORDER BY r.decided_at DESC, r.memory_low_id, r.memory_high_id""",
+            [*current_params, *label_params],
+        )
+        return tuple(_row_to_current_cross_document_relation(row) for row in rows)
+
+    async def record_cross_document_relation_dismissal(
+        self,
+        *,
+        memory_id: str,
+        counterpart_memory_id: str,
+        label: CrossDocumentRelationLabel,
+        expected_content_hash: str,
+        counterpart_expected_content_hash: str,
+        actor: str,
+        note: str | None = None,
+    ) -> CrossDocumentRelationDismissal:
+        """Dismiss one relation label for both Memories' current content.
+
+        Dismissing the same label for the same content again returns the
+        dismissal already in force.
+        """
+
+        if label is CrossDocumentRelationLabel.NONE:
+            raise ValueError("a none label is not a relation to dismiss")
+        low_id, high_id = pair_key(memory_id, counterpart_memory_id)
+        expected = {
+            memory_id: expected_content_hash,
+            counterpart_memory_id: counterpart_expected_content_hash,
+        }
+        async with self._write_lock:
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                current = await self._current_content_hashes_unlocked((low_id, high_id))
+                if set(current) != {low_id, high_id}:
+                    raise LookupError("relation Memory not found")
+                if current != expected:
+                    raise RelationDismissalConflict("memory_content_changed")
+                existing = await self.db.execute_fetchall(
+                    """SELECT * FROM cross_document_relation_dismissals
+                        WHERE memory_low_id = ? AND memory_high_id = ? AND label = ?
+                          AND low_content_hash = ? AND high_content_hash = ?
+                          AND restored_at IS NULL""",
+                    (low_id, high_id, label.value, current[low_id], current[high_id]),
+                )
+                if existing:
+                    await self.db.rollback()
+                    return _row_to_cross_document_relation_dismissal(existing[0])
+                dismissal = CrossDocumentRelationDismissal(
+                    id=f"rdm-{uuid.uuid4().hex}",
+                    memory_low_id=low_id,
+                    memory_high_id=high_id,
+                    label=label,
+                    low_content_hash=current[low_id],
+                    high_content_hash=current[high_id],
+                    dismissed_by=actor,
+                    dismissed_at=_now_iso(),
+                    note=note,
+                )
+                await self.db.execute(
+                    """INSERT INTO cross_document_relation_dismissals (
+                           id, memory_low_id, memory_high_id, label,
+                           low_content_hash, high_content_hash,
+                           dismissed_by, dismissed_at, note
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        dismissal.id,
+                        dismissal.memory_low_id,
+                        dismissal.memory_high_id,
+                        dismissal.label.value,
+                        dismissal.low_content_hash,
+                        dismissal.high_content_hash,
+                        dismissal.dismissed_by,
+                        dismissal.dismissed_at,
+                        dismissal.note,
+                    ),
+                )
+                await self._insert_memory_audit_event_unlocked(
+                    _relation_dismissal_audit_event(
+                        "cross_document_relation_dismissed",
+                        dismissal,
+                        memory_id=memory_id,
+                        actor=actor,
+                    )
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return dismissal
+
+    async def restore_cross_document_relation_dismissals(
+        self,
+        *,
+        memory_id: str,
+        counterpart_memory_id: str,
+        actor: str,
+    ) -> tuple[CrossDocumentRelationDismissal, ...]:
+        """Undo the dismissals in force for one pair; returns the ones undone."""
+
+        low_id, high_id = pair_key(memory_id, counterpart_memory_id)
+        async with self._write_lock:
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                rows = await self.db.execute_fetchall(
+                    f"""SELECT d.* {_ACTIVE_RELATION_DISMISSAL_SQL}
+                          AND d.memory_low_id = ? AND d.memory_high_id = ?
+                        ORDER BY d.dismissed_at, d.id""",
+                    (low_id, high_id),
+                )
+                restored = tuple(_row_to_cross_document_relation_dismissal(row) for row in rows)
+                restored_at = _now_iso()
+                for dismissal in restored:
+                    await self.db.execute(
+                        """UPDATE cross_document_relation_dismissals
+                              SET restored_by = ?, restored_at = ?
+                            WHERE id = ? AND restored_at IS NULL""",
+                        (actor, restored_at, dismissal.id),
+                    )
+                    await self._insert_memory_audit_event_unlocked(
+                        _relation_dismissal_audit_event(
+                            "cross_document_relation_restored",
+                            dismissal,
+                            memory_id=memory_id,
+                            actor=actor,
                         )
                     )
-        return {memory_id: tuple(items) for memory_id, items in contexts.items()}
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return restored
+
+    async def list_active_cross_document_relation_dismissals(
+        self,
+        memory_id: str,
+        scope,
+        *,
+        limit: int,
+    ) -> tuple[CrossDocumentRelationDismissal, ...]:
+        """The dismissals in force for one Memory's pairs, newest first.
+
+        In force means not undone and bound to both current contents; both
+        Memories are active and visible to the caller.
+        """
+
+        low_visibility_sql, low_visibility_params = visible_sql(scope, "dismissed_low")
+        high_visibility_sql, high_visibility_params = visible_sql(scope, "dismissed_high")
+        rows = await self.db.execute_fetchall(
+            f"""SELECT d.* {_ACTIVE_RELATION_DISMISSAL_SQL}
+                  AND ? IN (d.memory_low_id, d.memory_high_id)
+                  AND dismissed_low.status = 'active' AND dismissed_high.status = 'active'
+                  AND {low_visibility_sql}
+                  AND {high_visibility_sql}
+                 ORDER BY d.dismissed_at DESC, d.id
+                 LIMIT ?""",
+            (memory_id, *low_visibility_params, *high_visibility_params, limit),
+        )
+        return tuple(_row_to_cross_document_relation_dismissal(row) for row in rows)
+
+    async def _current_content_hashes_unlocked(self, memory_ids: Sequence[str]) -> dict[str, str]:
+        hashes: dict[str, str] = {}
+        for offset in range(0, len(memory_ids), STORAGE_BIND_CHUNK_SIZE):
+            chunk = tuple(memory_ids[offset : offset + STORAGE_BIND_CHUNK_SIZE])
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = await self.db.execute_fetchall(
+                f"SELECT id, content_hash FROM memories WHERE id IN ({placeholders})",
+                chunk,
+            )
+            hashes.update({str(row["id"]): str(row["content_hash"]) for row in rows})
+        return hashes
 
     async def get_memory_ids_for_doc(self, doc_id: str) -> list[str]:
         ids: list[str] = []
@@ -16177,11 +16926,11 @@ class Database:
                     id, memory_type, content, content_hash, visibility, owner_user_id,
                     project_key, repo_identifier,
                     confidence, corroboration_count,
-                    contradiction_count, valid_from, valid_until,
+                    valid_from, valid_until,
                     superseded_by, status, retirement_reason, retired_at,
                     superseded_at, replacement_reason, replacement_kind, extraction_context,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         new_memory.id,
                         new_memory.memory_type,
@@ -16193,7 +16942,6 @@ class Database:
                         new_memory.repo_identifier,
                         new_memory.confidence,
                         new_memory.corroboration_count,
-                        new_memory.contradiction_count,
                         new_memory.valid_from.isoformat() if new_memory.valid_from else None,
                         new_memory.valid_until.isoformat() if new_memory.valid_until else None,
                         new_memory.superseded_by,
@@ -16301,7 +17049,6 @@ class Database:
                 if relation_outcome is not None:
                     await self._record_relation_outcome_bundle_unlocked(
                         relation_outcome,
-                        projection_plane=RelationProjectionPlane.LIFECYCLE,
                     )
                 await self.db.commit()
             except Exception:
@@ -23021,64 +23768,6 @@ class Database:
             await self.db.commit()
 
     # ==================================================================
-    # ==================================================================
-    # Contradictions
-    # ==================================================================
-
-    async def record_contradiction(
-        self,
-        memory_id_a: str,
-        memory_id_b: str,
-        classification: str,
-        reason: str | None = None,
-    ) -> None:
-        """Record a contradiction between two memories and increment their counts."""
-        if memory_id_a == memory_id_b:
-            raise ValueError("contradiction requires two distinct Memories")
-        memory_id_a, memory_id_b = sorted((memory_id_a, memory_id_b))
-        async with self._write_lock:
-            try:
-                await self.db.execute("BEGIN IMMEDIATE")
-                async with self.db.execute(
-                    """SELECT classification
-                         FROM memory_contradictions
-                        WHERE memory_id_a = ? AND memory_id_b = ?""",
-                    (memory_id_a, memory_id_b),
-                ) as cursor:
-                    existing = await cursor.fetchone()
-                increment = False
-                if existing is None:
-                    await self.db.execute(
-                        """INSERT INTO memory_contradictions
-                           (memory_id_a, memory_id_b, classification, reason)
-                           VALUES (?, ?, ?, ?)""",
-                        (memory_id_a, memory_id_b, classification, reason),
-                    )
-                    increment = classification == "contradiction"
-                elif existing["classification"] != "contradiction" and classification == "contradiction":
-                    await self.db.execute(
-                        """UPDATE memory_contradictions
-                              SET classification = ?, reason = ?
-                            WHERE memory_id_a = ? AND memory_id_b = ?""",
-                        (
-                            classification,
-                            reason,
-                            memory_id_a,
-                            memory_id_b,
-                        ),
-                    )
-                    increment = True
-                if increment:
-                    await self.db.execute(
-                        "UPDATE memories SET contradiction_count = contradiction_count + 1 WHERE id IN (?, ?)",
-                        (memory_id_a, memory_id_b),
-                    )
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-
-    # ==================================================================
     # Memory reviews
     # ==================================================================
 
@@ -23113,188 +23802,6 @@ class Database:
             )
             await self.db.commit()
         return review.id
-
-    async def record_memory_review_with_relation_outcome(
-        self,
-        review: MemoryReview,
-        relation_outcome: RelationOutcomeBundle,
-    ) -> str:
-        """Atomically record a review work item and its relation audit.
-
-        Unlike ``mark_memory_pending_review_with_case``, this operation never
-        changes either Memory's lifecycle status.  It is the persistence seam
-        for cross-source findings, where classification alone has no authority
-        to quarantine, supersede, or retire a Memory.
-        """
-        async with self._write_lock:
-            try:
-                await self.db.execute("BEGIN IMMEDIATE")
-                if review.kind == "cross_source_conflict":
-                    memories, supports = await self._load_cross_source_review_snapshots_unlocked(review)
-                    validate_cross_source_review_write(
-                        review,
-                        relation_outcome,
-                        memories=memories,
-                        supports=supports,
-                    )
-                async with self.db.execute(
-                    "SELECT * FROM memory_reviews WHERE id = ?",
-                    (review.id,),
-                ) as cursor:
-                    existing_review = await cursor.fetchone()
-                if existing_review is not None:
-                    validate_pending_review_retry(
-                        review,
-                        self._row_to_review(existing_review),
-                    )
-                    await self._record_relation_outcome_bundle_unlocked(
-                        relation_outcome,
-                        projection_plane=RelationProjectionPlane.LIFECYCLE,
-                    )
-                    await self.db.commit()
-                    return review.id
-
-                now = _now_iso()
-                await self._record_relation_outcome_bundle_unlocked(
-                    relation_outcome,
-                    projection_plane=RelationProjectionPlane.LIFECYCLE,
-                )
-                await self.db.execute(
-                    """INSERT INTO memory_reviews (
-                        id, kind, status, incumbent_memory_id, challenger_memory_id,
-                        reason, review_note, reviewer,
-                        expected_incumbent_updated_at, expected_challenger_updated_at,
-                        expected_support_set_hash, replacement_kind, created_at, resolved_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        review.id,
-                        review.kind,
-                        review.status,
-                        review.incumbent_memory_id,
-                        review.challenger_memory_id,
-                        review.reason,
-                        review.review_note,
-                        review.reviewer,
-                        review.expected_incumbent_updated_at,
-                        review.expected_challenger_updated_at,
-                        review.expected_support_set_hash,
-                        _validate_replacement_kind(review.replacement_kind),
-                        review.created_at.isoformat() if review.created_at else now,
-                        review.resolved_at.isoformat() if review.resolved_at else None,
-                    ),
-                )
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-        return review.id
-
-    async def _load_cross_source_review_snapshots_unlocked(
-        self,
-        review: MemoryReview,
-    ) -> tuple[
-        tuple[CrossSourceReviewMemorySnapshot, ...],
-        tuple[CrossSourceReviewSupportSnapshot, ...],
-    ]:
-        memory_ids = (
-            review.incumbent_memory_id,
-            review.challenger_memory_id,
-        )
-        async with self.db.execute(
-            """SELECT id, status, superseded_by, updated_at, visibility,
-                      owner_user_id, repo_identifier, project_key
-                 FROM memories
-                WHERE id IN (?, ?)""",
-            memory_ids,
-        ) as cursor:
-            memory_rows = await cursor.fetchall()
-        memories = tuple(
-            CrossSourceReviewMemorySnapshot(
-                memory_id=str(row["id"]),
-                status=str(row["status"]),
-                superseded_by=row["superseded_by"],
-                updated_at=row["updated_at"],
-                visibility=str(row["visibility"]),
-                owner_user_id=row["owner_user_id"],
-                repo_identifier=row["repo_identifier"],
-                project_key=row["project_key"],
-            )
-            for row in memory_rows
-        )
-
-        v2 = (
-            await self.get_support_scope_version()
-            is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-        )
-        support_from = (
-            """memory_unit_support_assertions MSA
-                 JOIN evidence_references ER
-                   ON ER.evidence_unit_id = MSA.evidence_unit_id
-                  AND ER.role IN ('primary', 'required')"""
-            if v2
-            else """memory_support_assertions MSA
-                 JOIN evidence_references ER
-                   ON ER.id = MSA.evidence_reference_id"""
-        )
-        async with self.db.execute(
-            f"""SELECT MSA.memory_id,
-                      MSA.source_id AS assertion_source_id,
-                      MSA.access_context_hash AS assertion_access_context_hash,
-                      ER.evidence_unit_id,
-                      EU.source_id AS evidence_source_id,
-                      EU.source_lineage_id AS evidence_source_lineage_id,
-                      EU.visibility AS evidence_visibility,
-                      EU.owner_user_id AS evidence_owner_user_id,
-                      EU.repo_identifier AS evidence_repo_identifier,
-                      EU.project_key AS evidence_project_key,
-                      EU.access_context_hash AS evidence_access_context_hash,
-                      ER.observation_id,
-                      SO.source_id AS observation_source_id,
-                      ER.observation_revision_id,
-                      SO.current_revision_id AS current_observation_revision_id,
-                      SO.source_unit_id,
-                      SU.source_id AS source_unit_source_id,
-                      S.access_policy AS source_access_policy,
-                      S.owner_user_id AS source_owner_user_id
-                 FROM {support_from}
-                 JOIN evidence_units EU
-                   ON EU.id = ER.evidence_unit_id
-                 JOIN source_observations SO
-                   ON SO.id = ER.observation_id
-                 JOIN source_units SU
-                   ON SU.id = SO.source_unit_id
-                 JOIN sources S
-                   ON S.id = MSA.source_id
-                WHERE MSA.memory_id IN (?, ?) AND MSA.active = 1
-                ORDER BY MSA.memory_id, MSA.id, ER.id""",
-            memory_ids,
-        ) as cursor:
-            support_rows = await cursor.fetchall()
-        supports = tuple(
-            CrossSourceReviewSupportSnapshot(
-                memory_id=str(row["memory_id"]),
-                assertion_source_id=str(row["assertion_source_id"]),
-                assertion_access_context_hash=str(row["assertion_access_context_hash"]),
-                evidence_unit_id=str(row["evidence_unit_id"]),
-                evidence_source_id=str(row["evidence_source_id"]),
-                evidence_source_lineage_id=row["evidence_source_lineage_id"],
-                evidence_visibility=str(row["evidence_visibility"]),
-                evidence_owner_user_id=row["evidence_owner_user_id"],
-                evidence_repo_identifier=row["evidence_repo_identifier"],
-                evidence_project_key=row["evidence_project_key"],
-                evidence_access_context_hash=row["evidence_access_context_hash"],
-                observation_id=str(row["observation_id"]),
-                observation_source_id=str(row["observation_source_id"]),
-                observation_revision_id=str(row["observation_revision_id"]),
-                current_observation_revision_id=row["current_observation_revision_id"],
-                source_unit_id=str(row["source_unit_id"]),
-                source_unit_source_id=str(row["source_unit_source_id"]),
-                source_access_policy=str(row["source_access_policy"]),
-                source_owner_user_id=str(row["source_owner_user_id"]),
-            )
-            for row in support_rows
-        )
-        return memories, supports
 
     async def get_memory_review(self, review_id: str) -> MemoryReview | None:
         async with self.db.execute(
@@ -23439,7 +23946,6 @@ class Database:
                 if relation_outcome is not None:
                     await self._record_relation_outcome_bundle_unlocked(
                         relation_outcome,
-                        projection_plane=RelationProjectionPlane.LIFECYCLE,
                     )
                 if related_review_id is not None:
                     async with self.db.execute(
@@ -24143,7 +24649,6 @@ class Database:
             repo_identifier=d.get("repo_identifier"),
             confidence=d["confidence"],
             corroboration_count=d["corroboration_count"],
-            contradiction_count=d["contradiction_count"],
             valid_from=_parse_date(d.get("valid_from")),
             valid_until=_parse_date(d.get("valid_until")),
             superseded_by=d.get("superseded_by"),
