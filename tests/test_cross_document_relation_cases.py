@@ -20,11 +20,17 @@ from memforge.evals.offline_evaluation import (
 )
 from memforge.llm.structured import CrossDocumentRelationResponse
 from memforge.memory.cross_source_conflict_reviews import CROSS_SOURCE_CONFLICT_REVIEW_KIND
-from memforge.memory.cross_document_relation import CrossDocumentRelationLabel
+from memforge.memory.cross_document_relation import (
+    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+    CrossDocumentRelationLabel,
+)
 from memforge.models import Memory, MemoryReview, content_hash
 from memforge.storage.database import Database
 from tests.llm_fixture import FIXTURE_MODEL, fixture_budget
-from tests.relation_evidence_fixture import primary_evidence_unit_fixture
+from tests.relation_evidence_fixture import (
+    primary_evidence_unit_fixture,
+    primary_observation_revision_fixture,
+)
 
 UPDATED_AT = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
 ACTOR = "operator@example.test"
@@ -75,6 +81,10 @@ class _ReviewStore:
 
     async def get_document(self, doc_id):
         return type("Doc", (), {"title": f"Title {doc_id}"})()
+
+    async def get_current_source_observation_revisions(self, source_unit_id):
+        memory_id = source_unit_id.removeprefix("unit-")
+        return {f"obs-{memory_id}": primary_observation_revision_fixture(memory_id)}
 
 
 @pytest.fixture
@@ -143,7 +153,11 @@ async def test_seed_pins_decided_reviews_with_labels_and_is_repeatable(db: Datab
         ground_truth = await db.get_accepted_ground_truth_revision(item.ground_truth_revision_id)
         assert case.case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION
         assert case.source_id == "src-teams"
-        assert case.manifest["challenger"]["statement"] == store.memories[case.manifest["challenger"]["memory_id"]].content
+        assert case.manifest["classifier_version"] == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+        challenger_id = case.manifest["challenger"]["memory_id"]
+        assert case.manifest["challenger"]["statement"] == store.memories[challenger_id].content
+        assert case.manifest["challenger"]["evidence"] == [f"Evidence for {challenger_id}."]
+        assert case.manifest["challenger"]["evidence_time"] == "2026-03-25"
         assert case.manifest["candidate"]["document_title"].startswith("Title ")
         labels_by_review[case.manifest["origin"]["review_id"]] = (
             ground_truth.rubric["expected_label"],
@@ -208,7 +222,7 @@ async def test_relation_run_reports_label_precision_and_recall(db: Database) -> 
             "code_revision": "test",
             "prompt_hash": "test",
             "schema_version": "1",
-            "contract_version": "cross-document-relation-v1",
+            "contract_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
             "model": FIXTURE_MODEL,
             "replay_harness_version": "1",
         },
@@ -263,3 +277,98 @@ async def test_seed_route_requires_a_maintenance_operator(db: Database, tmp_path
             "skipped": {"memory_changed": 0, "private_memory": 0, "no_source_evidence": 0},
         }
         assert unknown.status_code == 400
+
+
+async def _executed_relation_run(db: Database) -> str:
+    seed = await seed_cross_document_relation_cases(
+        _review_store(),
+        OfflineAgentEvaluation(db, executors={}),
+        actor=ACTOR,
+        label_overrides={},
+    )
+    evaluation = OfflineAgentEvaluation(
+        db,
+        executors={AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION: CrossDocumentRelationReplayExecutor(_LabelClient())},
+    )
+    report = await evaluation.execute_run(
+        cohort_id=seed.cohort_id,
+        candidate_manifest={
+            "code_revision": "test",
+            "prompt_hash": "test",
+            "schema_version": "1",
+            "contract_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+            "model": FIXTURE_MODEL,
+            "replay_harness_version": "1",
+        },
+        evaluator_suite="cross_document_relation",
+        evaluator_version="1",
+        created_by=ACTOR,
+    )
+    return report.run.run_id
+
+
+@pytest.mark.asyncio
+async def test_a_case_pinned_for_another_classifier_is_neither_curated_nor_replayed(db: Database) -> None:
+    run_id = await _executed_relation_run(db)
+    [output, *_rest] = await OfflineAgentEvaluation(db, executors={}).read_case_outputs(
+        run_id, requesting_user_id=ACTOR
+    )
+    earlier = {**output.case.manifest, "classifier_version": "cross-document-relation-v1"}
+
+    with pytest.raises(ValueError, match="cross-document-relation-v1"):
+        await OfflineAgentEvaluation(db, executors={}).curate_case(
+            case_kind=AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION,
+            source_id=output.case.source_id,
+            doc_id=output.case.doc_id,
+            source_unit_id=output.case.source_unit_id,
+            manifest=earlier,
+            promotion_policy_version="test",
+            created_by=ACTOR,
+        )
+    with pytest.raises(ValueError, match="cross-document-relation-v1"):
+        await CrossDocumentRelationReplayExecutor(_LabelClient()).execute(
+            replace(output.case, manifest=earlier),
+            {"model": FIXTURE_MODEL},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("operator", "status"), [(False, 403), (True, 200)])
+async def test_case_outputs_route_returns_pinned_input_label_and_reason(
+    db: Database, tmp_path, operator: bool, status: int
+) -> None:
+    from memforge.server.admin_api import create_admin_app
+
+    run_id = await _executed_relation_run(db)
+    config = AppConfig(base_dir=tmp_path / "memforge")
+    config.sync.worker_enabled = False
+    app = create_admin_app(
+        db=db,
+        config=config,
+        principal_resolver=lambda _request: ACTOR,
+        workspace_role_resolver=lambda _request: "workspace_admin",
+        maintenance_operator_resolver=lambda _request: operator,
+    )
+
+    with TestClient(app) as client:
+        response = client.get(f"/api/v1/agent-evaluations/runs/{run_id}/case-outputs")
+        missing = client.get("/api/v1/agent-evaluations/runs/aer-missing/case-outputs")
+
+    assert response.status_code == status
+    if not operator:
+        return
+    assert missing.status_code == 404
+    payload = response.json()
+    assert payload["run_id"] == run_id
+    by_review = {case["manifest"]["origin"]["review_id"]: case for case in payload["cases"]}
+    assert set(by_review) == {"rev-confirmed", "rev-updated", "rev-dismissed"}
+    confirmed = by_review["rev-confirmed"]
+    assert confirmed["rubric"] == {"expected_label": "contradicts"}
+    assert confirmed["manifest"]["challenger"]["evidence"] == ["Evidence for mem-a."]
+    assert confirmed["result"]["output"] == {
+        "case_kind": AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION.value,
+        "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+        "label": "contradicts",
+        "reason": "fixture",
+    }
+    assert {check["reason_code"] for check in confirmed["checks"]} >= {"contradicts:contradicts"}

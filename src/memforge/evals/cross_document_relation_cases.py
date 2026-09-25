@@ -1,9 +1,11 @@
 """Pin human-labeled Memory pairs as cross-document relation evaluation cases.
 
 The labeled set comes from people's decisions on Cross-Source Conflict Reviews.
-A case pins both Memories as the classifier sees them, so the set survives the
-removal of the Reviews and any later change of either Memory. A decision is
-pinned only while both Memories still hold the version it was made for.
+A case pins both Memories as the classifier sees them, together with the
+classifier contract version whose input it holds, so the set survives the
+removal of the Reviews and any later change of either Memory, and a case is
+replayed only by the contract it was pinned for. A decision is pinned only
+while both Memories still hold the version it was made for.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from memforge.evals.offline_evaluation import (
     OfflineAgentEvaluation,
 )
 from memforge.memory.cross_document_relation import (
+    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
     CrossDocumentRelationLabel,
     RelationSubjectStore,
     load_relation_subjects,
@@ -33,7 +36,7 @@ from memforge.memory.cross_source_conflict_reviews import (
 )
 from memforge.models import Memory, MemoryReview, ReviewStatus, Visibility
 
-RELATION_CASE_POLICY_VERSION = "cross-document-relation-cases-v1"
+RELATION_CASE_POLICY_VERSION = "cross-document-relation-cases-v2"
 RELATION_CASE_GROUP_KEY = "cross_document_relation"
 
 # A person's decision on a Cross-Source Conflict Review, as a relation label.
@@ -201,6 +204,7 @@ async def _pin_case(
         doc_id=unit.doc_id,
         source_unit_id=unit.source_unit_id,
         manifest={
+            "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
             "challenger": subjects[challenger.id].to_manifest(),
             "candidate": subjects[candidate.id].to_manifest(),
             "origin": dict(origin),

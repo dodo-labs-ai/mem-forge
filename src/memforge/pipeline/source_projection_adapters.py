@@ -57,6 +57,12 @@ BUILTIN_SPECIALIZED_SOURCE_TYPES = frozenset(
     }
 )
 
+# Source types whose adapter records the provider's revision time of the one
+# Observation that holds the whole document body (a Confluence page version)
+# as the document time. Other adapters record a sync or submission time, or the
+# update time of an item made of several Observations, as the document time.
+SOURCE_TYPES_WITH_DOCUMENT_REVISION_TIME = frozenset({"confluence"})
+
 _JIRA_OPERATIONAL_HISTORY_FIELDS = frozenset(
     {
         "assignee",

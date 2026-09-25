@@ -5453,6 +5453,31 @@ def create_admin_app(
         execution = await db.get_agent_evaluation_run_execution(run_id)
         return agent_evaluation_report_public_payload(report, execution)
 
+    @evaluation_router.get("/runs/{run_id}/case-outputs")
+    async def get_agent_evaluation_case_outputs(
+        run_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Return each case's pinned input, accepted rubric and candidate output for failure analysis."""
+
+        from memforge.evals.offline_evaluation import (
+            OfflineAgentEvaluation,
+            agent_evaluation_case_outputs_payload,
+        )
+
+        actor = _require_maintenance_operator(request)
+        try:
+            outputs = await OfflineAgentEvaluation(db, executors={}).read_case_outputs(
+                run_id,
+                requesting_user_id=actor,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        return agent_evaluation_case_outputs_payload(run_id, outputs)
+
     @source_router.get("/{source_id}/memory-lifecycle")
     async def get_source_memory_lifecycle(
         source_id: str,
