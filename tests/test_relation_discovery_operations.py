@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from memforge.memory.relation_discovery_contract import (
 from memforge.models import DocumentRecord, Memory, MemoryReview, ReviewStatus, content_hash
 from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 from memforge.storage.database import Database
+from tests.relation_evidence_fixture import primary_evidence_unit_fixture, primary_observation_revision_fixture
 
 MAX_ATTEMPTS = DEFAULT_RELATION_DISCOVERY_BUDGET.max_attempts
 REVIEWED_AT = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
@@ -381,6 +383,21 @@ async def test_rerun_of_completed_work_keeps_its_classifier_version_until_it_com
 # ---------------------------------------------------------------------------
 
 
+def _evidence_times(db: Database, times: dict[str, str]) -> None:
+    """Give each named Memory a Primary Evidence the source recorded at that time."""
+
+    async def evidence_units(memory_id):
+        return (primary_evidence_unit_fixture(memory_id),) if memory_id in times else ()
+
+    async def current_revisions(source_unit_id):
+        memory_id = source_unit_id.removeprefix("unit-")
+        revision = replace(primary_observation_revision_fixture(memory_id), observed_at=times[memory_id])
+        return {revision.observation_id: revision}
+
+    db.get_memory_evidence_units = evidence_units
+    db.get_current_source_observation_revisions = current_revisions
+
+
 async def _seed_reviews(db: Database) -> dict[str, Memory]:
     memories = {memory_id: await _memory(db, memory_id) for memory_id in "abcdefghij"}
     await _review(db, "rev-confirmed", ReviewStatus.APPROVED, challenger=memories["a"], incumbent=memories["b"])
@@ -456,6 +473,7 @@ async def test_conversion_apply_writes_relations_dismissals_reruns_once(db: Data
     [relation] = await db.db.execute_fetchall("SELECT * FROM cross_document_relations")
     assert (relation["memory_low_id"], relation["memory_high_id"]) == (low_id, high_id)
     assert (relation["label"], relation["decided_by"]) == ("contradicts", "review")
+    assert (relation["low_evidence_time"], relation["high_evidence_time"]) == (None, None)
     assert relation["decided_at"] == REVIEWED_AT.isoformat()
     assert relation["low_content_hash"] == memories[low_id].content_hash
     assert [item["label"] for item in search_view["data"]] == ["contradicts"]
@@ -473,8 +491,7 @@ async def test_conversion_apply_writes_relations_dismissals_reruns_once(db: Data
         assert dismissal["note"] == "different payroll runs"
     [dismissed] = detail["dismissed_relations"]
     assert dismissed["counterpart"]["memory_id"] == "d"
-    # Without source revision times an updates relation reads as a conflict.
-    assert dismissed["labels"] == ["contradicts"]
+    assert dismissed["labels"] == ["contradicts", "updates"]
 
     work = {
         row["id"]: (row["status"], row["run_generation"])
@@ -497,6 +514,7 @@ async def test_conversion_apply_writes_relations_dismissals_reruns_once(db: Data
 @pytest.mark.asyncio
 async def test_conversion_report_converts_relabeled_reviews_by_their_label(db: Database, tmp_path) -> None:
     await _seed_reviews(db)
+    _evidence_times(db, {"a": "2026-07-02T08:00:00+00:00", "b": "2026-06-30T08:00:00+00:00"})
     relabels = {
         "rev-confirmed": "updates",
         "rev-dismissed": "equivalent",
@@ -526,6 +544,7 @@ async def test_conversion_apply_writes_a_relabeled_confirmed_review_as_a_confirm
     tmp_path,
 ) -> None:
     await _seed_reviews(db)
+    _evidence_times(db, {"a": "2026-07-02T08:00:00+00:00", "b": "2026-06-30T08:00:00+00:00"})
     relabels = {"rev-confirmed": "updates"}
 
     with _client(db, tmp_path) as client:
@@ -546,8 +565,11 @@ async def test_conversion_apply_writes_a_relabeled_confirmed_review_as_a_confirm
     assert without_relabels.status_code == 409
     assert applied.status_code == 200
     assert applied.json()["complete"] is True
-    [relation] = await db.db.execute_fetchall("SELECT label, decided_by FROM cross_document_relations")
+    [relation] = await db.db.execute_fetchall(
+        "SELECT label, decided_by, low_evidence_time, high_evidence_time FROM cross_document_relations"
+    )
     assert (relation["label"], relation["decided_by"]) == ("updates", "review")
+    assert (relation["low_evidence_time"], relation["high_evidence_time"]) == ("2026-07-02", "2026-06-30")
     [event] = await db.db.execute_fetchall(
         "SELECT payload FROM memory_audit_events WHERE event_type = ?",
         (CONVERSION_APPLIED_EVENT,),
@@ -555,6 +577,27 @@ async def test_conversion_apply_writes_a_relabeled_confirmed_review_as_a_confirm
     assert [(item["review_id"], item["label"]) for item in json.loads(event["payload"])["relations"]] == [
         ("rev-confirmed", "updates")
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "times",
+    [{}, {"a": "2026-07-02T08:00:00+00:00", "b": "2026-07-02T17:00:00+00:00"}],
+    ids=["unknown", "same-date"],
+)
+async def test_conversion_records_an_updates_relabel_as_contradicts_when_evidence_times_do_not_order_it(
+    db: Database, tmp_path, times: dict[str, str]
+) -> None:
+    await _seed_reviews(db)
+    _evidence_times(db, times)
+
+    with _client(db, tmp_path) as client:
+        report = client.post(
+            "/api/v1/memories/cross-source-review-conversion/report",
+            json={"label_overrides": {"rev-confirmed": "updates"}},
+        ).json()
+
+    assert report["relation_labels"] == {"rev-confirmed": "contradicts"}
 
 
 @pytest.mark.asyncio

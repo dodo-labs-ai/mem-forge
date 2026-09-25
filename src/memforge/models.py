@@ -631,17 +631,18 @@ class RelatedMemory:
     summary: str
     content_hash: str
     sources: tuple[MemorySourceRef, ...] = ()
-    # Newest source revision time of the Memory's current Support.
-    revision_at: str | None = None
+    # UTC date on which the source recorded the Evidence the relation was
+    # decided on; None when unknown or outside a relation.
+    evidence_time: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class MemoryRelationContext:
     """One current Cross-Document Relation, read from one of its two Memories.
 
-    ``label`` is the label a reader sees: an ``updates`` pair whose source
-    revision times do not order it reads as ``contradicts``. ``role`` is this
-    Memory's side: ``newer`` or ``older`` for ``updates``, ``peer`` otherwise.
+    ``label`` is the recorded label. ``role`` is this Memory's side: ``newer``
+    or ``older`` for ``updates``, ordered by the Evidence times the relation
+    was decided on, and ``peer`` otherwise.
     """
 
     label: str

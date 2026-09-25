@@ -128,6 +128,8 @@ class _Store:
         self.disabled_lookup_user_id = None
         self.lease_kwargs = None
         self.exhausted_selection = None
+        # Source time of each Memory's Primary Evidence; the fixture time otherwise.
+        self.observed_at: dict[str, str] = {}
         self.work = RelationDiscoveryWork(
             request=RelationDiscoveryRequest(
                 id="work-1",
@@ -186,7 +188,10 @@ class _Store:
 
     async def get_current_source_observation_revisions(self, source_unit_id):
         memory_id = source_unit_id.removeprefix("unit-")
-        return {f"obs-{memory_id}": primary_observation_revision_fixture(memory_id)}
+        revision = primary_observation_revision_fixture(memory_id)
+        if memory_id in self.observed_at:
+            revision = replace(revision, observed_at=self.observed_at[memory_id])
+        return {f"obs-{memory_id}": revision}
 
     async def get_document(self, doc_id):
         return DocumentRecord(
@@ -326,6 +331,7 @@ async def test_relation_discovery_records_one_relation_per_labeled_pair_and_no_r
         _memory("mem-z", "Opposite claim"),
     )
     store = _Store(challenger, candidates)
+    store.observed_at = {"mem-m": "2026-04-02T09:00:00+00:00", "mem-y": "2026-03-01T09:00:00+00:00"}
     classifier = _Classifier(
         {
             "mem-b": CrossDocumentRelationLabel.EQUIVALENT,
@@ -351,6 +357,10 @@ async def test_relation_discovery_records_one_relation_per_labeled_pair_and_no_r
     assert by_pair["mem-b", "mem-m"].low_content_hash == candidates[1].content_hash
     assert by_pair["mem-b", "mem-m"].high_content_hash == challenger.content_hash
     assert by_pair["mem-m", "mem-y"].label is CrossDocumentRelationLabel.UPDATES
+    assert (by_pair["mem-m", "mem-y"].low_evidence_time, by_pair["mem-m", "mem-y"].high_evidence_time) == (
+        "2026-04-02",
+        "2026-03-01",
+    )
     assert by_pair["mem-m", "mem-z"].label is CrossDocumentRelationLabel.CONTRADICTS
     for record in outcome.relations:
         assert record.classifier_version == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
@@ -367,6 +377,27 @@ async def test_relation_discovery_records_one_relation_per_labeled_pair_and_no_r
         "mem-y": "updates",
         "mem-z": "contradicts",
     }
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_records_updates_as_contradicts_when_evidence_times_do_not_order_the_pair() -> None:
+    challenger = _memory("mem-m", "Current claim")
+    same_day = _memory("mem-s", "Claim recorded the same day")
+    untimed = _memory("mem-u", "Claim without a source time")
+    store = _Store(challenger, (same_day, untimed))
+    store.observed_at = {"mem-u": ""}
+
+    await _discovery(
+        store,
+        (same_day, untimed),
+        _Classifier({"mem-s": CrossDocumentRelationLabel.UPDATES, "mem-u": CrossDocumentRelationLabel.UPDATES}),
+    ).process_slice(worker_id="worker-1")
+
+    assert [record.label for record in store.completed.relations] == [
+        CrossDocumentRelationLabel.CONTRADICTS,
+        CrossDocumentRelationLabel.CONTRADICTS,
+    ]
+    assert store.completed_run.relation_run.audit["labels"] == {"mem-s": "updates", "mem-u": "updates"}
 
 
 @pytest.mark.asyncio

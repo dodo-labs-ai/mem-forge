@@ -778,7 +778,7 @@ class RelatedMemoryDetail(BaseModel):
     summary: str
     content_hash: str
     sources: list[MemorySourceRefDetail] = []
-    revision_at: str | None = None
+    evidence_time: str | None = None
 
 
 class MemoryRelationDetail(BaseModel):
@@ -4426,7 +4426,7 @@ def create_admin_app(
     ):
         """List the relations current for the caller, newest decision first.
 
-        A view, not a work queue. ``label`` filters by the label a reader sees.
+        A view, not a work queue. ``label`` filters by the recorded label.
         """
 
         views, total = await list_relation_pairs(

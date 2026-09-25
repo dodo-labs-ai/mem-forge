@@ -18,7 +18,7 @@ def _relation() -> dict[str, object]:
             "summary": "Payroll closes on the 25th.",
             "content_hash": "hash-newer",
             "sources": [{"source_id": "src-jira", "source_type": "jira", "name": "Payroll Jira"}],
-            "revision_at": "2026-08-01T00:00:00+00:00",
+            "evidence_time": "2026-08-01",
         },
         "reason": "The later ticket moves the closing day.",
         "decided_by": "classifier",
@@ -30,7 +30,7 @@ def test_search_compaction_keeps_relations_and_notice() -> None:
         {
             "memory_id": "mem-older",
             "summary": "Payroll closes on the 20th.",
-            "relation_notice": "Updated by the newer Memory mem-newer from Payroll Jira (revised 2026-08-01).",
+            "relation_notice": "Updated by the newer Memory mem-newer from Payroll Jira (recorded 2026-08-01).",
             "relations": [_relation()],
             "corroborated_by": 2,
         }
@@ -39,7 +39,7 @@ def test_search_compaction_keeps_relations_and_notice() -> None:
     assert result == {
         "memory_id": "mem-older",
         "summary": "Payroll closes on the 20th.",
-        "relation_notice": "Updated by the newer Memory mem-newer from Payroll Jira (revised 2026-08-01).",
+        "relation_notice": "Updated by the newer Memory mem-newer from Payroll Jira (recorded 2026-08-01).",
         "relations": [_relation()],
     }
 

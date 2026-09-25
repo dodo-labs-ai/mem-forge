@@ -10,7 +10,6 @@ import {
   RELATION_DISMISS_ACTIONS,
   RELATION_LABEL_NAMES,
   relatedMemorySources,
-  relationRevisionDate,
   relationSentence,
 } from "./relations";
 
@@ -23,17 +22,17 @@ function errorDetail(error: unknown): string | null {
 
 function CounterpartLine({ memory }: { memory: RelatedMemory }) {
   const sources = relatedMemorySources(memory);
-  const revised = relationRevisionDate(memory);
+  const recorded = memory.evidence_time;
   return (
     <div className="space-y-1">
       <Link to={`/memories/${memory.memory_id}`} className="text-sm text-primary hover:underline">
         {memory.summary}
       </Link>
-      {(sources || revised) && (
+      {(sources || recorded) && (
         <div className="text-xs text-muted-foreground">
           {sources}
-          {sources && revised ? " · " : ""}
-          {revised ? `revised ${revised}` : ""}
+          {sources && recorded ? " · " : ""}
+          {recorded ? `recorded ${recorded}` : ""}
         </div>
       )}
     </div>

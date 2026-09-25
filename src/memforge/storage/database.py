@@ -463,6 +463,8 @@ def _row_to_current_cross_document_relation(row: Any) -> CurrentCrossDocumentRel
         label=CrossDocumentRelationLabel(row["label"]),
         low_content_hash=str(row["low_content_hash"]),
         high_content_hash=str(row["high_content_hash"]),
+        low_evidence_time=row["low_evidence_time"],
+        high_evidence_time=row["high_evidence_time"],
         reason=str(row["reason"] or ""),
         decided_by=CrossDocumentRelationDecider(row["decided_by"]),
         decided_at=str(row["decided_at"]),
@@ -828,6 +830,8 @@ def _enabled_source_visibility_condition(
 
 # Cross-document relations between two Memories, bound to both contents, and
 # the dismissals people record for them. A pair is stored lower Memory id first.
+# Each side keeps the Evidence time (a UTC date) the relation was decided on;
+# an updates pair is stored only when those dates order it.
 _CROSS_DOCUMENT_RELATION_DDL = """
 CREATE TABLE IF NOT EXISTS cross_document_relations (
     memory_low_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -835,6 +839,8 @@ CREATE TABLE IF NOT EXISTS cross_document_relations (
     label               TEXT NOT NULL CHECK (label IN ('equivalent', 'updates', 'contradicts')),
     low_content_hash    TEXT NOT NULL,
     high_content_hash   TEXT NOT NULL,
+    low_evidence_time   TEXT,
+    high_evidence_time  TEXT,
     reason              TEXT NOT NULL DEFAULT '',
     classifier_version  TEXT,
     relation_run_id     TEXT,
@@ -842,7 +848,12 @@ CREATE TABLE IF NOT EXISTS cross_document_relations (
     decided_by          TEXT NOT NULL CHECK (decided_by IN ('classifier', 'review')),
     decided_at          TEXT NOT NULL,
     PRIMARY KEY (memory_low_id, memory_high_id),
-    CHECK (memory_low_id < memory_high_id)
+    CHECK (memory_low_id < memory_high_id),
+    CHECK (
+        label <> 'updates'
+        OR (low_evidence_time IS NOT NULL AND high_evidence_time IS NOT NULL
+            AND low_evidence_time <> high_evidence_time)
+    )
 );
 CREATE INDEX IF NOT EXISTS idx_cross_document_relations_high
     ON cross_document_relations(memory_high_id);
@@ -10384,7 +10395,6 @@ class Database:
                     f"""SELECT msa.memory_id, msa.id AS support_id,
                                msa.evidence_unit_id, msa.source_id,
                                msa.access_context_hash, eu.part_set_digest,
-                               eu.observed_at AS source_revision_at,
                                EXISTS (
                                    SELECT 1 FROM evidence_references primary_er
                                    WHERE primary_er.evidence_unit_id = msa.evidence_unit_id
@@ -10411,7 +10421,6 @@ class Database:
                         access_context_hash=str(row["access_context_hash"]),
                         part_set_digest=str(row["part_set_digest"]),
                         is_current=bool(row["is_current"]),
-                        source_revision_at=row["source_revision_at"],
                     )
                     for row in rows
                 )
@@ -10423,12 +10432,10 @@ class Database:
             rows = await self.db.execute_fetchall(
                 f"""SELECT msa.memory_id, msa.evidence_reference_id,
                            msa.source_id, msa.access_context_hash,
-                           er.observation_revision_id = so.current_revision_id AS is_current,
-                           sor.observed_at AS source_revision_at
+                           er.observation_revision_id = so.current_revision_id AS is_current
                     FROM memory_support_assertions msa
                     LEFT JOIN evidence_references er ON er.id = msa.evidence_reference_id
                     LEFT JOIN source_observations so ON so.id = er.observation_id
-                    LEFT JOIN source_observation_revisions sor ON sor.id = er.observation_revision_id
                     WHERE msa.active = 1
                       AND msa.memory_id IN ({placeholders})""",
                 chunk,
@@ -10440,7 +10447,6 @@ class Database:
                     source_id=str(row["source_id"]),
                     access_context_hash=str(row["access_context_hash"]),
                     is_current=bool(row["is_current"]),
-                    source_revision_at=row["source_revision_at"],
                 )
                 for row in rows
             )
@@ -12759,13 +12765,16 @@ class Database:
             await self.db.execute(
                 """INSERT INTO cross_document_relations (
                        memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
+                       low_evidence_time, high_evidence_time,
                        reason, classifier_version, relation_run_id, discovery_work_id,
                        decided_by, decided_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(memory_low_id, memory_high_id) DO UPDATE SET
                        label = excluded.label,
                        low_content_hash = excluded.low_content_hash,
                        high_content_hash = excluded.high_content_hash,
+                       low_evidence_time = excluded.low_evidence_time,
+                       high_evidence_time = excluded.high_evidence_time,
                        reason = excluded.reason,
                        classifier_version = excluded.classifier_version,
                        relation_run_id = excluded.relation_run_id,
@@ -12783,6 +12792,8 @@ class Database:
                     record.label.value,
                     record.low_content_hash,
                     record.high_content_hash,
+                    record.low_evidence_time,
+                    record.high_evidence_time,
                     record.reason,
                     record.classifier_version,
                     record.relation_run_id,
@@ -12995,12 +13006,14 @@ class Database:
                     await self.db.execute(
                         """INSERT INTO cross_document_relations (
                                memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
-                               reason, decided_by, decided_at
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                               low_evidence_time, high_evidence_time, reason, decided_by, decided_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT(memory_low_id, memory_high_id) DO UPDATE SET
                                label = excluded.label,
                                low_content_hash = excluded.low_content_hash,
                                high_content_hash = excluded.high_content_hash,
+                               low_evidence_time = excluded.low_evidence_time,
+                               high_evidence_time = excluded.high_evidence_time,
                                reason = excluded.reason,
                                classifier_version = NULL,
                                relation_run_id = NULL,
@@ -13013,6 +13026,8 @@ class Database:
                             decision.label.value,
                             decision.low_content_hash,
                             decision.high_content_hash,
+                            decision.low_evidence_time,
+                            decision.high_evidence_time,
                             decision.reason,
                             CrossDocumentRelationDecider.REVIEW.value,
                             decision.resolved_at or applied_at,

@@ -7,14 +7,17 @@ dismissed, unless the report and apply requests relabel it by Review id.
 
 | Review | Becomes |
 | --- | --- |
-| labeled ``contradicts``, ``updates`` or ``equivalent``, both Memories unchanged | relation of that label decided by review |
+| labeled ``contradicts``, ``updates`` or ``equivalent``, both Memories unchanged | relation of that label decided by review; ``updates`` is recorded as ``contradicts`` when the Evidence times do not order the pair |
 | labeled ``none``, both Memories unchanged | Relation Dismissals of ``contradicts`` and ``updates`` for both contents |
 | labeled ``none``, a Memory changed | nothing; a dismissal of old content hides nothing |
 | labeled otherwise with a changed Memory, pending or stale | re-run of the challenger's discovery |
 
-A Review converts by its Memories' content alone and never reads their Sources:
-a relation and a dismissal are read under the reader's access to both Memories,
-so a private, changing or deleted Source never holds back the conversion.
+A Review converts by its Memories' content and never reads their Sources: a
+relation and a dismissal are read under the reader's access to both Memories,
+so a private, changing or deleted Source never holds back the conversion. A
+relation records each Memory's Evidence time as discovery would show it to the
+classifier, and an ``updates`` pair is ordered by those times as discovery
+orders it.
 
 A Review labeled ``none`` found that both statements hold, so it dismisses both
 labels that say they cannot. A person who has already undone such a dismissal
@@ -42,7 +45,13 @@ import hashlib
 import json
 from typing import Protocol
 
-from memforge.memory.cross_document_relation import CrossDocumentRelationLabel, pair_key
+from memforge.memory.cross_document_relation import (
+    CrossDocumentRelationLabel,
+    RelationSubjectStore,
+    load_relation_subjects,
+    pair_key,
+    recorded_relation_label,
+)
 from memforge.memory.cross_source_conflict_reviews import (
     CrossSourceConflictReviewStore,
     decided_review_labels,
@@ -83,7 +92,11 @@ class CrossSourceReviewConversionConflict(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ConvertedReviewDecision:
-    """A person's decision on a Review, bound to both Memories' current content."""
+    """A person's decision on a Review, bound to both Memories' current content.
+
+    A relation carries both Memories' Evidence times and the label it is
+    recorded with; a dismissal carries no times.
+    """
 
     review_id: str
     label: CrossDocumentRelationLabel
@@ -91,6 +104,8 @@ class ConvertedReviewDecision:
     memory_high_id: str
     low_content_hash: str
     high_content_hash: str
+    low_evidence_time: str | None
+    high_evidence_time: str | None
     reason: str
     reviewer: str | None
     resolved_at: str | None
@@ -161,7 +176,7 @@ class CrossSourceReviewConversionReceipt:
         )
 
 
-class CrossSourceReviewConversionStore(CrossSourceConflictReviewStore, Protocol):
+class CrossSourceReviewConversionStore(CrossSourceConflictReviewStore, RelationSubjectStore, Protocol):
     async def list_memories_by_ids(self, memory_ids: Sequence[str]) -> list[Memory]: ...
 
     async def get_latest_relation_discovery_work(
@@ -220,7 +235,7 @@ async def build_conversion_plan(
             [memory_id for review in reviews for memory_id in (review.challenger_memory_id, review.incumbent_memory_id)]
         )
     }
-    relations: list[ConvertedReviewDecision] = []
+    decided: list[tuple[MemoryReview, CrossDocumentRelationLabel, Memory, Memory]] = []
     dismissals: list[ConvertedReviewDecision] = []
     discarded: list[str] = []
     rerun: list[str] = []
@@ -236,8 +251,10 @@ async def build_conversion_plan(
             and incumbent is not None
             and review_memories_unchanged(review, challenger=challenger, incumbent=incumbent)
         ):
-            decision = _converted_decision(review, label, challenger, incumbent)
-            (dismissals if label is CrossDocumentRelationLabel.NONE else relations).append(decision)
+            if label is CrossDocumentRelationLabel.NONE:
+                dismissals.append(_converted_decision(review, label, challenger, incumbent))
+            else:
+                decided.append((review, label, challenger, incumbent))
             continue
         if label is CrossDocumentRelationLabel.NONE:
             discarded.append(review.id)
@@ -252,6 +269,20 @@ async def build_conversion_plan(
             rerun_work_ids.append(work.request.id)
         else:
             nothing_to_rerun.append(review.id)
+    subjects = await load_relation_subjects(
+        store,
+        [memory for _review, _label, challenger, incumbent in decided for memory in (challenger, incumbent)],
+    )
+    relations = [
+        _converted_decision(
+            review,
+            label,
+            challenger,
+            incumbent,
+            evidence_times={memory_id: subjects[memory_id].evidence_time for memory_id in (challenger.id, incumbent.id)},
+        )
+        for review, label, challenger, incumbent in decided
+    ]
     exhausted_work_ids = tuple(sorted(work.request.id for work in await _list_exhausted_work(store, max_attempts)))
     fields = {
         "review_ids": tuple(review.id for review in reviews),
@@ -314,16 +345,26 @@ def _converted_decision(
     label: CrossDocumentRelationLabel,
     challenger: Memory,
     incumbent: Memory,
+    *,
+    evidence_times: Mapping[str, str | None] | None = None,
 ) -> ConvertedReviewDecision:
     by_id = {challenger.id: challenger, incumbent.id: incumbent}
     low_id, high_id = pair_key(challenger.id, incumbent.id)
+    times = evidence_times or {}
+    low_time, high_time = times.get(low_id), times.get(high_id)
     return ConvertedReviewDecision(
         review_id=review.id,
-        label=label,
+        label=(
+            label
+            if label is CrossDocumentRelationLabel.NONE
+            else recorded_relation_label(label, low_id, high_id, low_time, high_time)
+        ),
         memory_low_id=low_id,
         memory_high_id=high_id,
         low_content_hash=by_id[low_id].content_hash,
         high_content_hash=by_id[high_id].content_hash,
+        low_evidence_time=low_time,
+        high_evidence_time=high_time,
         reason=review.reason or "",
         reviewer=review.reviewer,
         resolved_at=review.resolved_at.isoformat() if review.resolved_at else None,

@@ -41,7 +41,7 @@ import {
   isReservedProjectKey,
 } from "@/api/projectKeys";
 import { MemoryFiltersPopover } from "./MemoryFiltersPopover";
-import { RELATION_LABEL_NAMES, relatedMemorySources, relationRevisionDate } from "./relations";
+import { RELATION_LABEL_NAMES, relatedMemorySources } from "./relations";
 
 const PAGE_PROJECT_ALL = "all";
 const SHARED_PROJECT_LABEL = "Shared";
@@ -694,7 +694,7 @@ function RelationPairList({
                     <div className="space-y-2">
                       {pair.memories.map((memory) => {
                         const sources = relatedMemorySources(memory);
-                        const revised = relationRevisionDate(memory);
+                        const recorded = memory.evidence_time;
                         return (
                           <Link
                             key={memory.memory_id}
@@ -706,7 +706,7 @@ function RelationPairList({
                               {memory.summary}
                             </div>
                             <div className="text-xs text-muted-foreground">
-                              {[sources, revised ? `revised ${revised}` : ""].filter(Boolean).join(" · ")}
+                              {[sources, recorded ? `recorded ${recorded}` : ""].filter(Boolean).join(" · ")}
                             </div>
                           </Link>
                         );

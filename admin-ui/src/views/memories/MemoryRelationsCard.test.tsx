@@ -22,7 +22,7 @@ const counterpart: RelatedMemory = {
   summary: "Payroll closes on Thursday.",
   content_hash: "hash-b",
   sources: [{ source_id: "src-jira", source_type: "jira", name: "Payroll backlog" }],
-  revision_at: "2026-08-08T09:30:00+00:00",
+  evidence_time: "2026-08-08",
 };
 
 function memoryFixture(overrides: Partial<Memory> = {}): Memory {
