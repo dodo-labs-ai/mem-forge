@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from tests.llm_fixture import FixtureBudgetClient
+from tests.unit_support_fixture import primary_reference, record_unit_support, select_quoted_fragments
 from tests.revision_client_fixture import (
     EvidenceSelection,
     RequiredSelection,
@@ -56,21 +57,15 @@ from memforge.memory.evidence import (
     EvidenceRole,
     EvidenceUnit,
     LifecycleAction,
-    MemorySupportAssertion,
     MemoryUnitSupportAssertion,
     RelationOutcomeBundle,
     RelationRunRecord,
     RelationType,
-    SupportScopeVersion,
     evidence_part_set_digest,
     memory_unit_support_assertion_id,
 )
 from memforge.memory.lifecycle_plan import (
     AuthorityPlanStaleError,
-    CoverageProof,
-    CutoverFindingReason,
-    CutoverFindingStatus,
-    LifecycleCutoverFinding,
     LifecycleGateState,
     LifecycleMutation,
     LifecycleMutationType,
@@ -80,10 +75,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleReviewStatus,
     LifecycleVectorDeliveryResult,
     LifecycleVectorDeliveryState,
-    LifecycleVectorOperation,
-    LifecycleVectorTaskStatus,
     ReconciliationScope,
-    StaleGuard,
 )
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
@@ -110,7 +102,6 @@ from memforge.models import (
     DocumentRecord,
     Memory,
     MemoryExtractionResult,
-    MemorySource,
     NormalizedContent,
     RawContent,
     RawMemory,
@@ -195,6 +186,31 @@ async def _set_fixture_source_type(db: Database, source_type: str) -> None:
         config_json="{}",
         access_policy="workspace",
         owner_user_id="owner-1",
+    )
+
+
+_WORKSPACE_ACCESS_CONTEXT_HASH = lifecycle_access_context_hash(
+    visibility="workspace",
+    owner_user_id=None,
+    project_key="ENG",
+    repo_identifier=None,
+)
+
+
+def _selected(
+    projection: SourceProjection,
+    raw_memories,
+    *,
+    access_context_hash: str = _WORKSPACE_ACCESS_CONTEXT_HASH,
+    **kwargs,
+) -> list[RawMemory]:
+    """Return candidates as the extractor emits them, with their quoted Fragment selected."""
+
+    return select_quoted_fragments(
+        projection,
+        raw_memories,
+        access_context_hash=access_context_hash,
+        **kwargs,
     )
 
 
@@ -686,12 +702,12 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
     await engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(first, [
             RawMemory(
                 content="Service uses PostgreSQL 15.",
                 memory_type="fact",
             )
-        ],
+        ]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -704,7 +720,7 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
         lifecycle_attempt_count=2,
     )
     [incumbent] = await db.list_memories()
-    previous_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    previous_support = await db.get_active_memory_support_unit_ids(incumbent.id)
 
     second = _projection(
         run_id="projection-conflict-review-2",
@@ -723,7 +739,7 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
     stats = await reviewing_engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(second, [
             RawMemory(
                 content="Service uses PostgreSQL 16.",
                 memory_type="fact",
@@ -731,7 +747,7 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
                 evidence_quote="Service uses PostgreSQL 16.",
                 evidence_resolved_from_block=True,
             )
-        ],
+        ]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -746,7 +762,7 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
     assert stats["pending_review"] == 1
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
-    assert await db.get_active_memory_support_reference_ids(incumbent.id) == previous_support
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == previous_support
     assert [memory.id for memory in await db.list_memories()] == [incumbent.id]
     [review] = await db.list_lifecycle_reviews(
         "src-1",
@@ -786,7 +802,7 @@ async def test_additive_refinement_commits_revision_with_candidate_local_evidenc
     await initial_engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(first, [
             RawMemory(
                 content=first_text,
                 memory_type="fact",
@@ -794,7 +810,7 @@ async def test_additive_refinement_commits_revision_with_candidate_local_evidenc
                 evidence_anchor="projection_batch",
                 source_observation_id=first.observations[0].id,
             )
-        ],
+        ]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -823,7 +839,7 @@ async def test_additive_refinement_commits_revision_with_candidate_local_evidenc
     stats = await revision_engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(second, [
             RawMemory(
                 content=second_text,
                 memory_type="fact",
@@ -832,7 +848,7 @@ async def test_additive_refinement_commits_revision_with_candidate_local_evidenc
                 evidence_resolved_from_block=True,
                 source_observation_id=second.observations[0].id,
             )
-        ],
+        ]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -880,7 +896,7 @@ async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branc
     await initial_engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(first, [
             RawMemory(
                 content=claim,
                 memory_type="procedure",
@@ -889,7 +905,7 @@ async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branc
                 source_observation_id=first.observations[0].id,
             )
             for claim in branch_claims
-        ],
+        ]),
         doc_type="runbook",
         project_key="ENG",
         repo_identifier=None,
@@ -922,7 +938,7 @@ async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branc
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(second, [
             RawMemory(
                 content=current_procedure,
                 memory_type="procedure",
@@ -931,7 +947,7 @@ async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branc
                 evidence_resolved_from_block=True,
                 source_observation_id=second.observations[0].id,
             )
-        ],
+        ]),
         doc_type="runbook",
         project_key="ENG",
         repo_identifier=None,
@@ -981,7 +997,7 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
     await initial_engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(first, [
             RawMemory(
                 content=claim,
                 memory_type="procedure",
@@ -990,7 +1006,7 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
                 source_observation_id=first.observations[0].id,
             )
             for claim in branch_claims
-        ],
+        ]),
         doc_type="runbook",
         project_key="ENG",
         repo_identifier=None,
@@ -1023,7 +1039,7 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(second, [
             RawMemory(
                 content=canonical_procedure,
                 memory_type="procedure",
@@ -1032,7 +1048,7 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
                 evidence_resolved_from_block=True,
                 source_observation_id=second.observations[0].id,
             )
-        ],
+        ]),
         doc_type="runbook",
         project_key="ENG",
         repo_identifier=None,
@@ -1082,7 +1098,7 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
     await engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(first, [
             RawMemory(
                 content=("The architecture diagram establishes that A7 remains enabled."),
                 memory_type="decision",
@@ -1091,7 +1107,7 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
                 source_observation_id=page_observation_id,
                 required_source_observation_ids=(artifact_observation_id,),
             )
-        ],
+        ]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -1102,7 +1118,7 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
         source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
     )
     [incumbent] = await db.list_memories()
-    previous_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    previous_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     observation_ids = await db.get_active_memory_support_observation_ids_many(
         (incumbent.id,),
         source_id="src-1",
@@ -1140,7 +1156,7 @@ async def test_inference_ineligible_artifact_revision_preserves_incumbent_suppor
     )
 
     current = await db.get_memory(incumbent.id)
-    current_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert current is not None and current.status == "active"
     assert stats["pending_review"] == 1
     assert current_support == previous_support
@@ -1178,7 +1194,7 @@ async def test_context_artifact_does_not_become_active_support_dependency(
     await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(projection, [
             RawMemory(
                 content="A7 remains enabled.",
                 memory_type="decision",
@@ -1186,7 +1202,7 @@ async def test_context_artifact_does_not_become_active_support_dependency(
                 evidence_anchor="projection_batch",
                 source_observation_id=page_observation_id,
             )
-        ],
+        ]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -1232,7 +1248,7 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
     await engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(first, [
             RawMemory(
                 content="The diagram records that A7 remains enabled.",
                 memory_type="decision",
@@ -1240,7 +1256,7 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
                 source_observation_id=page_observation_id,
                 required_source_observation_ids=(artifact_observation_id,),
             )
-        ],
+        ]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -1251,7 +1267,7 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
         source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
     )
     [incumbent] = await db.list_memories()
-    previous_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    previous_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _projection(
         run_id="projection-artifact-removed",
         body="# Page",
@@ -1285,7 +1301,7 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
     )
 
     current = await db.get_memory(incumbent.id)
-    current_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert current is not None and current.status == "active"
     assert stats["pending_review"] == 1
     assert current_support == previous_support
@@ -1475,13 +1491,13 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
     canonical = RawMemory(
         content=projection.observation_revisions[0].content,
         memory_type="fact",
-        evidence_quote=projection.observation_revisions[0].content,
+        evidence_quote="The payroll trigger remained OPEN and was not processed.",
         source_observation_id=observation_id,
     )
     duplicate = RawMemory(
         content="  # Page\n\nThe   payroll trigger remained OPEN and was not processed. ",
         memory_type="fact",
-        evidence_quote=projection.observation_revisions[0].content,
+        evidence_quote="The payroll trigger remained OPEN and was not processed.",
         source_observation_id=observation_id,
     )
     adapters = build_sqlite_adapters(db, object())
@@ -1496,7 +1512,7 @@ async def test_cold_baseline_collapses_exact_duplicates_before_lifecycle_writes(
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
-        raw_memories=[canonical, duplicate],
+        raw_memories=_selected(projection, [canonical, duplicate]),
         doc_type="ticket",
         project_key="ENG",
         repo_identifier=None,
@@ -1590,7 +1606,7 @@ async def test_projected_lifecycle_records_low_value_admission_without_content(
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
-        raw_memories=[durable, instance_output],
+        raw_memories=_selected(projection, [durable, instance_output]),
         doc_type="document",
         project_key="ENG",
         repo_identifier=None,
@@ -1639,7 +1655,7 @@ async def test_projected_create_persists_validity_as_dates(db: Database) -> None
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
-        raw_memories=[raw],
+        raw_memories=_selected(projection, [raw]),
         doc_type="document",
         project_key="ENG",
         repo_identifier=None,
@@ -1689,7 +1705,7 @@ async def test_entity_resolution_reads_each_mention_with_its_own_memory_text(db:
     await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
-        raw_memories=[payroll],
+        raw_memories=_selected(projection, [payroll]),
         doc_type="document",
         project_key="ENG",
         repo_identifier=None,
@@ -1726,7 +1742,7 @@ async def test_incomplete_candidate_ledger_is_audited_as_fallback_and_keeps_memo
     await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(projection, [
             RawMemory(
                 content="The trigger remained OPEN.",
                 memory_type="fact",
@@ -1739,7 +1755,7 @@ async def test_incomplete_candidate_ledger_is_audited_as_fallback_and_keeps_memo
                 evidence_quote="The trigger was not processed.",
                 source_observation_id=observation_id,
             ),
-        ],
+        ]),
         doc_type="ticket",
         project_key="ENG",
         repo_identifier=None,
@@ -2035,30 +2051,19 @@ async def _seed_incumbent_support(
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
         access_context_hash=access_context_hash,
     )
-    await db.upsert_evidence_unit(unit)
-    reference = (
-        await db.record_evidence_references(
-            unit.id,
-            (
-                EvidenceReference(
-                    role=EvidenceRole.PRIMARY,
-                    anchor=SourceAnchor(
-                        kind=AnchorKind.WHOLE_OBSERVATION,
-                        observation_id=observation.id,
-                        observation_revision_id=revision.id,
-                    ),
-                ),
+    await record_unit_support(
+        db,
+        memory_id=incumbent.id,
+        unit=unit,
+        references=(
+            primary_reference(
+                SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=observation.id,
+                    observation_revision_id=revision.id,
+                )
             ),
-        )
-    )[0]
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id=f"support-{memory_id}",
-            memory_id=incumbent.id,
-            evidence_reference_id=reference.id or "",
-            source_id="src-1",
-            access_context_hash=access_context_hash,
-        )
+        ),
     )
     return incumbent
 
@@ -2105,35 +2110,26 @@ async def _seed_exact_incumbent_support(
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
         access_context_hash=access_context_hash,
     )
-    await db.upsert_evidence_unit(unit)
-    [reference] = await db.record_evidence_references(
-        unit.id,
-        (
-            EvidenceReference(
-                role=EvidenceRole.PRIMARY,
-                anchor=SourceAnchor(
+    await record_unit_support(
+        db,
+        memory_id=incumbent.id,
+        unit=unit,
+        references=(
+            primary_reference(
+                SourceAnchor(
                     kind=AnchorKind.REVISION_RANGE,
                     observation_id=observation.id,
                     observation_revision_id=revision.id,
                     range_start=start,
                     range_end=start + len(memory_content),
-                ),
+                )
             ),
         ),
-    )
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id=f"support-{memory_id}",
-            memory_id=incumbent.id,
-            evidence_reference_id=reference.id or "",
-            source_id="src-1",
-            access_context_hash=access_context_hash,
-        )
     )
     return incumbent
 
 
-async def _add_independent_legacy_support_alternative(
+async def _add_independent_support_alternative(
     db: Database,
     *,
     incumbent: Memory,
@@ -2173,8 +2169,10 @@ async def _add_independent_legacy_support_alternative(
     observation = projection.observations[0]
     revision = projection.observation_revisions[0]
     unit_id = f"eu-{incumbent.id}-{doc_id}"
-    await db.upsert_evidence_unit(
-        EvidenceUnit(
+    await record_unit_support(
+        db,
+        memory_id=incumbent.id,
+        unit=EvidenceUnit(
             id=unit_id,
             source_id="src-1",
             doc_id=doc_id,
@@ -2190,29 +2188,16 @@ async def _add_independent_legacy_support_alternative(
             excerpt=incumbent.content,
             evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
             access_context_hash=access_context_hash,
-        )
-    )
-    [reference] = await db.record_evidence_references(
-        unit_id,
-        (
-            EvidenceReference(
-                role=EvidenceRole.PRIMARY,
-                anchor=SourceAnchor(
+        ),
+        references=(
+            primary_reference(
+                SourceAnchor(
                     kind=AnchorKind.WHOLE_OBSERVATION,
                     observation_id=observation.id,
                     observation_revision_id=revision.id,
-                ),
+                )
             ),
         ),
-    )
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id=f"support-{incumbent.id}-{doc_id}",
-            memory_id=incumbent.id,
-            evidence_reference_id=reference.id or "",
-            source_id="src-1",
-            access_context_hash=access_context_hash,
-        )
     )
     return unit_id
 
@@ -2251,17 +2236,12 @@ async def _seed_v2_stale_cross_unit_scenario(
         item_id="confluence-456",
         page_id="456",
     )
-    alternative_unit_id = await _add_independent_legacy_support_alternative(
+    alternative_unit_id = await _add_independent_support_alternative(
         db,
         incumbent=incumbent,
         projection=alternative,
         doc_id="confluence-456",
         access_context_hash=access_context_hash,
-    )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id=prefix,
     )
     await db.enable_lifecycle_gate("src-1")
     alternative_current = _projection(
@@ -2285,7 +2265,7 @@ async def _seed_v2_stale_cross_unit_scenario(
     )
 
 
-async def _add_same_unit_legacy_support_alternative(
+async def _add_same_unit_support_alternative(
     db: Database,
     *,
     incumbent: Memory,
@@ -2297,8 +2277,10 @@ async def _add_same_unit_legacy_support_alternative(
     excerpt = "A7 is removed."
     start = revision.content.index(excerpt)
     unit_id = f"eu-{incumbent.id}-same-unit-alternative"
-    await db.upsert_evidence_unit(
-        EvidenceUnit(
+    await record_unit_support(
+        db,
+        memory_id=incumbent.id,
+        unit=EvidenceUnit(
             id=unit_id,
             source_id="src-1",
             doc_id="confluence-123",
@@ -2314,31 +2296,18 @@ async def _add_same_unit_legacy_support_alternative(
             excerpt=excerpt,
             evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
             access_context_hash=access_context_hash,
-        )
-    )
-    [reference] = await db.record_evidence_references(
-        unit_id,
-        (
-            EvidenceReference(
-                role=EvidenceRole.PRIMARY,
-                anchor=SourceAnchor(
+        ),
+        references=(
+            primary_reference(
+                SourceAnchor(
                     kind=AnchorKind.REVISION_RANGE,
                     observation_id=observation.id,
                     observation_revision_id=revision.id,
                     range_start=start,
                     range_end=start + len(excerpt),
-                ),
+                )
             ),
         ),
-    )
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id=f"support-{incumbent.id}-same-unit-alternative",
-            memory_id=incumbent.id,
-            evidence_reference_id=reference.id or "",
-            source_id="src-1",
-            access_context_hash=access_context_hash,
-        )
     )
     return unit_id
 
@@ -2413,7 +2382,7 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
     incumbent = await db.get_memory(incumbent.id)
     assert incumbent is not None
     await db.enable_lifecycle_gate("src-1")
-    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
 
     second = _projection(
         run_id="projection-noop-2",
@@ -2421,12 +2390,18 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
         prior=first.source_unit_revisions[0],
         prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
-    raw = RawMemory(
-        content=incumbent.content,
-        memory_type=incumbent.memory_type,
-        confidence=incumbent.confidence,
-        extraction_context="A7 is removed.",
-        evidence_quote="A7 is removed.",
+    [raw] = _selected(
+        second,
+        [
+            RawMemory(
+                content=incumbent.content,
+                memory_type=incumbent.memory_type,
+                confidence=incumbent.confidence,
+                extraction_context="A7 is removed.",
+                evidence_quote="A7 is removed.",
+            )
+        ],
+        access_context_hash="workspace-eng",
     )
     evidence = build_projected_claim_evidence(
         projection=second,
@@ -2461,12 +2436,11 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
             ),
         ),
         incumbents={incumbent.id: incumbent},
-        source_support_reference_ids={incumbent.id: old_support},
-        all_active_support_reference_ids={incumbent.id: old_support},
+        source_support_unit_ids={incumbent.id: old_support},
+        all_active_support_unit_ids={incumbent.id: old_support},
         support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
         observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
-        new_evidence_reference_ids=(),
-        evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
+        evidence_unit_ids_by_claim_hash=evidence.evidence_unit_ids_by_claim_hash,
         defaults=NewMemoryDefaults(
             visibility="workspace",
             owner_user_id=None,
@@ -2482,8 +2456,8 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
 
     await db.apply_source_projection_lifecycle(second, plan)
 
-    current_support = await db.get_active_memory_support_reference_ids(incumbent.id)
-    expected_support = evidence.reference_ids_by_claim_hash[content_hash(raw.content)]
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    expected_support = evidence.evidence_unit_ids_by_claim_hash[content_hash(raw.content)]
     assert current_support == expected_support
     assert set(current_support).isdisjoint(old_support)
     current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
@@ -2550,11 +2524,10 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
         gate_state=LifecycleGateState.GATED,
         operations=(),
         incumbents={},
-        source_support_reference_ids={},
-        all_active_support_reference_ids={},
+        source_support_unit_ids={},
+        all_active_support_unit_ids={},
         support_set_hashes={},
         observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
-        new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
             owner_user_id=None,
@@ -2756,13 +2729,12 @@ async def test_atomic_projection_lifecycle_fences_other_sqlite_writers_before_ba
         gate_state=LifecycleGateState.GATED,
         operations=(),
         incumbents={},
-        source_support_reference_ids={},
-        all_active_support_reference_ids={},
+        source_support_unit_ids={},
+        all_active_support_unit_ids={},
         support_set_hashes={},
         observation_revision_ids=tuple(
             revision.id for revision in second.observation_revisions
         ),
-        new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
             owner_user_id=None,
@@ -3475,7 +3447,7 @@ async def test_noop_preserves_stale_support_only_with_explicit_unresolved_skip(
     incumbent = await db.get_memory(seeded.id)
     assert incumbent is not None
     await db.enable_lifecycle_gate("src-1")
-    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     original_document = await db.get_document("confluence-123")
     assert original_document is not None
     second = _projection(
@@ -3505,11 +3477,10 @@ async def test_noop_preserves_stale_support_only_with_explicit_unresolved_skip(
             ),
         ),
         incumbents={incumbent.id: incumbent},
-        source_support_reference_ids={incumbent.id: old_support},
-        all_active_support_reference_ids={incumbent.id: old_support},
+        source_support_unit_ids={incumbent.id: old_support},
+        all_active_support_unit_ids={incumbent.id: old_support},
         support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
         observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
-        new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
             owner_user_id=None,
@@ -3559,13 +3530,13 @@ async def test_noop_preserves_stale_support_only_with_explicit_unresolved_skip(
     if skip_revalidation:
         await commit()
     else:
-        with pytest.raises(ValueError, match="stale or ambiguous source support"):
+        with pytest.raises(ValueError, match="stale or incomplete Unit support"):
             await commit()
 
     current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
     assert current_unit is not None
     assert current_unit.id == (second if skip_revalidation else first).source_unit_revisions[0].id
-    assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
     assert (await db.get_document("confluence-123")).title == (
         staged_document.title if skip_revalidation else original_document.title
     )
@@ -3596,8 +3567,8 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
     unrelated = await db.get_memory(unrelated.id)
     assert reviewed is not None
     assert unrelated is not None
-    reviewed_support = await db.get_active_memory_support_reference_ids(reviewed.id)
-    unrelated_support = await db.get_active_memory_support_reference_ids(unrelated.id)
+    reviewed_support = await db.get_active_memory_support_unit_ids(reviewed.id)
+    unrelated_support = await db.get_active_memory_support_unit_ids(unrelated.id)
     await db.enable_lifecycle_gate("src-1")
 
     second = _projection(
@@ -3632,11 +3603,11 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
             ),
         ),
         incumbents={reviewed.id: reviewed, unrelated.id: unrelated},
-        source_support_reference_ids={
+        source_support_unit_ids={
             reviewed.id: reviewed_support,
             unrelated.id: unrelated_support,
         },
-        all_active_support_reference_ids={
+        all_active_support_unit_ids={
             reviewed.id: reviewed_support,
             unrelated.id: unrelated_support,
         },
@@ -3645,7 +3616,6 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
             unrelated.id: await db.get_memory_support_set_hash(unrelated.id),
         },
         observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
-        new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
             owner_user_id=None,
@@ -3657,7 +3627,7 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
         ),
     )
 
-    with pytest.raises(ValueError, match="stale or ambiguous source support"):
+    with pytest.raises(ValueError, match="stale or incomplete Unit support"):
         await db.apply_source_projection_lifecycle(second, plan)
 
     current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
@@ -3675,7 +3645,7 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
     incumbent = await _seed_incumbent_support(db, projection=first)
     incumbent = await db.get_memory(incumbent.id)
     assert incumbent is not None
-    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     await db.enable_lifecycle_gate("src-1")
 
     second = _projection(
@@ -3705,11 +3675,10 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
             ),
         ),
         incumbents={incumbent.id: incumbent},
-        source_support_reference_ids={incumbent.id: old_support},
-        all_active_support_reference_ids={incumbent.id: old_support},
+        source_support_unit_ids={incumbent.id: old_support},
+        all_active_support_unit_ids={incumbent.id: old_support},
         support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
         observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
-        new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
             owner_user_id=None,
@@ -3726,10 +3695,10 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
     current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
     assert current_unit is not None
     assert current_unit.id == second.source_unit_revisions[0].id
-    assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
     support_state = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
-    assert support_state.reference_ids == old_support
-    assert support_state.current_reference_ids == ()
+    assert support_state.unit_ids == old_support
+    assert support_state.current_unit_ids == ()
     review = await db.get_lifecycle_review(str(plan.mutations[0].payload["review_id"]))
     assert review is not None
     assert review.status is LifecycleReviewStatus.PENDING
@@ -3744,7 +3713,7 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
     incumbent = await _seed_incumbent_support(db, projection=first)
     incumbent = await db.get_memory(incumbent.id)
     assert incumbent is not None
-    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     await db.enable_lifecycle_gate("src-1")
 
     changed = _projection(
@@ -3773,11 +3742,10 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
             ),
         ),
         incumbents={incumbent.id: incumbent},
-        source_support_reference_ids={incumbent.id: old_support},
-        all_active_support_reference_ids={incumbent.id: old_support},
+        source_support_unit_ids={incumbent.id: old_support},
+        all_active_support_unit_ids={incumbent.id: old_support},
         support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
         observation_revision_ids=tuple(revision.id for revision in changed.observation_revisions),
-        new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
             owner_user_id=None,
@@ -3815,11 +3783,10 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
             ),
         ),
         incumbents={incumbent.id: incumbent},
-        source_support_reference_ids={incumbent.id: old_support},
-        all_active_support_reference_ids={incumbent.id: old_support},
+        source_support_unit_ids={incumbent.id: old_support},
+        all_active_support_unit_ids={incumbent.id: old_support},
         support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
         observation_revision_ids=tuple(revision.id for revision in later.observation_revisions),
-        new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
             owner_user_id=None,
@@ -3834,7 +3801,7 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
     await db.apply_source_projection_lifecycle(later, later_plan)
 
     assert await db.get_lifecycle_plan_status(later_plan.id) == "applied"
-    assert await db.get_active_memory_support_reference_ids(incumbent.id) == old_support
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
     review = await db.get_lifecycle_review(str(review_plan.mutations[0].payload["review_id"]))
     assert review is not None
     assert review.status is LifecycleReviewStatus.PENDING
@@ -3848,7 +3815,7 @@ async def test_stale_cross_unit_support_allows_review_but_blocks_destructive_pla
     first = _projection(run_id="projection-review-unit-1", body="A7 is removed.")
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     changed = _projection(
         run_id="projection-review-unit-2",
         body="A7 is retained.",
@@ -3876,14 +3843,14 @@ async def test_stale_cross_unit_support_allows_review_but_blocks_destructive_pla
                                 "mutation_type": "remove_support",
                                 "memory_id": incumbent.id,
                                 "source_id": "src-1",
-                                "evidence_reference_ids": list(old_support),
+                                "evidence_unit_ids": list(old_support),
                             }
                         ]
                     }
                 },
             ),
         ),
-        coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,)),
+        coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,), incumbent_decisions=()),
         scope=SimpleNamespace(
             source_id="src-1",
             source_unit_id=other.source_units[0].id,
@@ -3896,11 +3863,12 @@ async def test_stale_cross_unit_support_allows_review_but_blocks_destructive_pla
                 mutation_type=LifecycleMutationType.REMOVE_SUPPORT,
                 memory_id=incumbent.id,
                 source_id="src-1",
-                evidence_reference_ids=tuple(old_support),
+                evidence_unit_ids=tuple(old_support),
             ),
         )
-        with pytest.raises(ValueError, match="stale or ambiguous source support"):
+        with pytest.raises(ProjectedLifecycleDeferredError) as raised:
             await db._validate_projected_support_invariant_unlocked(plan)
+        assert raised.value.blocking_source_unit_ids == (first.source_units[0].id,)
     else:
         await db._validate_projected_support_invariant_unlocked(plan)
 
@@ -3912,7 +3880,7 @@ async def test_review_does_not_exempt_mismatched_observation_revision_lineage(
     first = _projection(run_id="projection-review-lineage-1", body="A7 is removed.")
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    support = await db.get_active_memory_support_unit_ids(incumbent.id)
     other = _projection(
         run_id="projection-review-lineage-other",
         body="An unrelated page changes.",
@@ -3921,7 +3889,8 @@ async def test_review_does_not_exempt_mismatched_observation_revision_lineage(
     )
     await db.record_source_projection(other)
     await db.db.execute(
-        "UPDATE evidence_references SET observation_revision_id = ? WHERE id = ?",
+        """UPDATE evidence_references SET observation_revision_id = ?
+            WHERE evidence_unit_id = ? AND role = 'primary'""",
         (other.observation_revisions[0].id, support[0]),
     )
     await db.db.commit()
@@ -3938,21 +3907,21 @@ async def test_review_does_not_exempt_mismatched_observation_revision_lineage(
                                 "mutation_type": "remove_support",
                                 "memory_id": incumbent.id,
                                 "source_id": "src-1",
-                                "evidence_reference_ids": list(support),
+                                "evidence_unit_ids": list(support),
                             }
                         ]
                     }
                 },
             ),
         ),
-        coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,)),
+        coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,), incumbent_decisions=()),
         scope=SimpleNamespace(
             source_id="src-1",
             source_unit_id=first.source_units[0].id,
         ),
     )
 
-    with pytest.raises(ValueError, match="stale or ambiguous source support"):
+    with pytest.raises(ValueError, match="stale or incomplete Unit support"):
         await db._validate_projected_support_invariant_unlocked(plan)
 
 
@@ -3983,19 +3952,19 @@ async def test_projected_support_invariant_cannot_hide_a_missing_lineage_hop(
     )
     await db.record_source_projection(projection)
     incumbent = await _seed_incumbent_support(db, projection=projection)
-    [reference_id] = await db.get_active_memory_support_reference_ids(incumbent.id)
+    [unit_id] = await db.get_active_memory_support_unit_ids(incumbent.id)
     async with db.db.execute(
-        """SELECT er.evidence_unit_id, er.observation_id,
+        """SELECT er.id, er.evidence_unit_id, er.observation_id,
                   er.observation_revision_id, so.source_unit_id
              FROM evidence_references er
              JOIN source_observations so ON so.id = er.observation_id
-            WHERE er.id = ?""",
-        (reference_id,),
+            WHERE er.evidence_unit_id = ? AND er.role = 'primary'""",
+        (unit_id,),
     ) as cursor:
         lineage = await cursor.fetchone()
     assert lineage is not None
     ids = {
-        "reference_id": reference_id,
+        "reference_id": lineage["id"],
         "evidence_unit_id": lineage["evidence_unit_id"],
         "observation_id": lineage["observation_id"],
         "observation_revision_id": lineage["observation_revision_id"],
@@ -4007,14 +3976,14 @@ async def test_projected_support_invariant_cannot_hide_a_missing_lineage_hop(
     await db.db.commit()
     plan = SimpleNamespace(
         mutations=(),
-        coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,)),
+        coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,), incumbent_decisions=()),
         scope=SimpleNamespace(
             source_id="src-1",
             source_unit_id=projection.source_units[0].id,
         ),
     )
 
-    with pytest.raises(ValueError, match="stale or ambiguous source support"):
+    with pytest.raises(ValueError, match="stale or incomplete Unit support"):
         await db._validate_projected_support_invariant_unlocked(plan)
 
 
@@ -4097,34 +4066,23 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
         access_context_hash="workspace-eng",
     )
-    await db.upsert_evidence_unit(other_unit)
-    other_reference = (
-        await db.record_evidence_references(
-            other_unit.id,
-            (
-                EvidenceReference(
-                    role=EvidenceRole.PRIMARY,
-                    anchor=SourceAnchor(
-                        kind=AnchorKind.WHOLE_OBSERVATION,
-                        observation_id=other_observation.id,
-                        observation_revision_id=other_revision.id,
-                    ),
-                ),
+    await record_unit_support(
+        db,
+        memory_id=incumbent.id,
+        unit=other_unit,
+        references=(
+            primary_reference(
+                SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=other_observation.id,
+                    observation_revision_id=other_revision.id,
+                )
             ),
-        )
-    )[0]
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-multi-unit-other",
-            memory_id=incumbent.id,
-            evidence_reference_id=other_reference.id or "",
-            source_id="src-1",
-            access_context_hash="workspace-eng",
-        )
+        ),
     )
     plan = SimpleNamespace(
         mutations=(),
-        coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,)),
+        coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,), incumbent_decisions=()),
         scope=SimpleNamespace(
             source_id="src-1",
             source_unit_id=first.source_units[0].id,
@@ -4136,9 +4094,10 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
                   su.source_id AS unit_source_id,
                   eu.source_lineage_id, so.source_unit_id,
                   er.observation_revision_id, so.current_revision_id
-             FROM memory_support_assertions msa
-             JOIN evidence_references er ON er.id = msa.evidence_reference_id
-             JOIN evidence_units eu ON eu.id = er.evidence_unit_id
+             FROM memory_unit_support_assertions msa
+             JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
+             JOIN evidence_references er
+               ON er.evidence_unit_id = eu.id AND er.role IN ('primary', 'required')
              JOIN source_observations so ON so.id = er.observation_id
              JOIN source_units su ON su.id = so.source_unit_id
             WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
@@ -4180,7 +4139,6 @@ async def test_projected_support_invariant_accepts_other_valid_same_source_unit(
     await db._validate_projected_support_invariant_unlocked(plan)
 
 
-
 @pytest.mark.asyncio
 async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extraction(
     db: Database,
@@ -4192,7 +4150,7 @@ async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extrac
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
     await db.enable_lifecycle_gate("src-1")
-    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _projection(
         run_id="projection-incremental-keep-2",
         body="A7 is removed.\nNew deployment note.",
@@ -4221,7 +4179,7 @@ async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extrac
         source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
     )
 
-    current_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert stats["noop"] == 1
     assert current_support
     assert set(current_support).isdisjoint(old_support)
@@ -4250,11 +4208,6 @@ async def test_v2_incremental_noop_rebinds_complete_unit_to_current_revision(
             project_key="ENG",
             repo_identifier=None,
         ),
-    )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-noop-rebind",
     )
     await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
@@ -4338,17 +4291,12 @@ async def test_v2_noop_rebind_preserves_independent_support_alternative(
         item_id="confluence-456",
         page_id="456",
     )
-    alternative_unit_id = await _add_independent_legacy_support_alternative(
+    alternative_unit_id = await _add_independent_support_alternative(
         db,
         incumbent=incumbent,
         projection=alternative,
         doc_id="confluence-456",
         access_context_hash=access_context_hash,
-    )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-alternative-rebind",
     )
     await db.enable_lifecycle_gate("src-1")
     original_unit_id = f"eu-{incumbent.id}"
@@ -4419,16 +4367,11 @@ async def test_v2_noop_assesses_each_same_unit_alternative(
         projection=first,
         access_context_hash=access_context_hash,
     )
-    alternative_unit_id = await _add_same_unit_legacy_support_alternative(
+    alternative_unit_id = await _add_same_unit_support_alternative(
         db,
         incumbent=incumbent,
         projection=first,
         access_context_hash=access_context_hash,
-    )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-same-unit-alternatives",
     )
     await db.enable_lifecycle_gate("src-1")
     original_unit_id = f"eu-{incumbent.id}"
@@ -4502,17 +4445,12 @@ async def test_v2_noop_postcondition_failure_rolls_back_and_is_non_retryable(
         item_id="confluence-456",
         page_id="456",
     )
-    await _add_independent_legacy_support_alternative(
+    await _add_independent_support_alternative(
         db,
         incumbent=incumbent,
         projection=alternative,
         doc_id="confluence-456",
         access_context_hash=access_context_hash,
-    )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-rollback",
     )
     await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
@@ -4576,7 +4514,7 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
     await db.enable_lifecycle_gate("src-1")
-    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     current_quote = "The A7 slot remains excluded."
     second = _projection(
         run_id="projection-primary-reword-2",
@@ -4610,7 +4548,7 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
         source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
     )
 
-    current_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert stats["noop"] == 1
     assert set(current_support).isdisjoint(old_support)
     [evidence] = await db.get_active_memory_support_evidence(
@@ -4689,11 +4627,6 @@ async def test_v2_noop_revalidation_uses_bounded_fragment_refs_for_large_revisio
         projection=first,
         memory_id="mem-b8",
         memory_content="B8 requires approval.",
-    )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-bounded-support-revalidation",
     )
     await db.enable_lifecycle_gate("src-1")
     old_support = {
@@ -4799,7 +4732,7 @@ async def test_incremental_noop_exhausted_fragment_repair_stops_document_retry_w
     assert raised.value.runtime_bundle.event.model_call_count == 2
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
-    assert await db.get_active_memory_support_reference_ids(incumbent.id)
+    assert await db.get_active_memory_support_unit_ids(incumbent.id)
     assert await db.list_lifecycle_reviews("src-1") == []
     current_revision = await db.get_current_source_unit_revision(
         first.source_units[0].id
@@ -4855,7 +4788,7 @@ async def test_incremental_noop_unavailable_support_validation_is_retryable_with
     assert isinstance(raised.value.__cause__, StructuredLlmError)
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
-    assert await db.get_active_memory_support_reference_ids(incumbent.id)
+    assert await db.get_active_memory_support_unit_ids(incumbent.id)
     assert await db.list_lifecycle_reviews("src-1") == []
     current_revision = await db.get_current_source_unit_revision(first.source_units[0].id)
     assert current_revision is not None
@@ -4907,7 +4840,7 @@ async def test_incremental_noop_invalidated_primary_creates_review(
     assert stats["pending_review"] == 1
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
-    assert await db.get_active_memory_support_reference_ids(incumbent.id)
+    assert await db.get_active_memory_support_unit_ids(incumbent.id)
 
 
 @pytest.mark.asyncio
@@ -4959,7 +4892,7 @@ async def test_persistent_incomplete_incumbent_audit_fails_closed_without_mutati
     assert client.calls == 1
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
-    assert await db.get_active_memory_support_reference_ids(incumbent.id)
+    assert await db.get_active_memory_support_unit_ids(incumbent.id)
     assert failure.value.runtime_bundle.event.outcome == "failed"
     assert failure.value.runtime_bundle.event.reason_code == "support_response_incomplete"
     assert failure.value.runtime_bundle.event.attempt_count == 3
@@ -5008,7 +4941,7 @@ async def test_explicit_empty_revision_deterministically_removes_incumbent_suppo
     )
 
     assert stats["deleted"] == 1
-    assert await db.get_active_memory_support_reference_ids(incumbent.id) == ()
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == ()
     retired = await db.get_memory(incumbent.id)
     assert retired is not None
     assert retired.status == "retired"
@@ -5066,7 +4999,6 @@ async def _seed_jira_required_incumbent(
         ),
         access_context_hash=access_context_hash,
     )
-    await db.upsert_evidence_unit(unit)
     required_references = (
         tuple(
             EvidenceReference(
@@ -5096,30 +5028,21 @@ async def _seed_jira_required_incumbent(
             ),
         )
     )
-    references = await db.record_evidence_references(
-        unit.id,
-        (
-            EvidenceReference(
-                role=EvidenceRole.PRIMARY,
-                anchor=SourceAnchor(
+    await record_unit_support(
+        db,
+        memory_id=incumbent.id,
+        unit=unit,
+        references=(
+            primary_reference(
+                SourceAnchor(
                     kind=AnchorKind.WHOLE_OBSERVATION,
                     observation_id=primary.id,
                     observation_revision_id=revisions[primary.id].id,
-                ),
+                )
             ),
             *required_references,
         ),
     )
-    for index, reference in enumerate(references):
-        await db.upsert_memory_support_assertion(
-            MemorySupportAssertion(
-                id=f"support-jira-required-{index}",
-                memory_id=incumbent.id,
-                evidence_reference_id=reference.id or "",
-                source_id="src-1",
-                access_context_hash=access_context_hash,
-            )
-        )
     return incumbent
 
 
@@ -5145,7 +5068,7 @@ async def test_partial_jira_projection_assesses_changes_outside_old_evidence(
         source_type="jira",
     )
     await db.enable_lifecycle_gate("src-1")
-    await db.get_active_memory_support_reference_ids(incumbent.id)
+    await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _jira_projection(
         run_id="projection-jira-partial-fence-2",
         description="Changed issue description.",
@@ -5191,7 +5114,7 @@ async def test_partial_jira_projection_assesses_changes_outside_old_evidence(
     assert sample["reconciliation_incumbent_count"] == 1
     assert sample["reconciliation_model_incumbent_count"] == 1
     assert sample["reconciliation_llm_call_count"] == 0
-    assert await db.get_active_memory_support_reference_ids(incumbent.id)
+    assert await db.get_active_memory_support_unit_ids(incumbent.id)
     assert stats["support_revalidation_model_call_count"] == 1
 
 
@@ -5275,8 +5198,6 @@ async def test_partial_jira_projection_keeps_a_validated_support_on_an_unreturne
     from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 
     await _set_fixture_source_type(db, "jira")
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(expected_report_id=cutover.id, owner_id="test-partial-validated")
     await db.enable_lifecycle_gate("src-1")
     claim, evidence = "A7 is retained for regular payroll.", "Decision: retain A7"
     first = _jira_projection(
@@ -5444,7 +5365,7 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
-        raw_memories=[candidate],
+        raw_memories=_selected(second, [candidate]),
         doc_type="ticket",
         project_key="ENG",
         repo_identifier=None,
@@ -5538,7 +5459,7 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
     await db.record_source_projection(first)
     incumbent = await _seed_jira_required_incumbent(db, first)
     await db.enable_lifecycle_gate("src-1")
-    old_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     revisions = {item.observation_id: item for item in first.observation_revisions}
     second = _jira_projection(
         run_id="projection-jira-required-2",
@@ -5572,7 +5493,7 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
         source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
     )
 
-    current_support = await db.get_active_memory_support_reference_ids(incumbent.id)
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert stats["noop"] == 1
     assert set(current_support).isdisjoint(old_support)
     evidence = await db.get_active_memory_support_evidence(
@@ -5672,11 +5593,6 @@ async def test_v2_noop_revalidates_revised_required_jira_description(
         first,
         access_context_hash=access_context_hash,
     )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-required-rebind",
-    )
     await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _jira_projection(
@@ -5762,11 +5678,6 @@ async def test_v2_noop_uses_canonical_field_type_to_resolve_duplicate_text(
         first,
         access_context_hash=access_context_hash,
     )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-ambiguous-required",
-    )
     await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _jira_projection(
@@ -5827,11 +5738,6 @@ async def test_v2_noop_model_selects_exact_ref_among_repeated_text(
         memory_id="mem-indistinguishable",
         memory_content=claim,
     )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-indistinguishable",
-    )
     await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _projection(
@@ -5889,11 +5795,6 @@ async def test_v2_noop_semantically_unsupported_current_fragment_stages_review(
         db,
         projection=first,
         access_context_hash=access_context_hash,
-    )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-unpresentable",
     )
     await db.gate_destructive_lifecycle("src-1", reason="Review required by source policy")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
@@ -6148,7 +6049,7 @@ async def test_v2_deferred_plan_rolls_back_every_memory_in_source_unit(
         page_id="456",
     )
     alternative_units = {
-        await _add_independent_legacy_support_alternative(
+        await _add_independent_support_alternative(
             db,
             incumbent=memory,
             projection=alternative,
@@ -6157,11 +6058,6 @@ async def test_v2_deferred_plan_rolls_back_every_memory_in_source_unit(
         )
         for memory in (first_memory, second_memory)
     }
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-multi-memory",
-    )
     await db.enable_lifecycle_gate("src-1")
     memory_ids = (first_memory.id, second_memory.id)
     old_support = {
@@ -6222,9 +6118,9 @@ async def test_v2_deferred_plan_rolls_back_every_memory_in_source_unit(
             memory_id: current_memories[memory_id]  # type: ignore[dict-item]
             for memory_id in memory_ids
         },
-        source_support_reference_ids=source_support,
-        all_active_support_reference_ids={
-            memory_id: support_states[memory_id].support_ids
+        source_support_unit_ids=source_support,
+        all_active_support_unit_ids={
+            memory_id: support_states[memory_id].unit_ids
             for memory_id in memory_ids
         },
         support_set_hashes={
@@ -6232,13 +6128,6 @@ async def test_v2_deferred_plan_rolls_back_every_memory_in_source_unit(
             for memory_id in memory_ids
         },
         observation_revision_ids=(),
-        new_evidence_reference_ids=(),
-        support_scope_version=SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
-        source_support_unit_ids=source_support,
-        all_active_support_unit_ids={
-            memory_id: support_states[memory_id].support_ids
-            for memory_id in memory_ids
-        },
         defaults=NewMemoryDefaults(
             visibility="workspace",
             owner_user_id=None,
@@ -6505,11 +6394,6 @@ async def test_v2_noop_preserves_multiple_required_parts_in_one_observation(
             "Payroll",
         ),
     )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-multi-required-rebind",
-    )
     await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _jira_projection(
@@ -6590,11 +6474,6 @@ async def test_v2_noop_resolves_decoded_canonical_quotes_to_raw_json_ranges(
         first,
         primary_excerpt=old_primary,
         access_context_hash=access_context_hash,
-    )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-escaped-rebind",
     )
     await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
@@ -6687,11 +6566,6 @@ async def test_v2_noop_propagates_representation_compiler_contract_failure(
         db,
         projection=first,
         access_context_hash=access_context_hash,
-    )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id="test-v2-compiler-contract",
     )
     await db.enable_lifecycle_gate("src-1")
     second = _projection(
@@ -6795,11 +6669,6 @@ async def test_v2_noop_propagates_bounded_revalidation_operational_limitation(
         db,
         projection=first,
         access_context_hash=access_context_hash,
-    )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(
-        expected_report_id=cutover.id,
-        owner_id=f"test-v2-{limitation_code.value}",
     )
     await db.enable_lifecycle_gate("src-1")
     second = _projection(
@@ -6983,101 +6852,20 @@ async def test_noop_with_invalidated_required_evidence_creates_review(db: Databa
     assert stats["pending_review"] == 1
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
-    assert await db.get_active_memory_support_reference_ids(incumbent.id)
-
-
-@pytest.mark.asyncio
-async def test_source_rebaseline_preserves_source_and_documents_but_resets_derived_lifecycle(
-    db: Database,
-) -> None:
-    projection = _projection(run_id="projection-before-rebaseline", body="A7 is removed.")
-    await db.record_source_projection(projection)
-    incumbent = await _seed_incumbent_support(db, projection=projection)
-    await db.set_source_subscription("src-1", "user-1", False)
-    await db.enable_lifecycle_gate("src-1")
-    await db.upsert_lifecycle_cutover_finding(
-        LifecycleCutoverFinding(
-            id="finding-before-rebaseline",
-            source_id="src-1",
-            memory_id=incumbent.id,
-            reason=CutoverFindingReason.AMBIGUOUS_OBSERVATION,
-            status=CutoverFindingStatus.OPEN,
-            available_provenance={"doc_id": "confluence-123"},
-            mapping_attempt={"strategy": "exact"},
-        )
-    )
-
-    result = await db.rebaseline_source_lifecycle("src-1")
-
-    assert result.retired_memory_ids == (incumbent.id,)
-    assert await db.get_source("src-1") is not None
-    assert await db.get_document("confluence-123") is not None
-    assert await db.is_source_enabled_for_user("src-1", "user-1") is False
-    reset_memory = await db.get_memory(incumbent.id)
-    assert reset_memory is not None
-    assert reset_memory.status == "retired"
-    assert reset_memory.retirement_reason == "source_rebaseline"
-    assert await db.get_active_memory_support_reference_ids(incumbent.id) == ()
-    assert await db.get_source_projection(projection.run_id) is None
-    assert await db.find_source_unit_by_document_id("src-1", "confluence-123") is None
-    gate = await db.get_lifecycle_gate("src-1")
-    assert gate.state is LifecycleGateState.GATED
-    assert gate.reason == "source rebaseline requires a complete successful replay"
-    finding = await db.get_lifecycle_cutover_finding("finding-before-rebaseline")
-    assert finding is not None
-    assert finding.status is CutoverFindingStatus.RESOLVED
-    assert finding.mapping_attempt["resolution"] == "source_rebaseline"
-    cleanup_tasks = await db.list_lifecycle_vector_tasks(source_id="src-1")
-    assert len(cleanup_tasks) == 1
-    assert cleanup_tasks[0].memory_id == incumbent.id
-    assert cleanup_tasks[0].operation is LifecycleVectorOperation.DELETE
-
-
-@pytest.mark.asyncio
-async def test_source_rebaseline_preserves_failed_vector_cleanup_for_retry(db: Database) -> None:
-    projection = _projection(run_id="projection-before-rebaseline-retry", body="A7 is removed.")
-    await db.record_source_projection(projection)
-    await _seed_incumbent_support(db, projection=projection)
-
-    await db.rebaseline_source_lifecycle("src-1")
-    [task] = await db.list_lifecycle_vector_tasks(source_id="src-1")
-    await db.fail_lifecycle_vector_task(task.id, "temporary Chroma failure")
-
-    # Retrying the relational reset has no remaining source associations, but
-    # it must not erase the failed external cleanup task.
-    await db.rebaseline_source_lifecycle("src-1")
-
-    [retryable] = await db.list_lifecycle_vector_tasks(source_id="src-1")
-    assert retryable.id == task.id
-    assert retryable.status is LifecycleVectorTaskStatus.FAILED
-    assert retryable.attempts == 1
-
-    await db.fail_lifecycle_vector_task(task.id, "secondary lifecycle state failure")
-    [retried] = await db.list_lifecycle_vector_tasks(source_id="src-1")
-    assert retried.attempts == 2
-    assert retried.error == "temporary Chroma failure"
-
-    await db.complete_lifecycle_vector_task(task.id)
-    async with db.db.execute(
-        "SELECT status, error FROM lifecycle_vector_outbox WHERE id = ?",
-        (task.id,),
-    ) as cursor:
-        recovered = await cursor.fetchone()
-    assert recovered is not None
-    assert (recovered["status"], recovered["error"]) == (
-        "completed",
-        "temporary Chroma failure",
-    )
+    assert await db.get_active_memory_support_unit_ids(incumbent.id)
 
 
 @pytest.mark.asyncio
 async def test_lifecycle_vector_retry_respects_durable_backoff_and_completion_is_idempotent(
     db: Database,
 ) -> None:
-    projection = _projection(run_id="projection-vector-backoff", body="A7 is removed.")
-    await db.record_source_projection(projection)
-    await _seed_incumbent_support(db, projection=projection)
-    await db.rebaseline_source_lifecycle("src-1")
+    await db.db.execute(
+        """INSERT INTO source_deletion_vector_outbox (
+               id, source_id, memory_id, status, created_at, updated_at
+           ) VALUES ('vector-backoff', 'src-1', 'mem-old', 'pending',
+                     '2026-07-30T09:00:00+00:00', '2026-07-30T09:00:00+00:00')"""
+    )
+    await db.db.commit()
     [task] = await db.list_lifecycle_vector_tasks(source_id="src-1")
 
     retry_at = "2026-07-30T10:01:00+00:00"
@@ -7145,128 +6933,6 @@ async def test_memory_store_rebaseline_drains_only_its_source_vector_tasks() -> 
 
 async def _async_none() -> None:
     return None
-
-
-@pytest.mark.asyncio
-async def test_cross_source_keep_persists_provenance_and_survives_other_source_rebaseline(
-    db: Database,
-) -> None:
-    first = _projection(run_id="projection-cross-source-1", body="A7 is removed.")
-    await db.record_source_projection(first)
-    incumbent = await _seed_incumbent_support(db, projection=first)
-    incumbent = await db.get_memory(incumbent.id)
-    assert incumbent is not None
-
-    await db.upsert_source(
-        id="src-2",
-        type="confluence",
-        name="Second source",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="owner-2",
-    )
-    now = datetime(2026, 7, 15, tzinfo=timezone.utc).isoformat()
-    await db.db.execute(
-        """INSERT INTO documents (
-               doc_id, source, source_url, title, space_or_project,
-               last_modified, version, content_hash, last_synced
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            "confluence-456",
-            "src-2",
-            "https://example.test/456",
-            "Second page",
-            "ENG",
-            now,
-            "1",
-            "h2",
-            now,
-        ),
-    )
-    await db.db.commit()
-    await db.enable_lifecycle_gate("src-2")
-    second = _projection(
-        run_id="projection-cross-source-2",
-        body="A7 is removed.",
-        item_id="confluence-456",
-        source_id="src-2",
-    )
-    raw = RawMemory(
-        content=incumbent.content,
-        memory_type=incumbent.memory_type,
-        confidence=incumbent.confidence,
-        evidence_quote="A7 is removed.",
-    )
-    evidence = build_projected_claim_evidence(
-        projection=second,
-        raw_memories=(raw,),
-        doc_id="confluence-456",
-        source_type="confluence",
-        project_key="ENG",
-        visibility="workspace",
-        owner_user_id=None,
-        repo_identifier=None,
-        access_context_hash="workspace-eng",
-        extractor_run_id=second.run_id,
-    )
-    delta = second.deltas[0]
-    source_one_refs = await db.get_active_memory_support_reference_ids(incumbent.id)
-    plan = build_lifecycle_plan(
-        plan_id="plan-cross-source-keep",
-        scope=ReconciliationScope(
-            id="scope-cross-source-keep",
-            source_id="src-2",
-            source_unit_id=delta.source_unit_id,
-            base_unit_revision_id=delta.previous_unit_revision_id,
-            target_unit_revision_id=delta.current_unit_revision_id,
-        ),
-        gate_state=LifecycleGateState.ENABLED,
-        operations=(
-            ReconcileOperation(
-                action=ReconcileAction.NOOP,
-                memory_id=incumbent.id,
-                memory=raw,
-                reason="independent source corroborates the claim",
-            ),
-        ),
-        incumbents={incumbent.id: incumbent},
-        source_support_reference_ids={incumbent.id: ()},
-        all_active_support_reference_ids={incumbent.id: source_one_refs},
-        support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
-        observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
-        new_evidence_reference_ids=(),
-        evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
-        defaults=NewMemoryDefaults(
-            visibility="workspace",
-            owner_user_id=None,
-            project_key="ENG",
-            repo_identifier=None,
-            doc_id="confluence-456",
-            source_type="confluence",
-            access_context_hash="workspace-eng",
-        ),
-        evidence_units=evidence.units,
-        evidence_references=evidence.references,
-    )
-
-    await db.apply_source_projection_lifecycle(second, plan)
-
-    sources = await db.get_memory_sources(incumbent.id)
-    assert {(item.source_id, item.doc_id) for item in sources} == {
-        ("src-1", "confluence-123"),
-        ("src-2", "confluence-456"),
-    }
-    assert (await db.get_memory(incumbent.id)).corroboration_count == 2
-
-    await db.rebaseline_source_lifecycle("src-1")
-
-    surviving = await db.get_memory(incumbent.id)
-    assert surviving is not None
-    assert surviving.status == "active"
-    assert surviving.corroboration_count == 1
-    assert {(item.source_id, item.doc_id) for item in await db.get_memory_sources(incumbent.id)} == {
-        ("src-2", "confluence-456")
-    }
 
 
 @pytest.mark.asyncio
@@ -7341,7 +7007,7 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
     prepared = engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-456",
-        raw_memories=[raw],
+        raw_memories=_selected(second, [raw]),
         doc_type="design-doc",
         project_key=None,
         repo_identifier=None,
@@ -7445,7 +7111,7 @@ async def test_same_source_cross_unit_semantic_equivalent_claim_reuses_memory_id
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-456",
-        raw_memories=[
+        raw_memories=_selected(second, [
             RawMemory(
                 content="A7 remains excluded.",
                 memory_type="decision",
@@ -7453,7 +7119,7 @@ async def test_same_source_cross_unit_semantic_equivalent_claim_reuses_memory_id
                 evidence_quote="A7 remains excluded.",
                 source_observation_id=second.observations[0].id,
             )
-        ],
+        ]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -7478,9 +7144,8 @@ async def test_same_source_cross_unit_semantic_equivalent_claim_reuses_memory_id
     assert len(supports) == 2
     lineage_rows = await db.db.execute_fetchall(
         """SELECT COUNT(DISTINCT EU.SOURCE_LINEAGE_ID) AS lineage_count
-             FROM MEMORY_SUPPORT_ASSERTIONS MSA
-             JOIN EVIDENCE_REFERENCES ER ON ER.ID = MSA.EVIDENCE_REFERENCE_ID
-             JOIN EVIDENCE_UNITS EU ON EU.ID = ER.EVIDENCE_UNIT_ID
+             FROM MEMORY_UNIT_SUPPORT_ASSERTIONS MSA
+             JOIN EVIDENCE_UNITS EU ON EU.ID = MSA.EVIDENCE_UNIT_ID
             WHERE MSA.MEMORY_ID = ? AND MSA.ACTIVE = 1""",
         (incumbent.id,),
     )
@@ -7512,7 +7177,7 @@ async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves
     first_stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=first,
         doc_id="confluence-123",
-        raw_memories=[first_raw],
+        raw_memories=_selected(first, [first_raw]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -7555,7 +7220,7 @@ async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves
     second_stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-456",
-        raw_memories=[second_raw],
+        raw_memories=_selected(second, [second_raw]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -7579,9 +7244,8 @@ async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves
     lineage_rows = await db.db.execute_fetchall(
         """SELECT COUNT(DISTINCT EU.SOURCE_LINEAGE_ID) AS lineage_count,
                   COUNT(DISTINCT EU.DOC_ID) AS document_count
-             FROM MEMORY_SUPPORT_ASSERTIONS MSA
-             JOIN EVIDENCE_REFERENCES ER ON ER.ID = MSA.EVIDENCE_REFERENCE_ID
-             JOIN EVIDENCE_UNITS EU ON EU.ID = ER.EVIDENCE_UNIT_ID
+             FROM MEMORY_UNIT_SUPPORT_ASSERTIONS MSA
+             JOIN EVIDENCE_UNITS EU ON EU.ID = MSA.EVIDENCE_UNIT_ID
             WHERE MSA.MEMORY_ID = ? AND MSA.ACTIVE = 1""",
         (memory.id,),
     )
@@ -7664,7 +7328,7 @@ async def test_cross_source_exact_claim_reuses_memory_without_llm_and_preserves_
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-456",
-        raw_memories=[raw],
+        raw_memories=_selected(second, [raw]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -7796,7 +7460,16 @@ async def test_ordinary_exact_admission_preserves_agent_claim_identity(
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="private-confluence-123",
-        raw_memories=[raw],
+        raw_memories=_selected(
+            projection,
+            [raw],
+            access_context_hash=lifecycle_access_context_hash(
+                visibility="private",
+                owner_user_id="owner-1",
+                project_key="ENG",
+                repo_identifier="repo-a",
+            ),
+        ),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier="repo-a",
@@ -7875,12 +7548,16 @@ async def test_stale_parallel_cross_unit_create_fails_closed_before_duplicate_wr
     )
 
     def plan_for(projection: SourceProjection, doc_id: str) -> LifecyclePlan:
-        raw = RawMemory(
-            content="A7 is retained for regular payroll.",
-            memory_type="decision",
-            confidence=0.95,
-            evidence_quote="A7 is retained for regular payroll.",
-            source_observation_id=projection.observations[0].id,
+        [raw] = _selected(
+            projection,
+            [
+                RawMemory(
+                    content="A7 is retained for regular payroll.",
+                    memory_type="decision",
+                    confidence=0.95,
+                    evidence_quote="A7 is retained for regular payroll.",
+                )
+            ],
         )
         access_context_hash = lifecycle_access_context_hash(
             visibility="workspace",
@@ -7919,12 +7596,11 @@ async def test_stale_parallel_cross_unit_create_fails_closed_before_duplicate_wr
                 ),
             ),
             incumbents={},
-            source_support_reference_ids={},
-            all_active_support_reference_ids={},
+            source_support_unit_ids={},
+            all_active_support_unit_ids={},
             support_set_hashes={},
             observation_revision_ids=tuple(revision.id for revision in projection.observation_revisions),
-            new_evidence_reference_ids=(),
-            evidence_reference_ids_by_claim_hash=evidence.reference_ids_by_claim_hash,
+            evidence_unit_ids_by_claim_hash=evidence.evidence_unit_ids_by_claim_hash,
             defaults=NewMemoryDefaults(
                 visibility="workspace",
                 owner_user_id=None,
@@ -7995,7 +7671,7 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
-        raw_memories=[raw],
+        raw_memories=_selected(projection, [raw]),
         doc_type="ticket",
         project_key="ENG",
         repo_identifier=None,
@@ -8270,14 +7946,14 @@ async def _create_relation_discovery_fixture(
     await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
-        raw_memories=[
+        raw_memories=_selected(projection, [
             RawMemory(
                 content="A7 applies only to regular payroll.",
                 memory_type="decision",
                 evidence_quote="A7 applies only to regular payroll.",
                 extraction_context="A7 applies only to regular payroll.",
             )
-        ],
+        ]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -8501,13 +8177,19 @@ async def test_relation_discovery_rejects_candidate_support_change_before_commit
     await db.add_memory_source(candidate.id, "other-doc", "confluence", source_updated_at=now)
 
     async def attach_new_support() -> None:
-        await db.upsert_memory_support_assertion(
-            MemorySupportAssertion(
-                id="support-stale-relation-candidate",
+        access_context_hash = unit.access_context_hash or ""
+        await db.upsert_memory_unit_support_assertion(
+            MemoryUnitSupportAssertion(
+                id=memory_unit_support_assertion_id(
+                    memory_id=candidate.id,
+                    evidence_unit_id=challenger_evidence[0].evidence_unit_id,
+                    source_id="src-1",
+                    access_context_hash=access_context_hash,
+                ),
                 memory_id=candidate.id,
-                evidence_reference_id=challenger_evidence[0].reference_id,
+                evidence_unit_id=challenger_evidence[0].evidence_unit_id,
                 source_id="src-1",
-                access_context_hash=unit.access_context_hash or "",
+                access_context_hash=access_context_hash,
             )
         )
 
@@ -8637,7 +8319,7 @@ async def test_relation_discovery_records_relation_after_lifecycle_commit(
     await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
-        raw_memories=[raw],
+        raw_memories=_selected(projection, [raw]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -8958,7 +8640,7 @@ async def test_new_projected_memory_commit_survives_vector_outbox_delivery_failu
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
-        raw_memories=[raw],
+        raw_memories=_selected(projection, [raw]),
         doc_type="design-doc",
         project_key="ENG",
         repo_identifier=None,
@@ -8975,316 +8657,6 @@ async def test_new_projected_memory_commit_survives_vector_outbox_delivery_failu
     assert stats["vector_delivery_pending"] == 1
     assert len(support) == 1
     assert support[0].anchor.observation_revision_id == projection.observation_revisions[0].id
-
-
-@pytest.mark.asyncio
-async def test_generic_document_delete_rejects_active_projected_support(
-    db: Database,
-) -> None:
-    projection = _projection(
-        run_id="projection-delete-fail-closed",
-        body="A7 applies only to regular payroll.",
-    )
-    await db.record_source_projection(projection)
-    incumbent = await _seed_incumbent_support(db, projection=projection)
-
-    with pytest.raises(
-        ValueError,
-        match="active projected support remains",
-    ):
-        await db.delete_document("confluence-123")
-
-    current = await db.get_memory(incumbent.id)
-    assert current is not None and current.status == "active"
-    assert await db.get_document("confluence-123") is not None
-    assert await db.get_active_memory_support_reference_ids(incumbent.id)
-    assert (
-        await db.get_evidence_unit((await db.get_active_memory_support_evidence(incumbent.id))[0].evidence_unit_id)
-        is not None
-    )
-
-
-@pytest.mark.asyncio
-async def test_rebaseline_replay_reuses_memory_with_explicit_observation_support(
-    db: Database,
-) -> None:
-    await _set_fixture_source_type(db, "jira")
-    projection = _jira_projection(
-        run_id="projection-jira-before-rebaseline",
-        description="A7 applies only to regular payroll.",
-        comment_body="The rollout note is unrelated.",
-    )
-    primary = projection.observations[0]
-    raw = RawMemory(
-        content="A7 applies only to regular payroll.",
-        memory_type="decision",
-        confidence=0.95,
-        evidence_quote="A7 applies only to regular payroll.",
-        extraction_context="A7 applies only to regular payroll.",
-        evidence_anchor="projection_batch",
-        source_observation_id=primary.id,
-    )
-    adapters = build_sqlite_adapters(db, object())
-    engine = MemoryEngine(
-        cross_document_candidates=_candidate_retriever(adapters),
-        db=db,
-        memory_store=_OutboxDrainer(db),
-        structured_llm_client=_SemanticEquivalentClient(),
-    )
-    arguments = {
-        "doc_id": "confluence-123",
-        "raw_memories": [raw],
-        "doc_type": "ticket",
-        "project_key": "ENG",
-        "repo_identifier": None,
-        "document_content": "PAY-12",
-        "update_mode": "full_document",
-        "changed_hunks": None,
-        "update_plan_stats": None,
-        "source_updated_at": datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
-    }
-
-    first = await engine.prepare_and_commit_projected_lifecycle(projection=projection, **arguments)
-    [memory] = await db.list_memories(source="src-1", status="active")
-    assert first["added"] == 1
-    assert await db.get_active_memory_support_evidence(memory.id, source_id="src-1")
-
-    await db.rebaseline_source_lifecycle("src-1")
-    replay = _jira_projection(
-        run_id="projection-jira-after-rebaseline",
-        description="A7 applies only to regular payroll.",
-        comment_body="The rollout note is unrelated.",
-    )
-    second = await engine.prepare_and_commit_projected_lifecycle(projection=replay, **arguments)
-
-    replayed = await db.get_memory(memory.id)
-    support = await db.get_active_memory_support_evidence(memory.id, source_id="src-1")
-    assert replayed is not None and replayed.status == "active"
-    assert second["reactivated"] == 1
-    assert second["corroborated"] == 1
-    assert second["relation_discovery_enqueued"] == 1
-    assert len(support) == 1
-    assert support[0].anchor.observation_id == primary.id
-    plan_rows = await db.db.execute_fetchall(
-        "SELECT payload_json FROM lifecycle_plans WHERE id = ?",
-        (
-            lifecycle_plan_id(
-                ReconciliationScope(
-                    id=f"scope:{replay.run_id}",
-                    source_id=replay.source_id,
-                    source_unit_id=replay.deltas[0].source_unit_id,
-                    base_unit_revision_id=replay.deltas[0].previous_unit_revision_id,
-                    target_unit_revision_id=replay.deltas[0].current_unit_revision_id,
-                )
-            ),
-        ),
-    )
-    assert len(plan_rows) == 1
-    plan_payload = json.loads(str(plan_rows[0]["payload_json"]))
-    assert [item["mutation_type"] for item in plan_payload["mutations"]] == [
-        "reactivate_memory",
-        "attach_support",
-        "refresh_memory_index",
-    ]
-    assert plan_payload["mutations"][0]["payload"]["expected_content_hash"] == memory.content_hash
-
-
-@pytest.mark.asyncio
-async def test_reactivation_rejects_stale_content_hash_and_keeps_memory_retired(
-    db: Database,
-) -> None:
-    memory = Memory(
-        id="mem-rebaseline-stale",
-        memory_type="decision",
-        content="A7 applies only to regular payroll.",
-        content_hash=content_hash("A7 applies only to regular payroll."),
-        status="retired",
-        retirement_reason="source_rebaseline",
-    )
-    await db.insert_memory(memory)
-    plan = LifecyclePlan(
-        id="plan-rebaseline-stale",
-        scope=ReconciliationScope(
-            id="scope-rebaseline-stale",
-            source_id="src-1",
-            source_unit_id="unit-rebaseline-stale",
-            base_unit_revision_id=None,
-            target_unit_revision_id=None,
-        ),
-        gate_state=LifecycleGateState.GATED,
-        coverage_proof=CoverageProof((), (), (), ()),
-        stale_guard=StaleGuard((), {}),
-        mutations=(
-            LifecycleMutation(
-                LifecycleMutationType.REACTIVATE_MEMORY,
-                memory_id=memory.id,
-                source_id="src-1",
-                payload={"expected_content_hash": "stale-content-hash"},
-            ),
-        ),
-    )
-
-    with pytest.raises(ValueError, match="reactivate Memory stale guard failed"):
-        await db.apply_lifecycle_plan(plan)
-
-    persisted = await db.get_memory(memory.id)
-    assert persisted is not None and persisted.status == "retired"
-    assert await db.get_lifecycle_plan_payload(plan.id) is None
-
-
-@pytest.mark.asyncio
-async def test_reactivation_without_new_source_support_rolls_back(
-    db: Database,
-) -> None:
-    memory = Memory(
-        id="mem-rebaseline-no-support",
-        memory_type="decision",
-        content="A7 applies only to regular payroll.",
-        content_hash=content_hash("A7 applies only to regular payroll."),
-        status="retired",
-        retirement_reason="source_rebaseline",
-    )
-    await db.insert_memory(memory)
-    plan = LifecyclePlan(
-        id="plan-rebaseline-no-support",
-        scope=ReconciliationScope(
-            id="scope-rebaseline-no-support",
-            source_id="src-1",
-            source_unit_id="unit-rebaseline-no-support",
-            base_unit_revision_id=None,
-            target_unit_revision_id=None,
-        ),
-        gate_state=LifecycleGateState.GATED,
-        coverage_proof=CoverageProof((), (), (), ()),
-        stale_guard=StaleGuard((), {}),
-        mutations=(
-            LifecycleMutation(
-                LifecycleMutationType.REACTIVATE_MEMORY,
-                memory_id=memory.id,
-                source_id="src-1",
-                payload={"expected_content_hash": memory.content_hash},
-            ),
-        ),
-    )
-
-    with pytest.raises(ValueError, match="activated Memory without source support"):
-        await db.apply_lifecycle_plan(plan)
-
-    persisted = await db.get_memory(memory.id)
-    assert persisted is not None and persisted.status == "retired"
-    assert await db.get_lifecycle_plan_payload(plan.id) is None
-
-
-@pytest.mark.asyncio
-async def test_rebaseline_reset_preserves_an_overlapping_source_projection(
-    db: Database,
-) -> None:
-    memory = Memory(
-        id="mem-overlapping-source-edge",
-        memory_type="fact",
-        content="A fact projected by two Configured Sources.",
-        content_hash=content_hash("A fact projected by two Configured Sources."),
-        project_key="ENG",
-    )
-    await db.insert_memory(memory)
-    await db.add_memory_source(
-        memory.id,
-        "confluence-123",
-        "confluence",
-        memory.content,
-        source_updated_at=None,
-    )
-    await db.upsert_source(
-        id="src-overlap",
-        type="confluence",
-        name="Overlapping source",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="owner-1",
-    )
-    await db.restore_memory_source_snapshot(
-        MemorySource(
-            memory_id=memory.id,
-            doc_id="confluence-123",
-            source_id="src-overlap",
-            source_type="confluence",
-            excerpt=memory.content,
-            source_updated_at=None,
-        )
-    )
-    overlap_projection = _projection(
-        run_id="projection-overlapping-source-edge",
-        body=memory.content,
-        source_id="src-overlap",
-    )
-    await db.record_source_projection(overlap_projection)
-    overlap_observation = overlap_projection.observations[0]
-    overlap_revision = next(
-        revision
-        for revision in overlap_projection.observation_revisions
-        if revision.observation_id == overlap_observation.id
-    )
-    overlap_unit = EvidenceUnit(
-        id="eu-overlapping-source-edge",
-        source_id="src-overlap",
-        doc_id="confluence-123",
-        doc_revision_id=overlap_projection.source_unit_revisions[0].id,
-        source_type="confluence",
-        source_anchor=overlap_observation.id,
-        source_lineage_id=overlap_projection.source_units[0].id,
-        project_key="ENG",
-        visibility="workspace",
-        owner_user_id=None,
-        repo_identifier=None,
-        content=overlap_revision.content,
-        excerpt=memory.content,
-        evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
-        access_context_hash="workspace-eng",
-    )
-    await db.upsert_evidence_unit(overlap_unit)
-    overlap_reference = (
-        await db.record_evidence_references(
-            overlap_unit.id,
-            (
-                EvidenceReference(
-                    role=EvidenceRole.PRIMARY,
-                    anchor=SourceAnchor(
-                        kind=AnchorKind.WHOLE_OBSERVATION,
-                        observation_id=overlap_observation.id,
-                        observation_revision_id=overlap_revision.id,
-                    ),
-                ),
-            ),
-        )
-    )[0]
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-overlapping-source-edge",
-            memory_id=memory.id,
-            evidence_reference_id=overlap_reference.id or "",
-            source_id="src-overlap",
-            access_context_hash="workspace-eng",
-        )
-    )
-
-    result = await db.rebaseline_source_lifecycle("src-1")
-
-    persisted = await db.get_memory(memory.id)
-    assert result.retired_memory_ids == ()
-    assert persisted is not None and persisted.status == "active"
-    remaining_sources = await db.get_memory_sources(memory.id)
-    assert [(source.source_id, source.doc_id) for source in remaining_sources] == [("src-overlap", "confluence-123")]
-    metadata = await db.db.execute_fetchall(
-        """SELECT source_id FROM memory_search_metadata_trigram
-             WHERE memory_id = ? AND doc_id = ?""",
-        (memory.id, "confluence-123"),
-    )
-    assert [row["source_id"] for row in metadata] == ["src-overlap"]
-    supports = await db.db.execute_fetchall(
-        "SELECT source_id FROM memory_support_assertions WHERE memory_id = ? AND active = 1",
-        (memory.id,),
-    )
-    assert [row["source_id"] for row in supports] == ["src-overlap"]
 
 
 @pytest.mark.asyncio
@@ -9417,30 +8789,19 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
         access_context_hash="workspace-eng",
     )
-    await db.upsert_evidence_unit(old_unit)
-    old_reference = (
-        await db.record_evidence_references(
-            old_unit.id,
-            (
-                EvidenceReference(
-                    role=EvidenceRole.PRIMARY,
-                    anchor=SourceAnchor(
-                        kind=AnchorKind.WHOLE_OBSERVATION,
-                        observation_id=first.observations[0].id,
-                        observation_revision_id=old_revision.id,
-                    ),
-                ),
+    await record_unit_support(
+        db,
+        memory_id=incumbent.id,
+        unit=old_unit,
+        references=(
+            primary_reference(
+                SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=first.observations[0].id,
+                    observation_revision_id=old_revision.id,
+                )
             ),
-        )
-    )[0]
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-old",
-            memory_id=incumbent.id,
-            evidence_reference_id=old_reference.id or "",
-            source_id="src-1",
-            access_context_hash="workspace-eng",
-        )
+        ),
     )
     await db.enable_lifecycle_gate("src-1")
 
@@ -9522,30 +8883,19 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
         access_context_hash="workspace-eng",
     )
-    await db.upsert_evidence_unit(cross_source_unit)
-    cross_source_reference = (
-        await db.record_evidence_references(
-            cross_source_unit.id,
-            (
-                EvidenceReference(
-                    role=EvidenceRole.PRIMARY,
-                    anchor=SourceAnchor(
-                        kind=AnchorKind.WHOLE_OBSERVATION,
-                        observation_id=cross_source_observation.id,
-                        observation_revision_id=cross_source_revision.id,
-                    ),
-                ),
+    await record_unit_support(
+        db,
+        memory_id=cross_source_memory.id,
+        unit=cross_source_unit,
+        references=(
+            primary_reference(
+                SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=cross_source_observation.id,
+                    observation_revision_id=cross_source_revision.id,
+                )
             ),
-        )
-    )[0]
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-cross-source",
-            memory_id=cross_source_memory.id,
-            evidence_reference_id=cross_source_reference.id or "",
-            source_id="src-2",
-            access_context_hash="workspace-eng",
-        )
+        ),
     )
 
     second = _projection(
@@ -9554,15 +8904,19 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
         prior=first.source_unit_revisions[0],
         prior_observations={first.observations[0].id: old_revision},
     )
-    raw = RawMemory(
-        content="A7 is retained and marked as reduced retro chain.",
-        memory_type="decision",
-        confidence=0.95,
-        entity_refs=["A7"],
-        extraction_context="A7 is retained and marked as reduced retro chain.",
-        source_observation_id=second.observations[0].id,
-        evidence_quote="A7 is retained and marked as reduced retro chain.",
-        evidence_resolved_from_block=True,
+    [raw] = _selected(
+        second,
+        [
+            RawMemory(
+                content="A7 is retained and marked as reduced retro chain.",
+                memory_type="decision",
+                confidence=0.95,
+                entity_refs=["A7"],
+                extraction_context="A7 is retained and marked as reduced retro chain.",
+                evidence_quote="A7 is retained and marked as reduced retro chain.",
+                evidence_resolved_from_block=True,
+            )
+        ],
     )
     evidence = build_projected_claim_evidence(
         projection=second,
@@ -9573,7 +8927,7 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
         visibility="workspace",
         owner_user_id=None,
         repo_identifier=None,
-        access_context_hash="workspace-eng",
+        access_context_hash=_WORKSPACE_ACCESS_CONTEXT_HASH,
         extractor_run_id="sync-2",
     )
     adapters = build_sqlite_adapters(db, object())
@@ -9735,7 +9089,7 @@ async def test_projected_lifecycle_enforces_candidate_quality_before_persistence
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=projection,
         doc_id="confluence-123",
-        raw_memories=[raw],
+        raw_memories=_selected(projection, [raw]),
         doc_type="document",
         project_key="ENG",
         repo_identifier=None,
@@ -9853,7 +9207,7 @@ async def test_tombstone_retains_document_when_unmapped_provenance_remains(
         (memory.id, "confluence-123"),
     )
     await db.db.execute(
-        "UPDATE memory_support_assertions SET active = 0, removed_at = ? WHERE memory_id = ?",
+        "UPDATE memory_unit_support_assertions SET active = 0, removed_at = ? WHERE memory_id = ?",
         (datetime.now(timezone.utc).isoformat(), memory.id),
     )
     await db.db.commit()
@@ -9904,8 +9258,6 @@ async def test_reused_evidence_advances_only_support_validation_plan_across_revi
     incumbent = await _seed_exact_incumbent_support(
         db, projection=first, memory_id="mem-baseline", memory_content="A7 remains excluded.",
     )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(expected_report_id=cutover.id, owner_id="test-baseline")
     await db.enable_lifecycle_gate("src-1")
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -10056,8 +9408,6 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
     continued = await _seed_exact_incumbent_support(
         db, projection=first, memory_id="mem-continued", memory_content=continued_claim,
     )
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(expected_report_id=cutover.id, owner_id="test-insufficient")
     await db.enable_lifecycle_gate("src-1")
     adapters = build_sqlite_adapters(db, object())
     client = SelectiveSupportClient()
@@ -10210,8 +9560,6 @@ async def _exact_support_engine(
     """Seed legacy Support on ``first`` and return an engine; the first advance records exact digests."""
     await db.record_source_projection(first)
     incumbent = await _seed_exact_incumbent_support(db, projection=first, memory_id=memory_id, memory_content=claim)
-    cutover = await db.report_support_scope_cutover()
-    await db.apply_support_scope_v2_cutover(expected_report_id=cutover.id, owner_id="test-exact-support")
     await db.enable_lifecycle_gate("src-1")
     client = client_type(incumbent.id)
     adapters = build_sqlite_adapters(db, object())

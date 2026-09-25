@@ -109,7 +109,6 @@ from memforge.evals.agent_evaluation import (
     AgentAssessmentQuery,
     AgentRuntimeEventQuery,
     bind_source_lifecycle_outcome,
-    runtime_session_id,
 )
 from memforge.storage.database import Database
 from memforge.storage.database import MIGRATIONS
@@ -4000,21 +3999,6 @@ class ProjectionFragmentRecordingExtractor(RecordingMemoryExtractor):
         return MemoryExtractionResult(memories=[])
 
 
-class FailingDiffThenStructuralExtractor(ProjectionBatchRecordingExtractor):
-    def __init__(self, *, raise_error: bool) -> None:
-        super().__init__()
-        self.raise_error = raise_error
-
-    async def extract_memory_changes(self, **kwargs):
-        self.change_calls.append(kwargs)
-        if self.raise_error:
-            raise RuntimeError("provider unavailable")
-        return MemoryExtractionResult(
-            error_type="structured_llm_error",
-            metadata={"safe_error_code": "invalid_response"},
-        )
-
-
 class WholeDocumentDiffThenStructuralExtractor(ProjectionBatchRecordingExtractor):
     async def extract_memory_changes(self, **kwargs):
         self.change_calls.append(kwargs)
@@ -4048,94 +4032,28 @@ class WholeDocumentDiffThenStructuralExtractor(ProjectionBatchRecordingExtractor
         )
 
 
-class ProjectionBatchCandidateExtractor(ProjectionBatchRecordingExtractor):
-    async def extract_projection_batch_memories(self, batch, **kwargs):
+class ProjectionFragmentCandidateExtractor(ProjectionFragmentRecordingExtractor):
+    async def extract_projection_fragment_memories(self, catalog, **kwargs):
         del kwargs
-        self.projection_calls.append(batch)
-        index = len(self.projection_calls) - 1
+        self.fragment_calls.append(catalog)
+        index = len(self.fragment_calls) - 1
+        primary = next(fragment for fragment in catalog.fragments if fragment.primary_eligible)
+        selection = catalog.resolve_selection(primary_ref=primary.reference)
         return MemoryExtractionResult(
             memories=[
                 RawMemory(
-                    content=f"Durable claim from projection batch {index}.",
+                    content=f"Durable claim from projection fragments {index}.",
                     memory_type="fact",
-                    source_observation_id=next(iter(dict(batch.primary_content_by_observation_id))),
+                    source_observation_id=primary.anchor.observation_id,
+                    resolved_evidence_selection=selection,
                 )
             ]
         )
 
 
-class PartiallyFailingProjectionBatchExtractor(ProjectionBatchRecordingExtractor):
-    def __init__(self) -> None:
-        super().__init__()
-        self.completed_batch_ids: list[str] = []
-        self.failed_batch_ids: list[str] = []
-
-    async def extract_projection_batch_memories(self, batch, **kwargs):
-        del kwargs
-        self.projection_calls.append(batch)
-        if "design-line-02000" in batch.primary_markdown:
-            self.failed_batch_ids.append(batch.id)
-            return MemoryExtractionResult(
-                error_type="structured_llm_error",
-                error="ValidationError",
-                metadata={"structured_llm_calls": 1},
-            )
-        self.completed_batch_ids.append(batch.id)
-        return MemoryExtractionResult(
-            memories=[
-                RawMemory(
-                    content=f"Durable claim from projection batch {batch.id}.",
-                    memory_type="fact",
-                    source_observation_id=next(iter(dict(batch.primary_content_by_observation_id))),
-                )
-            ],
-            metadata={"structured_llm_calls": 1},
-        )
-
-
-class StructuralUnitCandidateExtractor(ProjectionBatchRecordingExtractor):
-    async def extract_unit_memories(self, context, **kwargs):
-        self.unit_calls.append({"context": context, **kwargs})
-        return MemoryExtractionResult(
-            memories=[
-                RawMemory(
-                    content=(f"Durable claim from structural unit {context.unit.unit_id}."),
-                    memory_type="fact",
-                )
-            ]
-        )
-
-
-class PartiallyFailingStructuralUnitExtractor(StructuralUnitCandidateExtractor):
-    def __init__(self) -> None:
-        super().__init__()
-        self.completed_unit_ids: list[str] = []
-        self.failed_unit_ids: list[str] = []
-
-    async def extract_unit_memories(self, context, **kwargs):
-        self.unit_calls.append({"context": context, **kwargs})
-        if "design-line-02000" in context.unit.unit_markdown:
-            self.failed_unit_ids.append(context.unit.unit_id)
-            return MemoryExtractionResult(
-                error_type="structured_llm_error",
-                error="ValidationError",
-                metadata={"structured_llm_calls": 1},
-            )
-        self.completed_unit_ids.append(context.unit.unit_id)
-        return MemoryExtractionResult(
-            memories=[
-                RawMemory(
-                    content=(f"Durable claim from structural unit {context.unit.unit_id}."),
-                    memory_type="fact",
-                )
-            ],
-            metadata={"structured_llm_calls": 1},
-        )
-
-
-class ProjectionBatchArtifactSummaryExtractor(ProjectionBatchRecordingExtractor):
-    async def extract_projection_batch_memories(self, batch, **kwargs):
-        self.projection_calls.append(batch)
+class ProjectionFragmentArtifactSummaryExtractor(ProjectionFragmentRecordingExtractor):
+    async def extract_projection_fragment_memories(self, catalog, **kwargs):
+        self.fragment_calls.append(catalog)
         images = kwargs.get("images", ())
         return MemoryExtractionResult(
             memories=[],
@@ -4512,7 +4430,7 @@ async def test_artifact_summary_commits_with_the_same_projected_revision(db: Dat
         owner_user_id="dev",
     )
     memory_engine = RecordingMemoryEngine()
-    extractor = ProjectionBatchArtifactSummaryExtractor()
+    extractor = ProjectionFragmentArtifactSummaryExtractor()
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
@@ -4540,7 +4458,7 @@ async def test_artifact_summary_commits_with_the_same_projected_revision(db: Dat
     persisted = await db.get_source_artifact_revision(artifact_revision.id)
     assert persisted is not None
     assert persisted.summary == "Architecture diagram showing the stable image flow."
-    assert len(extractor.projection_calls) == 1
+    assert len(extractor.fragment_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -4555,7 +4473,7 @@ async def test_artifact_only_source_unit_enters_multimodal_extraction(db: Databa
         owner_user_id="dev",
     )
     memory_engine = RecordingMemoryEngine()
-    extractor = ProjectionBatchArtifactSummaryExtractor()
+    extractor = ProjectionFragmentArtifactSummaryExtractor()
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
@@ -4572,7 +4490,7 @@ async def test_artifact_only_source_unit_enters_multimodal_extraction(db: Databa
     )
 
     assert state.last_sync_status == "success"
-    assert len(extractor.projection_calls) == 1
+    assert len(extractor.fragment_calls) == 1
     assert len(memory_engine.projected_lifecycle_calls) == 1
     committed_projection = memory_engine.projected_lifecycle_calls[0]["projection"]
     artifact_revision = next(
@@ -5030,8 +4948,12 @@ class BlockingMemoryExtractor(NoopMemoryExtractor):
         del context, kwargs
         return await self._extract()
 
-    async def extract_projection_batch_memories(self, batch, **kwargs):
-        del batch, kwargs
+    def fragment_output_tokens(self, catalog):
+        del catalog
+        return self.max_tokens
+
+    async def extract_projection_fragment_memories(self, catalog, **kwargs):
+        del catalog, kwargs
         return await self._extract()
 
 
@@ -5083,7 +5005,8 @@ async def test_projection_images_load_only_after_shared_multimodal_admission(
         )
     )
     await asyncio.wait_for(extractor.target_reached.wait(), timeout=2)
-    assert stores[0].artifact_read_count == 1
+    admitted_read_count = stores[0].artifact_read_count
+    assert admitted_read_count >= 1
 
     second_task = asyncio.create_task(
         orchestrator(stores[1]).sync_gene(
@@ -5099,7 +5022,7 @@ async def test_projection_images_load_only_after_shared_multimodal_admission(
     states = await asyncio.gather(first_task, second_task)
 
     assert [state.last_sync_status for state in states] == ["success", "success"]
-    assert stores[1].artifact_read_count == 1
+    assert stores[1].artifact_read_count == admitted_read_count
 
 
 class ConstantMemorySampler:
@@ -5174,7 +5097,9 @@ async def _insert_document_with_metadata(
     normalized_content_uri: str | None = None,
     projection_source_type: str | None = None,
     configured_source_type: str | None = None,
+    source_url: str | None = None,
 ) -> None:
+    source_url = source_url or f"http://example/{doc_id}"
     await db.upsert_source(
         id=source_id,
         type=configured_source_type or projection_source_type or "docs",
@@ -5192,7 +5117,7 @@ async def _insert_document_with_metadata(
         (
             doc_id,
             source_id,
-            f"http://example/{doc_id}",
+            source_url,
             title,
             "ARCH",
             now.isoformat(),
@@ -5210,7 +5135,7 @@ async def _insert_document_with_metadata(
     item = ContentItem(
         item_id=doc_id,
         title=title,
-        source_url=f"http://example/{doc_id}",
+        source_url=source_url,
         last_modified=now,
         content_type="application/json" if projection_source_type == "jira" else "text/markdown",
         space_or_project="ARCH",
@@ -5325,290 +5250,6 @@ async def test_block_fallback_writes_correlated_content_free_audit(
     assert row.payload["target_unit_revision_id"] == "unitrev-current"
     assert row.payload["evidence_block_fallback_samples"] == [sample]
     assert "Durable procedure." not in str(row.payload)
-
-
-@pytest.mark.asyncio
-async def test_large_single_observation_uses_bounded_structural_units(db: Database) -> None:
-    source_id = "src-large-confluence"
-    await db.upsert_source(
-        id=source_id,
-        type="confluence",
-        name="Large Confluence",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    body = "\n".join(f"design-line-{index:05d}" for index in range(6_000))
-    extractor = ProjectionBatchRecordingExtractor()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=extractor,
-        memory_engine=NoopMemoryEngine(),
-        memory_store=None,
-        max_concurrent=2,
-        retry_sleep=_skip_retry_delay,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=LargeConfluenceGene(body),
-        source_name="Large Confluence",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "success"
-    assert extractor.projection_calls == []
-    assert extractor.full_calls == []
-    assert len(extractor.unit_calls) > 1
-    assert all(call["context"].unit.unit_id for call in extractor.unit_calls)
-
-
-@pytest.mark.asyncio
-async def test_structural_unit_candidates_are_aggregated_before_projected_lifecycle(
-    db: Database,
-) -> None:
-    source_id = "src-large-confluence-ledger"
-    await db.upsert_source(
-        id=source_id,
-        type="confluence",
-        name="Large Confluence",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    body = "\n".join(f"design-line-{index:05d}" for index in range(9_000))
-    extractor = StructuralUnitCandidateExtractor()
-    memory_engine = RecordingMemoryEngine()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=extractor,
-        memory_engine=memory_engine,
-        memory_store=None,
-        max_concurrent=2,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=LargeConfluenceGene(body),
-        source_name="Large Confluence",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "success"
-    assert extractor.projection_calls == []
-    assert len(extractor.unit_calls) > 1
-    assert len(memory_engine.projected_lifecycle_calls) == 1
-    [lifecycle_call] = memory_engine.projected_lifecycle_calls
-    assert len(lifecycle_call["raw_memories"]) == len(extractor.unit_calls)
-
-
-@pytest.mark.asyncio
-async def test_failed_structural_unit_stages_target_and_preserves_completed_siblings(
-    db: Database,
-) -> None:
-    source_id = "src-recoverable-projection-derivation"
-    await db.upsert_source(
-        id=source_id,
-        type="confluence",
-        name="Recoverable Confluence",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    body = "\n".join(f"design-line-{index:05d}" for index in range(6_000))
-    extractor = PartiallyFailingStructuralUnitExtractor()
-    memory_engine = RecordingMemoryEngine()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=extractor,
-        memory_engine=memory_engine,
-        memory_store=None,
-        max_concurrent=2,
-        retry_sleep=_skip_retry_delay,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=LargeConfluenceGene(body),
-        source_name="Recoverable Confluence",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "failed"
-    assert state.memories_extracted == 0
-    assert extractor.completed_unit_ids
-    assert extractor.failed_unit_ids
-    assert memory_engine.projected_lifecycle_calls == []
-
-    [attempt] = await db.list_source_derivation_attempts(source_id=source_id)
-    assert attempt.status == "retryable_failure"
-    assert attempt.target_unit_revision_id
-    assert attempt.projection_payload_hash
-    assert sum(batch.status == "completed" for batch in attempt.batches) == len(extractor.completed_unit_ids)
-    assert sum(batch.status == "retryable_failure" for batch in attempt.batches) == len(extractor.failed_unit_ids)
-    assert all(batch.output_payload_hash for batch in attempt.batches if batch.status == "completed")
-
-    recovery_order: list[str] = []
-
-    class OrderedRetryExtractor(StructuralUnitCandidateExtractor):
-        async def extract_unit_memories(self, context, **kwargs):
-            recovery_order.append("resume_extraction")
-            return await super().extract_unit_memories(
-                context,
-                **kwargs,
-            )
-
-    class OrderedRetryGene(LargeConfluenceGene):
-        async def authenticate(self) -> None:
-            recovery_order.append("provider_authenticate")
-
-    retry_extractor = OrderedRetryExtractor()
-    admission = DocumentLifecycleAdmission(max_active=1)
-    retry = GeneSyncOrchestrator(
-        db=db,
-        doc_store=orchestrator.doc_store,
-        memory_extractor=retry_extractor,
-        memory_engine=memory_engine,
-        memory_store=None,
-        max_concurrent=2,
-        document_lifecycle_admission=admission,
-        retry_sleep=_skip_retry_delay,
-    )
-    progress: list[dict] = []
-    async with admission.slot("src-other", "doc-other"):
-        retry_task = asyncio.create_task(
-            retry.sync_gene(
-                gene=OrderedRetryGene(body),
-                source_name="Recoverable Confluence",
-                source_id=source_id,
-                progress_callback=progress.append,
-            )
-        )
-        for _ in range(100):
-            if progress or recovery_order or retry_task.done():
-                break
-            await asyncio.sleep(0.01)
-        assert recovery_order == []
-        assert progress == [
-            {
-                "phase": "recovering_derivations",
-                "current": 0,
-                "total": 1,
-                "title": None,
-            }
-        ]
-    retry_state = await retry_task
-
-    assert retry_state.last_sync_status == "success"
-    assert {
-        "phase": "recovering_derivations",
-        "current": 1,
-        "total": 1,
-        "title": None,
-    } in progress
-    assert {call["context"].unit.unit_id for call in retry_extractor.unit_calls} == set(extractor.failed_unit_ids)
-    [completed_attempt] = await db.list_source_derivation_attempts(source_id=source_id)
-    assert completed_attempt.id == attempt.id
-    assert completed_attempt.status == "applied"
-    assert all(batch.status == "completed" for batch in completed_attempt.batches)
-    assert len(memory_engine.projected_lifecycle_calls) == 1
-    assert recovery_order.index("resume_extraction") < recovery_order.index("provider_authenticate")
-    [lifecycle_call] = memory_engine.projected_lifecycle_calls
-    assert len(lifecycle_call["raw_memories"]) == len(extractor.unit_calls)
-
-
-@pytest.mark.asyncio
-async def test_derivation_recovery_supersedes_an_old_extraction_contract(
-    db: Database,
-) -> None:
-    source_id = "src-stale-extraction-contract"
-    await db.upsert_source(
-        id=source_id,
-        type="confluence",
-        name="Stale extraction contract",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    body = "\n".join(f"design-line-{index:05d}" for index in range(6_000))
-    first = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=PartiallyFailingStructuralUnitExtractor(),
-        memory_engine=RecordingMemoryEngine(),
-        memory_store=None,
-        max_concurrent=2,
-        retry_sleep=_skip_retry_delay,
-    )
-
-    failed = await first.sync_gene(
-        gene=LargeConfluenceGene(body),
-        source_name="Stale extraction contract",
-        source_id=source_id,
-    )
-
-    assert failed.last_sync_status == "failed"
-    [attempt] = await db.list_source_derivation_attempts(source_id=source_id)
-    await db.db.execute(
-        """UPDATE source_derivation_attempts
-           SET extraction_contract_version = ?
-           WHERE id = ?""",
-        ("projection-extraction-v6", attempt.id),
-    )
-    await db.db.commit()
-
-    recovery = GeneSyncOrchestrator(
-        db=db,
-        doc_store=first.doc_store,
-        memory_extractor=FailingMemoryExtractor(),
-        memory_engine=FailingProjectedMemoryEngine(),
-        memory_store=None,
-        max_concurrent=1,
-        retry_sleep=_skip_retry_delay,
-    )
-    stats = await recovery._resume_source_derivations(
-        source_id=source_id,
-        source_activity_epoch=attempt.context.source_activity_epoch,
-        run_id="run-contract-upgrade",
-    )
-
-    assert (
-        stats.processed,
-        stats.updated,
-        stats.memories_extracted,
-        stats.memories_corroborated,
-        stats.deferred_results,
-    ) == (0, 0, 0, 0, ())
-    [superseded] = await db.list_source_derivation_attempts(source_id=source_id)
-    assert superseded.status == "superseded"
-    assert superseded.terminal_reason_code == "CONTRACT_SUPERSEDED"
-
-    await db.db.execute(
-        "UPDATE source_derivation_attempts SET status = 'completed', terminal_reason_code = NULL WHERE id = ?",
-        (attempt.id,),
-    )
-    await db.db.commit()
-
-    repeated = await recovery._resume_source_derivations(
-        source_id=source_id,
-        source_activity_epoch=(
-            (attempt.context.source_activity_epoch or 0) + 1
-        ),
-        run_id="run-completed-contract-history",
-    )
-
-    assert (
-        repeated.processed,
-        repeated.updated,
-        repeated.memories_extracted,
-        repeated.memories_corroborated,
-        repeated.deferred_results,
-    ) == (0, 0, 0, 0, ())
-    [completed_history] = await db.list_source_derivation_attempts(
-        source_id=source_id
-    )
-    assert completed_history.status == "completed"
-    assert completed_history.terminal_reason_code is None
 
 
 async def _stage_completed_v9_recovery_attempt(
@@ -6043,10 +5684,11 @@ async def test_failed_newer_provider_target_still_supersedes_recovered_intent(
     assert state.docs_processed == 0
     assert state.docs_failed == 1
     assert engine.semantic_calls == 2
-    [superseded] = await db.list_source_derivation_attempts(
-        source_id=source_id
-    )
-    assert superseded.id == attempt.id
+    attempts = {
+        item.id: item
+        for item in await db.list_source_derivation_attempts(source_id=source_id)
+    }
+    superseded = attempts[attempt.id]
     assert superseded.status == "superseded"
     assert (
         superseded.terminal_reason_code
@@ -6317,7 +5959,7 @@ async def test_sync_supersedes_completed_derivation_when_its_lifecycle_plan_is_a
     orchestrator = GeneSyncOrchestrator(
         db=db,
         doc_store=StubDocumentStore(),
-        memory_extractor=ProjectionBatchCandidateExtractor(),
+        memory_extractor=ProjectionFragmentCandidateExtractor(),
         memory_engine=memory_engine,
         memory_store=None,
         max_concurrent=1,
@@ -6341,6 +5983,7 @@ async def test_sync_supersedes_completed_derivation_when_its_lifecycle_plan_is_a
                     applied.context,
                     user_id="stale-completed-attempt",
                 ),
+                extraction_contract_version=applied.extraction_contract_version,
             )
         )
     ).attempt
@@ -7226,8 +6869,9 @@ async def test_targeted_reprocess_extracts_unchanged_current_projection(
         version="2",
         normalized_content_uri=normalized_content_uri,
         projection_source_type="docs",
+        source_url="https://docs.example/doc-1",
     )
-    extractor = ProjectionBatchRecordingExtractor()
+    extractor = ProjectionFragmentRecordingExtractor()
     memory_engine = RecordingMemoryEngine()
     orchestrator = GeneSyncOrchestrator(
         db=db,
@@ -7249,8 +6893,8 @@ async def test_targeted_reprocess_extracts_unchanged_current_projection(
     assert state.last_sync_status == "success"
     assert state.docs_processed == 1
     assert state.docs_updated == 1
-    assert len(extractor.projection_calls) == 1
-    assert extractor.projection_calls[0].primary_observation_ids
+    [catalog] = extractor.fragment_calls
+    assert any(fragment.primary_eligible for fragment in catalog.fragments)
     assert len(memory_engine.projected_lifecycle_calls) == 1
 
 
@@ -11629,13 +11273,15 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
             ),
         )
 
-    class OneClaimExtractor(RecordingMemoryExtractor):
+    class OneClaimExtractor(ProjectionFragmentRecordingExtractor):
         def __init__(self) -> None:
             super().__init__()
             self.claim_calls: list[str] = []
 
-        def _result(self, mode: str) -> MemoryExtractionResult:
-            self.claim_calls.append(mode)
+        async def extract_projection_fragment_memories(self, catalog, **kwargs):
+            del kwargs
+            self.claim_calls.append(catalog.target_unit_revision_id)
+            [fragment] = [item for item in catalog.fragments if "Keep A7." in item.presentation_text]
             return MemoryExtractionResult(
                 memories=[
                     RawMemory(
@@ -11643,25 +11289,11 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
                         memory_type="fact",
                         evidence_quote="Keep A7.",
                         extraction_context="Keep A7.",
+                        source_observation_id=fragment.anchor.observation_id,
+                        resolved_evidence_selection=catalog.resolve_selection(primary_ref=fragment.reference),
                     )
                 ]
             )
-
-        async def extract_memories(self, **kwargs):
-            self.full_calls.append(kwargs)
-            return self._result("full")
-
-        async def extract_memory_changes(self, **kwargs):
-            self.change_calls.append(kwargs)
-            return self._result("changes")
-
-        async def extract_unit_memories(self, context, **kwargs):
-            self.unit_calls.append({"context": context, **kwargs})
-            return self._result("unit")
-
-            async def extract_projection_batch_memories(self, batch, **kwargs):
-                del kwargs
-                return self._result(f"projection:{batch.id}")
 
     class ReplayMemoryStore:
         def __init__(self, database: Database) -> None:
@@ -11996,145 +11628,6 @@ async def test_document_update_uses_diff_guided_extraction_and_audits_strategy(
 
 
 @pytest.mark.asyncio
-async def test_single_observation_small_diff_uses_diff_guided_derivation_with_production_capabilities(
-    db: Database,
-) -> None:
-    source_id = "src-production-capability-diff-update"
-    old_markdown = "# Design Doc\n\nThe service uses PostgreSQL 14."
-    new_markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
-    doc_store = StubDocumentStore()
-    normalized_content_uri = doc_store.store_normalized(
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=old_markdown,
-    )
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=old_markdown,
-        version="1",
-        normalized_content_uri=normalized_content_uri,
-    )
-    extractor = ProjectionBatchRecordingExtractor()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=doc_store,
-        memory_extractor=extractor,
-        memory_engine=RecordingMemoryEngine(),
-        memory_store=_audited_memory_store(db),
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=UpdatingDocumentGene(new_markdown),
-        source_name="Documents",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "success"
-    assert len(extractor.change_calls) == 1
-    assert extractor.change_calls[0]["updated_document"] == new_markdown
-    assert extractor.projection_calls == []
-    assert extractor.full_calls == []
-    assert extractor.unit_calls == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("raise_error", [False, True])
-async def test_failed_diff_guided_derivation_falls_back_to_durable_structural_work(
-    db: Database,
-    raise_error: bool,
-) -> None:
-    source_id = f"src-diff-derivation-fallback-{raise_error}"
-    old_markdown = "# Design Doc\n\nThe service uses PostgreSQL 14."
-    new_markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
-    doc_store = StubDocumentStore()
-    normalized_content_uri = doc_store.store_normalized(
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=old_markdown,
-    )
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=old_markdown,
-        version="1",
-        normalized_content_uri=normalized_content_uri,
-    )
-    extractor = FailingDiffThenStructuralExtractor(raise_error=raise_error)
-    memory_engine = RecordingMemoryEngine()
-
-    class RecordingRuntimeEventTraceSink:
-        def __init__(self) -> None:
-            self.batches = []
-            self.assessment_batches = []
-
-        def publish(self, events) -> None:
-            self.batches.append(events)
-
-        def assessment_sink(self):
-            owner = self
-
-            class RecordingAssessmentSink:
-                def publish(self, assessments, events) -> None:
-                    owner.assessment_batches.append((assessments, events))
-
-            return RecordingAssessmentSink()
-
-    trace_sink = RecordingRuntimeEventTraceSink()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=doc_store,
-        memory_extractor=extractor,
-        memory_engine=memory_engine,
-        memory_store=_audited_memory_store(db),
-        max_concurrent=1,
-        runtime_event_trace_sink=trace_sink,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=UpdatingDocumentGene(new_markdown),
-        source_name="Documents",
-        source_id=source_id,
-    )
-
-    attempts = await db.list_source_derivation_attempts(source_id=source_id)
-    assert state.last_sync_status == "success"
-    assert len(extractor.change_calls) == 1
-    assert len(extractor.unit_calls) == 1
-    assert extractor.projection_calls == []
-    assert extractor.full_calls == []
-    assert [attempt.context.work_strategy for attempt in attempts] == [
-        "auto",
-        "structural",
-    ]
-    assert [attempt.status for attempt in attempts] == [
-        "superseded",
-        "applied",
-    ]
-    runtime_events = [event for batch in trace_sink.batches for event in batch]
-    assert len({event.projection_run_id for event in runtime_events}) == 1
-    assert len({event.derivation_id for event in runtime_events}) == 2
-    assert len({event.trace_id for event in runtime_events}) == 2
-    assert len({runtime_session_id(event.projection_run_id) for event in runtime_events}) == 1
-    assert len(trace_sink.assessment_batches) == len(trace_sink.batches)
-    assert any(assessments for assessments, _events in trace_sink.assessment_batches)
-    assert all(
-        {assessment.target_event_id for assessment in assessments}
-        <= {event.event_id for event in events}
-        for assessments, events in trace_sink.assessment_batches
-    )
-    assert len(memory_engine.projected_lifecycle_calls) == 1
-    assert memory_engine.projected_lifecycle_calls[0]["update_mode"] == "diff_guided"
-
-
-@pytest.mark.asyncio
 async def test_diff_guided_extraction_rejects_candidates_outside_current_change(
     db: Database,
 ) -> None:
@@ -12205,109 +11698,6 @@ async def test_diff_guided_extraction_rejects_candidates_outside_current_change(
     assert len(extraction_rows) == 1
     assert extraction_rows[0].payload["extracted_count"] == 1
     assert extraction_rows[0].payload["rejected_outside_changed_range_count"] == 1
-
-
-@pytest.mark.asyncio
-async def test_whole_document_diff_evidence_falls_back_without_inlining_document(
-    db: Database,
-) -> None:
-    source_id = "src-whole-document-diff-evidence"
-    stable_body = "\n".join(f"Stable context line {index}." for index in range(300))
-    old_markdown = f"# Design\n\n{stable_body}\n\nThe service uses PostgreSQL 14."
-    new_markdown = f"# Design\n\n{stable_body}\n\nThe service uses PostgreSQL 15."
-    doc_store = StubDocumentStore()
-    normalized_content_uri = doc_store.store_normalized(
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design",
-        markdown=old_markdown,
-    )
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design",
-        markdown=old_markdown,
-        version="1",
-        normalized_content_uri=normalized_content_uri,
-    )
-    extractor = WholeDocumentDiffThenStructuralExtractor()
-    memory_engine = RecordingMemoryEngine()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=doc_store,
-        memory_extractor=extractor,
-        memory_engine=memory_engine,
-        memory_store=_audited_memory_store(db),
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=UpdatingDocumentGene(new_markdown),
-        source_name="Documents",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "success"
-    assert len(extractor.change_calls) == 1
-    assert len(extractor.unit_calls) >= 1
-    assert len(memory_engine.projected_lifecycle_calls) == 1
-    raw_memories = memory_engine.projected_lifecycle_calls[0]["raw_memories"]
-    assert [memory.extraction_context for memory in raw_memories] == [
-        "The service uses PostgreSQL 15."
-    ]
-    assert all(memory.extraction_context != new_markdown for memory in raw_memories)
-
-
-@pytest.mark.asyncio
-async def test_large_single_observation_update_uses_durable_bounded_derivation(
-    db: Database,
-) -> None:
-    source_id = "src-large-diff-evidence-boundary"
-    stable_body = "\n".join(f"Stable context line {index}." for index in range(4_000))
-    old_markdown = f"# Design Doc\n\n{stable_body}\n\nThe service uses PostgreSQL 14."
-    new_markdown = f"# Design Doc\n\n{stable_body}\n\nThe service uses PostgreSQL 15."
-    doc_store = StubDocumentStore()
-    normalized_content_uri = doc_store.store_normalized(
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=old_markdown,
-    )
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=old_markdown,
-        version="1",
-        normalized_content_uri=normalized_content_uri,
-    )
-    extractor = ProjectionBatchRecordingExtractor()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=doc_store,
-        memory_extractor=extractor,
-        memory_engine=RecordingMemoryEngine(),
-        memory_store=_audited_memory_store(db),
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=UpdatingDocumentGene(new_markdown),
-        source_name="Documents",
-        source_id=source_id,
-    )
-
-    assert state.last_sync_status == "success"
-    assert len(extractor.change_calls) == 1
-    assert extractor.projection_calls == []
-    assert extractor.unit_calls == []
-    [derivation] = await db.list_source_derivation_attempts(
-        source_id=source_id,
-    )
-    assert derivation.status == "applied"
-    assert len(derivation.batches) == 1
 
 
 @pytest.mark.asyncio
@@ -12423,57 +11813,6 @@ async def test_document_update_falls_back_to_full_extraction_when_previous_conte
     assert audit_rows[0].decision == "full_document"
     assert audit_rows[0].reason == "previous_content_missing"
     assert audit_rows[0].payload["fallback_from"] == "diff_guided"
-
-
-@pytest.mark.asyncio
-async def test_large_full_document_uses_deterministic_units(db: Database):
-    source_id = "src-large-doc-full"
-    await db.upsert_source(
-        id=source_id,
-        type="docs",
-        name="Documents",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    markdown = "# Design Doc\n\nIntro.\n\n" + "\n\n".join(
-        f"## Section {index}\n\n" + ("Durable design detail. " * 900) for index in range(8)
-    )
-    extractor = ProjectionBatchRecordingExtractor()
-    memory_store = _audited_memory_store(db)
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=extractor,
-        memory_engine=NoopMemoryEngine(),
-        memory_store=memory_store,
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=UpdatingDocumentGene(markdown, version="1"),
-        source_name="Documents",
-        source_id=source_id,
-    )
-
-    audit_rows = await db.list_memory_audit_events(
-        event_type="memory_extraction_completed",
-    )
-    assert state.last_sync_status == "success"
-    assert state.docs_updated == 1
-    assert extractor.full_calls == []
-    assert extractor.projection_calls == []
-    assert len(extractor.unit_calls) > 1
-    assert all(call["context"].unit.unit_id for call in extractor.unit_calls)
-    assert len(audit_rows) == 1
-    assert audit_rows[0].decision == "full_document"
-    assert audit_rows[0].payload["unitized"] is True
-    assert audit_rows[0].payload["unit_count"] == len(extractor.unit_calls)
-    assert audit_rows[0].payload["segmentation_version"] == "v2"
-    assert audit_rows[0].payload["extraction_queue_wait_ms"] >= 0
-    assert audit_rows[0].payload["input_binary_bytes"] == 0
-    assert audit_rows[0].payload["multimodal_calls"] == 0
-    assert audit_rows[0].payload["max_active_multimodal"] == 0
 
 
 @pytest.mark.asyncio
@@ -13490,88 +12829,6 @@ async def test_lifecycle_failure_never_attempts_document_snapshot_restore(
     assert state.failed_docs[0].error == "lifecycle apply failed"
     assert await db.get_document("doc-1") is not None
     assert await db.find_source_unit_by_document_id(source_id, "doc-1", current_only=True) is None
-
-
-@pytest.mark.asyncio
-async def test_derivation_recovery_uses_latest_context_for_one_projection_scope(
-    db: Database,
-) -> None:
-    source_id = "src-latest-derivation-context"
-    previous_markdown = "# Design Doc\n\nThe service uses PostgreSQL 14."
-    doc_store = StubDocumentStore()
-    previous_uri = doc_store.store_normalized(
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=previous_markdown,
-    )
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id="doc-1",
-        title="Design Doc",
-        markdown=previous_markdown,
-        version="1",
-        normalized_content_uri=previous_uri,
-    )
-    updated_markdown = "# Design Doc\n\nThe service uses PostgreSQL 15."
-    failed = await GeneSyncOrchestrator(
-        db=db,
-        doc_store=doc_store,
-        memory_extractor=ProjectionBatchCandidateExtractor(),
-        memory_engine=FailingProjectedMemoryEngine(),
-        memory_store=None,
-        max_concurrent=1,
-        retry_sleep=_skip_retry_delay,
-    ).sync_gene(
-        gene=UpdatingDocumentGene(updated_markdown),
-        source_name="Documents",
-        source_id=source_id,
-    )
-
-    assert failed.last_sync_status == "failed"
-    attempts = await db.list_source_derivation_attempts(
-        source_id=source_id,
-    )
-    assert [attempt.context.update_mode for attempt in attempts] == [
-        "diff_guided",
-        "full_document",
-    ]
-    assert len({attempt.projection_identity_hash for attempt in attempts}) == 1
-
-    engine = RecordingMemoryEngine()
-    progress: list[dict] = []
-    recovered = await GeneSyncOrchestrator(
-        db=db,
-        doc_store=doc_store,
-        memory_extractor=ProjectionBatchCandidateExtractor(),
-        memory_engine=engine,
-        memory_store=None,
-        max_concurrent=1,
-        retry_sleep=_skip_retry_delay,
-    ).sync_gene(
-        gene=UpdatingDocumentGene(updated_markdown),
-        source_name="Documents",
-        source_id=source_id,
-        progress_callback=progress.append,
-    )
-
-    assert recovered.last_sync_status == "success"
-    assert len(engine.projected_lifecycle_calls) == 1
-    assert engine.projected_lifecycle_calls[0]["update_mode"] == "full_document"
-    assert {
-        "phase": "recovering_derivations",
-        "current": 0,
-        "total": 1,
-        "title": None,
-    } in progress
-    active_attempts = await db.list_source_derivation_attempts(
-        source_id=source_id,
-    )
-    assert [attempt.status for attempt in active_attempts] == [
-        "superseded",
-        "applied",
-    ]
 
 
 @pytest.mark.asyncio

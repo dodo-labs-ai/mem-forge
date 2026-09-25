@@ -61,13 +61,13 @@ def build_lifecycle_plan(
     gate_state: LifecycleGateState,
     operations: Sequence[ReconcileOperation],
     incumbents: Mapping[str, Memory],
-    source_support_reference_ids: Mapping[str, tuple[str, ...]],
-    all_active_support_reference_ids: Mapping[str, tuple[str, ...]],
+    source_support_reference_ids: Mapping[str, tuple[str, ...]] | None = None,
+    all_active_support_reference_ids: Mapping[str, tuple[str, ...]] | None = None,
     support_set_hashes: Mapping[str, str],
     observation_revision_ids: tuple[str, ...],
-    new_evidence_reference_ids: tuple[str, ...],
+    new_evidence_reference_ids: tuple[str, ...] = (),
     evidence_reference_ids_by_claim_hash: Mapping[str, tuple[str, ...]] | None = None,
-    support_scope_version: SupportScopeVersion = SupportScopeVersion.REFERENCE_SET_V1,
+    support_scope_version: SupportScopeVersion = SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
     source_support_unit_ids: Mapping[str, tuple[str, ...]] | None = None,
     all_active_support_unit_ids: Mapping[str, tuple[str, ...]] | None = None,
     new_evidence_unit_ids: tuple[str, ...] = (),
@@ -180,7 +180,7 @@ def build_lifecycle_plan(
         return (
             (source_support_unit_ids or {}).get(memory_id, ())
             if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else source_support_reference_ids.get(memory_id, ())
+            else (source_support_reference_ids or {}).get(memory_id, ())
         )
 
     def memory_creation_mutations(raw: RawMemory) -> tuple[str, tuple[LifecycleMutation, ...]]:
@@ -289,7 +289,7 @@ def build_lifecycle_plan(
         all_support = (
             (all_active_support_unit_ids or {}).get(memory_id, ())
             if support_scope_version is SupportScopeVersion.EVIDENCE_UNIT_SET_V2
-            else all_active_support_reference_ids.get(memory_id, ())
+            else (all_active_support_reference_ids or {}).get(memory_id, ())
         )
         external_support = set(all_support).difference(current_source_support)
 

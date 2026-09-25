@@ -282,6 +282,7 @@ async def _seed_lifecycle_review(db: Database, *, review_id: str = "review-lifec
         "stale_guard": {
             "observation_revision_ids": [],
             "support_set_hashes": {incumbent.id: "support-hash"},
+            "support_scope_version": "evidence-unit-set-v2",
             "memory_versions": {incumbent.id: incumbent.updated_at.isoformat()},
         },
     }
@@ -336,6 +337,7 @@ async def _seed_refreshable_stale_lifecycle_review(db: Database) -> str:
     payload = await db.get_lifecycle_plan_payload("plan-lifecycle-review")
     assert payload is not None
     payload["stale_guard"] = {
+        **payload["stale_guard"],
         "observation_revision_ids": [],
         "support_set_hashes": {incumbent.id: support_hash},
         "memory_versions": {incumbent.id: lifecycle_memory_version(incumbent)},
@@ -353,7 +355,7 @@ async def _seed_refreshable_stale_lifecycle_review(db: Database) -> str:
                 "mutation_type": "refresh_memory_index",
                 "memory_id": incumbent.id,
                 "source_id": "src-lifecycle",
-                "evidence_reference_ids": [],
+                "evidence_unit_ids": [],
                 "replacement_memory_id": None,
                 "payload": {},
             }

@@ -521,7 +521,7 @@ class CoverageProof:
 class StaleGuard:
     observation_revision_ids: tuple[str, ...]
     support_set_hashes: Mapping[str, str]
-    support_scope_version: SupportScopeVersion = SupportScopeVersion.REFERENCE_SET_V1
+    support_scope_version: SupportScopeVersion = SupportScopeVersion.EVIDENCE_UNIT_SET_V2
     memory_versions: Mapping[str, str] = field(default_factory=dict)
 
 

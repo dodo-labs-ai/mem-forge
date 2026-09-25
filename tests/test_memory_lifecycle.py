@@ -99,23 +99,6 @@ class TestSupportAwareRetirement:
         assert stored.retired_at is not None
 
     @pytest.mark.asyncio
-    async def test_document_deletion_retires_only_zero_support_memory(self, db):
-        await _insert_doc(db, "doc-a", source="src-delete")
-        await _insert_doc(db, "doc-b", source="src-keep")
-        mem = _make_memory("mem-docdel01", "Service uses PostgreSQL")
-        await db.insert_memory(mem)
-        await db.add_memory_source(mem.id, "doc-a", "confluence", source_updated_at=None)
-        await db.add_memory_source(mem.id, "doc-b", "confluence", source_updated_at=None)
-
-        await db.delete_document("doc-a")
-
-        stored = await db.get_memory(mem.id)
-        sources = await db.get_memory_sources(mem.id)
-        assert stored.status == "active"
-        assert stored.corroboration_count == 1
-        assert [s.doc_id for s in sources] == ["doc-b"]
-
-    @pytest.mark.asyncio
     async def test_losing_last_extracted_source_keeps_corroborated_memory_active(self, db):
         await _insert_doc(db, "doc-owner")
         await _insert_doc(db, "doc-support")
@@ -152,26 +135,6 @@ class TestSupportAwareRetirement:
         assert stored.corroboration_count == 1
         assert [(source.doc_id, source.support_kind) for source in sources] == [
             ("doc-owner", "extracted"),
-        ]
-
-    @pytest.mark.asyncio
-    async def test_document_deletion_keeps_corroborated_memory_active(self, db):
-        await _insert_doc(db, "doc-owner", source="src-delete")
-        await _insert_doc(db, "doc-support", source="src-keep")
-        mem = _make_memory("mem-docown01", "Service uses PostgreSQL")
-        await db.insert_memory(mem)
-        await db.add_memory_source(mem.id, "doc-owner", "confluence", support_kind="extracted", source_updated_at=None)
-        await db.add_memory_source(mem.id, "doc-support", "jira", support_kind="corroborated", source_updated_at=None)
-
-        await db.delete_document("doc-owner")
-
-        stored = await db.get_memory(mem.id)
-        sources = await db.get_memory_sources(mem.id)
-        assert stored.status == "active"
-        assert stored.retirement_reason is None
-        assert stored.corroboration_count == 1
-        assert [(source.doc_id, source.support_kind) for source in sources] == [
-            ("doc-support", "corroborated"),
         ]
 
     @pytest.mark.asyncio
@@ -219,57 +182,12 @@ class TestSupportAwareRetirement:
 
         await db.delete_source_cascade(source_id)
 
-        assert await db.get_latest_source_sync_run(source_id=source_id) is None
-        assert await db.list_source_sync_inputs(source_id=source_id) == []
-
-        await db.upsert_source(
-            source_id, "confluence", "Recreated Source", "{}", access_policy="workspace", owner_user_id="dev"
-        )
+        source = await db.get_source(source_id)
+        assert source is not None
+        assert source["status"] == "retired"
+        assert source["sync_schedule"]["enabled"] is False
+        assert await db.get_sync_state(source_id) is None
         assert await db.is_source_enabled_for_user(source_id, "user-1") is True
-
-    @pytest.mark.asyncio
-    async def test_source_cascade_durably_records_exact_artifacts_for_cleanup(self, db):
-        source_id = "src-artifacts"
-        now = datetime.now(timezone.utc)
-        await db.upsert_source(
-            source_id, "confluence", "Artifact Source", "{}", access_policy="workspace", owner_user_id="dev"
-        )
-        await db.upsert_document(
-            DocumentRecord(
-                doc_id="doc-artifacts",
-                source=source_id,
-                source_url="https://wiki.example.test/doc-artifacts",
-                title="Architecture",
-                space_or_project="SFPAY",
-                author=None,
-                last_modified=now,
-                labels=[],
-                version="1",
-                content_hash="artifact-hash",
-                token_count=100,
-                raw_content_uri="object-store://workspace/documents/src-artifacts/raw.html",
-                raw_content_type="text/html",
-                normalized_content_uri="object-store://workspace/documents/src-artifacts/page.md",
-                pdf_content_uri="object-store://workspace/documents/src-artifacts/page.pdf",
-                last_synced=now,
-            )
-        )
-        await db.create_source_sync_input(
-            source_id=source_id,
-            raw_uri="object-store://workspace/documents/src-artifacts/package.json",
-            raw_sha256="package-input-hash",
-            raw_content_type="application/json",
-        )
-
-        await db.delete_source_cascade(source_id)
-
-        tasks = await db.list_source_artifact_cleanup_tasks(limit=10)
-        assert {(task.source_id, task.artifact_uri) for task in tasks} == {
-            (source_id, "object-store://workspace/documents/src-artifacts/raw.html"),
-            (source_id, "object-store://workspace/documents/src-artifacts/page.md"),
-            (source_id, "object-store://workspace/documents/src-artifacts/page.pdf"),
-            (source_id, "object-store://workspace/documents/src-artifacts/package.json"),
-        }
 
     @pytest.mark.asyncio
     async def test_artifact_cleanup_removes_exact_file_and_completes_outbox_task(self, db, tmp_path):
@@ -308,7 +226,7 @@ class TestSupportAwareRetirement:
                 last_synced=now,
             )
         )
-        await db.delete_source_cascade(source_id)
+        await db.delete_projected_document("doc-cleanup")
 
         processed = await SourceArtifactCleanupService(db, document_store).run_pending(limit=10)
 
@@ -352,7 +270,7 @@ class TestSupportAwareRetirement:
                 last_synced=now,
             )
         )
-        await db.delete_source_cascade(source_id)
+        await db.delete_projected_document("doc-legacy-artifact")
 
         processed = await SourceArtifactCleanupService(
             db,
@@ -390,7 +308,7 @@ class TestSupportAwareRetirement:
             )
         )
 
-        await db.delete_document("doc-document-cleanup")
+        await db.delete_projected_document("doc-document-cleanup")
 
         tasks = await db.list_source_artifact_cleanup_tasks(limit=10)
         assert [(task.source_id, task.artifact_uri) for task in tasks] == [

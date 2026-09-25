@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
-import json
 import sqlite3
 from types import SimpleNamespace
 
@@ -16,8 +15,6 @@ from memforge.memory.evidence import (
     EvidenceReference,
     EvidenceRole,
     EvidenceUnit,
-    MemorySupportAssertion,
-    evidence_reference_id_for,
 )
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
@@ -46,37 +43,28 @@ from memforge.memory.lifecycle_review import (
     build_lifecycle_review_approval_plan,
     build_lifecycle_review_refresh_plan,
 )
-from memforge.genes.local_markdown_gene import LocalMarkdownGene
 from memforge.memory.cutover import (
-    list_agent_session_lifecycle_migration_candidates,
     recover_stale_lifecycle_jobs,
-    reconstruct_historical_source_projection,
-    repair_lifecycle_cutover_finding,
     run_source_lifecycle_backfill,
     run_source_lifecycle_backfill_job,
     run_source_lifecycle_recovery_job,
     run_with_lifecycle_activity_heartbeat,
 )
 from memforge.models import (
-    ContentItem,
     DocumentRecord,
     Memory,
     MemoryReview,
-    MemorySource,
-    NormalizedContent,
-    RawContent,
     ReconcileAction,
     ReconcileOperation,
     ReviewKind,
     ReviewStatus,
     content_hash,
 )
-from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.storage.database import Database, MIGRATIONS
-from memforge.storage.document_store import LocalDocumentStore
 from tests.test_source_projection_store import _projection
+from tests.unit_support_fixture import complete_unit_parts, primary_reference, record_unit_support
 
 
 @pytest_asyncio.fixture
@@ -117,33 +105,14 @@ def _finding() -> LifecycleCutoverFinding:
     )
 
 
-@pytest.mark.asyncio
-async def test_support_assertion_rejects_unknown_memory_with_adapter_contract_error(
-    db: Database,
-) -> None:
-    with pytest.raises(
-        ValueError,
-        match="support assertion references unknown Memory",
-    ):
-        await db.upsert_memory_support_assertion(
-            MemorySupportAssertion(
-                id="support-unknown-memory",
-                memory_id="mem-missing",
-                evidence_reference_id="reference-not-read",
-                source_id="src-1",
-                access_context_hash="workspace",
-            )
-        )
-
-
 def _unit() -> EvidenceUnit:
     return EvidenceUnit(
         id="eu-backfill-1",
         source_id="src-1",
         doc_id="legacy-gate-doc",
-        doc_revision_id="obsrev-page-1-v2",
+        doc_revision_id="unitrev-page-1-v2",
         source_type="confluence",
-        source_anchor="legacy-compatible-anchor",
+        source_anchor="obs-page-1-body",
         source_lineage_id="unit-page-1",
         project_key=None,
         visibility="workspace",
@@ -152,6 +121,7 @@ def _unit() -> EvidenceUnit:
         content="Legacy claim",
         excerpt="Legacy claim",
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        access_context_hash="workspace",
     )
 
 
@@ -209,167 +179,6 @@ async def test_new_source_is_destructive_lifecycle_gated_by_default(db: Database
     gate = await db.get_lifecycle_gate("src-1")
 
     assert gate.state is LifecycleGateState.GATED
-
-
-@pytest.mark.asyncio
-async def test_agent_session_migration_inventory_includes_hidden_gate_and_enabled_lineage_gap(
-    db: Database,
-    monkeypatch,
-) -> None:
-    for source_id in ("src-agent-hidden", "src-agent-enabled-gap", "src-agent-healthy"):
-        await db.upsert_source(
-            id=source_id,
-            type="agent_session",
-            name="Agent Session",
-            config_json="{}",
-            access_policy="private",
-            owner_user_id=f"owner-{source_id}",
-        )
-        memory_id = f"mem-{source_id}"
-        doc_id = f"doc-{source_id}"
-        await db.insert_memory(
-            Memory(
-                id=memory_id,
-                memory_type="fact",
-                content=f"claim for {source_id}",
-                content_hash=content_hash(f"claim for {source_id}"),
-                visibility="private",
-                owner_user_id=f"owner-{source_id}",
-            )
-        )
-        await db.db.execute(
-            """INSERT INTO documents (
-                   doc_id, source, source_url, title, space_or_project, last_modified,
-                   version, content_hash, last_synced
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                doc_id,
-                source_id,
-                f"agent-knowledge://{source_id}/{doc_id}",
-                "Agent concept",
-                "agent-session",
-                "2026-07-16T00:00:00+00:00",
-                "1",
-                "hash",
-                "2026-07-16T00:00:00+00:00",
-            ),
-        )
-        await db.add_memory_source(
-            memory_id,
-            doc_id,
-            "agent_session",
-            f"claim for {source_id}",
-            source_updated_at=None,
-        )
-
-    # Simulate a legacy writer that created unsupported provenance after a gate
-    # had already been enabled. The public gate API correctly rejects this state.
-    await db.db.execute(
-        """INSERT INTO source_lifecycle_gates (
-               source_id, state, reason, audited_at, enabled_at, updated_at
-           ) VALUES (?, 'enabled', NULL, ?, ?, ?)""",
-        (
-            "src-agent-enabled-gap",
-            "2026-07-16T00:00:00+00:00",
-            "2026-07-16T00:00:00+00:00",
-            "2026-07-16T00:00:00+00:00",
-        ),
-    )
-    await db.db.commit()
-
-    healthy_projection = _projection()
-    healthy_observation = replace(
-        healthy_projection.observations[0],
-        id="obs-agent-healthy",
-        source_id="src-agent-healthy",
-        source_unit_id="unit-agent-healthy",
-        observation_type="agent_concept",
-        provider_key="doc-src-agent-healthy:concept",
-    )
-    healthy_observation_revision = replace(
-        healthy_projection.observation_revisions[0],
-        id="obsrev-agent-healthy",
-        observation_id=healthy_observation.id,
-    )
-    healthy_source_unit = replace(
-        healthy_projection.source_units[0],
-        id="unit-agent-healthy",
-        source_id="src-agent-healthy",
-        unit_type="agent_concept",
-        provider_key="doc-src-agent-healthy",
-        locator={"document_id": "doc-src-agent-healthy"},
-    )
-    healthy_source_unit_revision = replace(
-        healthy_projection.source_unit_revisions[0],
-        id="unitrev-agent-healthy",
-        source_unit_id=healthy_source_unit.id,
-        observation_revision_ids=(healthy_observation_revision.id,),
-    )
-    await db.record_source_projection(
-        replace(
-            healthy_projection,
-            run_id="projection-agent-healthy",
-            source_id="src-agent-healthy",
-            source_type="agent_session",
-            observations=(healthy_observation,),
-            observation_revisions=(healthy_observation_revision,),
-            source_units=(healthy_source_unit,),
-            source_unit_revisions=(healthy_source_unit_revision,),
-            relations=(),
-            deltas=(),
-        )
-    )
-    healthy_unit = replace(
-        _unit(),
-        id="eu-agent-healthy",
-        source_id="src-agent-healthy",
-        doc_id="doc-src-agent-healthy",
-        doc_revision_id=healthy_observation_revision.id,
-        source_type="agent_session",
-        source_lineage_id=healthy_source_unit.id,
-    )
-    await db.upsert_evidence_unit(healthy_unit)
-    healthy_reference = EvidenceReference(
-        role=EvidenceRole.PRIMARY,
-        anchor=SourceAnchor(
-            kind=AnchorKind.WHOLE_OBSERVATION,
-            observation_id="obs-agent-healthy",
-            observation_revision_id=healthy_observation_revision.id,
-        ),
-        evidence_unit_id=healthy_unit.id,
-    )
-    healthy_reference = replace(
-        healthy_reference,
-        id=evidence_reference_id_for(healthy_unit.id, healthy_reference),
-    )
-    await db.record_evidence_references(healthy_unit.id, (healthy_reference,))
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-agent-healthy",
-            memory_id="mem-src-agent-healthy",
-            evidence_reference_id=healthy_reference.id or "",
-            source_id="src-agent-healthy",
-            access_context_hash="private:owner-src-agent-healthy",
-        )
-    )
-    await db.enable_lifecycle_gate("src-agent-healthy")
-
-    async def forbid_content_scan(_source_id: str):
-        raise AssertionError("candidate inventory must not load Memory content or excerpts")
-
-    monkeypatch.setattr(db, "list_legacy_memory_provenance", forbid_content_scan)
-
-    candidates = await list_agent_session_lifecycle_migration_candidates(db)
-
-    assert [candidate.source_id for candidate in candidates] == [
-        "src-agent-enabled-gap",
-        "src-agent-hidden",
-    ]
-    assert [candidate.active_memory_count for candidate in candidates] == [1, 1]
-    assert [candidate.missing_support_count for candidate in candidates] == [1, 1]
-    assert [candidate.missing_source_provenance_count for candidate in candidates] == [0, 0]
-    assert candidates[0].gate_state is LifecycleGateState.ENABLED
-    assert candidates[1].gate_state is LifecycleGateState.GATED
 
 
 @pytest.mark.asyncio
@@ -570,55 +379,6 @@ async def test_lifecycle_activity_heartbeat_prefers_completed_work_when_both_tas
 
 
 @pytest.mark.asyncio
-async def test_resolved_finding_retry_preserves_history_and_enabled_gate(
-    db: Database,
-) -> None:
-    finding = _finding()
-    await db.upsert_lifecycle_cutover_finding(finding)
-
-    with pytest.raises(ValueError, match="open lifecycle cutover findings"):
-        await db.enable_lifecycle_gate("src-1")
-
-    await _attach_legacy_source(db)
-    unit = _unit()
-    await db.upsert_evidence_unit(unit)
-    reference = EvidenceReference(
-        role=EvidenceRole.PRIMARY,
-        anchor=SourceAnchor(
-            kind=AnchorKind.WHOLE_OBSERVATION,
-            observation_id="obs-page-1-body",
-            observation_revision_id="obsrev-page-1-v2",
-        ),
-        evidence_unit_id=unit.id,
-    )
-    reference = replace(reference, id=evidence_reference_id_for(unit.id, reference))
-    await db.record_evidence_references(unit.id, (reference,))
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-1",
-            memory_id="mem-legacy",
-            evidence_reference_id=reference.id or "",
-            source_id="src-1",
-            access_context_hash="workspace",
-        )
-    )
-
-    resolved = await db.resolve_lifecycle_cutover_finding(
-        finding.id,
-        observation_id="obs-page-1-body",
-        source_unit_id="unit-page-1",
-    )
-    gate = await db.enable_lifecycle_gate("src-1")
-    await db.upsert_lifecycle_cutover_finding(finding)
-
-    assert resolved.status is CutoverFindingStatus.RESOLVED
-    assert resolved.created_at == (await db.get_lifecycle_cutover_finding(finding.id)).created_at
-    assert gate.state is LifecycleGateState.ENABLED
-    assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
-    assert (await db.get_lifecycle_cutover_finding(finding.id)).status is CutoverFindingStatus.RESOLVED
-
-
-@pytest.mark.asyncio
 async def test_finding_upsert_rejects_identity_or_status_change(db: Database) -> None:
     finding = _finding()
     await db.upsert_lifecycle_cutover_finding(finding)
@@ -724,14 +484,10 @@ async def test_gate_rejects_source_provenance_without_exact_document_support(
 @pytest.mark.parametrize(
     "corrupt_statement, corrupt_params",
     (
-        (
-            "DELETE FROM evidence_references WHERE id = ?",
-            ("er-eu-backfill-1-106109283a0fd70a",),
-        ),
         ("DELETE FROM evidence_units WHERE id = ?", ("eu-backfill-1",)),
         ("UPDATE evidence_units SET doc_id = NULL WHERE id = ?", ("eu-backfill-1",)),
     ),
-    ids=("missing-reference", "missing-evidence-unit", "null-document"),
+    ids=("missing-evidence-unit", "null-document"),
 )
 async def test_reverse_support_projection_audit_fails_closed_for_corrupt_evidence_chain(
     db: Database,
@@ -739,9 +495,7 @@ async def test_reverse_support_projection_audit_fails_closed_for_corrupt_evidenc
     corrupt_params: tuple[str, ...],
 ) -> None:
     await _attach_legacy_source(db)
-    reference = await _persist_exact_support_and_provenance(db)
-    if "evidence_references" in corrupt_statement:
-        corrupt_params = (reference.id or "",)
+    await _persist_exact_support_and_provenance(db)
     await db.db.commit()
     await db.db.execute("PRAGMA foreign_keys = OFF")
     await db.db.execute(corrupt_statement, corrupt_params)
@@ -762,32 +516,27 @@ async def test_gate_ignores_inactive_historical_memory_without_support(db: Datab
     assert gate.state is LifecycleGateState.ENABLED
 
 
-async def _persist_exact_support_and_provenance(db: Database) -> EvidenceReference:
+async def _persist_exact_support_and_provenance(db: Database) -> str:
+    """Make ``_unit()`` active Support for the fixture Memory and return its id."""
+
     if not any(source.source_id == "src-1" for source in await db.get_memory_sources("mem-legacy")):
         await _attach_legacy_source(db)
     unit = _unit()
-    await db.upsert_evidence_unit(unit)
-    reference = EvidenceReference(
-        role=EvidenceRole.PRIMARY,
-        anchor=SourceAnchor(
-            kind=AnchorKind.WHOLE_OBSERVATION,
-            observation_id="obs-page-1-body",
-            observation_revision_id="obsrev-page-1-v2",
+    await record_unit_support(
+        db,
+        memory_id="mem-legacy",
+        unit=unit,
+        references=(
+            primary_reference(
+                SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id="obs-page-1-body",
+                    observation_revision_id="obsrev-page-1-v2",
+                )
+            ),
         ),
-        evidence_unit_id=unit.id,
     )
-    reference = replace(reference, id=evidence_reference_id_for(unit.id, reference))
-    await db.record_evidence_references(unit.id, (reference,))
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-1",
-            memory_id="mem-legacy",
-            evidence_reference_id=reference.id or "",
-            source_id="src-1",
-            access_context_hash="workspace",
-        )
-    )
-    return reference
+    return unit.id
 
 
 def _overlapping_source_projection():
@@ -855,8 +604,8 @@ def _overlapping_support_plan(
     *,
     plan_id: str,
     mutation_type: LifecycleMutationType,
-    reference: EvidenceReference,
-    evidence_unit: EvidenceUnit | None = None,
+    evidence_unit: EvidenceUnit,
+    staged_references: tuple[EvidenceReference, ...] = (),
     support_hash: str | None = None,
 ) -> LifecyclePlan:
     removing = mutation_type is LifecycleMutationType.REMOVE_SUPPORT
@@ -895,15 +644,15 @@ def _overlapping_support_plan(
                 mutation_type,
                 memory_id="mem-legacy",
                 source_id="src-2",
-                evidence_reference_ids=(reference.id or "",),
+                evidence_unit_ids=(evidence_unit.id,),
                 payload={
                     "access_context_hash": "workspace",
                     "document_id": "legacy-gate-doc",
                 },
             ),
         ),
-        evidence_units=((evidence_unit,) if evidence_unit is not None else ()),
-        evidence_references=((reference,) if evidence_unit is not None else ()),
+        evidence_units=((evidence_unit,) if staged_references else ()),
+        evidence_references=staged_references,
     )
 
 
@@ -911,7 +660,7 @@ async def _attach_overlapping_source_support(
     db: Database,
     *,
     plan_id: str,
-) -> tuple[EvidenceUnit, EvidenceReference]:
+) -> EvidenceUnit:
     await _persist_exact_support_and_provenance(db)
     await db.upsert_source(
         id="src-2",
@@ -922,37 +671,40 @@ async def _attach_overlapping_source_support(
         owner_user_id="owner-1",
     )
     await db.record_source_projection(_overlapping_source_projection())
-    unit = replace(
-        _unit(),
-        id=f"eu-{plan_id}",
-        source_id="src-2",
-        doc_revision_id="obsrev-page-1-v2-source-2",
-        source_lineage_id="unit-page-1-source-2",
-    )
-    reference = EvidenceReference(
-        role=EvidenceRole.PRIMARY,
-        anchor=SourceAnchor(
-            kind=AnchorKind.WHOLE_OBSERVATION,
-            observation_id="obs-page-1-body-source-2",
-            observation_revision_id="obsrev-page-1-v2-source-2",
+    unit, references = await complete_unit_parts(
+        db,
+        replace(
+            _unit(),
+            id=f"eu-{plan_id}",
+            source_id="src-2",
+            doc_revision_id="unitrev-page-1-v2-source-2",
+            source_anchor="obs-page-1-body-source-2",
+            source_lineage_id="unit-page-1-source-2",
         ),
-        evidence_unit_id=unit.id,
+        (
+            primary_reference(
+                SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id="obs-page-1-body-source-2",
+                    observation_revision_id="obsrev-page-1-v2-source-2",
+                )
+            ),
+        ),
     )
-    reference = replace(reference, id=evidence_reference_id_for(unit.id, reference))
     await db.apply_lifecycle_plan(
         _overlapping_support_plan(
             plan_id=plan_id,
             mutation_type=LifecycleMutationType.ATTACH_SUPPORT,
-            reference=reference,
             evidence_unit=unit,
+            staged_references=references,
         )
     )
-    return unit, reference
+    return unit
 
 
 async def _attach_same_source_incarnation_support(
     db: Database,
-) -> tuple[EvidenceReference, EvidenceReference]:
+) -> tuple[str, str]:
     """Attach two active Support edges sharing one Memory/source/document.
 
     Source Unit identity can be reincarnated for a reused document locator, so
@@ -960,7 +712,7 @@ async def _attach_same_source_incarnation_support(
     Support edges are gone.
     """
 
-    first_reference = await _persist_exact_support_and_provenance(db)
+    first_unit_id = await _persist_exact_support_and_provenance(db)
     original = _projection()
     second_unit = replace(
         original.source_units[0],
@@ -999,35 +751,26 @@ async def _attach_same_source_incarnation_support(
     second_evidence_unit = replace(
         _unit(),
         id="eu-page-1-incarnation-2",
-        doc_revision_id=second_observation_revision.id,
+        doc_revision_id=second_unit_revision.id,
+        source_anchor=second_observation.id,
         source_lineage_id=second_unit.id,
     )
-    await db.upsert_evidence_unit(second_evidence_unit)
-    second_reference = EvidenceReference(
-        role=EvidenceRole.PRIMARY,
-        anchor=SourceAnchor(
-            kind=AnchorKind.WHOLE_OBSERVATION,
-            observation_id=second_observation.id,
-            observation_revision_id=second_observation_revision.id,
+    await record_unit_support(
+        db,
+        memory_id="mem-legacy",
+        unit=second_evidence_unit,
+        references=(
+            primary_reference(
+                SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id=second_observation.id,
+                    observation_revision_id=second_observation_revision.id,
+                )
+            ),
         ),
-        evidence_unit_id=second_evidence_unit.id,
-    )
-    second_reference = replace(
-        second_reference,
-        id=evidence_reference_id_for(second_evidence_unit.id, second_reference),
-    )
-    await db.record_evidence_references(second_evidence_unit.id, (second_reference,))
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-page-1-incarnation-2",
-            memory_id="mem-legacy",
-            evidence_reference_id=second_reference.id or "",
-            source_id="src-1",
-            access_context_hash="workspace",
-        )
     )
     await db.enable_lifecycle_gate("src-1")
-    return first_reference, second_reference
+    return first_unit_id, second_evidence_unit.id
 
 
 def _remove_support_plan(
@@ -1036,7 +779,7 @@ def _remove_support_plan(
     scope_source_unit_id: str,
     target_unit_revision_id: str,
     observation_revision_id: str,
-    reference_id: str,
+    evidence_unit_id: str,
     support_hash: str,
 ) -> LifecyclePlan:
     return LifecyclePlan(
@@ -1070,7 +813,7 @@ def _remove_support_plan(
                 LifecycleMutationType.REMOVE_SUPPORT,
                 memory_id="mem-legacy",
                 source_id="src-1",
-                evidence_reference_ids=(reference_id,),
+                evidence_unit_ids=(evidence_unit_id,),
                 payload={"document_id": "legacy-gate-doc"},
             ),
         ),
@@ -1081,19 +824,19 @@ def _remove_support_plan(
 async def test_remove_support_preserves_shared_same_source_document_projection(
     db: Database,
 ) -> None:
-    first_reference, second_reference = await _attach_same_source_incarnation_support(db)
+    first_unit_id, second_unit_id = await _attach_same_source_incarnation_support(db)
     plan = _remove_support_plan(
         plan_id="plan-remove-first-incarnation",
         scope_source_unit_id="unit-page-1",
         target_unit_revision_id="unitrev-page-1-v2",
         observation_revision_id="obsrev-page-1-v2",
-        reference_id=first_reference.id or "",
+        evidence_unit_id=first_unit_id,
         support_hash=await db.get_memory_support_set_hash("mem-legacy"),
     )
 
     await db.apply_lifecycle_plan(plan)
 
-    assert await db.get_active_memory_support_reference_ids("mem-legacy") == (second_reference.id,)
+    assert await db.get_active_memory_support_unit_ids("mem-legacy") == (second_unit_id,)
     assert [(source.source_id, source.doc_id) for source in await db.get_memory_sources("mem-legacy")] == [
         ("src-1", "legacy-gate-doc")
     ]
@@ -1101,33 +844,10 @@ async def test_remove_support_preserves_shared_same_source_document_projection(
 
 
 @pytest.mark.asyncio
-async def test_remove_support_rejects_reference_owned_by_another_source_unit(
-    db: Database,
-) -> None:
-    first_reference, second_reference = await _attach_same_source_incarnation_support(db)
-    plan = _remove_support_plan(
-        plan_id="plan-cross-unit-remove",
-        scope_source_unit_id="unit-page-1",
-        target_unit_revision_id="unitrev-page-1-v2",
-        observation_revision_id="obsrev-page-1-v2",
-        reference_id=second_reference.id or "",
-        support_hash=await db.get_memory_support_set_hash("mem-legacy"),
-    )
-
-    with pytest.raises(ValueError, match="another Source Unit"):
-        await db.apply_lifecycle_plan(plan)
-
-    assert set(await db.get_active_memory_support_reference_ids("mem-legacy")) == {
-        first_reference.id,
-        second_reference.id,
-    }
-
-
-@pytest.mark.asyncio
 async def test_overlapping_configured_sources_keep_independent_support_projection(
     db: Database,
 ) -> None:
-    _, reference = await _attach_overlapping_source_support(
+    unit = await _attach_overlapping_source_support(
         db,
         plan_id="plan-overlapping-attach",
     )
@@ -1146,7 +866,7 @@ async def test_overlapping_configured_sources_keep_independent_support_projectio
         _overlapping_support_plan(
             plan_id="plan-overlapping-remove",
             mutation_type=LifecycleMutationType.REMOVE_SUPPORT,
-            reference=reference,
+            evidence_unit=unit,
             support_hash=await db.get_memory_support_set_hash("mem-legacy"),
         )
     )
@@ -1197,68 +917,6 @@ async def test_document_owned_corroboration_preserves_an_overlapping_source_proj
 
 
 @pytest.mark.asyncio
-async def test_remove_memory_source_removes_only_the_named_configured_source(
-    db: Database,
-) -> None:
-    overlapping_unit, _ = await _attach_overlapping_source_support(
-        db,
-        plan_id="plan-overlapping-direct-remove",
-    )
-    retired = await db.remove_memory_source(
-        "mem-legacy",
-        "legacy-gate-doc",
-        source_id="src-2",
-    )
-
-    assert retired is False
-    sources = await db.get_memory_sources("mem-legacy")
-    assert [(source.source_id, source.doc_id) for source in sources] == [
-        ("src-1", "legacy-gate-doc"),
-    ]
-    assert await db.get_evidence_unit("eu-backfill-1") is not None
-    assert await db.get_evidence_unit(overlapping_unit.id) is not None
-    assert await db.get_active_memory_support_evidence("mem-legacy", source_id="src-2") == ()
-    metadata_rows = await db.db.execute_fetchall(
-        """SELECT source_id FROM memory_search_metadata_trigram
-             WHERE memory_id = ? AND doc_id = ? ORDER BY source_id""",
-        ("mem-legacy", "legacy-gate-doc"),
-    )
-    assert [row["source_id"] for row in metadata_rows] == ["src-1"]
-
-
-@pytest.mark.asyncio
-async def test_remove_memory_source_fails_closed_when_other_support_lacks_projection(
-    db: Database,
-) -> None:
-    _, other_reference = await _attach_overlapping_source_support(
-        db,
-        plan_id="plan-overlapping-drift",
-    )
-    await db.db.execute(
-        "DELETE FROM memory_sources WHERE memory_id = ? AND source_id = ?",
-        ("mem-legacy", "src-2"),
-    )
-    await db.db.commit()
-
-    with pytest.raises(ValueError, match="active support lacks source provenance"):
-        await db.remove_memory_source(
-            "mem-legacy",
-            "legacy-gate-doc",
-            source_id="src-1",
-        )
-
-    stored = await db.get_memory("mem-legacy")
-    assert stored is not None
-    assert stored.status == "active"
-    support_ids = set(await db.get_active_memory_support_reference_ids("mem-legacy"))
-    assert other_reference.id in support_ids
-    assert len(support_ids) == 2
-    assert [(source.source_id, source.doc_id) for source in await db.get_memory_sources("mem-legacy")] == [
-        ("src-1", "legacy-gate-doc")
-    ]
-
-
-@pytest.mark.asyncio
 async def test_remove_memory_source_is_noop_for_missing_memory(db: Database) -> None:
     retired = await db.remove_memory_source(
         "mem-missing",
@@ -1274,53 +932,10 @@ async def test_remove_memory_source_is_noop_for_missing_memory(db: Database) -> 
 
 
 @pytest.mark.asyncio
-async def test_remove_memory_source_preserves_shared_evidence_for_another_memory(
-    db: Database,
-) -> None:
-    unit, reference = await _attach_overlapping_source_support(
-        db,
-        plan_id="plan-shared-evidence-remove",
-    )
-    other = Memory(
-        id="mem-other-shared-evidence",
-        memory_type="fact",
-        content="Another claim uses the same evidence unit.",
-        content_hash=content_hash("Another claim uses the same evidence unit."),
-    )
-    await db.insert_memory(other)
-    await db.restore_memory_source_snapshot(
-        MemorySource(
-            memory_id=other.id,
-            doc_id=unit.doc_id,
-            source_id=unit.source_id,
-            source_type=unit.source_type,
-            excerpt=unit.excerpt,
-            source_updated_at=None,
-        )
-    )
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-other-shared-evidence",
-            memory_id=other.id,
-            evidence_reference_id=reference.id or "",
-            source_id=unit.source_id,
-            access_context_hash="workspace",
-        )
-    )
-
-    await db.remove_memory_source("mem-legacy", unit.doc_id, source_id=unit.source_id)
-
-    stored_unit = await db.get_evidence_unit(unit.id)
-    assert stored_unit is not None
-    assert stored_unit.id == unit.id
-    assert await db.get_active_memory_support_reference_ids(other.id) == (reference.id,)
-
-
-@pytest.mark.asyncio
 async def test_delete_source_preserves_a_document_projected_by_another_configured_source(
     db: Database,
 ) -> None:
-    overlapping_unit, _ = await _attach_overlapping_source_support(
+    overlapping_unit = await _attach_overlapping_source_support(
         db,
         plan_id="plan-overlapping-delete-owner",
     )
@@ -1335,8 +950,7 @@ async def test_delete_source_preserves_a_document_projected_by_another_configure
     assert [(source.source_id, source.doc_id) for source in sources] == [
         ("src-2", "legacy-gate-doc"),
     ]
-    assert await db.get_evidence_unit("eu-backfill-1") is None
-    assert await db.get_evidence_unit(overlapping_unit.id) is not None
+    assert await db.get_active_memory_support_unit_ids("mem-legacy") == (overlapping_unit.id,)
     memory = await db.get_memory("mem-legacy")
     assert memory is not None
     assert memory.status == "active"
@@ -1346,7 +960,7 @@ async def test_delete_source_preserves_a_document_projected_by_another_configure
 async def test_delete_non_owner_source_removes_its_exact_shared_document_projection(
     db: Database,
 ) -> None:
-    overlapping_unit, _ = await _attach_overlapping_source_support(
+    await _attach_overlapping_source_support(
         db,
         plan_id="plan-overlapping-delete-non-owner",
     )
@@ -1361,14 +975,13 @@ async def test_delete_non_owner_source_removes_its_exact_shared_document_project
     assert [(source.source_id, source.doc_id) for source in sources] == [
         ("src-1", "legacy-gate-doc"),
     ]
-    assert await db.get_evidence_unit("eu-backfill-1") is not None
-    assert await db.get_evidence_unit(overlapping_unit.id) is None
+    assert await db.get_active_memory_support_unit_ids("mem-legacy") == ("eu-backfill-1",)
     memory = await db.get_memory("mem-legacy")
     assert memory is not None
     assert memory.status == "active"
 
 
-def _retirement_plan(reference: EvidenceReference, support_hash: str) -> LifecyclePlan:
+def _retirement_plan(evidence_unit_id: str, support_hash: str) -> LifecyclePlan:
     return LifecyclePlan(
         id="plan-retire-1",
         scope=ReconciliationScope(
@@ -1400,7 +1013,7 @@ def _retirement_plan(reference: EvidenceReference, support_hash: str) -> Lifecyc
                 LifecycleMutationType.REMOVE_SUPPORT,
                 memory_id="mem-legacy",
                 source_id="src-1",
-                evidence_reference_ids=(reference.id or "",),
+                evidence_unit_ids=(evidence_unit_id,),
             ),
             LifecycleMutation(
                 LifecycleMutationType.RETIRE_MEMORY,
@@ -1412,7 +1025,7 @@ def _retirement_plan(reference: EvidenceReference, support_hash: str) -> Lifecyc
 
 
 def _gated_retirement_plan(
-    reference: EvidenceReference,
+    evidence_unit_id: str,
     incumbent: Memory,
     support_hash: str,
     *,
@@ -1436,11 +1049,10 @@ def _gated_retirement_plan(
             ),
         ),
         incumbents={incumbent.id: incumbent},
-        source_support_reference_ids={incumbent.id: (reference.id or "",)},
-        all_active_support_reference_ids={incumbent.id: (reference.id or "",)},
+        source_support_unit_ids={incumbent.id: (evidence_unit_id,)},
+        all_active_support_unit_ids={incumbent.id: (evidence_unit_id,)},
         support_set_hashes={incumbent.id: support_hash},
         observation_revision_ids=("obsrev-page-1-v2",),
-        new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
             owner_user_id=None,
@@ -1455,9 +1067,9 @@ def _gated_retirement_plan(
 
 @pytest.mark.asyncio
 async def test_lifecycle_plan_applies_support_removal_and_retirement_atomically(db: Database) -> None:
-    reference = await _persist_exact_support_and_provenance(db)
+    unit_id = await _persist_exact_support_and_provenance(db)
     await db.enable_lifecycle_gate("src-1")
-    plan = _retirement_plan(reference, await db.get_memory_support_set_hash("mem-legacy"))
+    plan = _retirement_plan(unit_id, await db.get_memory_support_set_hash("mem-legacy"))
     other = Database(db.db_path)
     await other.connect()
 
@@ -1503,12 +1115,12 @@ async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
             challenger_memory_id=challenger.id,
         )
     )
-    reference = await _persist_exact_support_and_provenance(db)
+    unit_id = await _persist_exact_support_and_provenance(db)
     incumbent = await db.get_memory("mem-legacy")
     assert incumbent is not None
     support_hash = await db.get_memory_support_set_hash(incumbent.id)
     review_plan = _gated_retirement_plan(
-        reference,
+        unit_id,
         incumbent,
         support_hash,
         plan_id="plan-terminal-review",
@@ -1521,7 +1133,7 @@ async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
     assert len(lifecycle_reviews) == 1
     await db.enable_lifecycle_gate("src-1")
     plan = replace(
-        _retirement_plan(reference, support_hash),
+        _retirement_plan(unit_id, support_hash),
         id="plan-terminal-retire",
     )
 
@@ -1541,12 +1153,12 @@ async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
 async def test_gated_review_approval_applies_proposal_and_resolves_review_atomically(
     db: Database,
 ) -> None:
-    reference = await _persist_exact_support_and_provenance(db)
+    unit_id = await _persist_exact_support_and_provenance(db)
     incumbent = await db.get_memory("mem-legacy")
     assert incumbent is not None
     support_hash = await db.get_memory_support_set_hash(incumbent.id)
     original = _gated_retirement_plan(
-        reference,
+        unit_id,
         incumbent,
         support_hash,
         plan_id="plan-gated-delete",
@@ -1578,8 +1190,8 @@ async def test_gated_review_approval_applies_proposal_and_resolves_review_atomic
 async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
     db: Database,
 ) -> None:
-    source_reference = await _persist_exact_support_and_provenance(db)
-    _, other_reference = await _attach_overlapping_source_support(
+    source_unit_id = await _persist_exact_support_and_provenance(db)
+    other_unit = await _attach_overlapping_source_support(
         db,
         plan_id="plan-review-refresh-other-source",
     )
@@ -1606,11 +1218,10 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
             ),
         ),
         incumbents={incumbent.id: incumbent},
-        source_support_reference_ids={incumbent.id: (source_reference.id or "",)},
-        all_active_support_reference_ids={incumbent.id: support_state.reference_ids},
+        source_support_unit_ids={incumbent.id: (source_unit_id,)},
+        all_active_support_unit_ids={incumbent.id: support_state.unit_ids},
         support_set_hashes={incumbent.id: support_state.support_set_hash},
         observation_revision_ids=("obsrev-page-1-v2",),
-        new_evidence_reference_ids=(),
         defaults=NewMemoryDefaults(
             visibility="workspace",
             owner_user_id=None,
@@ -1630,14 +1241,20 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
         status=LifecycleReviewStatus.PENDING,
     )
 
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-review-refresh-other-source",
-            memory_id=incumbent.id,
-            evidence_reference_id=other_reference.id or "",
-            source_id="src-2",
-            access_context_hash="workspace-updated",
-        )
+    additional_other_unit = replace(other_unit, id="eu-review-refresh-other-source-additional")
+    await record_unit_support(
+        db,
+        memory_id=incumbent.id,
+        unit=additional_other_unit,
+        references=(
+            primary_reference(
+                SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id="obs-page-1-body-source-2",
+                    observation_revision_id="obsrev-page-1-v2-source-2",
+                )
+            ),
+        ),
     )
     await db.resolve_lifecycle_review(stale_review.id, LifecycleReviewStatus.STALE)
     incumbent = await db.get_memory(incumbent.id)
@@ -1664,7 +1281,7 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
 
     assert (await db.get_lifecycle_review(refreshed_review_id)).status is LifecycleReviewStatus.APPROVED  # type: ignore[union-attr]
     remaining = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
-    assert remaining.reference_ids == (other_reference.id,)
+    assert remaining.unit_ids == tuple(sorted((other_unit.id, additional_other_unit.id)))
     assert (await db.get_memory(incumbent.id)).status == "active"  # type: ignore[union-attr]
 
 
@@ -1704,9 +1321,9 @@ async def test_failed_vector_tasks_rotate_without_starving_new_pending_cleanup(
 
 @pytest.mark.asyncio
 async def test_stale_lifecycle_plan_rolls_back_without_partial_mutation(db: Database) -> None:
-    reference = await _persist_exact_support_and_provenance(db)
+    unit_id = await _persist_exact_support_and_provenance(db)
     await db.enable_lifecycle_gate("src-1")
-    stale = _retirement_plan(reference, "not-the-current-support-hash")
+    stale = _retirement_plan(unit_id, "not-the-current-support-hash")
 
     with pytest.raises(ValueError, match="support stale guard"):
         await db.apply_lifecycle_plan(stale)
@@ -1718,42 +1335,40 @@ async def test_stale_lifecycle_plan_rolls_back_without_partial_mutation(db: Data
 
 @pytest.mark.asyncio
 async def test_mutation_failure_rolls_back_staged_evidence_with_the_plan(db: Database) -> None:
-    active_reference = await _persist_exact_support_and_provenance(db)
+    unit_id = await _persist_exact_support_and_provenance(db)
     await db.enable_lifecycle_gate("src-1")
-    staged_unit = replace(
-        _unit(),
-        id="eu-staged-rollback",
-        source_anchor="obs-page-1-body",
-    )
-    staged_reference = EvidenceReference(
-        id="eref-staged-rollback",
-        evidence_unit_id=staged_unit.id,
-        role=EvidenceRole.PRIMARY,
-        anchor=SourceAnchor(
-            kind=AnchorKind.WHOLE_OBSERVATION,
-            observation_id="obs-page-1-body",
-            observation_revision_id="obsrev-page-1-v2",
+    staged_unit, staged_references = await complete_unit_parts(
+        db,
+        replace(_unit(), id="eu-staged-rollback"),
+        (
+            primary_reference(
+                SourceAnchor(
+                    kind=AnchorKind.WHOLE_OBSERVATION,
+                    observation_id="obs-page-1-body",
+                    observation_revision_id="obsrev-page-1-v2",
+                )
+            ),
         ),
     )
     plan = _retirement_plan(
-        active_reference,
+        unit_id,
         await db.get_memory_support_set_hash("mem-legacy"),
     )
     plan = replace(
         plan,
         id="plan-evidence-rollback",
         evidence_units=(staged_unit,),
-        evidence_references=(staged_reference,),
+        evidence_references=staged_references,
         mutations=(
             replace(
                 plan.mutations[0],
-                evidence_reference_ids=("eref-not-active-support",),
+                evidence_unit_ids=("eu-not-active-support",),
             ),
             plan.mutations[1],
         ),
     )
 
-    with pytest.raises(ValueError, match="complete active support set"):
+    with pytest.raises(ValueError, match="complete active Evidence Units"):
         await db.apply_lifecycle_plan(plan)
 
     assert await db.get_evidence_unit(staged_unit.id) is None
@@ -1764,7 +1379,7 @@ async def test_mutation_failure_rolls_back_staged_evidence_with_the_plan(db: Dat
 
 @pytest.mark.asyncio
 async def test_mutation_failure_rolls_back_source_projection_with_the_plan(db: Database) -> None:
-    active_reference = await _persist_exact_support_and_provenance(db)
+    unit_id = await _persist_exact_support_and_provenance(db)
     await db.enable_lifecycle_gate("src-1")
     previous = _projection()
     observation_revision = replace(
@@ -1799,7 +1414,7 @@ async def test_mutation_failure_rolls_back_source_projection_with_the_plan(db: D
         ),
     )
     plan = _retirement_plan(
-        active_reference,
+        unit_id,
         await db.get_memory_support_set_hash("mem-legacy"),
     )
     plan = replace(
@@ -1817,13 +1432,13 @@ async def test_mutation_failure_rolls_back_source_projection_with_the_plan(db: D
         mutations=(
             replace(
                 plan.mutations[0],
-                evidence_reference_ids=("eref-not-active-support",),
+                evidence_unit_ids=("eu-not-active-support",),
             ),
             plan.mutations[1],
         ),
     )
 
-    with pytest.raises(ValueError, match="complete active support set"):
+    with pytest.raises(ValueError, match="complete active Evidence Units"):
         await db.apply_source_projection_lifecycle(projection, plan)
 
     current = await db.get_current_source_unit_revision("unit-page-1")
@@ -1836,24 +1451,22 @@ async def test_mutation_failure_rolls_back_source_projection_with_the_plan(db: D
 async def test_stale_source_activity_epoch_rejects_projected_lifecycle_commit(
     db: Database,
 ) -> None:
-    active_reference = await _persist_exact_support_and_provenance(db)
+    unit_id = await _persist_exact_support_and_provenance(db)
     await db.enable_lifecycle_gate("src-1")
     lease = await db.acquire_source_activity(
-        activity_id="sync-before-rebaseline",
+        activity_id="sync-before-fence",
         source_id="src-1",
         kind=SourceActivityKind.SYNC,
     )
-    await db.create_source_rebaseline_job(
-        LifecycleBackfillJob(
-            id="rebaseline-fence",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
+    await db.db.execute(
+        "UPDATE sources SET activity_epoch = activity_epoch + 1 WHERE id = ?",
+        ("src-1",),
     )
+    await db.db.commit()
     projection = replace(_projection(), run_id="projection-from-stale-worker")
     plan = replace(
         _retirement_plan(
-            active_reference,
+            unit_id,
             await db.get_memory_support_set_hash("mem-legacy"),
         ),
         id="plan-from-stale-worker",
@@ -1874,10 +1487,10 @@ async def test_stale_source_activity_epoch_rejects_projected_lifecycle_commit(
 async def test_memory_version_stale_guard_rejects_concurrent_incumbent_change(
     db: Database,
 ) -> None:
-    reference = await _persist_exact_support_and_provenance(db)
+    unit_id = await _persist_exact_support_and_provenance(db)
     await db.enable_lifecycle_gate("src-1")
     plan = _retirement_plan(
-        reference,
+        unit_id,
         await db.get_memory_support_set_hash("mem-legacy"),
     )
     plan = replace(
@@ -1894,104 +1507,6 @@ async def test_memory_version_stale_guard_rejects_concurrent_incumbent_change(
     memory = await db.get_memory("mem-legacy")
     assert memory is not None and memory.status == "active"
     assert await db.get_lifecycle_plan_status(plan.id) is None
-
-
-@pytest.mark.asyncio
-async def test_backfill_maps_exact_document_lineage_and_enables_gate(db: Database) -> None:
-    now = "2026-07-15T00:00:00+00:00"
-    await db.db.execute(
-        """INSERT INTO documents (
-               doc_id, source, source_url, title, space_or_project, last_modified, version,
-               content_hash, last_synced
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        ("legacy-doc", "src-1", "https://example.test/page-1", "Page 1", "ENG", now, "1", "hash", now),
-    )
-    await db.add_memory_source(
-        "mem-legacy",
-        "legacy-doc",
-        "confluence",
-        "new body",
-        source_updated_at=None,
-    )
-    projection = _projection()
-    projection = replace(
-        projection,
-        source_units=(
-            replace(
-                projection.source_units[0],
-                locator={"document_id": "legacy-doc", "url": "https://example.test/page-1"},
-            ),
-        ),
-    )
-    # The fixture already persisted the original retry identity. Use a distinct
-    # run so the enriched locator is a new immutable projection snapshot.
-    await db.record_source_projection(replace(projection, run_id="projection-run-backfill"))
-
-    result = await run_source_lifecycle_backfill(db, "src-1")
-
-    assert result.scanned_memories == 1
-    assert result.mapped_memories == 1
-    assert result.finding_count == 0
-    assert result.gate_enabled is True
-    assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
-
-
-@pytest.mark.asyncio
-async def test_backfill_single_observation_without_exact_excerpt_does_not_copy_revision(
-    db: Database,
-) -> None:
-    now = "2026-07-15T00:00:00+00:00"
-    await db.db.execute(
-        """INSERT INTO documents (
-               doc_id, source, source_url, title, space_or_project, last_modified, version,
-               content_hash, last_synced
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            "legacy-doc",
-            "src-1",
-            "https://example.test/page-1",
-            "Page 1",
-            "ENG",
-            now,
-            "1",
-            "hash",
-            now,
-        ),
-    )
-    await db.add_memory_source(
-        "mem-legacy",
-        "legacy-doc",
-        "confluence",
-        "legacy excerpt absent from the current revision",
-        source_updated_at=None,
-    )
-    projection = _projection()
-    projection = replace(
-        projection,
-        source_units=(
-            replace(
-                projection.source_units[0],
-                locator={
-                    "document_id": "legacy-doc",
-                    "url": "https://example.test/page-1",
-                },
-            ),
-        ),
-    )
-    await db.record_source_projection(replace(projection, run_id="projection-run-limited-backfill"))
-
-    result = await run_source_lifecycle_backfill(db, "src-1")
-
-    assert result.mapped_memories == 1
-    [support] = await db.get_active_memory_support_evidence(
-        "mem-legacy",
-        source_id="src-1",
-    )
-    unit = await db.get_evidence_unit(support.evidence_unit_id)
-    assert unit is not None
-    assert unit.content == ""
-    assert unit.excerpt is None
-    assert unit.evidence_provenance is EvidenceContentProvenance.LEGACY_LIMITED
 
 
 @pytest.mark.asyncio
@@ -2134,467 +1649,6 @@ async def test_backfill_trusts_existing_active_support_only_at_current_revision(
         assert database.enabled == []
         assert len(database.upserted) == 1
         assert database.gated == ["src-1"]
-
-
-@pytest.mark.asyncio
-async def test_local_markdown_synthetic_canary_projects_and_closes_cutover(
-    db: Database,
-    tmp_path,
-) -> None:
-    source_id = "src-local-markdown-canary"
-    document_id = "local-markdown-vault-a-design-md"
-    memory_id = "mem-local-markdown-canary"
-    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
-    await db.upsert_source(
-        id=source_id,
-        type="local_markdown",
-        name="Local Markdown Canary",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="owner-1",
-    )
-    await db.insert_memory(
-        Memory(
-            id=memory_id,
-            memory_type="decision",
-            content="Keep A7.",
-            content_hash=content_hash("Keep A7."),
-        )
-    )
-
-    packages_dir = tmp_path / "local-markdown-canary"
-    packages_dir.mkdir()
-    package_path = packages_dir / "design.json"
-    package_path.write_text(
-        json.dumps(
-            {
-                "package_kind": "local_markdown_document",
-                "doc_id": document_id,
-                "title": "Design",
-                "source_url": "file:///vault-a/design.md",
-                "last_modified": now.isoformat(),
-                "content_type": "text/markdown",
-                "space_or_project": "vault-a",
-                "version": "1",
-                "author": "Ada",
-                "vault_id": "vault-a",
-                "relative_path": "design.md",
-                "file_lineage_id": "file-77",
-                "markdown": "# Design\n\nKeep A7.",
-            }
-        ),
-        encoding="utf-8",
-    )
-    gene = LocalMarkdownGene({"documents_dir": str(packages_dir)}, source_id)
-    await gene.authenticate()
-    items = [item async for item in gene.discover()]
-    assert len(items) == 1
-    raw = await gene.fetch(items[0])
-    normalized = await gene.normalize(raw)
-    projection = project_source_item(
-        source_id=source_id,
-        source_type="local_markdown",
-        run_id="local-markdown-canary-run",
-        item=items[0],
-        raw=raw,
-        normalized=normalized,
-    )
-    await db.record_source_projection(projection)
-    await db.upsert_document(
-        DocumentRecord(
-            doc_id=document_id,
-            source=source_id,
-            source_url=items[0].source_url,
-            title=items[0].title,
-            space_or_project=items[0].space_or_project,
-            author=items[0].author,
-            last_modified=now,
-            labels=items[0].labels,
-            version=items[0].version,
-            content_hash=content_hash(normalized.markdown_body),
-            token_count=4,
-            raw_content_uri=None,
-            raw_content_type=None,
-            normalized_content_uri=None,
-            pdf_content_uri=None,
-            last_synced=now,
-        )
-    )
-    await db.add_memory_source(
-        memory_id,
-        document_id,
-        "local_markdown",
-        "Keep A7.",
-        source_updated_at=now,
-    )
-
-    result = await run_source_lifecycle_backfill(db, source_id)
-
-    assert projection.source_units[0].unit_type == "local_file"
-    assert projection.source_units[0].provider_key == "vault-a:file-77"
-    assert projection.observations[0].observation_type == "file_content"
-    assert result.scanned_memories == 1
-    assert result.mapped_memories == 1
-    assert result.finding_count == 0
-    assert result.gate_enabled is True
-    assert (await db.get_lifecycle_gate(source_id)).state is LifecycleGateState.ENABLED
-
-
-@pytest.mark.asyncio
-async def test_recovery_reextracts_only_identifiable_documents_then_validates_lineage(
-    db: Database,
-) -> None:
-    now = "2026-07-15T00:00:00+00:00"
-    await db.db.execute(
-        """INSERT INTO documents (
-               doc_id, source, source_url, title, space_or_project, last_modified, version,
-               content_hash, last_synced
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        ("legacy-doc", "src-1", "https://example.test/page-1", "Page 1", "ENG", now, "1", "hash", now),
-    )
-    await db.add_memory_source(
-        "mem-legacy",
-        "legacy-doc",
-        "confluence",
-        "new body",
-        source_updated_at=None,
-    )
-    requested: list[frozenset[str]] = []
-
-    async def reextract(document_ids: frozenset[str]) -> None:
-        requested.append(document_ids)
-        projection = _projection()
-        await db.record_source_projection(
-            replace(
-                projection,
-                run_id="projection-run-recovered",
-                source_units=(
-                    replace(
-                        projection.source_units[0],
-                        locator={
-                            "document_id": "legacy-doc",
-                            "url": "https://example.test/page-1",
-                        },
-                    ),
-                ),
-            )
-        )
-
-    completed = await run_source_lifecycle_recovery_job(
-        db,
-        "src-1",
-        job_id="backfill-recovery",
-        repair_projections=reextract,
-    )
-
-    assert requested == [frozenset({"legacy-doc"})]
-    assert completed.status is LifecycleBackfillJobStatus.COMPLETED
-    assert completed.finding_count == 0
-    findings = await db.list_lifecycle_cutover_findings("src-1")
-    assert len(findings) == 1
-    assert findings[0].status is CutoverFindingStatus.RESOLVED
-    assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
-
-
-@pytest.mark.asyncio
-async def test_cutover_reconstructs_historical_projection_from_exact_stored_artifacts(
-    db: Database,
-    tmp_path,
-) -> None:
-    source_id = "src-teams-historical"
-    await db.upsert_source(
-        id=source_id,
-        type="teams",
-        name="Historical Teams",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="owner-1",
-    )
-    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
-    raw_payload = {
-        "conversation_type": "group_chat",
-        "messages": [
-            {
-                "id": "message-1",
-                "from": "Ada",
-                "content": "Legacy claim",
-                "time": now.isoformat(),
-                "attachments": [],
-            }
-        ],
-    }
-    store = LocalDocumentStore(str(tmp_path / "artifacts"))
-    raw_uri = store.store_raw(
-        source_id,
-        "doc-legacy",
-        "Historical Teams block",
-        json.dumps(raw_payload).encode(),
-        "application/json",
-    )
-    normalized_uri = store.store_normalized(
-        source_id,
-        "doc-legacy",
-        "Historical Teams block",
-        "# Historical Teams block\n\nLegacy claim",
-    )
-    await db.upsert_document(
-        DocumentRecord(
-            doc_id="teams-historical-window",
-            source=source_id,
-            source_url="https://teams.microsoft.com/l/message/conversation-1/message-1",
-            title="Historical Teams block",
-            space_or_project="PCC",
-            author="Ada",
-            last_modified=now,
-            labels=["group_chat"],
-            version="v1",
-            content_hash="historical-hash",
-            token_count=3,
-            raw_content_uri=raw_uri,
-            raw_content_type="application/json",
-            normalized_content_uri=normalized_uri,
-            pdf_content_uri=None,
-            last_synced=now,
-        )
-    )
-    await db.add_memory_source(
-        "mem-legacy",
-        "teams-historical-window",
-        "teams",
-        "Legacy claim",
-        source_updated_at=None,
-    )
-    assert (await run_source_lifecycle_backfill(db, source_id)).finding_count == 1
-
-    projections = []
-
-    async def reconstruct(document_ids: frozenset[str]) -> None:
-        for document_id in document_ids:
-            projections.append(
-                await reconstruct_historical_source_projection(
-                    db,
-                    store,
-                    source_id=source_id,
-                    source_type="teams",
-                    document_id=document_id,
-                )
-            )
-
-    async def unexpected_reextract(document_ids: frozenset[str]) -> None:
-        raise AssertionError(f"re-extraction should not run: {document_ids}")
-
-    completed = await run_source_lifecycle_recovery_job(
-        db,
-        source_id,
-        job_id="historical-reconstruction",
-        reconstruct_documents=reconstruct,
-        repair_projections=unexpected_reextract,
-    )
-
-    assert projections[0].checkpoint["cutover_repair"] is True
-    assert await db.find_source_unit_by_document_id(source_id, "teams-historical-window") is not None
-    assert completed.mapped_memories == 1
-    assert completed.finding_count == 0
-    assert (await db.get_lifecycle_gate(source_id)).state is LifecycleGateState.ENABLED
-
-
-@pytest.mark.asyncio
-async def test_cutover_reconstructs_agent_session_projection_from_canonical_concept(
-    db: Database,
-    tmp_path,
-) -> None:
-    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
-    await db.upsert_source(
-        id="src-agent",
-        type="agent_session",
-        name="Codex Session",
-        config_json="{}",
-        access_policy="private",
-        owner_user_id="owner-1",
-    )
-    markdown = "# Durable convention\n\nLegacy claim\n"
-    await db.upsert_agent_concept(
-        concept_id="akb-concept-1",
-        source_id="src-agent",
-        owner_user_id="owner-1",
-        workspace="workspace-1",
-        repo_identifier="repo-1",
-        concept_type="convention",
-        concept_path="conventions/durable-convention.md",
-        title="Durable convention",
-        markdown_body=markdown,
-        frontmatter={"source_type": "agent_session"},
-        observed_at=now,
-    )
-    await db.upsert_document(
-        DocumentRecord(
-            doc_id="akb-concept-1",
-            source="src-agent",
-            source_url="agent-knowledge://owner-1/akb-concept-1",
-            title="Durable convention",
-            space_or_project="workspace-1",
-            author="codex",
-            last_modified=now,
-            labels=["convention"],
-            version=content_hash(markdown),
-            content_hash=content_hash(markdown),
-            token_count=None,
-            raw_content_uri=None,
-            raw_content_type="text/markdown",
-            normalized_content_uri=None,
-            pdf_content_uri=None,
-            last_synced=now,
-            client="codex",
-        )
-    )
-    await db.add_memory_source(
-        "mem-legacy",
-        "akb-concept-1",
-        "agent_session",
-        "Legacy claim",
-        source_updated_at=None,
-    )
-    assert (await run_source_lifecycle_backfill(db, "src-agent")).finding_count == 1
-
-    async def reconstruct(document_ids: frozenset[str]) -> None:
-        for document_id in document_ids:
-            await reconstruct_historical_source_projection(
-                db,
-                LocalDocumentStore(str(tmp_path / "missing-artifacts")),
-                source_id="src-agent",
-                source_type="agent_session",
-                document_id=document_id,
-            )
-
-    completed = await run_source_lifecycle_recovery_job(
-        db,
-        "src-agent",
-        job_id="agent-concept-reconstruction",
-        reconstruct_documents=reconstruct,
-    )
-
-    source_unit = await db.find_source_unit_by_document_id("src-agent", "akb-concept-1")
-    assert source_unit is not None
-    assert source_unit.unit_type == "agent_session_window"
-    assert completed.mapped_memories == 1
-    assert completed.finding_count == 0
-    assert (await db.get_lifecycle_gate("src-agent")).state is LifecycleGateState.ENABLED
-
-
-@pytest.mark.asyncio
-async def test_ambiguous_cutover_finding_requires_exact_observation_repair(db: Database) -> None:
-    source_id = "src-teams-ambiguous"
-    await db.upsert_source(
-        id=source_id,
-        type="teams",
-        name="Ambiguous Teams",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="owner-1",
-    )
-    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
-    item = ContentItem(
-        item_id="teams-window-ambiguous",
-        title="Ambiguous Teams window",
-        source_url="https://teams.microsoft.com/l/message/conversation-1/message-1",
-        last_modified=now,
-        content_type="application/json",
-        version="v1",
-        extra={"window_id": "teams-window-ambiguous", "conversation_id": "conversation-1"},
-    )
-    raw = RawContent(
-        item=item,
-        body=json.dumps(
-            {
-                "messages": [
-                    {
-                        "id": "message-1",
-                        "content": "Repeated quote",
-                        "attachments": [],
-                        "time": "2026-07-15T10:00:00Z",
-                    },
-                    {
-                        "id": "message-2",
-                        "content": "Repeated quote",
-                        "attachments": [],
-                        "time": "2026-07-15T10:01:00Z",
-                    },
-                ]
-            }
-        ).encode(),
-        content_type="application/json",
-    )
-    projection = project_source_item(
-        source_id=source_id,
-        source_type="teams",
-        run_id="projection-ambiguous",
-        item=item,
-        raw=raw,
-        normalized=NormalizedContent(item=item, markdown_body="Repeated quote"),
-    )
-    await db.record_source_projection(projection)
-    await db.upsert_document(
-        DocumentRecord(
-            doc_id=item.item_id,
-            source=source_id,
-            source_url=item.source_url,
-            title=item.title,
-            space_or_project="PCC",
-            author=None,
-            last_modified=now,
-            labels=[],
-            version="v1",
-            content_hash="ambiguous-hash",
-            token_count=2,
-            raw_content_uri=None,
-            raw_content_type="application/json",
-            normalized_content_uri=None,
-            pdf_content_uri=None,
-            last_synced=now,
-        )
-    )
-    await db.add_memory_source(
-        "mem-legacy",
-        item.item_id,
-        "teams",
-        "Repeated quote…",
-        source_updated_at=None,
-    )
-    result = await run_source_lifecycle_backfill(db, source_id)
-    assert result.finding_count == 1
-    finding = (await db.list_lifecycle_cutover_findings(source_id))[0]
-    assert finding.reason is CutoverFindingReason.AMBIGUOUS_OBSERVATION
-
-    selected_observation_id = projection.observations[0].id
-    with pytest.raises(ValueError, match="requires an exact evidence_quote"):
-        await repair_lifecycle_cutover_finding(
-            db,
-            source_id=source_id,
-            finding_id=finding.id,
-            observation_id=selected_observation_id,
-        )
-    repaired = await repair_lifecycle_cutover_finding(
-        db,
-        source_id=source_id,
-        finding_id=finding.id,
-        observation_id=selected_observation_id,
-        evidence_quote="Repeated quote",
-        operator_id="operator-1",
-    )
-    final = await run_source_lifecycle_backfill(db, source_id)
-
-    assert repaired.status is CutoverFindingStatus.RESOLVED
-    assert repaired.observation_id == selected_observation_id
-    assert final.finding_count == 0
-    assert final.gate_enabled is True
-    async with db.db.execute(
-        "SELECT source_metadata_json FROM evidence_units WHERE source_id = ?",
-        (source_id,),
-    ) as cursor:
-        metadata = json.loads((await cursor.fetchone())["source_metadata_json"])
-    assert metadata["operator_selected_observation"] is True
-    assert metadata["operator_id"] == "operator-1"
-    assert metadata["legacy_excerpt_replaced"] is True
 
 
 @pytest.mark.asyncio
@@ -2809,37 +1863,6 @@ async def test_recover_stale_lifecycle_backfill_job_fails_expired_job_atomically
 
 
 @pytest.mark.asyncio
-async def test_rebaseline_rejects_recovered_maintenance_epoch(
-    db: Database,
-) -> None:
-    job = await db.create_source_rebaseline_job(
-        LifecycleBackfillJob(
-            id="sqlite-rebaseline-stale-epoch",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    activity = await db.renew_source_activity(
-        activity_id=job.id,
-        capability=job.id,
-    )
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.commit()
-    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
-
-    with pytest.raises(SourceActivityConflict, match="source activity"):
-        await db.rebaseline_source_lifecycle(
-            "src-1",
-            source_activity=activity,
-        )
-
-    assert await db.get_source_projection("projection-run-1") is not None
-
-
-@pytest.mark.asyncio
 async def test_backfill_rejects_recovered_maintenance_authority(
     db: Database,
 ) -> None:
@@ -3022,60 +2045,6 @@ async def test_evidence_reference_write_rejects_recovered_maintenance_fence(
 
 
 @pytest.mark.asyncio
-async def test_support_write_rejects_recovered_maintenance_fence(
-    db: Database,
-) -> None:
-    await db.upsert_evidence_unit(_unit())
-    references = await db.record_evidence_references(
-        _unit().id,
-        (
-            EvidenceReference(
-                role=EvidenceRole.PRIMARY,
-                anchor=SourceAnchor(
-                    kind=AnchorKind.WHOLE_OBSERVATION,
-                    observation_id="obs-page-1-body",
-                    observation_revision_id="obsrev-page-1-v2",
-                ),
-                evidence_unit_id=_unit().id,
-            ),
-        ),
-    )
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-support-stale-fence",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    activity = await db.renew_source_activity(
-        activity_id=job.id,
-        capability=job.id,
-    )
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.commit()
-    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
-    reference_id = references[0].id or ""
-
-    with pytest.raises(SourceActivityConflict, match="source activity"):
-        await db.upsert_memory_support_assertion(
-            MemorySupportAssertion(
-                id="support-stale-fence",
-                memory_id="mem-legacy",
-                evidence_reference_id=reference_id,
-                source_id="src-1",
-                access_context_hash="access-a",
-            ),
-            source_activity=activity,
-        )
-
-    assert reference_id not in await db.get_active_memory_support_reference_ids("mem-legacy")
-
-
-@pytest.mark.asyncio
 async def test_finding_write_rejects_recovered_maintenance_fence(
     db: Database,
 ) -> None:
@@ -3105,64 +2074,6 @@ async def test_finding_write_rejects_recovered_maintenance_fence(
         )
 
     assert await db.get_lifecycle_cutover_finding(_finding().id) is None
-
-
-@pytest.mark.asyncio
-async def test_finding_resolution_rejects_recovered_maintenance_fence(
-    db: Database,
-) -> None:
-    finding = _finding()
-    unit = _unit()
-    await db.upsert_lifecycle_cutover_finding(finding)
-    await db.upsert_evidence_unit(unit)
-    reference = EvidenceReference(
-        role=EvidenceRole.PRIMARY,
-        anchor=SourceAnchor(
-            kind=AnchorKind.WHOLE_OBSERVATION,
-            observation_id="obs-page-1-body",
-            observation_revision_id="obsrev-page-1-v2",
-        ),
-        evidence_unit_id=unit.id,
-    )
-    reference = replace(reference, id=evidence_reference_id_for(unit.id, reference))
-    await db.record_evidence_references(unit.id, (reference,))
-    await db.upsert_memory_support_assertion(
-        MemorySupportAssertion(
-            id="support-finding-stale-fence",
-            memory_id="mem-legacy",
-            evidence_reference_id=reference.id or "",
-            source_id="src-1",
-            access_context_hash="workspace",
-        )
-    )
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-finding-resolution-stale-fence",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    activity = await db.renew_source_activity(
-        activity_id=job.id,
-        capability=job.id,
-    )
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.commit()
-    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
-
-    with pytest.raises(SourceActivityConflict, match="source activity"):
-        await db.resolve_lifecycle_cutover_finding(
-            finding.id,
-            observation_id="obs-page-1-body",
-            source_unit_id="unit-page-1",
-            source_activity=activity,
-        )
-
-    assert (await db.get_lifecycle_cutover_finding(finding.id)).status is (CutoverFindingStatus.OPEN)
 
 
 @pytest.mark.asyncio

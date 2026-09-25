@@ -58,7 +58,7 @@ def build_projected_claim_evidence(
     access_context_hash: str,
     extractor_run_id: str | None,
     observed_at: str | None = None,
-    support_scope_version: SupportScopeVersion = SupportScopeVersion.REFERENCE_SET_V1,
+    support_scope_version: SupportScopeVersion = SupportScopeVersion.EVIDENCE_UNIT_SET_V2,
 ) -> ProjectedClaimEvidence:
     """Build deterministic evidence staged for the atomic Lifecycle Plan.
 
