@@ -512,7 +512,9 @@ def test_daemon_raw_transfer_failure_closes_process_and_never_processes(monkeypa
 
     monkeypatch.setattr(main.subprocess, "run", metadata)
     monkeypatch.setattr(main.subprocess, "Popen", raw_process)
-    monkeypatch.setattr(main, "GITHUB_RAW_TRANSFER_TIMEOUT_SECONDS", 0.5)
+    if failure == "timeout":
+        # Only the timeout case reaches the deadline; the others end on their own.
+        monkeypatch.setattr(main, "GITHUB_RAW_TRANSFER_TIMEOUT_SECONDS", 0.5)
     FakeToolClient.reset({})
     job = {
         "job_id": "laj-error", "attempt_count": 1, "workspace_id": "workspace-a",
