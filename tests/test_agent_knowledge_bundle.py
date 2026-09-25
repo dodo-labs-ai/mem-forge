@@ -1964,6 +1964,8 @@ async def test_agent_memory_prompt_uses_primary_evidence_as_authorization_bounda
     assert "<supporting_evidence>" in prompt
     assert "[E1:assistant_message] I verified the prompt tests" in prompt
     assert "<candidate_evidence>" not in prompt
+    assert "- primary_event_id never appears in required_event_ids." in prompt
+    assert "- With no_output, leave primary_event_id and required_event_ids empty." in prompt
 
 
 @pytest.mark.asyncio
