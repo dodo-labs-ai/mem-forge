@@ -55,6 +55,7 @@ _HTTP_PAYLOAD_TOO_LARGE = 413
 _SCHEMA_REPAIR_MAX_VALIDATION_FIELDS = 8
 _SCHEMA_REPAIR_LOCATION_CHAR_CAP = 256
 _SCHEMA_REPAIR_RULE_CHAR_CAP = 128
+_SCHEMA_REPAIR_MESSAGE_CHAR_CAP = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -1058,6 +1059,9 @@ class _StructuredLlmFailure:
     terminal_category: StructuredLlmTerminalCategory
     error_code: str
     validation_fields: tuple[tuple[str, str], ...] = ()
+    # Whole-object rules have no field path to point at, so the schema repair
+    # prompt names them by the validator's own message.
+    model_level_messages: tuple[str, ...] = ()
 
     def to_error(self, *, timeout_s: float | None = None) -> StructuredLlmError:
         if self.terminal_category == "deadline_exceeded":
@@ -1191,6 +1195,7 @@ def _structured_failure(
         terminal_category=category,
         error_code=_safe_provider_error_code(exc),
         validation_fields=_safe_validation_fields(exc),
+        model_level_messages=_model_level_validation_messages(exc),
     )
 
 
@@ -1215,6 +1220,18 @@ def _safe_validation_fields(
         if rule_type:
             fields.append((location, rule_type))
     return tuple(fields)
+
+
+def _model_level_validation_messages(exc: BaseException) -> tuple[str, ...]:
+    """Return validator messages for errors about the whole object, not one field."""
+
+    if not isinstance(exc, ValidationError):
+        return ()
+    return tuple(
+        str(error.get("msg") or "")
+        for error in exc.errors(include_url=False, include_context=False, include_input=False)
+        if not error.get("loc") and error.get("msg")
+    )
 
 
 def _message_content(response) -> object:
@@ -1427,16 +1444,18 @@ def _json_text_prompt(
             :_SCHEMA_REPAIR_MAX_VALIDATION_FIELDS
         ]
     ]
-    diagnostic = json.dumps(
-        {
-            "error_code": validation_failure.error_code[
-                :_SCHEMA_REPAIR_RULE_CHAR_CAP
-            ],
-            "validation_errors": validation_fields,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    diagnostic_fields: dict[str, object] = {
+        "error_code": validation_failure.error_code[:_SCHEMA_REPAIR_RULE_CHAR_CAP],
+        "validation_errors": validation_fields,
+    }
+    if validation_failure.model_level_messages:
+        diagnostic_fields["model_level_errors"] = [
+            message[:_SCHEMA_REPAIR_MESSAGE_CHAR_CAP]
+            for message in validation_failure.model_level_messages[
+                :_SCHEMA_REPAIR_MAX_VALIDATION_FIELDS
+            ]
+        ]
+    diagnostic = json.dumps(diagnostic_fields, ensure_ascii=False, separators=(",", ":"))
     previous_attempt = (
         "The preceding native-schema response"
         if validation_source == "native_schema"

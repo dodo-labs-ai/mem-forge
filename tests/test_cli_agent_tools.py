@@ -22,6 +22,7 @@ def _isolate_cli_target_configuration(monkeypatch, tmp_path: Path):
     for name in ("MEMFORGE_API_URL", "MEMFORGE_EDITION", "MEMFORGE_WORKSPACE_ID", "MEMFORGE_API_TOKEN"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MEMFORGE_CLI_CONFIG", str(tmp_path / "isolated-cli.toml"))
+    monkeypatch.setenv("MEMFORGE_WORKSPACE_BINDINGS_FILE", str(tmp_path / "isolated-workspace-bindings.json"))
     monkeypatch.setattr(
         main,
         "discover_target",
@@ -640,10 +641,143 @@ def test_target_add_accepts_cloud_origin_without_client_workspace_state(monkeypa
     assert "workspace_id" not in cli_config.read_text(encoding="utf-8")
 
 
+CLOUD_TEST_ORIGIN = "https://memforge-dev.cfapps.eu12.hana.ondemand.com"
+
+
+class _WorkspaceRecordingClient(FakeToolClient):
+    """Record the workspace each CLI command selects for its client."""
+
+    selected: list[str] = []
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        type(self).selected.append(self.workspace_id)
+
+
+def _bind_directory(tmp_path: Path, directory: Path, workspace_id: str) -> None:
+    (tmp_path / "isolated-workspace-bindings.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "targets": {CLOUD_TEST_ORIGIN: {"directory_bindings": {str(directory): workspace_id}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _cloud_env() -> dict[str, str]:
+    return {"MEMFORGE_API_URL": CLOUD_TEST_ORIGIN, "MEMFORGE_API_TOKEN": "token-1"}
+
+
+def test_sources_list_uses_explicit_workspace_id(monkeypatch):
+    FakeToolClient.reset({}, list_response={"data": []})
+    _WorkspaceRecordingClient.selected = []
+    monkeypatch.setattr(main, "ToolClient", _WorkspaceRecordingClient)
+
+    result = CliRunner().invoke(cli, ["sources", "list", "--workspace-id", "payroll_agent"], env=_cloud_env())
+
+    assert result.exit_code == 0, result.output
+    assert _WorkspaceRecordingClient.selected == ["payroll_agent"]
+
+
+def test_sources_list_lists_workspace_ids_when_selection_is_required(monkeypatch, tmp_path: Path):
+    FakeToolClient.reset(
+        {},
+        list_response={
+            "error": "MemForge API request failed",
+            "status_code": 409,
+            "code": "workspace_selection_required",
+            "detail": "Select a workspace for this request.",
+            "workspace_ids": ["mount_tai", "payroll_agent"],
+        },
+    )
+    _WorkspaceRecordingClient.selected = []
+    monkeypatch.setattr(main, "ToolClient", _WorkspaceRecordingClient)
+    # A current-directory binding only selects the workspace for project commands.
+    _bind_directory(tmp_path, tmp_path, "mount_tai")
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(cli, ["sources", "list"], env=_cloud_env())
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["workspace_ids"] == ["mount_tai", "payroll_agent"]
+    assert payload["hint"] == "Pass --workspace-id with one of: mount_tai, payroll_agent."
+    assert _WorkspaceRecordingClient.selected == [""]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["search", "release process"],
+        ["memory", "search", "release process"],
+        ["get-memory", "mem-1"],
+        ["memory", "get", "mem-1"],
+        ["get-resource", "/api/v1/documents/doc-1/content"],
+        ["memory", "resource", "/api/v1/documents/doc-1/content"],
+    ],
+)
+def test_project_commands_use_current_directory_binding(monkeypatch, tmp_path: Path, command):
+    FakeToolClient.reset({"results": []})
+    _WorkspaceRecordingClient.selected = []
+    monkeypatch.setattr(main, "ToolClient", _WorkspaceRecordingClient)
+    project = tmp_path / "project"
+    (project / "src").mkdir(parents=True)
+    _bind_directory(tmp_path, project, "mount_tai")
+    monkeypatch.chdir(project / "src")
+
+    bound = CliRunner().invoke(cli, command, env=_cloud_env())
+    explicit = CliRunner().invoke(cli, [*command, "--workspace-id", "payroll_agent"], env=_cloud_env())
+
+    assert bound.exit_code == 0, bound.output
+    assert explicit.exit_code == 0, explicit.output
+    assert _WorkspaceRecordingClient.selected == ["mount_tai", "payroll_agent"]
+
+
+def test_project_command_without_binding_sends_no_workspace(monkeypatch, tmp_path: Path):
+    FakeToolClient.reset({"results": []})
+    _WorkspaceRecordingClient.selected = []
+    monkeypatch.setattr(main, "ToolClient", _WorkspaceRecordingClient)
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(cli, ["search", "release process"], env=_cloud_env())
+
+    assert result.exit_code == 0, result.output
+    assert _WorkspaceRecordingClient.selected == [""]
+
+
+def test_project_command_reports_unusable_binding(monkeypatch, tmp_path: Path):
+    FakeToolClient.reset({"results": []})
+    monkeypatch.setattr(main, "ToolClient", _WorkspaceRecordingClient)
+    (tmp_path / "isolated-workspace-bindings.json").write_text("{not json", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(cli, ["search", "release process"], env=_cloud_env())
+
+    assert result.exit_code == 1
+    assert "workspace_bindings_invalid" in result.output
+    assert "--workspace-id" in result.output
+
+
 class _StubClient:
-    def __init__(self, **responses):
+    """Workspace-scoped CLI client double; ``workspaces`` maps IDs to scoped doubles."""
+
+    def __init__(self, *, workspaces=None, **responses):
         self._responses = responses
+        self._workspaces = workspaces or {}
         self.calls = []
+
+    def list_workspaces(self):
+        self.calls.append(("list_workspaces", None))
+        return self._responses.get(
+            "list_workspaces",
+            {"workspaces": [{"workspace_id": "ws-a", "selectable": True}]},
+        )
+
+    def for_workspace(self, workspace_id):
+        self.calls.append(("for_workspace", workspace_id))
+        return self._workspaces.get(workspace_id, self)
 
     def get_jira_session(self, base_url):
         self.calls.append(("get_jira_session", base_url))
@@ -662,6 +796,48 @@ class _StubClient:
         return self._responses.get("upload_jira_session", {})
 
 
+def _jira_principal_changed_response():
+    return {
+        "error": "MemForge API request failed",
+        "status_code": 409,
+        "code": "jira_principal_changed",
+        "detail": {
+            "code": "jira_principal_changed",
+            "message": "changed",
+            "origin": "https://jira.tools.sap",
+            "old_principal_id": "old-user",
+            "new_principal_id": "new-user",
+        },
+    }
+
+
+def _workspace_selection_response():
+    return {
+        "error": "MemForge API request failed",
+        "status_code": 409,
+        "code": "workspace_selection_required",
+        "detail": "Select a workspace for this request.",
+        "workspace_ids": ["mount_tai", "payroll_agent"],
+    }
+
+
+def _fake_jira_capture(monkeypatch, captured=None):
+    from memforge.auth import jira_capture
+
+    async def fake_capture(base_url, *, browser=None, interactive=False):
+        assert interactive is True
+        if captured is not None:
+            captured.update(base_url=base_url, browser=browser)
+        return jira_capture.JiraCaptureResult(
+            origin=base_url,
+            cookie_header="SESSION=x",
+            browser=browser,
+            principal={"accountId": "u1"},
+        )
+
+    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
+
+
 def test_adapter_jira_status_reports_stored_session(monkeypatch):
     stub = _StubClient(
         get_jira_session={
@@ -672,42 +848,47 @@ def test_adapter_jira_status_reports_stored_session(monkeypatch):
             "browser": "chrome",
         }
     )
-    monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
-    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "status", "--base-url", "https://jira.tools.sap"])
+    selected = []
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: selected.append(workspace_id) or stub)
+    result = CliRunner().invoke(
+        cli,
+        ["adapter", "auth", "jira", "status", "--base-url", "https://jira.tools.sap", "--workspace-id", "ws-a"],
+    )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["status"] == "active"
     assert payload["principal_name"] == "Rose H"
     assert stub.calls == [("get_jira_session", "https://jira.tools.sap")]
+    assert selected == ["ws-a"]
 
 
 def test_adapter_jira_status_missing_session_is_not_an_error(monkeypatch):
     stub = _StubClient(get_jira_session={"provider": "jira", "origin": "https://jira.tools.sap", "status": "missing"})
-    monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: stub)
     result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "status", "--base-url", "https://jira.tools.sap"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["status"] == "missing"
 
 
+def test_adapter_jira_status_reports_workspace_selection_error(monkeypatch):
+    stub = _StubClient(get_jira_session=_workspace_selection_response())
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: stub)
+
+    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "status", "--base-url", "https://jira.tools.sap"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["code"] == "workspace_selection_required"
+    assert payload["workspace_ids"] == ["mount_tai", "payroll_agent"]
+    assert payload["hint"] == "Pass --workspace-id with one of: mount_tai, payroll_agent."
+    assert "principal_changed" not in result.output
+
+
 def test_adapter_jira_refresh_captures_and_uploads(monkeypatch):
-    from memforge.auth import jira_capture
-
     captured = {}
-
-    async def fake_capture(base_url, *, browser=None, interactive=False):
-        assert interactive is True
-        captured["base_url"] = base_url
-        captured["browser"] = browser
-        return jira_capture.JiraCaptureResult(
-            origin=base_url,
-            cookie_header="SESSION=x",
-            browser=browser,
-            principal={"accountId": "u1"},
-        )
-
+    _fake_jira_capture(monkeypatch, captured)
     stub = _StubClient(upload_jira_session={"provider": "jira", "origin": "https://jira.tools.sap", "status": "active"})
-    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
-    monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: stub)
 
     result = CliRunner().invoke(
         cli,
@@ -715,11 +896,118 @@ def test_adapter_jira_refresh_captures_and_uploads(monkeypatch):
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["status"] == "active"
+    assert payload == {
+        "origin": "https://jira.tools.sap",
+        "results": [
+            {
+                "workspace_id": "ws-a",
+                "status": "uploaded",
+                "session": {"provider": "jira", "origin": "https://jira.tools.sap", "status": "active"},
+            }
+        ],
+    }
     assert captured == {"base_url": "https://jira.tools.sap", "browser": "chrome"}
-    assert stub.calls[0][0] == "upload_jira_session"
-    assert stub.calls[0][1]["cookie_header"] == "SESSION=x"
-    assert stub.calls[0][1]["base_url"] == "https://jira.tools.sap"
+    uploads = [call for call in stub.calls if call[0] == "upload_jira_session"]
+    assert [call[0] for call in stub.calls[:2]] == ["list_workspaces", "for_workspace"]
+    assert uploads[0][1]["cookie_header"] == "SESSION=x"
+    assert uploads[0][1]["base_url"] == "https://jira.tools.sap"
+
+
+def test_adapter_jira_refresh_uploads_only_to_explicit_workspace(monkeypatch):
+    _fake_jira_capture(monkeypatch)
+    stub = _StubClient(upload_jira_session={"status": "active"})
+    selected = []
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: selected.append(workspace_id) or stub)
+
+    result = CliRunner().invoke(
+        cli,
+        ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap", "--workspace-id", "ws-b"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["results"][0]["workspace_id"] == "ws-b"
+    assert selected == ["ws-b"]
+    assert [call[0] for call in stub.calls] == ["upload_jira_session"]
+
+
+def test_adapter_jira_refresh_fans_out_to_workspaces_with_jira_source(monkeypatch):
+    _fake_jira_capture(monkeypatch)
+    configured = {"origins": [{"origin": "https://jira.tools.sap", "configured": True}]}
+    accepted = _StubClient(list_jira_origins=configured, upload_jira_session={"status": "active"})
+    changed = _StubClient(list_jira_origins=configured, upload_jira_session=_jira_principal_changed_response())
+    unrelated = _StubClient(list_jira_origins={"origins": [{"origin": "https://jira.other", "configured": True}]})
+    account = _StubClient(
+        list_workspaces={
+            "workspaces": [
+                {"workspace_id": "mount_tai", "selectable": True},
+                {"workspace_id": "payroll_agent", "selectable": True},
+                {"workspace_id": "sandbox", "selectable": True},
+                {"workspace_id": "suspended", "selectable": False},
+            ]
+        },
+        workspaces={"mount_tai": accepted, "payroll_agent": changed, "sandbox": unrelated},
+    )
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: account)
+
+    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["error"] == "jira_session_upload_incomplete"
+    assert payload["results"] == [
+        {"workspace_id": "mount_tai", "status": "uploaded", "session": {"status": "active"}},
+        {
+            "workspace_id": "payroll_agent",
+            "status": "principal_changed",
+            "old_principal_id": "old-user",
+            "new_principal_id": "new-user",
+        },
+    ]
+    assert not any(call[0] == "upload_jira_session" for call in unrelated.calls)
+    assert ("for_workspace", "suspended") not in account.calls
+
+
+def test_adapter_jira_refresh_requires_workspace_when_no_workspace_has_the_origin(monkeypatch):
+    _fake_jira_capture(monkeypatch)
+    account = _StubClient(
+        list_workspaces={
+            "workspaces": [
+                {"workspace_id": "mount_tai", "selectable": True},
+                {"workspace_id": "payroll_agent", "selectable": True},
+            ]
+        },
+    )
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: account)
+
+    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["error"] == "jira_source_not_found"
+    assert payload["workspace_ids"] == ["mount_tai", "payroll_agent"]
+    assert "--workspace-id" in payload["detail"]
+    assert not any(call[0] == "upload_jira_session" for call in account.calls)
+
+
+def test_adapter_jira_refresh_reports_non_principal_conflict_as_failure(monkeypatch):
+    _fake_jira_capture(monkeypatch)
+    stub = _StubClient(upload_jira_session=_workspace_selection_response())
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: stub)
+
+    result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["results"] == [
+        {
+            "workspace_id": "ws-a",
+            "status": "failed",
+            "status_code": 409,
+            "code": "workspace_selection_required",
+            "detail": "Select a workspace for this request.",
+        }
+    ]
+    assert "principal_changed" not in result.output
 
 
 def test_adapter_jira_refresh_no_session_returns_json_error(monkeypatch):
@@ -731,7 +1019,7 @@ def test_adapter_jira_refresh_no_session_returns_json_error(monkeypatch):
         raise JiraAuthSessionMissingError("No active Jira browser session cookies were found")
 
     monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
-    monkeypatch.setattr(main, "_tool_client", lambda ctx: _StubClient())
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: _StubClient())
 
     result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap"])
     assert result.exit_code == 1
@@ -748,7 +1036,7 @@ def test_adapter_jira_refresh_capture_error_returns_json_error(monkeypatch):
         raise ValueError("Unsupported browser for Jira session extraction: netscape")
 
     monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
-    monkeypatch.setattr(main, "_tool_client", lambda ctx: _StubClient())
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: _StubClient())
 
     result = CliRunner().invoke(
         cli,
@@ -761,44 +1049,22 @@ def test_adapter_jira_refresh_capture_error_returns_json_error(monkeypatch):
 
 
 def test_adapter_jira_refresh_principal_change_returns_json_error(monkeypatch):
-    from memforge.auth import jira_capture
-
-    async def fake_capture(base_url, *, browser=None, interactive=False):
-        assert interactive is True
-        return jira_capture.JiraCaptureResult(
-            origin=base_url,
-            cookie_header="SESSION=x",
-            browser=None,
-            principal={"accountId": "u1"},
-        )
-
-    body = json.dumps(
-        {
-            "detail": {
-                "message": "changed",
-                "origin": "https://jira.tools.sap",
-                "old_principal_id": "old-user",
-                "new_principal_id": "new-user",
-            }
-        }
-    )
-    stub = _StubClient(
-        upload_jira_session={
-            "error": "MemForge API request failed",
-            "status_code": 409,
-            "detail": body,
-        }
-    )
-    monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
-    monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
+    _fake_jira_capture(monkeypatch)
+    stub = _StubClient(upload_jira_session=_jira_principal_changed_response())
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: stub)
 
     result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "refresh", "--base-url", "https://jira.tools.sap"])
     assert result.exit_code == 1
     payload = json.loads(result.output)
-    assert payload["error"] == "principal_changed"
     assert payload["origin"] == "https://jira.tools.sap"
-    assert payload["old_principal_id"] == "old-user"
-    assert payload["new_principal_id"] == "new-user"
+    assert payload["results"] == [
+        {
+            "workspace_id": "ws-a",
+            "status": "principal_changed",
+            "old_principal_id": "old-user",
+            "new_principal_id": "new-user",
+        }
+    ]
 
 
 def test_adapter_jira_list_and_forget(monkeypatch):
@@ -812,7 +1078,7 @@ def test_adapter_jira_list_and_forget(monkeypatch):
         list_jira_origins={"origins": [{"origin": "https://jira.tools.sap", "status": "active"}]},
         forget_jira_session={"ok": True, "origin": "https://jira.tools.sap", "forgotten": True},
     )
-    monkeypatch.setattr(main, "_tool_client", lambda ctx: stub)
+    monkeypatch.setattr(main, "_tool_client", lambda ctx, workspace_id: stub)
     list_result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "list"])
     assert list_result.exit_code == 0, list_result.output
     assert json.loads(list_result.output)["origins"][0]["origin"] == "https://jira.tools.sap"
@@ -1270,7 +1536,7 @@ def test_local_agent_github_uploads_each_body_before_fetching_the_next(monkeypat
                     return {
                         "error": "lease rejected",
                         "status_code": 409,
-                        "detail": '{"detail":"local_agent_lease_not_current"}',
+                        "detail": "local_agent_lease_not_current",
                     }
             return {"doc_id": kwargs["relative_path"], "document_hash": "receipt"}
 
@@ -1483,7 +1749,7 @@ def test_local_agent_cloud_github_sync_stops_after_lease_rejection(monkeypatch):
         {
             "error": "MemForge API request failed",
             "status_code": 409,
-            "detail": '{"detail":"local_agent_lease_not_current"}',
+            "detail": "local_agent_lease_not_current",
         }
     )
     monkeypatch.setattr(main.subprocess, "run", _fake_github_remote_run)
@@ -2194,15 +2460,13 @@ def test_local_agent_cloud_jira_sync_stops_on_principal_change(monkeypatch):
     conflict = {
         "error": "MemForge API request failed",
         "status_code": 409,
-        "detail": json.dumps(
-            {
-                "detail": {
-                    "origin": "https://jira.example.test",
-                    "old_principal_id": "old-user",
-                    "new_principal_id": "different-user",
-                }
-            }
-        ),
+        "code": "jira_principal_changed",
+        "detail": {
+            "code": "jira_principal_changed",
+            "origin": "https://jira.example.test",
+            "old_principal_id": "old-user",
+            "new_principal_id": "different-user",
+        },
     }
     monkeypatch.setattr(jira_capture, "capture_and_prevalidate", fake_capture)
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
@@ -3076,7 +3340,7 @@ def test_local_agent_cloud_teams_sync_stops_after_lease_is_rejected(monkeypatch,
         return {
             "error": "MemForge API request failed",
             "status_code": 409,
-            "detail": '{"detail":"local_agent_lease_not_current"}',
+            "detail": "local_agent_lease_not_current",
         }
 
     monkeypatch.setattr(main, "_collect_teams_documents_from_cloud_job", fake_collect, raising=False)

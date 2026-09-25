@@ -1820,6 +1820,37 @@ async def test_litellm_structured_client_repairs_invalid_json_first_response(
 
 
 @pytest.mark.asyncio
+async def test_litellm_structured_client_repair_names_model_level_rule(monkeypatch):
+    calls = []
+
+    async def fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return CompletionResponse('{"action":"no_output","primary_event_id":"E1"}')
+        return CompletionResponse('{"action":"no_output"}')
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="provider/model-without-native-schema",
+            base_url=None,
+            api_key=None,
+            timeout_s=1.0,
+            num_retries=1,
+        ),
+    )
+
+    response = await client.generate_agent_knowledge_patch("prompt", max_tokens=1024)
+
+    assert response.action == "no_output"
+    assert len(calls) == 2
+    repair_prompt = calls[1]["messages"][0]["content"]
+    assert '"validation_errors":[{"location":"$","rule":"value_error"}]' in repair_prompt
+    assert '"model_level_errors":["Value error, no_output cannot select Evidence events"]' in repair_prompt
+
+
+@pytest.mark.asyncio
 async def test_litellm_structured_client_bounds_schema_repair_diagnostics(
     monkeypatch,
 ):

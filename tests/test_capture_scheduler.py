@@ -420,3 +420,203 @@ def test_recover_and_upload_completion_have_no_idle_promotion_gap(queue, monkeyp
         drain(db)
     assert posted == ["1", "2"]
     assert read(db) == (0, 2, None)
+
+
+class _Binding:
+    """Mutable local workspace resolution for one test."""
+
+    def __init__(self, workspace_id=None):
+        self.workspace_id = workspace_id
+        self.calls = 0
+
+    def resolve(self, **_kw):
+        self.calls += 1
+        return type("Binding", (), {"workspace_id": self.workspace_id})()
+
+
+@pytest.fixture
+def unbound(queue, monkeypatch):
+    """A pending capture whose session directory has no workspace binding, on a controlled clock."""
+    db, transcript, request = queue
+    binding = _Binding()
+    monkeypatch.setattr(h, "resolve_workspace_binding", binding.resolve)
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE session_cursor SET workspace_id = NULL")
+    clock = [datetime.now(timezone.utc)]
+    monkeypatch.setattr(h, "_now_iso", lambda: clock[0].isoformat())
+    monkeypatch.setattr(h, "_iso_after", lambda seconds: (clock[0] + timedelta(seconds=seconds)).isoformat())
+    return db, transcript, request, binding, clock
+
+
+def test_unresolved_workspace_waits_without_requests_until_binding_resolves(unbound, monkeypatch):
+    db, _transcript, _request, binding, clock = unbound
+    posted = []
+
+    def post(path, payload, **kw):
+        posted.append(kw.get("workspace_id"))
+        if "workspace_id" not in kw:
+            raise h.WorkspaceSelectionRequiredError
+        return {}
+
+    monkeypatch.setattr(h, "_post_json", post)
+    start = clock[0]
+    assert drain(db) == 0
+    assert posted == [None]
+    assert read(db, "capture_pending, last_error, failure_count, retry_after") == (
+        1,
+        "workspace_selection_required",
+        0,
+        (start + timedelta(seconds=h.CAPTURE_RETRY_MAX_INTERVAL_SECONDS)).isoformat(),
+    )
+
+    # Due again while still unbound: resolved locally, no request, wait pushed out.
+    clock[0] = start + timedelta(seconds=h.CAPTURE_RETRY_MAX_INTERVAL_SECONDS)
+    assert drain(db) == 0
+    assert posted == [None]
+    assert read(db, "last_error, retry_after") == (
+        "workspace_selection_required",
+        (clock[0] + timedelta(seconds=h.CAPTURE_RETRY_MAX_INTERVAL_SECONDS)).isoformat(),
+    )
+
+    binding.workspace_id = "bound"
+    clock[0] += timedelta(seconds=h.CAPTURE_RETRY_MAX_INTERVAL_SECONDS)
+    assert drain(db) == 1
+    assert posted == [None, "bound"]
+    assert read(db, "capture_pending, captured_through, workspace_id, last_error, retry_after") == (
+        0,
+        1,
+        "bound",
+        None,
+        None,
+    )
+
+
+def test_new_hook_with_resolved_workspace_clears_the_wait(unbound, monkeypatch):
+    db, _transcript, request, binding, _clock = unbound
+    monkeypatch.setattr(h, "_post_json", lambda *a, **kw: (_ for _ in ()).throw(h.WorkspaceSelectionRequiredError()))
+    assert drain(db) == 0
+    assert read(db, "retry_after")[0] is not None
+
+    binding.workspace_id = "bound"
+    request()
+    assert read(db, "workspace_id, retry_after") == ("bound", None)
+
+    posted = []
+    monkeypatch.setattr(h, "_post_json", lambda path, payload, **kw: posted.append(kw["workspace_id"]) or {})
+    assert drain(db) == 1
+    assert posted == ["bound"]
+
+
+def test_binding_errors_wait_like_selection_errors(unbound, monkeypatch):
+    db, _transcript, _request, _binding, clock = unbound
+
+    def post(*_a, **_kw):
+        raise h.WorkspaceBindingError("workspace_context_invalid")
+
+    monkeypatch.setattr(h, "_post_json", post)
+    assert drain(db) == 0
+    assert read(db, "last_error, failure_count, retry_after") == (
+        "workspace_context_invalid",
+        0,
+        (clock[0] + timedelta(seconds=h.CAPTURE_RETRY_MAX_INTERVAL_SECONDS)).isoformat(),
+    )
+
+
+def test_transient_failures_back_off_exponentially_up_to_the_cap(unbound, monkeypatch):
+    db, _transcript, _request, _binding, clock = unbound
+    monkeypatch.setattr(h, "_post_json", lambda *a, **kw: (_ for _ in ()).throw(OSError("503")))
+    delays = []
+    for _attempt in range(8):
+        attempted_at = clock[0]
+        assert drain(db) == 0
+        retry_after = datetime.fromisoformat(read(db, "retry_after")[0])
+        delays.append((retry_after - attempted_at).total_seconds())
+        # Not retried before its time.
+        clock[0] = retry_after - timedelta(seconds=1)
+        assert drain(db) == 0
+        clock[0] = retry_after
+
+    base, cap = h.CAPTURE_RETRY_INTERVAL_SECONDS, h.CAPTURE_RETRY_MAX_INTERVAL_SECONDS
+    assert delays == [base, base * 2, base * 4, base * 8, base * 16, base * 32, cap, cap]
+    assert read(db, "failure_count")[0] == len(delays)
+
+    monkeypatch.setattr(h, "_post_json", lambda *a, **kw: {})
+    assert drain(db) == 1
+    assert read(db, "capture_pending, failure_count, retry_after, last_error") == (0, 0, None, None)
+
+
+def test_waiting_backlog_older_than_the_cutoff_is_dropped(unbound, monkeypatch, capsys):
+    db, transcript, _request, binding, clock = unbound
+    monkeypatch.setattr(h, "_post_json", lambda *a, **kw: (_ for _ in ()).throw(h.WorkspaceSelectionRequiredError()))
+    assert drain(db) == 0
+
+    clock[0] += timedelta(seconds=h.CAPTURE_RETRY_MAX_INTERVAL_SECONDS)
+    last_activity = clock[0] - timedelta(seconds=h.WORKSPACE_BACKLOG_MAX_AGE_SECONDS + 1)
+    os.utime(transcript, (last_activity.timestamp(), last_activity.timestamp()))
+    binding.workspace_id = "bound"
+    posted = []
+    monkeypatch.setattr(h, "_post_json", lambda *a, **kw: posted.append(a) or {})
+    assert drain(db) == 0
+
+    assert posted == []
+    assert read(db, "capture_pending, captured_through, last_error, retry_after") == (
+        0,
+        1,
+        h.WORKSPACE_BACKLOG_EXPIRED,
+        None,
+    )
+    assert "waited for a workspace longer than the backlog age" in capsys.readouterr().err
+
+
+def test_waiting_backlog_within_the_cutoff_is_uploaded(unbound, monkeypatch):
+    db, transcript, _request, binding, clock = unbound
+    monkeypatch.setattr(h, "_post_json", lambda *a, **kw: (_ for _ in ()).throw(h.WorkspaceSelectionRequiredError()))
+    assert drain(db) == 0
+
+    clock[0] += timedelta(seconds=h.CAPTURE_RETRY_MAX_INTERVAL_SECONDS)
+    last_activity = clock[0] - timedelta(seconds=h.WORKSPACE_BACKLOG_MAX_AGE_SECONDS - 60)
+    os.utime(transcript, (last_activity.timestamp(), last_activity.timestamp()))
+    binding.workspace_id = "bound"
+    posted = []
+    monkeypatch.setattr(h, "_post_json", lambda path, payload, **kw: posted.append(kw["workspace_id"]) or {})
+    assert drain(db) == 1
+    assert posted == ["bound"]
+
+
+@pytest.mark.parametrize(("bound_workspace", "expect_hint"), [(None, True), ("bound", False)])
+def test_session_start_reports_missing_binding_while_captures_wait(
+    unbound, monkeypatch, capsys, bound_workspace, expect_hint
+):
+    import json
+
+    db, transcript, _request, binding, _clock = unbound
+    monkeypatch.setattr(h, "_post_json", lambda *a, **kw: (_ for _ in ()).throw(h.WorkspaceSelectionRequiredError()))
+    assert drain(db) == 0
+    binding.workspace_id = bound_workspace
+    monkeypatch.setattr(h, "_spawn_agent_window_worker", lambda **kw: None)
+
+    h._run_context(
+        dict(hook_event_name="SessionStart", session_id="other", cwd=str(transcript.parent)),
+        client="codex",
+        timeout=1,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert (output.get("systemMessage") == h.WORKSPACE_BINDING_HINT) is expect_hint
+
+
+def test_session_start_without_waiting_captures_has_no_binding_hint(queue, monkeypatch, capsys):
+    import json
+
+    _db, transcript, _request = queue
+    monkeypatch.setattr(h, "resolve_workspace_binding", _Binding().resolve)
+    monkeypatch.setattr(h, "_spawn_agent_window_worker", lambda **kw: None)
+
+    h._run_context(
+        dict(hook_event_name="SessionStart", session_id="other", cwd=str(transcript.parent)),
+        client="codex",
+        timeout=1,
+    )
+
+    assert "systemMessage" not in json.loads(capsys.readouterr().out)

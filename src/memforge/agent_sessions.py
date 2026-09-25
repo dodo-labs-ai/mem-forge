@@ -29,7 +29,7 @@ from memforge.agent_knowledge import (
     render_agent_knowledge_patch_prompt,
 )
 from memforge.memory.project_resolver import resolve_project_key
-from memforge.llm.batch_runner import OUTPUT_INVALID, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import AgentSessionAuthorityResponse
 from memforge.models import AgentHookReceipt, AgentSessionReceipt, content_hash, slugify
 from memforge.repo_identity import normalize_repo_identifier
@@ -39,6 +39,34 @@ from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 AGENT_SESSION_SOURCE_TYPE = "agent_session"
 AGENT_SESSION_SOURCE_KIND = "generated_agent_summary"
 AGENT_SESSION_KNOWLEDGE_PATCH_MAX_TOKENS = 8192
+AGENT_SESSION_LLM_FAILED_CODE = "agent_session_llm_failed"
+AGENT_SESSION_LLM_UNAVAILABLE_CATEGORY = "unavailable"
+AGENT_SESSION_LLM_UNAVAILABLE_CODE = "llm_unavailable"
+# Clients resubmit a window whose model call failed; this is the earliest useful retry.
+AGENT_SESSION_WINDOW_RETRY_AFTER_SECONDS = 60
+
+
+class AgentSessionWindowLlmError(RuntimeError):
+    """A window's model call failed, so the window stays unprocessed and can be resubmitted.
+
+    ``category`` is the batch runner's failure category, or ``unavailable`` when
+    no model is configured for the route. ``error_code`` is the structured-output
+    code of the failing call.
+    """
+
+    def __init__(self, category: str, error_code: str, message: str) -> None:
+        super().__init__(message)
+        self.category = category
+        self.error_code = error_code
+
+    @classmethod
+    def from_failure(cls, failure: ItemFailure, operation: str) -> AgentSessionWindowLlmError:
+        cause = f": {failure.error}" if failure.error is not None else ""
+        return cls(
+            failure.category,
+            failure.error_code,
+            f"{operation} failed ({failure.category}, {failure.error_code}){cause}",
+        )
 
 
 async def _run_agent_patch_with_activity(
@@ -418,9 +446,9 @@ async def _classify_agent_session_authority(
     authoritative_ids = set()
     for evidence_id, outcome in outcomes.items():
         if isinstance(outcome, ItemFailure):
-            raise outcome.error or ValueError(
-                f"authority classification failed for evidence {evidence_id}: {outcome.error_code}"
-            )
+            raise AgentSessionWindowLlmError.from_failure(
+                outcome, f"authority classification for evidence {evidence_id}"
+            ) from outcome.error
         if outcome[0].is_authoritative:
             authoritative_ids.add(evidence_id)
     return _with_authority_roles(events, authoritative_ids)
@@ -1053,7 +1081,11 @@ async def submit_agent_session_window(
             outcome="failed",
             reason="agent session window summarization LLM unavailable",
         )
-        raise ValueError("agent session window summarization LLM unavailable")
+        raise AgentSessionWindowLlmError(
+            AGENT_SESSION_LLM_UNAVAILABLE_CATEGORY,
+            AGENT_SESSION_LLM_UNAVAILABLE_CODE,
+            "agent session window summarization LLM unavailable",
+        )
 
     repo_identifier = normalize_repo_identifier(repo)
     try:
@@ -1116,11 +1148,9 @@ async def submit_agent_session_window(
             await record_failure(exc)
             raise
         if isinstance(proposal, ItemFailure):
-            cause = proposal.error or ValueError(f"agent knowledge patch request failed: {proposal.error_code}")
-            await record_failure(cause)
-            if proposal.error_code == OUTPUT_INVALID:
-                raise ValueError(f"agent knowledge patch validation failed: {cause}") from cause
-            raise cause
+            error = AgentSessionWindowLlmError.from_failure(proposal, "agent knowledge patch")
+            await record_failure(proposal.error or error)
+            raise error from proposal.error
         if citation not in proposal.citations:
             proposal.citations.append(citation)
         primary_evidence_error = _agent_patch_primary_evidence_error(
