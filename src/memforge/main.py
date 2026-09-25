@@ -14,6 +14,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
 from importlib import metadata
 from itertools import chain
 from pathlib import Path, PurePosixPath
@@ -82,6 +83,11 @@ from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES,
 )
 from memforge.tool_client import ToolClient
+from memforge.workspace_bindings import (
+    WORKSPACE_SELECTION_REQUIRED_CODE,
+    WorkspaceBindingError,
+    resolve_workspace_binding,
+)
 
 console = Console()
 log_console = Console(stderr=True)
@@ -115,6 +121,7 @@ DEFAULT_GITHUB_INCLUDE_EXTENSIONS = DEFAULT_INCLUDE_EXTENSION_LIST
 WATCH_DEFAULT_INTERVAL_SECONDS = 1800  # 30 minutes
 WATCH_BACKOFF_BASE_SECONDS = 5
 WATCH_BACKOFF_MAX_SECONDS = 300  # 5 minutes
+LOCAL_AGENT_LEASE_NOT_CURRENT = "local_agent_lease_not_current"
 INTERACTIVE_DISABLE_ENV = "MEMFORGE_NO_INTERACTIVE"
 INTERACTIVE_SCRIPT_ENV = "MEMFORGE_INTERACTIVE_SCRIPT"
 INTERACTIVE_BIN_ENV = "MEMFORGE_CLI_BIN"
@@ -279,9 +286,45 @@ def _build_cli_target(
         raise click.ClickException(f"Could not discover MemForge capabilities: {exc}") from exc
 
 
-def _tool_client(ctx) -> ToolClient:
+def _workspace_id_option(command):
+    """Add the request-scoped workspace selector to a workspace data-plane command."""
+    return click.option(
+        "--workspace-id",
+        default=None,
+        help="Workspace for this request. Required when the account can select more than one workspace.",
+    )(command)
+
+
+def _tool_client(ctx, workspace_id: str | None) -> ToolClient:
+    """Return a client for the active target, scoped to an explicit workspace when one is given."""
     resolved = _resolve_api_target(ctx.obj["config"])
-    return ToolClient(target=resolved.target, api_token=resolved.api_token)
+    return ToolClient(target=resolved.target, api_token=resolved.api_token, workspace_id=workspace_id)
+
+
+def _project_tool_client(ctx, workspace_id: str | None) -> ToolClient:
+    """Return a client for a project command.
+
+    An explicit ``--workspace-id`` wins. Otherwise the current directory's
+    confirmed directory or repository binding selects the workspace. The hook
+    fallback is never used for interactive commands.
+    """
+    resolved = _resolve_api_target(ctx.obj["config"])
+    return ToolClient(
+        target=resolved.target,
+        api_token=resolved.api_token,
+        workspace_id=workspace_id or _current_directory_workspace_id(resolved.target.origin),
+    )
+
+
+def _current_directory_workspace_id(origin: str) -> str | None:
+    try:
+        resolution = resolve_workspace_binding(origin=origin, working_directory=os.getcwd())
+    except WorkspaceBindingError as exc:
+        raise click.ClickException(
+            f"The workspace binding for this directory cannot be used ({exc.code}). "
+            "Fix it with the memforge-setup skill or pass --workspace-id."
+        ) from exc
+    return resolution.workspace_id
 
 
 def _local_agent_tool_client(ctx) -> ToolClient:
@@ -290,6 +333,12 @@ def _local_agent_tool_client(ctx) -> ToolClient:
 
 
 def _emit_tool_payload(ctx, payload: dict) -> None:
+    if payload.get("code") == WORKSPACE_SELECTION_REQUIRED_CODE:
+        workspace_ids = [str(workspace_id) for workspace_id in payload.get("workspace_ids") or []]
+        payload = {
+            **payload,
+            "hint": f"Pass --workspace-id with one of: {', '.join(workspace_ids)}.",
+        }
     click.echo(json.dumps(payload, indent=2, ensure_ascii=False))
     if payload.get("error"):
         ctx.exit(1)
@@ -981,14 +1030,16 @@ async def _run_online_evaluation_report(
 
 @eval_group.command("offline-report")
 @click.option("--run-id", required=True)
+@_workspace_id_option
 @click.pass_context
 def eval_offline_report(
     ctx: click.Context,
     run_id: str,
+    workspace_id: str | None,
 ) -> None:
     """Read one authorized immutable offline evaluation report via the service."""
 
-    _emit_tool_payload(ctx, _tool_client(ctx).get_agent_evaluation_run(run_id))
+    _emit_tool_payload(ctx, _tool_client(ctx, workspace_id).get_agent_evaluation_run(run_id))
 
 
 @eval_group.command("offline-submit")
@@ -998,8 +1049,9 @@ def eval_offline_report(
     required=True,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
 )
+@_workspace_id_option
 @click.pass_context
-def eval_offline_submit(ctx: click.Context, spec_path: Path) -> None:
+def eval_offline_submit(ctx: click.Context, spec_path: Path, workspace_id: str | None) -> None:
     """Submit one pinned offline evaluation JSON spec via the service."""
 
     try:
@@ -1008,25 +1060,27 @@ def eval_offline_submit(ctx: click.Context, spec_path: Path) -> None:
         raise click.ClickException(f"Cannot read evaluation spec: {exc}") from exc
     if not isinstance(payload, dict):
         raise click.ClickException("Evaluation spec must be a JSON object")
-    _emit_tool_payload(ctx, _tool_client(ctx).admit_agent_evaluation_run(payload))
+    _emit_tool_payload(ctx, _tool_client(ctx, workspace_id).admit_agent_evaluation_run(payload))
 
 
 @eval_group.command("langfuse-policy-approve")
 @click.option("--source-id", required=True)
 @click.option("--policy-version", required=True)
 @click.option("--queue-id", required=True)
+@_workspace_id_option
 @click.pass_context
 def eval_langfuse_policy_approve(
     ctx: click.Context,
     source_id: str,
     policy_version: str,
     queue_id: str,
+    workspace_id: str | None,
 ) -> None:
     """Approve one Source for one preconfigured Langfuse reviewer queue."""
 
     _emit_tool_payload(
         ctx,
-        _tool_client(ctx).approve_langfuse_annotation_policy(
+        _tool_client(ctx, workspace_id).approve_langfuse_annotation_policy(
             {
                 "source_id": source_id,
                 "policy_version": policy_version,
@@ -1044,6 +1098,7 @@ def eval_langfuse_policy_approve(
 @click.option("--reviewer-id", "provider_reviewer_id", required=True)
 @click.option("--queue-id", required=True)
 @click.option("--score-config-id", required=True)
+@_workspace_id_option
 @click.pass_context
 def eval_langfuse_annotation_export(
     ctx: click.Context,
@@ -1054,12 +1109,13 @@ def eval_langfuse_annotation_export(
     provider_reviewer_id: str,
     queue_id: str,
     score_config_id: str,
+    workspace_id: str | None,
 ) -> None:
     """Create or resume one blinded Langfuse reviewer task."""
 
     _emit_tool_payload(
         ctx,
-        _tool_client(ctx).export_langfuse_annotation(
+        _tool_client(ctx, workspace_id).export_langfuse_annotation(
             {
                 "result_id": result_id,
                 "content_policy_id": content_policy_id,
@@ -1075,20 +1131,22 @@ def eval_langfuse_annotation_export(
 
 @eval_group.command("langfuse-annotation-status")
 @click.option("--task-id", required=True)
+@_workspace_id_option
 @click.pass_context
-def eval_langfuse_annotation_status(ctx: click.Context, task_id: str) -> None:
+def eval_langfuse_annotation_status(ctx: click.Context, task_id: str, workspace_id: str | None) -> None:
     """Read one content-free Langfuse annotation task status."""
 
-    _emit_tool_payload(ctx, _tool_client(ctx).get_langfuse_annotation_task(task_id))
+    _emit_tool_payload(ctx, _tool_client(ctx, workspace_id).get_langfuse_annotation_task(task_id))
 
 
 @eval_group.command("langfuse-annotation-import")
 @click.option("--task-id", required=True)
+@_workspace_id_option
 @click.pass_context
-def eval_langfuse_annotation_import(ctx: click.Context, task_id: str) -> None:
+def eval_langfuse_annotation_import(ctx: click.Context, task_id: str, workspace_id: str | None) -> None:
     """Import one completed Langfuse annotation Score."""
 
-    _emit_tool_payload(ctx, _tool_client(ctx).import_langfuse_annotation(task_id))
+    _emit_tool_payload(ctx, _tool_client(ctx, workspace_id).import_langfuse_annotation(task_id))
 
 
 @eval_group.command("purge-runtime-events")
@@ -1433,7 +1491,7 @@ def target_use(ctx, name: str):
 @click.pass_context
 def target_check(ctx):
     """Check the active API target health."""
-    payload = _tool_client(ctx).health()
+    payload = _tool_client(ctx, None).health()
     _emit_tool_payload(ctx, payload)
 
 
@@ -1904,6 +1962,7 @@ def sync(ctx, source: str | None):
     help="Date field to filter when --start-date or --end-date is provided.",
 )
 @click.option("--include-superseded", is_flag=True, help="Include superseded memories.")
+@_workspace_id_option
 @click.pass_context
 def search(
     ctx,
@@ -1917,6 +1976,7 @@ def search(
     end_date: str | None,
     date_type: str,
     include_superseded: bool,
+    workspace_id: str | None,
 ):
     """Search MemForge using the same service path as the MCP search tool."""
     time_range = (
@@ -1939,16 +1999,17 @@ def search(
         kwargs["entities"] = list(entities)
     if time_range:
         kwargs["time_range"] = time_range
-    payload = _tool_client(ctx).search(**kwargs)
+    payload = _project_tool_client(ctx, workspace_id).search(**kwargs)
     _emit_tool_payload(ctx, payload)
 
 
 @cli.command("get-memory")
 @click.argument("memory_id")
+@_workspace_id_option
 @click.pass_context
-def get_memory(ctx, memory_id: str):
+def get_memory(ctx, memory_id: str, workspace_id: str | None):
     """Fetch full memory detail and provenance by memory ID."""
-    payload = _tool_client(ctx).get_memory(memory_id)
+    payload = _project_tool_client(ctx, workspace_id).get_memory(memory_id)
     _emit_tool_payload(ctx, payload)
 
 
@@ -1957,10 +2018,11 @@ def get_memory(ctx, memory_id: str):
 @click.option("--mode", default="text", show_default=True, type=click.Choice(["text", "file", "base64"]))
 @click.option("--max-chars", default=120_000, show_default=True, type=int, help="Maximum text characters to print.")
 @click.option("--max-bytes", default=2_000_000, show_default=True, type=int, help="Maximum bytes for inline modes.")
+@_workspace_id_option
 @click.pass_context
-def get_resource(ctx, url: str, mode: str, max_chars: int, max_bytes: int):
+def get_resource(ctx, url: str, mode: str, max_chars: int, max_bytes: int, workspace_id: str | None):
     """Fetch a source artifact URL returned by get-memory."""
-    payload = _tool_client(ctx).get_resource(
+    payload = _project_tool_client(ctx, workspace_id).get_resource(
         url=url,
         mode=mode,
         max_chars=max_chars,
@@ -2002,6 +2064,7 @@ def memory():
     help="Date field to filter when --start-date or --end-date is provided.",
 )
 @click.option("--include-superseded", is_flag=True, help="Include superseded memories.")
+@_workspace_id_option
 @click.pass_context
 def memory_search(
     ctx,
@@ -2014,6 +2077,7 @@ def memory_search(
     end_date: str | None,
     date_type: str,
     include_superseded: bool,
+    workspace_id: str | None,
 ):
     """Search MemForge memories."""
     time_range = (
@@ -2034,16 +2098,17 @@ def memory_search(
         kwargs["entities"] = list(entities)
     if time_range:
         kwargs["time_range"] = time_range
-    payload = _tool_client(ctx).search(**kwargs)
+    payload = _project_tool_client(ctx, workspace_id).search(**kwargs)
     _emit_tool_payload(ctx, payload)
 
 
 @memory.command("get")
 @click.argument("memory_id")
+@_workspace_id_option
 @click.pass_context
-def memory_get(ctx, memory_id: str):
+def memory_get(ctx, memory_id: str, workspace_id: str | None):
     """Fetch memory detail and provenance."""
-    payload = _tool_client(ctx).get_memory(memory_id)
+    payload = _project_tool_client(ctx, workspace_id).get_memory(memory_id)
     _emit_tool_payload(ctx, payload)
 
 
@@ -2052,10 +2117,11 @@ def memory_get(ctx, memory_id: str):
 @click.option("--mode", default="text", show_default=True, type=click.Choice(["text", "file", "base64"]))
 @click.option("--max-chars", default=120_000, show_default=True, type=int, help="Maximum text characters to print.")
 @click.option("--max-bytes", default=2_000_000, show_default=True, type=int, help="Maximum bytes for inline modes.")
+@_workspace_id_option
 @click.pass_context
-def memory_resource(ctx, url: str, mode: str, max_chars: int, max_bytes: int):
+def memory_resource(ctx, url: str, mode: str, max_chars: int, max_bytes: int, workspace_id: str | None):
     """Fetch a source artifact URL returned by get-memory."""
-    payload = _tool_client(ctx).get_resource(
+    payload = _project_tool_client(ctx, workspace_id).get_resource(
         url=url,
         mode=mode,
         max_chars=max_chars,
@@ -2094,10 +2160,11 @@ def sources():
 
 
 @sources.command("list")
+@_workspace_id_option
 @click.pass_context
-def sources_list(ctx):
+def sources_list(ctx, workspace_id: str | None):
     """List all configured sources for the active API target."""
-    payload = _tool_client(ctx).list_sources()
+    payload = _tool_client(ctx, workspace_id).list_sources()
     if ctx.obj.get("json") or payload.get("error"):
         _emit_tool_payload(ctx, payload)
         return
@@ -2130,10 +2197,11 @@ def sources_list(ctx):
 
 
 @sources.command("searchable")
+@_workspace_id_option
 @click.pass_context
-def sources_searchable(ctx):
+def sources_searchable(ctx, workspace_id: str | None):
     """List source IDs available for memory search filtering."""
-    payload = _tool_client(ctx).list_searchable_sources()
+    payload = _tool_client(ctx, workspace_id).list_searchable_sources()
     if ctx.obj.get("json") or payload.get("error"):
         _emit_tool_payload(ctx, payload)
         return
@@ -2169,14 +2237,15 @@ def sources_searchable(ctx):
 @click.argument("source_id")
 @click.option("--every-minutes", type=int, default=1440, show_default=True, help="Automatic sync interval.")
 @click.option("--disable", is_flag=True, help="Disable automatic sync for this source.")
+@_workspace_id_option
 @click.pass_context
-def sources_schedule(ctx, source_id: str, every_minutes: int, disable: bool):
+def sources_schedule(ctx, source_id: str, every_minutes: int, disable: bool, workspace_id: str | None):
     """Configure automatic sync for one source over the active API target."""
     if every_minutes < SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES:
         raise click.ClickException(f"--every-minutes must be at least {SOURCE_SYNC_SCHEDULE_MIN_INTERVAL_MINUTES}.")
     if every_minutes > SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES:
         raise click.ClickException(f"--every-minutes must be at most {SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES}.")
-    client = _tool_client(ctx)
+    client = _tool_client(ctx, workspace_id)
     payload = client.update_source_schedule(
         source_id=source_id,
         enabled=not disable,
@@ -2187,10 +2256,11 @@ def sources_schedule(ctx, source_id: str, every_minutes: int, disable: bool):
 
 @sources.command("schedule-show")
 @click.argument("source_id")
+@_workspace_id_option
 @click.pass_context
-def sources_schedule_show(ctx, source_id: str):
+def sources_schedule_show(ctx, source_id: str, workspace_id: str | None):
     """Show automatic sync schedule for one source over the active API target."""
-    payload = _tool_client(ctx).get_source_schedule(source_id)
+    payload = _tool_client(ctx, workspace_id).get_source_schedule(source_id)
     _emit_tool_payload(ctx, payload)
 
 
@@ -3060,7 +3130,7 @@ def _run_cloud_jira_auth_job(
             cookie_header=captured.cookie_header,
             browser=captured.browser,
         )
-        if uploaded_session.get("status_code") == 409:
+        if _is_jira_principal_change(uploaded_session):
             return {
                 "operation": operation,
                 "source_id": source_id,
@@ -3094,17 +3164,11 @@ def _run_cloud_jira_auth_job(
 
 
 def _local_agent_lease_not_current(response: object) -> bool:
-    if not isinstance(response, dict) or response.get("status_code") != 409:
-        return False
-    detail = response.get("detail")
-    if isinstance(detail, str):
-        try:
-            parsed = json.loads(detail)
-        except json.JSONDecodeError:
-            return "local_agent_lease_not_current" in detail
-        if isinstance(parsed, dict):
-            return parsed.get("detail") == "local_agent_lease_not_current"
-    return detail == "local_agent_lease_not_current"
+    return (
+        isinstance(response, dict)
+        and response.get("status_code") == HTTPStatus.CONFLICT
+        and response.get("detail") == LOCAL_AGENT_LEASE_NOT_CURRENT
+    )
 
 
 def _raise_if_local_agent_lease_not_current(response: object) -> None:
@@ -3112,7 +3176,7 @@ def _raise_if_local_agent_lease_not_current(response: object) -> None:
         return
     from memforge.local_agent.runner import CloudJobLeaseLost
 
-    raise CloudJobLeaseLost("local_agent_lease_not_current")
+    raise CloudJobLeaseLost(LOCAL_AGENT_LEASE_NOT_CURRENT)
 
 
 def _required_local_source_doc_ids(
@@ -3293,7 +3357,7 @@ def _run_cloud_jira_sync_job(
             cookie_header=captured.cookie_header,
             browser=captured.browser,
         )
-        if uploaded_session.get("status_code") == 409:
+        if _is_jira_principal_change(uploaded_session):
             principal_change = _principal_change_payload(uploaded_session)
             return {
                 "operation": operation,
@@ -5626,24 +5690,21 @@ def adapter_auth():
     pass
 
 
+def _is_jira_principal_change(upload_result: dict) -> bool:
+    from memforge.auth.jira_auth import JIRA_PRINCIPAL_CHANGED_CODE
+
+    return upload_result.get("code") == JIRA_PRINCIPAL_CHANGED_CODE
+
+
 def _principal_change_payload(upload_result: dict) -> dict:
-    """Translate a 409 upload response into the principal-changed signal the CLI emits."""
-    inner: dict = {}
-    body = upload_result.get("detail")
-    if isinstance(body, str):
-        try:
-            parsed = json.loads(body)
-        except ValueError:
-            parsed = None
-        if isinstance(parsed, dict):
-            candidate = parsed.get("detail", parsed)
-            if isinstance(candidate, dict):
-                inner = candidate
+    """Translate a Jira principal-change conflict into the signal the CLI emits."""
+    detail = upload_result.get("detail")
+    principal = detail if isinstance(detail, dict) else {}
     return {
         "error": "principal_changed",
-        "origin": inner.get("origin"),
-        "old_principal_id": inner.get("old_principal_id"),
-        "new_principal_id": inner.get("new_principal_id"),
+        "origin": principal.get("origin"),
+        "old_principal_id": principal.get("old_principal_id"),
+        "new_principal_id": principal.get("new_principal_id"),
     }
 
 
@@ -5651,18 +5712,119 @@ def _cookie_hash(cookie_header: str) -> str:
     return hashlib.sha256(cookie_header.encode("utf-8")).hexdigest()
 
 
-async def run_watch_tick(*, base_url, browser, client, last_hash, capture, log):
-    """One watch iteration. Returns (action, new_last_hash).
+@dataclass(frozen=True)
+class _JiraSessionFanOut:
+    """Workspaces that receive one captured Jira session.
+
+    ``clients`` maps each receiving workspace to its scoped client. ``failures``
+    are per-workspace results for workspaces whose Jira Sources could not be
+    read. ``error`` is set when no workspace can receive the session.
+    """
+
+    clients: dict[str, Any]
+    failures: tuple[dict, ...] = ()
+    error: dict | None = None
+
+
+def _jira_session_fan_out(client: Any, *, origin: str, workspace_id: str | None) -> _JiraSessionFanOut:
+    """Select the workspaces that receive a captured Jira session for one origin.
+
+    An explicit workspace receives it directly. Otherwise an account with one
+    selectable workspace uploads there, including before its first Jira Source
+    exists, and an account with several uploads to every workspace that has a
+    Jira Source for this origin.
+    """
+    if workspace_id:
+        return _JiraSessionFanOut(clients={workspace_id: client})
+    listing = client.list_workspaces()
+    if listing.get("error"):
+        return _JiraSessionFanOut(clients={}, error=listing)
+    selectable = [
+        str(workspace["workspace_id"])
+        for workspace in listing.get("workspaces") or []
+        if workspace.get("selectable") and workspace.get("workspace_id")
+    ]
+    if not selectable:
+        return _JiraSessionFanOut(
+            clients={},
+            error={"error": "no_selectable_workspace", "detail": "No workspace can receive the Jira session."},
+        )
+    if len(selectable) == 1:
+        return _JiraSessionFanOut(clients={selectable[0]: client.for_workspace(selectable[0])})
+
+    clients: dict[str, Any] = {}
+    failures: list[dict] = []
+    for selectable_id in selectable:
+        scoped = client.for_workspace(selectable_id)
+        origins = scoped.list_jira_origins()
+        if origins.get("error"):
+            failures.append(_jira_workspace_failure(selectable_id, origins))
+            continue
+        if any(
+            entry.get("origin") == origin and entry.get("configured")
+            for entry in origins.get("origins") or []
+        ):
+            clients[selectable_id] = scoped
+    if not clients and not failures:
+        return _JiraSessionFanOut(
+            clients={},
+            error={
+                "error": "jira_source_not_found",
+                "detail": f"No workspace has a Jira Source for {origin}. Pass --workspace-id to choose one.",
+                "workspace_ids": selectable,
+            },
+        )
+    return _JiraSessionFanOut(clients=clients, failures=tuple(failures))
+
+
+def _jira_workspace_failure(workspace_id: str, response: dict) -> dict:
+    return {
+        "workspace_id": workspace_id,
+        "status": "failed",
+        "status_code": response.get("status_code"),
+        "code": response.get("code"),
+        "detail": response.get("detail") or response.get("error"),
+    }
+
+
+def _jira_upload_result(workspace_id: str, uploaded: dict) -> dict:
+    """Describe one workspace's Jira session upload."""
+    if _is_jira_principal_change(uploaded):
+        principal = _principal_change_payload(uploaded)
+        return {
+            "workspace_id": workspace_id,
+            "status": "principal_changed",
+            "old_principal_id": principal["old_principal_id"],
+            "new_principal_id": principal["new_principal_id"],
+        }
+    if uploaded.get("error"):
+        return _jira_workspace_failure(workspace_id, uploaded)
+    return {"workspace_id": workspace_id, "status": "uploaded", "session": uploaded}
+
+
+def _jira_refresh_payload(origin: str, results: list[dict]) -> dict:
+    payload: dict[str, Any] = {"origin": origin, "results": results}
+    if any(result["status"] != "uploaded" for result in results):
+        payload["error"] = "jira_session_upload_incomplete"
+    return payload
+
+
+async def run_watch_tick(*, base_url, browser, clients, last_hash, capture, log):
+    """One watch iteration over every receiving workspace. Returns (action, new_last_hash).
 
     action is one of: uploaded, unchanged, expired, principal_conflict, transport_error.
-    Pure over its injected collaborators (capture, client, log) so it is unit-testable.
+    ``clients`` maps each receiving workspace ID to its scoped client. The new
+    cookie is recorded only when every workspace accepted it, so the next tick
+    retries a partial upload. Pure over its injected collaborators (capture,
+    clients, log) so it is unit-testable.
     """
     from memforge.auth.jira_auth import JiraAuthSessionMissingError
 
     try:
         result = await capture(base_url, browser=browser)
     except JiraAuthSessionMissingError as exc:
-        client.mark_jira_session_expired(base_url=base_url, error=str(exc))
+        for client in clients.values():
+            client.mark_jira_session_expired(base_url=base_url, error=str(exc))
         log(f"Jira session for {base_url} is not active; sign back into Jira in your browser. ({exc})")
         return "expired", None
 
@@ -5670,18 +5832,30 @@ async def run_watch_tick(*, base_url, browser, client, last_hash, capture, log):
     if new_hash == last_hash:
         return "unchanged", last_hash
 
-    uploaded = client.upload_jira_session(
-        base_url=base_url,
-        cookie_header=result.cookie_header,
-        browser=result.browser,
-    )
-    if uploaded.get("status_code") == 409:
-        log(f"A different Jira user is signed in for {base_url}; re-run refresh with --confirm-principal-change.")
-        return "principal_conflict", last_hash
-    if uploaded.get("error"):
-        log(f"Upload to MemForge failed: {uploaded.get('detail') or uploaded['error']}")
+    statuses = set()
+    for workspace_id, client in clients.items():
+        outcome = _jira_upload_result(
+            workspace_id,
+            client.upload_jira_session(
+                base_url=base_url,
+                cookie_header=result.cookie_header,
+                browser=result.browser,
+            ),
+        )
+        statuses.add(outcome["status"])
+        if outcome["status"] == "principal_changed":
+            log(
+                f"[{workspace_id}] A different Jira user is signed in for {base_url}; "
+                "re-run refresh with --confirm-principal-change."
+            )
+        elif outcome["status"] == "failed":
+            log(f"[{workspace_id}] Upload to MemForge failed: {outcome['code'] or outcome['detail']}")
+        else:
+            log(f"[{workspace_id}] Refreshed Jira session for {base_url} (cookie {new_hash[:8]}).")
+    if "failed" in statuses:
         return "transport_error", last_hash
-    log(f"Refreshed Jira session for {base_url} (cookie {new_hash[:8]}).")
+    if "principal_changed" in statuses:
+        return "principal_conflict", last_hash
     return "uploaded", new_hash
 
 
@@ -5703,45 +5877,71 @@ def _make_browser_session_group(descriptor):
     def group():
         """Manage the server's stored browser session for this provider.
 
-        ``status``, ``list``, and ``forget`` talk to the remote MemForge server.
-        ``refresh`` captures the cookie from the local browser and uploads it.
+        ``status``, ``list``, and ``forget`` talk to the remote MemForge server
+        for one workspace. ``refresh`` and ``watch`` capture the cookie from the
+        local browser once and upload it to every workspace with a Jira Source
+        for the origin, or to the workspace given by ``--workspace-id``.
         """
+
+    def fan_out_or_emit(ctx, client, *, base_url: str, workspace_id: str | None) -> _JiraSessionFanOut | None:
+        from memforge.auth.jira_auth import canonical_jira_origin
+
+        try:
+            origin = canonical_jira_origin(base_url)
+        except ValueError as exc:
+            _emit_tool_payload(ctx, {"error": "invalid_base_url", "detail": str(exc)})
+            return None
+        fan_out = _jira_session_fan_out(client, origin=origin, workspace_id=workspace_id)
+        if fan_out.error is not None:
+            _emit_tool_payload(ctx, fan_out.error)
+            return None
+        if not fan_out.clients:
+            _emit_tool_payload(ctx, _jira_refresh_payload(origin, list(fan_out.failures)))
+            return None
+        return fan_out
 
     @group.command("status")
     @click.option("--base-url", required=True, help=f"{descriptor.label} base URL.")
+    @_workspace_id_option
     @click.pass_context
-    def status_cmd(ctx, base_url):
+    def status_cmd(ctx, base_url, workspace_id):
         """Show the server's stored session status for an origin."""
-        _emit_tool_payload(ctx, _tool_client(ctx).get_jira_session(base_url))
+        _emit_tool_payload(ctx, _tool_client(ctx, workspace_id).get_jira_session(base_url))
 
     @group.command("list")
+    @_workspace_id_option
     @click.pass_context
-    def list_cmd(ctx):
+    def list_cmd(ctx, workspace_id):
         """List known origins from the server."""
-        _emit_tool_payload(ctx, _tool_client(ctx).list_jira_origins())
+        _emit_tool_payload(ctx, _tool_client(ctx, workspace_id).list_jira_origins())
 
     @group.command("forget")
     @click.option("--base-url", required=True, help="Origin whose stored session to delete.")
+    @_workspace_id_option
     @click.pass_context
-    def forget_cmd(ctx, base_url):
+    def forget_cmd(ctx, base_url, workspace_id):
         """Forget the local and server-side stored session for an origin."""
         from memforge.auth.jira_auth import canonical_jira_origin
         from memforge.auth.jira_browser_session import JiraBrowserSession
 
         origin = canonical_jira_origin(base_url)
         JiraBrowserSession().forget(origin=origin)
-        _emit_tool_payload(ctx, _tool_client(ctx).forget_jira_session(origin))
+        _emit_tool_payload(ctx, _tool_client(ctx, workspace_id).forget_jira_session(origin))
 
     @group.command("refresh")
     @click.option("--base-url", required=True, help=f"{descriptor.label} base URL.")
     @click.option("--browser", default=None, help="Browser to read cookies from, for example chrome or edge.")
     @click.option("--confirm-principal-change", is_flag=True, help="Allow this session to replace a different user.")
+    @_workspace_id_option
     @click.pass_context
-    def refresh_cmd(ctx, base_url, browser, confirm_principal_change):
-        """Capture the local browser session and upload it to the server."""
+    def refresh_cmd(ctx, base_url, browser, confirm_principal_change, workspace_id):
+        """Capture the local browser session and upload it to each receiving workspace."""
         from memforge.auth import jira_capture
         from memforge.auth.jira_auth import JiraAuthSessionError, JiraAuthSessionMissingError
 
+        fan_out = fan_out_or_emit(ctx, _tool_client(ctx, workspace_id), base_url=base_url, workspace_id=workspace_id)
+        if fan_out is None:
+            return
         try:
             result = asyncio.run(
                 jira_capture.capture_and_prevalidate(
@@ -5756,16 +5956,19 @@ def _make_browser_session_group(descriptor):
         except (JiraAuthSessionError, ValueError) as exc:
             _emit_tool_payload(ctx, {"error": "auth_failed", "detail": str(exc)})
             return
-        payload = _tool_client(ctx).upload_jira_session(
-            base_url=result.origin,
-            cookie_header=result.cookie_header,
-            browser=result.browser,
-            confirm_principal_change=confirm_principal_change,
-        )
-        if payload.get("status_code") == 409:
-            _emit_tool_payload(ctx, _principal_change_payload(payload))
-            return
-        _emit_tool_payload(ctx, payload)
+        results = [
+            _jira_upload_result(
+                receiving_id,
+                client.upload_jira_session(
+                    base_url=result.origin,
+                    cookie_header=result.cookie_header,
+                    browser=result.browser,
+                    confirm_principal_change=confirm_principal_change,
+                ),
+            )
+            for receiving_id, client in fan_out.clients.items()
+        ]
+        _emit_tool_payload(ctx, _jira_refresh_payload(result.origin, [*results, *fan_out.failures]))
 
     @group.command("watch")
     @click.option("--base-url", required=True, help=f"{descriptor.label} base URL.")
@@ -5777,12 +5980,20 @@ def _make_browser_session_group(descriptor):
         show_default=True,
         help="Seconds between re-capture attempts. Keep it under your Jira idle timeout.",
     )
+    @_workspace_id_option
     @click.pass_context
-    def watch_cmd(ctx, base_url, browser, interval_seconds):
-        """Keep the server's Jira session fresh by re-capturing on an interval."""
+    def watch_cmd(ctx, base_url, browser, interval_seconds, workspace_id):
+        """Keep each receiving workspace's Jira session fresh by re-capturing on an interval."""
         from memforge.auth import jira_capture
 
-        client = _tool_client(ctx)
+        fan_out = fan_out_or_emit(ctx, _tool_client(ctx, workspace_id), base_url=base_url, workspace_id=workspace_id)
+        if fan_out is None:
+            return
+        for failure in fan_out.failures:
+            click.echo(
+                f"[{failure['workspace_id']}] Could not read Jira Sources; this workspace is not refreshed: "
+                f"{failure['code'] or failure['detail']}"
+            )
 
         async def _capture(url, *, browser=None):
             return await jira_capture.capture_and_prevalidate(url, browser=browser)
@@ -5795,7 +6006,7 @@ def _make_browser_session_group(descriptor):
                     action, last_hash = await run_watch_tick(
                         base_url=base_url,
                         browser=browser,
-                        client=client,
+                        clients=fan_out.clients,
                         last_hash=last_hash,
                         capture=_capture,
                         log=click.echo,

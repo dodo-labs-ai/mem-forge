@@ -930,7 +930,7 @@ def test_packaged_plugin_version_is_consistent():
     import tomllib
 
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.61"
+    version = "0.1.62"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
@@ -4684,8 +4684,51 @@ def test_post_json_classifies_workspace_selection_conflict(monkeypatch):
 
     monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
 
-    with pytest.raises(hook_adapter.WorkspaceSelectionRequiredError):
+    with pytest.raises(hook_adapter.WorkspaceSelectionRequiredError) as raised:
         hook_adapter._post_json("/hooks/receipts", {}, timeout=1)
+    assert raised.value.code == "workspace_selection_required"
+
+
+def test_post_json_classifies_inaccessible_workspace(monkeypatch):
+    from memforge import hook_adapter
+
+    def fake_urlopen(request, timeout: float):
+        raise hook_adapter.urllib.error.HTTPError(
+            request.full_url,
+            404,
+            "Not Found",
+            hdrs=None,
+            fp=io.BytesIO(
+                json.dumps(
+                    {"code": "workspace_not_found_or_inaccessible", "detail": "Workspace not found or inaccessible."}
+                ).encode()
+            ),
+        )
+
+    monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(hook_adapter.WorkspaceSelectionRequiredError) as raised:
+        hook_adapter._post_json("/agent-sessions/windows", {}, timeout=1, workspace_id="retired")
+    assert raised.value.code == "workspace_not_found_or_inaccessible"
+
+
+def test_post_json_keeps_service_failures_retryable(monkeypatch):
+    from memforge import hook_adapter
+
+    def fake_urlopen(request, timeout: float):
+        raise hook_adapter.urllib.error.HTTPError(
+            request.full_url,
+            503,
+            "Service Unavailable",
+            hdrs=None,
+            fp=io.BytesIO(json.dumps({"detail": {"code": "agent_session_llm_failed"}}).encode()),
+        )
+
+    monkeypatch.setattr(hook_adapter.urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(RuntimeError, match="HTTP 503") as raised:
+        hook_adapter._post_json("/agent-sessions/windows", {}, timeout=1, workspace_id="mount_tai")
+    assert not isinstance(raised.value, hook_adapter.WorkspaceSelectionRequiredError)
 
 
 def test_post_json_targets_zero_configuration_local_oss(monkeypatch):

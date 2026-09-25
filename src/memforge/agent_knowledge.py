@@ -202,6 +202,26 @@ class AgentKnowledgePatchProposal(BaseModel):
 class AgentKnowledgePatchModelResponse(AgentKnowledgePatchProposal):
     """Provider response schema; internal application commands stay separately authorized."""
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_primary_from_required(cls, value: object):
+        """Remove the Primary event from Required; listing it twice carries no information."""
+
+        if not isinstance(value, Mapping):
+            return value
+        primary = value.get("primary_event_id")
+        required = value.get("required_event_ids")
+        if not isinstance(primary, str) or not primary.strip() or not isinstance(required, list):
+            return value
+        primary = primary.strip()
+        normalized = dict(value)
+        normalized["required_event_ids"] = [
+            event_id
+            for event_id in required
+            if not (isinstance(event_id, str) and event_id.strip() == primary)
+        ]
+        return normalized
+
     @model_validator(mode="after")
     def _require_model_primary_event(self):
         if self.action != "no_output" and self.primary_event_id is None:
@@ -1944,6 +1964,8 @@ Decision boundary:
 - If nothing durable should be kept, use no_output.
 - Agent-session memory is user-anchored: non-no_output actions require exactly one primary_event_id copied from <primary_evidence>.
 - required_event_ids is duplicate-free and contains only necessary user-authored dependency events; do not include merely helpful context.
+- primary_event_id never appears in required_event_ids.
+- With no_output, leave primary_event_id and required_event_ids empty.
 - Primary evidence is explicit durable user intent: a user-authored preference, approval, design decision, rule, convention, or instruction to remember something for future work.
 - Generic chat control such as "continue", "do it", "retry", or "ok" is supporting context, not durable memory authority.
 - Primary evidence authorizes the durable claim. Supporting evidence can explain, qualify, or provide provenance, but Supporting evidence cannot by itself authorize create_new_concept or add_new_claim.

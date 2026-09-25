@@ -311,9 +311,15 @@ async function actionAuthJira() {
   if (browser) args.push("--browser", browser);
 
   const payload = await runStep("Refreshing Jira browser session", args);
-  if (payload?.error === "principal_changed") {
+  const changed = Array.isArray(payload?.results)
+    ? payload.results.filter((result) => result.status === "principal_changed").map((result) => result.workspace_id)
+    : [];
+  if (changed.length) {
     const confirmChange = ensureNotCancelled(
-      await confirm({ message: "A different Jira user is signed in. Confirm principal change?", initialValue: false }),
+      await confirm({
+        message: `A different Jira user is signed in for workspace ${changed.join(", ")}. Confirm principal change?`,
+        initialValue: false,
+      }),
     );
     if (confirmChange) {
       await runStep("Refreshing Jira browser session (confirmed)", [...args, "--confirm-principal-change"]);

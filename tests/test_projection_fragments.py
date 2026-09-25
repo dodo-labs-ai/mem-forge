@@ -307,6 +307,32 @@ def test_agent_patch_model_uses_one_primary_event_and_reads_one_legacy_id() -> N
         AgentKnowledgePatchModelResponse(action="create_new_concept")
 
 
+def test_agent_patch_model_drops_primary_repeated_as_required() -> None:
+    response = AgentKnowledgePatchModelResponse.model_validate_json(
+        '{"action":"create_new_concept","primary_event_id":"E1","required_event_ids":["E1","E2"]}'
+    )
+
+    assert response.primary_event_id == "E1"
+    assert response.required_event_ids == ["E2"]
+    with pytest.raises(ValidationError, match="primary_event_id cannot also be Required"):
+        AgentKnowledgePatchProposal(
+            action="create_new_concept",
+            primary_event_id="E1",
+            required_event_ids=["E1"],
+        )
+
+
+def test_agent_patch_model_no_output_with_events_still_fails() -> None:
+    with pytest.raises(ValidationError, match="no_output cannot select Evidence events"):
+        AgentKnowledgePatchModelResponse.model_validate(
+            {"action": "no_output", "primary_event_id": "E1", "required_event_ids": ["E1"]}
+        )
+    with pytest.raises(ValidationError, match="no_output cannot select Evidence events"):
+        AgentKnowledgePatchModelResponse.model_validate(
+            {"action": "no_output", "required_event_ids": ["E2"]}
+        )
+
+
 def test_v9_response_accepts_redundant_selectors_for_admission_normalization() -> None:
     payload = {
         "memories": [

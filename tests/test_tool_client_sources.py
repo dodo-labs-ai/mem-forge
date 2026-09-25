@@ -899,3 +899,119 @@ def test_tool_client_file_mode_verifies_resource_integrity(
     else:
         assert result["error"] == "resource fetch failed"
         assert result["detail"] == expected_error
+
+
+def _http_error(status_code: int, body: bytes):
+    import io
+    from urllib.error import HTTPError
+
+    return HTTPError("https://memforge.example.test", status_code, "error", hdrs=None, fp=io.BytesIO(body))
+
+
+def _failing_client(monkeypatch, error, *, workspace_id: str | None = None) -> tuple[ToolClient, list[str]]:
+    urls: list[str] = []
+
+    class FailingOpener:
+        def open(self, request, timeout):
+            urls.append(request.full_url)
+            raise error
+
+    monkeypatch.setattr(tool_client, "build_opener", lambda *_handlers: FailingOpener())
+    client = ToolClient(
+        target=build_target(origin="https://memforge.example.hana.ondemand.com", edition="cloud"),
+        api_token="tok",
+        workspace_id=workspace_id,
+    )
+    return client, urls
+
+
+def test_http_error_carries_routing_code_and_selectable_workspaces(monkeypatch):
+    body = {
+        "code": "workspace_selection_required",
+        "detail": "Select a workspace for this request.",
+        "workspace_ids": ["mount_tai", "payroll_agent"],
+    }
+    client, _urls = _failing_client(monkeypatch, _http_error(409, json.dumps(body).encode()))
+
+    assert client.list_sources() == {
+        "error": "MemForge API request failed",
+        "status_code": 409,
+        "code": "workspace_selection_required",
+        "detail": "Select a workspace for this request.",
+        "workspace_ids": ["mount_tai", "payroll_agent"],
+    }
+
+
+def test_http_error_reads_code_from_structured_route_detail(monkeypatch):
+    detail = {
+        "code": "jira_principal_changed",
+        "origin": "https://jira.example.test",
+        "old_principal_id": "old-user",
+        "new_principal_id": "new-user",
+    }
+    client, _urls = _failing_client(monkeypatch, _http_error(409, json.dumps({"detail": detail}).encode()))
+
+    result = client.upload_jira_session(base_url="https://jira.example.test", cookie_header="SESSION=x")
+
+    assert result["status_code"] == 409
+    assert result["code"] == "jira_principal_changed"
+    assert result["detail"] == detail
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_detail"),
+    [
+        (b'{"detail": "local_agent_lease_not_current"}', "local_agent_lease_not_current"),
+        (b'{"error": "Not found", "status_code": 404}', "Not found"),
+        (b"upstream gateway timeout", "upstream gateway timeout"),
+    ],
+)
+def test_http_error_keeps_plain_detail_without_code(monkeypatch, body, expected_detail):
+    client, _urls = _failing_client(monkeypatch, _http_error(409, body))
+
+    result = client.list_sources()
+
+    assert result["code"] is None
+    assert result["detail"] == expected_detail
+
+
+def test_push_source_artifact_and_resource_fetch_share_error_parsing(monkeypatch):
+    body = json.dumps({"code": "workspace_not_found_or_inaccessible", "detail": "Workspace not found."}).encode()
+    client, _urls = _failing_client(monkeypatch, _http_error(404, body), workspace_id="mount_tai")
+
+    artifact = client.push_source_artifact(
+        source_id="src-1",
+        source_unit_key="unit",
+        provider_key="key",
+        provider_revision="rev",
+        parent_observation_type="jira_issue",
+        parent_provider_key="PAY-1",
+        filename="a.png",
+        media_type="image/png",
+        content=b"x",
+    )
+    client, _urls = _failing_client(monkeypatch, _http_error(404, body), workspace_id="mount_tai")
+    resource = client.get_resource(url="/api/v1/source-artifacts/obsrev-1")
+
+    assert artifact["code"] == resource["code"] == "workspace_not_found_or_inaccessible"
+    assert resource["error"] == "resource fetch failed"
+    assert resource["url"] == "/api/v1/source-artifacts/obsrev-1"
+
+
+def test_list_workspaces_never_carries_a_workspace_selector():
+    client = _RecordingClient({"workspaces": []}, origin="https://memforge.example.hana.ondemand.com")
+    scoped = client.for_workspace("mount_tai")
+    scoped_calls: list[tuple[str, str]] = []
+    scoped._http_json = lambda method, url, body: scoped_calls.append((method, url)) or {"workspaces": []}  # type: ignore[method-assign]
+
+    scoped.list_workspaces()
+
+    assert scoped_calls == [("GET", "https://memforge.example.hana.ondemand.com/api/v1/workspaces")]
+
+
+def test_workspace_scoped_client_sends_workspace_query(monkeypatch):
+    client, urls = _failing_client(monkeypatch, _http_error(500, b"{}"), workspace_id="mount_tai")
+
+    client.list_sources()
+
+    assert urls == ["https://memforge.example.hana.ondemand.com/api/v1/sources?workspace_id=mount_tai"]

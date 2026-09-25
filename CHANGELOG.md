@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.62 - 2026-09-25
+
+- Retry failed Agent Session capture uploads with exponential backoff from 60
+  seconds up to one hour, and reset the backoff after a successful upload.
+- Stop sending captures that cannot select a workspace. They wait until the
+  session directory resolves to a workspace, either on a later hook or at the
+  hourly check; waiting captures whose transcript is older than 7 days are
+  dropped and recorded in the queue.
+- Show the workspace binding hint at SessionStart while captures wait for a
+  workspace and the current project is unbound.
+- Add `--workspace-id` to workspace-scoped CLI commands. `search` and `memory`
+  commands use the current directory's workspace binding when the option is
+  omitted; other commands report the selectable workspace IDs when the account
+  has several.
+- `memforge adapter auth jira refresh` and `watch` upload one captured session
+  to every workspace with a Jira Source for the origin and report each result.
+  Only the service's `jira_principal_changed` conflict is reported as a
+  principal change.
+- `POST /api/v1/agent-sessions/windows` answers a failed model call with a
+  retryable 503 (`agent_session_llm_failed`, with `category`, `error_code` and
+  `Retry-After`) instead of 400 or 500.
+
 ## 0.1.61 - 2026-09-09
 
 - Coalesce Stop, PreCompact, and SessionStart capture requests under one on-demand

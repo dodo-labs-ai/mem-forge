@@ -34,6 +34,19 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_WORKSPACE_BINDINGS_FILE = Path.home() / ".memforge" / "workspace-bindings.json"
 WorkspaceBindingSource = Literal["directory", "repository", "hook_default", "none"]
+# Service error codes that mean the request needs a different workspace selector.
+WORKSPACE_SELECTION_REQUIRED_CODE = "workspace_selection_required"
+WORKSPACE_NOT_FOUND_CODE = "workspace_not_found_or_inaccessible"
+# Every code a WorkspaceBindingError carries: local context cannot select a workspace.
+WORKSPACE_BINDING_ERROR_CODES = frozenset(
+    {
+        "workspace_binding_ambiguous",
+        "workspace_bindings_directory_must_be_absolute",
+        "workspace_bindings_invalid",
+        "workspace_bindings_version_unsupported",
+        "workspace_context_invalid",
+    }
+)
 
 
 class WorkspaceBindingError(ValueError):
