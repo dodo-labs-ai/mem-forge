@@ -11,14 +11,9 @@ from dataclasses import asdict, dataclass
 from typing import Literal, Mapping
 
 
-ReviewActionKey = Literal[
-    "use_latest_state",
-    "keep_current_state",
-    "confirm_conflict",
-    "not_a_conflict",
-]
+ReviewActionKey = Literal["use_latest_state", "keep_current_state"]
 ReviewDecision = Literal["approve", "reject"]
-ReviewDecisionLabel = Literal["Updated", "Support removed", "Conflict"]
+ReviewDecisionLabel = Literal["Updated", "Support removed"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,46 +42,11 @@ class ReviewPresentation:
 
 def present_memory_review(
     *,
-    kind: str,
     reason: str | None,
     source_backed_correction: bool = False,
 ) -> ReviewPresentation:
     """Present a workbench Review without exposing its internal action names."""
 
-    if kind == "cross_source_conflict":
-        return ReviewPresentation(
-            decision_label="Conflict",
-            summary="Do these source-backed memories really conflict?",
-            why_human=(
-                "Both memories have independent source evidence. Confirming or dismissing "
-                "the conflict closes this Review without choosing a winning source."
-            ),
-            current_label="Source-backed memory",
-            proposed_label="Other source-backed memory",
-            proposed_empty_text="The other source-backed memory snapshot is unavailable.",
-            actions=(
-                ReviewActionPresentation(
-                    key="confirm_conflict",
-                    decision="approve",
-                    label="Confirm conflict",
-                    consequence=(
-                        "Record this as a reviewed conflict and keep both source-backed "
-                        "memories active."
-                    ),
-                    requires_note=False,
-                ),
-                ReviewActionPresentation(
-                    key="not_a_conflict",
-                    decision="reject",
-                    label="Not a conflict",
-                    consequence=(
-                        "Dismiss this conflict finding and keep both source-backed memories active."
-                    ),
-                    requires_note=True,
-                ),
-            ),
-            technical_reason=reason,
-        )
     return _presentation(
         decision_label="Updated",
         summary=(

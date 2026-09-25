@@ -13,11 +13,15 @@ from memforge.llm.structured import (
 )
 from memforge.memory.cross_document_relation import (
     CROSS_DOCUMENT_RELATION_RULES,
+    CrossDocumentRelationJudgment,
     CrossDocumentRelationLabel,
+    CrossDocumentRelationOutcome,
     CrossDocumentRelationPair,
+    CrossDocumentRelationRecord,
     RelationSubject,
     StructuredCrossDocumentRelationClassifier,
     load_relation_subjects,
+    pair_key,
 )
 from memforge.memory.evidence import EvidencePartKind, EvidenceRole
 from memforge.memory.relation_classifier import MemoryPairClassificationError
@@ -248,6 +252,60 @@ def test_rules_define_the_same_situation_domain_neutrally_and_prefer_none() -> N
     assert "judge the statements themselves" not in rules
     for dimension in ("version", "country", "environment", "ticket"):
         assert dimension not in rules
+
+
+def test_record_orders_the_pair_and_binds_both_contents() -> None:
+    challenger = _subject("mem-z", "Payroll runs weekly.")
+    candidate = _subject("mem-a", "Payroll runs monthly.")
+    judgment = CrossDocumentRelationJudgment(
+        pair=CrossDocumentRelationPair(challenger=challenger, candidate=candidate),
+        label=CrossDocumentRelationLabel.CONTRADICTS,
+        reason="different schedules",
+    )
+
+    record = CrossDocumentRelationRecord.from_judgment(judgment, relation_run_id="run-1", discovery_work_id="work-1")
+
+    assert (record.memory_low_id, record.memory_high_id) == ("mem-a", "mem-z")
+    assert (record.low_content_hash, record.high_content_hash) == (candidate.content_hash, challenger.content_hash)
+    assert pair_key("mem-z", "mem-a") == ("mem-a", "mem-z")
+    with pytest.raises(ValueError):
+        CrossDocumentRelationRecord.from_judgment(
+            CrossDocumentRelationJudgment(pair=judgment.pair, label=CrossDocumentRelationLabel.NONE, reason=""),
+            relation_run_id="run-1",
+            discovery_work_id="work-1",
+        )
+
+
+def test_outcome_binds_every_judged_pair_to_the_contents_it_was_judged_on() -> None:
+    challenger = _subject("mem-m", "Payroll runs weekly.")
+    judged = (_subject("mem-a", "Payroll runs monthly."), _subject("mem-z", "Payroll runs on Fridays."))
+    judgments = (
+        CrossDocumentRelationJudgment(
+            pair=CrossDocumentRelationPair(challenger=challenger, candidate=judged[0]),
+            label=CrossDocumentRelationLabel.CONTRADICTS,
+            reason="different schedules",
+        ),
+        CrossDocumentRelationJudgment(
+            pair=CrossDocumentRelationPair(challenger=challenger, candidate=judged[1]),
+            label=CrossDocumentRelationLabel.NONE,
+            reason="compatible",
+        ),
+    )
+
+    outcome = CrossDocumentRelationOutcome.from_judgments(
+        challenger, judgments, relation_run_id="run-1", discovery_work_id="work-1"
+    )
+
+    assert outcome.judged_content_hashes == {subject.memory_id: subject.content_hash for subject in judged}
+    [record] = outcome.relations
+    assert (record.memory_low_id, record.memory_high_id) == ("mem-a", "mem-m")
+    with pytest.raises(ValueError, match="judged pair"):
+        CrossDocumentRelationOutcome(
+            challenger_id=challenger.memory_id,
+            challenger_content_hash=challenger.content_hash,
+            judged_content_hashes={"mem-a": "older-content"},
+            relations=(record,),
+        )
 
 
 def test_subject_manifest_round_trips_and_requires_the_evidence_fields() -> None:
@@ -513,3 +571,35 @@ async def test_subjects_come_from_the_current_evidence_unit() -> None:
         memory_id="mem-plain", content_hash=content_hash("mem-plain"), statement="mem-plain", memory_type="fact",
     )
     assert store.document_reads == ["doc-mem-a"]
+
+
+class _RelationClient:
+    async def discover_memory_relations(self, prompt, **kwargs):
+        raise AssertionError("not called")
+
+    async def classify_cross_document_relations(self, prompt, **kwargs):
+        raise AssertionError("not called")
+
+
+class _IdentityOnlyClient:
+    async def discover_memory_relations(self, prompt, **kwargs):
+        raise AssertionError("not called")
+
+
+@pytest.mark.parametrize(
+    ("client", "expects_discovery"), [(_RelationClient(), True), (_IdentityOnlyClient(), False)]
+)
+def test_engine_gives_discovery_and_identity_their_own_classifiers(client, expects_discovery: bool) -> None:
+    from memforge.memory.engine import MemoryEngine
+    from memforge.memory.sparse_relation_classifier import SparseMemoryRelationClassifier
+
+    engine = MemoryEngine(
+        cross_document_candidates=None,  # type: ignore[arg-type]
+        db=None,  # type: ignore[arg-type]
+        memory_store=None,  # type: ignore[arg-type]
+        structured_llm_client=client,
+    )
+
+    assert isinstance(engine.pair_classifier, StructuredCrossDocumentRelationClassifier) is expects_discovery
+    assert (engine.pair_classifier is None) is not expects_discovery
+    assert isinstance(engine.identity_resolver._pair_classifier, SparseMemoryRelationClassifier)  # noqa: SLF001

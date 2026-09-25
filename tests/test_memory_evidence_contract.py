@@ -21,8 +21,6 @@ from memforge.memory.evidence import (
     ReviewCase,
     build_candidate_universe,
     build_mandatory_candidate_bucket_results,
-    classify_authority_case,
-    is_destructive_authority,
     is_mandatory_candidate_bucket,
     relation_run_id_for,
     validate_evidence_references,
@@ -178,121 +176,6 @@ def test_relation_run_id_includes_classifier_action_and_candidate_contract() -> 
     assert first != changed_candidate
 
 
-def test_independent_visible_refines_is_non_destructive_authority() -> None:
-    candidate = _candidate(source_id="src-2", doc_id="doc-2", source_lineage_id="lineage-2")
-
-    authority = classify_authority_case(
-        _unit(),
-        candidate,
-        CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,
-        RelationType.REFINES,
-        _access(),
-    )
-
-    assert authority is AuthorityCase.INDEPENDENT_REFINEMENT
-
-
-def test_cross_scope_private_candidate_is_blocked_before_semantic_authority() -> None:
-    private_candidate = _candidate(
-        visibility="private",
-        owner_user_id="other-user",
-        repo_identifier="github.com/example/repo",
-    )
-
-    authority = classify_authority_case(
-        _unit(owner_user_id="andrew.sun01@sap.com", repo_identifier="github.com/example/repo"),
-        private_candidate,
-        CandidateBucket.SAME_AGENT_CLAIM,
-        RelationType.EQUIVALENT,
-        _access(repo_identifier="github.com/example/repo"),
-    )
-
-    assert authority is AuthorityCase.CROSS_SCOPE_BLOCKED
-
-
-def test_same_private_repo_scope_is_visible_but_not_destructive_authority() -> None:
-    candidate = _candidate(
-        visibility="private",
-        owner_user_id="andrew.sun01@sap.com",
-        repo_identifier="github.com/example/repo",
-        source_id="src-2",
-        doc_id="doc-2",
-        source_lineage_id="lineage-2",
-    )
-
-    authority = classify_authority_case(
-        _unit(
-            visibility="private",
-            owner_user_id="andrew.sun01@sap.com",
-            repo_identifier="github.com/example/repo",
-        ),
-        candidate,
-        CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,
-        RelationType.EQUIVALENT,
-        _access(repo_identifier="github.com/example/repo"),
-    )
-
-    assert authority is AuthorityCase.SAME_PRIVATE_REPO_SCOPE
-    assert not is_destructive_authority(authority)
-
-
-def test_private_repo_contradiction_remains_a_cross_source_review_case() -> None:
-    candidate = _candidate(
-        visibility="private",
-        owner_user_id="andrew.sun01@sap.com",
-        repo_identifier="github.com/example/repo",
-        source_id="src-2",
-        doc_id="doc-2",
-        source_lineage_id="lineage-2",
-    )
-
-    authority = classify_authority_case(
-        _unit(
-            visibility="private",
-            owner_user_id="andrew.sun01@sap.com",
-            repo_identifier="github.com/example/repo",
-        ),
-        candidate,
-        CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,
-        RelationType.CONTRADICTS,
-        _access(repo_identifier="github.com/example/repo"),
-    )
-
-    assert authority is AuthorityCase.CROSS_SOURCE_CONFLICT
-    assert not is_destructive_authority(authority)
-
-
-def test_same_source_cross_document_contradiction_is_independent_conflict() -> None:
-    candidate = _candidate(
-        source_id="src-1",
-        doc_id="doc-2",
-        source_lineage_id="lineage-2",
-    )
-
-    authority = classify_authority_case(
-        _unit(source_id="src-1", doc_id="doc-1", source_lineage_id="lineage-1"),
-        candidate,
-        CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,
-        RelationType.CONTRADICTS,
-        _access(),
-    )
-
-    assert authority is AuthorityCase.INDEPENDENT_CONFLICT
-    assert not is_destructive_authority(authority)
-
-
-def test_contradiction_without_candidate_source_is_independent_conflict() -> None:
-    authority = classify_authority_case(
-        _unit(source_id="src-1", doc_id="doc-1", source_lineage_id="lineage-1"),
-        _candidate(source_id=None, doc_id="doc-2", source_lineage_id="lineage-2"),
-        CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS,
-        RelationType.CONTRADICTS,
-        _access(),
-    )
-
-    assert authority is AuthorityCase.INDEPENDENT_CONFLICT
-
-
 @pytest.mark.parametrize(
     "bucket",
     [
@@ -424,24 +307,6 @@ def test_same_batch_multi_target_destructive_conflicts_create_review() -> None:
 
     assert result.action is LifecycleAction.CREATE_REVIEW
     assert result.review_case is ReviewCase.MULTI_DESTRUCTIVE_MATCH
-
-
-def test_cross_source_conflict_creates_review_not_new_memory() -> None:
-    service = MemoryRelationApplyService()
-    decision = RelationDecision(
-        candidate_memory_id="mem-cross-source",
-        relation_type=RelationType.CONTRADICTS,
-        authority_case=AuthorityCase.CROSS_SOURCE_CONFLICT,
-        confidence=0.91,
-        matched_bucket=CandidateBucket.SHARED_ENTITIES,
-        matched_bucket_complete=True,
-    )
-
-    result = service.derive_lifecycle(_unit(), [decision])
-
-    assert result.action is LifecycleAction.CREATE_REVIEW
-    assert result.review_case is None
-    assert result.target_memory_id == "mem-cross-source"
 
 
 def test_evidence_unit_lifetime_uniqueness_blocks_second_created_memory() -> None:

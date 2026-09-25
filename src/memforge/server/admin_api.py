@@ -26,7 +26,7 @@ from typing import Any, Awaitable, Callable, Literal
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -57,7 +57,32 @@ from memforge.genes.atlassian_auth import (
 )
 from memforge.github_repo_utils import github_extension_allowed, github_include_extensions
 from memforge.memory.audit import AuditContext
-from memforge.memory.cross_document_relation import CrossDocumentRelationLabel
+from memforge.memory.cross_document_relation import (
+    MAX_RELATIONS_PER_MEMORY,
+    CrossDocumentRelationLabel,
+    RelationDismissalConflict,
+)
+from memforge.memory.cross_source_conflict_reviews import ReviewLabelOverrideError
+from memforge.memory.cross_source_review_conversion import (
+    CrossSourceReviewConversionConflict,
+    CrossSourceReviewConversionReceipt,
+    apply_conversion,
+    build_conversion_plan,
+    delete_converted_reviews,
+)
+from memforge.memory.relation_discovery import DEFAULT_RELATION_DISCOVERY_BUDGET
+from memforge.memory.relation_discovery_contract import (
+    RelationDiscoveryWork,
+    RelationDiscoveryWorkSelection,
+    RelationDiscoveryWorkState,
+)
+from memforge.memory.cross_document_relation_reader import (
+    dismiss_relation,
+    dismissed_relation_views,
+    list_relation_pairs,
+    read_memory_relations,
+    relation_notice,
+)
 from memforge.memory.lifecycle import normalize_memory_status
 from memforge.memory.cutover import run_with_lifecycle_activity_heartbeat
 from memforge.memory.lifecycle_service import (
@@ -92,6 +117,7 @@ from memforge.models import (
     MemoryType,
     MemoryReview,
     Project,
+    ReviewKind,
     SourceSyncInput,
     SourceExecutionKind,
     UNSORTED_PROJECT_KEY,
@@ -516,6 +542,21 @@ async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
     return await SqliteRelationalStore(db).filter_visible_ids(list(ids), scope)
 
 
+async def _require_visible_relation_pair(
+    db: Database,
+    memory_id: str,
+    counterpart_memory_id: str,
+    scope,
+) -> None:
+    """Anyone who can see both Memories may act on their relation; others see no pair."""
+
+    if memory_id == counterpart_memory_id:
+        raise HTTPException(status_code=404, detail="Relation not found")
+    visible = await _filter_visible_ids(db, [memory_id, counterpart_memory_id], scope)
+    if {memory_id, counterpart_memory_id} - visible:
+        raise HTTPException(status_code=404, detail="Relation not found")
+
+
 async def _review_source_ids(
     db: Database,
     memories: list[Memory],
@@ -720,16 +761,174 @@ class MemoryEvidenceGroupDetail(BaseModel):
     items: list[MemoryEvidenceItemDetail]
 
 
-class MemoryConflictContextDetail(BaseModel):
-    review_id: str
-    counterpart_memory_id: str
-    counterpart_summary: str
-    review_status: Literal["pending", "approved", "rejected", "stale"]
-    disposition: Literal["pending", "confirmed", "dismissed", "stale"]
-    reason: str | None = None
-    review_note: str | None = None
-    reviewer: str | None = None
-    resolved_at: str | None = None
+# The labels a stored relation can have; none is never stored.
+RelationLabelLiteral = Literal["equivalent", "updates", "contradicts"]
+# A dismissal note is a short explanation, not a document.
+RELATION_DISMISSAL_NOTE_MAX_CHARS = 2000
+
+
+class MemorySourceRefDetail(BaseModel):
+    source_id: str
+    source_type: str
+    name: str | None = None
+
+
+class RelatedMemoryDetail(BaseModel):
+    memory_id: str
+    summary: str
+    content_hash: str
+    sources: list[MemorySourceRefDetail] = []
+    evidence_time: str | None = None
+
+
+class MemoryRelationDetail(BaseModel):
+    """A current Cross-Document Relation read from this Memory."""
+
+    label: RelationLabelLiteral
+    role: Literal["newer", "older", "peer"]
+    counterpart: RelatedMemoryDetail
+    reason: str
+    decided_by: Literal["classifier", "review"]
+
+
+class DismissedRelationDetail(BaseModel):
+    """The Relation Dismissals in force for one pair; undoing them shows the relations again."""
+
+    counterpart: RelatedMemoryDetail
+    labels: list[RelationLabelLiteral]
+    dismissed_by: str
+    dismissed_at: str
+    note: str | None = None
+
+
+class RelationPairDetail(BaseModel):
+    label: RelationLabelLiteral
+    newer_memory_id: str | None = None
+    reason: str
+    decided_by: Literal["classifier", "review"]
+    decided_at: str
+    memories: list[RelatedMemoryDetail]
+
+
+class RelationListResponse(BaseModel):
+    data: list[RelationPairDetail]
+    total: int
+    limit: int
+    offset: int
+
+
+class RelationDismissalRequest(BaseModel):
+    """Dismiss the relation the caller sees, bound to both contents it was shown for."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: RelationLabelLiteral
+    expected_content_hash: str = Field(min_length=1)
+    counterpart_expected_content_hash: str = Field(min_length=1)
+    note: str | None = Field(default=None, max_length=RELATION_DISMISSAL_NOTE_MAX_CHARS)
+
+
+class RelationDismissalResponse(BaseModel):
+    dismissal_id: str
+    memory_low_id: str
+    memory_high_id: str
+    label: RelationLabelLiteral
+    dismissed_by: str
+    dismissed_at: str
+
+
+class RelationRestoreResponse(BaseModel):
+    restored_dismissal_ids: list[str]
+
+
+class RelationDiscoveryWorkDetail(BaseModel):
+    id: str
+    memory_id: str
+    source_id: str
+    source_unit_id: str
+    status: str
+    attempts: int
+    run_generation: int
+    error: str | None = None
+    error_code: str | None = None
+    classifier_version: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    completed_at: str | None = None
+
+
+class RelationDiscoveryWorkListResponse(BaseModel):
+    data: list[RelationDiscoveryWorkDetail]
+    total: int
+    limit: int
+    offset: int
+
+
+class RelationDiscoveryWorkFilter(BaseModel):
+    """Which finished discovery work an operator re-runs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["exhausted", "completed"]
+    error_code: str | None = None
+    updated_from: datetime | None = None
+    updated_to: datetime | None = None
+    classifier_version: str | None = None
+
+
+class RelationDiscoveryRerunResponse(BaseModel):
+    rerun_count: int
+
+
+class CrossSourceReviewLabelsRequest(BaseModel):
+    """Human relabels of decided Cross-Source Conflict Reviews, by Review id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label_overrides: dict[str, CrossDocumentRelationLabel] = Field(default_factory=dict)
+
+
+class CrossSourceReviewConversionReportResponse(BaseModel):
+    report_id: str
+    review_count: int
+    # The relation each converted Review becomes, by Review id.
+    relation_labels: dict[str, CrossDocumentRelationLabel]
+    dismissal_review_ids: list[str]
+    discarded_review_ids: list[str]
+    rerun_review_ids: list[str]
+    nothing_to_rerun_review_ids: list[str]
+    exhausted_work_ids: list[str]
+    planned: dict[str, int]
+    applied: bool
+
+
+class CrossSourceReviewConversionApplyRequest(CrossSourceReviewLabelsRequest):
+    """Apply a report with the relabels it was made with."""
+
+    report_id: str = Field(min_length=1)
+
+
+class CrossSourceReviewConversionReceiptResponse(BaseModel):
+    report_id: str
+    applied_by: str
+    applied_at: str
+    planned: dict[str, int]
+    written: dict[str, int]
+    complete: bool
+
+
+class CrossSourceReviewDeletionRequest(BaseModel):
+    """Delete converted Reviews once their labeled evaluation cases are frozen."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    report_id: str = Field(min_length=1)
+    cohort_id: str = Field(min_length=1)
+
+
+class CrossSourceReviewDeletionResponse(BaseModel):
+    report_id: str
+    deleted_review_count: int
 
 
 class MemoryResponse(BaseModel):
@@ -742,7 +941,6 @@ class MemoryResponse(BaseModel):
     project_key: str | None = None
     confidence: float
     corroboration_count: int
-    contradiction_count: int
     valid_from: str | None = None
     valid_until: str | None = None
     superseded_by: str | None = None
@@ -766,7 +964,9 @@ class MemoryResponse(BaseModel):
 class MemoryDetailResponse(MemoryResponse):
     entity_refs: list[str] = []
     evidence: list[MemoryEvidenceGroupDetail] = []
-    conflict_contexts: list[MemoryConflictContextDetail] = []
+    relations: list[MemoryRelationDetail] = []
+    relation_notice: str | None = None
+    dismissed_relations: list[DismissedRelationDetail] = []
 
 
 class MemoryListResponse(BaseModel):
@@ -1703,8 +1903,6 @@ class ReviewActionPresentationResponse(BaseModel):
     key: Literal[
         "use_latest_state",
         "keep_current_state",
-        "confirm_conflict",
-        "not_a_conflict",
     ]
     decision: Literal["approve", "reject"]
     label: str
@@ -1782,16 +1980,6 @@ class AgentEvaluationRunCreateRequest(BaseModel):
     replicate_count: int = Field(default=1, ge=1)
     baseline_run_id: str | None = None
     semantic_judge: dict[str, object] | None = None
-
-
-class RelationCaseSeedRequest(BaseModel):
-    """Human relabels of decided Cross-Source Conflict Reviews, by Review id."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    label_overrides: dict[str, Literal["none", "equivalent", "updates", "contradicts"]] = Field(
-        default_factory=dict
-    )
 
 
 class AgentEvaluationLangfusePolicyRequest(BaseModel):
@@ -2941,7 +3129,6 @@ def _memory_to_response(
         project_key=mem.project_key,
         confidence=mem.confidence,
         corroboration_count=mem.corroboration_count,
-        contradiction_count=mem.contradiction_count,
         valid_from=_dt_iso(mem.valid_from),
         valid_until=_dt_iso(mem.valid_until),
         superseded_by=mem.superseded_by,
@@ -2999,12 +3186,67 @@ def _review_to_response(
         decision_fingerprint=memory_review_decision_fingerprint(review, related_challengers),
         presentation=_presentation_response(
             present_memory_review(
-                kind=review.kind,
                 reason=review.reason,
                 source_backed_correction=review.expected_support_set_hash is not None,
             )
         ),
     )
+
+
+def _relation_discovery_selection(
+    *,
+    state: str,
+    error_code: str | None,
+    updated_from: datetime | None,
+    updated_to: datetime | None,
+    classifier_version: str | None,
+) -> RelationDiscoveryWorkSelection:
+    return RelationDiscoveryWorkSelection(
+        state=RelationDiscoveryWorkState(state),
+        max_attempts=DEFAULT_RELATION_DISCOVERY_BUDGET.max_attempts,
+        error_code=error_code,
+        updated_from=updated_from,
+        updated_to=updated_to,
+        classifier_version=classifier_version,
+    )
+
+
+def _relation_discovery_work_detail(work: RelationDiscoveryWork) -> RelationDiscoveryWorkDetail:
+    return RelationDiscoveryWorkDetail(
+        id=work.request.id,
+        memory_id=work.request.memory_id,
+        source_id=work.request.source_id,
+        source_unit_id=work.request.source_unit_id,
+        status=work.status.value,
+        attempts=work.attempts,
+        run_generation=work.run_generation,
+        error=work.error,
+        error_code=work.error_code,
+        classifier_version=work.classifier_version,
+        created_at=work.created_at,
+        updated_at=work.updated_at,
+        completed_at=work.completed_at,
+    )
+
+
+def _conversion_receipt_response(
+    receipt: CrossSourceReviewConversionReceipt,
+) -> CrossSourceReviewConversionReceiptResponse:
+    return CrossSourceReviewConversionReceiptResponse(
+        report_id=receipt.report_id,
+        applied_by=receipt.applied_by,
+        applied_at=receipt.applied_at,
+        planned=dict(receipt.planned),
+        written=dict(receipt.written),
+        complete=receipt.complete,
+    )
+
+
+async def _get_supersede_review(db: Database, review_id: str) -> MemoryReview | None:
+    """The workbench Review with this id; supersede is the only Memory Review kind."""
+
+    review = await db.get_memory_review(review_id)
+    return review if review is not None and review.kind == ReviewKind.SUPERSEDE.value else None
 
 
 def _presentation_response(value: ReviewPresentation) -> ReviewPresentationResponse:
@@ -3794,6 +4036,7 @@ def create_admin_app(
     document_router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
     source_artifact_router = APIRouter(prefix="/api/v1/source-artifacts", tags=["source-artifacts"])
     memory_router = APIRouter(prefix="/api/v1/memories", tags=["memories"])
+    relation_discovery_router = APIRouter(prefix="/api/v1/relation-discovery", tags=["relation-discovery"])
     review_router = APIRouter(prefix="/api/v1/memory-reviews", tags=["memory-reviews"])
     entity_router = APIRouter(prefix="/api/v1/entities", tags=["entities"])
     gene_router = APIRouter(prefix="/api/v1/genes", tags=["genes"])
@@ -4173,31 +4416,94 @@ def create_admin_app(
                 detail=f"Search unavailable: {e}",
             ) from e
 
-    @memory_router.get("/contradictions")
-    async def memory_contradictions(
-        limit: int = 50,
-        offset: int = 0,
+    @memory_router.get("/relations", response_model=RelationListResponse)
+    async def list_memory_relations(
+        request: Request,
+        label: RelationLabelLiteral | None = None,
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
         db: Database = Depends(get_db),
     ):
-        """List memories that have contradiction_count > 0."""
-        async with db.db.execute(
-            """SELECT * FROM memories
-               WHERE contradiction_count > 0 AND status = 'active'
-               ORDER BY contradiction_count DESC
-               LIMIT ? OFFSET ?""",
-            (limit, offset),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        """List the relations current for the caller, newest decision first.
 
-        memories = [_memory_to_response(db._row_to_memory(row)) for row in rows]
+        A view, not a work queue. ``label`` filters by the recorded label.
+        """
 
-        async with db.db.execute(
-            "SELECT COUNT(*) FROM memories WHERE contradiction_count > 0 AND status = 'active'"
-        ) as cursor:
-            total_row = await cursor.fetchone()
-            total = total_row[0] if total_row else 0
+        views, total = await list_relation_pairs(
+            db,
+            _workspace_default_scope(request, include_private=True),
+            label=CrossDocumentRelationLabel(label) if label is not None else None,
+            limit=limit,
+            offset=offset,
+        )
+        return RelationListResponse(
+            data=[RelationPairDetail(**asdict(view)) for view in views],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
 
-        return {"data": [m.model_dump() for m in memories], "total": total}
+    @memory_router.post(
+        "/{memory_id}/relations/{counterpart_memory_id}/dismissal",
+        response_model=RelationDismissalResponse,
+    )
+    async def dismiss_memory_relation(
+        memory_id: str,
+        counterpart_memory_id: str,
+        body: RelationDismissalRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Hide one relation until either Memory changes; no lifecycle effect."""
+
+        scope = _workspace_default_scope(request, include_private=True)
+        try:
+            dismissal = await dismiss_relation(
+                db,
+                memory_id=memory_id,
+                counterpart_memory_id=counterpart_memory_id,
+                label=CrossDocumentRelationLabel(body.label),
+                expected_content_hash=body.expected_content_hash,
+                counterpart_expected_content_hash=body.counterpart_expected_content_hash,
+                actor=resolve_request_principal(request),
+                scope=scope,
+                note=body.note,
+            )
+        except RelationDismissalConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Relation not found") from exc
+        return RelationDismissalResponse(
+            dismissal_id=dismissal.id,
+            memory_low_id=dismissal.memory_low_id,
+            memory_high_id=dismissal.memory_high_id,
+            label=dismissal.label.value,
+            dismissed_by=dismissal.dismissed_by,
+            dismissed_at=dismissal.dismissed_at,
+        )
+
+    @memory_router.delete(
+        "/{memory_id}/relations/{counterpart_memory_id}/dismissal",
+        response_model=RelationRestoreResponse,
+    )
+    async def restore_memory_relation(
+        memory_id: str,
+        counterpart_memory_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Undo the dismissals in force for one pair of Memories."""
+
+        scope = _workspace_default_scope(request, include_private=True)
+        await _require_visible_relation_pair(db, memory_id, counterpart_memory_id, scope)
+        restored = await db.restore_cross_document_relation_dismissals(
+            memory_id=memory_id,
+            counterpart_memory_id=counterpart_memory_id,
+            actor=resolve_request_principal(request),
+        )
+        if not restored:
+            raise HTTPException(status_code=404, detail="Relation dismissal not found")
+        return RelationRestoreResponse(restored_dismissal_ids=[item.id for item in restored])
 
     @memory_router.get("/{memory_id}", response_model=MemoryDetailResponse)
     async def get_memory(
@@ -4231,8 +4537,15 @@ def create_admin_app(
 
         origin_info = (await _origin_source_types(db, [memory_id])).get(memory_id, (None, None))
         origin_source_type, origin_client = origin_info
-        conflict_contexts = await db.list_memory_conflict_contexts(
-            [memory_id],
+        relations = (await read_memory_relations(db, [memory_id], scope)).get(memory_id, ())
+        dismissed = await dismissed_relation_views(
+            db,
+            memory_id,
+            await db.list_active_cross_document_relation_dismissals(
+                memory_id,
+                scope,
+                limit=MAX_RELATIONS_PER_MEMORY,
+            ),
             scope,
         )
 
@@ -4246,7 +4559,6 @@ def create_admin_app(
             project_key=mem.project_key,
             confidence=mem.confidence,
             corroboration_count=mem.corroboration_count,
-            contradiction_count=mem.contradiction_count,
             valid_from=_dt_iso(mem.valid_from),
             valid_until=_dt_iso(mem.valid_until),
             superseded_by=mem.superseded_by,
@@ -4261,9 +4573,9 @@ def create_admin_app(
             updated_at=_dt_iso(mem.updated_at),
             entity_refs=entity_names,
             evidence=evidence_groups,
-            conflict_contexts=[
-                MemoryConflictContextDetail(**asdict(item)) for item in conflict_contexts.get(memory_id, ())
-            ],
+            relations=[MemoryRelationDetail(**asdict(item)) for item in relations],
+            relation_notice=relation_notice(relations),
+            dismissed_relations=[DismissedRelationDetail(**asdict(item)) for item in dismissed],
             origin_source_type=origin_source_type,
             origin_client=origin_client,
         )
@@ -4448,6 +4760,132 @@ def create_admin_app(
                 )
                 for item in receipts
             ],
+        )
+
+    @memory_router.post(
+        "/cross-source-review-conversion/report",
+        response_model=CrossSourceReviewConversionReportResponse,
+    )
+    async def report_cross_source_review_conversion(
+        request: Request,
+        body: CrossSourceReviewLabelsRequest = Body(default_factory=CrossSourceReviewLabelsRequest),
+        db: Database = Depends(get_db),
+    ):
+        """Classify every Cross-Source Conflict Review for conversion; writes nothing."""
+
+        _require_maintenance_operator(request)
+        try:
+            plan = await build_conversion_plan(
+                db,
+                label_overrides=body.label_overrides,
+                max_attempts=DEFAULT_RELATION_DISCOVERY_BUDGET.max_attempts,
+            )
+        except ReviewLabelOverrideError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return CrossSourceReviewConversionReportResponse(
+            report_id=plan.report_id,
+            review_count=len(plan.review_ids),
+            relation_labels={item.review_id: item.label for item in plan.relations},
+            dismissal_review_ids=[item.review_id for item in plan.dismissals],
+            discarded_review_ids=list(plan.discarded_review_ids),
+            rerun_review_ids=list(plan.rerun_review_ids),
+            nothing_to_rerun_review_ids=list(plan.nothing_to_rerun_review_ids),
+            exhausted_work_ids=list(plan.exhausted_work_ids),
+            planned=plan.planned_counts,
+            applied=await db.get_cross_source_review_conversion(plan.report_id) is not None,
+        )
+
+    @memory_router.post(
+        "/cross-source-review-conversion/apply",
+        response_model=CrossSourceReviewConversionReceiptResponse,
+    )
+    async def apply_cross_source_review_conversion(
+        body: CrossSourceReviewConversionApplyRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Apply one reported conversion; the same report applies once."""
+
+        actor = _require_maintenance_operator(request)
+        try:
+            receipt = await apply_conversion(
+                db,
+                report_id=body.report_id,
+                label_overrides=body.label_overrides,
+                actor=actor,
+                max_attempts=DEFAULT_RELATION_DISCOVERY_BUDGET.max_attempts,
+            )
+        except ReviewLabelOverrideError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except CrossSourceReviewConversionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return _conversion_receipt_response(receipt)
+
+    @memory_router.post(
+        "/cross-source-review-conversion/delete",
+        response_model=CrossSourceReviewDeletionResponse,
+    )
+    async def delete_converted_cross_source_reviews(
+        body: CrossSourceReviewDeletionRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Delete the Review rows of a complete conversion after the evaluation set is frozen."""
+
+        from memforge.evals.cross_document_relation_cases import RELATION_CASE_POLICY_VERSION
+
+        actor = _require_maintenance_operator(request)
+        cohort = await db.get_agent_evaluation_cohort(body.cohort_id)
+        if cohort is None or cohort.selection_policy_version != RELATION_CASE_POLICY_VERSION:
+            raise HTTPException(status_code=409, detail="relation evaluation cohort not found")
+        try:
+            deleted = await delete_converted_reviews(db, report_id=body.report_id, actor=actor)
+        except CrossSourceReviewConversionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return CrossSourceReviewDeletionResponse(report_id=body.report_id, deleted_review_count=deleted)
+
+    @relation_discovery_router.get("/work", response_model=RelationDiscoveryWorkListResponse)
+    async def list_relation_discovery_work(
+        request: Request,
+        state: Literal["exhausted", "completed", "failed"],
+        error_code: str | None = None,
+        updated_from: datetime | None = None,
+        updated_to: datetime | None = None,
+        classifier_version: str | None = None,
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+        db: Database = Depends(get_db),
+    ):
+        """List discovery work by state with its last error; exhausted work used every attempt."""
+
+        _require_maintenance_operator(request)
+        selection = _relation_discovery_selection(
+            state=state,
+            error_code=error_code,
+            updated_from=updated_from,
+            updated_to=updated_to,
+            classifier_version=classifier_version,
+        )
+        work = await db.list_relation_discovery_work(selection, limit=limit, offset=offset)
+        return RelationDiscoveryWorkListResponse(
+            data=[_relation_discovery_work_detail(item) for item in work],
+            total=await db.count_relation_discovery_work(selection),
+            limit=limit,
+            offset=offset,
+        )
+
+    @relation_discovery_router.post("/work/rerun", response_model=RelationDiscoveryRerunResponse)
+    async def rerun_relation_discovery_work(
+        body: RelationDiscoveryWorkFilter,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Queue selected completed or exhausted work again, auditing each item's last state."""
+
+        actor = _require_maintenance_operator(request)
+        selection = _relation_discovery_selection(**body.model_dump())
+        return RelationDiscoveryRerunResponse(
+            rerun_count=await db.rerun_relation_discovery_work(selection, actor=actor)
         )
 
     @memory_router.post("/{memory_id}/retire", response_model=MemoryLifecycleResponse)
@@ -5350,7 +5788,7 @@ def create_admin_app(
 
     @evaluation_router.post("/relation-cases/seed")
     async def seed_relation_evaluation_cases(
-        body: RelationCaseSeedRequest,
+        body: CrossSourceReviewLabelsRequest,
         request: Request,
         db: Database = Depends(get_db),
     ):
@@ -5365,10 +5803,7 @@ def create_admin_app(
                 db,
                 OfflineAgentEvaluation(db, executors={}),
                 actor=actor,
-                label_overrides={
-                    review_id: CrossDocumentRelationLabel(label)
-                    for review_id, label in body.label_overrides.items()
-                },
+                label_overrides=body.label_overrides,
             )
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -8206,7 +8641,6 @@ def create_admin_app(
     async def list_memory_reviews(
         request: Request,
         status: str | None = "open",
-        kind: str | None = None,
         origin: Literal["memory", "lifecycle"] | None = None,
         source_id: str | None = None,
         limit: int = 100,
@@ -8222,15 +8656,10 @@ def create_admin_app(
             raise HTTPException(status_code=400, detail="offset must not be negative")
         if status not in {None, "all", "open", "pending", "stale", "approved", "rejected"}:
             raise HTTPException(status_code=400, detail="unsupported review status")
-        if kind == "lifecycle":
-            if origin == "memory":
-                raise HTTPException(status_code=400, detail="kind and origin filters conflict")
-            origin = "lifecycle"
-            kind = None
 
         normalized_status = status if status and status != "all" else None
         include_legacy = origin in {None, "memory"}
-        include_lifecycle = origin in {None, "lifecycle"} and kind is None
+        include_lifecycle = origin in {None, "lifecycle"}
         reviews: list[MemoryReview] = []
         if include_legacy:
             review_statuses = ("pending", "stale") if normalized_status == "stale" else (normalized_status,)
@@ -8239,7 +8668,7 @@ def create_admin_app(
                 while True:
                     chunk = await db.list_memory_reviews(
                         status=review_status,
-                        kind=kind,
+                        kind=ReviewKind.SUPERSEDE.value,
                         limit=500,
                         offset=review_offset,
                     )
@@ -8451,7 +8880,7 @@ def create_admin_app(
         config: AppConfig = Depends(get_config),
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
     ):
-        review = await db.get_memory_review(review_id)
+        review = await _get_supersede_review(db, review_id)
         lifecycle_review = await db.get_lifecycle_review(review_id)
         if review is not None and lifecycle_review is not None:
             raise HTTPException(status_code=409, detail="Review ID is ambiguous across storage origins")
@@ -8804,7 +9233,7 @@ def create_admin_app(
         request: Request,
         db: Database,
     ) -> MemoryReviewDecisionResult:
-        memory_review = await db.get_memory_review(item.review_id)
+        memory_review = await _get_supersede_review(db, item.review_id)
         lifecycle_review = await db.get_lifecycle_review(item.review_id)
         if memory_review is not None and lifecycle_review is not None:
             return MemoryReviewDecisionResult(
@@ -8935,7 +9364,6 @@ def create_admin_app(
                         message="A related Review participant changed lifecycle state",
                     )
                 presentation = present_memory_review(
-                    kind=memory_review.kind,
                     reason=memory_review.reason,
                     source_backed_correction=memory_review.expected_support_set_hash is not None,
                 )
@@ -9412,6 +9840,7 @@ def create_admin_app(
     app.include_router(document_router)
     app.include_router(source_artifact_router)
     app.include_router(memory_router)
+    app.include_router(relation_discovery_router)
     app.include_router(review_router)
     app.include_router(entity_router)
     app.include_router(gene_router)

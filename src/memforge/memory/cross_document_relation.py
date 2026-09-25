@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Protocol
 
@@ -41,6 +41,13 @@ class CrossDocumentRelationLabel(str, Enum):
     EQUIVALENT = "equivalent"
     UPDATES = "updates"
     CONTRADICTS = "contradicts"
+
+
+class CrossDocumentRelationDecider(str, Enum):
+    """Who decided a stored relation: the classifier or a person's confirmed Review."""
+
+    CLASSIFIER = "classifier"
+    REVIEW = "review"
 
 
 CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v2"
@@ -136,6 +143,289 @@ class CrossDocumentRelationClassifier(Protocol):
         self,
         pairs: tuple[CrossDocumentRelationPair, ...],
     ) -> CrossDocumentRelationClassification: ...
+
+
+def pair_key(first_memory_id: str, second_memory_id: str) -> tuple[str, str]:
+    """The stored order of a pair: the lower Memory id first."""
+
+    if first_memory_id == second_memory_id:
+        raise ValueError("a relation needs two different Memories")
+    return (
+        (first_memory_id, second_memory_id)
+        if first_memory_id < second_memory_id
+        else (second_memory_id, first_memory_id)
+    )
+
+
+def pair_counterpart(memory_low_id: str, memory_high_id: str, memory_id: str) -> str:
+    """The other Memory of a stored pair."""
+
+    if memory_id == memory_low_id:
+        return memory_high_id
+    if memory_id == memory_high_id:
+        return memory_low_id
+    raise ValueError(f"{memory_id} is not part of this pair")
+
+
+def _evidence_date(evidence_time: str | None) -> date | None:
+    if not evidence_time:
+        return None
+    try:
+        return date.fromisoformat(evidence_time)
+    except ValueError:
+        return None
+
+
+def newer_memory_by_evidence_time(
+    memory_low_id: str,
+    memory_high_id: str,
+    low_evidence_time: str | None,
+    high_evidence_time: str | None,
+) -> str | None:
+    """The Memory whose Evidence the source recorded later, or None when the times do not order the pair."""
+
+    low = _evidence_date(low_evidence_time)
+    high = _evidence_date(high_evidence_time)
+    if low is None or high is None or low == high:
+        return None
+    return memory_low_id if low > high else memory_high_id
+
+
+def recorded_relation_label(
+    label: CrossDocumentRelationLabel,
+    memory_low_id: str,
+    memory_high_id: str,
+    low_evidence_time: str | None,
+    high_evidence_time: str | None,
+) -> CrossDocumentRelationLabel:
+    """The label a relation is recorded with.
+
+    The program, not the classifier, orders an ``updates`` pair, by the same
+    Evidence times the classifier saw (``RelationSubject.evidence_time``). A
+    pair those times do not order, because either is unknown or both fall on
+    the same date, is recorded as ``contradicts``.
+    """
+
+    if label is CrossDocumentRelationLabel.UPDATES and (
+        newer_memory_by_evidence_time(memory_low_id, memory_high_id, low_evidence_time, high_evidence_time) is None
+    ):
+        return CrossDocumentRelationLabel.CONTRADICTS
+    return label
+
+
+def _check_recorded_relation(
+    label: CrossDocumentRelationLabel,
+    memory_low_id: str,
+    memory_high_id: str,
+    low_evidence_time: str | None,
+    high_evidence_time: str | None,
+) -> None:
+    if memory_low_id >= memory_high_id:
+        raise ValueError("a relation pair must be stored lower Memory id first")
+    if label is CrossDocumentRelationLabel.NONE:
+        raise ValueError("a none judgment is not stored as a relation")
+    if recorded_relation_label(label, memory_low_id, memory_high_id, low_evidence_time, high_evidence_time) is not label:
+        raise ValueError("an updates relation needs Evidence times that order the pair")
+
+
+@dataclass(frozen=True, slots=True)
+class CrossDocumentRelationRecord:
+    """One relation a discovery run found, bound to the two contents it judged.
+
+    ``low_evidence_time`` and ``high_evidence_time`` are the Evidence times the
+    classifier saw for each Memory; they order an ``updates`` pair.
+    """
+
+    memory_low_id: str
+    memory_high_id: str
+    label: CrossDocumentRelationLabel
+    low_content_hash: str
+    high_content_hash: str
+    low_evidence_time: str | None
+    high_evidence_time: str | None
+    reason: str
+    relation_run_id: str
+    discovery_work_id: str
+    classifier_version: str = CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+
+    def __post_init__(self) -> None:
+        _check_recorded_relation(
+            self.label,
+            self.memory_low_id,
+            self.memory_high_id,
+            self.low_evidence_time,
+            self.high_evidence_time,
+        )
+
+    def counterpart_of(self, memory_id: str) -> str:
+        return pair_counterpart(self.memory_low_id, self.memory_high_id, memory_id)
+
+    @classmethod
+    def from_judgment(
+        cls,
+        judgment: CrossDocumentRelationJudgment,
+        *,
+        relation_run_id: str,
+        discovery_work_id: str,
+    ) -> CrossDocumentRelationRecord:
+        by_id = {
+            judgment.pair.challenger.memory_id: judgment.pair.challenger,
+            judgment.pair.candidate.memory_id: judgment.pair.candidate,
+        }
+        low_id, high_id = pair_key(*by_id)
+        low, high = by_id[low_id], by_id[high_id]
+        return cls(
+            memory_low_id=low_id,
+            memory_high_id=high_id,
+            label=recorded_relation_label(judgment.label, low_id, high_id, low.evidence_time, high.evidence_time),
+            low_content_hash=low.content_hash,
+            high_content_hash=high.content_hash,
+            low_evidence_time=low.evidence_time,
+            high_evidence_time=high.evidence_time,
+            reason=judgment.reason,
+            relation_run_id=relation_run_id,
+            discovery_work_id=discovery_work_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CrossDocumentRelationOutcome:
+    """What one discovery run judged for its challenger.
+
+    ``judged_content_hashes`` maps every judged candidate to the content it was
+    judged on; a judged candidate without a relation was judged none. Storage
+    records the outcome only while the challenger and every judged candidate
+    still hold those contents.
+    """
+
+    challenger_id: str
+    challenger_content_hash: str
+    judged_content_hashes: Mapping[str, str]
+    relations: tuple[CrossDocumentRelationRecord, ...] = ()
+
+    def __post_init__(self) -> None:
+        judged = {self.challenger_id: self.challenger_content_hash, **self.judged_content_hashes}
+        for record in self.relations:
+            counterpart = record.counterpart_of(self.challenger_id)
+            if counterpart not in self.judged_content_hashes or (
+                record.low_content_hash,
+                record.high_content_hash,
+            ) != (judged[record.memory_low_id], judged[record.memory_high_id]):
+                raise ValueError("a relation must name a judged pair and the contents it was judged on")
+
+    @classmethod
+    def from_judgments(
+        cls,
+        challenger: RelationSubject,
+        judgments: Sequence[CrossDocumentRelationJudgment],
+        *,
+        relation_run_id: str,
+        discovery_work_id: str,
+    ) -> CrossDocumentRelationOutcome:
+        if any(judgment.pair.challenger != challenger for judgment in judgments):
+            raise ValueError("a discovery outcome judges pairs of one challenger")
+        return cls(
+            challenger_id=challenger.memory_id,
+            challenger_content_hash=challenger.content_hash,
+            judged_content_hashes={
+                judgment.pair.candidate.memory_id: judgment.pair.candidate.content_hash
+                for judgment in judgments
+            },
+            relations=tuple(
+                CrossDocumentRelationRecord.from_judgment(
+                    judgment,
+                    relation_run_id=relation_run_id,
+                    discovery_work_id=discovery_work_id,
+                )
+                for judgment in judgments
+                if judgment.label is not CrossDocumentRelationLabel.NONE
+            ),
+        )
+
+
+# Relations shown per Memory, most consequential label first.
+MAX_RELATIONS_PER_MEMORY = 10
+RELATION_READ_ORDER = (
+    CrossDocumentRelationLabel.CONTRADICTS,
+    CrossDocumentRelationLabel.UPDATES,
+    CrossDocumentRelationLabel.EQUIVALENT,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentCrossDocumentRelation:
+    """A stored relation that is current for the caller.
+
+    Current means both Memories are active and visible to the caller, both
+    contents still equal the judged contents, and no active dismissal hides
+    it. The Evidence times are the ones the relation was decided on; they
+    order an ``updates`` pair and date each Memory for the reader.
+    """
+
+    memory_low_id: str
+    memory_high_id: str
+    label: CrossDocumentRelationLabel
+    low_content_hash: str
+    high_content_hash: str
+    low_evidence_time: str | None
+    high_evidence_time: str | None
+    reason: str
+    decided_by: CrossDocumentRelationDecider
+    decided_at: str
+
+    def __post_init__(self) -> None:
+        _check_recorded_relation(
+            self.label,
+            self.memory_low_id,
+            self.memory_high_id,
+            self.low_evidence_time,
+            self.high_evidence_time,
+        )
+
+    def counterpart_of(self, memory_id: str) -> str:
+        return pair_counterpart(self.memory_low_id, self.memory_high_id, memory_id)
+
+    def evidence_time_of(self, memory_id: str) -> str | None:
+        if memory_id == self.memory_low_id:
+            return self.low_evidence_time
+        if memory_id == self.memory_high_id:
+            return self.high_evidence_time
+        raise ValueError(f"{memory_id} is not part of this pair")
+
+    @property
+    def newer_memory_id(self) -> str | None:
+        """The newer Memory of an ``updates`` pair; None for every other label."""
+
+        if self.label is not CrossDocumentRelationLabel.UPDATES:
+            return None
+        return newer_memory_by_evidence_time(
+            self.memory_low_id,
+            self.memory_high_id,
+            self.low_evidence_time,
+            self.high_evidence_time,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CrossDocumentRelationDismissal:
+    """A person's record that one relation is wrong for both current contents."""
+
+    id: str
+    memory_low_id: str
+    memory_high_id: str
+    label: CrossDocumentRelationLabel
+    low_content_hash: str
+    high_content_hash: str
+    dismissed_by: str
+    dismissed_at: str
+    note: str | None = None
+
+    def counterpart_of(self, memory_id: str) -> str:
+        return pair_counterpart(self.memory_low_id, self.memory_high_id, memory_id)
+
+
+class RelationDismissalConflict(ValueError):
+    """The dismissal names content or a relation that is no longer current."""
 
 
 CROSS_DOCUMENT_RELATION_RULES = """Each pair holds two statements taken from different documents.

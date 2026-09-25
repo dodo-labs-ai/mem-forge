@@ -1,56 +1,45 @@
-"""Budgeted post-commit discovery of non-destructive Memory relations."""
+"""Budgeted post-commit discovery of cross-document Memory relations.
+
+Discovery labels each (challenger, candidate) pair and writes relations only.
+It creates no Review and changes neither Memory.
+"""
 
 from __future__ import annotations
 
 import time
 import logging
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from memforge.memory.cross_document_relation import (
+    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+    CrossDocumentRelationClassification,
+    CrossDocumentRelationClassifier,
+    CrossDocumentRelationOutcome,
+    CrossDocumentRelationPair,
+    load_relation_subjects,
+)
 from memforge.memory.evidence import (
-    AccessContext,
-    AuthorityCase,
-    EvidenceRelationRecord,
     LifecycleAction,
     RelationOutcomeBundle,
     RelationRunRecord,
-    RelationType,
-    ReviewCase,
     build_candidate_universe,
-    classify_authority_case,
 )
 from memforge.memory.relation_candidate_retrieval import (
     CrossDocumentCandidateRetriever,
     CrossDocumentCandidateSelection,
 )
-from memforge.memory.relation_classifier import (
-    MemoryPair,
-    MemoryPairClassification,
-    MemoryPairClassifier,
-    MemoryPairClassificationError,
-    MemoryPairContext,
-    MemoryPairDecision,
-    MemoryRelationType,
-)
+from memforge.memory.relation_classifier import MemoryPairClassificationError
 from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryWork,
+    RelationDiscoveryWorkSelection,
+    RelationDiscoveryWorkState,
     resolve_relation_discovery_actor_user_id,
 )
-from memforge.memory.lifecycle_planner import lifecycle_access_context_hash
-from memforge.memory.sparse_relation_classifier import SPARSE_MEMORY_CLASSIFIER_VERSION
-from memforge.models import (
-    Memory,
-    MemoryReview,
-    MemoryStatus,
-    ReviewKind,
-    ReviewStatus,
-    generate_deterministic_review_id,
-)
+from memforge.models import Memory, MemoryStatus
 from memforge.storage.adapters.protocols import RelationalStore
 
 
-RELATION_DISCOVERY_CLASSIFIER_VERSION = SPARSE_MEMORY_CLASSIFIER_VERSION
 logger = logging.getLogger(__name__)
 
 
@@ -89,10 +78,12 @@ class RelationDiscoverySliceResult:
     failed_work: int = 0
     obsolete_work: int = 0
     checked_candidate_pairs: int = 0
-    reused_candidate_pairs: int = 0
     llm_calls: int = 0
     prompt_chars: int = 0
     elapsed_ms: int = 0
+    # Work that used every attempt, counted across the store after a slice that
+    # attempted work.
+    exhausted_work: int = 0
 
 
 class RelationDiscovery:
@@ -103,7 +94,7 @@ class RelationDiscovery:
         *,
         store: RelationalStore,
         candidate_retriever: CrossDocumentCandidateRetriever,
-        pair_classifier: MemoryPairClassifier,
+        pair_classifier: CrossDocumentRelationClassifier,
     ) -> None:
         self._store = store
         self._candidate_retriever = candidate_retriever
@@ -119,7 +110,7 @@ class RelationDiscovery:
         policy = budget or DEFAULT_RELATION_DISCOVERY_BUDGET
         started = time.perf_counter()
         attempted = completed = failed = obsolete = 0
-        checked_pairs = reused_pairs = llm_calls = prompt_chars = 0
+        checked_pairs = llm_calls = prompt_chars = 0
 
         while attempted < policy.max_work_items:
             if time.perf_counter() - started >= policy.max_wall_time_seconds:
@@ -138,9 +129,7 @@ class RelationDiscovery:
             work = leased[0]
             attempted += 1
             try:
-                outcome = await self._process_work(
-                    work,
-                )
+                outcome = await self._process_work(work)
                 if outcome is None:
                     await self._store.obsolete_relation_discovery_work(
                         work.request.id,
@@ -150,24 +139,22 @@ class RelationDiscovery:
                     )
                     obsolete += 1
                     continue
-                relation_outcome, reviews, classification = outcome
+                relation_run, document_relations, classification = outcome
                 checked_pairs += classification.pair_count
-                reused_pairs += classification.reused_pair_count
                 llm_calls += classification.llm_calls
                 prompt_chars += classification.prompt_chars
                 await self._store.complete_relation_discovery_work(
                     work.request.id,
                     worker_id=worker_id,
                     lease_token=_lease_token(work),
-                    relation_outcome=relation_outcome,
-                    reviews=reviews,
+                    relation_run=relation_run,
+                    document_relations=document_relations,
                 )
                 completed += 1
             except Exception as error:
                 recorded_error = error
                 if isinstance(error, _WorkProcessingError):
                     checked_pairs += error.pair_count
-                    reused_pairs += error.reused_pair_count
                     llm_calls += error.llm_calls
                     prompt_chars += error.prompt_chars
                     recorded_error = error.cause
@@ -186,34 +173,38 @@ class RelationDiscovery:
                     worker_id=worker_id,
                     lease_token=_lease_token(work),
                     error=f"{type(recorded_error).__name__}: {recorded_error}",
+                    error_code=relation_discovery_error_code(recorded_error),
                     next_attempt_at=(retry_at.isoformat() if retry_at is not None else None),
                     exhausted=exhausted,
                 )
                 failed += 1
 
+        exhausted_work = (
+            await self._store.count_relation_discovery_work(
+                RelationDiscoveryWorkSelection(
+                    state=RelationDiscoveryWorkState.EXHAUSTED,
+                    max_attempts=policy.max_attempts,
+                )
+            )
+            if attempted
+            else 0
+        )
         return RelationDiscoverySliceResult(
             attempted_work=attempted,
             completed_work=completed,
             failed_work=failed,
             obsolete_work=obsolete,
             checked_candidate_pairs=checked_pairs,
-            reused_candidate_pairs=reused_pairs,
             llm_calls=llm_calls,
             prompt_chars=prompt_chars,
             elapsed_ms=max(0, round((time.perf_counter() - started) * 1000)),
+            exhausted_work=exhausted_work,
         )
 
     async def _process_work(
         self,
         work: RelationDiscoveryWork,
-    ) -> (
-        tuple[
-            RelationOutcomeBundle,
-            tuple[MemoryReview, ...],
-            _CompletedClassification,
-        ]
-        | None
-    ):
+    ) -> tuple[RelationOutcomeBundle, CrossDocumentRelationOutcome, _CompletedClassification] | None:
         request = work.request
         challenger = await self._store.get_memory(request.memory_id)
         if (
@@ -254,77 +245,20 @@ class RelationDiscovery:
             source_id=request.source_id,
             excluded_source_ids=disabled_source_ids,
         )
-        candidate_contexts = {
-            item.memory.memory_id: MemoryPairContext(
-                source_id=item.memory.source_id,
-                doc_id=item.memory.doc_id,
-                source_lineage_id=item.memory.source_lineage_id,
-            )
-            for item in selection.discovery
-        }
-        challenger_context = MemoryPairContext(
-            source_id=evidence_unit.source_id,
-            doc_id=evidence_unit.doc_id,
-            source_lineage_id=evidence_unit.source_lineage_id,
-        )
-        pairs = tuple(
-            MemoryPair(
-                challenger=challenger,
-                candidate=loaded_by_id[memory_id],
-                challenger_context=challenger_context,
-                candidate_context=candidate_contexts.get(memory_id),
-            )
-            for memory_id in selection.candidate_ids
-        )
-        reusable_by_candidate_id = {
-            item.candidate_memory_id: item
-            for item in request.preclassified_decisions
-        }
+        candidates = tuple(loaded_by_id[memory_id] for memory_id in selection.candidate_ids)
         candidate_support = await self._store.get_active_memory_support_states(
-            tuple(pair.candidate.id for pair in pairs)
+            tuple(candidate.id for candidate in candidates)
         )
-        challenger_access_context_hash = lifecycle_access_context_hash(
-            visibility=challenger.visibility,
-            owner_user_id=challenger.owner_user_id,
-            project_key=challenger.project_key,
-            repo_identifier=challenger.repo_identifier,
+        subjects = await load_relation_subjects(self._store, (challenger, *candidates))
+        pairs = tuple(
+            CrossDocumentRelationPair(challenger=subjects[challenger.id], candidate=subjects[candidate.id])
+            for candidate in candidates
         )
-        reused_decisions: dict[tuple[str, str], MemoryPairDecision] = {}
-        reused_candidate_ids: set[str] = set()
-        pending_pairs: list[MemoryPair] = []
-        for pair in pairs:
-            saved = reusable_by_candidate_id.get(pair.candidate.id)
-            if (
-                saved is None
-                or saved.expected_candidate_content_hash != pair.candidate.content_hash
-                or saved.expected_candidate_support_set_hash
-                != candidate_support[pair.candidate.id].current_support_set_hash
-                or saved.expected_candidate_access_context_hash
-                != lifecycle_access_context_hash(
-                    visibility=pair.candidate.visibility,
-                    owner_user_id=pair.candidate.owner_user_id,
-                    project_key=pair.candidate.project_key,
-                    repo_identifier=pair.candidate.repo_identifier,
-                )
-                or saved.expected_challenger_access_context_hash
-                != challenger_access_context_hash
-                or saved.classifier_version != RELATION_DISCOVERY_CLASSIFIER_VERSION
-            ):
-                pending_pairs.append(pair)
-                continue
-            reused_candidate_ids.add(pair.candidate.id)
-            if saved.relation_type is not None:
-                reused_decisions[pair.key] = MemoryPairDecision(
-                    pair=pair,
-                    relation_type=saved.relation_type,
-                    direction=saved.direction,
-                    reason=saved.reason,
-                )
         try:
             classification = (
-                await self._pair_classifier.classify(tuple(pending_pairs))
-                if pending_pairs
-                else MemoryPairClassification(decisions=(), llm_calls=0, prompt_chars=0)
+                await self._pair_classifier.classify(pairs)
+                if pairs
+                else CrossDocumentRelationClassification(judgments=(), llm_calls=0, prompt_chars=0)
             )
         except MemoryPairClassificationError as error:
             raise _WorkProcessingError(
@@ -334,76 +268,59 @@ class RelationDiscovery:
                 prompt_chars=error.prompt_chars,
             ) from error
         try:
-            classified_by_key = {
-                **reused_decisions,
-                **{decision.pair.key: decision for decision in classification.decisions},
+            candidate_support_set_hashes = {
+                candidate.id: candidate_support[candidate.id].current_support_set_hash
+                for candidate in candidates
             }
-            decisions = tuple(classified_by_key[pair.key] for pair in pairs if pair.key in classified_by_key)
             await self._candidate_retriever.ensure_selection_current(
                 selection,
                 challenger=challenger,
                 doc_id=evidence_unit.doc_id or request.doc_id,
                 source_id=request.source_id,
                 excluded_source_ids=disabled_source_ids,
-                expected_support_set_hashes={
-                    pair.candidate.id: candidate_support[
-                        pair.candidate.id
-                    ].current_support_set_hash
-                    for pair in pairs
-                },
+                expected_support_set_hashes=candidate_support_set_hashes,
             )
-            bundle, reviews = await self._build_outcome(
+            relation_run = self._build_relation_run(
                 work=work,
                 challenger=challenger,
-                actor_user_id=actor_user_id,
                 evidence_unit=evidence_unit,
                 selection=selection,
-                decisions=decisions,
-                loaded_by_id=loaded_by_id,
-                classification_llm_calls=classification.llm_calls,
-                classification_prompt_chars=classification.prompt_chars,
-                reused_pair_count=len(reused_candidate_ids),
-                candidate_support_set_hashes={
-                    pair.candidate.id: candidate_support[
-                        pair.candidate.id
-                    ].current_support_set_hash
-                    for pair in pairs
-                },
+                classification=classification,
+                candidate_support_set_hashes=candidate_support_set_hashes,
+            )
+            document_relations = CrossDocumentRelationOutcome.from_judgments(
+                subjects[challenger.id],
+                classification.judgments,
+                relation_run_id=relation_run.relation_run.id,
+                discovery_work_id=work.request.id,
             )
         except Exception as error:
             raise _WorkProcessingError(
                 cause=error,
                 pair_count=len(pairs),
-                reused_pair_count=len(reused_candidate_ids),
                 llm_calls=classification.llm_calls,
                 prompt_chars=classification.prompt_chars,
             ) from error
         return (
-            bundle,
-            reviews,
+            relation_run,
+            document_relations,
             _CompletedClassification(
                 pair_count=len(pairs),
-                reused_pair_count=len(reused_candidate_ids),
                 llm_calls=classification.llm_calls,
                 prompt_chars=classification.prompt_chars,
             ),
         )
 
-    async def _build_outcome(
-        self,
+    @staticmethod
+    def _build_relation_run(
         *,
         work: RelationDiscoveryWork,
         challenger: Memory,
-        actor_user_id: str | None,
         evidence_unit,
         selection: CrossDocumentCandidateSelection,
-        decisions: tuple[MemoryPairDecision, ...],
-        loaded_by_id,
-        classification_llm_calls: int,
-        classification_prompt_chars: int,
-        reused_pair_count: int,
-        candidate_support_set_hashes: Mapping[str, str],
-    ) -> tuple[RelationOutcomeBundle, tuple[MemoryReview, ...]]:
+        classification: CrossDocumentRelationClassification,
+        candidate_support_set_hashes: dict[str, str],
+    ) -> RelationOutcomeBundle:
         relation_run_id = _relation_run_id(work, selection)
         universe = build_candidate_universe(
             relation_run_id=relation_run_id,
@@ -411,70 +328,7 @@ class RelationDiscovery:
             bucket_results=selection.bucket_results(),
             recall_candidate_cap=max(1, len(selection.discovery)),
         )
-        candidate_by_id = {candidate.memory.memory_id: candidate.memory for candidate in selection.discovery}
-        source_subscriptions = tuple(
-            dict.fromkeys(
-                source_id
-                for source_id in (
-                    evidence_unit.source_id,
-                    *(candidate.source_id for candidate in candidate_by_id.values()),
-                )
-                if source_id
-            )
-        )
-        access_context = AccessContext(
-            actor_user_id=actor_user_id,
-            source_subscriptions=source_subscriptions,
-            repo_identifier=challenger.repo_identifier,
-            operation_type="relation_discovery",
-        )
-        relations: list[EvidenceRelationRecord] = []
-        cross_source_conflicts: list[tuple[MemoryPairDecision, Memory]] = []
-        now = datetime.now(timezone.utc)
-        for decision in decisions:
-            relation_type = _persisted_relation_type(decision.relation_type)
-            if relation_type is None:
-                continue
-            candidate_row = candidate_by_id[decision.pair.candidate.id]
-            authority = classify_authority_case(
-                evidence_unit,
-                candidate_row,
-                universe.candidates[
-                    next(
-                        index
-                        for index, candidate in enumerate(universe.candidates)
-                        if candidate.memory_id == decision.pair.candidate.id
-                    )
-                ].bucket,
-                relation_type,
-                access_context,
-            )
-            relations.append(
-                EvidenceRelationRecord(
-                    evidence_unit_id=evidence_unit.id,
-                    memory_id=decision.pair.candidate.id,
-                    relation_type=relation_type,
-                    direction=decision.direction,
-                    authority_case=authority,
-                    is_authoritative_support=False,
-                    source_lineage_id=evidence_unit.source_lineage_id,
-                    confidence=1.0,
-                    reason=decision.reason,
-                    classifier_version=RELATION_DISCOVERY_CLASSIFIER_VERSION,
-                    relation_run_id=relation_run_id,
-                    created_at=now.isoformat(),
-                )
-            )
-            if (
-                relation_type is RelationType.CONTRADICTS
-                and authority is AuthorityCase.CROSS_SOURCE_CONFLICT
-                and candidate_row.source_id
-                and candidate_row.source_id != evidence_unit.source_id
-            ):
-                cross_source_conflicts.append((decision, dict(loaded_by_id)[decision.pair.candidate.id]))
-
-        lifecycle_action = LifecycleAction.CREATE_REVIEW if cross_source_conflicts else LifecycleAction.NONE
-        review_case = ReviewCase.CROSS_SOURCE_CONFLICT if cross_source_conflicts else None
+        now = datetime.now(timezone.utc).isoformat()
         relation_run = RelationRunRecord(
             id=relation_run_id,
             evidence_unit_id=evidence_unit.id,
@@ -483,50 +337,40 @@ class RelationDiscovery:
             mandatory_candidate_count=universe.mandatory_candidate_count,
             checked_candidate_count=universe.checked_candidate_count,
             incomplete_mandatory_buckets=universe.incomplete_mandatory_buckets,
-            classifier_version=RELATION_DISCOVERY_CLASSIFIER_VERSION,
-            lifecycle_action=lifecycle_action,
-            review_case=review_case,
-            status="review" if cross_source_conflicts else "checked",
+            classifier_version=CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+            lifecycle_action=LifecycleAction.NONE,
+            review_case=None,
+            status="checked",
             result_memory_id=challenger.id,
             audit={
                 "source": "relation_discovery",
                 "work_id": work.request.id,
+                "run_generation": work.run_generation,
                 "candidate_count_kind": "windowed",
-                "llm_calls": classification_llm_calls,
-                "prompt_chars": classification_prompt_chars,
-                "reused_identity_pair_count": reused_pair_count,
+                "llm_calls": classification.llm_calls,
+                "prompt_chars": classification.prompt_chars,
+                "labels": {
+                    judgment.pair.candidate.memory_id: judgment.label.value
+                    for judgment in classification.judgments
+                },
                 **selection.audit,
                 **selection.telemetry,
             },
-            started_at=now.isoformat(),
-            completed_at=now.isoformat(),
+            started_at=now,
+            completed_at=now,
         )
-        bundle = RelationOutcomeBundle(
+        return RelationOutcomeBundle(
             evidence_unit=evidence_unit,
             relation_run=relation_run,
             candidates=universe.candidates,
-            relations=tuple(relations),
             candidate_provenance=tuple(candidate.memory for candidate in selection.discovery),
-            expected_candidate_support_set_hashes=dict(candidate_support_set_hashes),
+            expected_candidate_support_set_hashes=candidate_support_set_hashes,
         )
-        reviews = tuple(
-            _cross_source_review(
-                decision=decision,
-                challenger=challenger,
-                incumbent=incumbent,
-                relation_run=relation_run,
-                evidence_unit_id=evidence_unit.id,
-                now=now,
-            )
-            for decision, incumbent in cross_source_conflicts
-        )
-        return bundle, reviews
 
 
 @dataclass(frozen=True, slots=True)
 class _CompletedClassification:
     pair_count: int
-    reused_pair_count: int
     llm_calls: int
     prompt_chars: int
 
@@ -537,15 +381,12 @@ class _WorkProcessingError(RuntimeError):
     pair_count: int
     llm_calls: int
     prompt_chars: int
-    reused_pair_count: int = 0
 
 
-def _persisted_relation_type(
-    relation_type: MemoryRelationType,
-) -> RelationType | None:
-    if relation_type is MemoryRelationType.UNRELATED:
-        return None
-    return RelationType(relation_type.value)
+def relation_discovery_error_code(error: BaseException) -> str:
+    """A stable code for one failure: the classifier's code, else the exception type."""
+
+    return str(getattr(error, "error_code", None) or type(error).__name__)
 
 
 def _relation_run_id(
@@ -556,43 +397,14 @@ def _relation_run_id(
         "\x1f".join(
             (
                 work.request.id,
+                str(work.run_generation),
                 work.request.expected_content_hash,
                 selection.snapshot_identity,
-                RELATION_DISCOVERY_CLASSIFIER_VERSION,
+                CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
             )
         ).encode("utf-8")
     ).hexdigest()[:20]
     return f"relation-run-{digest}"
-
-
-def _cross_source_review(
-    *,
-    decision: MemoryPairDecision,
-    challenger: Memory,
-    incumbent: Memory,
-    relation_run: RelationRunRecord,
-    evidence_unit_id: str,
-    now: datetime,
-) -> MemoryReview:
-    kind = ReviewKind.CROSS_SOURCE_CONFLICT.value
-    return MemoryReview(
-        id=generate_deterministic_review_id(
-            kind=kind,
-            incumbent_memory_id=incumbent.id,
-            challenger_memory_id=challenger.id,
-            relation_run_id=relation_run.id,
-            evidence_unit_id=evidence_unit_id,
-            review_case=ReviewCase.CROSS_SOURCE_CONFLICT.value,
-        ),
-        kind=kind,
-        status=ReviewStatus.PENDING.value,
-        incumbent_memory_id=incumbent.id,
-        challenger_memory_id=challenger.id,
-        reason=f"contradicts: {decision.reason}" if decision.reason else "contradicts",
-        expected_incumbent_updated_at=(incumbent.updated_at.isoformat() if incumbent.updated_at else None),
-        expected_challenger_updated_at=(challenger.updated_at.isoformat() if challenger.updated_at else None),
-        created_at=now,
-    )
 
 
 def _lease_token(work: RelationDiscoveryWork) -> str:

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Brain, Database, Files, FolderTree, Lock, RefreshCw, ShieldCheck } from "lucide-react";
 import { resourceClient } from "@/api/client";
 import type {
@@ -8,6 +8,8 @@ import type {
   MemoryReviewListResponse,
   PaginatedResponse,
   Project,
+  RelationLabel,
+  RelationPair,
   Source,
   Stats,
 } from "@/api/types";
@@ -39,6 +41,7 @@ import {
   isReservedProjectKey,
 } from "@/api/projectKeys";
 import { MemoryFiltersPopover } from "./MemoryFiltersPopover";
+import { RELATION_LABEL_NAMES, relatedMemorySources } from "./relations";
 
 const PAGE_PROJECT_ALL = "all";
 const SHARED_PROJECT_LABEL = "Shared";
@@ -51,6 +54,17 @@ const TYPE_OPTIONS = [
   { value: "decision", label: "Decision" },
   { value: "convention", label: "Convention" },
   { value: "procedure", label: "Procedure" },
+];
+
+// "all" lists Memories; any other value lists current relations instead.
+const RELATION_ALL = "all";
+const RELATION_ANY = "any";
+const RELATION_OPTIONS = [
+  { value: RELATION_ALL, label: "Any memory" },
+  { value: RELATION_ANY, label: "Has a relation" },
+  { value: "contradicts", label: "Conflicts" },
+  { value: "updates", label: "Updates" },
+  { value: "equivalent", label: "Same knowledge" },
 ];
 
 const STATUS_OPTIONS = [
@@ -113,7 +127,6 @@ function searchHitToMemoryRow(hit: SearchHit): Memory {
     project_key: null,
     confidence: hit.confidence,
     corroboration_count: hit.corroborated_by,
-    contradiction_count: 0,
     status: hit.status ?? "active",
     retirement_reason: null,
     retired_at: null,
@@ -189,6 +202,7 @@ export function MemoriesPage() {
   const [status, setStatus] = useState("all");
   const [source, setSource] = useState("all");
   const [pageProject, setPageProject] = useState<string>(PAGE_PROJECT_ALL);
+  const [relation, setRelation] = useState<string>(RELATION_ALL);
   const [narrowToggle, setNarrowToggle] = useState(NARROW_TOGGLE_DEFAULT);
   const [page, setPage] = useState(0);
   const navigate = useNavigate();
@@ -214,6 +228,10 @@ export function MemoriesPage() {
     setPageProject(value);
     setPage(0);
   };
+  const changeRelation = (value: string) => {
+    setRelation(value);
+    setPage(0);
+  };
   const changeNarrow = (value: boolean) => {
     setNarrowToggle(value);
     setPage(0);
@@ -223,6 +241,7 @@ export function MemoriesPage() {
     setStatus("all");
     setSource("all");
     setPageProject(PAGE_PROJECT_ALL);
+    setRelation(RELATION_ALL);
     setNarrowToggle(NARROW_TOGGLE_DEFAULT);
     setPage(0);
   };
@@ -251,6 +270,22 @@ export function MemoriesPage() {
   const effectiveProjectKey = pageProjectOverride;
   const hasQuery = search.trim().length > 0;
   const useSearchRoute = effectiveProjectKey !== null && hasQuery;
+  const relationView = relation !== RELATION_ALL;
+  const relationsQuery = useQuery<PaginatedResponse<RelationPair>>({
+    queryKey: ["memory-relations", relation, page],
+    enabled: relationView,
+    queryFn: () =>
+      resourceClient
+        .get<PaginatedResponse<RelationPair>>("/memories/relations", {
+          params: {
+            label: relation === RELATION_ANY ? undefined : (relation as RelationLabel),
+            limit: LIST_PAGE_SIZE,
+            offset: page * LIST_PAGE_SIZE,
+          },
+        })
+        .then((response) => response.data),
+  });
+
   const memoriesQuery = useQuery<PaginatedResponse<Memory>>({
     queryKey: [
       "memories",
@@ -264,7 +299,7 @@ export function MemoriesPage() {
       pageProject,
       page,
     ],
-    enabled: true,
+    enabled: !relationView,
     queryFn: async () => {
       if (useSearchRoute) {
         // The UI only ever asks for a project-bound view: the narrow toggle
@@ -329,8 +364,11 @@ export function MemoriesPage() {
   // candidate pool exceeds the visible page, the header advertises the wider
   // pool ("N candidates") so users know the list is a ranked window. When
   // they line up the keyword/admin route uses the same total.
-  const headerCount =
-    useSearchRoute && total > memories.length
+  const relationPairs = relationsQuery.data?.data ?? [];
+  const relationTotal = relationsQuery.data?.total ?? 0;
+  const headerCount = relationView
+    ? `${relationTotal.toLocaleString()} relations`
+    : useSearchRoute && total > memories.length
       ? `${total.toLocaleString()} candidates`
       : `${memories.length.toLocaleString()} memories`;
   const sourcesData = sourcesQuery.data;
@@ -419,19 +457,26 @@ export function MemoriesPage() {
 
       <DataSurface>
         <div className="flex flex-col gap-2 border-b p-3 sm:flex-row sm:items-center">
-          <SearchInput
-            value={search}
-            onChange={changeSearch}
-            placeholder="Search memories"
-            ariaLabel="Search memories"
-            size="sm"
-            className="min-w-0 flex-1"
-          />
+          {relationView ? (
+            <div className="min-w-0 flex-1 text-xs text-muted-foreground">
+              Relations between Memories from different documents
+            </div>
+          ) : (
+            <SearchInput
+              value={search}
+              onChange={changeSearch}
+              placeholder="Search memories"
+              ariaLabel="Search memories"
+              size="sm"
+              className="min-w-0 flex-1"
+            />
+          )}
           <MemoryFiltersPopover
             type={type}
             status={status}
             source={source}
             project={pageProject}
+            relation={relation}
             projectLabel={effectiveProjectLabel}
             narrowProject={narrowToggle}
             typeOptions={TYPE_OPTIONS}
@@ -441,10 +486,12 @@ export function MemoriesPage() {
               ...sourceList.map((item) => ({ value: item.id, label: item.name })),
             ]}
             projectOptions={projectOptions}
+            relationOptions={RELATION_OPTIONS}
             onTypeChange={changeType}
             onStatusChange={changeStatus}
             onSourceChange={changeSource}
             onProjectChange={changeProject}
+            onRelationChange={changeRelation}
             onNarrowProjectChange={changeNarrow}
             onClear={clearFilters}
           />
@@ -452,6 +499,15 @@ export function MemoriesPage() {
             {headerCount}
           </span>
         </div>
+        {relationView ? (
+          <RelationPairList
+            query={relationsQuery}
+            pairs={relationPairs}
+            page={page}
+            total={relationTotal}
+            onPageChange={setPage}
+          />
+        ) : (
         <>
             <AsyncBoundary
               isLoading={memoriesQuery.isLoading}
@@ -577,7 +633,103 @@ export function MemoriesPage() {
               />
             )}
         </>
+        )}
       </DataSurface>
     </div>
+  );
+}
+
+
+/**
+ * Current Cross-Document Relations, newest decision first. A view of hints for
+ * readers, not a work queue: nothing here waits for a decision.
+ */
+function RelationPairList({
+  query,
+  pairs,
+  page,
+  total,
+  onPageChange,
+}: {
+  query: { isLoading: boolean; isError: boolean; error: unknown; refetch: () => unknown };
+  pairs: RelationPair[];
+  page: number;
+  total: number;
+  onPageChange: (page: number) => void;
+}) {
+  return (
+    <>
+      <AsyncBoundary
+        isLoading={query.isLoading}
+        isError={query.isError}
+        error={query.error}
+        onRetry={() => query.refetch()}
+        isEmpty={pairs.length === 0}
+        empty={
+          <EmptyState
+            icon={Brain}
+            title="No relations found"
+            description="Discovery records relations between Memories from different documents."
+          />
+        }
+      >
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead className="w-32">Relation</TableHead>
+                <TableHead>Memories</TableHead>
+                <TableHead className="w-24">Decided</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {pairs.map((pair) => (
+                <TableRow key={pair.memories.map((memory) => memory.memory_id).join(":")}>
+                  <TableCell className="align-top">
+                    <Badge variant={pair.label === "contradicts" ? "destructive" : "secondary"}>
+                      {RELATION_LABEL_NAMES[pair.label]}
+                    </Badge>
+                  </TableCell>
+                  <TableCell>
+                    <div className="space-y-2">
+                      {pair.memories.map((memory) => {
+                        const sources = relatedMemorySources(memory);
+                        const recorded = memory.evidence_time;
+                        return (
+                          <Link
+                            key={memory.memory_id}
+                            to={`/memories/${memory.memory_id}`}
+                            className="block max-w-2xl hover:underline"
+                          >
+                            <div className="truncate text-sm font-medium">
+                              {pair.newer_memory_id === memory.memory_id ? "Newer: " : ""}
+                              {memory.summary}
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                              {[sources, recorded ? `recorded ${recorded}` : ""].filter(Boolean).join(" · ")}
+                            </div>
+                          </Link>
+                        );
+                      })}
+                      {pair.reason && <p className="text-xs text-muted-foreground">{pair.reason}</p>}
+                    </div>
+                  </TableCell>
+                  <TableCell className="align-top text-muted-foreground">
+                    {timeAgo(pair.decided_at)}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      </AsyncBoundary>
+      <Pagination
+        page={page}
+        pageSize={LIST_PAGE_SIZE}
+        total={total}
+        onPageChange={onPageChange}
+        itemLabel="relations"
+      />
+    </>
   );
 }

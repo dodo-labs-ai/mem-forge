@@ -930,7 +930,7 @@ def test_packaged_plugin_version_is_consistent():
     import tomllib
 
     root = Path(__file__).resolve().parents[1]
-    version = "0.1.62"
+    version = "0.1.63"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()
@@ -3977,7 +3977,6 @@ def test_mcp_proxy_compacts_get_memory_response_for_agent_context(monkeypatch):
                     "project_key": "PAY",
                     "confidence": 0.93,
                     "corroboration_count": 1,
-                    "contradiction_count": 0,
                     "status": "active",
                     "retirement_reason": None,
                     "replacement_reason": None,

@@ -1497,7 +1497,7 @@ async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
     await db.insert_memory_review(
         MemoryReview(
             id="review-terminal-incumbent",
-            kind=ReviewKind.CROSS_SOURCE_CONFLICT.value,
+            kind=ReviewKind.SUPERSEDE.value,
             status=ReviewStatus.PENDING.value,
             incumbent_memory_id="mem-legacy",
             challenger_memory_id=challenger.id,

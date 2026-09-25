@@ -65,13 +65,13 @@ from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitation,
     SupportRevalidationLimitationCode,
 )
+from memforge.memory.cross_document_relation import StructuredCrossDocumentRelationClassifier
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.sparse_relation_classifier import (
     SPARSE_MEMORY_CLASSIFIER_VERSION,
     SparseMemoryRelationClassifier,
 )
 from memforge.memory.relation_classifier import MemoryPairClassificationError
-from memforge.memory.relation_discovery_contract import PreclassifiedRelationDecision
 from memforge.source_access import (
     memory_visibility_for_document,
     memory_visibility_for_source_id,
@@ -286,16 +286,23 @@ class MemoryEngine:
             self.runtime_event_trace_sink
         )
         self.pair_classifier = (
-            SparseMemoryRelationClassifier(
+            StructuredCrossDocumentRelationClassifier(
                 client=structured_llm_client,
                 model=llm_model,
             )
-            if callable(getattr(structured_llm_client, "discover_memory_relations", None))
+            if callable(getattr(structured_llm_client, "classify_cross_document_relations", None))
             else None
         )
         self.identity_resolver = IdentityResolver(
             memory_store=memory_store,
-            pair_classifier=self.pair_classifier,
+            pair_classifier=(
+                SparseMemoryRelationClassifier(
+                    client=structured_llm_client,
+                    model=llm_model,
+                )
+                if callable(getattr(structured_llm_client, "discover_memory_relations", None))
+                else None
+            ),
             llm_model=llm_model,
         )
         # Entity resolver with embedding + LLM capabilities
@@ -1435,7 +1442,6 @@ class MemoryEngine:
         _runtime_context.stage = "plan_construction"
         corroboration_targets: dict[str, Memory] = {}
         corroboration_proofs: dict[str, dict[str, object]] = {}
-        preclassified_relations: dict[str, tuple[PreclassifiedRelationDecision, ...]] = {}
         identity_claim_hashes: list[str] = []
         identity_requests: list[IdentityResolutionRequest] = []
         operation_memories = tuple(operation.memory for operation in operations if operation.memory is not None)
@@ -1516,17 +1522,6 @@ class MemoryEngine:
                 terminal_category=incomplete_identity.terminal_category,
                 error_code=incomplete_identity.error_code,
             )
-        classified_candidate_ids = tuple(
-            dict.fromkeys(
-                memory_id
-                for resolution in identity_resolutions
-                for memory_id in (
-                    *(decision.candidate_memory_id for decision in resolution.classified_pairs),
-                    *((resolution.target.id,) if resolution.target is not None else ()),
-                )
-            )
-        )
-        classified_candidate_support = await self.db.get_active_memory_support_states(classified_candidate_ids)
         attached_target_ids: list[str] = []
         for claim_hash, resolution in zip(
             identity_claim_hashes,
@@ -1535,27 +1530,6 @@ class MemoryEngine:
         ):
             target = resolution.target
             equivalence_proof = resolution.equivalence_proof
-            preclassified_relations[claim_hash] = tuple(
-                PreclassifiedRelationDecision(
-                    candidate_memory_id=decision.candidate_memory_id,
-                    expected_candidate_content_hash=decision.candidate_content_hash,
-                    expected_candidate_support_set_hash=(
-                        classified_candidate_support[decision.candidate_memory_id].current_support_set_hash
-                    ),
-                    expected_candidate_access_context_hash=lifecycle_access_context_hash(
-                        visibility=decision.candidate_visibility,
-                        owner_user_id=decision.candidate_owner_user_id,
-                        project_key=decision.candidate_project_key,
-                        repo_identifier=decision.candidate_repo_identifier,
-                    ),
-                    expected_challenger_access_context_hash=access_context_hash,
-                    relation_type=decision.relation_type,
-                    direction=decision.direction,
-                    reason=decision.reason,
-                    classifier_version=SPARSE_MEMORY_CLASSIFIER_VERSION,
-                )
-                for decision in resolution.classified_pairs
-            )
             if target is None or equivalence_proof is None:
                 continue
             corroboration_targets[claim_hash] = target
@@ -1600,7 +1574,6 @@ class MemoryEngine:
             access_context_hash=access_context_hash,
             actor_user_id=user_id,
             entity_ids_by_claim_hash=entity_ids_by_claim_hash,
-            preclassified_relations_by_claim_hash=preclassified_relations,
             source_updated_at=(
                 source_updated_at.isoformat()
                 if source_updated_at is not None
@@ -1968,7 +1941,6 @@ class MemoryEngine:
             entity_refs=raw.entity_refs,
             confidence=raw.confidence,
             corroboration_count=1,
-            contradiction_count=0,
             valid_from=parse_memory_validity_date(raw.valid_from),
             valid_until=parse_memory_validity_date(raw.valid_until),
             created_at=datetime.now(timezone.utc),

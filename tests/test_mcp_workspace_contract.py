@@ -8,7 +8,7 @@ from memforge import plugin_mcp_proxy as proxy
 def test_mcp_exposes_workspace_directory_and_optional_workspace_selector() -> None:
     tools = {tool["name"]: tool for tool in proxy.TOOLS}
 
-    assert len(tools) == 14
+    assert len(tools) == 16
     assert "list_workspaces" in tools
     assert "set_default_workspace" not in tools
     assert "validate_memory_review_decisions" in tools

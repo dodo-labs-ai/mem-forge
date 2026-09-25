@@ -7,16 +7,14 @@ from datetime import datetime, timezone
 
 import pytest
 
-from memforge.memory.evidence import RelationDirection
-from memforge.memory.relation_classifier import MemoryRelationType
 from memforge.memory.relation_discovery_contract import (
-    PreclassifiedRelationDecision,
     RelationDiscoveryRequest,
+    RelationDiscoveryWorkSelection,
+    RelationDiscoveryWorkState,
 )
 from memforge.models import (
     DocumentRecord,
     Memory,
-    MemoryReview,
     MemorySource,
     Visibility,
     content_hash,
@@ -29,11 +27,7 @@ from memforge.storage.adapters.sqlite.relational import SqliteRelationalStore
 from memforge.storage.admin_memory import MemoryAdminListFilters
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("omitted", [False, True])
-async def test_sqlite_relation_work_round_trips_preclassified_identity_decisions(
-    db: Database, omitted: bool,
-) -> None:
+async def _enqueue_relation_work(db: Database, *, work_id: str = "relation-work-1") -> Memory:
     await db.upsert_source(
         id="src-confluence",
         type="confluence",
@@ -45,7 +39,7 @@ async def test_sqlite_relation_work_round_trips_preclassified_identity_decisions
     challenger = _memory("mem-challenger")
     await db.insert_memory(challenger)
     await db.db.execute(
-        """INSERT INTO lifecycle_plans (
+        """INSERT OR IGNORE INTO lifecycle_plans (
                id, reconciliation_scope_id, source_id, source_unit_id,
                target_unit_revision_id, status, payload_json, payload_hash, created_at
            ) VALUES (?, ?, ?, ?, ?, 'applied', '{}', ?, ?)""",
@@ -59,44 +53,123 @@ async def test_sqlite_relation_work_round_trips_preclassified_identity_decisions
             "2026-07-22T00:00:00+00:00",
         ),
     )
-    request = RelationDiscoveryRequest(
-        id="relation-work-preclassified",
-        memory_id="mem-challenger",
-        expected_content_hash=challenger.content_hash,
-        source_id="src-confluence",
-        source_unit_id="unit-1",
-        source_unit_revision_id="unitrev-1",
-        doc_id="doc-1",
-        actor_user_id=None,
-        preclassified_decisions=(
-            PreclassifiedRelationDecision(
-                candidate_memory_id="mem-candidate",
-                expected_candidate_content_hash="candidate-hash",
-                expected_candidate_support_set_hash="support-hash",
-                expected_candidate_access_context_hash="candidate-access",
-                expected_challenger_access_context_hash="challenger-access",
-                relation_type=None if omitted else MemoryRelationType.REFINES,
-                direction=None if omitted else RelationDirection.CANDIDATE_TO_CHALLENGER,
-                reason="identity stage checked this pair",
-                classifier_version="memory-relation-v1",
-            ),
-        ),
-    )
-
     await db._enqueue_relation_discovery_work_unlocked(  # noqa: SLF001
         "plan-1",
-        request,
+        RelationDiscoveryRequest(
+            id=work_id,
+            memory_id=challenger.id,
+            expected_content_hash=challenger.content_hash,
+            source_id="src-confluence",
+            source_unit_id="unit-1",
+            source_unit_revision_id="unitrev-1",
+            doc_id="doc-1",
+            actor_user_id=None,
+        ),
         now="2026-07-22T00:00:00+00:00",
     )
     await db.db.commit()
+    return challenger
+
+
+async def _lease_one(db: Database, *, max_attempts: int = 3):
     [work] = await db.lease_relation_discovery_work(
         worker_id="relation-worker",
         limit=1,
         lease_seconds=60,
-        max_attempts=3,
+        max_attempts=max_attempts,
     )
+    return work
 
-    assert work.request.preclassified_decisions == request.preclassified_decisions
+
+@pytest.mark.asyncio
+async def test_sqlite_relation_work_records_the_last_failure_and_its_code(db: Database) -> None:
+    await _enqueue_relation_work(db)
+    first = await _lease_one(db)
+    assert (first.run_generation, first.error_code, first.classifier_version) == (0, None, None)
+    await db.fail_relation_discovery_work(
+        first.request.id,
+        worker_id="relation-worker",
+        lease_token=first.lease_token,
+        error="MemoryPairClassificationError: first failure",
+        error_code="output_invalid",
+        next_attempt_at=None,
+        exhausted=False,
+    )
+    second = await _lease_one(db)
+    await db.fail_relation_discovery_work(
+        second.request.id,
+        worker_id="relation-worker",
+        lease_token=second.lease_token,
+        error="TimeoutError: second failure",
+        error_code="TimeoutError",
+        next_attempt_at=None,
+        exhausted=False,
+    )
+    third = await _lease_one(db)
+
+    assert third.error == "TimeoutError: second failure"
+    assert third.error_code == "TimeoutError"
+
+    await db.obsolete_relation_discovery_work(
+        third.request.id,
+        worker_id="relation-worker",
+        lease_token=third.lease_token,
+        reason="challenger is no longer current",
+    )
+    rows = await db.db.execute_fetchall(
+        "SELECT status, error, error_code FROM relation_discovery_work WHERE id = ?",
+        (third.request.id,),
+    )
+    assert dict(rows[0]) == {
+        "status": "obsolete",
+        "error": "TimeoutError: second failure",
+        "error_code": "TimeoutError",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sqlite_relation_work_counts_exhausted_failed_and_completed_selections(db: Database) -> None:
+    await _enqueue_relation_work(db)
+    await db.db.executemany(
+        """INSERT INTO relation_discovery_work (
+               id, lifecycle_plan_id, memory_id, expected_content_hash, source_id,
+               source_unit_id, doc_id, status, attempts, error_code, classifier_version,
+               created_at, updated_at
+           ) SELECT ?, lifecycle_plan_id, memory_id, ?, source_id,
+                    source_unit_id, doc_id, ?, ?, ?, ?, created_at, ?
+               FROM relation_discovery_work WHERE id = 'relation-work-1'""",
+        [
+            ("work-exhausted-a", "hash-work-exhausted-a", "failed", 5, "output_invalid", None, "2026-07-23T00:00:00+00:00"),
+            ("work-exhausted-b", "hash-work-exhausted-b", "failed", 6, "TimeoutError", None, "2026-07-25T00:00:00+00:00"),
+            ("work-retrying", "hash-work-retrying", "failed", 2, "TimeoutError", None, "2026-07-23T00:00:00+00:00"),
+            ("work-done-v1", "hash-work-done-v1", "completed", 1, None, "memory-relation-v4-sparse", "2026-07-23T00:00:00+00:00"),
+            ("work-done-v2", "hash-work-done-v2", "completed", 1, None, "cross-document-relation-v1", "2026-07-23T00:00:00+00:00"),
+        ],
+    )
+    await db.db.commit()
+
+    def selection(state: RelationDiscoveryWorkState, **filters) -> RelationDiscoveryWorkSelection:
+        return RelationDiscoveryWorkSelection(state=state, max_attempts=5, **filters)
+
+    assert await db.count_relation_discovery_work(selection(RelationDiscoveryWorkState.EXHAUSTED)) == 2
+    assert await db.count_relation_discovery_work(selection(RelationDiscoveryWorkState.FAILED)) == 1
+    assert await db.count_relation_discovery_work(selection(RelationDiscoveryWorkState.COMPLETED)) == 2
+    assert await db.count_relation_discovery_work(
+        selection(RelationDiscoveryWorkState.EXHAUSTED, error_code="TimeoutError")
+    ) == 1
+    assert await db.count_relation_discovery_work(
+        selection(
+            RelationDiscoveryWorkState.EXHAUSTED,
+            updated_from=datetime(2026, 7, 24),
+            updated_to=datetime(2026, 7, 26, tzinfo=timezone.utc),
+        )
+    ) == 1
+    assert await db.count_relation_discovery_work(
+        selection(RelationDiscoveryWorkState.COMPLETED, classifier_version="memory-relation-v4-sparse")
+    ) == 1
+    assert await SqliteRelationalStore(db).count_relation_discovery_work(
+        selection(RelationDiscoveryWorkState.EXHAUSTED)
+    ) == 2
 
 
 @pytest.mark.asyncio
@@ -391,131 +464,6 @@ async def db(tmp_path):
 @pytest.mark.asyncio
 async def test_satisfies_relational_store_protocol(db):
     assert isinstance(SqliteRelationalStore(db), RelationalStore)
-
-
-@pytest.mark.asyncio
-async def test_conflict_contexts_derive_approved_and_rejected_review_dispositions(db):
-    incumbent = _memory("mem-conflict-incumbent")
-    approved_counterpart = _memory("mem-conflict-approved")
-    rejected_counterpart = _memory("mem-conflict-rejected")
-    for memory in (incumbent, approved_counterpart, rejected_counterpart):
-        await db.insert_memory(memory)
-    await db.insert_memory_review(
-        MemoryReview(
-            id="review-conflict-approved",
-            kind="cross_source_conflict",
-            status="approved",
-            incumbent_memory_id=incumbent.id,
-            challenger_memory_id=approved_counterpart.id,
-            reason="The claims assert incompatible payroll deadlines.",
-            review_note="Confirmed after comparing both source policies.",
-            reviewer="reviewer-1",
-            resolved_at=datetime.now(timezone.utc),
-        )
-    )
-    await db.insert_memory_review(
-        MemoryReview(
-            id="review-conflict-rejected",
-            kind="cross_source_conflict",
-            status="rejected",
-            incumbent_memory_id=incumbent.id,
-            challenger_memory_id=rejected_counterpart.id,
-            reason="The claims appeared inconsistent before scope review.",
-            review_note="Different payroll areas; not a conflict.",
-            reviewer="reviewer-2",
-            resolved_at=datetime.now(timezone.utc),
-        )
-    )
-
-    contexts = await SqliteRelationalStore(db).list_memory_conflict_contexts(
-        (incumbent.id, approved_counterpart.id),
-        AccessScope(
-            user_id=LOCAL_DEV_USER_ID,
-            include_private=False,
-            allowed_statuses=("active",),
-            active_project=None,
-            scope_mode="workspace",
-        ),
-    )
-
-    assert [(item.review_id, item.disposition) for item in contexts[incumbent.id]] == [
-        ("review-conflict-rejected", "dismissed"),
-        ("review-conflict-approved", "confirmed"),
-    ]
-    [reverse] = contexts[approved_counterpart.id]
-    assert reverse.counterpart_memory_id == incumbent.id
-    assert reverse.counterpart_summary == incumbent.content
-    assert reverse.disposition == "confirmed"
-
-
-@pytest.mark.asyncio
-async def test_conflict_contexts_do_not_expose_an_invisible_counterpart(db):
-    visible = _memory("mem-conflict-visible")
-    private = _memory(
-        "mem-conflict-private",
-        visibility=Visibility.PRIVATE.value,
-        owner_user_id="another-user",
-    )
-    await db.insert_memory(visible)
-    await db.insert_memory(private)
-    await db.insert_memory_review(
-        MemoryReview(
-            id="review-conflict-private",
-            kind="cross_source_conflict",
-            status="approved",
-            incumbent_memory_id=visible.id,
-            challenger_memory_id=private.id,
-            reason="Private counterpart must not leak.",
-        )
-    )
-
-    contexts = await SqliteRelationalStore(db).list_memory_conflict_contexts(
-        (visible.id,),
-        AccessScope(
-            user_id=LOCAL_DEV_USER_ID,
-            include_private=True,
-            allowed_statuses=("active",),
-            active_project=None,
-            scope_mode="workspace",
-        ),
-    )
-
-    assert contexts == {visible.id: ()}
-
-
-@pytest.mark.asyncio
-async def test_conflict_contexts_derive_dynamic_staleness_without_mutating_review(db):
-    incumbent = _memory("mem-conflict-stale-a")
-    counterpart = _memory("mem-conflict-stale-b")
-    await db.insert_memory(incumbent)
-    await db.insert_memory(counterpart)
-    await db.insert_memory_review(
-        MemoryReview(
-            id="review-conflict-stale",
-            kind="cross_source_conflict",
-            status="pending",
-            incumbent_memory_id=incumbent.id,
-            challenger_memory_id=counterpart.id,
-            expected_incumbent_updated_at="2000-01-01T00:00:00+00:00",
-            expected_challenger_updated_at=counterpart.updated_at.isoformat(),
-        )
-    )
-
-    contexts = await SqliteRelationalStore(db).list_memory_conflict_contexts(
-        (incumbent.id,),
-        AccessScope(
-            user_id=LOCAL_DEV_USER_ID,
-            include_private=False,
-            allowed_statuses=("active",),
-            active_project=None,
-            scope_mode="workspace",
-        ),
-    )
-
-    [context] = contexts[incumbent.id]
-    assert context.review_status == "stale"
-    assert context.disposition == "stale"
-    assert (await db.get_memory_review("review-conflict-stale")).status == "pending"
 
 
 @pytest.mark.asyncio
@@ -1637,3 +1585,104 @@ async def test_add_memory_source_links_provenance(db):
     await store.add_memory_source("m1", "doc1", "confluence", "an excerpt", source_updated_at=None)
     sources = await db.get_memory_sources("m1")
     assert [s.doc_id for s in sources] == ["doc1"]
+
+
+@pytest.mark.asyncio
+async def test_relation_work_migration_backfills_codes_and_classifier_versions(db: Database) -> None:
+    from memforge.memory.evidence import EvidenceContentProvenance, EvidenceUnit
+
+    await _enqueue_relation_work(db)
+    await db.upsert_evidence_unit(
+        EvidenceUnit(
+            id="eu-migration",
+            source_id="src-confluence",
+            doc_id="doc-1",
+            doc_revision_id="rev-1",
+            source_type="confluence",
+            source_anchor=None,
+            source_lineage_id="unit-1",
+            project_key=None,
+            visibility="workspace",
+            owner_user_id=None,
+            repo_identifier=None,
+            content="Evidence",
+            excerpt="Evidence",
+            evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,
+        )
+    )
+    await db.db.execute("DROP INDEX idx_relation_discovery_work_state")
+    for column in ("error_code", "run_generation", "classifier_version"):
+        await db.db.execute(f"ALTER TABLE relation_discovery_work DROP COLUMN {column}")
+    await db.db.execute(
+        "ALTER TABLE relation_discovery_work ADD COLUMN preclassified_decisions_json TEXT NOT NULL DEFAULT '[]'"
+    )
+    await db.db.executemany(
+        """INSERT INTO relation_discovery_work (
+               id, lifecycle_plan_id, memory_id, expected_content_hash, source_id,
+               source_unit_id, doc_id, status, attempts, error, created_at, updated_at
+           ) SELECT ?, lifecycle_plan_id, memory_id, ?, source_id, source_unit_id, doc_id,
+                    ?, ?, ?, created_at, updated_at
+               FROM relation_discovery_work WHERE id = 'relation-work-1'""",
+        [
+            ("work-completed", "hash-completed", "completed", 1, None),
+            ("work-failed", "hash-failed", "failed", 5, "MemoryPairClassificationError: output_invalid"),
+        ],
+    )
+    for run_id, completed_at in (("run-older", "2026-07-01T00:00:00+00:00"), ("run-newer", "2026-07-02T00:00:00+00:00")):
+        await db.db.execute(
+            """INSERT INTO relation_runs (
+                   id, evidence_unit_id, classifier_version, status, audit_json, completed_at
+               ) VALUES (?, 'eu-migration', ?, 'checked', ?, ?)""",
+            (run_id, f"classifier-{run_id}", '{"work_id": "work-completed"}', completed_at),
+        )
+    await db.db.execute("DELETE FROM schema_migrations WHERE version = 95")
+    await db.db.commit()
+
+    await db._run_migrations()  # noqa: SLF001
+
+    columns = {row[1] for row in await db.db.execute_fetchall("PRAGMA table_info(relation_discovery_work)")}
+    assert "preclassified_decisions_json" not in columns
+    rows = {
+        row["id"]: dict(row)
+        for row in await db.db.execute_fetchall(
+            "SELECT id, error_code, run_generation, classifier_version FROM relation_discovery_work"
+        )
+    }
+    assert rows["work-completed"]["classifier_version"] == "classifier-run-newer"
+    assert rows["work-failed"]["error_code"] == "MemoryPairClassificationError"
+    assert rows["relation-work-1"] == {
+        "id": "relation-work-1",
+        "error_code": None,
+        "run_generation": 0,
+        "classifier_version": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_purging_a_memory_removes_its_relations_and_dismissals(db: Database) -> None:
+    low, high, other = _memory("mem-a"), _memory("mem-b"), _memory("mem-c")
+    for memory in (low, high, other):
+        await db.insert_memory(memory)
+    decided_at = "2026-07-20T00:00:00+00:00"
+    for pair in ((low, high), (high, other)):
+        await db.db.execute(
+            """INSERT INTO cross_document_relations (
+                   memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
+                   decided_by, decided_at
+               ) VALUES (?, ?, 'contradicts', ?, ?, 'classifier', ?)""",
+            (pair[0].id, pair[1].id, pair[0].content_hash, pair[1].content_hash, decided_at),
+        )
+    await db.db.execute(
+        """INSERT INTO cross_document_relation_dismissals (
+               id, memory_low_id, memory_high_id, label, low_content_hash, high_content_hash,
+               dismissed_by, dismissed_at
+           ) VALUES ('dismissal-1', ?, ?, 'contradicts', ?, ?, 'reader', ?)""",
+        (low.id, high.id, low.content_hash, high.content_hash, decided_at),
+    )
+    await db.db.commit()
+
+    await db.purge_memory(low.id)
+
+    remaining = await db.db.execute_fetchall("SELECT memory_low_id, memory_high_id FROM cross_document_relations")
+    assert [tuple(row) for row in remaining] == [(high.id, other.id)]
+    assert await db.db.execute_fetchall("SELECT id FROM cross_document_relation_dismissals") == []

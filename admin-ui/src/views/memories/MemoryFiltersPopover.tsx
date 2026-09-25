@@ -21,16 +21,19 @@ interface MemoryFiltersPopoverProps {
   status: string;
   source: string;
   project: string;
+  relation: string;
   projectLabel: string;
   narrowProject: boolean;
   typeOptions: FilterOption[];
   statusOptions: FilterOption[];
   sourceOptions: FilterOption[];
   projectOptions: FilterOption[];
+  relationOptions: FilterOption[];
   onTypeChange: (value: string) => void;
   onStatusChange: (value: string) => void;
   onSourceChange: (value: string) => void;
   onProjectChange: (value: string) => void;
+  onRelationChange: (value: string) => void;
   onNarrowProjectChange: (value: boolean) => void;
   onClear: () => void;
 }
@@ -78,23 +81,29 @@ export function MemoryFiltersPopover({
   status,
   source,
   project,
+  relation,
   projectLabel,
   narrowProject,
   typeOptions,
   statusOptions,
   sourceOptions,
   projectOptions,
+  relationOptions,
   onTypeChange,
   onStatusChange,
   onSourceChange,
   onProjectChange,
+  onRelationChange,
   onNarrowProjectChange,
   onClear,
 }: MemoryFiltersPopoverProps) {
-  const activeFilterCount = [type, status, source, project].filter(
-    (value) => value !== "all",
-  ).length;
-  const hasProjectFilter = project !== "all";
+  // A relation filter lists relations instead of Memories, and the Memory
+  // filters do not apply to that list.
+  const relationView = relation !== "all";
+  const activeFilterCount = relationView
+    ? 1
+    : [type, status, source, project].filter((value) => value !== "all").length;
+  const hasProjectFilter = !relationView && project !== "all";
 
   return (
     <PopoverPrimitive.Root>
@@ -143,29 +152,39 @@ export function MemoryFiltersPopover({
             </div>
 
             <div className="grid grid-cols-1 gap-3 min-[420px]:grid-cols-2">
+              {!relationView && (
+                <>
+                  <FilterField
+                    label="Type"
+                    value={type}
+                    options={typeOptions}
+                    onChange={onTypeChange}
+                  />
+                  <FilterField
+                    label="Status"
+                    value={status}
+                    options={statusOptions}
+                    onChange={onStatusChange}
+                  />
+                  <FilterField
+                    label="Source"
+                    value={source}
+                    options={sourceOptions}
+                    onChange={onSourceChange}
+                  />
+                  <FilterField
+                    label="Project"
+                    value={project}
+                    options={projectOptions}
+                    onChange={onProjectChange}
+                  />
+                </>
+              )}
               <FilterField
-                label="Type"
-                value={type}
-                options={typeOptions}
-                onChange={onTypeChange}
-              />
-              <FilterField
-                label="Status"
-                value={status}
-                options={statusOptions}
-                onChange={onStatusChange}
-              />
-              <FilterField
-                label="Source"
-                value={source}
-                options={sourceOptions}
-                onChange={onSourceChange}
-              />
-              <FilterField
-                label="Project"
-                value={project}
-                options={projectOptions}
-                onChange={onProjectChange}
+                label="Relation"
+                value={relation}
+                options={relationOptions}
+                onChange={onRelationChange}
               />
             </div>
 

@@ -20,9 +20,8 @@ from memforge.models import (
     Entity,
     EntityAlias,
     Memory,
-    MemoryConflictContext,
-    MemoryReview,
     MemorySource,
+    MemorySourceRef,
     Project,
     SourceLifecycleResetResult,
 )
@@ -38,6 +37,7 @@ from memforge.memory.evidence import (
     RelationOutcomeBundle,
 )
 from memforge.memory.audit import MemoryAuditEvent
+from memforge.memory.cross_document_relation import CrossDocumentRelationOutcome, CurrentCrossDocumentRelation
 from memforge.memory.lifecycle_plan import (
     LegacyMemoryProvenance,
     LifecycleCutoverFinding,
@@ -49,7 +49,10 @@ from memforge.memory.lifecycle_plan import (
     LifecycleReviewStatus,
     LifecycleVectorTask,
 )
-from memforge.memory.relation_discovery_contract import RelationDiscoveryWork
+from memforge.memory.relation_discovery_contract import (
+    RelationDiscoveryWork,
+    RelationDiscoveryWorkSelection,
+)
 from memforge.memory.review_decision import ReviewVectorTask
 from memforge.source_projection import (
     ProjectionCoverage,
@@ -378,11 +381,27 @@ class RelationalStore(Protocol):
         self,
         memory_ids: Sequence[str],
     ) -> Mapping[str, tuple[str, ...]]: ...
-    async def list_memory_conflict_contexts(
+    async def get_memory_source_refs_many(
         self,
         memory_ids: Sequence[str],
         scope: AccessScope,
-    ) -> Mapping[str, tuple[MemoryConflictContext, ...]]: ...
+    ) -> Mapping[str, tuple[MemorySourceRef, ...]]:
+        """Return each Memory's Sources that the caller may read, virtual Sources included."""
+        ...
+
+    async def list_cross_document_relations(
+        self,
+        memory_ids: Sequence[str],
+        scope: AccessScope,
+    ) -> Mapping[str, tuple[CurrentCrossDocumentRelation, ...]]:
+        """Return up to MAX_RELATIONS_PER_MEMORY current relations per Memory.
+
+        A relation is current when both Memories are active and visible under
+        ``scope``, both contents equal the stored hashes, and no dismissal that
+        is not undone names the same label and both hashes. Rows are ordered by
+        RELATION_READ_ORDER, then newest decision first.
+        """
+        ...
     async def get_memory_entity_ids(self, memory_id: str) -> list[int]: ...
     async def get_current_relation_evidence_unit(
         self,
@@ -883,8 +902,8 @@ class RelationalStore(Protocol):
         *,
         worker_id: str,
         lease_token: str,
-        relation_outcome: RelationOutcomeBundle,
-        reviews: Sequence[MemoryReview] = (),
+        relation_run: RelationOutcomeBundle,
+        document_relations: CrossDocumentRelationOutcome,
     ) -> None: ...
     async def fail_relation_discovery_work(
         self,
@@ -893,9 +912,14 @@ class RelationalStore(Protocol):
         worker_id: str,
         lease_token: str,
         error: str,
+        error_code: str,
         next_attempt_at: str | None,
         exhausted: bool,
     ) -> None: ...
+    async def count_relation_discovery_work(
+        self,
+        selection: RelationDiscoveryWorkSelection,
+    ) -> int: ...
     async def obsolete_relation_discovery_work(
         self,
         work_id: str,

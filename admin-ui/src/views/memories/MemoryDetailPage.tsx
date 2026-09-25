@@ -12,6 +12,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { formatDateTime, timeAgo } from "@/utils/date";
 import { getLifecycleDetail, type LifecycleDetail } from "./lifecycle";
+import { MemoryRelationsCard } from "./MemoryRelationsCard";
 
 const STATUS_LABELS: Record<string, string> = {
   active: "Active",
@@ -166,6 +167,8 @@ export function MemoryDetailPage() {
       </Card>
 
       {lifecycleDetail && <LifecycleCard detail={lifecycleDetail} />}
+
+      <MemoryRelationsCard memory={memory} />
 
       <Card>
         <CardHeader>

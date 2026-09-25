@@ -74,7 +74,6 @@ class TestMemoryDataclass:
         assert mem.status == "active"
         assert mem.confidence == 0.7
         assert mem.corroboration_count == 1
-        assert mem.contradiction_count == 0
         assert mem.entity_refs == []
 
     def test_custom_values(self):
