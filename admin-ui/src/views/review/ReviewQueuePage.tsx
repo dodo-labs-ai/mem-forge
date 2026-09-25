@@ -17,7 +17,7 @@ import {
   type ReviewCueExcerpt,
 } from "@/views/review/reviewQueueCue";
 
-type ReviewQueueFilter = "all" | "lifecycle" | "cross_source_conflict" | "supersede";
+type ReviewQueueFilter = "all" | "lifecycle" | "memory";
 
 function useReviewQueue(page: number, filter: ReviewQueueFilter) {
   return useQuery<MemoryReviewListResponse>({
@@ -27,11 +27,7 @@ function useReviewQueue(page: number, filter: ReviewQueueFilter) {
         .get("/memory-reviews", {
           params: {
             status: "open",
-            origin: filter === "lifecycle" ? "lifecycle" : undefined,
-            kind:
-              filter === "cross_source_conflict" || filter === "supersede"
-                ? filter
-                : undefined,
+            origin: filter === "all" ? undefined : filter,
             limit: REVIEW_QUEUE_PAGE_SIZE,
             offset: page * REVIEW_QUEUE_PAGE_SIZE,
           },
@@ -68,9 +64,7 @@ export function ReviewQueuePage() {
   const page = pageFromSearchParams(searchParams);
   const rawFilter = searchParams.get("filter");
   const filter: ReviewQueueFilter =
-    rawFilter === "lifecycle" ||
-    rawFilter === "cross_source_conflict" ||
-    rawFilter === "supersede"
+    rawFilter === "lifecycle" || rawFilter === "memory"
       ? rawFilter
       : "all";
   const queueQuery = useReviewQueue(page, filter);
@@ -99,7 +93,7 @@ export function ReviewQueuePage() {
     <div className="space-y-4">
       <PageHeader
         title="Review queue"
-        description="Resolve lifecycle proposals and conflict findings. Open a Review for evidence, consequences, and technical details."
+        description="Resolve lifecycle proposals and Memory updates. Open a Review for evidence, consequences, and technical details."
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <label className="sr-only" htmlFor="review-queue-filter">
@@ -113,8 +107,7 @@ export function ReviewQueuePage() {
             >
               <option value="all">All decisions</option>
               <option value="lifecycle">Source lifecycle</option>
-              <option value="cross_source_conflict">Cross-source conflicts</option>
-              <option value="supersede">Memory updates</option>
+              <option value="memory">Memory updates</option>
             </select>
             <Button type="button" variant="outline" onClick={() => queueQuery.refetch()}>
               <RefreshCw className="size-4" />

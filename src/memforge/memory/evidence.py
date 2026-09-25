@@ -470,13 +470,6 @@ class LifecycleAction(str, Enum):
     RETIRE_MEMORY = "retire_memory"
 
 
-class RelationProjectionPlane(str, Enum):
-    """Owner of one update to the current Evidence Relation projection."""
-
-    LIFECYCLE = "lifecycle"
-    DISCOVERY = "discovery"
-
-
 class ReviewCase(str, Enum):
     LEGACY_LIMITED_EVIDENCE = "legacy_limited_evidence"
     MISSING_CONTENT_PROVENANCE = "missing_content_provenance"
@@ -709,7 +702,7 @@ class RelationCandidateRecord:
 
 @dataclass(frozen=True, slots=True)
 class RelationOutcomeBundle:
-    """Complete relation-audit write set for one lifecycle decision."""
+    """Complete relation-audit write set for one lifecycle decision or discovery run."""
 
     evidence_unit: EvidenceUnit
     relation_run: RelationRunRecord
@@ -1008,12 +1001,6 @@ def build_candidate_universe(
     )
 
 
-def _same_agent_claim(unit: EvidenceUnit, candidate: CandidateMemory) -> bool:
-    unit_anchor = unit.source_metadata.get("claim_anchor")
-    candidate_anchor = candidate.source_metadata.get("claim_anchor")
-    return bool(unit_anchor and candidate_anchor and unit_anchor == candidate_anchor)
-
-
 def _source_is_visible(candidate: CandidateMemory, access_context: AccessContext) -> bool:
     return candidate.source_id is None or candidate.source_id in access_context.source_subscriptions
 
@@ -1032,60 +1019,6 @@ def _private_scope_is_allowed(
     if unit.repo_identifier and candidate.repo_identifier and unit.repo_identifier != candidate.repo_identifier:
         return False
     return True
-
-
-def classify_authority_case(
-    unit: EvidenceUnit,
-    candidate: CandidateMemory,
-    matched_bucket: CandidateBucket,
-    relation_type: RelationType,
-    access_context: AccessContext,
-) -> AuthorityCase:
-    """Classify lifecycle authority with deterministic scope rules.
-
-    The semantic classifier can say two items are related, but only this boundary
-    decides whether the relation is allowed to affect durable Memory state.
-    """
-    if not _source_is_visible(candidate, access_context):
-        return AuthorityCase.CROSS_SCOPE_BLOCKED
-    if not _private_scope_is_allowed(unit, candidate, access_context):
-        return AuthorityCase.CROSS_SCOPE_BLOCKED
-
-    if matched_bucket is CandidateBucket.SAME_AGENT_CLAIM and _same_agent_claim(unit, candidate):
-        return AuthorityCase.SAME_AGENT_CLAIM
-
-    if (
-        unit.doc_id
-        and candidate.doc_id
-        and unit.doc_id == candidate.doc_id
-        and unit.doc_revision_id
-        and candidate.doc_revision_id
-        and unit.doc_revision_id == candidate.doc_revision_id
-    ):
-        return AuthorityCase.SAME_DOCUMENT_REVISION
-
-    if unit.source_lineage_id and unit.source_lineage_id == candidate.source_lineage_id:
-        return AuthorityCase.SAME_SOURCE_LINEAGE
-
-    if relation_type is RelationType.CONTRADICTS:
-        if unit.source_id and candidate.source_id and unit.source_id != candidate.source_id:
-            return AuthorityCase.CROSS_SOURCE_CONFLICT
-        return AuthorityCase.INDEPENDENT_CONFLICT
-
-    if (
-        unit.visibility == "private"
-        and candidate.visibility == "private"
-        and unit.owner_user_id == candidate.owner_user_id == access_context.actor_user_id
-        and unit.repo_identifier
-        and unit.repo_identifier == candidate.repo_identifier == access_context.repo_identifier
-    ):
-        return AuthorityCase.SAME_PRIVATE_REPO_SCOPE
-
-    if relation_type is RelationType.REFINES:
-        return AuthorityCase.INDEPENDENT_REFINEMENT
-    if relation_type in (RelationType.SUPPORTS, RelationType.EQUIVALENT):
-        return AuthorityCase.INDEPENDENT_SUPPORT
-    return AuthorityCase.CROSS_SCOPE_BLOCKED
 
 
 class MemoryRelationApplyService:
@@ -1125,18 +1058,6 @@ class MemoryRelationApplyService:
                 target_memory_id=first.candidate_memory_id,
             )
 
-        cross_source_conflicts = [
-            decision
-            for decision in decisions
-            if decision.relation_type is RelationType.CONTRADICTS
-            and decision.authority_case is AuthorityCase.CROSS_SOURCE_CONFLICT
-        ]
-        if cross_source_conflicts:
-            return LifecycleDecision(
-                action=LifecycleAction.CREATE_REVIEW,
-                target_memory_id=cross_source_conflicts[0].candidate_memory_id,
-            )
-
         if self._has_attachable_support(decisions):
             return LifecycleDecision(action=LifecycleAction.ATTACH_SUPPORT)
 
@@ -1167,13 +1088,6 @@ class MemoryRelationApplyService:
         if any(decision.proposed_memory_content for decision in decisions):
             if unit.evidence_provenance is not EvidenceContentProvenance.SOURCE_EXCERPT or not unit.excerpt:
                 return ReviewCase.MISSING_CONTENT_PROVENANCE
-
-        if any(
-            decision.relation_type is RelationType.REFINES
-            and decision.authority_case is AuthorityCase.INDEPENDENT_REFINEMENT
-            for decision in decisions
-        ):
-            return ReviewCase.NON_AUTHORITATIVE_REFINEMENT
 
         return None
 

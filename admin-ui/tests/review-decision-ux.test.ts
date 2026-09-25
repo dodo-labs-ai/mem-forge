@@ -39,7 +39,7 @@ assert.match(queue, /offset: page \* REVIEW_QUEUE_PAGE_SIZE/);
 assert.match(queue, /<Pagination/);
 assert.match(queue, /searchParams\.get\("page"\)/);
 assert.match(queue, /review-queue-filter/);
-assert.match(queue, /cross_source_conflict/);
+assert.doesNotMatch(queue, /cross_source_conflict/);
 assert.match(queue, /Source lifecycle/);
 assert.doesNotMatch(queue, /review\.presentation\.why_human/);
 assert.doesNotMatch(queue, /CardContent/);

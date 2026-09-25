@@ -26,7 +26,6 @@ from memforge.memory.lifecycle_plan import (
     StaleGuard,
 )
 from memforge.memory.relation_discovery_contract import (
-    PreclassifiedRelationDecision,
     RelationDiscoveryRequest,
     relation_discovery_request_id,
     resolve_relation_discovery_actor_user_id,
@@ -52,9 +51,6 @@ class NewMemoryDefaults:
     access_context_hash: str
     actor_user_id: str | None = None
     entity_ids_by_claim_hash: Mapping[str, tuple[int, ...]] | None = None
-    preclassified_relations_by_claim_hash: Mapping[
-        str, tuple[PreclassifiedRelationDecision, ...]
-    ] | None = None
     source_updated_at: str | None = None
 
 
@@ -136,20 +132,10 @@ def build_lifecycle_plan(
             return ()
         return defaults.entity_ids_by_claim_hash.get(content_hash(raw.content.strip()), ())
 
-    def preclassified_relations_for(
-        raw: RawMemory,
-    ) -> tuple[PreclassifiedRelationDecision, ...]:
-        if defaults.preclassified_relations_by_claim_hash is None:
-            return ()
-        return defaults.preclassified_relations_by_claim_hash.get(
-            content_hash(raw.content.strip()), ()
-        )
-
     def request_relation_discovery(
         memory_id: str,
         expected_content_hash: str,
         entity_ids: tuple[int, ...] = (),
-        preclassified_decisions: tuple[PreclassifiedRelationDecision, ...] = (),
     ) -> None:
         relation_discovery_requests.append(
             RelationDiscoveryRequest(
@@ -166,7 +152,6 @@ def build_lifecycle_plan(
                 doc_id=defaults.doc_id,
                 actor_user_id=relation_discovery_actor_user_id,
                 entity_ids=entity_ids,
-                preclassified_decisions=preclassified_decisions,
             )
         )
 
@@ -234,7 +219,6 @@ def build_lifecycle_plan(
                 memory_id,
                 content_hash(raw.content.strip()),
                 entity_ids_for(raw),
-                preclassified_relations_for(raw),
             )
         return memory_id
 

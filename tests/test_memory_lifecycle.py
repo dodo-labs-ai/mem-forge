@@ -563,12 +563,6 @@ class TestHardPurge:
             (memory.id, entity_id),
         )
         await db.db.execute(
-            """INSERT INTO memory_contradictions
-               (memory_id_a, memory_id_b, classification, reason)
-               VALUES (?, ?, ?, ?)""",
-            (memory.id, dependent.id, "contradiction", "test"),
-        )
-        await db.db.execute(
             """UPDATE memories SET
                 status = 'superseded',
                 superseded_by = ?,
@@ -588,11 +582,6 @@ class TestHardPurge:
         async with db.db.execute("SELECT COUNT(*) FROM memories_fts WHERE memory_id = ?", (memory.id,)) as cursor:
             assert (await cursor.fetchone())[0] == 0
         async with db.db.execute("SELECT COUNT(*) FROM memory_entities WHERE memory_id = ?", (memory.id,)) as cursor:
-            assert (await cursor.fetchone())[0] == 0
-        async with db.db.execute(
-            "SELECT COUNT(*) FROM memory_contradictions WHERE memory_id_a = ? OR memory_id_b = ?",
-            (memory.id, memory.id),
-        ) as cursor:
             assert (await cursor.fetchone())[0] == 0
 
         stored_dependent = await db.get_memory(dependent.id)

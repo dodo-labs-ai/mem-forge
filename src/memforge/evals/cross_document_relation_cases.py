@@ -30,7 +30,9 @@ from memforge.memory.cross_document_relation import (
     primary_evidence_unit,
 )
 from memforge.memory.cross_source_conflict_reviews import (
+    REVIEW_DECISION_LABELS,
     CrossSourceConflictReviewStore,
+    decided_review_labels,
     list_cross_source_conflict_reviews,
     review_memories_unchanged,
 )
@@ -39,11 +41,6 @@ from memforge.models import Memory, MemoryReview, ReviewStatus, Visibility
 RELATION_CASE_POLICY_VERSION = "cross-document-relation-cases-v2"
 RELATION_CASE_GROUP_KEY = "cross_document_relation"
 
-# A person's decision on a Cross-Source Conflict Review, as a relation label.
-_REVIEW_DECISION_LABELS = {
-    ReviewStatus.APPROVED.value: CrossDocumentRelationLabel.CONTRADICTS,
-    ReviewStatus.REJECTED.value: CrossDocumentRelationLabel.NONE,
-}
 # A dismissed finding is a recorded false positive; a confirmed one is a
 # representative true finding.
 _REVIEW_DECISION_POPULATIONS = {
@@ -94,12 +91,10 @@ async def seed_cross_document_relation_cases(
 
     reviews = [
         review
-        for status in _REVIEW_DECISION_LABELS
+        for status in REVIEW_DECISION_LABELS
         for review in await list_cross_source_conflict_reviews(store, status=status)
     ]
-    unknown = sorted(set(label_overrides) - {review.id for review in reviews})
-    if unknown:
-        raise ValueError("label overrides name no decided cross-source Review: " + ", ".join(unknown))
+    labels = decided_review_labels(reviews, label_overrides)
     pinned: list[_PinnedCase] = []
     skipped = {reason.value: 0 for reason in RelationCaseSkip}
     for review in reviews:
@@ -108,7 +103,7 @@ async def seed_cross_document_relation_cases(
             evaluation,
             review=review,
             actor=actor,
-            label=label_overrides.get(review.id, _REVIEW_DECISION_LABELS[review.status]),
+            label=labels[review.id],
         )
         if isinstance(outcome, RelationCaseSkip):
             skipped[outcome.value] += 1

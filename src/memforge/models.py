@@ -188,7 +188,6 @@ class Memory:
     # Confidence and lifecycle
     confidence: float = 0.7
     corroboration_count: int = 1
-    contradiction_count: int = 0
     valid_from: date | None = None
     valid_until: date | None = None
     created_at: datetime | None = None
@@ -616,29 +615,40 @@ class ChangelogEntry:
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryConflictContext:
-    """A visibility-safe Review disposition for one cross-source claim pair."""
+class MemorySourceRef:
+    """One Source a Memory comes from, as a reader may name it."""
 
-    review_id: str
-    counterpart_memory_id: str
-    counterpart_summary: str
-    review_status: str
-    disposition: str
-    reason: str | None = None
-    review_note: str | None = None
-    reviewer: str | None = None
-    resolved_at: str | None = None
+    source_id: str
+    source_type: str
+    name: str | None = None
 
 
-def conflict_disposition_for_review_status(review_status: str) -> str:
-    """Map durable Review status to the retrieval-facing pair disposition."""
+@dataclass(frozen=True, slots=True)
+class RelatedMemory:
+    """One Memory of a Cross-Document Relation, as the caller may see it."""
 
-    return {
-        "approved": "confirmed",
-        "rejected": "dismissed",
-        "pending": "pending",
-        "stale": "stale",
-    }.get(review_status, "stale")
+    memory_id: str
+    summary: str
+    content_hash: str
+    sources: tuple[MemorySourceRef, ...] = ()
+    # Newest source revision time of the Memory's current Support.
+    revision_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRelationContext:
+    """One current Cross-Document Relation, read from one of its two Memories.
+
+    ``label`` is the label a reader sees: an ``updates`` pair whose source
+    revision times do not order it reads as ``contradicts``. ``role`` is this
+    Memory's side: ``newer`` or ``older`` for ``updates``, ``peer`` otherwise.
+    """
+
+    label: str
+    role: str
+    counterpart: RelatedMemory
+    reason: str
+    decided_by: str
 
 
 @dataclass
@@ -654,8 +664,8 @@ class SearchResult:
     corroborated_by: int = 1
     last_observed_at: str | None = None
     freshness: str = "current"  # current | stale | unverified
-    contradiction_warning: str | None = None
-    conflict_contexts: tuple[MemoryConflictContext, ...] = ()
+    relation_notice: str | None = None
+    relations: tuple[MemoryRelationContext, ...] = ()
     status: str = "active"
     repo_identifier: str | None = None
     follow_up: dict[str, str] | None = None
@@ -689,7 +699,6 @@ class ReviewStatus(str, Enum):
 
 class ReviewKind(str, Enum):
     SUPERSEDE = "supersede"
-    CROSS_SOURCE_CONFLICT = "cross_source_conflict"
 
 
 def generate_review_id() -> str:

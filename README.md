@@ -28,7 +28,8 @@ while preserving source evidence and history.
 
 AI coding assistants often start each session blind to institutional context.
 MemForge bridges that gap through MCP-enabled agent plugins, an admin API, and
-integrations, with review flows for superseded facts and contradictions.
+integrations, with review flows for superseded facts and notices when documents
+conflict or one updates another.
 
 ## What It Does
 
