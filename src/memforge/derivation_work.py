@@ -12,7 +12,9 @@ from pydantic import BaseModel
 if TYPE_CHECKING:
     from memforge.llm.batch_runner import ItemFailure, LlmRequest
 
-WorkKind = Literal["support_assess", "support_scan", "support_reduce", "support_finalize", "claim_assess"]
+WorkKind = Literal[
+    "support_assess", "support_scan", "support_reduce", "support_finalize", "claim_assess", "change_impact",
+]
 
 
 def payload_hash(payload: Any) -> str:

@@ -1051,6 +1051,10 @@ class MemoryEngine:
             "support_revalidation_prompt_chars": 0,
             "support_revalidation_supported_count": 0,
             "support_revalidation_program_rebind_count": 0,
+            "support_revalidation_change_impact_request_count": 0,
+            "support_revalidation_change_impact_unaffected_count": 0,
+            "support_revalidation_change_impact_affected_count": 0,
+            "support_revalidation_change_impact_failed_count": 0,
             "support_revalidation_unresolved_partial_coverage_count": 0,
             "support_revalidation_unresolved_capacity_count": 0,
             "support_revalidation_unusable_baseline_count": 0,
@@ -1275,6 +1279,11 @@ class MemoryEngine:
                     stats["support_revalidation_reused_work_count"] = evaluator.reused
                     stats["support_revalidation_covered_source_claim_pairs"] = evaluator.covered_source_claim_pairs
                     stats["support_revalidation_program_rebind_count"] = evaluator.program_rebind_count
+                    stats["support_revalidation_change_impact_request_count"] = evaluator.stage_counts["change_impact"]
+                    impact_counts = evaluator.change_impact_counts
+                    stats["support_revalidation_change_impact_unaffected_count"] = impact_counts["unaffected"]
+                    stats["support_revalidation_change_impact_affected_count"] = impact_counts["affected"]
+                    stats["support_revalidation_change_impact_failed_count"] = impact_counts["failed"]
                     _runtime_context.model_call_count += evaluator.calls
                 stats["support_revalidation_completion_count"] = len(evaluator.final_work_ids)
                 required_derivation_work_ids = tuple(evaluator.final_work_ids) if derivation_id else ()

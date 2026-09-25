@@ -5,13 +5,14 @@ from dataclasses import replace
 
 import pytest
 
+from memforge.llm.structured import ChangeImpactWireResponse
 from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
 from memforge.models import Memory, content_hash
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.reconciler import ReconciliationContractError
 from memforge.pipeline.projection_fragments import SupportRevalidationLimitation
 from memforge.source_projection import ProjectionCoverage
-from tests.revision_client_fixture import continued, supported
+from tests.revision_client_fixture import change_impact_response, continued, supported
 from tests.test_projection_fragments import _projection
 
 
@@ -85,6 +86,8 @@ class Client:
         return "fixture-policy"
 
     async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+        if response_format is ChangeImpactWireResponse:
+            return change_impact_response(prompt)
         self.prompts.append(prompt)
         self.images.append(kwargs.get("images", ()))
         data = payload(prompt)

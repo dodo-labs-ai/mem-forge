@@ -1051,6 +1051,18 @@ class SupportAssessmentWireResponse(BaseModel):
     results: list[ContinueReadingWireResult | SupportedWireResult | UnsupportedWireResult]
 
 
+class ChangeImpactWireResult(BaseModel):
+    """Whether one revision's changes can affect one fixed claim, without generated prose."""
+
+    model_config = ConfigDict(extra="forbid")
+    work_id: str
+    impact: Literal["affected", "unaffected"]
+
+
+class ChangeImpactWireResponse(BaseModel):
+    results: list[ChangeImpactWireResult]
+
+
 class StructuredLlmError(RuntimeError):
     """Raised when a required structured LLM call cannot produce valid schema output."""
 
@@ -1400,6 +1412,8 @@ def _schema_operation_name(response_format: type[BaseModel]) -> str:
         return "claim_revision"
     if response_format is SupportAssessmentWireResponse:
         return "support_assessment"
+    if response_format is ChangeImpactWireResponse:
+        return "change_impact"
     name = response_format.__name__.removesuffix("Response")
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
@@ -1697,6 +1711,7 @@ _REFUSAL_ERROR_CODES: dict[type[BaseModel], str] = {
     CrossDocumentRelationResponse: "cross_document_relation_response_incomplete",
     MemoryRelationCatalogResponse: "memory_relation_response_incomplete",
     SupportAssessmentWireResponse: "support_response_incomplete",
+    ChangeImpactWireResponse: "change_impact_response_incomplete",
 }
 
 

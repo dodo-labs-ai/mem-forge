@@ -2,10 +2,11 @@
 
 import json
 import pytest
-from memforge.llm.structured import SupportAssessmentWireResponse
-from memforge.pipeline.revision_work import RevisionWorkExecutor
+from memforge.llm.structured import ChangeImpactWireResponse, SupportAssessmentWireResponse
+from memforge.pipeline.revision_work import CHANGE_IMPACT_CONTRACT, RevisionWorkExecutor
 from memforge.storage.database import Database
 from tests.test_derivation_work import prepare_database
+from tests.revision_client_fixture import change_impact_payload
 from tests.test_revision_work import Client, continued, payload, supported, work_items
 
 
@@ -37,7 +38,8 @@ async def test_three_range_dependency_and_sqlite_resume(tmp_path, failure):
         assert not result["w0"].supported
         assert executor.final_work_ids
         if failure:
-            assert executor.reused == failure - 1
+            # Every Change Impact request, and every reading request completed before the interruption.
+            assert executor.reused == executor.stage_counts["change_impact"] + failure - 1
         assert await db.get_current_source_unit_revision(root.source_unit_id) is None
         rows = await db.db.execute_fetchall(
             "SELECT payload_json FROM source_derivation_work WHERE derivation_id=?", (root.id,)
@@ -45,7 +47,7 @@ async def test_three_range_dependency_and_sqlite_resume(tmp_path, failure):
         works = [json.loads(r["payload_json"]) for r in rows]
         receipt = next(w for w in works if w["kind"] == "support_finalize")
         assert receipt["manifest"]["completion"] == "program"
-        assert all(w["kind"] in {"support_assess", "support_finalize"} for w in works)
+        assert all(w["kind"] in {"change_impact", "support_assess", "support_finalize"} for w in works)
         assert len(receipt["manifest"]["dependencies"]) >= 3
     finally:
         await db.close()
@@ -98,6 +100,18 @@ async def test_artifact_bytes_bound_to_first_assessment_and_carried_refs():
         image_stages = set()
 
         async def evaluate_revision_work(self, prompt, *, response_format, images=(), **kwargs):
+            if response_format is ChangeImpactWireResponse:
+                # The changed Artifact reaches Change Impact with its current bytes too.
+                image_rows = [
+                    r for r in change_impact_payload(prompt)["current"]["fragments"]
+                    if any(isinstance(m, dict) and "image_source_observation_id" in m for m in r[2:])
+                ]
+                assert [image.body for image in images] == [b"new"] * len(image_rows)
+                if images:
+                    self.image_stages.add("change_impact")
+                return await super().evaluate_revision_work(
+                    prompt, response_format=response_format, images=images, **kwargs
+                )
             data = payload(prompt)
             rows = [
                 *data["current"]["primary_candidates"], *data["current"]["required_only_candidates"],
@@ -128,15 +142,23 @@ async def test_artifact_bytes_bound_to_first_assessment_and_carried_refs():
         [SupportWorkItem("w0", memory(), old_support(base), context)]
     )
     assert result["w0"].supported
-    assert client.image_stages == {"assessment"}
+    assert client.image_stages == {"change_impact", "assessment"}
     assert reads and all(uri.endswith("diagram-2.png") for uri in reads)
     parts = result["w0"].memory.resolved_evidence_selection.parts
     assert parts[0].anchor == next(f.anchor for f in context.full_fragments if f.kind.value == "artifact")
 
 
+class UnaffectedClient(Client):
+    def impact(self, work, data):
+        return "unaffected"
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["epoch", "memory"])
-async def test_completed_assessments_cannot_commit_after_concurrent_state_change(tmp_path, drift):
+@pytest.mark.parametrize(("drift", "client_type"), [
+    (None, UnaffectedClient), ("epoch", Client), ("memory", Client), ("epoch", UnaffectedClient),
+])
+async def test_completed_assessments_cannot_commit_after_concurrent_state_change(tmp_path, drift, client_type):
+    """Support Assessment and Change Impact receipts pass the commit gate only without concurrent change."""
     from memforge.memory.lifecycle_plan import (
         LifecyclePlan,
         ReconciliationScope,
@@ -190,14 +212,22 @@ async def test_completed_assessments_cannot_commit_after_concurrent_state_change
             "SELECT status,content_hash,updated_at FROM memories WHERE id = ?", (items[0].memory.id,)
         )
         version = _lifecycle_memory_version(rows[0])
-        executor = RevisionWorkExecutor(client=Client(), model="fixture", store=db, derivation_id=root.id)
+        executor = RevisionWorkExecutor(client=client_type(), model="fixture", store=db, derivation_id=root.id)
         await executor.assess_many(items)
-        assert executor.final_work_ids and executor.stage_counts["support_assess"] > 1
+        if client_type is UnaffectedClient:
+            [receipt_id] = executor.final_work_ids
+            [receipt] = await db.db.execute_fetchall(
+                "SELECT payload_json FROM source_derivation_work WHERE work_id = ?", (receipt_id,)
+            )
+            assert json.loads(receipt["payload_json"])["manifest"]["contract"] == CHANGE_IMPACT_CONTRACT
+            assert executor.stage_counts["support_assess"] == 0 and executor.stage_counts["change_impact"]
+        else:
+            assert executor.final_work_ids and executor.stage_counts["support_assess"] > 1
         if drift == "epoch":
             await db.db.execute(
                 "UPDATE sources SET activity_epoch = activity_epoch + 1 WHERE id = ?", (root.source_id,)
             )
-        else:
+        elif drift == "memory":
             await db.db.execute(
                 "UPDATE memories SET content_hash = ? WHERE id = ?", ("concurrent-change", items[0].memory.id)
             )
@@ -217,16 +247,26 @@ async def test_completed_assessments_cannot_commit_after_concurrent_state_change
             stale_guard=StaleGuard((), {}, memory_versions={items[0].memory.id: version}),
             mutations=(),
         )
-        with pytest.raises(ValueError, match="epoch|Memory stale guard"):
+
+        async def commit():
             await db.apply_source_projection_lifecycle(
                 context.projection,
                 plan,
                 document=source_unit_derivation_context_from_payload(root.context_payload).document,
                 derivation_id=root.id,
                 derivation_context_identity_hash=root.context_identity_hash,
-                required_derivation_work_ids=executor.final_work_ids,
+                required_derivation_work_ids=tuple(executor.final_work_ids),
                 expected_source_activity_epoch=epoch,
             )
+
+        if drift is None:
+            await commit()
+            assert (
+                await db.get_current_source_unit_revision(root.source_unit_id)
+            ).id == context.projection.source_unit_revisions[0].id
+            return
+        with pytest.raises(ValueError, match="epoch|Memory stale guard"):
+            await commit()
         assert (
             await db.get_current_source_unit_revision(root.source_unit_id)
         ).id == context.base.source_unit_revisions[0].id
