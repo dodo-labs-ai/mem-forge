@@ -17393,7 +17393,7 @@ class Database:
     ) -> SourceSyncRun:
         """Queue one sync run, or coalesce into the Source's active run.
 
-        ``reprocess_document_ids`` queue an operator reprocess of those stored
+        ``reprocess_document_ids`` queue an operator reprocess of those
         Documents instead. It never coalesces: it is refused with
         :class:`SourceSyncRunActive` while another run is pending or running.
         A sync requested while a reprocess is active runs after it.
@@ -17440,7 +17440,7 @@ class Database:
         if reprocess_document_ids and (
             trigger != "reprocess" or force_full_sync or input_snapshot_id or retry_run_id
         ):
-            raise ValueError("a reprocess run names stored Documents only")
+            raise ValueError("a reprocess run names its Documents only")
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
         normalized_config_revision = _non_empty_string(source_config_revision)
         normalized_predecessor_activity_id = _non_empty_string(predecessor_activity_id)
