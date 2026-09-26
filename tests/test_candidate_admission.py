@@ -7,6 +7,7 @@ import pytest
 from memforge.llm.structured import CandidateAdmissionResponse, StructuredLlmError
 from memforge.memory.candidate_admission import CandidateAdmissionError, admit_candidates
 from memforge.models import RawMemory
+from memforge.pipeline.complete_support import COMPLETE_SUPPORT_DEFINITION
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from tests.llm_fixture import (
     FIXTURE_CONTEXT_WINDOW,
@@ -98,7 +99,7 @@ async def test_a_single_candidate_is_judged_with_exactly_its_selected_evidence()
         "Two reviewers from distinct teams required.", "Country: US.",
     ]
     assert request["round_claims"] == [{"id": row["id"], "claim": MOST_SPECIFIC}]
-    assert "identifying details in the claim are part of the claim" in client.prompts[0]
+    assert COMPLETE_SUPPORT_DEFINITION in client.prompts[0]
 
 
 @pytest.mark.asyncio
