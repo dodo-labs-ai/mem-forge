@@ -407,14 +407,8 @@ def continued(work, support=(), opposing=()):
 
 
 def supported(work, primary, required=()):
-    """A wire row that concludes supported, omitting every matched prior ref it does not select."""
-    selected = {primary, *required}
-    return {
-        "work_id": work["work_id"], "status": "supported", "primary_ref": primary, "required_refs": list(required),
-        "omitted_matched_refs": [
-            p["current_ref"] for p in work["prior_evidence"] if "current_ref" in p and p["current_ref"] not in selected
-        ],
-    }
+    """A wire row that concludes supported with this selection."""
+    return {"work_id": work["work_id"], "status": "supported", "primary_ref": primary, "required_refs": list(required)}
 
 
 def unsupported(work):
