@@ -204,13 +204,6 @@ class LifecycleMutationType(str, Enum):
     REFRESH_MEMORY_INDEX = "refresh_memory_index"
 
 
-class ClaimIdentityPolicy(str, Enum):
-    """Authority that determines whether exact claims share one Memory identity."""
-
-    ORDINARY_EXTRACTION = "ordinary_extraction"
-    EXPLICIT_CONCEPT = "explicit_concept"
-
-
 DESTRUCTIVE_MUTATIONS = frozenset(
     {
         LifecycleMutationType.REMOVE_SUPPORT,
@@ -425,9 +418,19 @@ class LifecyclePlan:
                 raise ValueError(
                     "maintenance operator authority permits retirement only"
                 )
+        activated_memory_ids = {
+            item.memory_id
+            for item in self.mutations
+            if item.mutation_type
+            is LifecycleMutationType.CREATE_MEMORY
+        }
         for item in self.mutations:
             if item.mutation_type in DESTRUCTIVE_MUTATIONS and item.memory_id not in incumbents:
                 raise ValueError("destructive mutation targets memory outside mandatory incumbent ledger")
+            if item.mutation_type is LifecycleMutationType.ATTACH_SUPPORT and not (
+                item.memory_id in incumbents or item.memory_id in activated_memory_ids
+            ):
+                raise ValueError("support attachment targets a Memory outside this Plan's incumbents and creations")
         unit_ids = {item.id for item in self.evidence_units}
         if len(unit_ids) != len(self.evidence_units):
             raise ValueError("duplicate staged Evidence Unit")
@@ -436,12 +439,6 @@ class LifecyclePlan:
         request_ids = {item.id for item in self.relation_discovery_requests}
         if len(request_ids) != len(self.relation_discovery_requests):
             raise ValueError("duplicate relation discovery request")
-        activated_memory_ids = {
-            item.memory_id
-            for item in self.mutations
-            if item.mutation_type
-            is LifecycleMutationType.CREATE_MEMORY
-        }
         for request in self.relation_discovery_requests:
             if request.source_id != self.scope.source_id:
                 raise ValueError("relation discovery request belongs to another source")

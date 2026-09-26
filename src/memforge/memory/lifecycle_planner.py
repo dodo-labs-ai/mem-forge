@@ -79,8 +79,6 @@ def build_lifecycle_plan(
     observation_revision_ids: tuple[str, ...],
     new_evidence_unit_ids: tuple[str, ...] = (),
     evidence_unit_ids_by_claim_hash: Mapping[str, tuple[str, ...]] | None = None,
-    corroboration_targets_by_claim_hash: Mapping[str, Memory] | None = None,
-    corroboration_proofs_by_claim_hash: Mapping[str, Mapping[str, object]] | None = None,
     defaults: NewMemoryDefaults,
     evidence_units: Sequence[EvidenceUnit] = (),
     evidence_references: Sequence[EvidenceReference] = (),
@@ -311,51 +309,9 @@ def build_lifecycle_plan(
 
     review_mutations: list[LifecycleMutation] = []
     raised_review_ids: set[str] = set()
-    corroboration_targets = corroboration_targets_by_claim_hash or {}
-    corroboration_proofs = corroboration_proofs_by_claim_hash or {}
-    corroboration_targets_by_id = {target.id: target for target in corroboration_targets.values()}
-    attached_target_ids: set[str] = set()
     for operation in add_operations:
         assert operation.memory is not None
-        claim_hash = content_hash(operation.memory.content.strip())
-        target = corroboration_targets.get(claim_hash)
-        if target is None:
-            create_memory(operation.memory)
-            continue
-        support_ids = support_ids_for(operation.memory)
-        if not support_ids:
-            raise ValueError("corroborated Memory candidate lacks support-granting evidence")
-        incumbent_operation = by_incumbent.get(target.id)
-        if incumbent_operation is not None and incumbent_operation.support_revalidation_skipped:
-            # Corroboration may reuse the identity, but cannot revalidate an old
-            # assertion by upserting its same Evidence ID under the new Plan.
-            preserved = set(source_support_unit_ids.get(target.id, ()))
-            support_ids = tuple(support_id for support_id in support_ids if support_id not in preserved)
-            if not support_ids:
-                continue
-        if target.status == "retired":
-            raise ValueError("retired Memory cannot be corroborated")
-        mutations.extend(
-            (
-                LifecycleMutation(
-                    LifecycleMutationType.ATTACH_SUPPORT,
-                    memory_id=target.id,
-                    source_id=scope.source_id,
-                    evidence_unit_ids=support_ids,
-                    payload={
-                        "access_context_hash": defaults.access_context_hash,
-                        "source_updated_at": defaults.source_updated_at,
-                        "equivalence_proof": dict(corroboration_proofs.get(claim_hash, {})),
-                    },
-                ),
-                LifecycleMutation(
-                    LifecycleMutationType.REFRESH_MEMORY_INDEX,
-                    memory_id=target.id,
-                    source_id=scope.source_id,
-                ),
-            )
-        )
-        attached_target_ids.add(target.id)
+        create_memory(operation.memory)
 
     for memory_id in incumbent_ids:
         operation = by_incumbent[memory_id]
@@ -635,15 +591,6 @@ def build_lifecycle_plan(
             continue
         raise ValueError(f"unsupported reconcile action: {operation.action.value}")
 
-    # Identity may attach only to an old Memory this Plan keeps.
-    replaced_or_reviewed = {
-        decision.memory_id for decision in decisions if decision.disposition is not IncumbentDisposition.KEEP
-    }
-    if conflicting := sorted(attached_target_ids & replaced_or_reviewed):
-        raise ValueError(
-            f"identity attach targets an old Memory this Plan deletes, replaces or reviews: {conflicting}"
-        )
-
     # A pending conflict that this revision's decision of its old Memory does not raise
     # is gone. Closing it first keeps a destructive mutation later in the Plan from
     # staling it; new Reviews come last, so each records its guard after every other
@@ -682,13 +629,10 @@ def build_lifecycle_plan(
         stale_guard=StaleGuard(
             observation_revision_ids=observation_revision_ids,
             support_set_hashes={
-                memory_id: support_set_hashes[memory_id] for memory_id in (*incumbent_ids, *sorted(attached_target_ids))
+                memory_id: support_set_hashes[memory_id] for memory_id in incumbent_ids
             },
             memory_versions={
-                memory_id: lifecycle_memory_version(
-                    incumbents.get(memory_id) or corroboration_targets_by_id[memory_id]
-                )
-                for memory_id in (*incumbent_ids, *sorted(attached_target_ids))
+                memory_id: lifecycle_memory_version(incumbents[memory_id]) for memory_id in incumbent_ids
             },
         ),
         mutations=tuple(mutations),
@@ -698,39 +642,6 @@ def build_lifecycle_plan(
     )
     plan.validate()
     return plan
-
-
-def identity_excluded_incumbent_ids(
-    operations: Sequence[ReconcileOperation],
-    *,
-    source_unit_id: str,
-    gate_state: LifecycleGateState,
-    source_support_unit_ids: Mapping[str, tuple[str, ...]],
-    evidence_unit_ids_by_claim_hash: Mapping[str, tuple[str, ...]],
-    coordinator_reviews: Sequence[LifecycleReview] = (),
-) -> frozenset[str]:
-    """The old Memories this round's Plan deletes, supersedes, updates or sends to Review.
-
-    Identity deduplication must not attach a Candidate to them. Every other old
-    Memory this round keeps, rebound or unresolved, is an eligible identity
-    target. These are the planner's own rules, so the Plan agrees with them.
-    """
-    existing_reviews = {review.id: review for review in coordinator_reviews}
-    excluded: set[str] = set()
-    for operation in operations:
-        memory_id = operation.memory_id
-        if memory_id is None:
-            continue
-        if operation.action is not ReconcileAction.NOOP or _raised_coordinator_reviews(
-            source_unit_id, memory_id, operation.reviews, existing_reviews,
-        ):
-            excluded.add(memory_id)
-        elif gate_state is LifecycleGateState.GATED and operation.memory is not None and _rebind_removes_support(
-            source_support_unit_ids.get(memory_id, ()),
-            _claim_support_ids(operation.memory, evidence_unit_ids_by_claim_hash),
-        ):
-            excluded.add(memory_id)
-    return frozenset(excluded)
 
 
 def _claim_support_ids(

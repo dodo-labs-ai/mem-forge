@@ -384,27 +384,6 @@ class MemoryRelationResponse(StructuredResponseModel):
     decisions: list[MemoryRelationDecision]
 
 
-class MemoryRelationCatalogEdge(MemoryRelationAssessment):
-    model_config = ConfigDict(extra="forbid")
-
-    existing_id: str = Field(pattern=r"^MEM-\d{4}$")
-    classification: Literal["equivalent", "refines", "contradicts"]
-
-
-class MemoryRelationCatalogResult(StructuredResponseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    candidate_id: str = Field(pattern=r"^NEW-\d{4}$")
-    relations: list[MemoryRelationCatalogEdge]
-
-
-class MemoryRelationCatalogResponse(StructuredResponseModel):
-    """One completion per challenger, with only explicitly discovered edges."""
-
-    model_config = ConfigDict(extra="forbid")
-    results: list[MemoryRelationCatalogResult]
-
-
 # One sentence of reasoning per pair keeps the output small and auditable.
 CROSS_DOCUMENT_RELATION_REASON_MAX_CHARS = 500
 
@@ -1594,7 +1573,6 @@ _REFUSAL_FINISH_REASONS = frozenset({"content_filter", "refusal"})
 _REFUSAL_ERROR_CODES: dict[type[BaseModel], str] = {
     ClaimRevisionWireResponse: "claim_response_incomplete",
     CrossDocumentRelationResponse: "cross_document_relation_response_incomplete",
-    MemoryRelationCatalogResponse: "memory_relation_response_incomplete",
     SupportAssessmentWireResponse: "support_response_incomplete",
     ChangeImpactWireResponse: "change_impact_response_incomplete",
 }
@@ -1760,14 +1738,6 @@ class LiteLlmStructuredClient:
             response_format=MemoryRelationResponse,
             max_tokens=max_tokens,
             model=model,
-        )
-
-    async def discover_memory_relations(
-        self, prompt: str, *, max_tokens: int = 32_768, model: str | None = None,
-    ) -> MemoryRelationCatalogResponse:
-        return await self._call_schema(
-            prompt=prompt, response_format=MemoryRelationCatalogResponse,
-            max_tokens=max_tokens, model=model,
         )
 
     async def classify_cross_document_relations(
