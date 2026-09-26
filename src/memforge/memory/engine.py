@@ -16,7 +16,7 @@ from memforge.llm.structured import StructuredLlmError, failure_retryable
 import logging
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -47,10 +47,6 @@ from memforge.memory.evidence import (
     EvidenceReference,
     EvidenceUnit,
 )
-from memforge.memory.identity_resolver import (
-    IdentityResolutionRequest,
-    IdentityResolver,
-)
 from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
     LifecyclePlan,
@@ -64,7 +60,6 @@ from memforge.memory.destructive_validation import KeptReason, validate_destruct
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
     build_lifecycle_plan,
-    identity_excluded_incumbent_ids,
     lifecycle_access_context_hash,
     lifecycle_memory_version,
     lifecycle_plan_id,
@@ -83,11 +78,6 @@ from memforge.pipeline.support_relation_coordinator import (
 )
 from memforge.memory.cross_document_relation import StructuredCrossDocumentRelationClassifier
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
-from memforge.memory.sparse_relation_classifier import (
-    SPARSE_MEMORY_CLASSIFIER_VERSION,
-    SparseMemoryRelationClassifier,
-)
-from memforge.memory.relation_classifier import MemoryPairClassificationError
 from memforge.source_access import (
     memory_visibility_for_document,
     memory_visibility_for_source_id,
@@ -108,8 +98,6 @@ from memforge.models import (
     ReconcileAction,
     ReconcileOperation,
     content_hash,
-    generate_memory_id,
-    parse_memory_validity_date,
 )
 
 if TYPE_CHECKING:
@@ -160,8 +148,6 @@ class _PreparedLifecyclePlanInputs:
     initial_support_owners: Mapping[str, Mapping[str, str]]
     observation_revision_ids: tuple[str, ...]
     evidence_unit_ids_by_claim_hash: Mapping[str, tuple[str, ...]]
-    corroboration_targets_by_claim_hash: Mapping[str, Memory]
-    corroboration_proofs_by_claim_hash: Mapping[str, Mapping[str, object]]
     defaults: NewMemoryDefaults
     evidence_units: tuple[EvidenceUnit, ...]
     evidence_references: tuple[EvidenceReference, ...]
@@ -180,7 +166,6 @@ class _PreparedProjectedLifecycleCommit:
     expected_source_activity_epoch: int | None
     source_activity: SourceActivityLease | None
     base_stats: Mapping[str, int]
-    corroboration_target_ids: frozenset[str]
     lifecycle_execution_owner_id: str | None
     operation_input_hash: str
     doc_id: str
@@ -312,18 +297,6 @@ class MemoryEngine:
             )
             if callable(getattr(structured_llm_client, "classify_cross_document_relations", None))
             else None
-        )
-        self.identity_resolver = IdentityResolver(
-            memory_store=memory_store,
-            pair_classifier=(
-                SparseMemoryRelationClassifier(
-                    client=structured_llm_client,
-                    model=llm_model,
-                )
-                if callable(getattr(structured_llm_client, "discover_memory_relations", None))
-                else None
-            ),
-            llm_model=llm_model,
         )
         # Entity resolver with embedding + LLM capabilities
         self.entity_resolver = EntityResolver(
@@ -617,10 +590,6 @@ class MemoryEngine:
             memory_id: current_memories[memory_id]
             for memory_id in incumbent_ids
         }
-        current_corroboration_targets = {
-            claim_hash: current_memories[target.id]
-            for claim_hash, target in inputs.corroboration_targets_by_claim_hash.items()
-        }
         support_states = await self.db.get_active_memory_support_states(
             memory_ids
         )
@@ -647,10 +616,6 @@ class MemoryEngine:
             support_set_hashes=support_hashes,
             observation_revision_ids=inputs.observation_revision_ids,
             evidence_unit_ids_by_claim_hash=(inputs.evidence_unit_ids_by_claim_hash),
-            corroboration_targets_by_claim_hash=current_corroboration_targets,
-            corroboration_proofs_by_claim_hash=(
-                inputs.corroboration_proofs_by_claim_hash
-            ),
             defaults=inputs.defaults,
             evidence_units=inputs.evidence_units,
             evidence_references=inputs.evidence_references,
@@ -808,14 +773,6 @@ class MemoryEngine:
                 stats["deleted"] += 1
             elif mutation.mutation_type.value == "create_review":
                 stats["pending_review"] += 1
-        stats["corroborated"] = len(
-            {
-                mutation.memory_id
-                for mutation in plan.mutations
-                if mutation.mutation_type.value == "attach_support"
-                and mutation.memory_id in prepared.corroboration_target_ids
-            }
-        )
         stats["noop"] = sum(
             decision.disposition.value == "keep"
             for decision in plan.coverage_proof.incumbent_decisions
@@ -918,7 +875,6 @@ class MemoryEngine:
 
         stats = {
             "added": 0,
-            "corroborated": 0,
             "updated": 0,
             "superseded": 0,
             "deleted": 0,
@@ -1432,33 +1388,30 @@ class MemoryEngine:
             )
             for raw_memory in operation_memories
         }
-        def claim_evidence(operations: Sequence[ReconcileOperation]):
-            """Stage the Evidence of every claim these operations bind."""
-            evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
-            for operation in operations:
-                if operation.action is not ReconcileAction.NOOP:
-                    continue
-                support = supports.get(operation.memory_id or "")
-                if operation.memory is not None and support is not None and support.evidence[:1] == (operation.memory,):
-                    evidence_memories.extend(support.evidence[1:])
-                for review in operation.reviews:
-                    evidence_memories.append(review.candidate)
-                    if review.rejection_rebind is not None:
-                        evidence_memories.append(review.rejection_rebind)
-            return build_projected_claim_evidence(
-                projection=projection,
-                raw_memories=evidence_memories,
-                doc_id=doc_id,
-                source_type=source_type,
-                project_key=project_key,
-                visibility=visibility,
-                owner_user_id=owner_user_id,
-                repo_identifier=repo_identifier,
-                access_context_hash=access_context_hash,
-                extractor_run_id=projection.run_id,
-            )
-
-        projected_evidence = claim_evidence(operations)
+        # Stage the Evidence of every claim these operations bind.
+        evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
+        for operation in operations:
+            if operation.action is not ReconcileAction.NOOP:
+                continue
+            support = supports.get(operation.memory_id or "")
+            if operation.memory is not None and support is not None and support.evidence[:1] == (operation.memory,):
+                evidence_memories.extend(support.evidence[1:])
+            for review in operation.reviews:
+                evidence_memories.append(review.candidate)
+                if review.rejection_rebind is not None:
+                    evidence_memories.append(review.rejection_rebind)
+        projected_evidence = build_projected_claim_evidence(
+            projection=projection,
+            raw_memories=evidence_memories,
+            doc_id=doc_id,
+            source_type=source_type,
+            project_key=project_key,
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            access_context_hash=access_context_hash,
+            extractor_run_id=projection.run_id,
+        )
 
         def canonical(raw: RawMemory) -> RawMemory:
             return projected_evidence.canonical_memories_by_claim_hash[content_hash(raw.content.strip())]
@@ -1480,97 +1433,6 @@ class MemoryEngine:
             )
             for operation in operations
         )
-        # Identity backstops a Relation omission: a Candidate equivalent to an old Memory
-        # this round keeps attaches to it instead of creating a duplicate.
-        identity_excluded_ids = identity_excluded_incumbent_ids(
-            operations,
-            source_unit_id=scope.source_unit_id,
-            gate_state=gate.state,
-            source_support_unit_ids=unit_support,
-            evidence_unit_ids_by_claim_hash=projected_evidence.evidence_unit_ids_by_claim_hash,
-            coordinator_reviews=unit_reviews,
-        )
-        corroboration_targets: dict[str, Memory] = {}
-        corroboration_proofs: dict[str, dict[str, object]] = {}
-        identity_claim_hashes: list[str] = []
-        identity_requests: list[IdentityResolutionRequest] = []
-        for operation in operations:
-            if operation.action is not ReconcileAction.ADD or operation.memory is None:
-                continue
-            candidate = self._build_memory(
-                operation.memory,
-                project_key,
-                visibility=visibility,
-                owner_user_id=owner_user_id,
-                repo_identifier=repo_identifier,
-            )
-            identity_claim_hashes.append(content_hash(operation.memory.content.strip()))
-            identity_requests.append(
-                IdentityResolutionRequest(
-                    challenger=candidate,
-                    doc_id=doc_id,
-                    entity_ids=entity_ids_by_claim_hash.get(
-                        content_hash(operation.memory.content.strip()),
-                        (),
-                    ),
-                    excluded_memory_ids=identity_excluded_ids,
-                )
-            )
-        identity_resolution = await self.identity_resolver.resolve(tuple(identity_requests))
-        identity_resolutions = identity_resolution.resolutions
-        stats.update(
-            {
-                "identity_resolution_pair_count": identity_resolution.metrics.pair_count,
-                "identity_resolution_llm_calls": identity_resolution.metrics.llm_calls,
-                "identity_resolution_prompt_chars": identity_resolution.metrics.prompt_chars,
-                "identity_resolution_elapsed_ms": identity_resolution.metrics.elapsed_ms,
-            }
-        )
-        incomplete_identity = next(
-            (item for item in identity_resolutions if not item.classification_complete and not item.unjudged), None,
-        )
-        if incomplete_identity is not None:
-            raise MemoryPairClassificationError(
-                incomplete_identity.failure_reason or "identity discovery did not complete",
-                pair_count=identity_resolution.metrics.pair_count,
-                llm_calls=identity_resolution.metrics.llm_calls,
-                prompt_chars=identity_resolution.metrics.prompt_chars,
-                terminal_category=incomplete_identity.terminal_category,
-                error_code=incomplete_identity.error_code,
-            )
-        # A Candidate whose identity cannot be judged may duplicate an old Memory:
-        # it is consumed this round without an ADD, like a local unresolved relationship.
-        unjudged_claim_hashes: set[str] = set()
-        for claim_hash, resolution in zip(identity_claim_hashes, identity_resolutions, strict=True):
-            if resolution.unjudged:
-                unjudged_claim_hashes.add(claim_hash)
-                logger.warning(
-                    "identity_candidate_unresolved source_unit_id=%s claim_hash=%s reason=%s error_code=%s",
-                    scope.source_unit_id, claim_hash, resolution.terminal_category, resolution.error_code,
-                )
-        stats["identity_resolution_unresolved_candidate_count"] = len(unjudged_claim_hashes)
-        if unjudged_claim_hashes:
-            operations = tuple(
-                operation for operation in operations
-                if not (
-                    operation.action is ReconcileAction.ADD and operation.memory is not None
-                    and content_hash(operation.memory.content.strip()) in unjudged_claim_hashes
-                )
-            )
-            projected_evidence = claim_evidence(operations)
-        attached_target_ids: list[str] = []
-        for claim_hash, resolution in zip(
-            identity_claim_hashes,
-            identity_resolutions,
-            strict=True,
-        ):
-            target = resolution.target
-            equivalence_proof = resolution.equivalence_proof
-            if target is None or equivalence_proof is None:
-                continue
-            corroboration_targets[claim_hash] = target
-            corroboration_proofs[claim_hash] = dict(equivalence_proof)
-            attached_target_ids.append(target.id)
         defaults = NewMemoryDefaults(
             visibility=visibility,
             owner_user_id=owner_user_id,
@@ -1587,15 +1449,8 @@ class MemoryEngine:
                 else None
             ),
         )
-        prepared_memories = {
-            **incumbents_by_id,
-            **{
-                target.id: target
-                for target in corroboration_targets.values()
-            },
-        }
         initial_support_owners = await self._active_support_owners(
-            tuple(sorted(prepared_memories))
+            tuple(sorted(incumbents_by_id))
         )
         derivation_context_identity_hash = (
             source_derivation_context_identity_hash(
@@ -1638,15 +1493,13 @@ class MemoryEngine:
                 incumbents=incumbents_by_id,
                 memory_authority_hashes={
                     memory_id: _prepared_memory_authority_hash(memory)
-                    for memory_id, memory in prepared_memories.items()
+                    for memory_id, memory in incumbents_by_id.items()
                 },
                 initial_support_owners=initial_support_owners,
                 observation_revision_ids=observation_revision_ids,
                 evidence_unit_ids_by_claim_hash=(
                     projected_evidence.evidence_unit_ids_by_claim_hash
                 ),
-                corroboration_targets_by_claim_hash=corroboration_targets,
-                corroboration_proofs_by_claim_hash=corroboration_proofs,
                 defaults=defaults,
                 evidence_units=projected_evidence.units,
                 evidence_references=projected_evidence.references,
@@ -1658,7 +1511,6 @@ class MemoryEngine:
             expected_source_activity_epoch=expected_source_activity_epoch,
             source_activity=source_activity,
             base_stats=dict(stats),
-            corroboration_target_ids=frozenset(attached_target_ids),
             lifecycle_execution_owner_id=lifecycle_execution_owner_id,
             operation_input_hash=operation_input_hash,
             doc_id=doc_id,
@@ -1673,7 +1525,6 @@ class MemoryEngine:
                 + structured_llm_call_count
                 + int(stats["support_revalidation_model_call_count"])
                 + entity_resolution.metrics.structured_llm_calls
-                + identity_resolution.metrics.llm_calls
             ),
             prepared_at_attempt_count=lifecycle_attempt_count,
             admission_rejections=admission.rejected,
@@ -1854,36 +1705,6 @@ class MemoryEngine:
         )
         return False
 
-    def _build_memory(
-        self,
-        raw: RawMemory,
-        project_key: str | None,
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None = None,
-        memory_id: str | None = None,
-    ) -> Memory:
-        """Build a Memory object from a RawMemory."""
-        return Memory(
-            id=memory_id or generate_memory_id(),
-            memory_type=raw.memory_type,
-            content=raw.content.strip(),
-            content_hash=content_hash(raw.content.strip()),
-            visibility=visibility,
-            owner_user_id=owner_user_id,
-            project_key=project_key,
-            repo_identifier=repo_identifier,
-            entity_refs=raw.entity_refs,
-            confidence=raw.confidence,
-            corroboration_count=1,
-            valid_from=parse_memory_validity_date(raw.valid_from),
-            valid_until=parse_memory_validity_date(raw.valid_until),
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-            status="active",
-            extraction_context=raw.extraction_context,
-        )
 
 
 def _observation_semantic_class(
@@ -2010,8 +1831,7 @@ def _source_lifecycle_operation_input_hash(
 
     manifest = {
         "semantic_contract": "/".join((REVISION_SUPPORT_CONTRACT, CANDIDATE_ADMISSION_CONTRACT,
-                                       CLAIM_REVISION_CONTRACT, REVISION_INPUT_POLICY,
-                                       SPARSE_MEMORY_CLASSIFIER_VERSION)),
+                                       CLAIM_REVISION_CONTRACT, REVISION_INPUT_POLICY)),
         "input_policy_identity": input_policy_identity,
         "projection_identity_hash": source_derivation_projection_identity_hash(projection),
         "candidates": [

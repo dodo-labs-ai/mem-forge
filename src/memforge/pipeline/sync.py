@@ -207,13 +207,6 @@ class _SourceDerivationRecovery:
     def memories_extracted(self) -> int:
         return sum(int(result["memories_extracted"]) for result in self.results)
 
-    @property
-    def memories_corroborated(self) -> int:
-        return sum(
-            int(result["memories_corroborated"])
-            for result in self.results
-        )
-
 
 class ExtractionWorkPool:
     """Work-conserving fair pool for app-wide heavy extraction work."""
@@ -826,7 +819,6 @@ class GeneSyncOrchestrator:
         docs_updated = 0
         docs_failed = 0
         memories_extracted = 0
-        memories_corroborated = 0
         failed_docs: list[FailedDoc] = []
         runtime_bundles = []
         error_message: str | None = None
@@ -1052,7 +1044,6 @@ class GeneSyncOrchestrator:
                     "processed": False,
                     "updated": False,
                     "memories_extracted": 0,
-                    "memories_corroborated": 0,
                     "failed": False,
                     "runtime_bundle": None,
                     "source_unit_id": None,
@@ -1142,10 +1133,6 @@ class GeneSyncOrchestrator:
                             stats["updated"] = item_stats.get("updated", False)
                             stats["memories_extracted"] = item_stats.get(
                                 "memories_extracted",
-                                0,
-                            )
-                            stats["memories_corroborated"] = item_stats.get(
-                                "memories_corroborated",
                                 0,
                             )
                             stats["source_unit_id"] = item_stats.get(
@@ -1334,7 +1321,6 @@ class GeneSyncOrchestrator:
                 if r["failed"]:
                     docs_failed += 1
                 memories_extracted += r["memories_extracted"]
-                memories_corroborated += r["memories_corroborated"]
                 if r.get("runtime_bundle") is not None:
                     runtime_bundles.append(r["runtime_bundle"])
 
@@ -1345,11 +1331,10 @@ class GeneSyncOrchestrator:
             # Pages not returned aren't deleted — they're just unchanged.
             # Only run deletion detection on full syncs (since=None).
             #
-            # A new Unit commits before an old one is removed: when a Unit's
-            # identity changes, the new Unit's identity attach must find the old
-            # Unit's Memories still Active. Deferred commits blocked only by this
-            # run's Units converge first; a commit that fails for good counts as
-            # a failed document and keeps absence unproven.
+            # Absence is proven only after every Unit of this run has committed,
+            # so deferred commits blocked only by this run's Units converge
+            # first; a commit that fails for good counts as a failed document
+            # and keeps absence unproven.
             await self._converge_deferred_projected_lifecycle(effective_results)
             deferred_failures = sum(result.get("terminal_error") is not None for result in deferred_results)
             deleted_count = 0
@@ -1430,7 +1415,6 @@ class GeneSyncOrchestrator:
                 if result["updated"]:
                     docs_updated += 1
                 memories_extracted += result["memories_extracted"]
-                memories_corroborated += result["memories_corroborated"]
 
             if scope_transition is not None:
                 scoped_reconciliation_coverage = None
@@ -1543,7 +1527,6 @@ class GeneSyncOrchestrator:
             docs_updated=docs_updated,
             docs_failed=docs_failed,
             memories_extracted=memories_extracted,
-            memories_corroborated=memories_corroborated,
             error_message=error_message,
             failed_docs=failed_docs,
             failure_retryable=failure_retryable,
@@ -1589,7 +1572,6 @@ class GeneSyncOrchestrator:
             docs_updated=docs_updated,
             docs_failed=docs_failed,
             memories_extracted=memories_extracted,
-            memories_corroborated=memories_corroborated,
             item_count=total_item_count,
             materialized_item_count=materialized_item_count,
             reused_projection_count=reused_projection_count,
@@ -1598,14 +1580,13 @@ class GeneSyncOrchestrator:
         logger.info(
             "Sync complete for %s (run_id=%s): "
             "%d processed, %d updated, %d failed, "
-            "%d memories extracted, %d corroborated, status=%s",
+            "%d memories extracted, status=%s",
             source_name,
             run_id,
             docs_processed,
             docs_updated,
             docs_failed,
             memories_extracted,
-            memories_corroborated,
             status,
         )
 
@@ -1692,9 +1673,6 @@ class GeneSyncOrchestrator:
                 result["updated"] = True
                 result["memories_extracted"] = int(
                     lifecycle_stats.get("added", 0)
-                )
-                result["memories_corroborated"] = int(
-                    lifecycle_stats.get("updated", 0)
                 )
                 result["failed"] = False
                 result["deferred_lifecycle"] = None
@@ -1816,7 +1794,6 @@ class GeneSyncOrchestrator:
                             "processed": False,
                             "updated": False,
                             "memories_extracted": 0,
-                            "memories_corroborated": 0,
                             "failed": False,
                             "runtime_bundle": exc.runtime_bundle,
                             "source_unit_id": exc.handle.source_unit_id,
@@ -1859,9 +1836,6 @@ class GeneSyncOrchestrator:
                     "updated": True,
                     "memories_extracted": int(
                         lifecycle_stats.get("added", 0)
-                    ),
-                    "memories_corroborated": int(
-                        lifecycle_stats.get("updated", 0)
                     ),
                     "failed": False,
                     "runtime_bundle": None,
@@ -2151,13 +2125,12 @@ class GeneSyncOrchestrator:
         Returns
         -------
         dict
-            Stats: ``{updated, memories_extracted, memories_corroborated}``.
+            Stats: ``{updated, memories_extracted}``.
         """
         doc_id = item.item_id
         stats = {
             "updated": False,
             "memories_extracted": 0,
-            "memories_corroborated": 0,
             "memory_supports_added": 0,
             "memory_supports_updated": 0,
             "memory_supports_removed": 0,
@@ -2699,7 +2672,6 @@ class GeneSyncOrchestrator:
                 lifecycle_attempt_count=lifecycle_attempt_count,
             )
             stats["memories_extracted"] = memory_stats.get("added", 0)
-            stats["memories_corroborated"] = memory_stats.get("updated", 0)
             stats["memory_supports_removed"] = memory_stats.get("deleted", 0)
             await self._insert_changelog(
                 ChangelogEntry(
@@ -2840,7 +2812,6 @@ class GeneSyncOrchestrator:
             lifecycle_attempt_count=lifecycle_attempt_count,
         )
         stats["memories_extracted"] = memory_stats.get("added", 0)
-        stats["memories_corroborated"] = memory_stats.get("updated", 0)
 
         self._memory_sample(
             "after_memory_engine",
@@ -2849,7 +2820,6 @@ class GeneSyncOrchestrator:
             doc_id=doc_id,
             raw_memory_count=len(raw_memories),
             memories_extracted=stats["memories_extracted"],
-            memories_corroborated=stats["memories_corroborated"],
             entity_mention_count=len(
                 {entity_ref for raw_memory in raw_memories for entity_ref in raw_memory.entity_refs}
             ),
@@ -2867,10 +2837,6 @@ class GeneSyncOrchestrator:
             entity_resolution_candidate_count=memory_stats.get("entity_resolution_candidate_count", 0),
             entity_resolution_new_entities=memory_stats.get("entity_resolution_new_entities", 0),
             entity_resolution_elapsed_ms=memory_stats.get("entity_resolution_elapsed_ms", 0),
-            identity_resolution_pair_count=memory_stats.get("identity_resolution_pair_count", 0),
-            identity_resolution_llm_calls=memory_stats.get("identity_resolution_llm_calls", 0),
-            identity_resolution_prompt_chars=memory_stats.get("identity_resolution_prompt_chars", 0),
-            identity_resolution_elapsed_ms=memory_stats.get("identity_resolution_elapsed_ms", 0),
         )
 
         # ------------------------------------------------------------------
@@ -2909,12 +2875,11 @@ class GeneSyncOrchestrator:
             )
 
         logger.info(
-            "Processed %s (%s): %s, %d memories inserted, %d corroborated, %d source supports added",
+            "Processed %s (%s): %s, %d memories inserted, %d source supports added",
             item.title,
             doc_id,
             change_type,
             stats["memories_extracted"],
-            stats["memories_corroborated"],
             stats["memory_supports_added"],
         )
 

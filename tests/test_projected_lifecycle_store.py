@@ -353,17 +353,17 @@ def _overlapping_support_plan(
         ),
         gate_state=(LifecycleGateState.ENABLED if removing else LifecycleGateState.GATED),
         coverage_proof=CoverageProof(
-            mandatory_incumbent_ids=(("mem-1",) if removing else ()),
+            mandatory_incumbent_ids=("mem-1",),
             incumbent_decisions=(
                 (
                     IncumbentDecision(
                         "mem-1",
                         IncumbentDisposition.REMOVE_SUPPORT,
                         "overlapping source no longer supports claim",
-                    ),
-                )
-                if removing
-                else ()
+                    )
+                    if removing
+                    else IncumbentDecision("mem-1", IncumbentDisposition.KEEP, "overlapping source states the claim")
+                ),
             ),
             batch_ids=("batch-overlap",),
             completed_batch_ids=("batch-overlap",),

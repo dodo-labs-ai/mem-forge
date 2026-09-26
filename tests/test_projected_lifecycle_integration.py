@@ -82,7 +82,6 @@ from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
     LifecycleMutation,
     LifecycleMutationType,
-    LifecyclePlan,
     ProjectedLifecycleDeferredError,
     ProjectedSupportInvariantError,
     LifecycleReviewStatus,
@@ -1455,52 +1454,6 @@ class _OutboxDrainer:
             await self.db.complete_lifecycle_vector_task(task.id)
         return LifecycleVectorDeliveryResult(state=LifecycleVectorDeliveryState.DELIVERED)
 
-    async def find_access_compatible_equivalence_candidates(
-        self,
-        memory: Memory,
-        **kwargs,
-    ) -> tuple[Memory, ...]:
-        del memory, kwargs
-        return ()
-
-    async def find_access_compatible_equivalence_candidates_batch(self, queries):
-        candidates = []
-        for query in queries:
-            candidates.append(
-                await self.find_access_compatible_equivalence_candidates(
-                    query.memory,
-                    excluded_memory_ids=query.excluded_memory_ids,
-                    doc_id=query.doc_id,
-                    entity_ids=query.entity_ids,
-                )
-            )
-        return tuple(candidates)
-
-    async def find_access_compatible_exact_candidate(
-        self,
-        memory: Memory,
-        *,
-        excluded_memory_ids=frozenset(),
-    ) -> Memory | None:
-        return await self.db.find_active_exact_claim_candidate(
-            memory.content_hash,
-            visibility=memory.visibility,
-            owner_user_id=memory.owner_user_id,
-            repo_identifier=memory.repo_identifier,
-            excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
-        )
-
-    async def find_access_compatible_exact_candidates_batch(self, requests):
-        return tuple(
-            [
-                await self.find_access_compatible_exact_candidate(
-                    request.challenger,
-                    excluded_memory_ids=request.excluded_memory_ids,
-                )
-                for request in requests
-            ]
-        )
-
 
 class _AuditedOutboxDrainer(_OutboxDrainer):
     def __init__(self, database: Database) -> None:
@@ -1536,37 +1489,6 @@ class _FailingOutboxDrainer(_OutboxDrainer):
             failed_tasks=1,
             error_types=("RuntimeError",),
         )
-
-
-class _EquivalentMemoryStore(_OutboxDrainer):
-    def __init__(self, database: Database, target: Memory) -> None:
-        super().__init__(database)
-        self.target = target
-
-    async def find_access_compatible_equivalence_candidates(
-        self,
-        memory: Memory,
-        *,
-        excluded_memory_ids=frozenset(),
-        scope=None,
-        doc_id=None,
-        entity_ids=(),
-    ) -> tuple[Memory, ...]:
-        del memory, excluded_memory_ids, scope, doc_id, entity_ids
-        return (self.target,)
-
-    async def find_access_compatible_equivalence_candidates_batch(self, queries):
-        candidates = []
-        for query in queries:
-            candidates.append(
-                await self.find_access_compatible_equivalence_candidates(
-                    query.memory,
-                    excluded_memory_ids=query.excluded_memory_ids,
-                    doc_id=query.doc_id,
-                    entity_ids=query.entity_ids,
-                )
-            )
-        return tuple(candidates)
 
 
 @pytest.mark.asyncio
@@ -7075,228 +6997,7 @@ async def test_lifecycle_vector_retry_respects_durable_backoff_and_completion_is
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("semantic_outcome", ["equivalent", "no_proposal", "incomplete"])
-async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attaches_support(
-    db: Database, semantic_outcome: str,
-) -> None:
-    first = _projection(run_id="projection-equivalent-source-1", body="A7 is removed.")
-    await db.record_source_projection(first)
-    incumbent = await _seed_incumbent_support(db, projection=first)
-    incumbent = await db.get_memory(incumbent.id)
-    assert incumbent is not None
-    await db.upsert_source(
-        id="src-2",
-        type="confluence",
-        name="Independent Engineering",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="owner-1",
-    )
-    now = datetime(2026, 7, 15, tzinfo=timezone.utc).isoformat()
-    await db.db.execute(
-        """INSERT INTO documents (
-               doc_id, source, source_url, title, space_or_project,
-               last_modified, version, content_hash, last_synced
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            "confluence-456",
-            "src-2",
-            "https://example.test/456",
-            "Independent Page",
-            "ENG",
-            now,
-            "1",
-            "h2",
-            now,
-        ),
-    )
-    await db.db.commit()
-    second = _projection(
-        run_id="projection-equivalent-source-2",
-        body="A7 remains excluded.",
-        item_id="confluence-456",
-        source_id="src-2",
-    )
-    raw = RawMemory(
-        content="A7 remains excluded.",
-        memory_type="decision",
-        confidence=0.9,
-        evidence_quote="A7 remains excluded.",
-        extraction_context="A7 remains excluded.",
-        source_observation_id="obs-from-unrelated-source",
-    )
-    adapters = build_sqlite_adapters(db, object())
-    client = _SemanticEquivalentClient()
-    if semantic_outcome != "equivalent":
-        from memforge.llm.structured import MemoryRelationCatalogResponse
-
-        async def discover(prompt, **kwargs):
-            payload = json.loads(prompt.split("<memory_relation_catalog>\n", 1)[1].split("\n</memory_relation_catalog>", 1)[0])
-            return MemoryRelationCatalogResponse.model_validate(dict(results=[] if semantic_outcome == "incomplete"
-                else [dict(candidate_id=row["id"], relations=[]) for row in payload["new_claims"]]))
-
-        client.discover_memory_relations = discover
-    engine = MemoryEngine(
-        cross_document_candidates=_candidate_retriever(adapters),
-        db=db,
-        memory_store=_EquivalentMemoryStore(db, incumbent),
-        structured_llm_client=client,
-    )
-
-    prepared = engine.prepare_and_commit_projected_lifecycle(
-        projection=second,
-        doc_id="confluence-456",
-        raw_memories=_selected(second, [raw]),
-        doc_type="design-doc",
-        project_key=None,
-        repo_identifier=None,
-        document_content="A7 remains excluded.",
-        update_mode="full_document",
-        changed_hunks=None,
-        update_plan_stats=None,
-        source_updated_at=datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
-    )
-
-    stats = await prepared
-    if semantic_outcome == "incomplete":
-        # Identity output that stays invalid for the pair alone: the Candidate may duplicate the
-        # incumbent, so it is consumed without ADD, and the revision commits.
-        assert stats["identity_resolution_unresolved_candidate_count"] == 1
-        assert stats["added"] == 0 and stats["corroborated"] == 0
-        [row] = await db.db.execute_fetchall("SELECT payload_json FROM lifecycle_plans WHERE source_id = ?", ("src-2",))
-        plan = json.loads(row["payload_json"])
-        assert plan["mutations"] == [] and plan["evidence_units"] == []
-        sources = await db.get_memory_sources(incumbent.id)
-        assert {source.source_id for source in sources} == {"src-1"}
-        return
-    if semantic_outcome == "no_proposal":
-        assert stats["added"] == 1 and stats["corroborated"] == 0
-        [row] = await db.db.execute_fetchall("SELECT payload_json FROM lifecycle_plans WHERE source_id = ?", ("src-2",))
-        request = json.loads(row["payload_json"])["relation_discovery_requests"][0]
-        assert "preclassified_decisions" not in request
-        [work] = await db.db.execute_fetchall(
-            "SELECT memory_id FROM relation_discovery_work WHERE id = ?", (request["id"],)
-        )
-        assert work["memory_id"] == request["memory_id"]
-        return
-    assert stats["added"] == 0
-    assert stats["corroborated"] == 1
-    sources = await db.get_memory_sources(incumbent.id)
-    assert {source.source_id for source in sources} == {"src-1", "src-2"}
-    plan_rows = await db.db.execute_fetchall(
-        "SELECT payload_json FROM lifecycle_plans WHERE source_id = ?",
-        ("src-2",),
-    )
-    assert len(plan_rows) == 1
-    plan_payload = json.loads(str(plan_rows[0]["payload_json"]))
-    attach = next(mutation for mutation in plan_payload["mutations"] if mutation["mutation_type"] == "attach_support")
-    assert attach["payload"]["equivalence_proof"] == {
-        "candidate_content_hash": content_hash("A7 remains excluded."),
-        "incumbent_content_hash": content_hash("A7 is removed."),
-        "method": "structured_relation_classifier",
-        "model": engine.llm_model,
-        "reason": "Both claims state that A7 is excluded.",
-    }
-    support = await active_support_evidence(
-        db,
-        incumbent.id,
-        source_id="src-2",
-    )
-    assert len(support) == 1
-    assert support[0].anchor.observation_revision_id == _body_revision(second).id
-    assert client.relation_calls == 1
-
-
-@pytest.mark.asyncio
-async def test_same_source_cross_unit_semantic_equivalent_claim_reuses_memory_id(
-    db: Database,
-) -> None:
-    first = _projection(run_id="projection-same-source-semantic-1", body="A7 is removed.")
-    await db.record_source_projection(first)
-    incumbent = await _seed_incumbent_support(db, projection=first)
-    incumbent = await db.get_memory(incumbent.id)
-    assert incumbent is not None
-    await db.enable_lifecycle_gate("src-1")
-    now = datetime(2026, 7, 15, tzinfo=timezone.utc).isoformat()
-    await db.db.execute(
-        """INSERT INTO documents (
-               doc_id, source, source_url, title, space_or_project,
-               last_modified, version, content_hash, last_synced
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            "confluence-456",
-            "src-1",
-            "https://example.test/456",
-            "Independent confirmation",
-            "ENG",
-            now,
-            "1",
-            "h2",
-            now,
-        ),
-    )
-    await db.db.commit()
-    second = _projection(
-        run_id="projection-same-source-semantic-2",
-        body="A7 remains excluded.",
-        item_id="confluence-456",
-        page_id="456",
-    )
-    adapters = build_sqlite_adapters(db, object())
-    engine = MemoryEngine(
-        cross_document_candidates=_candidate_retriever(adapters),
-        db=db,
-        memory_store=_EquivalentMemoryStore(db, incumbent),
-        structured_llm_client=_SemanticEquivalentClient(),
-    )
-
-    stats = await engine.prepare_and_commit_projected_lifecycle(
-        projection=second,
-        doc_id="confluence-456",
-        raw_memories=_selected(second, [
-            RawMemory(
-                content="A7 remains excluded.",
-                memory_type="decision",
-                confidence=0.9,
-                evidence_quote="A7 remains excluded.",
-                source_observation_id=_body_observation(second).id,
-            )
-        ]),
-        doc_type="design-doc",
-        project_key="ENG",
-        repo_identifier=None,
-        document_content="A7 remains excluded.",
-        update_mode="full_document",
-        changed_hunks=None,
-        update_plan_stats=None,
-        source_updated_at=datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
-    )
-
-    assert stats["added"] == 0
-    assert stats["corroborated"] == 1
-    assert len(await db.list_memories(source="src-1", status="active")) == 1
-    assert {(source.source_id, source.doc_id) for source in await db.get_memory_sources(incumbent.id)} == {
-        ("src-1", "confluence-123"),
-        ("src-1", "confluence-456"),
-    }
-    supports = await active_support_evidence(
-        db,
-        incumbent.id,
-        source_id="src-1",
-    )
-    assert len(supports) == 2
-    lineage_rows = await db.db.execute_fetchall(
-        """SELECT COUNT(DISTINCT EU.SOURCE_LINEAGE_ID) AS lineage_count
-             FROM MEMORY_UNIT_SUPPORT_ASSERTIONS MSA
-             JOIN EVIDENCE_UNITS EU ON EU.ID = MSA.EVIDENCE_UNIT_ID
-            WHERE MSA.MEMORY_ID = ? AND MSA.ACTIVE = 1""",
-        (incumbent.id,),
-    )
-    assert lineage_rows[0]["lineage_count"] == 2
-
-
-@pytest.mark.asyncio
-async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves_both_lineages(
+async def test_same_source_cross_unit_exact_claim_creates_its_own_memory(
     db: Database,
 ) -> None:
     adapters = build_sqlite_adapters(db, object())
@@ -7376,37 +7077,33 @@ async def test_same_source_cross_unit_exact_claim_reuses_memory_id_and_preserves
 
     memories = await db.list_memories(source="src-1", status="active")
     assert first_stats["added"] == 1
-    assert second_stats["added"] == 0
-    assert second_stats["corroborated"] == 1
-    assert len(memories) == 1
-    memory = memories[0]
-    assert {(source.source_id, source.doc_id) for source in await db.get_memory_sources(memory.id)} == {
-        ("src-1", "confluence-123"),
-        ("src-1", "confluence-456"),
+    assert second_stats["added"] == 1
+    assert second_stats["relation_discovery_enqueued"] == 1
+    assert len(memories) == 2
+    assert {memory.content_hash for memory in memories} == {content_hash(first_raw.content)}
+    documents_by_memory = {
+        memory.id: {(source.source_id, source.doc_id) for source in await db.get_memory_sources(memory.id)}
+        for memory in memories
     }
-    lineage_rows = await db.db.execute_fetchall(
-        """SELECT COUNT(DISTINCT EU.SOURCE_LINEAGE_ID) AS lineage_count,
-                  COUNT(DISTINCT EU.DOC_ID) AS document_count
-             FROM MEMORY_UNIT_SUPPORT_ASSERTIONS MSA
-             JOIN EVIDENCE_UNITS EU ON EU.ID = MSA.EVIDENCE_UNIT_ID
-            WHERE MSA.MEMORY_ID = ? AND MSA.ACTIVE = 1""",
-        (memory.id,),
-    )
-    assert lineage_rows[0]["lineage_count"] == 2
-    assert lineage_rows[0]["document_count"] == 2
+    assert sorted(documents_by_memory.values(), key=sorted) == [
+        {("src-1", "confluence-123")},
+        {("src-1", "confluence-456")},
+    ]
     plan_rows = await db.db.execute_fetchall(
         "SELECT payload_json FROM lifecycle_plans WHERE source_unit_id = ?",
         (second.deltas[0].source_unit_id,),
     )
     assert len(plan_rows) == 1
     payload = json.loads(str(plan_rows[0]["payload_json"]))
-    attach = next(mutation for mutation in payload["mutations"] if mutation["mutation_type"] == "attach_support")
-    assert attach["memory_id"] == memory.id
-    assert attach["payload"]["equivalence_proof"]["method"] == "exact_content"
+    [created] = [mutation for mutation in payload["mutations"] if mutation["mutation_type"] == "create_memory"]
+    assert {
+        mutation["memory_id"] for mutation in payload["mutations"] if mutation["mutation_type"] == "attach_support"
+    } == {created["memory_id"]}
+    assert documents_by_memory[created["memory_id"]] == {("src-1", "confluence-456")}
 
 
 @pytest.mark.asyncio
-async def test_cross_source_exact_claim_reuses_memory_without_llm_and_preserves_both_lineages(
+async def test_cross_source_exact_claim_creates_its_own_memory(
     db: Database,
 ) -> None:
     first = _projection(
@@ -7483,303 +7180,18 @@ async def test_cross_source_exact_claim_reuses_memory_without_llm_and_preserves_
     )
 
     memories = await db.list_memories(status="active")
-    assert stats["added"] == 0
-    assert stats["corroborated"] == 1
-    assert [memory.id for memory in memories] == [incumbent.id]
-    support = await active_support_evidence(db, incumbent.id)
-    assert {item.source_id for item in support} == {"src-1", "src-2"}
-    assert {item.anchor.observation_revision_id for item in support} == {
-        _body_revision(first).id,
-        _body_revision(second).id,
-    }
-
-
-@pytest.mark.asyncio
-async def test_ordinary_exact_admission_preserves_agent_claim_identity(
-    db: Database,
-) -> None:
-    claim_text = "A7 is retained for regular payroll."
-    now = datetime(2026, 7, 15, 9, 0, tzinfo=timezone.utc)
-    await db.upsert_source(
-        id="src-agent",
-        type="agent_session",
-        name="Agent Knowledge",
-        config_json="{}",
-        access_policy="private",
-        owner_user_id="owner-1",
-    )
-    await db.upsert_source(
-        id="src-private-doc",
-        type="confluence",
-        name="Private Engineering",
-        config_json="{}",
-        access_policy="private",
-        owner_user_id="owner-1",
-    )
-    await db.db.execute(
-        """INSERT INTO documents (
-               doc_id, source, source_url, title, space_or_project,
-               last_modified, version, content_hash, last_synced
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            "private-confluence-123",
-            "src-private-doc",
-            "https://example.test/private/123",
-            "Private page",
-            "ENG",
-            now.isoformat(),
-            "1",
-            "private-hash",
-            now.isoformat(),
-        ),
-    )
-    agent_memory = Memory(
-        id="mem-agent-explicit-claim",
-        memory_type="decision",
-        content=claim_text,
-        content_hash=content_hash(claim_text),
-        visibility="private",
-        owner_user_id="owner-1",
-        project_key="ENG",
-        repo_identifier="repo-a",
-    )
-    await db.insert_memory(agent_memory)
-    await db.upsert_agent_concept(
-        concept_id="agent-concept-explicit",
-        source_id="src-agent",
-        owner_user_id="owner-1",
-        workspace="/workspace",
-        repo_identifier="repo-a",
-        concept_type="decision",
-        concept_path="decisions/a7.md",
-        title="A7 handling",
-        markdown_body=claim_text,
-        frontmatter={},
-        observed_at=now,
-    )
-    await db.upsert_agent_claim(
-        claim_id="agent-claim-explicit",
-        concept_id="agent-concept-explicit",
-        display_anchor="A7 handling",
-        claim_text=claim_text,
-        memory_type="decision",
-        confidence=0.95,
-        memory_id=agent_memory.id,
-        observed_at=now,
-    )
-
-    assert (
-        await db.find_active_exact_claim_candidate(
-            agent_memory.content_hash,
-            visibility=agent_memory.visibility,
-            owner_user_id=agent_memory.owner_user_id,
-            repo_identifier=agent_memory.repo_identifier,
-        )
-        is None
-    )
-
-    projection = _projection(
-        run_id="projection-private-doc-after-agent-claim",
-        body=claim_text,
-        item_id="private-confluence-123",
-        page_id="private-123",
-        source_id="src-private-doc",
-    )
-    raw = RawMemory(
-        content=claim_text,
-        memory_type="decision",
-        confidence=0.95,
-        evidence_quote=claim_text,
-        source_observation_id=_body_observation(projection).id,
-    )
-    adapters = build_sqlite_adapters(db, object())
-    engine = MemoryEngine(
-        cross_document_candidates=_candidate_retriever(adapters),
-        db=db,
-        memory_store=_OutboxDrainer(db),
-        structured_llm_client=AdmittingClient(),
-    )
-
-    stats = await engine.prepare_and_commit_projected_lifecycle(
-        projection=projection,
-        doc_id="private-confluence-123",
-        raw_memories=_selected(
-            projection,
-            [raw],
-            access_context_hash=lifecycle_access_context_hash(
-                visibility="private",
-                owner_user_id="owner-1",
-                project_key="ENG",
-                repo_identifier="repo-a",
-            ),
-        ),
-        doc_type="design-doc",
-        project_key="ENG",
-        repo_identifier="repo-a",
-        document_content=claim_text,
-        update_mode="full_document",
-        changed_hunks=None,
-        update_plan_stats=None,
-        source_updated_at=now,
-        user_id="owner-1",
-    )
-
-    ordinary_memory = await db.find_active_exact_claim_candidate(
-        agent_memory.content_hash,
-        visibility=agent_memory.visibility,
-        owner_user_id=agent_memory.owner_user_id,
-        repo_identifier=agent_memory.repo_identifier,
-    )
-    claim = await db.get_agent_claim("agent-claim-explicit")
-    exact_rows = await db.db.execute_fetchall(
-        """SELECT id FROM memories
-           WHERE content_hash = ? AND status = 'active'
-           ORDER BY id""",
-        (agent_memory.content_hash,),
-    )
     assert stats["added"] == 1
-    assert ordinary_memory is not None
-    assert ordinary_memory.id != agent_memory.id
-    assert claim is not None
-    assert claim["memory_id"] == agent_memory.id
-    assert {row["id"] for row in exact_rows} == {
-        agent_memory.id,
-        ordinary_memory.id,
+    assert stats["relation_discovery_enqueued"] == 1
+    [created] = [memory for memory in memories if memory.id != incumbent.id]
+    assert created.content_hash == incumbent.content_hash
+    incumbent_support = await active_support_evidence(db, incumbent.id)
+    created_support = await active_support_evidence(db, created.id)
+    assert {(item.source_id, item.anchor.observation_revision_id) for item in incumbent_support} == {
+        ("src-1", _body_revision(first).id),
     }
-
-
-@pytest.mark.asyncio
-async def test_stale_parallel_cross_unit_create_fails_closed_before_duplicate_write(
-    db: Database,
-) -> None:
-    now = datetime(2026, 7, 15, tzinfo=timezone.utc).isoformat()
-    await db.db.execute(
-        """INSERT INTO documents (
-               doc_id, source, source_url, title, space_or_project,
-               last_modified, version, content_hash, last_synced
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            "confluence-456",
-            "src-1",
-            "https://example.test/456",
-            "Second page",
-            "ENG",
-            now,
-            "1",
-            "h2",
-            now,
-        ),
-    )
-    await db.db.commit()
-    projections = (
-        (
-            _projection(
-                run_id="projection-stale-exact-1",
-                body="A7 is retained for regular payroll.",
-            ),
-            "confluence-123",
-        ),
-        (
-            _projection(
-                run_id="projection-stale-exact-2",
-                body="A7 is retained for regular payroll.",
-                item_id="confluence-456",
-                page_id="456",
-            ),
-            "confluence-456",
-        ),
-    )
-
-    def plan_for(projection: SourceProjection, doc_id: str) -> LifecyclePlan:
-        [raw] = _selected(
-            projection,
-            [
-                RawMemory(
-                    content="A7 is retained for regular payroll.",
-                    memory_type="decision",
-                    confidence=0.95,
-                    evidence_quote="A7 is retained for regular payroll.",
-                )
-            ],
-        )
-        access_context_hash = lifecycle_access_context_hash(
-            visibility="workspace",
-            owner_user_id=None,
-            project_key="ENG",
-            repo_identifier=None,
-        )
-        evidence = build_projected_claim_evidence(
-            projection=projection,
-            raw_memories=(raw,),
-            doc_id=doc_id,
-            source_type="confluence",
-            project_key="ENG",
-            visibility="workspace",
-            owner_user_id=None,
-            repo_identifier=None,
-            access_context_hash=access_context_hash,
-            extractor_run_id=projection.run_id,
-        )
-        delta = projection.deltas[0]
-        scope = ReconciliationScope(
-            id=f"scope:{projection.run_id}",
-            source_id=projection.source_id,
-            source_unit_id=delta.source_unit_id,
-            base_unit_revision_id=delta.previous_unit_revision_id,
-            target_unit_revision_id=delta.current_unit_revision_id,
-        )
-        return build_lifecycle_plan(
-            plan_id=lifecycle_plan_id(scope),
-            scope=scope,
-            gate_state=LifecycleGateState.GATED,
-            operations=(
-                ReconcileOperation(
-                    action=ReconcileAction.ADD,
-                    memory=raw,
-                ),
-            ),
-            incumbents={},
-            source_support_unit_ids={},
-            all_active_support_unit_ids={},
-            support_set_hashes={},
-            observation_revision_ids=tuple(revision.id for revision in projection.observation_revisions),
-            evidence_unit_ids_by_claim_hash=evidence.evidence_unit_ids_by_claim_hash,
-            defaults=NewMemoryDefaults(
-                visibility="workspace",
-                owner_user_id=None,
-                project_key="ENG",
-                repo_identifier=None,
-                doc_id=doc_id,
-                source_type="confluence",
-                access_context_hash=access_context_hash,
-            ),
-            evidence_units=evidence.units,
-            evidence_references=evidence.references,
-        )
-
-    first_projection, first_doc_id = projections[0]
-    second_projection, second_doc_id = projections[1]
-    first_plan = plan_for(first_projection, first_doc_id)
-    stale_second_plan = plan_for(second_projection, second_doc_id)
-
-    await db.apply_source_projection_lifecycle(first_projection, first_plan)
-    with pytest.raises(
-        ValueError,
-        match="exact claim stale guard failed",
-    ):
-        await db.apply_source_projection_lifecycle(
-            second_projection,
-            stale_second_plan,
-        )
-
-    memories = await db.list_memories(source="src-1", status="active")
-    assert len(memories) == 1
-    async with db.db.execute(
-        "SELECT COUNT(*) AS total FROM source_units WHERE id = ?",
-        (second_projection.deltas[0].source_unit_id,),
-    ) as cursor:
-        row = await cursor.fetchone()
-    assert row["total"] == 0
+    assert {(item.source_id, item.anchor.observation_revision_id) for item in created_support} == {
+        ("src-2", _body_revision(second).id),
+    }
 
 
 @pytest.mark.asyncio
@@ -9648,18 +9060,17 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
     assert all(remaining_by_reference.get(part.reference_id) == part for part in old_support)
     for unit_id, unit in old_units.items():
         assert await db.get_evidence_unit(unit_id) == unit
-    if not equivalent_candidate or skip_stage == "claim":
-        assert remaining_support == old_support
-        assert await db.get_memory(skipped.id) == old_memory
-    else:
-        added_support = [part for part in remaining_support if part.reference_id not in {old.reference_id for old in old_support}]
-        assert len(added_support) == 1
-        assert added_support[0].validation_unit_revision_id == third.source_unit_revisions[0].id
+    assert remaining_support == old_support
+    assert await db.get_memory(skipped.id) == old_memory
     continued_support = await active_support_evidence(db, continued.id, source_id="src-1")
     assert continued_support and {part.validation_unit_revision_id for part in continued_support} == {third.source_unit_revisions[0].id}
     assert (await db.get_memory(skipped.id)).status == "active"
     assert (await db.get_memory(continued.id)).status == "active"
-    assert len(await db.db.execute_fetchall("SELECT id FROM memories")) == 2
+    # Relation proposes no relation between the restating Candidate and the unresolved
+    # old Memory, so the admitted Candidate becomes its own Memory.
+    restated = equivalent_candidate and skip_stage == "support"
+    assert stats["added"] == (1 if restated else 0)
+    assert len(await db.db.execute_fetchall("SELECT id FROM memories")) == (3 if restated else 2)
     assert not await db.db.execute_fetchall("SELECT id FROM lifecycle_reviews")
     assert stats["pending_review"] == 0
     assert stats["support_revalidation_skipped_memory_count"] == 1
@@ -9676,7 +9087,7 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
     )
     assert resumed_stats["support_revalidation_skipped_memory_count"] == 0
     assert (await db.get_current_source_unit_revision(first.source_units[0].id)).id == fourth.source_unit_revisions[0].id
-    assert len(await db.db.execute_fetchall("SELECT id FROM memories")) == 2
+    assert len(await db.db.execute_fetchall("SELECT id FROM memories")) == (3 if restated else 2)
     assert not await db.db.execute_fetchall("SELECT id FROM lifecycle_reviews")
 
     # The skipped Support compares v2→v4, while the other Memory compares v3→v4.

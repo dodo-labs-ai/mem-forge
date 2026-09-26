@@ -4744,9 +4744,8 @@ async def test_derivation_recovery_resumes_active_v9_before_provider_work(
         stats.processed,
         stats.updated,
         stats.memories_extracted,
-        stats.memories_corroborated,
         stats.deferred_results,
-    ) == (1, 1, 0, 0, ())
+    ) == (1, 1, 0, ())
     assert len(recovery_engine.projected_lifecycle_calls) == 1
     [preserved] = await db.list_source_derivation_attempts(source_id=source_id)
     assert preserved.status == "applied"
@@ -5192,9 +5191,8 @@ async def test_derivation_recovery_commits_the_current_policy_identity(
         stats.processed,
         stats.updated,
         stats.memories_extracted,
-        stats.memories_corroborated,
         stats.deferred_results,
-    ) == (1, 1, 0, 0, ())
+    ) == (1, 1, 0, ())
     assert extractor.fragment_calls
     [lifecycle_call] = recovery_engine.projected_lifecycle_calls
     replacement_id = lifecycle_call["derivation_id"]
@@ -9868,7 +9866,6 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
     class ReplayMemoryStore:
         def __init__(self, database: Database) -> None:
             self.db = database
-            self.relational = adapters.relational
 
         def operation_context(self, **kwargs):
             del kwargs
@@ -9876,38 +9873,6 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
 
         async def record_audit_event(self, *args, **kwargs):
             del args, kwargs
-
-        async def find_access_compatible_equivalence_candidates(self, *args, **kwargs):
-            del args, kwargs
-            return ()
-
-        async def find_access_compatible_equivalence_candidates_batch(self, queries):
-            return tuple(() for _query in queries)
-
-        async def find_access_compatible_exact_candidate(
-            self,
-            memory,
-            *,
-            excluded_memory_ids=frozenset(),
-        ):
-            return await self.db.find_active_exact_claim_candidate(
-                memory.content_hash,
-                visibility=memory.visibility,
-                owner_user_id=memory.owner_user_id,
-                repo_identifier=memory.repo_identifier,
-                excluded_memory_ids=tuple(sorted(excluded_memory_ids)),
-            )
-
-        async def find_access_compatible_exact_candidates_batch(self, requests):
-            return tuple(
-                [
-                    await self.find_access_compatible_exact_candidate(
-                        request.challenger,
-                        excluded_memory_ids=request.excluded_memory_ids,
-                    )
-                    for request in requests
-                ]
-            )
 
         async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id: str):
             from memforge.memory.lifecycle_plan import (

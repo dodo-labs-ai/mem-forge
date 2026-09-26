@@ -67,17 +67,3 @@ class RelationCoverage:
         if outside:
             return f"{row.candidate_id} names {', '.join(outside)}, which is not in its allowed list"
         return None
-
-    def validate(self, rows: Any) -> None:
-        """Require exactly one valid completion row for every candidate."""
-
-        seen: set[str] = set()
-        for row in rows:
-            candidate_id = row.candidate_id
-            if candidate_id not in self.allowed or candidate_id in seen:
-                raise ValueError("unknown or duplicate candidate completion")
-            seen.add(candidate_id)
-            if (error := self.row_error(row)) is not None:
-                raise ValueError(error)
-        if seen != set(self.allowed):
-            raise ValueError("missing candidate completion")
