@@ -6,17 +6,18 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.models import ContentItem, NormalizedContent, RawContent
+from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.projection_context import (
     CommittedSourceUnitSnapshot,
+    ExtractionAuthority,
     plan_projection_evidence_work,
 )
-from memforge.pipeline.projection_fragments import (
-    compile_projection_fragment_catalog,
-)
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.source_projection_adapters import (
     BUILTIN_SPECIALIZED_SOURCE_TYPES,
     project_source_item,
 )
+from tests.llm_fixture import NoopMemoryExtractor
 
 
 NOW = datetime(2026, 8, 12, tzinfo=timezone.utc)
@@ -82,7 +83,7 @@ def test_active_v9_source_matrix_uses_exact_current_incremental_authority(
         if observation.observation_type == target_type
     )
 
-    batches = plan_projection_evidence_work(
+    authority = plan_projection_evidence_work(
         second,
         committed_base_snapshot=CommittedSourceUnitSnapshot(
             unit_revision=first.source_unit_revisions[0],
@@ -91,20 +92,19 @@ def test_active_v9_source_matrix_uses_exact_current_incremental_authority(
         reprocess_all_current_observations=False,
     )
 
-    assert isinstance(batches, tuple)
-    batch = next(
-        item
-        for item in batches
-        if target_observation_id in item.primary_observation_ids
-    )
-    catalog = compile_projection_fragment_catalog(
-        second,
-        batch,
-        access_context_hash="workspace",
+    assert isinstance(authority, ExtractionAuthority)
+    assert target_observation_id in authority.ranges_by_observation_id
+    requests = plan_extraction_requests(
+        RevisionAssessmentContext(projection=second, base=first, access_context_hash="workspace"),
+        authority,
+        extractor=NoopMemoryExtractor(),
+        source_type=source_type,
+        doc_type="document",
     )
     primary_text = "\n".join(
         fragment.presentation_text
-        for fragment in catalog.fragments
+        for request in requests
+        for fragment in request.catalog.fragments
         if fragment.primary_eligible
     )
     assert CURRENT_RULE in primary_text

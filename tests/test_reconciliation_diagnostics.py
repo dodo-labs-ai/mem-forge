@@ -56,7 +56,7 @@ async def test_mandatory_provider_failure_preserves_support_and_revision_without
         run_id="diagnostics-after",
         body="A7 is retained.",
         prior=first.source_unit_revisions[0],
-        prior_observations={first.observations[0].id: first.observation_revisions[0]},
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(

@@ -15,10 +15,10 @@ from tests.revision_client_fixture import RevisionClientFixture, sparse_response
 
 
 class Client(RevisionClientFixture):
-    def __init__(self, classification, direction="symmetric", status="resolved", eligibility=True, consistent=True):
+    def __init__(self, classification, direction="symmetric", status="resolved", eligibility=True):
         self.calls = 0
         self.classification, self.direction = classification, direction
-        self.status, self.eligibility, self.consistent = status, eligibility, consistent
+        self.status, self.eligibility = status, eligibility
         self.duplicate = False
         self.invalid = False
         self.prompts = []
@@ -35,7 +35,6 @@ class Client(RevisionClientFixture):
         response = ClaimRevisionDecision(
             pair_index=0,
             status=self.status,
-            consistent_with_support=self.consistent,
             relation=MemoryRelationAssessment(
                 classification=self.classification,
                 direction=self.direction,
@@ -46,7 +45,6 @@ class Client(RevisionClientFixture):
                 same_knowledge_item=True,
                 preserves_incumbent_truth=self.eligibility,
                 challenger_is_complete_current_claim=True,
-                current_evidence_entails_challenger=True,
             )
             if self.classification == "refines" and self.direction == "challenger_to_candidate"
             else None,
@@ -93,25 +91,44 @@ async def test_one_call_relation_and_revision_action_matrix(relation, direction,
     assert [op.action for op in result.operations] == actions
     assert client.calls == 1
     assert "Country: US." in client.prompts[0]
+    [old] = catalog_payload(client.prompts[0])["existing_claims"]
+    assert set(old) == {"id", "text", "type", "valid_from", "valid_until"}
+    assert "current_support" not in client.prompts[0] and "evidence_status" not in client.prompts[0]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "status,supported,consistent", [("insufficient", True, True), ("resolved", False, True)]
-)
-async def test_uncertainty_or_l3_inconsistency_never_becomes_add(status, supported, consistent):
-    client = Client("equivalent", status=status, consistent=consistent)
+async def test_uncertain_relation_never_becomes_add():
+    client = Client("equivalent", status="insufficient")
     result = await reconcile_memories(
         new_extractions=[candidate()],
         existing_memories=[memory()],
         doc_type="policy",
         structured_llm_client=client,
-        support_audits=[SupportAuditEntry("memory", supported)],
+        support_audits=[SupportAuditEntry("memory", True)],
         include_metadata=True,
     )
     assert result.failure is None
     [operation] = result.operations
     assert operation.action == ReconcileAction.NOOP and operation.memory is None
+    assert operation.support_revalidation_skipped
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_an_equivalent_candidate_of_an_unsupported_incumbent_stays_unresolved():
+    client = Client("equivalent")
+    result = await reconcile_memories(
+        new_extractions=[candidate()],
+        existing_memories=[memory()],
+        doc_type="policy",
+        structured_llm_client=client,
+        support_audits=[SupportAuditEntry("memory", False, "Current source no longer states it")],
+        include_metadata=True,
+    )
+    assert result.failure is None
+    [operation] = result.operations
+    assert operation.action == ReconcileAction.NOOP and operation.memory_id == "memory"
+    assert operation.memory is None and not operation.flag_for_review
     assert operation.support_revalidation_skipped
     assert client.calls == 1
 
@@ -160,7 +177,7 @@ async def test_single_pair_does_not_require_large_model_output_window():
 
 
 @pytest.mark.asyncio
-async def test_refinement_entailment_chain_cannot_override_rejected_old_support():
+async def test_refinement_preserving_an_unsupported_incumbent_stays_unresolved():
     client = Client("refines", "challenger_to_candidate", eligibility=True)
     result = await reconcile_memories(
         new_extractions=[candidate()],
@@ -177,8 +194,24 @@ async def test_refinement_entailment_chain_cannot_override_rejected_old_support(
     assert client.calls == 1
 
 
-@pytest.mark.parametrize("stage", ["support", "claim"])
+@pytest.mark.asyncio
+async def test_refinement_that_drops_unsupported_incumbent_truth_removes_its_support():
+    client = Client("refines", "challenger_to_candidate", eligibility=False)
+    result = await reconcile_memories(
+        new_extractions=[candidate()],
+        existing_memories=[memory()],
+        doc_type="policy",
+        structured_llm_client=client,
+        support_audits=[SupportAuditEntry("memory", False)],
+        include_metadata=True,
+    )
+    assert result.failure is None
+    assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.DELETE]
+
+
+@pytest.mark.parametrize("stage", ["support", "admission", "claim"])
 def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeypatch, stage):
+    from memforge.memory import engine
     from memforge.memory.engine import _source_lifecycle_operation_input_hash
     from memforge.pipeline import revision_assessment, claim_revision
 
@@ -195,11 +228,11 @@ def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeyp
         llm_model="test",
     )
     before = _source_lifecycle_operation_input_hash(**inputs)
-    module, field = (
-        (revision_assessment, "REVISION_SUPPORT_CONTRACT")
-        if stage == "support"
-        else (claim_revision, "CLAIM_REVISION_CONTRACT")
-    )
+    module, field = {
+        "support": (revision_assessment, "REVISION_SUPPORT_CONTRACT"),
+        "admission": (engine, "CANDIDATE_ADMISSION_CONTRACT"),
+        "claim": (claim_revision, "CLAIM_REVISION_CONTRACT"),
+    }[stage]
     monkeypatch.setattr(module, field, "a-future-semantic-contract")
     assert _source_lifecycle_operation_input_hash(**inputs) != before
 
@@ -210,7 +243,6 @@ def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeyp
     [
         "same_knowledge_item",
         "challenger_is_complete_current_claim",
-        "current_evidence_entails_challenger",
     ],
 )
 async def test_revision_conditions_map_independently_to_the_lifecycle_gate(condition):
@@ -233,12 +265,7 @@ async def test_revision_conditions_map_independently_to_the_lifecycle_gate(condi
         include_metadata=True,
     )
     assert result.failure is None
-    if condition == "current_evidence_entails_challenger":
-        [operation] = result.operations
-        assert operation.action == ReconcileAction.NOOP and operation.memory is None
-        assert operation.support_revalidation_skipped
-    else:
-        assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
+    assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
     assert client.calls == 1
 
 
@@ -260,7 +287,6 @@ async def test_large_pair_group_subdivides_without_losing_pairs():
     result = await assess_claim_pairs(
         candidates=[candidate()],
         incumbents=olds,
-        support_audits=[SupportAuditEntry(old.id, True) for old in olds],
         client=client,
         model="fixture",
     )
@@ -270,7 +296,7 @@ async def test_large_pair_group_subdivides_without_losing_pairs():
 
 
 @pytest.mark.asyncio
-async def test_chunked_incumbents_merge_and_insufficient_evidence_in_any_chunk_blocks_the_candidate():
+async def test_chunked_incumbents_merge_relations_and_uncertainty_per_chunk():
     from dataclasses import replace
     from memforge.llm.structured import ClaimRevisionWireResponse
     from memforge.pipeline.claim_revision import assess_claim_pairs
@@ -286,21 +312,16 @@ async def test_chunked_incumbents_merge_and_insufficient_evidence_in_any_chunk_b
             second = old["id"] == "MEM-0002"
             return ClaimRevisionWireResponse.model_validate({"results": [{
                 "candidate_id": new["id"],
-                "evidence_status": "insufficient" if second else "entailed",
                 "relations": [] if second else [{"existing_id": old["id"], "relation": "equivalent", "reason": "Same rule"}],
                 "uncertain_existing_ids": [old["id"]] if second else [],
             }]})
 
     client = ChunkClient("equivalent")
     olds = [replace(memory(), id=f"memory-{i}") for i in range(2)]
-    result = await assess_claim_pairs(
-        candidates=[candidate()], incumbents=olds,
-        support_audits=[SupportAuditEntry(old.id, True) for old in olds], client=client, model="fixture",
-    )
+    result = await assess_claim_pairs(candidates=[candidate()], incumbents=olds, client=client, model="fixture")
     assert len(client.prompts) == 2
-    assert result.blocked_candidates == (0,)
     assert [(incumbent, decision.status) for _, incumbent, decision in result.decisions] == [
-        ("memory-0", "insufficient"), ("memory-1", "insufficient"),
+        ("memory-0", "resolved"), ("memory-1", "insufficient"),
     ]
 
 

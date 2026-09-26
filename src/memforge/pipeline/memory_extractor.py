@@ -5,17 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from dataclasses import replace
 from time import perf_counter
 
 from memforge.config import DEFAULT_MEMORY_EXTRACTION_MAX_TOKENS
 from memforge.evals.agent_evaluation import QualitySignal, record_quality_signal
-from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
+from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import (
+    INPUT_CAPACITY_EXCEEDED,
     LiteLlmStructuredClient,
     ProjectionFragmentMemoryExtractionResponse,
     StructuredLlmConfig,
     StructuredLlmError,
-    StructuredLlmImage,
 )
 from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.extraction_contract import (
@@ -29,18 +30,20 @@ from memforge.pipeline.fragment_selector_correction import (
 from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
     ProjectionFragmentCatalog,
-    SupportRevalidationLimitation,
 )
+from memforge.pipeline.projection_context import ExtractionAuthority
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["MemoryExtractor"]
+__all__ = ["ExtractionReading", "MemoryExtractor"]
 
 # Requested extraction output: a response envelope plus, per authorized Primary
 # Fragment, room for its claims (at least one claim, else about half its text).
 _FRAGMENT_OUTPUT_BASE_TOKENS = 512
 _FRAGMENT_OUTPUT_MIN_TOKENS = 768
 _FRAGMENT_OUTPUT_CHARS_PER_TOKEN = 2
+EXTRACTION_CAPACITY_EXCEEDED_MESSAGE = "one ReadingGroup alone exceeds the extraction request capacity"
 
 
 PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic knowledge from one authorized Source Unit catalog.
@@ -55,13 +58,12 @@ ref proves image contents; a caption or URL alone never proves unseen image deta
 Canonical fromString is the previous value; toString is the new value. Select the
 field-name/time refs when needed to state the change accurately.
 Structural groups describe ancestry, not additional Evidence. When a heading defines claim scope, select its current ref as Required.
+A row whose format is unit-identity names the Source Unit this catalog belongs to, such as its key, type or title.
+It states no claim itself: select it as Required when a claim names or depends on that Unit.
 Only the following application-owned Evidence Fragments may support a Memory:
 <evidence_fragment_catalog digest="{catalog_digest}">
 {fragment_catalog}
 </evidence_fragment_catalog>
-<read_only_context>
-{context_observations}
-</read_only_context>
 
 Each Memory must contain exactly:
 - "content": one self-contained durable claim
@@ -75,14 +77,91 @@ Each Memory must contain exactly:
 
 Do not return Evidence text, quotes, Observation or Revision IDs, offsets, hashes, profile names, catalog digests, Context refs, or lifecycle actions. Split a candidate that would otherwise need multiple independently claim-bearing Primary refs.
 
-""" + DURABLE_MEMORY_QUALITY_RULES + """Context outside the Fragment catalog is read-only. `required_only_candidates` may be selected as Required but never as Primary. If a durable claim is stated only by required_only_candidates, return an empty memories array. Fragment refs are valid only in this catalog. Never invent or transform a ref.
+""" + DURABLE_MEMORY_QUALITY_RULES + """`required_only_candidates` may be selected as Required but never as Primary. If a durable claim is stated only by required_only_candidates, return an empty memories array. Fragment refs are valid only in this catalog. Never invent or transform a ref.
 
 Return ONLY a JSON object with a "memories" array. Use {{"memories": []}} when there are no memories."""
 
 
-# ---------------------------------------------------------------------------
-# MemoryExtractor class
-# ---------------------------------------------------------------------------
+class ExtractionReading:
+    """One extraction catalog read as items: each ReadingGroup that holds authorized Primary.
+
+    The catalog holds exactly its items and the context every reading of them
+    adds. An item is keyed by the reference of its first Fragment. A request for
+    some of the items reads them with their context, which is never Primary.
+    """
+
+    def __init__(
+        self,
+        catalog: ProjectionFragmentCatalog,
+        context: RevisionAssessmentContext,
+        *,
+        source_type: str,
+        doc_type: str,
+    ) -> None:
+        self.catalog = catalog
+        self.context = context
+        self.source_type = source_type
+        self.doc_type = doc_type
+        self.items = {
+            group[0].reference: group
+            for group in context.reading_groups(catalog.fragments)
+            if any(fragment.primary_eligible for fragment in group)
+        }
+
+    @classmethod
+    def of_authority(
+        cls, context: RevisionAssessmentContext, authority: ExtractionAuthority, *, source_type: str, doc_type: str,
+    ) -> ExtractionReading:
+        """Read every ReadingGroup that holds authorized Primary, and nothing else, of the current revision."""
+        authorized = tuple(
+            replace(fragment, primary_eligible=fragment.primary_eligible and authority.authorizes(fragment))
+            for fragment in context.full_fragments
+        )
+        return cls(
+            _read_catalog(context, authorized, context.reading_groups(authorized)),
+            context,
+            source_type=source_type,
+            doc_type=doc_type,
+        )
+
+    def catalog_for(self, item_ids) -> ProjectionFragmentCatalog:
+        """The catalog of one request that reads these items."""
+        if set(item_ids) == set(self.items):
+            return self.catalog
+        return _read_catalog(self.context, self.catalog.fragments, tuple(self.items[item_id] for item_id in item_ids))
+
+    def request(self, item_ids, *, output_tokens, fits) -> LlmRequest:
+        """The one request that reads these items, with the Artifact images its catalog cites."""
+        return self.request_for(self.catalog_for(item_ids), output_tokens=output_tokens, fits=fits)
+
+    def request_for(self, catalog: ProjectionFragmentCatalog, *, output_tokens, fits) -> LlmRequest:
+        """The request that reads one catalog of these items."""
+        request = LlmRequest(
+            MemoryExtractor.projection_fragment_prompt(
+                catalog, source_type=self.source_type, doc_type=self.doc_type, revision_context=self.context,
+            ),
+            ProjectionFragmentMemoryExtractionResponse,
+            output_tokens(catalog),
+        )
+        return self.context.attach_images(request, catalog, fits=fits)
+
+
+def _read_catalog(context: RevisionAssessmentContext, fragments, groups) -> ProjectionFragmentCatalog:
+    """The groups that hold Primary, with their reading context demoted to Required-only."""
+    own = {
+        fragment.anchor
+        for group in groups
+        if any(fragment.primary_eligible for fragment in group)
+        for fragment in group
+    }
+    read = own | context.reading_context(tuple(f for f in fragments if f.anchor in own))
+    return context.catalog(
+        tuple(
+            fragment if fragment.anchor in own else replace(fragment, primary_eligible=False)
+            for fragment in fragments
+            if fragment.anchor in read
+        )
+    )
 
 
 class MemoryExtractor:
@@ -124,54 +203,11 @@ class MemoryExtractor:
             )
 
     @staticmethod
-    def projection_fragment_prompt(
-        catalog,
-        *,
-        source_type,
-        doc_type,
-        context_markdown="",
-        context_observation_ids=(),
-        revision_context=None,
-        mode="authorized_work",
-    ):
-        payload = revision_context.model_payload(catalog) if revision_context is not None else catalog.model_payload()
-        context_ids = set(context_observation_ids)
-        if context_ids and revision_context is not None:
-            required_context_anchors = {
-                fragment.anchor
-                for fragment in revision_context.full_fragments
-                if fragment.anchor.observation_id in context_ids
-            }
-            represented_context_anchors = {
-                fragment.anchor
-                for fragment in catalog.fragments
-                if fragment.anchor.observation_id in context_ids
-            }
-            if (
-                context_ids
-                <= {anchor.observation_id for anchor in required_context_anchors}
-                and required_context_anchors <= represented_context_anchors
-            ):
-                context_markdown = ""
-        if revision_context is not None and mode in {"delta", "full"}:
-            context_payload = {
-                "input_mode": mode,
-                **(
-                    {"removed_historical": revision_context.delta()[1]}
-                    if mode == "delta"
-                    else {}
-                ),
-                **({"additional_context": context_markdown} if context_markdown else {}),
-            }
-            context_observations = json.dumps(
-                context_payload, ensure_ascii=False, separators=(",", ":")
-            )
-        else:
-            context_observations = context_markdown
+    def projection_fragment_prompt(catalog, *, source_type, doc_type, revision_context) -> str:
+        payload = revision_context.model_payload(catalog)
         return PROJECTION_FRAGMENT_EXTRACTION_PROMPT.format(
             source_type=source_type, doc_type=doc_type, catalog_digest=catalog.digest,
             fragment_catalog=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            context_observations=context_observations,
         )
 
     async def extract_projection_fragment_memories(
@@ -180,44 +216,18 @@ class MemoryExtractor:
         *,
         source_type: str,
         doc_type: str = "unknown",
-        context_markdown: str = "",
-        images: tuple[StructuredLlmImage, ...] = (),
-        revision_context=None,
-        prepared_prompt: str | None = None,
-        prepared_input_mode: str | None = None,
-        prepared_selection_reason: str | None = None,
-        prepared_estimated_cost: dict[str, int] | None = None,
-        context_observation_ids: tuple[str, ...] = (),
+        revision_context: RevisionAssessmentContext,
     ) -> MemoryExtractionResult:
-        """Select exact current Evidence within this work's Primary authority."""
+        """Select exact current Evidence within this work's Primary authority.
+
+        Each ReadingGroup that holds authorized Primary is one runner item, so a
+        request that times out or exceeds capacity is halved and resent.
+        """
 
         if not self.structured_llm_client:
             return MemoryExtractionResult(
                 error_type="llm_client_unavailable",
                 error="No LLM client configured for memory extraction",
-            )
-        if not catalog.usable:
-            reason_codes = sorted({error.code.value for error in catalog.errors})
-            reason_code = (
-                "catalog_too_large"
-                if "catalog_too_large" in reason_codes
-                else (reason_codes[0] if reason_codes else "catalog_unusable")
-            )
-            record_quality_signal(
-                QualitySignal(
-                    event_name="evidence_admission_outcome",
-                    outcome="rejected",
-                    reason_code=reason_code,
-                )
-            )
-            return MemoryExtractionResult(
-                error_type="evidence_catalog_unusable",
-                error="Evidence Fragment catalog is not usable",
-                metadata={
-                    "extraction_contract_version": PROJECTION_EXTRACTION_CONTRACT_VERSION,
-                    "catalog_digest": catalog.digest,
-                    "catalog_error_codes": reason_codes,
-                },
             )
         invoke = getattr(
             self.structured_llm_client,
@@ -229,177 +239,139 @@ class MemoryExtractor:
                 error_type="projection_extraction_v9_unavailable",
                 error="Structured client does not implement projection-extraction-v9",
             )
+        reading = ExtractionReading(catalog, revision_context, source_type=source_type, doc_type=doc_type)
+        runner = LlmBatchRunner(self.structured_llm_client, model=self.model)
 
-        def make_prompt(selected_catalog, mode):
-            return self.projection_fragment_prompt(selected_catalog, source_type=source_type, doc_type=doc_type,
-                context_markdown=context_markdown, context_observation_ids=context_observation_ids,
-                revision_context=revision_context, mode=mode)
+        # The request last rendered for each set of items is the one sent for it.
+        rendered: dict[tuple[str, ...], tuple[LlmRequest, ProjectionFragmentCatalog]] = {}
 
-        input_mode = prepared_input_mode or "authorized_work"
-        input_selection_reason = prepared_selection_reason
-        estimated_input_cost = prepared_estimated_cost
-        prompt = prepared_prompt or make_prompt(catalog, input_mode)
-        if revision_context is not None and prepared_prompt is None:
-            from memforge.pipeline.revision_input import (
-                ExtractionInputTask,
-                InputCandidate,
-                InputCost,
-                PlannedTransport,
-                RevisionInputPlanner,
-            )
+        def render(item_ids, _parts) -> LlmRequest:
+            request_catalog = reading.catalog_for(item_ids)
+            request = reading.request_for(request_catalog, output_tokens=self.fragment_output_tokens, fits=runner.fits)
+            rendered[tuple(item_ids)] = (request, request_catalog)
+            return request
 
-            runner = LlmBatchRunner(self.structured_llm_client, model=self.model)
-
-            def plan_request(candidate: InputCandidate, *, load_images: bool) -> LlmRequest | None:
-                """Bound one whole-catalog request, or None when it cannot fit."""
-
-                def render():
-                    request = LlmRequest(
-                        make_prompt(candidate.catalog, candidate.mode.value),
-                        ProjectionFragmentMemoryExtractionResponse,
-                        self.fragment_output_tokens(candidate.catalog),
-                    )
-                    if not load_images:
-                        return request
-                    return revision_context.attach_images(request, candidate.catalog, fits=runner.fits)
-
-                return runner.fit(render)
-
-            def request_cost(request: LlmRequest, *, complete: bool = True) -> InputCost:
-                return InputCost(
-                    input_tokens=self.structured_llm_client.request_tokens(
-                        request.prompt, response_format=request.response_format,
-                        model=self.model, images=request.images,
-                    ),
-                    output_tokens=request.max_tokens,
-                    request_count=1,
-                    image_count=len(request.images),
-                    image_bytes=sum(len(image.body) for image in request.images),
-                    complete=complete,
-                )
-
-            class RequestPolicy:
-                @staticmethod
-                def lower_bound(candidate: InputCandidate):
-                    request = plan_request(candidate, load_images=False)
-                    if request is None:
-                        return None
-                    has_images = any(fragment.kind.value == "artifact" for fragment in candidate.catalog.fragments)
-                    return request_cost(request, complete=not has_images)
-
-                @staticmethod
-                def materialize(candidate: InputCandidate):
-                    request = plan_request(candidate, load_images=True)
-                    if request is None:
-                        return None
-                    return PlannedTransport(request_cost(request), (candidate.catalog, request.prompt, request.images))
-
-            baseline = (
-                revision_context.projection.deltas[0].previous_unit_revision_id
-                if revision_context.projection.deltas
-                else None
-            )
-            try:
-                plan = RevisionInputPlanner.plan(
-                    context=revision_context,
-                    task=ExtractionInputTask(catalog, named_baseline_revision_id=baseline),
-                    request_policy=RequestPolicy(),
-                )
-            except SupportRevalidationLimitation as error:
-                return MemoryExtractionResult(
-                    error_type="evidence_catalog_unusable",
-                    error=str(error),
-                    metadata={"catalog_error_codes": [error.code.value]},
-                )
-            catalog, prompt, images = plan.transport
-            input_mode = plan.mode.value
-            input_selection_reason = plan.selection_reason
-            estimated_input_cost = plan.estimated_cost.as_payload()
         started = perf_counter()
-        metrics = {
-            "structured_llm_calls": 1,
-            "input_mode": input_mode,
-            "input_selection_reason": input_selection_reason,
-            "estimated_input_cost": estimated_input_cost,
+        metrics: dict[str, object] = {
             "extraction_model": self.model,
-            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-            "prompt_chars": len(prompt),
-            "image_count": len(images),
-            "image_bytes": sum(len(image.body) for image in images),
             "extraction_contract_version": PROJECTION_EXTRACTION_CONTRACT_VERSION,
             "catalog_digest": catalog.digest,
             "catalog_fragment_count": len(catalog.fragments),
+            "reading_group_count": len(reading.items),
         }
-        runner = LlmBatchRunner(self.structured_llm_client, model=self.model)
-        request = LlmRequest(
-            prompt, ProjectionFragmentMemoryExtractionResponse, self.fragment_output_tokens(catalog), tuple(images),
-        )
+
+        def elapsed() -> dict[str, object]:
+            return {
+                "structured_llm_calls": runner.stats.calls,
+                "prompt_chars": runner.stats.prompt_chars,
+                "structured_llm_elapsed_ms": max(0, round((perf_counter() - started) * 1000)),
+            }
+
         try:
-            response = await runner.run_one(request, call=invoke)
+            outcomes = await runner.run_items(ItemTask(
+                item_ids=tuple(reading.items),
+                render=render,
+                # Every item of a request shares that request's response.
+                decode=lambda response, item_ids, _parts: ((item_id, (item_ids, response)) for item_id in item_ids),
+                call=invoke,
+            ))
         except Exception as error:
             logger.error("Unexpected projection Fragment extraction error: %s", error)
             return MemoryExtractionResult(
-                error_type="unexpected_error",
-                error=str(error),
-                metadata={
-                    **metrics,
-                    "structured_llm_elapsed_ms": max(
-                        0, round((perf_counter() - started) * 1000)
-                    ),
-                },
+                error_type="unexpected_error", error=str(error), metadata={**metrics, **elapsed()},
             )
-        if isinstance(response, ItemFailure):
-            if response.category == "capacity_exceeded":
+        failure = next((outcome for outcome in outcomes.values() if isinstance(outcome, ItemFailure)), None)
+        if failure is not None:
+            if failure.category == "capacity_exceeded":
                 return MemoryExtractionResult(
-                    error_type="input_capacity_exceeded",
-                    error="planned extraction request exceeds configured capability",
+                    error_type=INPUT_CAPACITY_EXCEEDED,
+                    error=EXTRACTION_CAPACITY_EXCEEDED_MESSAGE,
+                    metadata={**metrics, **elapsed()},
                 )
-            error = response.error
+            error = failure.error
             validation_fields = error.validation_fields if isinstance(error, StructuredLlmError) else ()
             return MemoryExtractionResult(
                 error_type="structured_llm_error",
                 error=str(error),
                 metadata={
                     **metrics,
-                    "safe_error_code": response.error_code,
+                    **elapsed(),
+                    "safe_error_code": failure.error_code,
                     "safe_validation_fields": [
                         {"location": location, "type": rule_type}
                         for location, rule_type in validation_fields
                     ],
-                    "structured_llm_elapsed_ms": max(
-                        0, round((perf_counter() - started) * 1000)
-                    ),
                 },
             )
 
-        candidates, correction_metrics = await correct_fragment_selectors_once(
-            response.memories, catalog=catalog, client=self.structured_llm_client,
-            extraction_prompt=prompt, max_tokens=self.fragment_output_tokens(catalog), model=self.model, images=images,
-            source_response=response,
-        )
-        metrics.update(correction_metrics)
-        metrics["structured_llm_calls"] += correction_metrics["selector_correction_calls"]
-
+        responses = dict(chunks[0] for chunks in outcomes.values())
         memories: list[RawMemory] = []
-        rejection_counts: dict[str, int] = {}
-        selector_normalization_count = 0
-        selector_normalization_fingerprints: list[str] = []
-        for candidate_index, candidate in enumerate(candidates):
-            normalized_required, removed_ref_count, repair_fingerprint = (
-                normalize_fragment_selector_refs(
-                    candidate_index=candidate_index,
-                    primary_ref=candidate.primary_ref,
-                    required_refs=candidate.required_refs,
-                )
+        resolution = _SelectionResolution()
+        image_count = image_bytes = 0
+        for item_ids, response in responses.items():
+            request, request_catalog = rendered[tuple(item_ids)]
+            image_count += len(request.images)
+            image_bytes += sum(len(image.body) for image in request.images)
+            candidates, correction_metrics = await correct_fragment_selectors_once(
+                response.memories, catalog=request_catalog, client=self.structured_llm_client,
+                extraction_prompt=request.prompt, max_tokens=request.max_tokens, model=self.model,
+                images=request.images, source_response=response,
             )
-            selector_normalization_count += removed_ref_count
+            resolution.add_correction(correction_metrics)
+            memories.extend(resolution.resolve(
+                candidates, catalog=request_catalog,
+                prompt_hash=hashlib.sha256(request.prompt.encode("utf-8")).hexdigest(),
+                returned=len(response.memories),
+            ))
+        return MemoryExtractionResult(
+            memories=memories,
+            metadata={
+                **metrics,
+                **elapsed(),
+                "structured_llm_calls": runner.stats.calls + resolution.correction["selector_correction_calls"],
+                "extraction_request_count": len(responses),
+                "image_count": image_count,
+                "image_bytes": image_bytes,
+                **resolution.metrics(),
+            },
+        )
+
+
+class _SelectionResolution:
+    """Resolve each extracted candidate's selectors into exact Evidence, across one operation's requests."""
+
+    def __init__(self) -> None:
+        self.returned = 0
+        self.resolved = 0
+        self.rejection_counts: dict[str, int] = {}
+        self.normalization_count = 0
+        self.normalization_fingerprints: list[str] = []
+        self.correction: dict[str, int] = {
+            "selector_correction_calls": 0,
+            "selector_correction_candidate_count": 0,
+            "selector_correction_recovered_count": 0,
+        }
+        self.correction_outcomes: list[str] = []
+
+    def add_correction(self, metrics: dict) -> None:
+        for key in self.correction:
+            self.correction[key] += int(metrics.get(key, 0) or 0)
+        self.correction_outcomes.append(str(metrics["selector_correction_outcome"]))
+
+    def resolve(self, candidates, *, catalog, prompt_hash: str, returned: int) -> list[RawMemory]:
+        self.returned += returned
+        memories = []
+        for candidate_index, candidate in enumerate(candidates):
+            normalized_required, removed_ref_count, repair_fingerprint = normalize_fragment_selector_refs(
+                candidate_index=candidate_index,
+                primary_ref=candidate.primary_ref,
+                required_refs=candidate.required_refs,
+            )
+            self.normalization_count += removed_ref_count
             if repair_fingerprint is not None:
-                selector_normalization_fingerprints.append(repair_fingerprint)
-            candidate_content_hash = hashlib.sha256(
-                candidate.content.encode("utf-8")
-            ).hexdigest()
+                self.normalization_fingerprints.append(repair_fingerprint)
             candidate_hash = catalog.selection_fingerprint(
-                candidate_content_hash=candidate_content_hash,
+                candidate_content_hash=hashlib.sha256(candidate.content.encode("utf-8")).hexdigest(),
                 primary_ref=candidate.primary_ref,
                 required_refs=normalized_required,
             )
@@ -409,13 +381,13 @@ class MemoryExtractor:
                     required_refs=normalized_required,
                 )
             except FragmentSelectionError as error:
-                rejection_counts[error.code.value] = rejection_counts.get(error.code.value, 0) + 1
+                self.rejection_counts[error.code.value] = self.rejection_counts.get(error.code.value, 0) + 1
                 record_quality_signal(
                     QualitySignal(
                         event_name="evidence_admission_outcome",
                         outcome="rejected",
                         reason_code=error.code.value,
-                        prompt_hash=metrics["prompt_sha256"],
+                        prompt_hash=prompt_hash,
                         candidate_hash=candidate_hash,
                     )
                 )
@@ -429,10 +401,11 @@ class MemoryExtractor:
                         if removed_ref_count
                         else "fragment_selection_resolved"
                     ),
-                    prompt_hash=metrics["prompt_sha256"],
+                    prompt_hash=prompt_hash,
                     candidate_hash=candidate_hash,
                 )
             )
+            self.resolved += 1
             memories.append(
                 RawMemory(
                     content=candidate.content,
@@ -451,32 +424,24 @@ class MemoryExtractor:
                     resolved_evidence_selection=selection,
                 )
             )
-        return MemoryExtractionResult(
-            memories=memories,
-            metadata={
-                **metrics,
-                "resolved_fragment_selection_count": len(memories),
-                "rejected_fragment_selection_count": (
-                    len(response.memories) - len(memories)
-                ),
-                "fragment_selection_rejection_counts": rejection_counts,
-                **(
-                    {
-                        "selector_normalized_candidate_count": len(
-                            selector_normalization_fingerprints
-                        ),
-                        "selector_normalization_count": (
-                            selector_normalization_count
-                        ),
-                        "selector_normalization_fingerprints": (
-                            selector_normalization_fingerprints
-                        ),
-                    }
-                    if selector_normalization_fingerprints
-                    else {}
-                ),
-                "structured_llm_elapsed_ms": max(
-                    0, round((perf_counter() - started) * 1000)
-                ),
-            },
-        )
+        return memories
+
+    def metrics(self) -> dict[str, object]:
+        return {
+            **self.correction,
+            "selector_correction_outcome": next(
+                (outcome for outcome in self.correction_outcomes if outcome != "not_needed"), "not_needed",
+            ),
+            "resolved_fragment_selection_count": self.resolved,
+            "rejected_fragment_selection_count": self.returned - self.resolved,
+            "fragment_selection_rejection_counts": self.rejection_counts,
+            **(
+                {
+                    "selector_normalized_candidate_count": len(self.normalization_fingerprints),
+                    "selector_normalization_count": self.normalization_count,
+                    "selector_normalization_fingerprints": self.normalization_fingerprints,
+                }
+                if self.normalization_fingerprints
+                else {}
+            ),
+        }

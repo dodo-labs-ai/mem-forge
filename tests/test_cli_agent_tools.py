@@ -97,6 +97,10 @@ class FakeToolClient:
         self.calls.append(("update_source_schedule", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
         return self.response
 
+    def reprocess_source_documents(self, **kwargs):
+        self.calls.append(("reprocess_source_documents", {"api_url": self.api_url, **kwargs}))
+        return self.response
+
     def search(self, **kwargs):
         self.calls.append(("search", {"api_url": self.api_url, "api_token": self.api_token, **kwargs}))
         return self.response
@@ -534,6 +538,40 @@ def test_sources_schedule_show_cli_reads_active_api_target(monkeypatch):
             },
         )
     ]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_sources_reprocess_cli_names_documents_on_the_active_api_target(monkeypatch, dry_run):
+    FakeToolClient.reset({"ok": True, "estimated_model_calls": 7})
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient, raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["sources", "reprocess", "src-1", "--document", "jira-PAY-1", "--document", "jira-PAY-2",
+         *(["--dry-run"] if dry_run else [])],
+        env={"MEMFORGE_API_URL": "https://memforge-dev.cfapps.eu12.hana.ondemand.com", "MEMFORGE_API_TOKEN": "t"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["estimated_model_calls"] == 7
+    assert FakeToolClient.calls == [
+        (
+            "reprocess_source_documents",
+            {
+                "api_url": "https://memforge-dev.cfapps.eu12.hana.ondemand.com",
+                "source_id": "src-1",
+                "document_ids": ["jira-PAY-1", "jira-PAY-2"],
+                "dry_run": dry_run,
+            },
+        )
+    ]
+
+
+def test_sources_reprocess_cli_requires_a_document():
+    result = CliRunner().invoke(cli, ["sources", "reprocess", "src-1"])
+
+    assert result.exit_code != 0
+    assert "--document" in result.output
 
 
 def test_target_profile_sets_default_api_url(monkeypatch, tmp_path: Path):

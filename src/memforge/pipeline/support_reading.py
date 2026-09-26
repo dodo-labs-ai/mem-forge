@@ -195,7 +195,7 @@ def plan_support_revision(
     ]
     # Only a Support with an UNKNOWN part neither judges nor reads the revision.
     reads_revision = any(not _any_unknown(parts) for parts in correspondences)
-    groups = _current_reading_groups(context, catalog) if reads_revision else ()
+    groups = context.reading_groups(catalog.fragments) if reads_revision else ()
     changes, changed_refs = (
         _changes(context, catalog, groups) if context.base is not None and reads_revision else ((), frozenset())
     )
@@ -285,12 +285,13 @@ def _changes(
     catalog: ProjectionFragmentCatalog,
     groups: tuple[tuple[EvidenceFragment, ...], ...],
 ) -> tuple[tuple[ReadingPart, ...], frozenset[str]]:
-    """The changed current ReadingGroups, whole, then removed old text: it may have qualified a claim."""
+    """The changed Unit Title and current ReadingGroups, whole, then removed old text: it may have qualified a claim."""
     changed_fragments, removed = context.delta_fragments()
     changed_anchors = {fragment.anchor for fragment in changed_fragments}
     # A list that lost an item changed, so its remaining items are read with the removal.
     touched = changed_anchors | _remaining_list_items(context, catalog, removed)
-    changed_groups = tuple(group for group in groups if any(f.anchor in touched for f in group))
+    title = tuple(fragment for fragment in catalog.fragments if fragment.anchor in context.unit_title_anchors)
+    changed_groups = tuple(group for group in (title, *groups) if any(f.anchor in touched for f in group))
     changes = (
         *(ReadingPart(fragments=group) for group in changed_groups),
         *(
@@ -335,17 +336,3 @@ def _headings(context: RevisionAssessmentContext, fragment: EvidenceFragment) ->
 def removed_entries(parts: Sequence[ReadingPart]) -> tuple[Mapping[str, Any], ...]:
     """The removed old text among some reading parts, in order."""
     return tuple(part.removed for part in parts if part.removed is not None)
-
-
-def _current_reading_groups(
-    context: RevisionAssessmentContext, catalog: ProjectionFragmentCatalog
-) -> tuple[tuple[EvidenceFragment, ...], ...]:
-    """Partition the current catalog in document order: one outermost list, or one Fragment, per group."""
-    list_of: dict[SourceAnchor, tuple[str, int]] = {}
-    for revision in context.current.values():
-        for index, group in enumerate(context.reading_index(revision).lists):
-            list_of.update(dict.fromkeys(group.trigger_anchors, (revision.id, index)))
-    groups: dict[SourceAnchor | tuple[str, int], list[EvidenceFragment]] = {}
-    for fragment in catalog.fragments:
-        groups.setdefault(list_of.get(fragment.anchor, fragment.anchor), []).append(fragment)
-    return tuple(tuple(group) for group in groups.values())

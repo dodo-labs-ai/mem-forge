@@ -46,7 +46,7 @@ from memforge.source_derivation import (
 from memforge.source_projection import source_projection_to_payload
 from memforge.llm.structured import OfflineSemanticJudgeResponse
 from memforge.storage.database import Database
-from tests.llm_fixture import FixtureBudgetClient
+from tests.llm_fixture import FixtureBudgetClient, fixture_request_planner
 
 
 class _FixedExecutor:
@@ -1105,6 +1105,9 @@ async def test_derivation_replay_uses_shared_planner_without_durable_staging() -
     )
     seen_batches = []
 
+    async def plan(authority, work, _candidate_manifest):
+        return await fixture_request_planner(work.projection, access_context_hash=work.access_context_hash)(authority)
+
     async def extract(batch, work, candidate_manifest):
         seen_batches.append((batch.id, work.access_context_hash, candidate_manifest["prompt_hash"]))
         return MemoryExtractionResult(
@@ -1118,7 +1121,7 @@ async def test_derivation_replay_uses_shared_planner_without_durable_staging() -
             ]
         )
 
-    executor = SourceUnitDerivationReplayExecutor(extract)
+    executor = SourceUnitDerivationReplayExecutor(plan, extract)
     output = await executor.execute(
         AgentEvaluationCase(
             case_id="aec-derivation",

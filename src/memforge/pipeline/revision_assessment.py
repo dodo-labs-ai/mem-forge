@@ -1,7 +1,8 @@
-"""Complete revision context shared by extraction and fixed-claim Support assessment.
+"""Complete revision context shared by Claim Extraction and fixed-claim Support assessment.
 
-Indexes are operation-local. Full and delta inputs share the same current
-fragment identities; old coordinates never select a new revision's Evidence.
+Indexes are operation-local. Every reading shares the same current Fragment
+identities, ReadingGroups and reading context; old coordinates never select a
+new revision's Evidence.
 """
 
 from __future__ import annotations
@@ -24,7 +25,10 @@ from memforge.pipeline.evidence_fragments import (
     revision_structural_ranges,
     _revision_structural_identities,
 )
-from memforge.pipeline.projection_context import observation_is_inference_eligible
+from memforge.pipeline.projection_context import (
+    observation_is_inference_eligible,
+    preceding_observation_id,
+)
 from memforge.pipeline.projection_images import ProjectionImageLoadError
 from memforge.pipeline.projection_fragments import (
     ProjectionFragmentCatalog,
@@ -32,15 +36,16 @@ from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitationCode,
     _compose_projection_fragment_catalog,
 )
-from memforge.source_projection import SourceObservationRevision, SourceProjection
+from memforge.source_projection import SourceAnchor, SourceObservationRevision, SourceProjection
+from memforge.source_representation import UNIT_TITLE_PROFILE
 
 # Versions how a fixed Support is revalidated against a revision: it enters the
 # reconciliation manifest and each revalidated Support's ``support_validation``.
-REVISION_SUPPORT_CONTRACT = "revision-support-v4"
-# Versions how revision Fragments are compiled into catalogs and how Claim
-# Extraction chooses its reading scope. Every catalog this context composes,
-# for extraction or for Support, carries it in its identity.
-REVISION_INPUT_POLICY = "revision-input-v6"
+REVISION_SUPPORT_CONTRACT = "revision-support-v5"
+# Versions how revision Fragments are compiled into catalogs, what every
+# reading adds as context, and Claim Extraction's reading scope. Every catalog
+# this context composes, for extraction or for Support, carries it in its identity.
+REVISION_INPUT_POLICY = "revision-input-v7"
 
 
 def revision_inference_capability_hash(client, *, extraction_model=None, extraction_max_tokens=None) -> str:
@@ -146,6 +151,13 @@ class RevisionAssessmentContext:
         }
         self.previous = {r.observation_id: r for r in base.observation_revisions} if base else {}
         self.full_fragments = tuple(f for revision in self.current.values() for f in self.index(revision).fragments)
+        # The Unit Title is read with every reading of this Unit.
+        self.unit_title_anchors = frozenset(
+            f.anchor
+            for revision in self.current.values()
+            if revision.evidence_profile == UNIT_TITLE_PROFILE
+            for f in self.index(revision).fragments
+        )
         self._delta = None
         self.structural_context = {}
         self.canonical_fields = {
@@ -282,11 +294,46 @@ class RevisionAssessmentContext:
             )
         return self.reading_indexes[revision.id]
 
+    def reading_groups(self, fragments) -> tuple[tuple[EvidenceFragment, ...], ...]:
+        """Partition Fragments, in their order, into ReadingGroups: one outermost list, or one Fragment.
+
+        The Unit Title is context of every reading, never a ReadingGroup of its own.
+        """
+        list_of: dict[SourceAnchor, tuple[str, int]] = {}
+        for revision in self.current.values():
+            for index, group in enumerate(self.reading_index(revision).lists):
+                list_of.update(dict.fromkeys(group.trigger_anchors, (revision.id, index)))
+        groups: dict[SourceAnchor | tuple[str, int], list[EvidenceFragment]] = {}
+        for fragment in fragments:
+            if fragment.anchor in self.unit_title_anchors:
+                continue
+            groups.setdefault(list_of.get(fragment.anchor, fragment.anchor), []).append(fragment)
+        return tuple(tuple(group) for group in groups.values())
+
+    def reading_context(self, fragments) -> frozenset[SourceAnchor]:
+        """What every model reading of these Fragments adds, never as Primary.
+
+        The representation adds heading, intro and list lead-in context; each
+        read Observation brings the one its provider says it answers or follows;
+        and the Unit Title names the Unit. The read Fragments are not repeated.
+        """
+        selected = {fragment.anchor for fragment in fragments}
+        context = set(self.unit_title_anchors)
+        for revision in self.current.values():
+            scoped = tuple(f for f in fragments if f.anchor.observation_revision_id == revision.id)
+            if scoped:
+                context.update(self.reading_index(revision).expand(scoped).context_anchors)
+        for observation_id in {fragment.anchor.observation_id for fragment in fragments}:
+            preceding = self.current.get(preceding_observation_id(self.projection, observation_id) or "")
+            if preceding is not None:
+                context.update(f.anchor for f in self.index(preceding).fragments)
+        return frozenset(context - selected)
+
     def catalog(self, fragments) -> ProjectionFragmentCatalog:
         return _compose_projection_fragment_catalog(
             projection=self.projection,
             access_context_hash=self.access_context_hash,
-            catalog_identity={"input_policy": REVISION_INPUT_POLICY, "purpose": "fixed_claim_support"},
+            catalog_identity={"input_policy": REVISION_INPUT_POLICY, "purpose": "revision_reading"},
             compiled_fragments=list(fragments),
             errors=[],
             component_digests=[],
@@ -328,8 +375,3 @@ class RevisionAssessmentContext:
             "text": fragment.presentation_text,
             **self.canonical_context(fragment),
         }
-
-    def delta(self):
-        """The changed current Fragments and the removed old text, as Claim Extraction reads them."""
-        changed, removed = self.delta_fragments()
-        return changed, [self.removed_entry(fragment) for fragment in removed]

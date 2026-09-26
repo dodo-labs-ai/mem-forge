@@ -38,20 +38,36 @@ from memforge.llm.structured import (
     ProjectionFragmentMemoryCandidate,
     ProjectionFragmentMemoryExtractionResponse,
 )
+from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.memory_extractor import MemoryExtractor
-from memforge.pipeline.projection_context import plan_projection_extraction_batches
+from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionRequest
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
-from memforge.pipeline.projection_fragments import compile_projection_fragment_catalog
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.source_access import source_is_discoverable
 from memforge.storage.database import Database
+from tests.llm_fixture import NoopMemoryExtractor, fixture_request_planner
 from tests.unit_support_fixture import active_support_evidence, record_unit_support
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
     SourceUnitDeriver,
 )
+
+
+def _file_content_extraction(projection, access_hash):
+    """The one planned request that reads the whole file content, and its reading context."""
+    context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash=access_hash)
+    content = next(o.id for o in projection.observations if o.observation_type == "file_content")
+    [request] = plan_extraction_requests(
+        context,
+        ExtractionAuthority({content: None}),
+        extractor=NoopMemoryExtractor(),
+        source_type=projection.source_type,
+        doc_type="document",
+    )
+    return request.catalog, context
 
 
 @pytest_asyncio.fixture
@@ -678,15 +694,8 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
             last_synced=now,
         )
     )
-    batch = plan_projection_extraction_batches(
-        projection,
-    )[0]
     access_hash = hashlib.sha256("workspace\x1f\x1f".encode()).hexdigest()
-    catalog = compile_projection_fragment_catalog(
-        projection,
-        batch,
-        access_context_hash=access_hash,
-    )
+    catalog, reading_context = _file_content_extraction(projection, access_hash)
     primary = next(
         fragment
         for fragment in catalog.fragments
@@ -715,6 +724,7 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
     ).extract_projection_fragment_memories(
         catalog,
         source_type="github_repo",
+        revision_context=reading_context,
     )
     assert extraction.error_type is None
     raw = extraction.memories[0]
@@ -814,14 +824,7 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
         },
     )
     await db.record_source_projection(updated_projection)
-    updated_batch = plan_projection_extraction_batches(
-        updated_projection,
-    )[0]
-    updated_catalog = compile_projection_fragment_catalog(
-        updated_projection,
-        updated_batch,
-        access_context_hash=access_hash,
-    )
+    updated_catalog, updated_context = _file_content_extraction(updated_projection, access_hash)
     updated_primary = next(
         fragment
         for fragment in updated_catalog.fragments
@@ -850,6 +853,7 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
     ).extract_projection_fragment_memories(
         updated_catalog,
         source_type="github_repo",
+        revision_context=updated_context,
     )
     updated_raw = updated_extraction.memories[0]
     updated_evidence = build_projected_claim_evidence(
@@ -1067,8 +1071,8 @@ async def test_deriver_stages_projection_extraction_v9_without_ingestion_replay(
     )
     seen_batches = []
 
-    async def extract(batch):
-        seen_batches.append(batch)
+    async def extract(request):
+        seen_batches.append(request)
         return MemoryExtractionResult(memories=[])
 
     result = await SourceUnitDeriver(db).derive(
@@ -1087,14 +1091,15 @@ async def test_deriver_stages_projection_extraction_v9_without_ingestion_replay(
                 user_id=None,
                 source_activity_epoch=None,
             ),
-            extract_batch=extract,
+            plan_requests=fixture_request_planner(projection, access_context_hash="access-support-v2"),
+            extract_request=extract,
             max_concurrent=1,
             access_context_hash="access-support-v2",
             inference_capability_hash="inference-support-v2",
         )
     )
     assert len(seen_batches) == 1
-    assert seen_batches[0].__class__.__name__ == "ProjectionExtractionBatch"
+    assert isinstance(seen_batches[0], ExtractionRequest)
     assert result.derivation.extraction_contract_version == "projection-extraction-v9"
     assert result.derivation.target_unit_revision_id == projection.source_unit_revisions[0].id
 

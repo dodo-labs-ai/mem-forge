@@ -89,7 +89,7 @@ def test_legacy_part_without_digest_is_never_exact():
 def test_modified_part_is_read_in_the_first_part_even_without_changed_content():
     base, _ = revisions(f"Intro para.\n\n{RULE}\n\nTail para.\n", "")
     same_revision = RevisionAssessmentContext(projection=base, base=base, access_context_hash="scope")
-    assert same_revision.delta() == ((), [])
+    assert same_revision.delta_fragments() == ((), ())
     items = [SupportWorkItem("w0", memory(), (part(base, RULE, exact=False),), same_revision)]
     revision_plan = plan_support_revision(same_revision, items)
     reading = revision_plan.reading_order(revision_plan.supports)
@@ -99,7 +99,7 @@ def test_modified_part_is_read_in_the_first_part_even_without_changed_content():
 
 def test_modified_part_in_a_changed_revision_still_reads_one_part_first():
     base, context = context_for(f"{RULE}\n\nTail para.\n", f"{RULE}\n\nTail para.\n")
-    assert context.delta() == ((), [])
+    assert context.delta_fragments() == ((), ())
     items = [SupportWorkItem("w0", memory(), (part(base, RULE, exact=False),), context)]
     revision_plan = plan_support_revision(context, items)
     [support] = revision_plan.supports
@@ -124,7 +124,7 @@ def test_other_unit_observation_is_never_rebound():
 
 def test_all_exact_without_changed_content_rebinds():
     base, context = context_for(f"{RULE}\n", f"{RULE}\n")
-    assert context.delta() == ((), [])
+    assert context.delta_fragments() == ((), ())
     items = [SupportWorkItem("w0", memory(), (part(base, RULE), part(base, "Country: US.", role=EvidenceRole.REQUIRED)), context)]
     revision_plan = plan_support_revision(context, items)
     [support] = revision_plan.supports
@@ -143,8 +143,8 @@ def test_all_exact_with_changed_content_routes_to_change_impact():
 
 def test_removed_content_counts_as_changed():
     base, context = context_for(f"{RULE}\n\nOld distant exception.\n", f"{RULE}\n")
-    changed, removed = context.delta()
-    assert changed == () and [entry["text"] for entry in removed] == ["Old distant exception."]
+    changed, removed = context.delta_fragments()
+    assert changed == () and [fragment.presentation_text for fragment in removed] == ["Old distant exception."]
     [support] = plan(context, (part(base, RULE),))
     assert statuses(support) == [Status.EXACT_UNCHANGED]
     assert support.route is SupportRoute.CHANGE_IMPACT

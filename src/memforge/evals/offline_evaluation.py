@@ -34,8 +34,9 @@ from memforge.memory.cross_document_relation import (
 from memforge.models import Memory, MemoryExtractionResult, RawMemory, ReconcileOperation
 from memforge.pipeline.reconciler import ReconciliationResult, SupportAuditEntry, reconcile_memories
 from memforge.pipeline.memory_extractor import MemoryExtractor
-from memforge.pipeline.projection_context import ProjectionExtractionBatch
-from memforge.pipeline.projection_fragments import compile_projection_fragment_catalog
+from memforge.pipeline.extraction_requests import plan_extraction_requests
+from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionRequest
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
@@ -827,12 +828,17 @@ class SourceUnitDerivationReplayExecutor:
 
     def __init__(
         self,
-        extract_batch: Callable[
-            [ProjectionExtractionBatch, ReplayedEvidenceWork, Mapping[str, object]],
+        plan_requests: Callable[
+            [ExtractionAuthority, ReplayedEvidenceWork, Mapping[str, object]],
+            Awaitable[tuple[ExtractionRequest, ...]],
+        ],
+        extract_request: Callable[
+            [ExtractionRequest, ReplayedEvidenceWork, Mapping[str, object]],
             Awaitable[MemoryExtractionResult],
         ],
     ) -> None:
-        self._extract_batch = extract_batch
+        self._plan_requests = plan_requests
+        self._extract_request = extract_request
 
     async def execute(
         self,
@@ -855,14 +861,18 @@ class SourceUnitDerivationReplayExecutor:
             ),
         )
 
-        async def extract(batch: ProjectionExtractionBatch) -> MemoryExtractionResult:
-            return await self._extract_batch(batch, work, candidate_manifest)
+        async def plan(authority: ExtractionAuthority) -> tuple[ExtractionRequest, ...]:
+            return await self._plan_requests(authority, work, candidate_manifest)
+
+        async def extract(request: ExtractionRequest) -> MemoryExtractionResult:
+            return await self._extract_request(request, work, candidate_manifest)
 
         result = await replay_source_unit_derivation(
             SourceUnitDerivationRequest(
                 projection=projection,
                 context=context,
-                extract_batch=extract,
+                plan_requests=plan,
+                extract_request=extract,
                 max_concurrent=_positive_int(candidate_manifest.get("max_concurrent"), default=1),
                 access_context_hash=work.access_context_hash,
                 inference_capability_hash=work.inference_capability_hash,
@@ -876,7 +886,7 @@ class SourceUnitDerivationReplayExecutor:
 
 
 class ProductionSourceUnitDerivationReplayExecutor:
-    """Run the production extraction prompts against one immutable case."""
+    """Run the production extraction planner and prompts against one immutable case."""
 
     def __init__(self, structured_llm_client: object) -> None:
         self._structured_llm_client = structured_llm_client
@@ -890,31 +900,47 @@ class ProductionSourceUnitDerivationReplayExecutor:
             model=str(candidate_manifest["model"]),
             structured_llm_client=self._structured_llm_client,
         )
+        context: RevisionAssessmentContext | None = None
+
+        def reading_context(work: ReplayedEvidenceWork) -> RevisionAssessmentContext:
+            """The one reading context of this case, shared by its planning and extraction."""
+
+            def unavailable(_observation_ids):
+                raise OfflineArtifactUnavailable("offline derivation requires pinned binary artifacts")
+
+            nonlocal context
+            if context is None or context.projection is not work.projection:
+                context = RevisionAssessmentContext(
+                    projection=work.projection,
+                    base=None,
+                    access_context_hash=work.access_context_hash,
+                    image_loader=unavailable,
+                )
+            return context
+
+        async def plan(
+            authority: ExtractionAuthority,
+            work: ReplayedEvidenceWork,
+            _candidate_manifest: Mapping[str, object],
+        ) -> tuple[ExtractionRequest, ...]:
+            return plan_extraction_requests(
+                reading_context(work), authority, extractor=extractor,
+                source_type=work.projection.source_type, doc_type=work.context.doc_type,
+            )
 
         async def extract(
-            batch: ProjectionExtractionBatch,
+            request: ExtractionRequest,
             work: ReplayedEvidenceWork,
             _candidate_manifest: Mapping[str, object],
         ) -> MemoryExtractionResult:
-            if batch.primary_image_bytes or batch.candidate_context_image_bytes:
-                raise OfflineArtifactUnavailable(
-                    "offline derivation requires pinned binary artifacts"
-                )
-            catalog = compile_projection_fragment_catalog(
-                work.projection,
-                batch,
-                access_context_hash=work.access_context_hash,
-                inference_capability_hash=work.inference_capability_hash,
-            )
             return await extractor.extract_projection_fragment_memories(
-                catalog,
+                request.catalog,
                 source_type=work.projection.source_type,
                 doc_type=work.context.doc_type,
-                context_markdown=batch.context_markdown,
-                context_observation_ids=batch.context_observation_ids,
+                revision_context=reading_context(work),
             )
 
-        return await SourceUnitDerivationReplayExecutor(extract).execute(
+        return await SourceUnitDerivationReplayExecutor(plan, extract).execute(
             case,
             candidate_manifest,
         )

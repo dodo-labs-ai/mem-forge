@@ -42,6 +42,7 @@ from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
     ExtractionWorkPool,
     GeneSyncOrchestrator,
+    SourceSyncMode,
     get_process_document_lifecycle_admission,
     get_process_extraction_work_pool,
 )
@@ -236,6 +237,7 @@ class RuntimeProvider(Protocol):
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
         reprocess_doc_ids: frozenset[str] | None = None,
+        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
@@ -334,6 +336,7 @@ class DefaultRuntimeProvider:
         force_full_sync: bool = False,
         authoritative_snapshot: bool = False,
         reprocess_doc_ids: frozenset[str] | None = None,
+        execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
         reusable_projection_doc_ids: frozenset[str] = frozenset(),
@@ -350,6 +353,7 @@ class DefaultRuntimeProvider:
             force_full_sync=force_full_sync,
             authoritative_snapshot=authoritative_snapshot,
             reprocess_doc_ids=reprocess_doc_ids,
+            execution_mode=execution_mode,
             lifecycle_cycle_id=lifecycle_cycle_id,
             scope_transition_run_id=scope_transition_run_id,
             reusable_projection_doc_ids=reusable_projection_doc_ids,
@@ -708,6 +712,7 @@ async def run_source_sync(
     force_full_sync: bool = False,
     authoritative_snapshot: bool = False,
     reprocess_doc_ids: frozenset[str] | None = None,
+    execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     lifecycle_cycle_id: str | None = None,
     scope_transition_run_id: str | None = None,
     reusable_projection_doc_ids: frozenset[str] = frozenset(),
@@ -768,6 +773,7 @@ async def run_source_sync(
             "force_full_sync": force_full_sync,
             "authoritative_snapshot": authoritative_snapshot,
             "reprocess_doc_ids": reprocess_doc_ids,
+            "execution_mode": execution_mode,
             "source_activity_epoch": source_activity_epoch,
             "source_activity": activity_lease,
             "lifecycle_cycle_id": lifecycle_cycle_id,
@@ -1168,52 +1174,56 @@ class SourceSyncWorker:
                                 f"source sync lease lost before initial progress update for run {run.run_id}"
                             )
 
-            inputs = await self.db.list_source_sync_inputs(
-                source_id=run.source_id,
-                workspace_id=run.workspace_id,
-                input_snapshot_id=run.input_snapshot_id,
-            )
+            # An operator reprocess reads stored Documents, not collected input.
+            reprocessing = bool(run.reprocess_document_ids)
             projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = ()
-            if run.input_snapshot_id is not None:
-                manifest_status = await self.db.get_source_sync_snapshot_manifest_status(
+            authoritative_collection = False
+            reusable_projection_doc_ids: frozenset[str] = frozenset()
+            if not reprocessing:
+                inputs = await self.db.list_source_sync_inputs(
                     source_id=run.source_id,
                     workspace_id=run.workspace_id,
-                    snapshot_id=run.input_snapshot_id,
+                    input_snapshot_id=run.input_snapshot_id,
                 )
-                if manifest_status is not None:
-                    projection_scope_attestations = tuple(manifest_status.get("scope_attestations") or ())
-            local_operation = local_agent_sync_operation(source["type"], source.get("config"))
-            if run.input_snapshot_id is None:
-                if local_operation is not None and run.input_generation_watermark is None:
-                    raise SourceSyncBoundaryError("local-agent sync run is missing its input generation boundary")
-                if run.input_generation_watermark is not None:
-                    inputs = [
-                        source_input
-                        for source_input in inputs
-                        if source_input.input_generation <= run.input_generation_watermark
-                    ]
-            authoritative_collection = run.input_snapshot_id is not None and local_agent_collection_is_authoritative(
-                source["type"]
-            )
-            reusable_projection_doc_ids = frozenset()
-            if run.input_snapshot_id is not None and not run.force_full_sync:
-                reusable_projection_doc_ids = await self.db.find_reusable_source_projection_memberships(
-                    source_id=run.source_id,
-                    workspace_id=run.workspace_id,
-                    snapshot_id=run.input_snapshot_id,
-                    expected_access_hash=projection_access_fingerprint(
-                        {
-                            "access_policy": str(source.get("access_policy") or "workspace"),
-                            "owner_user_id": source.get("owner_user_id"),
-                        }
-                    ),
+                if run.input_snapshot_id is not None:
+                    manifest_status = await self.db.get_source_sync_snapshot_manifest_status(
+                        source_id=run.source_id,
+                        workspace_id=run.workspace_id,
+                        snapshot_id=run.input_snapshot_id,
+                    )
+                    if manifest_status is not None:
+                        projection_scope_attestations = tuple(manifest_status.get("scope_attestations") or ())
+                local_operation = local_agent_sync_operation(source["type"], source.get("config"))
+                if run.input_snapshot_id is None:
+                    if local_operation is not None and run.input_generation_watermark is None:
+                        raise SourceSyncBoundaryError("local-agent sync run is missing its input generation boundary")
+                    if run.input_generation_watermark is not None:
+                        inputs = [
+                            source_input
+                            for source_input in inputs
+                            if source_input.input_generation <= run.input_generation_watermark
+                        ]
+                authoritative_collection = run.input_snapshot_id is not None and local_agent_collection_is_authoritative(
+                    source["type"]
                 )
-            source = source_with_sync_inputs(
-                source,
-                inputs,
-                input_snapshot_supplied=run.input_snapshot_id is not None,
-                authoritative_snapshot=authoritative_collection,
-            )
+                if run.input_snapshot_id is not None and not run.force_full_sync:
+                    reusable_projection_doc_ids = await self.db.find_reusable_source_projection_memberships(
+                        source_id=run.source_id,
+                        workspace_id=run.workspace_id,
+                        snapshot_id=run.input_snapshot_id,
+                        expected_access_hash=projection_access_fingerprint(
+                            {
+                                "access_policy": str(source.get("access_policy") or "workspace"),
+                                "owner_user_id": source.get("owner_user_id"),
+                            }
+                        ),
+                    )
+                source = source_with_sync_inputs(
+                    source,
+                    inputs,
+                    input_snapshot_supplied=run.input_snapshot_id is not None,
+                    authoritative_snapshot=authoritative_collection,
+                )
 
             runtime = await self.runtime_provider.build_sync_runtime(
                 self.db,
@@ -1233,8 +1243,10 @@ class SourceSyncWorker:
                 source=source,
                 runtime=runtime,
                 progress_callback=None,
-                force_full_sync=run.force_full_sync,
+                force_full_sync=run.force_full_sync and not reprocessing,
                 authoritative_snapshot=authoritative_collection,
+                reprocess_doc_ids=frozenset(run.reprocess_document_ids) or None,
+                execution_mode=(SourceSyncMode.REPROCESS if reprocessing else SourceSyncMode.NORMAL),
                 lifecycle_cycle_id=(f"{run.run_id}:attempt:{run.lease_attempt_count}"),
                 scope_transition_run_id=run.run_id,
                 reusable_projection_doc_ids=reusable_projection_doc_ids,
@@ -1256,9 +1268,12 @@ class SourceSyncWorker:
                 # retry budget and committed its successful documents. Replaying
                 # the complete durable run would duplicate successful provider
                 # and lifecycle work without improving the failure boundary.
+                # An operator reprocess is not retried; the operator requests it again.
                 next_attempt_at = (
                     self._next_retry_at(run, failed_at)
-                    if final_state.last_sync_status == "failed" and final_state.failure_retryable
+                    if final_state.last_sync_status == "failed"
+                    and final_state.failure_retryable
+                    and not reprocessing
                     else None
                 )
                 failed = await self.db.fail_source_sync_run(
@@ -1307,6 +1322,7 @@ class SourceSyncWorker:
                     (SourcePausedError, SourceNotActiveError, SourceSyncBoundaryError),
                 )
                 and next_attempt_at is not None
+                and not run.reprocess_document_ids
             )
             failed = await self.db.fail_source_sync_run(
                 run.run_id,
@@ -1404,6 +1420,30 @@ class SyncService:
             source_config_revision=effective_config_revision,
             predecessor_activity_id=predecessor_activity_id,
             retry_run_id=retry_run_id,
+        )
+
+    async def enqueue_reprocess(self, source_id: str, document_ids: tuple[str, ...]) -> SourceSyncRun:
+        """Queue an operator reprocess of stored Documents at their current revisions.
+
+        It keeps the sync cursor, so the Source must have one; it is refused
+        while another run of the Source is pending or running.
+        """
+        source = await self._ensure_source_can_sync(source_id)
+        if not document_ids:
+            raise ValueError("reprocess needs at least one Document")
+        state = await self.db.get_sync_state(source_id)
+        if state is None or state.last_sync_at is None:
+            raise SourceSyncBoundaryError(f"Source {source_id} has not completed a sync to reprocess")
+        return await self.db.enqueue_source_sync_run(
+            source_id=source_id,
+            workspace_id=self.workspace_id,
+            trigger="reprocess",
+            source_config_revision=(
+                local_agent_source_config_revision(source)
+                if local_agent_sync_operation(source["type"], source.get("config")) is not None
+                else None
+            ),
+            reprocess_document_ids=tuple(document_ids),
         )
 
     async def start_source(self, source_id: str, *, force_full_sync: bool = False) -> asyncio.Task:

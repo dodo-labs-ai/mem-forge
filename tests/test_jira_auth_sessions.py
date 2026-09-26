@@ -395,6 +395,7 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
             force_full_sync=False,
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
+            execution_mode=None,
             source_activity_epoch=None,
             source_activity=None,
             lifecycle_cycle_id=None,
@@ -406,6 +407,7 @@ async def test_runtime_resolves_jira_browser_session_without_persisting_cookie(d
             del (
                 authoritative_snapshot,
                 reprocess_doc_ids,
+                execution_mode,
                 source_activity_epoch,
                 source_activity,
                 lifecycle_cycle_id,
@@ -504,6 +506,7 @@ async def test_runtime_keeps_legacy_jira_pat_source_in_pat_mode(db, tmp_path, mo
             force_full_sync=False,
             authoritative_snapshot=False,
             reprocess_doc_ids=None,
+            execution_mode=None,
             source_activity_epoch=None,
             source_activity=None,
             lifecycle_cycle_id=None,
@@ -515,6 +518,7 @@ async def test_runtime_keeps_legacy_jira_pat_source_in_pat_mode(db, tmp_path, mo
             del (
                 authoritative_snapshot,
                 reprocess_doc_ids,
+                execution_mode,
                 source_activity_epoch,
                 source_activity,
                 lifecycle_cycle_id,

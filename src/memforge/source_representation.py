@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
+from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE
 from memforge.source_projection import (
     EvidenceCoordinateSpace,
     EvidenceRepresentationProfile,
@@ -23,6 +24,15 @@ BINARY_ARTIFACT_PROFILE = EvidenceRepresentationProfile(
 )
 PLAIN_TEXT_PROFILE = EvidenceRepresentationProfile(
     name="plain-text",
+    version=1,
+    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
+)
+# The Unit Title: the provider's human-facing name of one Source Unit, such as a
+# Jira key, type and summary. It is one Required-only Fragment: it scopes and
+# identifies claims but states none, so it is never Primary Evidence.
+UNIT_TITLE_OBSERVATION_TYPE = "unit_identity"
+UNIT_TITLE_PROFILE = EvidenceRepresentationProfile(
+    name="unit-identity",
     version=1,
     coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
 )
@@ -179,6 +189,7 @@ _SUPPORTED_REPRESENTATION_CONTRACTS: Mapping[
         MARKDOWN_STRUCTURAL_PROFILE,
         BINARY_ARTIFACT_PROFILE,
         PLAIN_TEXT_PROFILE,
+        UNIT_TITLE_PROFILE,
         *_REPRESENTATION_CONTRACTS.values(),
     }
 }
@@ -199,8 +210,11 @@ def representation_profile_for_observation_contract(
 ) -> EvidenceRepresentationProfile | None:
     """Declare a stored adapter contract without inspecting content or MIME."""
 
-    if observation_type == "binary_artifact":
+    if observation_type == SOURCE_ARTIFACT_OBSERVATION_TYPE:
         return BINARY_ARTIFACT_PROFILE
+    if observation_type == UNIT_TITLE_OBSERVATION_TYPE:
+        # Every adapter supplies its Unit Title in the same representation.
+        return UNIT_TITLE_PROFILE
     if observation_type == "document_content":
         # The extension-safe projection fallback is explicitly normalized Markdown.
         return MARKDOWN_STRUCTURAL_PROFILE
