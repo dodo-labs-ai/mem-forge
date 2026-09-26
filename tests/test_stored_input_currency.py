@@ -4,14 +4,18 @@ and recovery isolates Source Units."""
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 
 import httpx
 import pytest
 
+from memforge.llm.structured import failure_retryable
+from memforge.memory.engine import SourceUnitLifecycleExecutionError
 from memforge.models import ContentItem, GeneMetadata, NormalizedContent, RawContent
 from memforge.pipeline.source_projection_adapters import jira_changelog_semantic_class
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
+from memforge.source_activity import SourceActivityConflict
 from memforge.source_derivation import DERIVATION_DETERMINISTIC_FAILURE
 from memforge.storage.database import Database
 from tests.test_source_reprocess import RawKeepingDocumentStore
@@ -46,6 +50,7 @@ class JiraProvider:
         self.histories: dict[str, list[dict]] = {key: [authored(DOMAIN_HISTORY, "Ann")] for key in ISSUES}
         self.removed: set[str] = set()
         self.rediscovered: list[str] = []
+        self.urls = {key: f"https://jira.example/browse/{key}" for key in ISSUES}
 
     @classmethod
     def metadata(cls):
@@ -63,7 +68,7 @@ class JiraProvider:
     def _item(self, issue_key: str) -> ContentItem:
         return ContentItem(
             item_id=doc_id(issue_key), title=f"{issue_key}: Payroll run",
-            source_url=f"https://jira.example/browse/{issue_key}", last_modified=SYNCED_AT,
+            source_url=self.urls[issue_key], last_modified=SYNCED_AT,
             content_type="application/json", space_or_project="PAY", version="1",
             extra={"issue_id": ISSUES[issue_key], "issue_key": issue_key},
         )
@@ -117,8 +122,8 @@ class Harness:
             gene=self.provider, source_name="Jira", source_id=SOURCE_ID,
         )
 
-    async def reprocess(self, *issue_keys: str):
-        return await self.orchestrator().sync_gene(
+    async def reprocess(self, *issue_keys: str, extractor=None):
+        return await self.orchestrator(extractor).sync_gene(
             gene=self.provider, source_name="Jira", source_id=SOURCE_ID,
             execution_mode=SourceSyncMode.REPROCESS,
             reprocess_doc_ids=frozenset(doc_id(key) for key in issue_keys),
@@ -342,27 +347,111 @@ async def test_recovery_ends_a_derivation_that_cannot_commit_before_any_model_ca
     )
 
 
+class _WrappingLifecycleEngine(RecordingMemoryEngine):
+    """Fails the first lifecycle commit as the lifecycle engine reports a failure: wrapped, with its retry rule."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__()
+        self.cause = cause
+
+    async def prepare_and_commit_projected_lifecycle(self, **kwargs):
+        if self.cause is not None:
+            cause, self.cause = self.cause, None
+            raise SourceUnitLifecycleExecutionError(
+                "projected lifecycle commit failed", None, retryable=failure_retryable(cause),
+            ) from cause
+        return await super().prepare_and_commit_projected_lifecycle(**kwargs)
+
+
 @pytest.mark.asyncio
-async def test_recovery_stops_the_run_when_storage_is_unavailable(db, monkeypatch):
+@pytest.mark.parametrize(
+    "cause",
+    [
+        SourceActivityConflict("source activity epoch changed: expected 1, current 2"),
+        sqlite3.OperationalError("database is locked"),
+    ],
+    ids=["lost_fence", "storage"],
+)
+async def test_a_retryable_recovery_failure_stops_the_run_and_keeps_every_derivation_staged(db, cause):
     harness = await synced(db)
     staged = await _staged_changes(harness)
-    read_revisions = db.get_source_observation_revisions
-    reads: list[object] = []
-
-    async def unavailable_after_first_read(revision_ids):
-        reads.append(revision_ids)
-        if len(reads) > 1:
-            raise OSError("database unavailable")
-        return await read_revisions(revision_ids)
-
-    monkeypatch.setattr(db, "get_source_observation_revisions", unavailable_after_first_read)
+    harness.engine = _WrappingLifecycleEngine(cause)
 
     state = await harness.sync()
 
-    assert (state.last_sync_status, state.error_message) == ("failed", "database unavailable")
+    assert (state.last_sync_status, state.error_message) == ("failed", "projected lifecycle commit failed")
     statuses = {attempt.id: attempt.status for attempt in await db.list_source_derivation_attempts(source_id=SOURCE_ID)}
-    assert statuses[staged["PAY-1"].id] == "applied"
-    assert statuses[staged["PAY-2"].id] == "retryable_failure"
+    # PAY-1's extraction completed before its commit failed; PAY-2 was not reached. Both stay staged.
+    assert (statuses[staged["PAY-1"].id], statuses[staged["PAY-2"].id]) == ("completed", "retryable_failure")
+
+
+@pytest.mark.asyncio
+async def test_a_raw_save_failure_fails_the_document_before_its_revision_commits(db):
+    harness = await synced(db)
+    unit_id = await harness.unit_id("PAY-1")
+    committed = await db.get_current_source_unit_revision(unit_id)
+    before = await db.get_document(doc_id("PAY-1"))
+    # A location-only change moves the Unit to a new revision without semantic work.
+    harness.provider.urls["PAY-1"] = "https://jira.example/browse/PAY-1?moved"
+    store_raw = harness.store.store_raw
+
+    def unavailable(**kwargs):
+        raise OSError("object store unavailable")
+
+    harness.store.store_raw = unavailable
+    failed = await harness.sync()
+
+    assert failed.docs_failed == 1
+    assert await db.get_current_source_unit_revision(unit_id) == committed
+    assert (await db.get_document(doc_id("PAY-1"))).raw_content_uri == before.raw_content_uri
+
+    harness.store.store_raw = store_raw
+    assert (await harness.sync()).last_sync_status == "success"
+    moved = await db.get_current_source_unit_revision(unit_id)
+    assert moved.id != committed.id and moved.semantic_hash == committed.semantic_hash
+    stored = await db.get_document(doc_id("PAY-1"))
+    assert stored.source_url == harness.provider.urls["PAY-1"]
+    assert harness.stored_raw(stored.raw_content_uri)["key"] == "PAY-1"
+
+
+@pytest.mark.asyncio
+async def test_the_migration_supersedes_unapplied_reprocess_derivations_staged_from_stored_input(tmp_path):
+    path = tmp_path / "staged.db"
+    legacy = Database(str(path))
+    await legacy.connect()
+    NoopMemoryEngine.db = legacy
+    try:
+        await legacy.upsert_source(
+            id=SOURCE_ID, type="jira", name="Jira", config_json="{}", access_policy="workspace",
+            owner_user_id="dev",
+        )
+        harness = Harness(legacy)
+        assert (await harness.sync()).last_sync_status == "success"
+        await _staged_changes(harness)
+        assert (await harness.reprocess("PAY-1", extractor=FailingMemoryExtractor())).docs_failed == 1
+        unapplied = await legacy.list_source_derivation_attempts(
+            source_id=SOURCE_ID, statuses=("pending", "retryable_failure", "completed"),
+        )
+        reprocessed = {attempt.id: attempt for attempt in unapplied if attempt.context.support_without_baseline}
+        ordinary = {attempt.id: attempt.status for attempt in unapplied if attempt.id not in reprocessed}
+        assert reprocessed and ordinary
+        await legacy.db.execute("DELETE FROM schema_migrations WHERE version = 103")
+        await legacy.db.commit()
+    finally:
+        NoopMemoryEngine.db = None
+        await legacy.close()
+
+    migrated = Database(str(path))
+    await migrated.connect()
+    try:
+        attempts = {attempt.id: attempt for attempt in await migrated.list_source_derivation_attempts(source_id=SOURCE_ID)}
+        for attempt_id, before in reprocessed.items():
+            after = attempts[attempt_id]
+            assert (after.status, after.terminal_reason_code) == ("superseded", "DERIVATION_INPUT_SUPERSEDED")
+            assert after.updated_at > before.updated_at
+        assert {attempt_id: attempts[attempt_id].status for attempt_id in ordinary} == ordinary
+    finally:
+        await migrated.close()
 
 
 def _jira_gene(handler):
@@ -419,41 +508,84 @@ async def test_jira_rediscovers_one_issue_by_its_id_and_fetches_it_as_discovered
     assert requests == [f"/rest/api/2/issue/{ISSUES['PAY-1']}", f"/rest/api/2/issue/{ISSUES['PAY-2']}"]
 
 
-@pytest.mark.asyncio
-async def test_confluence_rediscovers_one_page_by_its_id():
+def _confluence_page(page_id: str, **fields) -> dict:
+    return {
+        "id": page_id, "title": "Payroll runbook", "status": "current", "space": {"key": "PAY"},
+        "version": {"number": 4, "when": "2026-09-21T08:00:00.000Z", "by": {"displayName": "Ann"}},
+        "metadata": {"labels": {"results": []}}, "_links": {"webui": f"/pages/{page_id}"},
+        **fields,
+    }
+
+
+def _labelled(page_id: str, *labels: str) -> dict:
+    return {"id": page_id, "status": "current", "metadata": {"labels": {"results": [{"name": name} for name in labels]}}}
+
+
+async def _rediscover_confluence(config: dict, pages: dict[str, dict]) -> dict[str, ContentItem | None]:
     from memforge.genes.confluence_gene import ConfluenceGene
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path != "/rest/api/content/42":
-            return httpx.Response(httpx.codes.NOT_FOUND, json={"message": "No content found"})
-        return httpx.Response(httpx.codes.OK, json={
-            "id": "42", "title": "Payroll runbook", "space": {"key": "PAY"},
-            "version": {"number": 4, "when": "2026-09-21T08:00:00.000Z", "by": {"displayName": "Ann"}},
-            "metadata": {"labels": {"results": []}}, "_links": {"webui": "/pages/42"},
-        })
+    expands: list[str] = []
 
-    gene = ConfluenceGene(
-        config={"base_url": "https://wiki.example.test", "spaces": ["PAY"], "pat": "token"}, source_id=SOURCE_ID,
-    )
+    async def handler(request: httpx.Request) -> httpx.Response:
+        expands.append(request.url.params["expand"])
+        page = pages.get(request.url.path.rsplit("/", 1)[-1])
+        if page is None:
+            return httpx.Response(httpx.codes.NOT_FOUND, json={"message": "No content found"})
+        return httpx.Response(httpx.codes.OK, json=page)
+
+    gene = ConfluenceGene(config={"base_url": "https://wiki.example.test", "pat": "token", **config}, source_id=SOURCE_ID)
     gene._client = httpx.AsyncClient(base_url="https://wiki.example.test", transport=httpx.MockTransport(handler))
     gene._request_limiter = None
     gene._api_prefix = ""
     gene._base_url = "https://wiki.example.test"
-
-    def stored(page_id: str) -> ContentItem:
-        return ContentItem(
-            item_id=f"confluence-{page_id}", title="Payroll runbook", source_url="https://wiki.example.test",
-            last_modified=SYNCED_AT, version="3", extra={"page_id": page_id, "space_key": "PAY"},
-        )
-
     try:
-        current = await gene.rediscover(stored("42"))
-        missing = await gene.rediscover(stored("43"))
+        found = {}
+        for page_id in (*pages, "404"):
+            stored = ContentItem(
+                item_id=f"confluence-{page_id}", title="Payroll runbook", source_url="https://wiki.example.test",
+                last_modified=SYNCED_AT, version="3", extra={"page_id": page_id, "space_key": "PAY"},
+            )
+            found[page_id] = await gene.rediscover(stored)
     finally:
         await gene._client.aclose()
+    assert all(expand.startswith("version,metadata.labels,space") for expand in expands)
+    return found
 
-    assert (current.item_id, current.version) == ("confluence-42", "4")
-    assert missing is None
+
+@pytest.mark.asyncio
+async def test_confluence_rediscovers_the_current_pages_of_its_spaces():
+    found = await _rediscover_confluence(
+        {"spaces": ["PAY"], "exclude_labels": ["draft"]},
+        {
+            "42": _confluence_page("42"),
+            "43": _confluence_page("43", status="archived"),
+            "44": _confluence_page("44", space={"key": "HR"}),
+            "45": _confluence_page("45", metadata={"labels": {"results": [{"name": "draft"}]}}),
+        },
+    )
+
+    assert (found["42"].item_id, found["42"].version, found["42"].space_or_project) == ("confluence-42", "4", "PAY")
+    assert {page_id for page_id, item in found.items() if item is None} == {"43", "44", "45", "404"}
+
+
+@pytest.mark.asyncio
+async def test_confluence_rediscovers_the_pages_its_tree_discovery_reaches():
+    root = "7"
+    found = await _rediscover_confluence(
+        {"page_tree_root": root, "exclude_labels": ["draft"]},
+        {
+            root: _confluence_page(root, status="archived"),
+            "42": _confluence_page("42", ancestors=[_labelled("1"), _labelled(root), _labelled("8")]),
+            "43": _confluence_page("43", ancestors=[_labelled("1")]),
+            "44": _confluence_page("44", ancestors=[_labelled(root), _labelled("9", "draft")]),
+            "45": _confluence_page("45", ancestors=[_labelled(root), {**_labelled("10"), "status": "archived"}]),
+            "46": _confluence_page("46", status="trashed", ancestors=[_labelled(root)]),
+        },
+    )
+
+    # The root is listed as discovery fetches it; the other pages only when discovery reaches them.
+    assert {page_id for page_id, item in found.items() if item is not None} == {root, "42"}
+    assert found["42"].space_or_project == "PAY"
 
 
 def test_only_sources_with_a_provider_to_ask_rediscover_their_documents():

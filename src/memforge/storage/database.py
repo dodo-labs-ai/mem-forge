@@ -219,6 +219,7 @@ from memforge.retrieval.access_predicate import readable_source_sql, visible_sql
 from memforge.retrieval.metadata_text import metadata_alias_text, metadata_compact_text
 from memforge.source_access import infer_legacy_source_access
 from memforge.source_derivation import (
+    DERIVATION_INPUT_SUPERSEDED,
     SOURCE_DERIVATION_BATCH_COMPLETED,
     SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE,
     SOURCE_DERIVATION_COMPLETED,
@@ -4429,6 +4430,15 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # computed from that content (see _classify_jira_changelog_revisions_unlocked).
         [],
     ),
+    (
+        103,
+        "Supersede unapplied reprocess derivations staged from stored input",
+        # Only a reprocess stages a derivation without a Support baseline.
+        # Before stored input was kept current, a reprocess could stage one from
+        # raw content older than the committed revision; applying it would
+        # regress the Unit (see _supersede_stored_input_reprocess_derivations_unlocked).
+        [],
+    ),
 ]
 
 
@@ -4728,6 +4738,9 @@ class Database:
             if version == 102:
                 classified = await self._classify_jira_changelog_revisions_unlocked()
                 logger.info("Classified %d stored Jira changelog revisions", classified)
+            if version == 103:
+                superseded = await self._supersede_stored_input_reprocess_derivations_unlocked()
+                logger.info("Superseded %d unapplied reprocess derivations staged from stored input", superseded)
             await self.db.execute(
                 "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, _now_iso()),
@@ -4770,6 +4783,18 @@ class Database:
                 (json.dumps(metadata, sort_keys=True), row["id"]),
             )
         return len(rows)
+
+    async def _supersede_stored_input_reprocess_derivations_unlocked(self) -> int:
+        """End unapplied derivations that a reprocess staged; their input may predate the committed revision."""
+
+        cursor = await self.db.execute(
+            """UPDATE source_derivation_attempts
+                  SET status = 'superseded', terminal_reason_code = ?, updated_at = ?
+                WHERE status IN ('pending', 'retryable_failure', 'completed')
+                  AND json_extract(context_payload_json, '$.support_without_baseline') = 1""",
+            (DERIVATION_INPUT_SUPERSEDED, _now_iso()),
+        )
+        return cursor.rowcount
 
     async def _backfill_evidence_context_associations_unlocked(self) -> None:
         rows = await self.db.execute_fetchall(
