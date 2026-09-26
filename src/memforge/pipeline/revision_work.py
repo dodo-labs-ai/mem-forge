@@ -5,12 +5,14 @@ unchanged Support in a revision without changes is rebound by the program. In
 a revision with changes, Change Impact judges it against the ChangeBundle:
 ``UNAFFECTED`` is rebound; ``AFFECTED`` or a Change Impact execution failure
 reads the revision in the Support reading order, like every other Support.
-This module is the only caller of the Change Impact model.
+SupportRelationCoordinator's single re-check of a claim reuses the same
+Support Assessment contract. This module is the only caller of the Change
+Impact model.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 import json
 import logging
@@ -44,6 +46,7 @@ from memforge.pipeline.revision_assessment import (
 )
 from memforge.pipeline.support_reading import (
     EvidenceCorrespondence,
+    EvidenceDigest,
     ReadingPart,
     SupportPlan,
     SupportReadingOrder,
@@ -229,6 +232,33 @@ class RevisionWorkExecutor:
                     results.update(await self._read(plan, assessed))
         return results
 
+    async def recheck(self, rechecks: list[SupportRecheck]) -> dict[str, SupportAssessment]:
+        """Re-check claims once for SupportRelationCoordinator.
+
+        A recheck without Candidate Evidence reads its Support in the normal
+        reading order, like any first read. A recheck with Candidate Evidence
+        reads only the current ReadingGroups that hold it: a supported result
+        binds the claim to the refs it selects, while "not supported" there is
+        no complete read and never retires the claim.
+        """
+        self._work_aliases = {recheck.item.id: f"WRK-{index:04d}" for index, recheck in enumerate(rechecks)}
+        cohorts: dict[tuple[int, tuple[EvidenceDigest, ...]], list[SupportRecheck]] = {}
+        for recheck in rechecks:
+            cohorts.setdefault((id(recheck.item.context), recheck.candidate_evidence), []).append(recheck)
+        results = {}
+        with failure_trace_context(derivation_id=self.derivation_id):
+            for cohort in cohorts.values():
+                evidence = cohort[0].candidate_evidence
+                plan = plan_support_revision(cohort[0].item.context, [recheck.item for recheck in cohort])
+                supports = list(plan.supports)
+                if evidence:
+                    results.update(await self._read(
+                        plan, supports, plan.evidence_reading_order(supports, evidence), candidate_evidence=evidence,
+                    ))
+                else:
+                    results.update(await self._read(plan, supports))
+        return results
+
     def _rebound(self, catalog, support: SupportPlan) -> SupportAssessment:
         """Every prior part is exactly current and no change affects the claim: bind it to the same text."""
         refs = [(correspondence.evidence.role, correspondence.current[0].reference) for correspondence in support.parts]
@@ -242,6 +272,7 @@ class RevisionWorkExecutor:
         return SupportAssessment(
             True, reason,
             self._revalidated(support.item, _resolved_selection(catalog, primary_ref, required_refs), support.route),
+            rebound=True,
         )
 
     async def _change_impact(self, plan: SupportRevisionPlan, supports: list[SupportPlan]) -> set[str]:
@@ -314,9 +345,12 @@ class RevisionWorkExecutor:
             },
         )
 
-    async def _read(self, plan: SupportRevisionPlan, supports: list[SupportPlan]) -> dict[str, SupportAssessment]:
+    async def _read(
+        self, plan: SupportRevisionPlan, supports: list[SupportPlan], reading: SupportReadingOrder | None = None,
+        *, candidate_evidence: tuple[EvidenceDigest, ...] = (),
+    ) -> dict[str, SupportAssessment]:
         """Stream one cohort through its reading order; each Support stops at its validated verdict."""
-        reading = plan.reading_order(supports)
+        reading = reading if reading is not None else plan.reading_order(supports)
         items = [support.item for support in supports]
         if not reading.has_current_content:
             # No current Evidence exists to select, and no assessed part is UNKNOWN.
@@ -325,7 +359,8 @@ class RevisionWorkExecutor:
                 for item in items
             }
         context = plan.context
-        journal = self._journal("support_assess", SUPPORT_ASSESSMENT_CONTRACT, plan.catalog, items)
+        scope = _reading_scope(candidate_evidence)
+        journal = self._journal("support_assess", SUPPORT_ASSESSMENT_CONTRACT, plan.catalog, items, scope)
         # Each Support's most recently decoded state; a capacity diagnostic reports its carried witnesses.
         latest = {item.id: SupportReadingState() for item in items}
         outcomes = await self._runner.run_chain(self._chain_task(plan, reading, supports, journal, latest))
@@ -363,7 +398,10 @@ class RevisionWorkExecutor:
                     f"{item.id} ended unsupported after {outcome.read_parts} of {len(reading.parts)} parts",
                 )
             results[item.id] = SupportAssessment(
-                False, "The complete current revision was read without complete Support.", None,
+                False,
+                "The Candidate's current Evidence does not support the claim." if candidate_evidence
+                else "The complete current revision was read without complete Support.",
+                None,
             )
         # Claims that read the same requests share one completion receipt.
         readers = {}
@@ -374,6 +412,7 @@ class RevisionWorkExecutor:
                 SUPPORT_ASSESSMENT_CONTRACT, plan.catalog, group, dependencies,
                 {"results": [{"work_id": item.id, **outcomes[item.id].model_dump(mode="json")} for item in group]},
                 coverage={"total": len(reading.parts), "read_parts": {item.id: outcomes[item.id].read_parts for item in group}},
+                reading=scope,
             )
         return results
 
@@ -466,7 +505,10 @@ class RevisionWorkExecutor:
 
     @staticmethod
     def _work_payload(support: SupportPlan, step: ChainStep, first_part_end) -> dict:
-        """Prior Evidence by exact correspondence; historical excerpts only inside the first part."""
+        """Prior Evidence by exact correspondence; historical excerpts only inside the first part.
+
+        An UNKNOWN part's text may still be current, so it is never shown as history.
+        """
         item_id = support.item.id
         in_first_part = step.position < first_part_end[item_id]
         prior = [
@@ -474,7 +516,8 @@ class RevisionWorkExecutor:
             if correspondence.status is EvidenceCorrespondence.EXACT_UNCHANGED
             else {"role": correspondence.evidence.role.value, "historical_excerpt": correspondence.evidence.excerpt}
             for correspondence in support.parts
-            if in_first_part or correspondence.status is EvidenceCorrespondence.EXACT_UNCHANGED
+            if correspondence.status is EvidenceCorrespondence.EXACT_UNCHANGED
+            or (in_first_part and correspondence.status is not EvidenceCorrespondence.UNKNOWN)
         ]
         state = step.states[item_id]
         return {
@@ -525,31 +568,34 @@ class RevisionWorkExecutor:
             for item in items
         ]
 
-    def _scope_identity(self, catalog, items):
+    def _scope_identity(self, catalog, items, reading=None):
         context = items[0].context
         return {
             "catalog": catalog.digest,
             "baseline": context.base.source_unit_revisions[0].id if context.base else None,
             "target": context.projection.source_unit_revisions[0].id,
             "work_items": self._identity(items),
+            **({"reading": reading} if reading is not None else {}),
         }
 
-    def _journal(self, kind, contract, catalog, items) -> DerivationWorkJournal:
+    def _journal(self, kind, contract, catalog, items, reading=None) -> DerivationWorkJournal:
         return DerivationWorkJournal(
             store=self.store,
             derivation_id=self.derivation_id,
             kind=kind,
-            scope={"contract": contract, **self._scope_identity(catalog, items)},
+            scope={"contract": contract, **self._scope_identity(catalog, items, reading)},
             budget_identity=self.client.input_policy_identity_for(self.model),
             model=self.model,
         )
 
-    async def _complete(self, contract, catalog, items, dependencies, result, *, coverage: dict | None = None):
+    async def _complete(
+        self, contract, catalog, items, dependencies, result, *, coverage: dict | None = None, reading=None,
+    ):
         """Record the program receipt that binds these results to the model work they rest on."""
         manifest = {
             "contract": contract,
             "completion": "program",
-            "scope": self._scope_identity(catalog, items),
+            "scope": self._scope_identity(catalog, items, reading),
             **({"coverage": coverage} if coverage is not None else {}),
             "dependencies": [list(dependency) for dependency in dependencies],
         }
@@ -562,6 +608,25 @@ class RevisionWorkExecutor:
         if work.result_hash != payload_hash(result):
             raise ValueError("assessment completion differs from its dependencies")
         self.final_work_ids.append(work.id)
+
+
+@dataclass(frozen=True)
+class SupportRecheck:
+    """One claim's single SupportRelationCoordinator re-check.
+
+    Without Candidate Evidence the Support is read in the normal reading order;
+    with it, only the ReadingGroups that hold that Evidence are read.
+    """
+
+    item: SupportWorkItem
+    candidate_evidence: tuple[EvidenceDigest, ...] = ()
+
+
+def _reading_scope(candidate_evidence: tuple[EvidenceDigest, ...]):
+    """A re-check against Candidate Evidence reads its own order, so its work is never another read's."""
+    if not candidate_evidence:
+        return None
+    return {"candidate_evidence": [list(digest) for digest in candidate_evidence]}
 
 
 def _revalidated_memory(memory: Memory, selection, support_validation: dict) -> RawMemory:

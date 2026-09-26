@@ -8,16 +8,17 @@ scope, access context, staged evidence, lifecycle plan, and outbox work from one
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 
 from memforge.llm.structured import StructuredLlmError
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from time import perf_counter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from memforge.evals.agent_evaluation import (
     AgentRuntimeBundle,
@@ -36,6 +37,12 @@ from memforge.memory.candidate_admission import (
     CandidateRejection,
     admit_candidates,
 )
+from memforge.memory.coordinator_review import (
+    CarriedConflict,
+    carried_conflicts,
+    carry_into_ledger,
+    is_coordinator_review,
+)
 from memforge.memory.entity_resolver import EntityResolver
 from memforge.memory.evidence import (
     EvidenceReference,
@@ -48,6 +55,8 @@ from memforge.memory.identity_resolver import (
 from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
     LifecyclePlan,
+    LifecycleReview,
+    LifecycleReviewStatus,
     ProjectedLifecycleDeferredError,
     AuthorityPlanStaleError,
     ProjectedSupportInvariantError,
@@ -64,6 +73,13 @@ from memforge.memory.quality import classify_memory_candidate
 from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitation,
     SupportRevalidationLimitationCode,
+)
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext, SupportAssessment
+from memforge.pipeline.support_relation_coordinator import (
+    MemorySupport,
+    RecheckReading,
+    SupportRecheckRequest,
+    memory_support,
 )
 from memforge.memory.cross_document_relation import StructuredCrossDocumentRelationClassifier
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
@@ -86,6 +102,7 @@ from memforge.source_derivation import (
 from memforge.storage.adapters.protocols import EntityResolutionScope
 from memforge.llm.failure_trace import failure_trace_context, enrich_failure_trace_context
 from memforge.models import (
+    CoordinatorProposal,
     Memory,
     RawMemory,
     ReconcileAction,
@@ -102,6 +119,9 @@ if TYPE_CHECKING:
     from memforge.storage.database import Database
 
 logger = logging.getLogger(__name__)
+
+_First = TypeVar("_First")
+_Second = TypeVar("_Second")
 
 __all__ = [
     "DeferredProjectedLifecycleHandle",
@@ -441,6 +461,40 @@ class MemoryEngine:
             protected.append(operation)
         return tuple(protected)
 
+    async def _carried_conflicts(
+        self,
+        *,
+        source_unit_id: str,
+        model_incumbents: Sequence[Memory],
+        context: RevisionAssessmentContext | None,
+    ) -> tuple[CarriedConflict, ...]:
+        """This Source Unit's pending coordinator conflicts whose staged Candidate is still exactly current."""
+
+        if context is None:
+            return ()
+        reviews = [
+            review
+            for review in await self.db.list_lifecycle_reviews(
+                status=LifecycleReviewStatus.PENDING,
+                incumbent_memory_ids=tuple(memory.id for memory in model_incumbents),
+            )
+            if is_coordinator_review(review, source_unit_id=source_unit_id)
+        ]
+        if not reviews:
+            return ()
+        return carried_conflicts(reviews, context.catalog(context.full_fragments))
+
+    async def _coordinator_reviews(
+        self, *, source_unit_id: str, incumbent_ids: Sequence[str],
+    ) -> tuple[LifecycleReview, ...]:
+        """Every coordinator Review this Source Unit raised on these incumbents, in any status."""
+
+        return tuple(
+            review
+            for review in await self.db.list_lifecycle_reviews(incumbent_memory_ids=tuple(incumbent_ids))
+            if is_coordinator_review(review, source_unit_id=source_unit_id)
+        )
+
     async def _derivation_protected_incumbents(
         self,
         *,
@@ -732,6 +786,9 @@ class MemoryEngine:
             defaults=inputs.defaults,
             evidence_units=inputs.evidence_units,
             evidence_references=inputs.evidence_references,
+            coordinator_reviews=await self._coordinator_reviews(
+                source_unit_id=inputs.scope.source_unit_id, incumbent_ids=incumbent_ids,
+            ),
         )
 
     def _prepared_runtime_bundle(
@@ -973,10 +1030,6 @@ class MemoryEngine:
     ) -> dict[str, int]:
         """Reconcile a complete Source Unit ledger and atomically apply one plan."""
 
-        from memforge.pipeline.reconciler import (
-            ReconciliationResult,
-            reconcile_memories,
-        )
         from memforge.pipeline.projection_evidence import build_projected_claim_evidence
 
         lifecycle_started = _runtime_context.started_at
@@ -1110,9 +1163,7 @@ class MemoryEngine:
             visibility=visibility, owner_user_id=owner_user_id,
             project_key=project_key, repo_identifier=repo_identifier,
         )
-        support_audits = []
-        skipped_revalidation: dict[str, str] = {}
-        assessed_evidence: dict[str, list[RawMemory]] = {}
+        supports: dict[str, MemorySupport] = {}
         required_derivation_work_ids = admission.work_ids
         model_incumbent_count = 0
         model_batch_count = 0
@@ -1135,14 +1186,25 @@ class MemoryEngine:
                 for memory in sorted(incumbents, key=lambda item: item.id)
             )
         else:
+            from memforge.pipeline.reconciler import (
+                ReconciliationContractError,
+                ReconciliationResult,
+                assess_relations,
+                join_support_and_relation,
+            )
+            from memforge.pipeline.revision_work import RevisionWorkExecutor, SupportRecheck
+            from memforge.pipeline.support_reading import SupportWorkItem, evidence_digests
+
             model_incumbents = [memory for memory in incumbents if memory.id not in derivation_protected_ids]
             model_incumbent_count = len(model_incumbents)
             if model_incumbents and not self.structured_llm_client:
                 raise RuntimeError("complete lifecycle reconciliation requires an LLM client")
+            work_items: list[SupportWorkItem] = []
+            work_by_memory: dict[str, list[SupportWorkItem]] = {}
+            evaluator = RevisionWorkExecutor(client=self.structured_llm_client, model=self.llm_model,
+                                             store=self.db, derivation_id=derivation_id)
+            assessment_context = None
             if model_incumbents:
-                from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-                from memforge.pipeline.reconciler import SupportAuditEntry, ReconciliationContractError
-
                 base = await self.db.get_current_source_unit_projection(scope.source_unit_id)
                 if base is not None and base.source_unit_revisions[0].id not in {scope.base_unit_revision_id, scope.target_unit_revision_id}:
                     raise AuthorityPlanStaleError("revision assessment base changed")
@@ -1164,10 +1226,6 @@ class MemoryEngine:
                 evidence_by_memory = await self.db.get_active_memory_support_evidence_many(
                     tuple(memory.id for memory in model_incumbents), source_id=projection.source_id,
                 )
-                from memforge.pipeline.revision_work import RevisionWorkExecutor
-                from memforge.pipeline.support_reading import SupportWorkItem
-                work_items = []
-                work_by_memory = {}
                 for memory in model_incumbents:
                     groups: dict[str, list] = {}
                     for item in evidence_by_memory.get(memory.id, ()):
@@ -1216,69 +1274,108 @@ class MemoryEngine:
                             if context is None:
                                 context = assessment_context_for(None)
                                 contexts_by_revision[None] = context
-                        work_id = f"w{len(work_items):06d}"
-                        work_items.append(SupportWorkItem(work_id, memory, tuple(support), context))
-                        work_by_memory[memory.id].append(work_id)
-                evaluator = RevisionWorkExecutor(client=self.structured_llm_client, model=self.llm_model,
-                                                 store=self.db, derivation_id=derivation_id)
-                stats["support_revalidation_work_item_count"] += len(work_items)
-                try:
-                    _runtime_context.stage = "support_revalidation"
-                    assessed = await evaluator.assess_many(work_items)
-                finally:
-                    stats["support_revalidation_model_call_count"] += evaluator.calls
-                    stats["support_revalidation_assessment_request_count"] = evaluator.stage_counts["support_assess"]
-                    stats["support_revalidation_prompt_chars"] += evaluator.prompt_chars
-                    stats["support_revalidation_reused_work_count"] = evaluator.reused
-                    stats["support_revalidation_covered_source_claim_pairs"] = evaluator.covered_source_claim_pairs
-                    stats["support_revalidation_program_rebind_count"] = evaluator.program_rebind_count
-                    stats["support_revalidation_change_impact_request_count"] = evaluator.stage_counts["change_impact"]
-                    impact_counts = evaluator.change_impact_counts
-                    stats["support_revalidation_change_impact_unaffected_count"] = impact_counts["unaffected"]
-                    stats["support_revalidation_change_impact_affected_count"] = impact_counts["affected"]
-                    stats["support_revalidation_change_impact_failed_count"] = impact_counts["failed"]
-                    _runtime_context.model_call_count += evaluator.calls
-                stats["support_revalidation_completion_count"] = len(evaluator.final_work_ids)
-                if derivation_id:
-                    required_derivation_work_ids += tuple(evaluator.final_work_ids)
+                        work_item = SupportWorkItem(f"w{len(work_items):06d}", memory, tuple(support), context)
+                        work_items.append(work_item)
+                        work_by_memory[memory.id].append(work_item)
+            stats["support_revalidation_work_item_count"] += len(work_items)
+            assessed: dict[str, SupportAssessment] = {}
+
+            async def recheck(requests: tuple[SupportRecheckRequest, ...]) -> dict[str, MemorySupport]:
+                """Run each conflicting claim's single re-check and fold it into its Memory-level result."""
+                rechecks: list[SupportRecheck] = []
+                owners: dict[str, list[str]] = {}
+                for request in requests:
+                    memory_items = work_by_memory[request.memory_id]
+                    if request.reading is RecheckReading.NORMAL_ORDER:
+                        rebound = [item for item in memory_items if assessed[item.id].rebound]
+                        rechecks.extend(SupportRecheck(item) for item in rebound)
+                        owners[request.memory_id] = [item.id for item in rebound]
+                        continue
+                    # One read of the claim, carrying every prior part it has in this Unit.
+                    item = SupportWorkItem(
+                        f"r{len(rechecks):06d}", memory_items[0].memory,
+                        tuple(part for memory_item in memory_items for part in memory_item.support),
+                        memory_items[0].context,
+                    )
+                    rechecks.append(SupportRecheck(item, tuple(sorted({
+                        digest for raw in request.candidates for digest in evidence_digests(raw.resolved_evidence_selection)
+                    }))))
+                    owners[request.memory_id] = [item.id]
+                results = await evaluator.recheck(rechecks)
+                rechecked = {}
+                for request in requests:
+                    assessments = [results[work_id] for work_id in owners[request.memory_id]]
+                    if request.reading is RecheckReading.NORMAL_ORDER:
+                        read = [assessed[item.id] for item in work_by_memory[request.memory_id] if not assessed[item.id].rebound]
+                        rechecked[request.memory_id] = memory_support([*read, *assessments], rechecked=True)
+                    else:
+                        rechecked[request.memory_id] = supports[request.memory_id].after_candidate_recheck(assessments[0])
+                supports.update(rechecked)
+                return rechecked
+
+            async def support_line() -> None:
+                if work_items:
+                    assessed.update(await evaluator.assess_many(work_items))
+
+            relation_line = assess_relations(
+                filtered_memories, model_incumbents, structured_llm_client=self.structured_llm_client,
+                llm_model=self.llm_model, image_loader=evidence_image_loader, work_store=self.db,
+                derivation_id=derivation_id, operation_input_hash=operation_input_hash,
+            )
+            # A failure raised on either line is a Support failure: Relation returns its own.
+            _runtime_context.stage = "support_revalidation"
+            try:
+                _, relation = await _run_concurrently(support_line(), relation_line)
                 unresolved_stats = {
                     "partial_coverage": "support_revalidation_unresolved_partial_coverage_count",
                     "capacity": "support_revalidation_unresolved_capacity_count",
                 }
-                for result in assessed.values():
-                    if result.unresolved is not None:
-                        stats[unresolved_stats[result.unresolved]] += 1
+                for assessment in assessed.values():
+                    if assessment.unresolved is not None:
+                        stats[unresolved_stats[assessment.unresolved]] += 1
                 for memory in model_incumbents:
-                    results = [assessed[work_id] for work_id in work_by_memory[memory.id]]
-                    if any(result.supported is None for result in results):
-                        skipped_revalidation[memory.id] = "; ".join(
-                            dict.fromkeys(result.reason for result in results if result.supported is None)
-                        )
-                        continue
-                    current = [result.memory for result in results if result.supported and result.memory is not None]
-                    stats["support_revalidation_supported_count"] += len(current)
-                    assessed_evidence[memory.id] = current
-                    support_audits.append(SupportAuditEntry(
-                        incumbent_id=memory.id, supported=bool(current),
-                        reason="; ".join(dict.fromkeys(result.reason for result in results)),
-                    ))
-                stats["support_revalidation_revision_index_count"] = len(assessment_context.indexes)
+                    supports[memory.id] = memory_support([assessed[item.id] for item in work_by_memory[memory.id]])
+                    stats["support_revalidation_supported_count"] += len(supports[memory.id].evidence)
+                if assessment_context is not None:
+                    stats["support_revalidation_revision_index_count"] = len(assessment_context.indexes)
+                if relation.failure is not None:
+                    result = ReconciliationResult(operations=[], failure=relation.failure, metrics=relation.metrics)
+                else:
+                    ledger = carry_into_ledger(
+                        filtered_memories, relation.entries,
+                        await self._carried_conflicts(
+                            source_unit_id=scope.source_unit_id, model_incumbents=model_incumbents,
+                            context=assessment_context,
+                        ),
+                    )
+                    stats["coordinator_carried_conflict_count"] = len(ledger.carried_pairs)
+                    result = await join_support_and_relation(
+                        replace(relation, entries=ledger.entries),
+                        new_extractions=ledger.candidates,
+                        existing_memories=model_incumbents,
+                        supports=dict(supports),
+                        structured_llm_client=self.structured_llm_client,
+                        llm_model=self.llm_model,
+                        recheck=recheck,
+                        rechecked_pairs=ledger.carried_pairs,
+                    )
+            finally:
+                stats["support_revalidation_model_call_count"] += evaluator.calls
+                stats["support_revalidation_assessment_request_count"] = evaluator.stage_counts["support_assess"]
+                stats["support_revalidation_prompt_chars"] += evaluator.prompt_chars
+                stats["support_revalidation_reused_work_count"] = evaluator.reused
+                stats["support_revalidation_covered_source_claim_pairs"] = evaluator.covered_source_claim_pairs
+                stats["support_revalidation_program_rebind_count"] = evaluator.program_rebind_count
+                stats["support_revalidation_change_impact_request_count"] = evaluator.stage_counts["change_impact"]
+                impact_counts = evaluator.change_impact_counts
+                stats["support_revalidation_change_impact_unaffected_count"] = impact_counts["unaffected"]
+                stats["support_revalidation_change_impact_affected_count"] = impact_counts["affected"]
+                stats["support_revalidation_change_impact_failed_count"] = impact_counts["failed"]
+                _runtime_context.model_call_count += evaluator.calls
+            stats["support_revalidation_completion_count"] = len(evaluator.final_work_ids)
+            if derivation_id:
+                required_derivation_work_ids += tuple(evaluator.final_work_ids)
             _runtime_context.stage = "reconciliation"
-            result = await reconcile_memories(
-                new_extractions=filtered_memories,
-                existing_memories=[memory for memory in model_incumbents if memory.id not in skipped_revalidation],
-                doc_type=doc_type,
-                structured_llm_client=self.structured_llm_client,
-                llm_model=self.llm_model,
-                include_metadata=True,
-                support_audits=support_audits,
-                image_loader=evidence_image_loader,
-                work_store=self.db,
-                derivation_id=derivation_id,
-                operation_input_hash=operation_input_hash,
-            )
-            if not isinstance(result, ReconciliationResult):
-                raise TypeError("metadata reconciliation must return ReconciliationResult")
             reconciliation_metrics = result.metrics
             required_derivation_work_ids += result.work_ids
             model_batch_count = reconciliation_metrics.model_batch_count
@@ -1295,6 +1392,9 @@ class MemoryEngine:
                     "reconciliation_revision_proof_failure_count": (
                         reconciliation_metrics.revision_proof_failure_count
                     ),
+                    "coordinator_recheck_count": len(result.rechecks),
+                    "coordinator_review_count": sum(len(operation.reviews) for operation in result.operations),
+                    "coordinator_unresolved_candidate_count": result.unresolved_candidate_count,
                 }
             )
             if result.failure is not None:
@@ -1336,21 +1436,6 @@ class MemoryEngine:
                 )
             operations = tuple(result.operations) + tuple(
                 ReconcileOperation(
-                    action=ReconcileAction.NOOP,
-                    memory_id=memory_id,
-                    reason=reason or "Support revalidation unresolved; preserve existing evidence",
-                    support_revalidation_skipped=True,
-                )
-                for memory_id, reason in skipped_revalidation.items()
-            )
-            skipped_revalidation.update({
-                operation.memory_id: operation.reason
-                for operation in result.operations
-                if operation.support_revalidation_skipped and operation.memory_id
-            })
-            stats["support_revalidation_skipped_memory_count"] = len(skipped_revalidation)
-            operations += tuple(
-                ReconcileOperation(
                     action=ReconcileAction.DELETE,
                     memory_id=memory_id,
                     reason=("current Source Artifact revision is not inference eligible"),
@@ -1358,6 +1443,9 @@ class MemoryEngine:
                 )
                 for memory_id in sorted(derivation_protected_ids)
             )
+        stats["support_revalidation_skipped_memory_count"] = sum(
+            operation.support_revalidation_skipped for operation in operations
+        )
         _runtime_context.stage = "plan_construction"
         protected_memory_ids = self._partial_projection_protected_incumbents(
             projection=projection,
@@ -1401,35 +1489,33 @@ class MemoryEngine:
                 separators=(",", ":"),
             )
         )
-        for operation in operations:
-            if (
-                operation.action
-                not in {
-                    ReconcileAction.ADD,
-                    ReconcileAction.UPDATE,
-                    ReconcileAction.SUPERSEDE,
-                }
-                or operation.memory is None
-            ):
-                continue
-            quality = classify_memory_candidate(operation.memory)
+        proposed_memories = [
+            *(
+                operation.memory for operation in operations
+                if operation.action in {ReconcileAction.ADD, ReconcileAction.UPDATE, ReconcileAction.SUPERSEDE}
+                and operation.memory is not None
+            ),
+            *(
+                review.candidate for operation in operations for review in operation.reviews
+                if review.proposal is CoordinatorProposal.SUPERSEDE
+            ),
+        ]
+        for proposed in proposed_memories:
+            quality = classify_memory_candidate(proposed)
             if not quality.keep:
                 raise RuntimeError(
                     "complete lifecycle reconciliation produced an unsafe Memory candidate: "
                     f"{quality.skip_reason or 'quality_rejected'}"
                 )
         incumbents_by_id = {memory.id: memory for memory in incumbents}
-        operations = tuple(
-            replace(operation, memory=assessed_evidence[operation.memory_id][0])
-            if (operation.action is ReconcileAction.NOOP and not operation.support_revalidation_skipped
-                and assessed_evidence.get(operation.memory_id))
-            else operation
-            for operation in operations
-        )
         _runtime_context.stage = "plan_construction"
         corroboration_targets: dict[str, Memory] = {}
         corroboration_proofs: dict[str, dict[str, object]] = {}
         identity_claim_hashes: list[str] = []
+        identity_excluded_ids = frozenset(incumbents_by_id).difference(
+            operation.memory_id for operation in operations
+            if operation.support_revalidation_skipped and not operation.reviews
+        )
         identity_requests: list[IdentityResolutionRequest] = []
         operation_memories = tuple(operation.memory for operation in operations if operation.memory is not None)
         memory_texts_by_mention: dict[str, list[str]] = {}
@@ -1486,7 +1572,7 @@ class MemoryEngine:
                         content_hash(operation.memory.content.strip()),
                         (),
                     ),
-                    excluded_memory_ids=frozenset(incumbents_by_id).difference(skipped_revalidation),
+                    excluded_memory_ids=identity_excluded_ids,
                 )
             )
         identity_resolution = await self.identity_resolver.resolve(tuple(identity_requests))
@@ -1524,8 +1610,15 @@ class MemoryEngine:
             attached_target_ids.append(target.id)
         evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
         for operation in operations:
-            if operation.action is ReconcileAction.NOOP:
-                evidence_memories.extend(assessed_evidence.get(operation.memory_id, [])[1:])
+            if operation.action is not ReconcileAction.NOOP:
+                continue
+            support = supports.get(operation.memory_id or "")
+            if operation.memory is not None and support is not None and support.evidence[:1] == (operation.memory,):
+                evidence_memories.extend(support.evidence[1:])
+            for review in operation.reviews:
+                evidence_memories.append(review.candidate)
+                if review.rejection_rebind is not None:
+                    evidence_memories.append(review.rejection_rebind)
         projected_evidence = build_projected_claim_evidence(
             projection=projection,
             raw_memories=evidence_memories,
@@ -1539,15 +1632,24 @@ class MemoryEngine:
             extractor_run_id=projection.run_id,
             observed_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
         )
+        def canonical(raw: RawMemory) -> RawMemory:
+            return projected_evidence.canonical_memories_by_claim_hash[content_hash(raw.content.strip())]
+
         operations = tuple(
             replace(
                 operation,
-                memory=projected_evidence.canonical_memories_by_claim_hash[
-                    content_hash(operation.memory.content.strip())
-                ],
+                memory=canonical(operation.memory) if operation.memory is not None else None,
+                reviews=tuple(
+                    replace(
+                        review,
+                        candidate=canonical(review.candidate),
+                        rejection_rebind=(
+                            canonical(review.rejection_rebind) if review.rejection_rebind is not None else None
+                        ),
+                    )
+                    for review in operation.reviews
+                ),
             )
-            if operation.memory is not None
-            else operation
             for operation in operations
         )
         defaults = NewMemoryDefaults(
@@ -1877,6 +1979,19 @@ def _observation_semantic_class(
         value = revision.metadata.get("semantic_class")
         return str(value) if isinstance(value, str) and value else None
     return None
+
+
+async def _run_concurrently(first: Awaitable[_First], second: Awaitable[_Second]) -> tuple[_First, _Second]:
+    """Run two lines at once; the first failure cancels the other and propagates unchanged."""
+    tasks = (asyncio.ensure_future(first), asyncio.ensure_future(second))
+    try:
+        first_result, second_result = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    return first_result, second_result
 
 
 def _support_validation_baseline(support) -> tuple[str | None, str | None]:

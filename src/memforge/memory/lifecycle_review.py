@@ -18,6 +18,7 @@ from memforge.memory.lifecycle_plan import (
     ReconciliationScope,
     StaleGuard,
 )
+from memforge.memory.coordinator_review import is_coordinator_review
 from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryRequest,
     relation_discovery_request_id,
@@ -31,23 +32,21 @@ def build_lifecycle_review_approval_plan(
     reviewer: str | None = None,
     review_note: str | None = None,
 ) -> LifecyclePlan:
-    """Turn a pending proposal into a fresh atomic plan with original stale guards.
+    """Turn a pending proposal into a fresh atomic plan with the Review's stale guards.
 
-    Approval never mutates from the review row alone. The original complete plan
-    supplies the source-unit revision and incumbent snapshots, while the review
-    carries only the mutations proposed for its one incumbent.
+    Approval never mutates from the review row alone. The creating plan supplies
+    the source-unit revision, while the review carries only the mutations
+    proposed for its one incumbent. A coordinator Review is guarded by the
+    incumbent state its creating plan left behind; any other Review by the
+    creating plan's own incumbent snapshot.
     """
 
     if review.status is not LifecycleReviewStatus.PENDING:
         raise ValueError(f"lifecycle review is already {review.status.value}")
     scope_payload = _mapping(original_plan_payload.get("scope"), "scope")
     source_id = _text(scope_payload.get("source_id"), "scope.source_id")
-    stale_payload = _mapping(original_plan_payload.get("stale_guard"), "stale_guard")
-    support_hashes = _string_mapping(stale_payload.get("support_set_hashes"), "support_set_hashes")
-    memory_versions = _string_mapping(stale_payload.get("memory_versions"), "memory_versions")
+    stale_guard = _review_stale_guard(review, original_plan_payload)
     incumbent_id = review.incumbent_memory_id
-    if incumbent_id not in support_hashes or incumbent_id not in memory_versions:
-        raise ValueError("review incumbent is absent from original stale guard")
 
     disposition = IncumbentDisposition(
         _text(review.staged_evidence.get("proposed_disposition"), "proposed_disposition")
@@ -108,13 +107,7 @@ def build_lifecycle_review_approval_plan(
             batch_ids=(f"{scope.id}:batch:0",),
             completed_batch_ids=(f"{scope.id}:batch:0",),
         ),
-        stale_guard=StaleGuard(
-            observation_revision_ids=tuple(
-                str(value) for value in _sequence(stale_payload.get("observation_revision_ids", ()))
-            ),
-            support_set_hashes={incumbent_id: support_hashes[incumbent_id]},
-            memory_versions={incumbent_id: memory_versions[incumbent_id]},
-        ),
+        stale_guard=stale_guard,
         # Resolve first inside the same transaction so terminal mutations stale
         # only other pending review work. Any later failure rolls approval back.
         mutations=(resolution, *proposed),
@@ -122,6 +115,99 @@ def build_lifecycle_review_approval_plan(
     )
     plan.validate()
     return plan
+
+
+def build_lifecycle_review_rejection_plan(
+    review: LifecycleReview,
+    original_plan_payload: Mapping[str, object],
+    *,
+    reviewer: str | None = None,
+    review_note: str | None = None,
+) -> LifecyclePlan | None:
+    """Plan a rejection that must change state, or None when rejection keeps the status quo.
+
+    A coordinator Review of an old Memory that also has an equivalent Candidate
+    records how rejection keeps it: bound to that Candidate's Evidence. The
+    rebind is guarded exactly like approval.
+    """
+
+    if review.status is not LifecycleReviewStatus.PENDING:
+        raise ValueError(f"lifecycle review is already {review.status.value}")
+    raw_mutations = review.staged_evidence.get("rejection_mutations")
+    if raw_mutations is None:
+        return None
+    scope_payload = _mapping(original_plan_payload.get("scope"), "scope")
+    source_id = _text(scope_payload.get("source_id"), "scope.source_id")
+    incumbent_id = review.incumbent_memory_id
+    rejection = tuple(_deserialize_mutation(value, source_id, incumbent_id) for value in _sequence(raw_mutations))
+    if not rejection:
+        raise ValueError("lifecycle review rejection names no mutations")
+    scope = ReconciliationScope(
+        id=f"{_text(scope_payload.get('id'), 'scope.id')}:review-rejection:{review.id}",
+        source_id=source_id,
+        source_unit_id=_text(scope_payload.get("source_unit_id"), "scope.source_unit_id"),
+        base_unit_revision_id=_optional_text(scope_payload.get("base_unit_revision_id")),
+        target_unit_revision_id=_optional_text(scope_payload.get("target_unit_revision_id")),
+        dependency_unit_ids=tuple(str(value) for value in _sequence(scope_payload.get("dependency_unit_ids", ()))),
+    )
+    plan = LifecyclePlan(
+        id=f"lifecycle-review-rejection-{review.id}",
+        scope=scope,
+        gate_state=LifecycleGateState.ENABLED,
+        coverage_proof=CoverageProof(
+            mandatory_incumbent_ids=(incumbent_id,),
+            incumbent_decisions=(
+                IncumbentDecision(
+                    memory_id=incumbent_id,
+                    disposition=IncumbentDisposition.KEEP,
+                    reason=review_note or "rejected lifecycle review",
+                ),
+            ),
+            batch_ids=(f"{scope.id}:batch:0",),
+            completed_batch_ids=(f"{scope.id}:batch:0",),
+        ),
+        stale_guard=_review_stale_guard(review, original_plan_payload),
+        mutations=(
+            LifecycleMutation(
+                mutation_type=LifecycleMutationType.RESOLVE_REVIEW,
+                memory_id=incumbent_id,
+                source_id=source_id,
+                payload={
+                    "review_id": review.id,
+                    "status": LifecycleReviewStatus.REJECTED.value,
+                    "reviewer": reviewer,
+                    "review_note": review_note,
+                },
+            ),
+            *rejection,
+        ),
+    )
+    plan.validate()
+    return plan
+
+
+def _review_stale_guard(review: LifecycleReview, original_plan_payload: Mapping[str, object]) -> StaleGuard:
+    stale_payload = _mapping(original_plan_payload.get("stale_guard"), "stale_guard")
+    observation_revision_ids = tuple(
+        str(value) for value in _sequence(stale_payload.get("observation_revision_ids", ()))
+    )
+    incumbent_id = review.incumbent_memory_id
+    if is_coordinator_review(review):
+        own = _mapping(review.staged_evidence.get("stale_guard"), "staged_evidence.stale_guard")
+        return StaleGuard(
+            observation_revision_ids=observation_revision_ids,
+            support_set_hashes={incumbent_id: _text(own.get("support_set_hash"), "stale_guard.support_set_hash")},
+            memory_versions={incumbent_id: _text(own.get("memory_version"), "stale_guard.memory_version")},
+        )
+    support_hashes = _string_mapping(stale_payload.get("support_set_hashes"), "support_set_hashes")
+    memory_versions = _string_mapping(stale_payload.get("memory_versions"), "memory_versions")
+    if incumbent_id not in support_hashes or incumbent_id not in memory_versions:
+        raise ValueError("review incumbent is absent from original stale guard")
+    return StaleGuard(
+        observation_revision_ids=observation_revision_ids,
+        support_set_hashes={incumbent_id: support_hashes[incumbent_id]},
+        memory_versions={incumbent_id: memory_versions[incumbent_id]},
+    )
 
 
 def build_lifecycle_review_refresh_plan(
@@ -141,6 +227,10 @@ def build_lifecycle_review_refresh_plan(
 
     if review.status is not LifecycleReviewStatus.STALE:
         raise ValueError("only a stale lifecycle review can be refreshed")
+    if is_coordinator_review(review):
+        raise ValueError(
+            "a coordinator Review is refreshed by the next revision of its Source Unit, which raises its conflict again"
+        )
     if not current_support_set_hash or not current_memory_version:
         raise ValueError("lifecycle review refresh requires a current incumbent snapshot")
 

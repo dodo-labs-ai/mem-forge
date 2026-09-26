@@ -18,12 +18,48 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
+from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole, ResolvedEvidenceSelection
 from memforge.models import Memory
 from memforge.pipeline.evidence_fragments import EvidenceFragment
 from memforge.pipeline.projection_fragments import ProjectionFragmentCatalog
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext, reading_group_label
 from memforge.source_projection import ProjectionCoverage, SourceAnchor
+
+
+# One Evidence part's exact identity: its Observation, raw digest and presentation digest.
+EvidenceDigest = tuple[str, str, str]
+
+
+def evidence_digests(selection: ResolvedEvidenceSelection) -> tuple[EvidenceDigest, ...]:
+    """The exact identities of a resolved selection's parts, sorted and distinct."""
+    return tuple(sorted({
+        (part.anchor.observation_id, part.raw_content_sha256, part.presentation_sha256) for part in selection.parts
+    }))
+
+
+def exact_evidence_selection(
+    catalog: ProjectionFragmentCatalog, parts: Sequence[tuple[EvidenceRole, EvidenceDigest]],
+) -> ResolvedEvidenceSelection | None:
+    """Rebind an Evidence selection whose every part is exactly and uniquely current, or None.
+
+    Like prior Evidence correspondence, a part matches only its own Observation's
+    Fragment with the same digests, and a Primary part only a Primary-eligible one.
+    """
+    refs: dict[EvidenceRole, list[str]] = {EvidenceRole.PRIMARY: [], EvidenceRole.REQUIRED: []}
+    for role, (observation_id, raw, presentation) in parts:
+        matches = [
+            fragment for fragment in catalog.fragments
+            if fragment.anchor.observation_id == observation_id
+            and _is_exact(role, raw, presentation, fragment)
+        ]
+        if len(matches) != 1:
+            return None
+        refs[role].append(matches[0].reference)
+    if len(refs[EvidenceRole.PRIMARY]) != 1:
+        return None
+    primary_ref = refs[EvidenceRole.PRIMARY][0]
+    required = tuple(dict.fromkeys(ref for ref in refs[EvidenceRole.REQUIRED] if ref != primary_ref))
+    return catalog.resolve_selection(primary_ref=primary_ref, required_refs=required)
 
 
 @dataclass(frozen=True)
@@ -177,6 +213,17 @@ class SupportRevisionPlan:
 
         return SupportReadingOrder(parts, {support.item.id: first_part_end(support) for support in assessed})
 
+    def evidence_reading_order(
+        self, assessed: Sequence[SupportPlan], evidence: Sequence[EvidenceDigest],
+    ) -> SupportReadingOrder:
+        """Only the current ReadingGroups that hold the given Evidence, in document order, read as one first part."""
+        wanted = set(evidence)
+        groups = self.groups or self.context.reading_groups(self.catalog.fragments)
+        parts = tuple(
+            ReadingPart(fragments=group) for group in groups if any(_digests(fragment) in wanted for fragment in group)
+        )
+        return SupportReadingOrder(parts, {support.item.id: len(parts) for support in assessed})
+
 
 def plan_support_revision(
     context: RevisionAssessmentContext, items: Sequence[SupportWorkItem]
@@ -220,7 +267,10 @@ def _correspond(
     # A carried Observation the provider did not return proves neither presence nor absence.
     if coverage is ProjectionCoverage.PARTIAL_PROJECTION and observation_id not in returned:
         return PartCorrespondence(part, EvidenceCorrespondence.UNKNOWN)
-    candidates = tuple(fragment for fragment in by_observation.get(observation_id, ()) if _is_exact(part, fragment))
+    candidates = tuple(
+        fragment for fragment in by_observation.get(observation_id, ())
+        if _is_exact(part.role, part.raw_content_sha256, part.presentation_sha256, fragment)
+    )
     if len(candidates) == 1:
         return PartCorrespondence(part, EvidenceCorrespondence.EXACT_UNCHANGED, candidates)
     if candidates:
@@ -244,15 +294,15 @@ def _overlaps(old: SourceAnchor, current: SourceAnchor) -> bool:
     return None not in ranges and current.range_start < old.range_end and old.range_start < current.range_end
 
 
-def _is_exact(part: ActiveSupportEvidence, fragment: EvidenceFragment) -> bool:
+def _is_exact(role: EvidenceRole, raw: str | None, presentation: str | None, fragment: EvidenceFragment) -> bool:
     """Compare every persisted digest without normalization; legacy parts without one never match."""
-    if part.role is EvidenceRole.PRIMARY and not fragment.primary_eligible:
+    if role is EvidenceRole.PRIMARY and not fragment.primary_eligible:
         return False
     recorded = tuple(
         (old, new)
         for old, new in (
-            (part.raw_content_sha256, fragment.raw_content_sha256),
-            (part.presentation_sha256, fragment.presentation_sha256),
+            (raw, fragment.raw_content_sha256),
+            (presentation, fragment.presentation_sha256),
         )
         if old is not None
     )

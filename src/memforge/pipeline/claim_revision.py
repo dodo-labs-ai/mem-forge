@@ -69,6 +69,7 @@ class ClaimRevisionLedger:
     decisions: tuple
     prompt_chars: int
     work_ids: tuple[str, ...] = ()
+    llm_calls: int = 0
 
 
 async def assess_claim_pairs(
@@ -80,8 +81,8 @@ async def assess_claim_pairs(
     """Discover edges for every admitted candidate against every incumbent without synthesizing missing edges.
 
     The request carries no Support result and asks for no Evidence judgment:
-    candidate admission already checked each candidate's Evidence, and only the
-    reducer combines relations with Support. Each NEW candidate is one work
+    candidate admission already checked each candidate's Evidence, and only
+    SupportRelationCoordinator combines relations with Support. Each NEW candidate is one work
     item; the incumbents are its shared context.
     A candidate whose incumbents do not fit one request reads them in
     consecutive chunks, and its per-chunk rows are merged here.
@@ -162,7 +163,7 @@ async def assess_claim_pairs(
                         reason="Refinement lacks its revision proof"))
                 decisions.append((index, old_ids[edge.existing_id].id, decision))
     return ClaimRevisionLedger(tuple(decisions), runner.stats.prompt_chars,
-        tuple(work.id for work in journal.works) if journal is not None else ())
+        tuple(work.id for work in journal.works) if journal is not None else (), runner.stats.calls)
 
 
 def _raise_failure(failure: ItemFailure):
