@@ -169,11 +169,7 @@ def build_lifecycle_plan(
         )
 
     def support_ids_for(raw: RawMemory) -> tuple[str, ...]:
-        if evidence_unit_ids_by_claim_hash is not None:
-            units = evidence_unit_ids_by_claim_hash.get(content_hash(raw.content.strip()), ())
-            if units:
-                return units
-        return new_evidence_unit_ids
+        return _claim_support_ids(raw, evidence_unit_ids_by_claim_hash, new_evidence_unit_ids)
 
     def memory_creation_mutations(raw: RawMemory) -> tuple[str, tuple[LifecycleMutation, ...]]:
         memory_id = _new_memory_id(scope.id, raw)
@@ -255,14 +251,7 @@ def build_lifecycle_plan(
     existing_reviews = {review.id: review for review in coordinator_reviews}
 
     def raised_reviews(memory_id: str, reviews: Sequence[CoordinatorReview]) -> list[tuple[str, CoordinatorReview]]:
-        raised: dict[str, CoordinatorReview] = {}
-        for review in reviews:
-            review_id = coordinator_review_id(scope.source_unit_id, memory_id, review.candidate.content)
-            existing = existing_reviews.get(review_id)
-            if existing is not None and existing.status in _DECIDED_REVIEW_STATUSES:
-                continue
-            raised.setdefault(review_id, review)
-        return list(raised.items())
+        return _raised_coordinator_reviews(scope.source_unit_id, memory_id, reviews, existing_reviews)
 
     def coordinator_review_mutation(
         review_id: str,
@@ -382,7 +371,7 @@ def build_lifecycle_plan(
             support_ids = support_ids_for(operation.memory) if operation.memory is not None else ()
             proposed_mutations: list[LifecycleMutation] = []
             if support_ids:
-                if current_source_support and set(support_ids) != set(current_source_support):
+                if _rebind_removes_support(current_source_support, support_ids):
                     proposed_mutations.append(
                         LifecycleMutation(
                             LifecycleMutationType.REMOVE_SUPPORT,
@@ -404,8 +393,8 @@ def build_lifecycle_plan(
                         },
                     )
                 )
-            gated_removal = gate_state is LifecycleGateState.GATED and any(
-                item.mutation_type is LifecycleMutationType.REMOVE_SUPPORT for item in proposed_mutations
+            gated_removal = gate_state is LifecycleGateState.GATED and _rebind_removes_support(
+                current_source_support, support_ids,
             )
             raised = raised_reviews(memory_id, operation.reviews)
             if raised:
@@ -644,6 +633,15 @@ def build_lifecycle_plan(
             continue
         raise ValueError(f"unsupported reconcile action: {operation.action.value}")
 
+    # Identity may attach only to an old Memory this Plan keeps.
+    replaced_or_reviewed = {
+        decision.memory_id for decision in decisions if decision.disposition is not IncumbentDisposition.KEEP
+    }
+    if conflicting := sorted(attached_target_ids & replaced_or_reviewed):
+        raise ValueError(
+            f"identity attach targets an old Memory this Plan deletes, replaces or reviews: {conflicting}"
+        )
+
     # A pending conflict this revision does not raise is gone. Closing it first keeps a
     # destructive mutation later in the Plan from staling it; new Reviews come last, so
     # each records its guard after every other mutation of its Memory.
@@ -692,6 +690,74 @@ def build_lifecycle_plan(
     )
     plan.validate()
     return plan
+
+
+def identity_excluded_incumbent_ids(
+    operations: Sequence[ReconcileOperation],
+    *,
+    source_unit_id: str,
+    gate_state: LifecycleGateState,
+    source_support_unit_ids: Mapping[str, tuple[str, ...]],
+    evidence_unit_ids_by_claim_hash: Mapping[str, tuple[str, ...]],
+    coordinator_reviews: Sequence[LifecycleReview] = (),
+) -> frozenset[str]:
+    """The old Memories this round's Plan deletes, supersedes, updates or sends to Review.
+
+    Identity deduplication must not attach a Candidate to them. Every other old
+    Memory this round keeps, rebound or unresolved, is an eligible identity
+    target. These are the planner's own rules, so the Plan agrees with them.
+    """
+    existing_reviews = {review.id: review for review in coordinator_reviews}
+    excluded: set[str] = set()
+    for operation in operations:
+        memory_id = operation.memory_id
+        if memory_id is None:
+            continue
+        if operation.action is not ReconcileAction.NOOP or _raised_coordinator_reviews(
+            source_unit_id, memory_id, operation.reviews, existing_reviews,
+        ):
+            excluded.add(memory_id)
+        elif gate_state is LifecycleGateState.GATED and operation.memory is not None and _rebind_removes_support(
+            source_support_unit_ids.get(memory_id, ()),
+            _claim_support_ids(operation.memory, evidence_unit_ids_by_claim_hash),
+        ):
+            excluded.add(memory_id)
+    return frozenset(excluded)
+
+
+def _claim_support_ids(
+    raw: RawMemory,
+    evidence_unit_ids_by_claim_hash: Mapping[str, tuple[str, ...]] | None,
+    fallback: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """The Evidence Units this round built for a claim."""
+    if evidence_unit_ids_by_claim_hash is not None:
+        units = evidence_unit_ids_by_claim_hash.get(content_hash(raw.content.strip()), ())
+        if units:
+            return units
+    return fallback
+
+
+def _rebind_removes_support(current_source_support: Sequence[str], support_ids: Sequence[str]) -> bool:
+    """A kept old Memory's rebind replaces this source's current Support with other Evidence Units."""
+    return bool(support_ids) and bool(current_source_support) and set(support_ids) != set(current_source_support)
+
+
+def _raised_coordinator_reviews(
+    source_unit_id: str,
+    memory_id: str,
+    reviews: Sequence[CoordinatorReview],
+    existing_reviews: Mapping[str, LifecycleReview],
+) -> list[tuple[str, CoordinatorReview]]:
+    """This round's coordinator Reviews of one old Memory by ID, less the conflicts a human already decided."""
+    raised: dict[str, CoordinatorReview] = {}
+    for review in reviews:
+        review_id = coordinator_review_id(source_unit_id, memory_id, review.candidate.content)
+        existing = existing_reviews.get(review_id)
+        if existing is not None and existing.status in _DECIDED_REVIEW_STATUSES:
+            continue
+        raised.setdefault(review_id, review)
+    return list(raised.items())
 
 
 def lifecycle_access_context_hash(

@@ -62,9 +62,11 @@ from memforge.memory.lifecycle_plan import (
     ProjectedSupportInvariantError,
     ReconciliationScope,
 )
+from memforge.memory.destructive_validation import KeptReason, validate_destructive_operations
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
     build_lifecycle_plan,
+    identity_excluded_incumbent_ids,
     lifecycle_access_context_hash,
     lifecycle_memory_version,
     lifecycle_plan_id,
@@ -93,7 +95,7 @@ from memforge.source_access import (
     memory_visibility_for_source_id,
 )
 from memforge.source_activity import SourceActivityLease
-from memforge.source_projection import ImpactResult, ProjectionCoverage, SourceUnitRevision, resolve_anchor_impact
+from memforge.source_projection import SourceUnitRevision
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
     source_derivation_context_identity_hash,
@@ -357,109 +359,6 @@ class MemoryEngine:
             if memory.status == "active":
                 incumbents_by_id.setdefault(memory.id, memory)
         return [incumbents_by_id[key] for key in sorted(incumbents_by_id)], unit_support
-
-    async def _projected_incumbent_impacts(
-        self,
-        *,
-        projection: SourceProjection,
-        incumbent_ids: frozenset[str],
-        unit_support: Mapping[str, tuple[str, ...]],
-    ) -> dict[str, ImpactResult]:
-        """Resolve each incumbent against the current Revision Delta.
-
-        Missing Unit Support, ambiguous mappings, and mixed evidence stay
-        UNKNOWN. A single affected reference makes the incumbent AFFECTED;
-        only a complete set of disjoint references proves DISJOINT.
-        """
-
-        delta = projection.deltas[0]
-        ordered_incumbent_ids = tuple(sorted(incumbent_ids))
-        evidence_by_memory_id = await self.db.get_active_memory_support_evidence_many(
-            ordered_incumbent_ids,
-            source_id=projection.source_id,
-        )
-        resolved: dict[str, ImpactResult] = {}
-        for memory_id in ordered_incumbent_ids:
-            unit_ids = frozenset(unit_support.get(memory_id, ()))
-            if not unit_ids:
-                resolved[memory_id] = ImpactResult.UNKNOWN
-                continue
-            evidence = evidence_by_memory_id.get(memory_id, ())
-            impacts = {
-                resolve_anchor_impact(item.anchor, delta)
-                for item in evidence
-                if item.evidence_unit_id in unit_ids
-            }
-            if ImpactResult.AFFECTED in impacts:
-                resolved[memory_id] = ImpactResult.AFFECTED
-            elif not impacts or ImpactResult.UNKNOWN in impacts:
-                resolved[memory_id] = ImpactResult.UNKNOWN
-            else:
-                resolved[memory_id] = ImpactResult.DISJOINT
-        return resolved
-
-    @staticmethod
-    def _partial_projection_protected_incumbents(
-        *,
-        projection: SourceProjection,
-        incumbent_impacts: Mapping[str, ImpactResult],
-    ) -> frozenset[str]:
-        """Return partial-projection incumbents without affected-anchor proof."""
-
-        if projection.coverage is not ProjectionCoverage.PARTIAL_PROJECTION:
-            return frozenset()
-        return frozenset(
-            memory_id for memory_id, impact in incumbent_impacts.items() if impact is not ImpactResult.AFFECTED
-        )
-
-    @staticmethod
-    def _enforce_partial_projection_keep(
-        operations: tuple[ReconcileOperation, ...],
-        protected_memory_ids: frozenset[str],
-    ) -> tuple[ReconcileOperation, ...]:
-        """Keep unproven incumbents while preserving non-destructive candidates."""
-
-        protected: list[ReconcileOperation] = []
-        for operation in operations:
-            if operation.memory_id not in protected_memory_ids:
-                protected.append(operation)
-                continue
-            if operation.action is ReconcileAction.UPDATE and operation.memory is not None:
-                protected.append(
-                    ReconcileOperation(
-                        action=ReconcileAction.ADD,
-                        memory=operation.memory,
-                        reason="partial projection preserves candidate without mutating unproven incumbent",
-                    )
-                )
-                protected.append(
-                    ReconcileOperation(
-                        action=ReconcileAction.NOOP,
-                        memory_id=operation.memory_id,
-                        reason="partial projection has no deterministic affected-anchor proof",
-                    )
-                )
-                continue
-            if operation.action is ReconcileAction.SUPERSEDE:
-                protected.append(
-                    replace(
-                        operation,
-                        reason="partial projection contradiction requires lifecycle review",
-                        flag_for_review=True,
-                    )
-                )
-                continue
-            if operation.action is ReconcileAction.DELETE:
-                protected.append(
-                    ReconcileOperation(
-                        action=ReconcileAction.NOOP,
-                        memory_id=operation.memory_id,
-                        reason="partial projection has no deterministic affected-anchor proof",
-                    )
-                )
-                continue
-            protected.append(operation)
-        return tuple(protected)
 
     async def _carried_conflicts(
         self,
@@ -1149,13 +1048,6 @@ class MemoryEngine:
             incumbent_ids=frozenset(memory.id for memory in incumbents),
             protected_source_observation_ids=frozenset(protected_source_observation_ids),
         )
-        incumbent_impacts: dict[str, ImpactResult] = {}
-        if projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION:
-            incumbent_impacts = await self._projected_incumbent_impacts(
-                projection=projection,
-                incumbent_ids=frozenset(memory.id for memory in incumbents),
-                unit_support=unit_support,
-            )
         visibility, owner_user_id = await memory_visibility_for_source_id(self.db, source_id=projection.source_id)
         if visibility == "private" and user_id is not None and user_id != owner_user_id:
             raise PermissionError("private projected lifecycle actor does not own the document")
@@ -1172,6 +1064,19 @@ class MemoryEngine:
         bounded_reconciliation_elapsed_ms = 0
         from memforge.pipeline.projection_images import projection_inference_image_observation_ids
         if not document_content.strip() and not filtered_memories and not projection_inference_image_observation_ids(projection):
+            # Nothing is left to read or relate. Whether each claim's Evidence is gone
+            # is a coverage fact, which DestructiveValidation checks before any removal.
+            evidence_by_memory = await self.db.get_active_memory_support_evidence_many(
+                tuple(memory.id for memory in incumbents), source_id=projection.source_id,
+            )
+            for memory in incumbents:
+                if memory.id not in derivation_protected_ids:
+                    supports[memory.id] = _empty_revision_support(projection, frozenset(
+                        item.anchor.observation_id for item in evidence_by_memory.get(memory.id, ())
+                        if item.evidence_unit_id in unit_support.get(memory.id, ())
+                    ))
+            # No Candidate is left, so no Relation work is owed.
+            relation_complete = True
             operations = tuple(
                 ReconcileOperation(
                     action=ReconcileAction.DELETE,
@@ -1338,6 +1243,9 @@ class MemoryEngine:
                     stats["support_revalidation_supported_count"] += len(supports[memory.id].evidence)
                 if assessment_context is not None:
                     stats["support_revalidation_revision_index_count"] = len(assessment_context.indexes)
+                relation_complete = relation.covers(
+                    len(filtered_memories), frozenset(memory.id for memory in model_incumbents),
+                )
                 if relation.failure is not None:
                     result = ReconciliationResult(operations=[], failure=relation.failure, metrics=relation.metrics)
                 else:
@@ -1443,17 +1351,17 @@ class MemoryEngine:
                 )
                 for memory_id in sorted(derivation_protected_ids)
             )
+        _runtime_context.stage = "plan_construction"
+        validation = validate_destructive_operations(
+            operations, supports=supports, relation_complete=relation_complete,
+        )
+        operations = validation.operations
+        for reason in KeptReason:
+            stats[f"destructive_validation_kept_{reason.value}_count"] = sum(
+                kept is reason for kept in validation.kept.values()
+            )
         stats["support_revalidation_skipped_memory_count"] = sum(
             operation.support_revalidation_skipped for operation in operations
-        )
-        _runtime_context.stage = "plan_construction"
-        protected_memory_ids = self._partial_projection_protected_incumbents(
-            projection=projection,
-            incumbent_impacts=incumbent_impacts,
-        )
-        operations = self._enforce_partial_projection_keep(
-            operations,
-            protected_memory_ids,
         )
         logger.info(
             json.dumps(
@@ -1508,15 +1416,6 @@ class MemoryEngine:
                     f"{quality.skip_reason or 'quality_rejected'}"
                 )
         incumbents_by_id = {memory.id: memory for memory in incumbents}
-        _runtime_context.stage = "plan_construction"
-        corroboration_targets: dict[str, Memory] = {}
-        corroboration_proofs: dict[str, dict[str, object]] = {}
-        identity_claim_hashes: list[str] = []
-        identity_excluded_ids = frozenset(incumbents_by_id).difference(
-            operation.memory_id for operation in operations
-            if operation.support_revalidation_skipped and not operation.reviews
-        )
-        identity_requests: list[IdentityResolutionRequest] = []
         operation_memories = tuple(operation.memory for operation in operations if operation.memory is not None)
         memory_texts_by_mention: dict[str, list[str]] = {}
         for raw_memory in operation_memories:
@@ -1553,6 +1452,67 @@ class MemoryEngine:
             )
             for raw_memory in operation_memories
         }
+        evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
+        for operation in operations:
+            if operation.action is not ReconcileAction.NOOP:
+                continue
+            support = supports.get(operation.memory_id or "")
+            if operation.memory is not None and support is not None and support.evidence[:1] == (operation.memory,):
+                evidence_memories.extend(support.evidence[1:])
+            for review in operation.reviews:
+                evidence_memories.append(review.candidate)
+                if review.rejection_rebind is not None:
+                    evidence_memories.append(review.rejection_rebind)
+        projected_evidence = build_projected_claim_evidence(
+            projection=projection,
+            raw_memories=evidence_memories,
+            doc_id=doc_id,
+            source_type=source_type,
+            project_key=project_key,
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            repo_identifier=repo_identifier,
+            access_context_hash=access_context_hash,
+            extractor_run_id=projection.run_id,
+            observed_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
+        )
+        def canonical(raw: RawMemory) -> RawMemory:
+            return projected_evidence.canonical_memories_by_claim_hash[content_hash(raw.content.strip())]
+
+        operations = tuple(
+            replace(
+                operation,
+                memory=canonical(operation.memory) if operation.memory is not None else None,
+                reviews=tuple(
+                    replace(
+                        review,
+                        candidate=canonical(review.candidate),
+                        rejection_rebind=(
+                            canonical(review.rejection_rebind) if review.rejection_rebind is not None else None
+                        ),
+                    )
+                    for review in operation.reviews
+                ),
+            )
+            for operation in operations
+        )
+        # Identity backstops a Relation omission: a Candidate equivalent to an old Memory
+        # this round keeps attaches to it instead of creating a duplicate.
+        identity_excluded_ids = identity_excluded_incumbent_ids(
+            operations,
+            source_unit_id=scope.source_unit_id,
+            gate_state=gate.state,
+            source_support_unit_ids=unit_support,
+            evidence_unit_ids_by_claim_hash=projected_evidence.evidence_unit_ids_by_claim_hash,
+            coordinator_reviews=(
+                await self._coordinator_reviews(source_unit_id=scope.source_unit_id, incumbent_ids=tuple(incumbents_by_id))
+                if any(operation.reviews for operation in operations) else ()
+            ),
+        )
+        corroboration_targets: dict[str, Memory] = {}
+        corroboration_proofs: dict[str, dict[str, object]] = {}
+        identity_claim_hashes: list[str] = []
+        identity_requests: list[IdentityResolutionRequest] = []
         for operation in operations:
             if operation.action is not ReconcileAction.ADD or operation.memory is None:
                 continue
@@ -1608,50 +1568,6 @@ class MemoryEngine:
             corroboration_targets[claim_hash] = target
             corroboration_proofs[claim_hash] = dict(equivalence_proof)
             attached_target_ids.append(target.id)
-        evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
-        for operation in operations:
-            if operation.action is not ReconcileAction.NOOP:
-                continue
-            support = supports.get(operation.memory_id or "")
-            if operation.memory is not None and support is not None and support.evidence[:1] == (operation.memory,):
-                evidence_memories.extend(support.evidence[1:])
-            for review in operation.reviews:
-                evidence_memories.append(review.candidate)
-                if review.rejection_rebind is not None:
-                    evidence_memories.append(review.rejection_rebind)
-        projected_evidence = build_projected_claim_evidence(
-            projection=projection,
-            raw_memories=evidence_memories,
-            doc_id=doc_id,
-            source_type=source_type,
-            project_key=project_key,
-            visibility=visibility,
-            owner_user_id=owner_user_id,
-            repo_identifier=repo_identifier,
-            access_context_hash=access_context_hash,
-            extractor_run_id=projection.run_id,
-            observed_at=(source_updated_at.isoformat() if source_updated_at is not None else None),
-        )
-        def canonical(raw: RawMemory) -> RawMemory:
-            return projected_evidence.canonical_memories_by_claim_hash[content_hash(raw.content.strip())]
-
-        operations = tuple(
-            replace(
-                operation,
-                memory=canonical(operation.memory) if operation.memory is not None else None,
-                reviews=tuple(
-                    replace(
-                        review,
-                        candidate=canonical(review.candidate),
-                        rejection_rebind=(
-                            canonical(review.rejection_rebind) if review.rejection_rebind is not None else None
-                        ),
-                    )
-                    for review in operation.reviews
-                ),
-            )
-            for operation in operations
-        )
         defaults = NewMemoryDefaults(
             visibility=visibility,
             owner_user_id=owner_user_id,
@@ -1992,6 +1908,27 @@ async def _run_concurrently(first: Awaitable[_First], second: Awaitable[_Second]
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     return first_result, second_result
+
+
+def _empty_revision_support(projection: SourceProjection, observation_ids: frozenset[str]) -> MemorySupport:
+    """One claim's Support result when the current revision has nothing to read.
+
+    Its Evidence is gone only where the revision is authoritative for it: every
+    Observation it rests on was returned, now without content, or the coverage
+    proves absence. An Observation that partial coverage did not return is
+    UNKNOWN, so the claim is ``UNRESOLVED(partial_coverage)``.
+    """
+    returned = {observation.id for observation in projection.observations}
+    if projection.coverage.proves_absence or (observation_ids and observation_ids <= returned):
+        return memory_support((
+            SupportAssessment(False, "source observation is explicitly empty", None, complete_read=True),
+        ))
+    return memory_support((
+        SupportAssessment(
+            None, "Partial projection coverage cannot prove that the source observation is empty.", None,
+            unresolved="partial_coverage",
+        ),
+    ))
 
 
 def _support_validation_baseline(support) -> tuple[str | None, str | None]:

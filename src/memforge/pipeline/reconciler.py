@@ -102,6 +102,13 @@ class RelationLine:
     failure: ReconciliationFailure | None = None
     metrics: ReconciliationMetrics = ReconciliationMetrics()
     work_ids: tuple[str, ...] = ()
+    # Candidates with a completion row, and the old-Memory catalog those rows cover.
+    completed_candidate_count: int = 0
+    catalog: frozenset[str] = frozenset()
+
+    def covers(self, candidate_count: int, incumbent_ids: frozenset[str]) -> bool:
+        """Whether every one of ``candidate_count`` Candidates has its row over exactly these old Memories."""
+        return self.failure is None and self.completed_candidate_count == candidate_count and self.catalog == incumbent_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,8 +144,13 @@ async def assess_relations(
     """
     started = perf_counter()
     pair_count = len(new_extractions) * len(existing_memories)
+    catalog = frozenset(memory.id for memory in existing_memories)
     if not new_extractions or not existing_memories:
-        return RelationLine(metrics=ReconciliationMetrics(relation_pair_count=pair_count))
+        # Nothing to relate: every Candidate's row is empty by definition.
+        return RelationLine(
+            metrics=ReconciliationMetrics(relation_pair_count=pair_count),
+            completed_candidate_count=len(new_extractions), catalog=catalog,
+        )
     from memforge.pipeline.claim_revision import assess_claim_pairs
 
     with structured_llm_line_scope() as line:
@@ -186,6 +198,7 @@ async def assess_relations(
     return RelationLine(
         entries=tuple(entries), proofs=tuple(proofs), work_ids=assessed.work_ids,
         metrics=_add_calls(metrics, line, started),
+        completed_candidate_count=assessed.completed_candidate_count, catalog=catalog,
     )
 
 

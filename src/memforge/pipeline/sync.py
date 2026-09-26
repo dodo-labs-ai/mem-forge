@@ -1328,9 +1328,17 @@ class GeneSyncOrchestrator:
             # When since= is set, the gene only returns CHANGED pages.
             # Pages not returned aren't deleted — they're just unchanged.
             # Only run deletion detection on full syncs (since=None).
+            #
+            # A new Unit commits before an old one is removed: when a Unit's
+            # identity changes, the new Unit's identity attach must find the old
+            # Unit's Memories still Active. Deferred commits blocked only by this
+            # run's Units converge first; a commit that fails for good counts as
+            # a failed document and keeps absence unproven.
+            await self._converge_deferred_projected_lifecycle(effective_results)
+            deferred_failures = sum(result.get("terminal_error") is not None for result in deferred_results)
             deleted_count = 0
             tombstoned_source_unit_ids: set[str] = set()
-            absence_is_authoritative = run_coverage.proves_absence and docs_failed == 0
+            absence_is_authoritative = run_coverage.proves_absence and docs_failed + deferred_failures == 0
 
             if absence_is_authoritative:
                 if progress_callback:
@@ -1377,11 +1385,15 @@ class GeneSyncOrchestrator:
                     len(indexed_doc_ids),
                 )
 
-            await self._converge_deferred_projected_lifecycle(
-                effective_results,
-                additional_source_unit_ids=tombstoned_source_unit_ids,
-            )
+            # A removed Unit may have blocked a deferred commit of this run.
+            if tombstoned_source_unit_ids:
+                await self._converge_deferred_projected_lifecycle(
+                    effective_results,
+                    additional_source_unit_ids=tombstoned_source_unit_ids,
+                )
             for result in deferred_results:
+                if result.get("deferred_lifecycle") is not None:
+                    result["terminal_error"] = _retained_document_error(result["deferred_lifecycle"])
                 terminal_error = result.get("terminal_error")
                 if terminal_error is not None:
                     result["failed"] = True
@@ -1589,7 +1601,12 @@ class GeneSyncOrchestrator:
         *,
         additional_source_unit_ids: set[str] | frozenset[str] = frozenset(),
     ) -> None:
-        """Commit same-run deferred intents without repeating semantic work."""
+        """Commit same-run deferred intents without repeating semantic work.
+
+        Only an intent whose blockers are all Units of this run, or Units this
+        run removed, is retried. An intent that stays deferred is left pending
+        for the caller, which may remove more Units and converge again.
+        """
 
         run_source_unit_ids = {
             str(result["source_unit_id"])
@@ -1601,6 +1618,7 @@ class GeneSyncOrchestrator:
             for result in results
             if result.get("deferred_lifecycle") is not None
             and result.get("source_unit_id")
+            and set(result["deferred_lifecycle"].handle.blocking_source_unit_ids).issubset(run_source_unit_ids)
         }
         if not pending:
             return
@@ -1659,10 +1677,6 @@ class GeneSyncOrchestrator:
                 successful += 1
             if successful == 0:
                 break
-
-        for result in pending.values():
-            deferred = result["deferred_lifecycle"]
-            result["terminal_error"] = _retained_document_error(deferred)
 
     async def _resume_source_derivations(
         self,

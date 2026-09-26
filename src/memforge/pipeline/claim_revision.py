@@ -70,6 +70,8 @@ class ClaimRevisionLedger:
     prompt_chars: int
     work_ids: tuple[str, ...] = ()
     llm_calls: int = 0
+    # Candidates whose completion row covered every incumbent of the catalog.
+    completed_candidate_count: int = 0
 
 
 async def assess_claim_pairs(
@@ -163,7 +165,8 @@ async def assess_claim_pairs(
                         reason="Refinement lacks its revision proof"))
                 decisions.append((index, old_ids[edge.existing_id].id, decision))
     return ClaimRevisionLedger(tuple(decisions), runner.stats.prompt_chars,
-        tuple(work.id for work in journal.works) if journal is not None else (), runner.stats.calls)
+        tuple(work.id for work in journal.works) if journal is not None else (), runner.stats.calls,
+        completed_candidate_count=len(outcomes))
 
 
 def _raise_failure(failure: ItemFailure):

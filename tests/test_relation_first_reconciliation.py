@@ -28,14 +28,12 @@ from memforge.memory.evidence import (
     ResolvedEvidenceSelection,
 )
 from memforge.source_projection import AnchorKind, SourceAnchor
-from memforge.memory.engine import MemoryEngine
 from memforge.memory.relation_classifier import MemoryRelationType
 from memforge.models import (
     CoordinatorProposal,
     Memory,
     RawMemory,
     ReconcileAction,
-    ReconcileOperation,
     content_hash,
 )
 from memforge.pipeline.reconciler import ReconciliationResult, reconcile_memories
@@ -438,43 +436,6 @@ def test_multiple_contradiction_candidates_never_guess_a_successor(supported: bo
     ]
     assert [operation.memory for operation in operations[:2]] == candidates
     assert operations[-1].memory_id == incumbent.id
-
-
-def test_partial_projection_keep_does_not_drop_replacement_candidate() -> None:
-    candidate = RawMemory(content="The service uses PostgreSQL 16.", memory_type="fact")
-
-    operations = MemoryEngine._enforce_partial_projection_keep(
-        (
-            ReconcileOperation(
-                action=ReconcileAction.UPDATE,
-                memory_id="mem-current",
-                memory=candidate,
-            ),
-        ),
-        frozenset({"mem-current"}),
-    )
-
-    assert [operation.action for operation in operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
-    assert operations[0].memory is candidate
-
-
-def test_partial_projection_contradiction_stays_in_review() -> None:
-    candidate = RawMemory(content="The service uses PostgreSQL 16.", memory_type="fact")
-
-    [operation] = MemoryEngine._enforce_partial_projection_keep(
-        (
-            ReconcileOperation(
-                action=ReconcileAction.SUPERSEDE,
-                memory_id="mem-current",
-                memory=candidate,
-            ),
-        ),
-        frozenset({"mem-current"}),
-    )
-
-    assert operation.action is ReconcileAction.SUPERSEDE
-    assert operation.memory is candidate
-    assert operation.flag_for_review is True
 
 
 def test_an_unsupported_equivalent_is_held_in_a_rebind_review() -> None:

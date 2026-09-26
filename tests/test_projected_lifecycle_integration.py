@@ -5555,12 +5555,6 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
         structured_llm_client=client,
     )
 
-    async def unexpected_impact_scan(**kwargs):
-        del kwargs
-        raise AssertionError("new-candidate reconciliation must not pre-scan impacts")
-
-    monkeypatch.setattr(engine, "_projected_incumbent_impacts", unexpected_impact_scan)
-
     stats = await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
