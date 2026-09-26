@@ -256,5 +256,10 @@ def test_uncertain_refs_share_the_same_duplicate_and_allowed_validation():
 def test_sparse_schema_retains_direction_and_conflict_proofs(overrides):
     data = edge("MEM-0001")
     data.update(overrides)
-    with pytest.raises(ValueError):
-        MemoryRelationCatalogResponse.model_validate(dict(results=[dict(candidate_id="NEW-0001", relations=[data])]))
+    if overrides["classification"] == "unrelated":
+        # The shape itself has no unrelated edge.
+        with pytest.raises(ValueError):
+            MemoryRelationCatalogResponse.model_validate(dict(results=[dict(candidate_id="NEW-0001", relations=[data])]))
+        return
+    response = MemoryRelationCatalogResponse.model_validate(dict(results=[dict(candidate_id="NEW-0001", relations=[data])]))
+    assert response.results[0].relations[0].row_error() is not None

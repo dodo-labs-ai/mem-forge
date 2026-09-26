@@ -334,12 +334,39 @@ async def test_a_missing_or_duplicated_row_is_re_asked_alone(first_reply):
     assert (runner.stats.calls, runner.stats.reasks, runner.stats.corrections) == (2, 1, 0)
 
 
-async def test_a_row_for_an_unrequested_id_is_ignored():
-    client = FixtureBudgetClient(respond=lambda prompt: Rows(rows=[*answer(prompt).rows, Row(id="i99", read=[])]))
+async def test_a_shifted_answer_is_rejected_as_a_whole_and_no_shifted_row_is_accepted():
+    """The model answers each item under its neighbour's ID, so the last answer names an ID it was never given."""
+    def shifted(prompt):
+        rows = answer(prompt).rows
+        if "<correction>" in prompt:
+            return Rows(rows=rows)
+        return Rows(rows=[Row(id=f"i{int(row.id[1:]) + 1:02d}", read=["shifted"]) for row in rows])
+
+    client = FixtureBudgetClient(respond=shifted)
     runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
 
-    assert await runner.run_items(item_task(client, ids(3))) == {item_id: ((),) for item_id in ids(3)}
-    assert runner.stats.calls == 1
+    results = await runner.run_items(item_task(client, ids(4)))
+
+    # No row of the shifted response was accepted: every item carries the corrected answer.
+    assert results == {item_id: ((),) for item_id in ids(4)}
+    assert "did not supply" in client.prompts[1] and "i04" in client.prompts[1].split("<correction>")[1]
+    assert (runner.stats.calls, runner.stats.corrections, runner.stats.reasks, runner.stats.splits) == (2, 1, 0, 0)
+
+
+async def test_an_answer_that_stays_shifted_is_split_like_unreadable_output():
+    def shifted(prompt):
+        rows = answer(prompt).rows
+        return Rows(rows=[Row(id=f"i{int(row.id[1:]) + 1:02d}", read=[]) for row in rows])
+
+    client = FixtureBudgetClient(respond=shifted)
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    results = await runner.run_items(item_task(client, ids(2)))
+
+    assert {(failure.category, failure.error_code) for failure in results.values()} == {
+        ("invalid_response", OUTPUT_INVALID)
+    }
+    assert runner.stats.splits == 1
 
 
 async def test_rejected_rows_cost_one_re_ask_whatever_their_number_and_the_request_size():

@@ -100,15 +100,16 @@ async def test_success_and_disabled_capture_create_no_artifacts(monkeypatch, tmp
     assert not list(tmp_path.iterdir())
 
 
-def test_schema_explains_inapplicable_proofs_and_still_rejects_them():
+def test_schema_explains_inapplicable_proofs_and_the_row_rule_rejects_them():
     props = ClaimRevisionWireDecision.model_json_schema()["properties"]
     assert "null" in props["revision_assessment"]["description"]
     assert "refines_challenger_to_candidate" in props["revision_assessment"]["description"]
     assert "null" in props["contradiction"]["description"]
-    with pytest.raises(ValueError, match="revision proof"):
-        ClaimRevisionWireDecision.model_validate({"existing_id":"MEM-0000", "relation":"equivalent",
-            "revision_assessment": {"same_knowledge_item": True, "preserves_incumbent_truth": True,
-                "challenger_is_complete_current_claim": True}})
+    # The shape parses; the meaning rule rejects only this row.
+    edge = ClaimRevisionWireDecision.model_validate({"existing_id":"MEM-0000", "relation":"equivalent",
+        "revision_assessment": {"same_knowledge_item": True, "preserves_incumbent_truth": True,
+            "challenger_is_complete_current_claim": True}})
+    assert "revision proof" in edge.row_error()
 
 
 @pytest.mark.parametrize("field", ["primary_ref", "required_refs"])

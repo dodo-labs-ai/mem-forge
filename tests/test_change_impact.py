@@ -302,10 +302,15 @@ async def test_work_id_coverage_is_validated(defect):
     executor = RevisionWorkExecutor(client=client, model="fixture")
     results = await executor.assess_many(work_items(CHANGED, 2))
     assert len(client.impact_prompts) == 2 and "<correction>" in client.impact_prompts[1]
-    # The accepted row is kept; only WRK-0001, which has no row, is re-asked in its own request.
-    assert [work["work_id"] for work in change_impact_payload(client.impact_prompts[1])["works"]] == ["WRK-0001"]
-    assert "no result was returned for WRK-0001" in client.impact_prompts[1]
-    assert executor.stage_counts["change_impact"] == 2
+    reasked = [work["work_id"] for work in change_impact_payload(client.impact_prompts[1])["works"]]
+    if defect == "omitted":
+        # The accepted row is kept; only WRK-0001, which has no row, is re-asked in its own request.
+        assert reasked == ["WRK-0001"] and "no result was returned for WRK-0001" in client.impact_prompts[1]
+        assert executor.stage_counts["change_impact"] == 2
+    else:
+        # An ID the request did not supply voids the whole response: it is corrected as one request.
+        assert reasked == ["WRK-0000", "WRK-0001"] and "WRK-9999" in client.impact_prompts[1]
+        assert executor.stage_counts["change_impact"] == 1
     # The two requests decide both works.
     assert all(r.memory.support_validation["route"] == "change_impact" for r in results.values())
     assert executor.change_impact_counts == {"unaffected": 2, "affected": 0, "failed": 0}

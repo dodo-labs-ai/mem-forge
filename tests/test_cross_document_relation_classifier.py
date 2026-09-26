@@ -131,7 +131,6 @@ async def test_classifier_returns_one_judgment_per_pair_by_pair_index() -> None:
         [
             {"pair_index": 0, "label": "none", "reason": ""},
             {"pair_index": 0, "label": "none", "reason": ""},
-            {"pair_index": 7, "label": "none", "reason": ""},
         ],
     ],
     ids=["missing_pair", "duplicate_hides_missing"],

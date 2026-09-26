@@ -300,20 +300,20 @@ class StructuredMemoryPairClassifier:
             return LlmRequest(prompt, MemoryRelationResponse, relation_output_tokens(self._policy, len(item_ids)))
 
         def decode(response: MemoryRelationResponse, _item_ids: tuple[str, ...], _context: tuple):
-            """Each decision is validated alone; a decision for an unknown pair_index is not an answer."""
+            """Each decision is validated alone by its own rule; the runner rejects an unrequested pair_index."""
             for decision in response.decisions:
                 pair_index = int(decision.pair_index)
                 if not 0 <= pair_index < len(pairs):
-                    continue
-                try:
+                    yield str(pair_index), RejectedRow(f"pair_index {pair_index} was not requested")
+                elif (error := decision.row_error()) is not None:
+                    yield str(pair_index), RejectedRow(f"pair_index {pair_index}: {error}")
+                else:
                     yield str(pair_index), MemoryPairDecision(
                         pair=pairs[pair_index],
                         relation_type=MemoryRelationType(decision.classification),
                         direction=RelationDirection(decision.direction),
                         reason=_auditable_relation_reason(decision),
                     )
-                except ValueError as error:
-                    yield str(pair_index), RejectedRow(f"pair_index {pair_index}: {error}")
 
         decisions, unjudged = await judge_pair_items(runner, ItemTask(
             item_ids=tuple(str(index) for index in range(len(pairs))), render=render, decode=decode,

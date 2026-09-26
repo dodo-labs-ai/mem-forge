@@ -14,7 +14,7 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Protocol
 
-from memforge.llm.batch_runner import ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.batch_runner import ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.structured import CrossDocumentRelationResponse
 from memforge.memory.evidence import (
     EvidencePartKind,
@@ -519,10 +519,11 @@ class StructuredCrossDocumentRelationClassifier:
             )
 
         def decode(response: CrossDocumentRelationResponse, _item_ids: tuple[str, ...], _context: tuple):
-            """Each decision is its pair's row; a decision for an unknown pair_index is not an answer."""
+            """Each decision is its pair's row; the runner rejects an unrequested pair_index."""
             for decision in response.decisions:
                 pair_index = int(decision.pair_index)
                 if not 0 <= pair_index < len(pairs):
+                    yield str(pair_index), RejectedRow(f"pair_index {pair_index} was not requested")
                     continue
                 yield str(pair_index), CrossDocumentRelationJudgment(
                     pair=pairs[pair_index],

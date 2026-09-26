@@ -149,8 +149,8 @@ async def test_duplicate_edge_and_missing_candidate_fail_closed():
         structured_llm_client=client,
         supports=dict([pinned("memory", True)]),
     )
-    # A duplicate edge fails the response schema in the client; a missing row gets the runner's one correction.
-    for invalid, calls in ((False, 1), (True, 2)):
+    # A repeated incumbent in the Candidate's row and a missing row are both row rules: one re-ask each.
+    for invalid, calls in ((False, 2), (True, 2)):
         client.invalid = invalid
         client.calls = 0
         result = await reconcile_memories(**args)

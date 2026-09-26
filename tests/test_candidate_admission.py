@@ -233,7 +233,8 @@ async def test_no_candidates_need_no_model_call():
                                           "duplicate_of": ["CND-0099"]}, id="duplicate-outside-round"),
     ],
 )
-async def test_a_candidate_whose_admission_stays_invalid_is_rejected_for_this_round(judge):
+async def test_a_candidate_whose_admission_stays_invalid_is_rejected_for_this_round(judge, request):
+    unknown_id = request.node.callspec.id == "unknown-id"
     unjudged = candidate(MOST_SPECIFIC)
     judged = candidate(INDEPENDENT)
 
@@ -247,8 +248,9 @@ async def test_a_candidate_whose_admission_stays_invalid_is_rejected_for_this_ro
     assert [(rejection.candidate, rejection.reject_reason) for rejection in result.rejected] == [
         (unjudged, "invalid_response"),
     ]
-    # Both Candidates, then the invalid one's re-ask.
-    assert client.calls == 2
+    # A duplicate outside the round is a row rule: one re-ask of that Candidate. An ID the request did not
+    # supply voids the response: one correction, then halves, the bad Candidate alone with its correction.
+    assert client.calls == (5 if unknown_id else 2)
 
 
 @pytest.mark.asyncio
