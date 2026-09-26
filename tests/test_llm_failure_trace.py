@@ -108,7 +108,7 @@ def test_schema_explains_inapplicable_proofs_and_still_rejects_them():
     with pytest.raises(ValueError, match="revision proof"):
         ClaimRevisionWireDecision.model_validate({"existing_id":"MEM-0000", "relation":"equivalent",
             "revision_assessment": {"same_knowledge_item": True, "preserves_incumbent_truth": True,
-                "challenger_is_complete_current_claim": True, "current_evidence_entails_challenger": True}})
+                "challenger_is_complete_current_claim": True}})
 
 
 @pytest.mark.parametrize("field", ["primary_ref", "required_refs"])

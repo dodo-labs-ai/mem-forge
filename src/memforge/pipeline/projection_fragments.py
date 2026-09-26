@@ -1042,25 +1042,18 @@ def compile_projection_fragment_catalog(
     *,
     catalog_id: str,
     access_context_hash: str,
-    context_observation_ids: tuple[str, ...] = (),
-    inference_capability_hash: str | None = None,
-    supplied_artifact_observation_ids: tuple[str, ...] = (),
     max_fragments: int = DEFAULT_MAX_FRAGMENTS,
     max_presentation_chars: int = DEFAULT_MAX_PRESENTATION_CHARS,
 ) -> ProjectionFragmentCatalog:
-    """Compile one immutable, source/scope-bound v9 selection catalog.
+    """Compile one immutable selection catalog of a Source Unit revision's authorized Observations.
 
-    Authorized Observations are compiled against their exact Primary ranges;
-    context Observations are Required-only.
+    Each authorized Observation is compiled against its exact Primary ranges.
     """
 
     if len(projection.source_units) != 1 or len(projection.source_unit_revisions) != 1:
         raise ValueError("projection Fragment catalog requires exactly one Source Unit revision")
     if not access_context_hash:
         raise ValueError("projection Fragment catalog requires an access context hash")
-    resolved_inference_capability_hash = (
-        inference_capability_hash or projection_inference_capability_hash()
-    )
     if max_fragments <= 0 or max_presentation_chars <= 0:
         raise ValueError("projection Fragment catalog limits must be positive")
 
@@ -1072,12 +1065,8 @@ def compile_projection_fragment_catalog(
     }
     observation_ids = {observation.id for observation in projection.observations}
     primary_ids = set(authority.ranges_by_observation_id)
-    selectable_ids = primary_ids | set(context_observation_ids)
-    if not selectable_ids.issubset(revisions) or not selectable_ids.issubset(observation_ids):
+    if not primary_ids.issubset(revisions) or not primary_ids.issubset(observation_ids):
         raise ValueError("projection Fragment catalog contains stale Observation identity")
-    supplied_artifacts = set(supplied_artifact_observation_ids)
-    if not supplied_artifacts.issubset(selectable_ids):
-        raise ValueError("supplied Artifact belongs to another catalog")
 
     compiled_fragments: list[EvidenceFragment] = []
     errors: list[FragmentCompilationError] = []
@@ -1085,39 +1074,26 @@ def compile_projection_fragment_catalog(
     authority_payload: list[Mapping[str, object]] = []
     artifact_metadata: dict[str, Mapping[str, object]] = {}
 
-    for observation_id in sorted(selectable_ids, key=lambda value: revisions[value].id):
+    for observation_id in sorted(primary_ids, key=lambda value: revisions[value].id):
         revision = revisions[observation_id]
-        is_primary = observation_id in primary_ids
-        if revision.evidence_profile is None:
-            ranges = (_whole_range(revision, primary_eligible=is_primary),)
-        elif revision.evidence_profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT:
-            if observation_id not in supplied_artifacts:
-                if is_primary:
-                    errors.append(
-                        _fatal_error(
-                            revision,
-                            FragmentCompilationErrorCode.ARTIFACT_INELIGIBLE,
-                            "Primary Artifact was not supplied to the extraction model",
-                        )
-                    )
-                continue
-            ranges = (_whole_range(revision, primary_eligible=is_primary),)
+        spans = authority.ranges_by_observation_id[observation_id]
+        whole_artifact = (
+            revision.evidence_profile is not None
+            and revision.evidence_profile.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
+        )
+        if whole_artifact:
             raw_artifact = revision.metadata.get("source_artifact")
             artifact_metadata[revision.id] = (
                 dict(raw_artifact) if isinstance(raw_artifact, Mapping) else {}
             )
-        elif is_primary:
-            spans = authority.ranges_by_observation_id[observation_id]
-            ranges = (
-                (_whole_range(revision, primary_eligible=True),)
-                if spans is None
-                else tuple(
-                    _text_range(revision, start, end, primary_eligible=True)
-                    for start, end in _merged_spans(spans)
-                )
+        ranges = (
+            (_whole_range(revision, primary_eligible=True),)
+            if spans is None or whole_artifact or revision.evidence_profile is None
+            else tuple(
+                _text_range(revision, start, end, primary_eligible=True)
+                for start, end in _merged_spans(spans)
             )
-        else:
-            ranges = (_whole_range(revision, primary_eligible=False),)
+        )
 
         authority_payload.extend(_authority_payload(revision, ranges))
         compiled = compile_fragments(
@@ -1135,9 +1111,7 @@ def compile_projection_fragment_catalog(
         access_context_hash=access_context_hash,
         catalog_identity={
             "catalog_id": catalog_id,
-            "inference_capability_hash": (
-                resolved_inference_capability_hash
-            ),
+            "inference_capability_hash": projection_inference_capability_hash(),
         },
         compiled_fragments=compiled_fragments,
         errors=errors,

@@ -26,8 +26,8 @@ from tests.test_projection_context import _committed_snapshot, _confluence_proje
 from tests.test_projection_fragments import _projection
 from tests.test_revision_work import Client
 
-# An old extraction context cap. No reading is truncated at, or grouped by, any character count.
-OLD_CONTEXT_CHAR_CAP = 20_000
+# The design's acceptance length for a reading that is never truncated or grouped by character count.
+LONG_READING_CHARS = 20_000
 
 
 def bounded_output(extractor, catalog):
@@ -96,7 +96,7 @@ def test_large_complete_table_reaches_actual_request_budget(representation, rows
 
 def test_first_import_streams_every_reading_group_through_complete_requests():
     body = "# US payroll\n\n" + "\n\n".join(f"Rule {i}: " + "This is exact source content. " * 80 for i in range(75))
-    assert len(body) > OLD_CONTEXT_CHAR_CAP
+    assert len(body) > LONG_READING_CHARS
     projection = _projection(primary_content=body, context_content="Country: US.\n")
     client = Client(limit=12000)
     extractor = MemoryExtractor(model="fixture", max_tokens=8192, structured_llm_client=client)
@@ -163,9 +163,9 @@ def test_reading_context_and_the_unit_title_are_never_primary():
     assert all(by_observation[comment]) and not any(by_observation[title]) and not any(by_observation[core])
 
 
-def test_context_larger_than_the_old_cap_is_read_whole():
+def test_reading_context_longer_than_20000_characters_is_read_whole():
     long_description = "Payroll context sentence. " * 2_000
-    assert len(long_description) > OLD_CONTEXT_CHAR_CAP
+    assert len(long_description) > LONG_READING_CHARS
     projection = _jira_projection(1)
     core = next(item for item in projection.observation_revisions if '"description"' in item.content)
     body = json.loads(core.content)

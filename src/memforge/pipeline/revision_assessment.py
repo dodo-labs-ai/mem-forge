@@ -328,7 +328,7 @@ class RevisionAssessmentContext:
         return _compose_projection_fragment_catalog(
             projection=self.projection,
             access_context_hash=self.access_context_hash,
-            catalog_identity={"input_policy": REVISION_INPUT_POLICY, "purpose": "fixed_claim_support"},
+            catalog_identity={"input_policy": REVISION_INPUT_POLICY, "purpose": "revision_reading"},
             compiled_fragments=list(fragments),
             errors=[],
             component_digests=[],
