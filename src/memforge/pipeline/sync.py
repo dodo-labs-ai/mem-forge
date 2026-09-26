@@ -97,9 +97,6 @@ from memforge.pipeline.extraction_contract import (
     CONTRACT_SUPERSEDED,
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
 )
-from memforge.pipeline.projection_fragments import (
-    compile_projection_fragment_catalog,
-)
 from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
 from memforge.pipeline.projection_images import (
     load_projection_images,
@@ -2898,80 +2895,30 @@ class GeneSyncOrchestrator:
             image_loader=lambda ids: self._projection_images(projection=projection, observation_ids=ids),
         )
 
-        async def prepare_batches(batches):
-            from memforge.pipeline.extraction_requests import plan_fragment_requests
-            from memforge.pipeline.projection_images import projection_inference_image_observation_ids
-            planned = []
+        async def plan_requests(authority):
+            from memforge.pipeline.extraction_requests import plan_extraction_requests
+
+            # Planning reads the bytes of the Artifacts each request cites.
             async with self._heavy_work_slot(source_id, multimodal=any(
                 fragment.kind.value == "artifact" for fragment in revision_context.full_fragments
             )):
-                for batch in batches:
-                    catalog = compile_projection_fragment_catalog(projection, batch, access_context_hash=access_context_hash,
-                        inference_capability_hash=inference_capability_hash,
-                        supplied_artifact_observation_ids=tuple(sorted(set(projection_inference_image_observation_ids(projection)) &
-                            (set(batch.primary_observation_ids) | set(batch.context_observation_ids if batch.candidate_context_observation_ids is None else batch.candidate_context_observation_ids)))),
-                        # This is an internal authority catalog. The complete request,
-                        # including metadata and output, is budgeted by the planner.
-                        max_fragments=max(1, len(revision_context.full_fragments)),
-                        max_presentation_chars=max(1, sum(len(f.presentation_text) for f in revision_context.full_fragments)))
-                    if not catalog.usable:
-                        planned.append(batch)
-                        continue
-                    planned.extend(plan_fragment_requests(batch, catalog, context=revision_context,
-                        extractor=self.memory_extractor, source_type=source_type, doc_type=doc_type))
-            return tuple(planned)
+                return plan_extraction_requests(
+                    revision_context, authority, extractor=self.memory_extractor,
+                    source_type=source_type, doc_type=doc_type,
+                )
 
-        async def extract_one(batch):
-            primary_ids = set(batch.primary_observation_ids)
-            supplied_observation_ids = primary_ids | set(
-                batch.context_observation_ids
-                if batch.candidate_context_observation_ids is None
-                else batch.candidate_context_observation_ids
-            )
-            if batch.prepared_catalog is not None:
-                supplied_observation_ids = {f.anchor.observation_id for f in batch.prepared_catalog.fragments if f.kind.value == "artifact"}
-            input_binary_bytes = (
-                batch.primary_image_bytes + batch.candidate_context_image_bytes
-            )
+        async def extract_request(request):
             async with self._heavy_work_slot(
                 source_id,
-                # Context expansion may turn a text batch into an image request.
-                # Reserve existing image admission before any possible byte reads.
-                multimodal=input_binary_bytes > 0 or any(
-                    fragment.kind.value == "artifact" for fragment in revision_context.full_fragments
-                ),
+                multimodal=any(fragment.kind.value == "artifact" for fragment in request.catalog.fragments),
             ) as admission:
-                batch_images = self._projection_images(
-                    projection=projection,
-                    observation_ids=supplied_observation_ids,
-                )
-                catalog = batch.prepared_catalog or compile_projection_fragment_catalog(
-                    projection,
-                    batch,
-                    access_context_hash=access_context_hash,
-                    inference_capability_hash=inference_capability_hash,
-                    supplied_artifact_observation_ids=tuple(
-                        image.source_observation_id for image in batch_images
-                    ),
-                )
                 result = await self.memory_extractor.extract_projection_fragment_memories(
-                    catalog,
+                    request.catalog,
                     source_type=source_type,
                     doc_type=doc_type,
-                    context_markdown=batch.context_markdown,
-                    context_observation_ids=batch.context_observation_ids,
-                    images=batch_images,
                     revision_context=revision_context,
-                    prepared_prompt=batch.prepared_prompt,
-                    prepared_input_mode=batch.prepared_input_mode,
-                    prepared_selection_reason=batch.prepared_selection_reason,
-                    prepared_estimated_cost=(
-                        dict(batch.prepared_estimated_cost)
-                        if batch.prepared_estimated_cost is not None
-                        else None
-                    ),
                 )
-                input_binary_bytes = (result.metadata or {}).get("image_bytes", input_binary_bytes)
+                input_binary_bytes = int((result.metadata or {}).get("image_bytes", 0) or 0)
                 result.metadata = {
                     **(result.metadata or {}),
                     "extraction_queue_wait_ms": admission.queue_wait_ms,
@@ -2988,8 +2935,8 @@ class GeneSyncOrchestrator:
             SourceUnitDerivationRequest(
                 projection=projection,
                 context=derivation_context,
-                extract_batch=extract_one,
-                prepare_batches=prepare_batches,
+                plan_requests=plan_requests,
+                extract_request=extract_request,
                 max_concurrent=self._source_parallelism_limit(),
                 committed_base_snapshot=committed_base_snapshot,
                 access_context_hash=access_context_hash,

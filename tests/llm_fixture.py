@@ -134,3 +134,20 @@ class NoopMemoryExtractor:
     async def extract_projection_fragment_memories(self, catalog, **kwargs):
         del catalog, kwargs
         return MemoryExtractionResult(memories=[])
+
+
+def fixture_request_planner(projection, *, access_context_hash: str, extractor=None, doc_type: str = "document"):
+    """The production extraction request planner for one projection, with unbounded fixture capacity."""
+    from memforge.pipeline.extraction_requests import plan_extraction_requests
+    from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+
+    async def plan(authority):
+        return plan_extraction_requests(
+            RevisionAssessmentContext(projection=projection, base=None, access_context_hash=access_context_hash),
+            authority,
+            extractor=extractor or NoopMemoryExtractor(),
+            source_type=projection.source_type,
+            doc_type=doc_type,
+        )
+
+    return plan

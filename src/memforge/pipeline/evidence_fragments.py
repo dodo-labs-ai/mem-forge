@@ -32,6 +32,7 @@ from memforge.source_projection import (
 from memforge.source_representation import (
     MARKDOWN_STRUCTURAL_PROFILE,
     PLAIN_TEXT_PROFILE,
+    UNIT_IDENTITY_PROFILE,
     CanonicalRecordField,
     CanonicalRecordSchema,
     EvidenceRepresentationContract,
@@ -44,6 +45,7 @@ COMPILER_CONTRACT_VERSION = 4
 DEFAULT_MAX_FRAGMENTS = 2_048
 DEFAULT_MAX_PRESENTATION_CHARS = 120_000
 _SUPPORTING_ROLES = frozenset({EvidenceRole.PRIMARY, EvidenceRole.REQUIRED})
+UNIT_IDENTITY_FRAGMENT_TYPE = UNIT_IDENTITY_PROFILE.name
 
 
 def _record_html_inline_source_range(state, silent: bool) -> bool:
@@ -683,6 +685,40 @@ def _compile_canonical_record_profile(
     )
 
 
+def _compile_unit_identity_profile(
+    revision: SourceObservationRevision,
+    contract: EvidenceRepresentationContract,
+    authority_ranges: tuple[EvidenceCandidateRange, ...],
+) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
+    """The Unit Title is one Fragment that is never Primary, whatever the work authorizes."""
+
+    del contract
+    start, end = _trim_range(revision.content, 0, len(revision.content))
+    if start >= end:
+        return (), ()
+    bound, errors = _bind_candidates_to_authority(
+        revision,
+        (
+            _text_candidate(
+                revision.content,
+                UNIT_IDENTITY_FRAGMENT_TYPE,
+                start,
+                end,
+                _SUPPORTING_ROLES,
+                revision.content[start:end],
+            ),
+        ),
+        authority_ranges,
+    )
+    return (
+        tuple(
+            replace(candidate, eligible_roles=candidate.eligible_roles - {EvidenceRole.PRIMARY})
+            for candidate in bound
+        ),
+        errors,
+    )
+
+
 _ProfileCompiler = Callable[
     [SourceObservationRevision, EvidenceRepresentationContract, tuple[EvidenceCandidateRange, ...]],
     tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]],
@@ -693,6 +729,7 @@ _PROFILE_COMPILERS: Mapping[tuple[str, int], _ProfileCompiler] = {
     ("canonical-record", 1): _compile_canonical_record_profile,
     ("plain-text", 1): _compile_plain_text_profile,
     ("binary-artifact", 1): _compile_binary_artifact_profile,
+    (UNIT_IDENTITY_PROFILE.name, UNIT_IDENTITY_PROFILE.version): _compile_unit_identity_profile,
 }
 
 

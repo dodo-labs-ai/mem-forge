@@ -18,7 +18,7 @@ from memforge.memory.evidence import (
 )
 from memforge.models import RawMemory, content_hash
 from memforge.pipeline.projection_context import (
-    context_observation_ids_for,
+    preceding_observation_id,
 )
 from memforge.source_projection import (
     AnchorKind,
@@ -189,13 +189,11 @@ def _materialize_claim_evidence(
         for reference in supporting_tuple
         if reference.role is EvidenceRole.REQUIRED
     }
-    context_ids = tuple(
-        observation_id
-        for observation_id in context_observation_ids_for(
-            projection,
-            primary.anchor.observation_id,
-        )
-        if observation_id not in required_observation_ids
+    preceding_id = preceding_observation_id(projection, primary.anchor.observation_id)
+    context_ids = (
+        (preceding_id,)
+        if preceding_id in revisions and preceding_id not in required_observation_ids
+        else ()
     )
     contexts = tuple(
         EvidenceReference(

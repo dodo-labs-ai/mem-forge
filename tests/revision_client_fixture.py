@@ -239,7 +239,9 @@ class RevisionClientFixture:
             if primary_row is None:
                 primary_row = next((row for row in rows if row[1] == work["claim"]), None)
         if primary_row is None:
-            previous = [{"role": "primary", "excerpt": work["claim"], **_source(groups[0] if groups else None)}]
+            # Without a configured quote the claim came from the first Primary-capable source.
+            source = next((group for group in groups if any(ref.startswith("PRM-") for ref in group["refs"])), None)
+            previous = [{"role": "primary", "excerpt": work["claim"], **_source(source)}]
         else:
             previous = [{"role": "primary", "excerpt": primary_row[1], **_source(sources.get(primary_row[0]))}]
         configured_required = tuple(getattr(self, "required_evidence_quotes", ()))
@@ -330,11 +332,13 @@ class RevisionClientFixture:
         ]
         previous = payload["previous_evidence"]
         primary_old = next(item for item in previous if item["role"] == "primary")
+        # Only PRM refs may be Primary; the Unit Title, for one, is always REQ.
+        primary_capable = [item for item in current if item["ref"].startswith("PRM-")]
         primary = next(
-            (item for item in current if item["text"] == primary_old["excerpt"]),
+            (item for item in primary_capable if item["text"] == primary_old["excerpt"]),
             next(
-                (item for item in current if item["kind"] != "artifact" and item["type"] != "markdown-heading"),
-                current[0],
+                (item for item in primary_capable if item["kind"] != "artifact" and item["type"] != "markdown-heading"),
+                primary_capable[0],
             ),
         )
         if hasattr(self, "select_support_evidence"):
@@ -345,7 +349,7 @@ class RevisionClientFixture:
                 "previous_primary_quote": primary_old["excerpt"],
                 "primary_candidates": [
                     {**item, "ref": refs[item["ref"]]}
-                    for item in current
+                    for item in primary_capable
                     if primary_old["source"] in {None, item["source"]}
                 ],
                 "required": [
