@@ -50,9 +50,8 @@ class ProjectionExtractionBatch:
     context_observation_ids_by_primary: tuple[tuple[str, tuple[str, ...]], ...]
     primary_markdown: str
     context_markdown: str
-    authority_policy_version: int = PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION
-    # Exact segment coordinates in immutable Observation revisions. Kept
-    # transient so EvidenceCatalog never creates a block across overlap seams.
+    # Exact primary segment coordinates in immutable Observation revisions.
+    # Fragment planning treats only these ranges as primary authority.
     primary_authority_spans: tuple[tuple[str, int, str], ...] = ()
     candidate_context_observation_ids: tuple[str, ...] | None = None
     candidate_context_image_bytes: int = 0

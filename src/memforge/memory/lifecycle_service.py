@@ -92,14 +92,6 @@ class MaintenanceClosureReceipt:
 
 
 @dataclass(frozen=True)
-class _ReplaceOwnedMemoryResult:
-    memory_id: str
-    replacement_memory_id: str
-    status: str
-    replacement_kind: ReplacementKind
-
-
-@dataclass(frozen=True)
 class CreateMemoryResult:
     memory_id: str
     status: str
@@ -438,100 +430,31 @@ class MemoryLifecycleService:
             )
         return tuple(normalized)
 
-    async def _replace_owned_memory(
+    async def _replace_agent_claim_memory(
         self,
-        memory_id: str,
+        old: Memory,
         *,
         replacement_content: str,
         provenance: str,
         reason: str,
-        expected_content_hash: str,
-        replacement_kind: ReplacementKind = "supersession",
-    ) -> _ReplaceOwnedMemoryResult:
-        replacement_kind = self._validate_replacement_kind(replacement_kind)
-        replacement_content = replacement_content.strip()
-        if not replacement_content:
-            raise MemoryLifecycleConflict("replacement_content_required")
-        provenance = provenance.strip() if provenance else None
-        if not provenance:
-            raise MemoryLifecycleConflict("provenance_required")
+        replacement_kind: ReplacementKind,
+    ) -> str:
+        """Replace a Managed Capture claim through its projection-owned path."""
 
-        old = await self._active_target(memory_id, expected_content_hash=expected_content_hash)
-        now = datetime.now(timezone.utc)
-        new_memory = Memory(
-            id=generate_memory_id(),
-            memory_type=old.memory_type,
-            content=replacement_content,
-            content_hash=content_hash(replacement_content),
-            visibility=old.visibility,
-            owner_user_id=old.owner_user_id,
-            project_key=old.project_key,
-            repo_identifier=old.repo_identifier,
-            confidence=old.confidence,
-            created_at=now,
-            updated_at=now,
-            status="active",
-            extraction_context=provenance,
-        )
-
-        claim = await self.db.get_agent_claim_by_memory_id(old.id)
-        if claim is not None:
-            try:
-                replacement_id = await AgentKnowledgeBundleService(
-                    db=self.db,
-                    memory_store=self.memory_store,
-                ).replace_claim_from_user_correction(
-                    old_memory_id=old.id,
-                    replacement_content=replacement_content,
-                    provenance=provenance,
-                    reason=reason,
-                    replacement_kind=replacement_kind,
-                    observed_at=now,
-                )
-            except AgentClaimLifecycleConflict as exc:
-                raise MemoryLifecycleConflict(exc.code) from exc
-            new_memory.id = replacement_id
-        else:
-            support_state = (await self.db.get_active_memory_support_states((old.id,)))[old.id]
-            if support_state.unit_ids:
-                raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review")
-            correction_doc_id = f"correction-{new_memory.id}"
-            await self._write_correction_document(
-                doc_id=correction_doc_id,
-                old_memory=old,
+        try:
+            return await AgentKnowledgeBundleService(
+                db=self.db,
+                memory_store=self.memory_store,
+            ).replace_claim_from_user_correction(
+                old_memory_id=old.id,
                 replacement_content=replacement_content,
                 provenance=provenance,
                 reason=reason,
                 replacement_kind=replacement_kind,
-                observed_at=now,
+                observed_at=datetime.now(timezone.utc),
             )
-            try:
-                await self.memory_store.supersede_memory(
-                    old.id,
-                    new_memory,
-                    correction_doc_id,
-                    "user_correction",
-                    replacement_kind=replacement_kind,
-                    replacement_reason=reason,
-                    source_updated_at=now,
-                    excerpt=provenance,
-                    carry_revision_sources=False,
-                )
-            except ValueError as exc:
-                # A concurrent projected write may attach support after the
-                # preflight.  Remove the not-yet-authoritative correction
-                # document and return the same explicit conflict.
-                await self._discard_correction_document(correction_doc_id)
-                if "active source support" in str(exc):
-                    raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review") from exc
-                raise
-
-        return _ReplaceOwnedMemoryResult(
-            memory_id=old.id,
-            replacement_memory_id=new_memory.id,
-            status="superseded",
-            replacement_kind=replacement_kind,
-        )
+        except AgentClaimLifecycleConflict as exc:
+            raise MemoryLifecycleConflict(exc.code) from exc
 
     async def propose_memory_correction(
         self,
@@ -572,20 +495,19 @@ class MemoryLifecycleService:
         if claim is not None:
             if old.owner_user_id != actor_user_id:
                 raise MemoryLifecycleNotFound("memory_not_found")
-            result = await self._replace_owned_memory(
-                old.id,
+            replacement_memory_id = await self._replace_agent_claim_memory(
+                old,
                 replacement_content=replacement_content,
                 provenance=provenance,
                 reason=reason,
-                expected_content_hash=expected_content_hash,
                 replacement_kind=replacement_kind,
             )
             return ProposeMemoryCorrectionResult(
-                memory_id=result.memory_id,
-                replacement_memory_id=result.replacement_memory_id,
+                memory_id=old.id,
+                replacement_memory_id=replacement_memory_id,
                 outcome="applied",
-                status=result.status,
-                replacement_kind=result.replacement_kind,
+                status="superseded",
+                replacement_kind=replacement_kind,
                 review_id="",
             )
 

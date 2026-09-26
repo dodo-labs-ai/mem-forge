@@ -438,8 +438,7 @@ class LifecycleAction(str, Enum):
 
 
 class ReviewCase(str, Enum):
-    # Stored on relation runs recorded before Evidence Units without an
-    # excerpt were reviewed as missing content provenance. Read-only.
+    # May appear on stored relation runs; never produced.
     LEGACY_LIMITED_EVIDENCE = "legacy_limited_evidence"
     MISSING_CONTENT_PROVENANCE = "missing_content_provenance"
     MULTI_DESTRUCTIVE_MATCH = "multi_destructive_match"

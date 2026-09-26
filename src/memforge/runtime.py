@@ -87,7 +87,7 @@ class SourceSyncUnsupportedError(SourceSyncBoundaryError):
     """Raised when a source type has no ordinary sync execution kind."""
 
 
-class SourceLifecycleMaintenanceError(SourceSyncBoundaryError, SourceActivityConflict):
+class SourceSyncActivityConflict(SourceSyncBoundaryError, SourceActivityConflict):
     """Raised when an ordinary sync overlaps another Source activity lease."""
 
 
@@ -738,7 +738,7 @@ async def run_source_sync(
             source_activity_epoch = activity_lease.epoch
             owns_activity = True
         except SourceActivityConflict as exc:
-            raise SourceLifecycleMaintenanceError(str(exc)) from exc
+            raise SourceSyncActivityConflict(str(exc)) from exc
 
         async def heartbeat_activity() -> None:
             while True:
@@ -789,7 +789,7 @@ async def run_source_sync(
             with contextlib.suppress(asyncio.CancelledError):
                 await sync_task
             await heartbeat_task
-            raise SourceLifecycleMaintenanceError(f"source activity heartbeat stopped: {activity_id}")
+            raise SourceSyncActivityConflict(f"source activity heartbeat stopped: {activity_id}")
         return await sync_task
     finally:
         if heartbeat_task is not None:

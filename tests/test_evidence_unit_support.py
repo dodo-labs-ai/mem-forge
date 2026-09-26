@@ -200,13 +200,14 @@ async def _seed_complete_unit_support(db: Database) -> tuple[str, str, str, str]
     return memory_id, evidence_unit_id, source_id, access_hash
 
 
-_REQUIRE_EVIDENCE_UNIT_SUPPORT_MIGRATION = 97
-_REMOVE_REFERENCE_SCOPED_SUPPORT_MIGRATION = 98
+_SUPPORT_STORAGE_MIGRATIONS = (97, 98, 99)
+_MIGRATION_BEFORE_SUPPORT_STORAGE_REMOVAL = 96
 _REFERENCE_SCOPED_SUPPORT_TABLES = (
     "memory_support_assertions",
     "support_cutover_reports",
     "support_cutover_lease",
 )
+_LIFECYCLE_CUTOVER_TABLES = ("lifecycle_cutover_findings", "lifecycle_backfill_jobs")
 
 
 async def _support_scope_marker(db: Database) -> str:
@@ -216,13 +217,23 @@ async def _support_scope_marker(db: Database) -> str:
     return str(row["marker_value"])
 
 
-def _mark_reference_scoped_before_upgrade(path: str, *, reference_support_row: bool) -> None:
-    """Rewind a closed workspace to the state an earlier version left behind."""
+def _rewind_before_support_storage_removal(
+    path: str,
+    *,
+    marker: str = "reference-set-v1",
+    reference_support_row: bool = False,
+) -> tuple[int, ...]:
+    """Rewind a closed workspace to the state an earlier version left behind.
 
+    Returns the migration versions the rewound workspace has not applied.
+    """
+
+    pending = (_MIGRATION_BEFORE_SUPPORT_STORAGE_REMOVAL, *_SUPPORT_STORAGE_MIGRATIONS)
     with sqlite3.connect(path) as connection:
         connection.execute(
-            """UPDATE system_contract_markers SET marker_value = 'reference-set-v1'
-                WHERE marker_key = 'support_scope_version'"""
+            """UPDATE system_contract_markers SET marker_value = ?
+                WHERE marker_key = 'support_scope_version'""",
+            (marker,),
         )
         connection.execute(
             """CREATE TABLE memory_support_assertions (
@@ -234,6 +245,8 @@ def _mark_reference_scoped_before_upgrade(path: str, *, reference_support_row: b
         )
         connection.execute("CREATE TABLE support_cutover_reports (id TEXT PRIMARY KEY)")
         connection.execute("CREATE TABLE support_cutover_lease (lease_key TEXT PRIMARY KEY)")
+        for table in _LIFECYCLE_CUTOVER_TABLES:
+            connection.execute(f"CREATE TABLE {table} (id TEXT PRIMARY KEY)")
         if reference_support_row:
             connection.execute(
                 """INSERT INTO memory_support_assertions (
@@ -242,13 +255,12 @@ def _mark_reference_scoped_before_upgrade(path: str, *, reference_support_row: b
                    ) VALUES ('reference-support', 'memory-1', 'eref-primary',
                              'source-1', 'access-1', 1, '2026-08-27T08:00:00+00:00')"""
             )
+        placeholders = ", ".join("?" for _ in pending)
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version IN (?, ?)",
-            (
-                _REQUIRE_EVIDENCE_UNIT_SUPPORT_MIGRATION,
-                _REMOVE_REFERENCE_SCOPED_SUPPORT_MIGRATION,
-            ),
+            f"DELETE FROM schema_migrations WHERE version IN ({placeholders})",
+            pending,
         )
+    return pending
 
 
 def _existing_tables(path: str, names: tuple[str, ...]) -> set[str]:
@@ -261,62 +273,98 @@ def _existing_tables(path: str, names: tuple[str, ...]) -> set[str]:
     return {str(name) for (name,) in rows}
 
 
+def _applied_migrations(path: str, versions: tuple[int, ...]) -> set[int]:
+    placeholders = ", ".join("?" for _ in versions)
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            f"SELECT version FROM schema_migrations WHERE version IN ({placeholders})",
+            versions,
+        ).fetchall()
+    return {int(version) for (version,) in rows}
+
+
+def _stored_support_scope_marker(path: str) -> str:
+    with sqlite3.connect(path) as connection:
+        [(marker,)] = connection.execute(
+            "SELECT marker_value FROM system_contract_markers WHERE marker_key = 'support_scope_version'"
+        ).fetchall()
+    return str(marker)
+
+
 @pytest.mark.asyncio
 async def test_new_workspace_starts_on_evidence_unit_support(db) -> None:
     assert await _support_scope_marker(db) == "evidence-unit-set-v2"
-    assert _existing_tables(db.db_path, _REFERENCE_SCOPED_SUPPORT_TABLES) == set()
+    assert _existing_tables(
+        db.db_path,
+        _REFERENCE_SCOPED_SUPPORT_TABLES + _LIFECYCLE_CUTOVER_TABLES,
+    ) == set()
 
 
 @pytest.mark.asyncio
 async def test_workspace_without_reference_scoped_support_moves_to_evidence_unit_support(db) -> None:
     await _seed_complete_unit_support(db)
     await db.close()
-    _mark_reference_scoped_before_upgrade(db.db_path, reference_support_row=False)
+    pending = _rewind_before_support_storage_removal(db.db_path)
 
     await db.connect()
 
     assert await _support_scope_marker(db) == "evidence-unit-set-v2"
     assert await db.get_active_memory_support_unit_ids("memory-1") == ("evidence-unit-1",)
-    assert _existing_tables(db.db_path, _REFERENCE_SCOPED_SUPPORT_TABLES) == set()
+    assert _applied_migrations(db.db_path, pending) == set(pending)
+    assert _existing_tables(
+        db.db_path,
+        _REFERENCE_SCOPED_SUPPORT_TABLES + _LIFECYCLE_CUTOVER_TABLES,
+    ) == set()
 
 
 @pytest.mark.asyncio
-async def test_workspace_with_reference_scoped_support_refuses_to_start(db) -> None:
+async def test_workspace_with_reference_scoped_support_refuses_before_any_migration(db) -> None:
     await _seed_complete_unit_support(db)
     await db.close()
-    _mark_reference_scoped_before_upgrade(db.db_path, reference_support_row=True)
+    pending = _rewind_before_support_storage_removal(db.db_path, reference_support_row=True)
 
     with pytest.raises(RuntimeError, match="reference-scoped Support"):
         await db.connect()
     await db.close()
 
-    with sqlite3.connect(db.db_path) as connection:
-        [(marker,)] = connection.execute(
-            "SELECT marker_value FROM system_contract_markers WHERE marker_key = 'support_scope_version'"
-        ).fetchall()
-        applied = connection.execute(
-            "SELECT 1 FROM schema_migrations WHERE version = ?",
-            (_REQUIRE_EVIDENCE_UNIT_SUPPORT_MIGRATION,),
-        ).fetchall()
-    assert marker == "reference-set-v1"
-    assert applied == []
-    assert _existing_tables(db.db_path, _REFERENCE_SCOPED_SUPPORT_TABLES) == set(
-        _REFERENCE_SCOPED_SUPPORT_TABLES
-    )
+    assert _stored_support_scope_marker(db.db_path) == "reference-set-v1"
+    assert _applied_migrations(db.db_path, pending) == set()
+    assert _existing_tables(
+        db.db_path,
+        _REFERENCE_SCOPED_SUPPORT_TABLES + _LIFECYCLE_CUTOVER_TABLES,
+    ) == set(_REFERENCE_SCOPED_SUPPORT_TABLES + _LIFECYCLE_CUTOVER_TABLES)
 
 
 @pytest.mark.asyncio
-async def test_unknown_support_scope_marker_refuses_to_start(db) -> None:
+@pytest.mark.parametrize("migrated", (False, True), ids=("before-upgrade", "after-upgrade"))
+async def test_unknown_support_scope_marker_refuses_to_start(db, migrated: bool) -> None:
     await db.close()
-    with sqlite3.connect(db.db_path) as connection:
-        connection.execute(
-            """UPDATE system_contract_markers SET marker_value = 'unknown-scope'
-                WHERE marker_key = 'support_scope_version'"""
-        )
+    if migrated:
+        with sqlite3.connect(db.db_path) as connection:
+            connection.execute(
+                """UPDATE system_contract_markers SET marker_value = 'unknown-scope'
+                    WHERE marker_key = 'support_scope_version'"""
+            )
+    else:
+        _rewind_before_support_storage_removal(db.db_path, marker="unknown-scope")
 
     with pytest.raises(RuntimeError, match="requires 'evidence-unit-set-v2'"):
         await db.connect()
     await db.close()
+
+    assert _stored_support_scope_marker(db.db_path) == "unknown-scope"
+
+
+@pytest.mark.asyncio
+async def test_read_only_connection_refuses_workspace_without_support_marker(tmp_path) -> None:
+    path = tmp_path / "before-support-marker.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
+    database = Database(str(path))
+
+    with pytest.raises(RuntimeError, match="marker is None; .* requires 'evidence-unit-set-v2'"):
+        await database.connect(run_migrations=False)
+    await database.close()
 
 
 def test_evidence_unit_revision_lineage_predicate_covers_identity_and_membership() -> None:
@@ -340,7 +388,7 @@ def test_evidence_unit_revision_lineage_predicate_covers_identity_and_membership
     )
 
 
-def test_v2_part_and_support_identity_exclude_presentation_only_changes() -> None:
+def test_part_and_support_identity_exclude_presentation_only_changes() -> None:
     anchor = SourceAnchor(
         kind=AnchorKind.REVISION_RANGE,
         observation_id="obs-1",
@@ -404,7 +452,7 @@ def test_v2_part_and_support_identity_exclude_presentation_only_changes() -> Non
 
 
 @pytest.mark.asyncio
-async def test_v2_lifecycle_removes_one_complete_unit_then_retires_last_support(db) -> None:
+async def test_lifecycle_removes_one_complete_unit_then_retires_last_support(db) -> None:
     memory_id, unit_id, source_id, access_hash = await _seed_complete_unit_support(db)
     await db.enable_lifecycle_gate(source_id)
     memory = await db.get_memory(memory_id)
@@ -452,7 +500,7 @@ async def test_v2_lifecycle_removes_one_complete_unit_then_retires_last_support(
 
 
 @pytest.mark.asyncio
-async def test_v2_source_removal_retires_last_support_without_deleting_history(db) -> None:
+async def test_source_removal_retires_last_support_without_deleting_history(db) -> None:
     memory_id, unit_id, source_id, _access_hash = await _seed_complete_unit_support(db)
 
     result = await db.delete_source_cascade(source_id)
@@ -485,7 +533,7 @@ async def test_v2_source_removal_retires_last_support_without_deleting_history(d
 
 
 @pytest.mark.asyncio
-async def test_v2_source_removal_preserves_memory_with_independent_support(db) -> None:
+async def test_source_removal_preserves_memory_with_independent_support(db) -> None:
     memory_id, unit_id, source_id, _access_hash = await _seed_complete_unit_support(db)
     now = datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc).isoformat()
     await db.upsert_source(
@@ -976,7 +1024,7 @@ async def test_invalid_supporting_part_omits_complete_evidence_unit(db) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_deriver_stages_projection_extraction_v9_without_ingestion_replay(db) -> None:
+async def test_deriver_stages_projection_extraction_v9_without_ingestion_replay(db) -> None:
     await _seed_complete_unit_support(db)
     now = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
     body = "# Durable rule\n\nAlways validate the complete Evidence Unit.\n"

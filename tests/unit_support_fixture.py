@@ -18,10 +18,7 @@ from memforge.memory.evidence import (
     evidence_reference_id_for,
     memory_unit_support_assertion_id,
 )
-from memforge.models import RawMemory
-from memforge.pipeline.evidence_fragments import EvidenceFragment
-from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-from memforge.source_projection import AnchorKind, SourceAnchor, SourceProjection
+from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.storage.database import Database
 
 _BINARY_ARTIFACT_PROFILE = "binary-artifact"
@@ -125,69 +122,6 @@ async def record_unit_support(
 
 def primary_reference(anchor: SourceAnchor) -> EvidenceReference:
     return EvidenceReference(role=EvidenceRole.PRIMARY, anchor=anchor)
-
-
-def select_quoted_fragments(
-    projection: SourceProjection,
-    raw_memories: Sequence[RawMemory],
-    *,
-    access_context_hash: str,
-    base: SourceProjection | None = None,
-) -> list[RawMemory]:
-    """Resolve each candidate's quote to the current Fragments an extractor would select.
-
-    The quote is the candidate's evidence quote, or its content when it has
-    none. A quote equal to a Fragment's text selects the first such Fragment
-    as the Primary, and a quote inside one Fragment selects that one. A
-    quote spanning several Fragments selects the first as the Primary and the
-    rest as Required parts. The Fragments of each Observation named in
-    ``required_source_observation_ids``, such as an image, are Required too.
-    """
-
-    context = RevisionAssessmentContext(
-        projection=projection,
-        base=base,
-        access_context_hash=access_context_hash,
-    )
-    catalog = context.catalog(context.full_fragments)
-
-    def fragments_for(quote: str) -> list[EvidenceFragment]:
-        exact = [fragment for fragment in catalog.fragments if fragment.presentation_text == quote]
-        if exact:
-            return exact[:1]
-        containing = [fragment for fragment in catalog.fragments if quote in fragment.presentation_text]
-        if containing:
-            [fragment] = containing
-            return [fragment]
-        spanned = [
-            fragment
-            for fragment in catalog.fragments
-            if fragment.presentation_text and fragment.presentation_text in quote
-        ]
-        assert spanned, f"no current Fragment matches quote: {quote!r}"
-        return spanned
-
-    selected: list[RawMemory] = []
-    for raw in raw_memories:
-        primary, *required = fragments_for(raw.evidence_quote or raw.content)
-        required += [
-            fragment
-            for fragment in catalog.fragments
-            if fragment.anchor.observation_id in raw.required_source_observation_ids
-            and fragment not in (primary, *required)
-        ]
-        selected.append(
-            replace(
-                raw,
-                source_observation_id=primary.anchor.observation_id,
-                required_source_observation_ids=[fragment.anchor.observation_id for fragment in required],
-                resolved_evidence_selection=catalog.resolve_selection(
-                    primary_ref=primary.reference,
-                    required_refs=tuple(fragment.reference for fragment in required),
-                ),
-            )
-        )
-    return selected
 
 
 async def active_support_evidence(

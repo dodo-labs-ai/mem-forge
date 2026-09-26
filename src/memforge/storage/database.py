@@ -736,9 +736,10 @@ def _local_agent_job_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 REFERENCE_SCOPED_SUPPORT_UNSUPPORTED_MESSAGE = (
-    "This workspace still records reference-scoped Support, which this MemForge "
-    "version no longer supports. Complete the Support cutover with an earlier "
-    "MemForge version or rebuild the workspace."
+    "This workspace records reference-scoped Support, which this MemForge version "
+    "cannot read. The database was left unchanged. Move it aside and start with a "
+    "new database; syncing the Sources again rebuilds their Memories with Evidence "
+    "Unit Support."
 )
 
 _VALID_VISIBILITIES = frozenset({Visibility.WORKSPACE.value, Visibility.PRIVATE.value})
@@ -4345,7 +4346,16 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         "Remove contradiction counts superseded by cross-document relations",
         ["DROP TABLE IF EXISTS memory_contradictions"],
     ),
-    (97, "Require Evidence Unit Support", []),
+    (
+        97,
+        "Move workspaces without reference-scoped Support onto Evidence Unit Support",
+        [
+            """UPDATE system_contract_markers
+                  SET marker_value = 'evidence-unit-set-v2', updated_at = datetime('now')
+                WHERE marker_key = 'support_scope_version'
+                  AND marker_value = 'reference-set-v1'""",
+        ],
+    ),
     (
         98,
         "Remove reference-scoped Support storage",
@@ -4424,6 +4434,7 @@ class Database:
             await self._db.execute("PRAGMA query_only = ON")
             await self._assert_evidence_unit_support_marker()
             return
+        await self._refuse_reference_scoped_support_unlocked()
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.executescript(SCHEMA)
         await self._run_migrations()
@@ -4431,7 +4442,16 @@ class Database:
         await self._assert_evidence_unit_support_marker()
         await self._db.commit()
 
+    async def _table_exists_unlocked(self, table: str) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
     async def _support_scope_marker_unlocked(self) -> str | None:
+        if not await self._table_exists_unlocked("system_contract_markers"):
+            return None
         async with self.db.execute(
             """SELECT marker_value FROM system_contract_markers
                WHERE marker_key = 'support_scope_version'"""
@@ -4449,33 +4469,16 @@ class Database:
                 f"requires {EVIDENCE_UNIT_SUPPORT_SCOPE!r}"
             )
 
-    async def _require_evidence_unit_support_unlocked(self) -> None:
-        """Move a workspace without reference-scoped Support onto Evidence Unit Support.
-
-        A workspace that still holds reference-scoped Support rows cannot be
-        opened by this version; its marker is left unchanged so an earlier
-        version can still complete the Support cutover.
-        """
+    async def _refuse_reference_scoped_support_unlocked(self) -> None:
+        """Refuse a workspace holding reference-scoped Support before changing its schema."""
 
         if await self._support_scope_marker_unlocked() == EVIDENCE_UNIT_SUPPORT_SCOPE:
             return
-        async with self.db.execute(
-            """SELECT 1 FROM sqlite_master
-               WHERE type = 'table' AND name = 'memory_support_assertions'"""
-        ) as cursor:
-            has_reference_support_table = await cursor.fetchone() is not None
-        if has_reference_support_table:
-            async with self.db.execute("SELECT 1 FROM memory_support_assertions LIMIT 1") as cursor:
-                if await cursor.fetchone() is not None:
-                    raise RuntimeError(REFERENCE_SCOPED_SUPPORT_UNSUPPORTED_MESSAGE)
-        await self.db.execute(
-            """INSERT INTO system_contract_markers (marker_key, marker_value, updated_at)
-               VALUES ('support_scope_version', ?, ?)
-               ON CONFLICT(marker_key) DO UPDATE SET
-                   marker_value = excluded.marker_value,
-                   updated_at = excluded.updated_at""",
-            (EVIDENCE_UNIT_SUPPORT_SCOPE, _now_iso()),
-        )
+        if not await self._table_exists_unlocked("memory_support_assertions"):
+            return
+        async with self.db.execute("SELECT 1 FROM memory_support_assertions LIMIT 1") as cursor:
+            if await cursor.fetchone() is not None:
+                raise RuntimeError(REFERENCE_SCOPED_SUPPORT_UNSUPPORTED_MESSAGE)
 
     async def _migrate_agent_runtime_event_v3_unlocked(self) -> None:
         """Relax extraction-only lineage and preserve v2 events and assessments."""
@@ -4624,8 +4627,6 @@ class Database:
                         await self.purge_memory(memory_id)
             if version == 79:
                 await self._migrate_agent_runtime_event_v3_unlocked()
-            if version == 97:
-                await self._require_evidence_unit_support_unlocked()
             for sql in statements:
                 try:
                     await self.db.execute(sql)
@@ -5856,13 +5857,13 @@ class Database:
         *,
         source_activity: SourceActivityLease | None = None,
     ) -> None:
-        """Delete document artifacts after an applied projected lifecycle plan.
+        """Delete a document record and its unshared artifacts.
 
-        Unlike the legacy deletion path, this method never infers Memory
-        lifecycle and never deletes Source Projection or Evidence lineage. The
-        caller must first apply a gate-checked Lifecycle Plan that removes every
-        document support edge; the invariant is checked again in this
-        transaction before the document record is removed.
+        This method never changes Memory lifecycle and never deletes Source
+        Projection or Evidence lineage. It deletes only a document that no
+        Memory names as provenance, which this transaction checks before the
+        document record is removed; a caller retiring Memories first applies
+        the Lifecycle Plan that removes their document Support.
         """
 
         async with self._write_lock:
@@ -6315,43 +6316,6 @@ class Database:
                 (reason_code, now, derivation_id),
             )
             await self.db.commit()
-
-    async def supersede_incomplete_source_derivations_for_contract(
-        self,
-        *,
-        extraction_contract_version: str,
-        reason_code: str = "CONTRACT_SUPERSEDED",
-    ) -> tuple[str, ...]:
-        """Terminally classify only pending/retryable work for one old contract."""
-
-        if not extraction_contract_version or not reason_code:
-            raise ValueError("derivation contract supersession requires typed identity")
-        now = _now_iso()
-        async with self._write_lock:
-            try:
-                rows = await self.db.execute_fetchall(
-                    """SELECT id FROM source_derivation_attempts
-                       WHERE extraction_contract_version = ?
-                         AND status IN ('pending', 'retryable_failure')
-                       ORDER BY created_at, id""",
-                    (extraction_contract_version,),
-                )
-                derivation_ids = tuple(str(row["id"]) for row in rows)
-                if derivation_ids:
-                    placeholders = ",".join("?" for _ in derivation_ids)
-                    await self.db.execute(
-                        f"""UPDATE source_derivation_attempts
-                            SET status = 'superseded', terminal_reason_code = ?,
-                                updated_at = ?
-                            WHERE id IN ({placeholders})
-                              AND status IN ('pending', 'retryable_failure')""",
-                        (reason_code, now, *derivation_ids),
-                    )
-                await self.db.commit()
-                return derivation_ids
-            except Exception:
-                await self.db.rollback()
-                raise
 
     async def stage_derivation_work(self, *, derivation_id: str, work: DerivationWork) -> DerivationWork:
         return await self._persist_derivation_work(derivation_id, work, stage=True)
@@ -7363,8 +7327,7 @@ class Database:
         support_rows = await self.db.execute_fetchall(
             """SELECT msa.id AS support_id, msa.evidence_unit_id,
                       eu.source_id, eu.source_type, eu.source_lineage_id,
-                      eu.doc_revision_id, eu.doc_id,
-                      eu.evidence_provenance
+                      eu.doc_revision_id, eu.doc_id
                  FROM memory_unit_support_assertions msa
                  JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
                 WHERE msa.memory_id = ? AND msa.active = 1
@@ -8079,7 +8042,7 @@ class Database:
             raise SourceActivityConflict(f"Source not found: {source_id}")
         return int(row["activity_epoch"] or 0)
 
-    async def _v2_unit_references_unlocked(
+    async def _unit_references_unlocked(
         self,
         evidence_unit_id: str,
     ) -> tuple[EvidenceReference, ...]:
@@ -8150,7 +8113,7 @@ class Database:
         )
         if assertion.id != expected_id:
             raise ValueError("v2 Support id is not deterministic")
-        references = await self._v2_unit_references_unlocked(assertion.evidence_unit_id)
+        references = await self._unit_references_unlocked(assertion.evidence_unit_id)
         part_digest = evidence_part_set_digest(references)
         if unit["part_set_digest"] != part_digest:
             raise ValueError("v2 Support Evidence Unit part digest mismatch")

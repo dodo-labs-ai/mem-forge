@@ -84,6 +84,7 @@ from memforge.memory.cross_document_relation_reader import (
     relation_notice,
 )
 from memforge.memory.lifecycle import normalize_memory_status
+from memforge.memory.lifecycle_plan import LifecycleGate
 from memforge.memory.lifecycle_service import (
     MaintenanceClosureEntry,
     MemoryLifecycleConflict,
@@ -149,7 +150,6 @@ from memforge.runtime import (
     SourceSyncWorker,
     SourceSyncUnsupportedError,
     SyncService,
-    SourceLifecycleMaintenanceError,
     SourcePausedError,
 )
 from memforge.scheduler import SyncScheduler
@@ -366,6 +366,15 @@ def _source_management_forbidden() -> HTTPException:
             "message": "Only the source owner or a workspace admin can manage this source.",
         },
     )
+
+
+def _lifecycle_gate_payload(gate: LifecycleGate) -> dict[str, object]:
+    return {
+        "state": gate.state.value,
+        "reason": gate.reason,
+        "audited_at": gate.audited_at,
+        "enabled_at": gate.enabled_at,
+    }
 
 
 def _require_source_management(request: Request, source: dict[str, Any]) -> None:
@@ -5929,12 +5938,7 @@ def create_admin_app(
                 }
                 for transition in scope_transitions
             ],
-            "gate": {
-                "state": gate.state.value,
-                "reason": gate.reason,
-                "audited_at": gate.audited_at,
-                "enabled_at": gate.enabled_at,
-            },
+            "gate": _lifecycle_gate_payload(gate),
             "reviews": [
                 {
                     "id": review.id,
@@ -5967,6 +5971,29 @@ def create_admin_app(
                 for task in vector_tasks
             ],
         }
+
+    @source_router.post("/{source_id}/memory-lifecycle/gate")
+    async def enable_source_memory_lifecycle_gate(
+        source_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Enable destructive lifecycle once every active Memory has complete Support.
+
+        Sources created by this version start enabled. A Source recorded before
+        lifecycle gates existed stays gated, and its destructive Reviews cannot
+        be approved, until this check passes.
+        """
+
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, source)
+        try:
+            gate = await db.enable_lifecycle_gate(source_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"source_id": source_id, "gate": _lifecycle_gate_payload(gate)}
 
     @source_router.get("/{source_id}/projection-inventory")
     async def get_source_projection_inventory(
@@ -6938,7 +6965,6 @@ def create_admin_app(
         except SourcePausedError:
             raise _source_paused_http_error()
         except (
-            SourceLifecycleMaintenanceError,
             SourceActivityConflict,
             SourceSyncUnsupportedError,
             ValueError,
@@ -7030,7 +7056,6 @@ def create_admin_app(
         except SourcePausedError:
             raise _source_paused_http_error()
         except (
-            SourceLifecycleMaintenanceError,
             SourceActivityConflict,
             SourceSyncUnsupportedError,
         ) as exc:
@@ -7076,7 +7101,6 @@ def create_admin_app(
         except SourcePausedError:
             raise _source_paused_http_error()
         except (
-            SourceLifecycleMaintenanceError,
             SourceActivityConflict,
             SourceSyncUnsupportedError,
         ) as exc:

@@ -299,7 +299,6 @@ def test_projection_batch_records_authority_segmentation_policy_identity() -> No
         max_primary_observations=8,
     )
 
-    assert batch.authority_policy_version == 5
     assert batch.id == "xbatch-907c4a188b1d37bf"
 
 

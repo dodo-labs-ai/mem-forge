@@ -1957,7 +1957,6 @@ async def test_extractor_persists_only_resolved_parts_and_never_falls_back() -> 
     assert memory.evidence_quote is None
     assert memory.resolved_evidence_selection is not None
     assert len(memory.resolved_evidence_selection.parts) == 2
-    assert "evidence_block_fallback_samples" not in result.metadata
 
     restored = memory_extraction_result_from_output_payload(
         memory_extraction_output_payload(result)
@@ -2120,45 +2119,6 @@ async def test_selector_correction_groups_failures_and_reuses_artifact_images() 
     assert metrics["selector_correction_recovered_count"] == 1
     assert corrected[0].required_refs == [artifact]
     assert corrected[1] is candidates[1]
-
-
-@pytest.mark.asyncio
-async def test_contract_change_supersedes_only_incomplete_older_derivations(db) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    for derivation_id, status in (
-        ("sdrv-pending", "pending"),
-        ("sdrv-retry", "retryable_failure"),
-        ("sdrv-complete", "completed"),
-    ):
-        await db.db.execute(
-            """INSERT INTO source_derivation_attempts (
-                   id, source_id, source_unit_id, target_unit_revision_id,
-                   projection_payload_json, projection_payload_hash,
-                   projection_identity_hash, context_payload_json,
-                   context_payload_hash, context_identity_hash,
-                   extraction_contract_version, status, created_at, updated_at
-               ) VALUES (?, 'source-1', 'unit-1', 'unitrev-1',
-                         '{}', 'projection-hash', 'projection-identity',
-                         '{}', 'context-hash', 'context-identity',
-                         'projection-extraction-v8', ?, ?, ?)""",
-            (derivation_id, status, now, now),
-        )
-    await db.db.commit()
-
-    superseded = await db.supersede_incomplete_source_derivations_for_contract(
-        extraction_contract_version="projection-extraction-v8",
-    )
-    assert superseded == ("sdrv-pending", "sdrv-retry")
-    rows = await db.db.execute_fetchall(
-        """SELECT id, status, terminal_reason_code
-           FROM source_derivation_attempts ORDER BY id"""
-    )
-    by_id = {str(row["id"]): row for row in rows}
-    assert by_id["sdrv-pending"]["status"] == "superseded"
-    assert by_id["sdrv-retry"]["status"] == "superseded"
-    assert by_id["sdrv-pending"]["terminal_reason_code"] == "CONTRACT_SUPERSEDED"
-    assert by_id["sdrv-complete"]["status"] == "completed"
-    assert by_id["sdrv-complete"]["terminal_reason_code"] is None
 
 
 def test_compact_catalog_preserves_exact_text_authority_and_internal_provenance():

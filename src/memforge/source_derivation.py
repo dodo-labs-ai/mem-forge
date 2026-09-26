@@ -40,7 +40,6 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.pipeline.bounded_work import collect_bounded
 from memforge.pipeline.extraction_contract import (
-    CONTRACT_SUPERSEDED,
     PROJECTION_EXTRACTION_CONTRACT_VERSION,
     PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION,
 )
@@ -75,7 +74,6 @@ SOURCE_DERIVATION_BATCH_RETRYABLE_FAILURE = "retryable_failure"
 
 _SAFE_DERIVATION_DIAGNOSTIC_RE = re.compile(r"^[A-Za-z0-9_.\[\]$-]+$")
 _MAX_SAFE_DERIVATION_ERROR_FIELDS = 32
-_EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT = 16
 _SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT = 32
 
 logger = logging.getLogger(__name__)
@@ -245,12 +243,6 @@ class SourceDerivationStore(DerivationWorkStore, Protocol):
         reason_code: str | None = None,
     ) -> None: ...
 
-    async def supersede_incomplete_source_derivations_for_contract(
-        self,
-        *,
-        extraction_contract_version: str,
-        reason_code: str = CONTRACT_SUPERSEDED,
-    ) -> tuple[str, ...]: ...
 
 @dataclass(frozen=True, slots=True)
 class SourceUnitDerivationRequest:
@@ -541,9 +533,6 @@ class SourceUnitDeriver:
                         ),
                         error_code=_safe_diagnostic_label(result.metadata.get("safe_error_code")),
                         candidate_count=len(result.memories),
-                        rejected_count=_safe_non_negative_int(
-                            result.metadata.get("invalid_evidence_block_count")
-                        ),
                     )
                 )
             except (TypeError, ValueError):
@@ -552,12 +541,6 @@ class SourceUnitDeriver:
                     derivation.id,
                     batch.id,
                 )
-            for sample in result.metadata.get(
-                "evidence_block_fallback_samples",
-                [],
-            ):
-                if isinstance(sample, dict):
-                    sample["source_derivation_batch_id"] = batch.id
             revision_by_observation = {
                 revision.observation_id: revision.id
                 for revision in request.projection.observation_revisions
@@ -695,10 +678,6 @@ def _safe_model_identifier(value: object) -> str | None:
     ):
         return None
     return value
-
-
-def _safe_non_negative_int(value: object) -> int | None:
-    return value if isinstance(value, int) and value >= 0 else None
 
 
 def source_derivation_manifest(
@@ -1078,7 +1057,7 @@ def _batch_input_payload_hash(
         "prepared_input_mode": batch.prepared_input_mode,
         "prepared_selection_reason": batch.prepared_selection_reason,
         "prepared_estimated_cost": dict(batch.prepared_estimated_cost or {}),
-        "authority_policy_version": batch.authority_policy_version,
+        "authority_policy_version": PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
         "primary_observation_ids": list(batch.primary_observation_ids),
         "primary_authority_spans": [
             {
@@ -1390,31 +1369,12 @@ def aggregate_extraction_metrics(
         ),
         default=0,
     )
-    refinement_counts: dict[str, int] = {}
-    fallback_samples: list[dict[str, object]] = []
-    fallback_sample_truncated_count = 0
     selector_normalization_present = False
     selector_normalized_candidate_count = 0
     selector_normalization_count = 0
     selector_normalization_fingerprints: list[str] = []
     for result in results:
         telemetry = _safe_evidence_telemetry(result.metadata)
-        for refinement, count in telemetry.get(
-            "evidence_refinement_counts",
-            {},
-        ).items():
-            refinement_counts[refinement] = refinement_counts.get(refinement, 0) + count
-        for sample in telemetry.get("evidence_block_fallback_samples", []):
-            if len(fallback_samples) < _EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT:
-                fallback_samples.append(sample)
-            else:
-                fallback_sample_truncated_count += 1
-        fallback_sample_truncated_count += int(
-            telemetry.get(
-                "evidence_block_fallback_sample_truncated_count",
-                0,
-            )
-        )
         if "selector_normalization_count" in telemetry:
             selector_normalization_present = True
             selector_normalized_candidate_count += int(
@@ -1431,15 +1391,6 @@ def aggregate_extraction_metrics(
                     < _SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT
                 ):
                     selector_normalization_fingerprints.append(fingerprint)
-    aggregated["evidence_refinement_counts"] = refinement_counts
-    aggregated["evidence_block_fallback_samples"] = fallback_samples
-    aggregated["evidence_block_fallback_sample_truncated_count"] = (
-        fallback_sample_truncated_count
-    )
-    aggregated["invalid_evidence_block_count"] = sum(
-        int((result.metadata or {}).get("invalid_evidence_block_count", 0) or 0)
-        for result in results
-    )
     if selector_normalization_present:
         aggregated.update(
             {
@@ -1460,41 +1411,6 @@ def _safe_evidence_telemetry(value: object) -> dict[str, object]:
 
     if not isinstance(value, Mapping):
         return {}
-    raw_counts = value.get("evidence_refinement_counts")
-    counts = (
-        {
-            str(name): max(0, int(count))
-            for name, count in raw_counts.items()
-            if isinstance(name, str) and isinstance(count, int)
-        }
-        if isinstance(raw_counts, Mapping)
-        else {}
-    )
-    raw_samples = value.get("evidence_block_fallback_samples")
-    samples: list[dict[str, object]] = []
-    if isinstance(raw_samples, list):
-        for sample in raw_samples[:_EVIDENCE_BLOCK_FALLBACK_SAMPLE_LIMIT]:
-            if not isinstance(sample, Mapping):
-                continue
-            samples.append(
-                {
-                    key: sample.get(key)
-                    for key in (
-                        "candidate_content_sha256",
-                        "source_derivation_batch_id",
-                        "source_observation_id",
-                        "source_observation_revision_id",
-                        "evidence_range_start",
-                        "evidence_range_end",
-                        "block_text_sha256",
-                        "block_chars",
-                        "submitted_quote_sha256",
-                        "submitted_quote_chars",
-                        "extraction_model",
-                        "prompt_sha256",
-                    )
-                }
-            )
     raw_normalization_fingerprints = value.get(
         "selector_normalization_fingerprints"
     )
@@ -1508,24 +1424,7 @@ def _safe_evidence_telemetry(value: object) -> dict[str, object]:
         if isinstance(fingerprint, str)
         and re.fullmatch(r"[0-9a-f]{64}", fingerprint) is not None
     ][:_SELECTOR_NORMALIZATION_FINGERPRINT_LIMIT]
-    telemetry = {
-        "evidence_refinement_counts": counts,
-        "evidence_block_fallback_samples": samples,
-        "evidence_block_fallback_sample_truncated_count": max(
-            0,
-            int(
-                value.get(
-                    "evidence_block_fallback_sample_truncated_count",
-                    0,
-                )
-                or 0
-            ),
-        ),
-        "invalid_evidence_block_count": max(
-            0,
-            int(value.get("invalid_evidence_block_count", 0) or 0),
-        ),
-    }
+    telemetry: dict[str, object] = {}
     if any(
         key in value
         for key in (

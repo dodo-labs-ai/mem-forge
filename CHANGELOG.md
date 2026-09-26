@@ -3,9 +3,14 @@
 ## Unreleased
 
 - Evidence Unit Support is the only Support model (ADR 0038). A workspace that
-  still holds reference-scoped Support refuses to start; finish the Support
-  cutover with an earlier version or rebuild the workspace. Other workspaces
-  drop the reference-scoped Support and lifecycle cutover tables on start.
+  still holds reference-scoped Support refuses to start and is left unchanged;
+  move the database aside and rebuild the workspace from its Sources. Other
+  workspaces drop the reference-scoped Support and lifecycle cutover tables on
+  start.
+- `POST /sources/{id}/memory-lifecycle/gate` enables destructive lifecycle for a
+  Source recorded before lifecycle gates existed, once every active Memory of
+  that Source has complete Support. Until then, its destructive Reviews cannot
+  be approved.
 - Remove Source lifecycle backfill, rebaseline and cutover finding repair:
   `POST /sources/{id}/memory-lifecycle/backfill`, `.../rebaseline` and
   `.../findings/{finding_id}/repair` are gone, `GET
