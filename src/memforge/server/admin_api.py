@@ -48,6 +48,7 @@ from memforge.genes import (
     GENE_REGISTRY,
     create_gene,
     list_available_genes,
+    source_rediscovers_documents,
     source_type_supports_sync,
 )
 from memforge.genes.atlassian_auth import (
@@ -7186,11 +7187,13 @@ def create_admin_app(
         artifact_store: DocumentArtifactStore = Depends(get_document_store),
         sync_service: SyncService = Depends(get_sync_service),
     ):
-        """Reprocess stored Documents at their current Source Unit revisions.
+        """Reprocess the Source Units of these Documents with the current adapter and compiler.
 
-        The run reads stored content only, so it needs neither the provider nor
-        a local daemon. ``dry_run`` reports what the run would read and an
-        estimate of its model calls without writing anything.
+        A Source that can ask its provider for one Document by id reads each
+        Document's current state from the provider; any other Source reads the
+        stored input, so it needs no local daemon. ``dry_run`` reports what the
+        run would read and an estimate of its model calls without writing or
+        contacting the provider.
         """
         source = await db.get_source(source_id)
         if not source:
@@ -7207,6 +7210,7 @@ def create_admin_app(
             response.status_code = 200
             return asdict(await reprocess_preview(
                 db, artifact_store, source_id=source_id, document_ids=document_ids,
+                rediscovers=source_rediscovers_documents(source["type"], source.get("config") or {}),
             ))
         try:
             run = await sync_service.enqueue_reprocess(source_id, document_ids)

@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Mapping, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Collection, Mapping, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from memforge.models import ContentItem, NormalizedContent, RawContent
@@ -219,6 +219,46 @@ class SourceObservationRevision:
     evidence_profile: EvidenceRepresentationProfile | None = None
 
 
+class ProjectionIdentityConflict(ValueError):
+    """A projected immutable row has the id of a stored row with a different identity.
+
+    Ids are derived from identity, so the conflict repeats on every attempt to
+    record the same projection.
+    """
+
+    retryable = False
+
+    def __init__(self, table: str, row_id: str) -> None:
+        super().__init__(f"immutable projection identity mismatch: {table}:{row_id}")
+        self.table = table
+        self.row_id = row_id
+
+
+def require_stored_revision_identity(
+    projection: SourceProjection,
+    stored_revisions: Mapping[str, SourceObservationRevision],
+) -> None:
+    """Fail when a projected Observation Revision differs in identity from its stored row.
+
+    An Observation Revision is content-addressed: its id is derived from its
+    Observation and semantic hash, and its Evidence Representation Profile
+    fixes how Evidence addresses its content. A stored row with the same id and
+    identity is the same revision whatever metadata either copy carries; a
+    stored row without a profile takes the declared one.
+    """
+
+    for revision in projection.observation_revisions:
+        stored = stored_revisions.get(revision.id)
+        if stored is None:
+            continue
+        if (
+            stored.observation_id != revision.observation_id
+            or stored.semantic_hash != revision.semantic_hash
+            or stored.evidence_profile not in {None, revision.evidence_profile}
+        ):
+            raise ProjectionIdentityConflict("source_observation_revisions", revision.id)
+
+
 @dataclass(frozen=True, slots=True)
 class SourceUnit:
     """Stable identity for one provider item within a configured Source.
@@ -358,7 +398,10 @@ class ProjectionEnvelope:
     normalized: NormalizedContent
     artifacts: tuple[StoredSourceArtifact, ...] = ()
     prior_unit_revision: SourceUnitRevision | None = None
+    # Current revisions, keyed by Observation id.
     prior_observation_revisions: Mapping[str, SourceObservationRevision] = field(default_factory=dict)
+    # Stored revisions this projection may produce again, keyed by revision id.
+    stored_observation_revisions: Mapping[str, SourceObservationRevision] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,6 +601,10 @@ class ProjectionStore(Protocol):
     async def get_current_source_observation_revisions(
         self,
         source_unit_id: str,
+    ) -> Mapping[str, SourceObservationRevision]: ...
+    async def get_source_observation_revisions(
+        self,
+        revision_ids: Collection[str],
     ) -> Mapping[str, SourceObservationRevision]: ...
     async def get_source_artifact_revision(
         self,

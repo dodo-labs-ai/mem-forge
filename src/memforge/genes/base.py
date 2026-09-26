@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -79,6 +79,8 @@ class Gene(ABC):
     Subclasses **may** override:
     - ``health_check()``  -- connectivity / credential validity probe
     - ``requires_pdf_artifact()`` -- whether a document must retain PDF provenance
+    - ``rediscovers_documents()`` and ``rediscover()`` -- read one stored
+      Document's current state from the provider by its id
     """
 
     # ------------------------------------------------------------------
@@ -102,6 +104,16 @@ class Gene(ABC):
         Each ``ConfigField`` describes one user-editable setting (base URL,
         API token, space keys, etc.).  Fields are grouped via ``ConfigGroup``.
         """
+
+    @classmethod
+    def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:
+        """Whether a Source with this configuration can ask its provider for one Document by id.
+
+        A Gene that can implements :meth:`rediscover`. Content a local agent
+        collected or a user uploaded has no provider to ask; its only copy is
+        the stored input.
+        """
+        return False
 
     def requires_pdf_artifact(
         self,
@@ -214,6 +226,16 @@ class Gene(ABC):
         RawContent
             The raw bytes and content-type for downstream normalisation.
         """
+
+    async def rediscover(self, item: ContentItem) -> ContentItem | None:
+        """Return the provider's current item for one stored Document.
+
+        ``item`` is rebuilt from the stored Document. The result is the item
+        discovery would yield for that Document now, so :meth:`fetch` reads its
+        current state; ``None`` means the provider no longer returns it.
+        Only Genes whose :meth:`rediscovers_documents` holds implement it.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot rediscover one Document")
 
     @asynccontextmanager
     async def open_source_artifact(
