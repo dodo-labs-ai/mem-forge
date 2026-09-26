@@ -230,7 +230,7 @@ export function ReviewDetailPage() {
             The underlying memory changed before a decision was applied. This record remains in
             audit history.
           </p>
-          {review.review_origin === "lifecycle" && review.status === "stale" && (
+          {review.refreshable && (
             <Button
               className="mt-3"
               variant="outline"

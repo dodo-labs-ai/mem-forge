@@ -1311,3 +1311,199 @@ async def test_evidence_reference_write_rejects_an_expired_activity_lease(
         )
 
 
+
+
+def _staged_claim(content: str):
+    """A Candidate whose resolved Evidence is one part of the fixture page body."""
+    import hashlib
+
+    from memforge.memory.evidence import EvidencePartKind, ResolvedEvidencePart, ResolvedEvidenceSelection
+    from memforge.models import RawMemory
+
+    digest = hashlib.sha256(content.encode()).hexdigest()
+    return RawMemory(
+        content=content,
+        memory_type="fact",
+        resolved_evidence_selection=ResolvedEvidenceSelection(
+            source_id="src-1", source_unit_id="unit-page-1", target_unit_revision_id="unitrev-page-1-v2",
+            access_context_hash="workspace", catalog_digest="catalog", compiler_contract_version=1,
+            parts=(
+                ResolvedEvidencePart(
+                    role=EvidenceRole.PRIMARY,
+                    kind=EvidencePartKind.TEXT,
+                    anchor=SourceAnchor(
+                        kind=AnchorKind.REVISION_RANGE, observation_id="obs-page-1-body",
+                        observation_revision_id="obsrev-page-1-v2", range_start=0, range_end=len(content),
+                    ),
+                    raw_content_sha256=digest,
+                    presentation_sha256=digest,
+                    excerpt=content,
+                ),
+            ),
+        ),
+    )
+
+
+async def _coordinator_review_plan(
+    db: Database, *, plan_id: str, raise_conflict: bool = True, coordinator_reviews=(),
+) -> LifecyclePlan:
+    """One revision's Plan that keeps mem-1 and, when asked, raises the same contradiction again."""
+    from memforge.models import CoordinatorProposal, CoordinatorReview
+
+    incumbent = await db.get_memory("mem-1")
+    assert incumbent is not None
+    candidate = _staged_claim("One reviewer approves payroll.")
+    return build_lifecycle_plan(
+        plan_id=plan_id,
+        scope=ReconciliationScope(
+            id=f"scope-{plan_id}", source_id="src-1", source_unit_id="unit-page-1",
+            base_unit_revision_id="unitrev-page-1-v1", target_unit_revision_id="unitrev-page-1-v2",
+        ),
+        gate_state=LifecycleGateState.ENABLED,
+        operations=(
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=incumbent.id,
+                reason="partial coverage",
+                support_revalidation_skipped=True,
+                reviews=(
+                    CoordinatorReview(candidate, CoordinatorProposal.SUPERSEDE, "one versus two reviewers"),
+                ) if raise_conflict else (),
+            ),
+        ),
+        incumbents={incumbent.id: incumbent},
+        source_support_unit_ids={incumbent.id: ("eu-1",)},
+        all_active_support_unit_ids={incumbent.id: ("eu-1",)},
+        support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
+        observation_revision_ids=("obsrev-page-1-v2",),
+        evidence_unit_ids_by_claim_hash={content_hash(candidate.content): ("eu-candidate",)},
+        defaults=NewMemoryDefaults(
+            visibility="workspace", owner_user_id=None, project_key=None, repo_identifier=None,
+            doc_id="gate-doc", source_type="confluence", access_context_hash="workspace",
+        ),
+        coordinator_reviews=coordinator_reviews,
+    )
+
+
+async def _coordinator_reviews(db: Database):
+    return await db.list_lifecycle_reviews(incumbent_memory_ids=("mem-1",))
+
+
+@pytest.mark.asyncio
+async def test_a_raised_again_coordinator_review_is_refreshed_in_place(db: Database) -> None:
+    from memforge.memory.coordinator_review import coordinator_review_id
+
+    await _persist_exact_support_and_provenance(db)
+    await db.enable_lifecycle_gate("src-1")
+    await db.apply_lifecycle_plan(await _coordinator_review_plan(db, plan_id="plan-conflict-1"))
+    [created] = await _coordinator_reviews(db)
+    assert created.id == coordinator_review_id("unit-page-1", "mem-1", "One reviewer approves payroll.")
+    assert created.staged_evidence["stale_guard"] == {
+        "support_set_hash": await db.get_memory_support_set_hash("mem-1"),
+        "memory_version": lifecycle_memory_version(await db.get_memory("mem-1")),
+    }
+
+    await db.apply_lifecycle_plan(await _coordinator_review_plan(
+        db, plan_id="plan-conflict-2", coordinator_reviews=(created,),
+    ))
+
+    [refreshed] = await _coordinator_reviews(db)
+    assert refreshed.id == created.id and refreshed.status is LifecycleReviewStatus.PENDING
+    assert refreshed.lifecycle_plan_id == "plan-conflict-2"
+    assert refreshed.created_at == created.created_at
+
+
+@pytest.mark.asyncio
+async def test_a_conflict_the_revision_no_longer_raises_closes_stale_and_reopens_when_raised(db: Database) -> None:
+    await _persist_exact_support_and_provenance(db)
+    await db.enable_lifecycle_gate("src-1")
+    await db.apply_lifecycle_plan(await _coordinator_review_plan(db, plan_id="plan-conflict-1"))
+    [pending] = await _coordinator_reviews(db)
+
+    closing = await _coordinator_review_plan(
+        db, plan_id="plan-conflict-gone", raise_conflict=False, coordinator_reviews=(pending,),
+    )
+    assert closing.mutations[0].mutation_type is LifecycleMutationType.RESOLVE_REVIEW
+    await db.apply_lifecycle_plan(closing)
+    [stale] = await _coordinator_reviews(db)
+    assert stale.status is LifecycleReviewStatus.STALE and stale.resolved_at is not None
+
+    await db.apply_lifecycle_plan(await _coordinator_review_plan(
+        db, plan_id="plan-conflict-again", coordinator_reviews=(stale,),
+    ))
+    [reopened] = await _coordinator_reviews(db)
+    assert (reopened.id, reopened.status, reopened.resolved_at) == (pending.id, LifecycleReviewStatus.PENDING, None)
+    assert reopened.lifecycle_plan_id == "plan-conflict-again"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decided", [LifecycleReviewStatus.REJECTED, LifecycleReviewStatus.APPROVED])
+async def test_a_decided_conflict_is_never_raised_again(db: Database, decided) -> None:
+    await _persist_exact_support_and_provenance(db)
+    await db.enable_lifecycle_gate("src-1")
+    await db.apply_lifecycle_plan(await _coordinator_review_plan(db, plan_id="plan-conflict-1"))
+    [pending] = await _coordinator_reviews(db)
+    await db.db.execute("UPDATE lifecycle_reviews SET status = ? WHERE id = ?", (decided.value, pending.id))
+    await db.db.commit()
+    [decided_review] = await _coordinator_reviews(db)
+
+    again = await _coordinator_review_plan(db, plan_id="plan-conflict-2", coordinator_reviews=(decided_review,))
+
+    assert not any(mutation.mutation_type is LifecycleMutationType.CREATE_REVIEW for mutation in again.mutations)
+    assert [decision.disposition for decision in again.coverage_proof.incumbent_decisions] == [
+        IncumbentDisposition.KEEP,
+    ]
+    # Plan apply refuses to raise a decided Review again even when a plan asks it to.
+    raising = await _coordinator_review_plan(db, plan_id="plan-conflict-3")
+    with pytest.raises(ValueError, match="cannot be raised again"):
+        await db.apply_lifecycle_plan(raising)
+    assert await db.get_lifecycle_plan_status(raising.id) is None
+    [unchanged] = await _coordinator_reviews(db)
+    assert unchanged.status is decided
+
+
+@pytest.mark.asyncio
+async def test_a_coordinator_review_is_approved_against_its_own_guard(db: Database) -> None:
+    await _persist_exact_support_and_provenance(db)
+    await db.enable_lifecycle_gate("src-1")
+    creating = await _coordinator_review_plan(db, plan_id="plan-conflict-1")
+    await db.apply_lifecycle_plan(creating)
+    [review] = await _coordinator_reviews(db)
+    payload = await db.get_lifecycle_plan_payload(creating.id)
+
+    approval = build_lifecycle_review_approval_plan(review, payload)
+
+    guard = review.staged_evidence["stale_guard"]
+    assert approval.stale_guard.support_set_hashes == {"mem-1": guard["support_set_hash"]}
+    assert approval.stale_guard.memory_versions == {"mem-1": guard["memory_version"]}
+    await db.db.execute("UPDATE memories SET updated_at = ? WHERE id = 'mem-1'", ("2030-01-01T00:00:00+00:00",))
+    await db.db.commit()
+    with pytest.raises(ValueError, match="stale guard"):
+        await db.apply_lifecycle_plan(approval)
+
+
+@pytest.mark.asyncio
+async def test_a_coordinator_review_is_not_refreshed_by_hand(db: Database) -> None:
+    await _persist_exact_support_and_provenance(db)
+    await db.enable_lifecycle_gate("src-1")
+    creating = await _coordinator_review_plan(db, plan_id="plan-conflict-1")
+    await db.apply_lifecycle_plan(creating)
+    [review] = await _coordinator_reviews(db)
+    stale = replace(review, status=LifecycleReviewStatus.STALE)
+
+    with pytest.raises(ValueError, match="next revision"):
+        build_lifecycle_review_refresh_plan(
+            stale, await db.get_lifecycle_plan_payload(creating.id), gate_state=LifecycleGateState.ENABLED,
+            current_support_set_hash="hash", current_memory_version="version",
+        )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_reviews_are_listed_by_incumbent(db: Database) -> None:
+    await _persist_exact_support_and_provenance(db)
+    await db.enable_lifecycle_gate("src-1")
+    await db.apply_lifecycle_plan(await _coordinator_review_plan(db, plan_id="plan-conflict-1"))
+
+    assert [review.incumbent_memory_id for review in await _coordinator_reviews(db)] == ["mem-1"]
+    assert await db.list_lifecycle_reviews(incumbent_memory_ids=("mem-other",)) == []
+    assert await db.list_lifecycle_reviews(incumbent_memory_ids=()) == []

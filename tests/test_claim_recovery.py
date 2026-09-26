@@ -5,7 +5,8 @@ import pytest
 
 from memforge.llm.structured import StructuredLlmError
 from memforge.pipeline.claim_revision import assess_claim_pairs
-from memforge.pipeline.reconciler import SupportAuditEntry, reconcile_memories
+from memforge.pipeline.reconciler import reconcile_memories
+from tests.revision_client_fixture import pinned
 from tests.test_claim_revision import candidate, memory, Client
 from tests.test_derivation_work import prepare_database
 
@@ -70,8 +71,7 @@ async def test_reconciliation_preserves_validation_fields_and_attempted_pair_cou
         async def assess_claim_revisions(self, *args, **kwargs):
             raise StructuredLlmError("invalid", error_code="ValidationError",
                 validation_fields=(("results.0.relations.0.relation", "literal_error"),))
-    result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()], doc_type="document",
-        structured_llm_client=Invalid("unrelated"), support_audits=[SupportAuditEntry("memory", True)], include_metadata=True)
+    result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()], llm_model="test-model", structured_llm_client=Invalid("unrelated"), supports=dict([pinned("memory", True)]))
     assert not result.operations
     assert result.failure.validation_fields == (("results.0.relations.0.relation", "literal_error"),)
     assert result.metrics.relation_pair_count == 1

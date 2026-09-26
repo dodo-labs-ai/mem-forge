@@ -6,7 +6,8 @@ from memforge.llm.structured import (
     RevisionAssessment,
 )
 from memforge.models import RawMemory, ReconcileAction
-from memforge.pipeline.reconciler import SupportAuditEntry, reconcile_memories
+from memforge.pipeline.reconciler import reconcile_memories
+from tests.revision_client_fixture import pinned
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from tests.test_revision_assessment import revisions, memory
 
@@ -82,10 +83,8 @@ async def test_one_call_relation_and_revision_action_matrix(relation, direction,
     result = await reconcile_memories(
         new_extractions=[candidate()],
         existing_memories=[memory()],
-        doc_type="policy",
-        structured_llm_client=client,
-        support_audits=[SupportAuditEntry("memory", supported)],
-        include_metadata=True,
+        llm_model="test-model", structured_llm_client=client,
+        supports=dict([pinned("memory", supported)]),
     )
     assert result.failure is None
     assert [op.action for op in result.operations] == actions
@@ -102,10 +101,8 @@ async def test_uncertain_relation_never_becomes_add():
     result = await reconcile_memories(
         new_extractions=[candidate()],
         existing_memories=[memory()],
-        doc_type="policy",
-        structured_llm_client=client,
-        support_audits=[SupportAuditEntry("memory", True)],
-        include_metadata=True,
+        llm_model="test-model", structured_llm_client=client,
+        supports=dict([pinned("memory", True)]),
     )
     assert result.failure is None
     [operation] = result.operations
@@ -120,10 +117,8 @@ async def test_an_equivalent_candidate_of_an_unsupported_incumbent_stays_unresol
     result = await reconcile_memories(
         new_extractions=[candidate()],
         existing_memories=[memory()],
-        doc_type="policy",
-        structured_llm_client=client,
-        support_audits=[SupportAuditEntry("memory", False, "Current source no longer states it")],
-        include_metadata=True,
+        llm_model="test-model", structured_llm_client=client,
+        supports=dict([pinned("memory", False, "Current source no longer states it")]),
     )
     assert result.failure is None
     [operation] = result.operations
@@ -140,10 +135,9 @@ async def test_duplicate_edge_and_missing_candidate_fail_closed():
     args = dict(
         new_extractions=[candidate()],
         existing_memories=[memory()],
-        doc_type="policy",
+        llm_model="test-model",
         structured_llm_client=client,
-        support_audits=[SupportAuditEntry("memory", True)],
-        include_metadata=True,
+        supports=dict([pinned("memory", True)]),
     )
     assert (await reconcile_memories(**args)).failure is not None
     client.invalid = True
@@ -167,10 +161,8 @@ async def test_single_pair_does_not_require_large_model_output_window():
     result = await reconcile_memories(
         new_extractions=[candidate()],
         existing_memories=[memory()],
-        doc_type="policy",
-        structured_llm_client=client,
-        support_audits=[SupportAuditEntry("memory", True)],
-        include_metadata=True,
+        llm_model="test-model", structured_llm_client=client,
+        supports=dict([pinned("memory", True)]),
     )
     assert result.failure is None and client.calls == 1
     assert max(requested) <= 8192
@@ -182,10 +174,8 @@ async def test_refinement_preserving_an_unsupported_incumbent_stays_unresolved()
     result = await reconcile_memories(
         new_extractions=[candidate()],
         existing_memories=[memory()],
-        doc_type="policy",
-        structured_llm_client=client,
-        support_audits=[SupportAuditEntry("memory", False)],
-        include_metadata=True,
+        llm_model="test-model", structured_llm_client=client,
+        supports=dict([pinned("memory", False)]),
     )
     assert result.failure is None
     [operation] = result.operations
@@ -200,10 +190,8 @@ async def test_refinement_that_drops_unsupported_incumbent_truth_removes_its_sup
     result = await reconcile_memories(
         new_extractions=[candidate()],
         existing_memories=[memory()],
-        doc_type="policy",
-        structured_llm_client=client,
-        support_audits=[SupportAuditEntry("memory", False)],
-        include_metadata=True,
+        llm_model="test-model", structured_llm_client=client,
+        supports=dict([pinned("memory", False)]),
     )
     assert result.failure is None
     assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.DELETE]
@@ -259,10 +247,8 @@ async def test_revision_conditions_map_independently_to_the_lifecycle_gate(condi
     result = await reconcile_memories(
         new_extractions=[candidate()],
         existing_memories=[memory()],
-        doc_type="policy",
-        structured_llm_client=client,
-        support_audits=[SupportAuditEntry("memory", True)],
-        include_metadata=True,
+        llm_model="test-model", structured_llm_client=client,
+        supports=dict([pinned("memory", True)]),
     )
     assert result.failure is None
     assert [op.action for op in result.operations] == [ReconcileAction.ADD, ReconcileAction.NOOP]
@@ -332,8 +318,7 @@ async def test_small_output_cap_can_assess_one_complete_pair():
     client.request_budget = lambda model=None: RequestBudget("fixture", 16000, 16000, 1024, .8, "fixture")
     client.request_fits = lambda prompt, **kwargs: kwargs["max_tokens"] <= 1024
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()],
-        doc_type="policy", structured_llm_client=client, support_audits=[SupportAuditEntry("memory", True)],
-        include_metadata=True)
+        llm_model="test-model", structured_llm_client=client, supports=dict([pinned("memory", True)]))
     assert result.failure is None and client.calls == 1
 
 
@@ -350,8 +335,7 @@ async def test_conflicting_current_refiners_skip_their_incumbent():
                 direction="symmetric", same_subject_and_scope=True, incompatible_assertions="Mutually exclusive refinements")])
     client = Conflicting("refines", "challenger_to_candidate")
     result = await reconcile_memories(new_extractions=[candidate(), candidate()], existing_memories=[memory()],
-        doc_type="policy", structured_llm_client=client, support_audits=[SupportAuditEntry("memory", True)],
-        include_metadata=True)
+        llm_model="test-model", structured_llm_client=client, supports=dict([pinned("memory", True)]))
     assert result.failure is None
     [operation] = result.operations
     assert operation.memory is None and operation.support_revalidation_skipped
