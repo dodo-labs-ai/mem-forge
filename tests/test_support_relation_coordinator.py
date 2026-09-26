@@ -193,6 +193,23 @@ def test_a_claim_still_unsupported_after_its_recheck_gets_a_rebind_review(result
     assert review.proposal is CoordinatorProposal.REBIND and review.candidate is equivalent
 
 
+@pytest.mark.parametrize("result", [UNSUPPORTED, PARTIAL])
+def test_a_candidate_evidence_recheck_beyond_capacity_takes_the_capacity_row(result) -> None:
+    equivalent, unrelated = _candidate("Two reviewers, restated."), _candidate("Retention is seven years.")
+    support = _support(result).after_candidate_recheck(
+        SupportAssessment(None, "One ReadingGroup exceeds capacity.", None, unresolved="capacity"),
+    )
+    relations = [_edge(0, EQUIVALENT)]
+
+    assert support.result is CAPACITY and support.rechecked
+    assert _rechecks([equivalent, unrelated], relations, {"mem-old": support}) == ()
+    coordination = _coordinate([equivalent, unrelated], relations, {"mem-old": support})
+    [kept] = [operation for operation in coordination.operations if operation.memory_id == "mem-old"]
+    assert kept.support_revalidation_skipped and not kept.reviews
+    assert _additions(coordination.operations) == [unrelated]
+    assert coordination.unresolved_candidate_count == 1
+
+
 def test_an_unsupported_claim_contradicted_by_one_candidate_is_superseded() -> None:
     contradicting = _candidate("One reviewer approves payroll.")
     [operation] = _coordinate([contradicting], [_edge(0, CONTRADICTS)], {
