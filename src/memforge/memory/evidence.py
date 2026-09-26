@@ -64,6 +64,8 @@ class CandidateBucket(str, Enum):
 class EvidenceContentProvenance(str, Enum):
     SOURCE_EXCERPT = "source_excerpt"
     SOURCE_ARTIFACT = "source_artifact"
+    # Stored on Evidence Units recovered from pre-Fragment lineage. It stays
+    # readable; nothing records new Units with it.
     LEGACY_LIMITED = "legacy_limited"
     NO_EXCERPT = "no_excerpt"
 
@@ -271,7 +273,6 @@ class MemoryEvidenceUnitProjection:
     source_unit_revision_id: str | None
     doc_id: str | None
     current: bool
-    legacy_limited: bool
     items: tuple[MemoryEvidenceItemProjection, ...]
 
 
@@ -437,6 +438,8 @@ class LifecycleAction(str, Enum):
 
 
 class ReviewCase(str, Enum):
+    # Stored on relation runs recorded before Evidence Units without an
+    # excerpt were reviewed as missing content provenance. Read-only.
     LEGACY_LIMITED_EVIDENCE = "legacy_limited_evidence"
     MISSING_CONTENT_PROVENANCE = "missing_content_provenance"
     MULTI_DESTRUCTIVE_MATCH = "multi_destructive_match"
@@ -1040,8 +1043,6 @@ class MemoryRelationApplyService:
             return ReviewCase.CROSS_SCOPE_BLOCKED
 
         if any(self._is_destructive_candidate(decision) for decision in decisions):
-            if unit.evidence_provenance is EvidenceContentProvenance.LEGACY_LIMITED:
-                return ReviewCase.LEGACY_LIMITED_EVIDENCE
             if unit.evidence_provenance is not EvidenceContentProvenance.SOURCE_EXCERPT or not unit.excerpt:
                 return ReviewCase.MISSING_CONTENT_PROVENANCE
             destructive_decisions = [decision for decision in decisions if self._is_destructive_candidate(decision)]

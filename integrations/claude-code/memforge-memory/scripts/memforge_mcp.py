@@ -1870,7 +1870,6 @@ def _compact_memory_evidence_unit(unit: dict[str, Any]) -> dict[str, Any]:
             "source_type",
             "doc_id",
             "current",
-            "legacy_limited",
         )
         if key in unit
     }

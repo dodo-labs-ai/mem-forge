@@ -8,7 +8,13 @@ from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from tests.llm_fixture import FixtureBudgetClient
-from tests.unit_support_fixture import primary_reference, record_unit_support, select_quoted_fragments
+from tests.unit_support_fixture import (
+    active_support_evidence,
+    primary_reference,
+    record_unit_support,
+    select_quoted_fragments,
+    withdraw_lifecycle_gate,
+)
 from tests.revision_client_fixture import (
     EvidenceSelection,
     RequiredSelection,
@@ -83,7 +89,6 @@ from memforge.memory.lifecycle_planner import (
     lifecycle_access_context_hash,
     lifecycle_plan_id,
 )
-from memforge.memory.store import MemoryStore
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.relation_candidate_retrieval import (
     CrossDocumentCandidateSelection,
@@ -107,12 +112,14 @@ from memforge.models import (
     RawMemory,
     ReconcileAction,
     ReconcileOperation,
-    SourceLifecycleResetResult,
     content_hash,
 )
 from memforge.pipeline.projection_evidence import build_projected_claim_evidence
+from memforge import source_derivation as source_derivation_module
+from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_CONTRACT_VERSION
 from memforge.pipeline.projection_context import (
     ProjectionExtractionBatch,
+    plan_projection_evidence_work,
 )
 from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitation,
@@ -136,7 +143,6 @@ from memforge.source_derivation import (
     SourceUnitDerivationRequest,
     SourceUnitDerivationContext,
     SourceUnitDeriver,
-    plan_source_derivation_work,
     safe_derivation_error,
     source_derivation_manifest,
 )
@@ -748,7 +754,6 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
                 memory_type="fact",
                 source_observation_id=second.observations[0].id,
                 evidence_quote="Service uses PostgreSQL 16.",
-                evidence_resolved_from_block=True,
             )
         ]),
         doc_type="design-doc",
@@ -848,7 +853,6 @@ async def test_additive_refinement_commits_revision_with_candidate_local_evidenc
                 memory_type="fact",
                 evidence_quote=second_text,
                 evidence_anchor="projection_batch",
-                evidence_resolved_from_block=True,
                 source_observation_id=second.observations[0].id,
             )
         ]),
@@ -867,7 +871,7 @@ async def test_additive_refinement_commits_revision_with_candidate_local_evidenc
     assert old.replacement_kind == "revision"
     replacement = await db.get_memory(old.superseded_by or "")
     assert replacement is not None and replacement.content == second_text
-    support = await db.get_active_memory_support_evidence(replacement.id, source_id="src-1")
+    support = await active_support_evidence(db, replacement.id, source_id="src-1")
     assert len([item for item in support if item.role is EvidenceRole.PRIMARY]) == 1
     assert support[0].excerpt == second_text
     assert stats["updated"] == 1
@@ -947,7 +951,6 @@ async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branc
                 memory_type="procedure",
                 evidence_quote=current_procedure,
                 evidence_anchor="projection_batch",
-                evidence_resolved_from_block=True,
                 source_observation_id=second.observations[0].id,
             )
         ]),
@@ -1048,7 +1051,6 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
                 memory_type="procedure",
                 evidence_quote=canonical_procedure,
                 evidence_anchor="projection_batch",
-                evidence_resolved_from_block=True,
                 source_observation_id=second.observations[0].id,
             )
         ]),
@@ -1362,14 +1364,8 @@ class _OutboxDrainer:
         memory: Memory,
         **kwargs,
     ) -> tuple[Memory, ...]:
-        del kwargs
-        candidate = await self.db.find_rebaseline_reactivation_candidate(
-            memory.content_hash,
-            visibility=memory.visibility,
-            owner_user_id=memory.owner_user_id,
-            repo_identifier=memory.repo_identifier,
-        )
-        return (candidate,) if candidate is not None else ()
+        del memory, kwargs
+        return ()
 
     async def find_access_compatible_equivalence_candidates_batch(self, queries):
         candidates = []
@@ -2781,11 +2777,11 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
             raise RuntimeError("worker interrupted")
         return MemoryExtractionResult()
 
+    async def prepare_batches(_planned):
+        return batches
+
     with pytest.raises(RuntimeError, match="worker interrupted"):
-        await SourceUnitDeriver(
-            db,
-            plan_work=lambda _projection, _context: batches,
-        ).derive(
+        await SourceUnitDeriver(db).derive(
             SourceUnitDerivationRequest(
                 projection=projection,
                 context=SourceUnitDerivationContext(
@@ -2802,7 +2798,10 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
                     source_activity_epoch=None,
                 ),
                 extract_batch=extract,
+                prepare_batches=prepare_batches,
                 max_concurrent=1,
+                access_context_hash="access-durable-batch-progress",
+                inference_capability_hash="inference-durable-batch-progress",
             )
         )
 
@@ -2867,6 +2866,8 @@ async def test_source_deriver_binds_provider_neutral_quality_events_to_current_l
             ),
             extract_batch=extract,
             max_concurrent=1,
+            access_context_hash="access-agent-eval",
+            inference_capability_hash="inference-agent-eval",
         )
     )
     rows = await db.list_agent_runtime_events(
@@ -3182,48 +3183,10 @@ async def test_source_derivation_creation_audit_failure_rolls_back_manifest(
     ) == []
 
 
-def test_single_observation_uses_projection_authority_when_document_view_differs():
-    message_content = "Use contextId to find the traceId before following the request logs."
-    projection = _teams_projection(
-        run_id="teams-authority-view",
-        message_content=message_content,
-    )
-    rendered_document = (
-        "# Group: PCC Agent Dev -- Jul 30, 10:00-10:00\n\n"
-        "**Group Chat**: PCC Agent Dev\n**Messages**: 1\n\n---\n\n"
-        f"**Alex** (2026-07-30T10:00):\n{message_content}\n"
-    )
-    context = SourceUnitDerivationContext(
-        document=SimpleNamespace(
-            doc_id="teams-window-1",
-            title="Group: PCC Agent Dev -- Jul 30, 10:00-10:00",
-            source_url="https://teams.example.test/message/1",
-        ),
-        doc_type="teams",
-        project_key=None,
-        repo_identifier=None,
-        document_content=rendered_document,
-        update_mode="full_document",
-        changed_hunks=None,
-        update_plan_stats=None,
-        source_updated_at=None,
-        user_id=None,
-        source_activity_epoch=None,
-    )
-
-    batches = plan_source_derivation_work(projection, context)
-
-    assert len(batches) == 1
-    assert isinstance(batches[0], ProjectionExtractionBatch)
-    [revision] = projection.observation_revisions
-    assert batches[0].primary_authority_spans == (
-        (revision.observation_id, 0, revision.content),
-    )
-
-
 @pytest.mark.asyncio
 async def test_projection_extraction_contract_change_invalidates_staged_derivation(
     db: Database,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     projection = _projection(
         run_id="projection-language-contract",
@@ -3245,15 +3208,23 @@ async def test_projection_extraction_contract_change_invalidates_staged_derivati
         source_activity_epoch=None,
     )
 
-    current_batches = plan_source_derivation_work(projection, context)
-    assert current_batches
-    previous_batches = tuple(replace(batch, id=f"{batch.id}-v2") for batch in current_batches)
-    previous = source_derivation_manifest(
+    current_batches = plan_projection_evidence_work(
         projection,
-        previous_batches,
-        context=context,
-        extraction_contract_version="projection-extraction-v2",
+        reprocess_all_current_observations=False,
     )
+    assert isinstance(current_batches, tuple) and current_batches
+    previous_batches = tuple(replace(batch, id=f"{batch.id}-v2") for batch in current_batches)
+    with monkeypatch.context() as previous_contract:
+        previous_contract.setattr(
+            source_derivation_module,
+            "PROJECTION_EXTRACTION_CONTRACT_VERSION",
+            "projection-extraction-v2",
+        )
+        previous = source_derivation_manifest(
+            projection,
+            previous_batches,
+            context=context,
+        )
     previous_attempt = (await db.stage_source_derivation(previous)).attempt
     for batch in previous_batches:
         previous_attempt = await db.record_source_derivation_batch_result(
@@ -3277,18 +3248,14 @@ async def test_projection_extraction_contract_change_invalidates_staged_derivati
             context=context,
             extract_batch=extract_batch,
             max_concurrent=1,
+            access_context_hash="access-contract-change",
+            inference_capability_hash="inference-contract-change",
         )
     )
 
-    current = source_derivation_manifest(
-        projection,
-        current_batches,
-        context=context,
-    )
-
-    assert current.extraction_contract_version != previous.extraction_contract_version
-    assert current.id != previous.id
-    assert result.derivation.id == current.id
+    assert previous.extraction_contract_version == "projection-extraction-v2"
+    assert result.derivation.extraction_contract_version == PROJECTION_EXTRACTION_CONTRACT_VERSION
+    assert result.derivation.id != previous.id
     assert result.reused_batch_count == 0
     assert result.executed_batch_count == len(current_batches)
     assert executed_batch_ids == [batch.id for batch in current_batches]
@@ -3315,7 +3282,11 @@ async def test_batch_result_and_runtime_events_rollback_together(db: Database) -
         user_id=None,
         source_activity_epoch=None,
     )
-    batches = plan_source_derivation_work(projection, context)
+    batches = plan_projection_evidence_work(
+        projection,
+        reprocess_all_current_observations=False,
+    )
+    assert isinstance(batches, tuple)
     manifest = source_derivation_manifest(projection, batches, context=context)
     await db.stage_source_derivation(manifest)
     [event] = bind_quality_signals(
@@ -4124,7 +4095,8 @@ async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extrac
     assert stats["noop"] == 1
     assert current_support
     assert set(current_support).isdisjoint(old_support)
-    [evidence] = await db.get_active_memory_support_evidence(
+    [evidence] = await active_support_evidence(
+        db,
         incumbent.id,
         source_id="src-1",
     )
@@ -4197,7 +4169,8 @@ async def test_v2_incremental_noop_rebinds_complete_unit_to_current_revision(
     assert stats["noop"] == 1
     assert current_support
     assert set(current_support).isdisjoint(old_support)
-    evidence = await db.get_active_memory_support_evidence(
+    evidence = await active_support_evidence(
+        db,
         incumbent.id,
         source_id="src-1",
     )
@@ -4492,7 +4465,8 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
     current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert stats["noop"] == 1
     assert set(current_support).isdisjoint(old_support)
-    [evidence] = await db.get_active_memory_support_evidence(
+    [evidence] = await active_support_evidence(
+        db,
         incumbent.id,
         source_id="src-1",
     )
@@ -4746,7 +4720,7 @@ async def test_incremental_noop_invalidated_primary_creates_review(
     )
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await db.gate_destructive_lifecycle("src-1", reason="Review required by source policy")
+    await withdraw_lifecycle_gate(db, "src-1")
     second = _projection(
         run_id="projection-primary-invalid-2",
         body="A7 is now retained.",
@@ -5185,7 +5159,7 @@ async def test_partial_jira_projection_keeps_a_validated_support_on_an_unreturne
 
     assert (await commit(first, [added], 15))["added"] == 1
     [memory] = await db.list_memories()
-    before = await db.get_active_memory_support_evidence(memory.id, source_id="src-1")
+    before = await active_support_evidence(db, memory.id, source_id="src-1")
     # The ADD recorded the first revision as the Support's validation baseline.
     assert before and all(part.validation_plan_id for part in before)
     assert {part.validation_unit_revision_id for part in before} == {first.source_unit_revisions[0].id}
@@ -5211,7 +5185,7 @@ async def test_partial_jira_projection_keeps_a_validated_support_on_an_unreturne
     assert stats["deleted"] == 0 and stats["pending_review"] == 0
     assert await db.get_memory(memory.id) == memory
     # Same Evidence, same validation baseline: the next revision still compares against the first.
-    assert await db.get_active_memory_support_evidence(memory.id, source_id="src-1") == before
+    assert await active_support_evidence(db, memory.id, source_id="src-1") == before
     committed = await db.get_current_source_unit_projection(second.source_unit_revisions[0].source_unit_id)
     assert committed.source_unit_revisions[0].id == second.source_unit_revisions[0].id
 
@@ -5255,7 +5229,6 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
         memory_type="procedure",
         evidence_quote="Payroll validation requires approval before release.",
         source_observation_id=description.id,
-        evidence_resolved_from_block=True,
     )
     responses = _RecordingAddClient(incumbent.id)
     from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
@@ -5437,7 +5410,8 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
     current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert stats["noop"] == 1
     assert set(current_support).isdisjoint(old_support)
-    evidence = await db.get_active_memory_support_evidence(
+    evidence = await active_support_evidence(
+        db,
         incumbent.id,
         source_id="src-1",
     )
@@ -5508,7 +5482,7 @@ async def test_noop_duplicate_required_refs_normalize_without_retry(
 
     assert stats["noop"] == 1
     assert stats["support_revalidation_model_call_count"] == 1
-    evidence = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    evidence = await active_support_evidence(db, incumbent.id, source_id="src-1")
     assert len([part for part in evidence if part.role is EvidenceRole.REQUIRED]) == 1
     assert await db.list_lifecycle_reviews("src-1") == []
 
@@ -5579,7 +5553,8 @@ async def test_v2_noop_revalidates_revised_required_jira_description(
     assert stats["noop"] == 1
     assert current_support
     assert set(current_support).isdisjoint(old_support)
-    evidence = await db.get_active_memory_support_evidence(
+    evidence = await active_support_evidence(
+        db,
         incumbent.id,
         source_id="src-1",
     )
@@ -5737,7 +5712,7 @@ async def test_v2_noop_semantically_unsupported_current_fragment_stages_review(
         projection=first,
         access_context_hash=access_context_hash,
     )
-    await db.gate_destructive_lifecycle("src-1", reason="Review required by source policy")
+    await withdraw_lifecycle_gate(db, "src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _projection(
         run_id="projection-v2-unpresentable-2",
@@ -5787,7 +5762,7 @@ async def test_v2_pending_review_ignores_unrelated_stale_cross_unit_support(
         db,
         prefix="projection-v2-causal-review",
     )
-    await db.gate_destructive_lifecycle("src-1", reason="Review required by source policy")
+    await withdraw_lifecycle_gate(db, "src-1")
     second = _projection(
         run_id="projection-v2-causal-review-2",
         body="<!-- no selectable current claim -->",
@@ -6378,7 +6353,8 @@ async def test_v2_noop_preserves_multiple_required_parts_in_one_observation(
     current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert stats["noop"] == 1
     assert set(current_support).isdisjoint(old_support)
-    evidence = await db.get_active_memory_support_evidence(
+    evidence = await active_support_evidence(
+        db,
         incumbent.id,
         source_id="src-1",
     )
@@ -6460,7 +6436,8 @@ async def test_v2_noop_resolves_decoded_canonical_quotes_to_raw_json_ranges(
     current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert stats["noop"] == 1
     assert set(current_support).isdisjoint(old_support)
-    evidence = await db.get_active_memory_support_evidence(
+    evidence = await active_support_evidence(
+        db,
         incumbent.id,
         source_id="src-1",
     )
@@ -6737,7 +6714,8 @@ async def test_noop_revalidates_revised_required_with_artifact_primary(
     )
 
     assert stats["noop"] == 1
-    evidence = await db.get_active_memory_support_evidence(
+    evidence = await active_support_evidence(
+        db,
         incumbent.id,
         source_id="src-1",
     )
@@ -6758,7 +6736,7 @@ async def test_noop_with_invalidated_required_evidence_creates_review(db: Databa
     )
     await db.record_source_projection(first)
     incumbent = await _seed_jira_required_incumbent(db, first)
-    await db.gate_destructive_lifecycle("src-1", reason="Review required by source policy")
+    await withdraw_lifecycle_gate(db, "src-1")
     second = _jira_projection(
         run_id="projection-jira-invalid-required-2",
         description="A7 now applies only to off-cycle payroll.",
@@ -6834,42 +6812,6 @@ async def test_lifecycle_vector_retry_respects_durable_backoff_and_completion_is
     await db.complete_lifecycle_vector_task(task.id)
     await db.complete_lifecycle_vector_task(task.id)
     assert await db.list_lifecycle_vector_tasks(source_id="src-1") == []
-
-
-@pytest.mark.asyncio
-async def test_memory_store_rebaseline_drains_only_its_source_vector_tasks() -> None:
-    class _Relational:
-        async def rebaseline_source_lifecycle(
-            self,
-            source_id: str,
-            *,
-            source_activity=None,
-        ) -> SourceLifecycleResetResult:
-            assert source_id == "src-1"
-            assert source_activity is None
-            return SourceLifecycleResetResult(
-                retired_memory_ids=("mem-1",),
-                retired_search_cleanup_required=True,
-            )
-
-    store = object.__new__(MemoryStore)
-    store.relational = _Relational()
-    store._operation_context = lambda **_kwargs: None
-    store._emit = lambda *_args, **_kwargs: _async_none()
-    drained: list[tuple[str | None, str | None]] = []
-
-    async def record_delivery(
-        lifecycle_plan_id: str | None = None,
-        *,
-        source_id: str | None = None,
-    ) -> LifecycleVectorDeliveryResult:
-        drained.append((lifecycle_plan_id, source_id))
-        return LifecycleVectorDeliveryResult(state=LifecycleVectorDeliveryState.DELIVERED)
-
-    store.attempt_lifecycle_vector_delivery = record_delivery
-
-    assert await store.rebaseline_source_lifecycle("src-1") == ["mem-1"]
-    assert drained == [(None, "src-1")]
 
 
 async def _async_none() -> None:
@@ -6997,7 +6939,8 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
         "model": engine.llm_model,
         "reason": "Both claims state that A7 is excluded.",
     }
-    support = await db.get_active_memory_support_evidence(
+    support = await active_support_evidence(
+        db,
         incumbent.id,
         source_id="src-2",
     )
@@ -7078,7 +7021,8 @@ async def test_same_source_cross_unit_semantic_equivalent_claim_reuses_memory_id
         ("src-1", "confluence-123"),
         ("src-1", "confluence-456"),
     }
-    supports = await db.get_active_memory_support_evidence(
+    supports = await active_support_evidence(
+        db,
         incumbent.id,
         source_id="src-1",
     )
@@ -7284,7 +7228,7 @@ async def test_cross_source_exact_claim_reuses_memory_without_llm_and_preserves_
     assert stats["added"] == 0
     assert stats["corroborated"] == 1
     assert [memory.id for memory in memories] == [incumbent.id]
-    support = await db.get_active_memory_support_evidence(incumbent.id)
+    support = await active_support_evidence(db, incumbent.id)
     assert {item.source_id for item in support} == {"src-1", "src-2"}
     assert {item.anchor.observation_revision_id for item in support} == {
         first.observation_revisions[0].id,
@@ -7624,7 +7568,7 @@ async def test_projected_memory_support_survives_relation_work_retry_and_empty_c
     )
 
     [memory] = await db.list_memories(source="src-1", status="active")
-    support = await db.get_active_memory_support_evidence(memory.id, source_id="src-1")
+    support = await active_support_evidence(db, memory.id, source_id="src-1")
     assert stats["added"] == 1
     assert len(support) == 1
     assert support[0].anchor.observation_id == primary.id
@@ -8078,7 +8022,7 @@ async def test_relation_discovery_rejects_candidate_support_change_before_commit
         db,
         run_id="projection-stale-candidate-support",
     )
-    challenger_evidence = await db.get_active_memory_support_evidence(challenger.id)
+    challenger_evidence = await active_support_evidence(db, challenger.id)
     assert len(challenger_evidence) == 1
     unit = await db.get_current_relation_evidence_unit(
         challenger.id,
@@ -8593,7 +8537,7 @@ async def test_new_projected_memory_commit_survives_vector_outbox_delivery_failu
     )
 
     [memory] = await db.list_memories(source="src-1", status="active")
-    support = await db.get_active_memory_support_evidence(memory.id, source_id="src-1")
+    support = await active_support_evidence(db, memory.id, source_id="src-1")
     assert stats["added"] == 1
     assert stats["vector_delivery_pending"] == 1
     assert len(support) == 1
@@ -8855,7 +8799,6 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
                 entity_refs=["A7"],
                 extraction_context="A7 is retained and marked as reduced retro chain.",
                 evidence_quote="A7 is retained and marked as reduced retro chain.",
-                evidence_resolved_from_block=True,
             )
         ],
     )
@@ -9249,13 +9192,13 @@ async def test_reused_evidence_advances_only_support_validation_plan_across_revi
         if version == 5:
             with pytest.raises(RuntimeError, match="injected after Support attach"):
                 await commit()
-            support = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+            support = await active_support_evidence(db, incumbent.id, source_id="src-1")
             assert {item.validation_unit_revision_id for item in support} == {"baseline-unit-v4"}
             assert (await db.get_current_source_unit_revision(first.source_units[0].id)).id == "baseline-unit-v4"
             break
         stats = await commit()
         assert stats["noop"] == 1
-        support = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+        support = await active_support_evidence(db, incumbent.id, source_id="src-1")
         assert {item.validation_unit_revision_id for item in support} == {revision.id}
         assert len({item.validation_plan_id for item in support}) == 1
         assert support[0].validation_plan_id is not None
@@ -9391,7 +9334,7 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
         return current, stats
 
     second, _ = await advance(first, 2)
-    old_support = await db.get_active_memory_support_evidence(skipped.id, source_id="src-1")
+    old_support = await active_support_evidence(db, skipped.id, source_id="src-1")
     assert old_support and {part.validation_unit_revision_id for part in old_support} == {second.source_unit_revisions[0].id}
     assert all(part.validation_plan_id for part in old_support)
     if mixed_supports:
@@ -9423,7 +9366,7 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
             memory_id=skipped.id, evidence_unit_id=alternate.id,
             source_id="src-1", access_context_hash=alternate.access_context_hash,
         ))
-        old_support = await db.get_active_memory_support_evidence(skipped.id, source_id="src-1")
+        old_support = await active_support_evidence(db, skipped.id, source_id="src-1")
         assert len({part.evidence_unit_id for part in old_support}) == 2
     old_units = {part.evidence_unit_id: await db.get_evidence_unit(part.evidence_unit_id) for part in old_support}
     old_memory = await db.get_memory(skipped.id)
@@ -9436,7 +9379,7 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
     assert stats["support_revalidation_unresolved_capacity_count"] == (1 if skip_stage == "support" else 0)
 
     assert (await db.get_current_source_unit_revision(first.source_units[0].id)).id == third.source_unit_revisions[0].id
-    remaining_support = await db.get_active_memory_support_evidence(skipped.id, source_id="src-1")
+    remaining_support = await active_support_evidence(db, skipped.id, source_id="src-1")
     remaining_by_reference = {part.reference_id: part for part in remaining_support}
     assert all(remaining_by_reference.get(part.reference_id) == part for part in old_support)
     for unit_id, unit in old_units.items():
@@ -9448,7 +9391,7 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
         added_support = [part for part in remaining_support if part.reference_id not in {old.reference_id for old in old_support}]
         assert len(added_support) == 1
         assert added_support[0].validation_unit_revision_id == third.source_unit_revisions[0].id
-    continued_support = await db.get_active_memory_support_evidence(continued.id, source_id="src-1")
+    continued_support = await active_support_evidence(db, continued.id, source_id="src-1")
     assert continued_support and {part.validation_unit_revision_id for part in continued_support} == {third.source_unit_revisions[0].id}
     assert (await db.get_memory(skipped.id)).status == "active"
     assert (await db.get_memory(continued.id)).status == "active"
@@ -9461,7 +9404,7 @@ async def test_unresolved_support_preserves_its_baseline_and_resumes_after_sourc
     client.skip_claim = False
     client.assessments.clear()
     fourth, resumed_stats = await advance(third, 4)
-    resumed = await db.get_active_memory_support_evidence(skipped.id, source_id="src-1")
+    resumed = await active_support_evidence(db, skipped.id, source_id="src-1")
     assert resumed
     assert {part.validation_unit_revision_id for part in resumed} == {fourth.source_unit_revisions[0].id}
     assert {part.validation_plan_id for part in resumed}.isdisjoint(
@@ -9538,7 +9481,7 @@ async def test_program_rebind_commits_without_support_call(db):
     second_body = body.replace("Edition 1.", "Edition 2.")
     second = page("rebind-v2", second_body, b"diagram-1", "1", prior=first)
     await advance(second, second_body, 2)
-    established = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    established = await active_support_evidence(db, incumbent.id, source_id="src-1")
     assert established[0].raw_content_sha256 and client.support_prompts
 
     # Only an Artifact that is not inference eligible changed: no readable content changed.
@@ -9550,7 +9493,7 @@ async def test_program_rebind_commits_without_support_call(db):
     assert client.support_prompts == []
     assert stats["support_revalidation_model_call_count"] == 0
     assert stats["support_revalidation_program_rebind_count"] == 1
-    rebound = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    rebound = await active_support_evidence(db, incumbent.id, source_id="src-1")
     assert {part.validation_unit_revision_id for part in rebound} == {third.source_unit_revisions[0].id}
     assert {part.validation_plan_id for part in rebound}.isdisjoint({part.validation_plan_id for part in established})
     assert (await db.get_memory(incumbent.id)).status == "active"
@@ -9585,7 +9528,7 @@ async def test_unaffected_change_rebinds_and_commits_with_its_receipt(db):
     )
     # The legacy Support has no digests yet, so this advance reads it and records them.
     await advance(second, second_body, 2)
-    established = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    established = await active_support_evidence(db, incumbent.id, source_id="src-1")
     assert established[0].raw_content_sha256 and client.support_prompts
 
     client.read_support = False
@@ -9609,7 +9552,7 @@ async def test_unaffected_change_rebinds_and_commits_with_its_receipt(db):
     assert stats["support_revalidation_completion_count"] == 1
     unit_id = first.source_units[0].id
     assert (await db.get_current_source_unit_revision(unit_id)).id == third.source_unit_revisions[0].id
-    rebound = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    rebound = await active_support_evidence(db, incumbent.id, source_id="src-1")
     assert {part.validation_unit_revision_id for part in rebound} == {third.source_unit_revisions[0].id}
     assert {part.validation_plan_id for part in rebound}.isdisjoint({part.validation_plan_id for part in established})
     assert (await db.get_memory(incumbent.id)).status == "active"
@@ -9658,7 +9601,7 @@ async def test_unusable_baseline_snapshot_is_assessed_with_diagnostic(db, monkey
     assessed = json.loads(request.split("<assessment>", 1)[1].split("</assessment>", 1)[0])
     assert not assessed["removed_historical"]
     monkeypatch.setattr(db, "get_active_memory_support_evidence_many", stored)
-    renewed = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    renewed = await active_support_evidence(db, incumbent.id, source_id="src-1")
     assert {part.validation_unit_revision_id for part in renewed} == {third.source_unit_revisions[0].id}
 
 
@@ -9728,5 +9671,5 @@ async def test_transient_support_failure_leaves_revision_uncommitted_and_retry_c
     assert (await db.get_current_source_unit_revision(unit_id)).id == third.source_unit_revisions[0].id
     contents = {row["content"] for row in await db.db.execute_fetchall("SELECT content FROM memories")}
     assert contents == {claim, candidate_text}
-    renewed = await db.get_active_memory_support_evidence(incumbent.id, source_id="src-1")
+    renewed = await active_support_evidence(db, incumbent.id, source_id="src-1")
     assert {part.validation_unit_revision_id for part in renewed} == {third.source_unit_revisions[0].id}

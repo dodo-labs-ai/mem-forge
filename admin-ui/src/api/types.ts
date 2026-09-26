@@ -136,7 +136,6 @@ export interface MemoryEvidenceGroup {
   doc_id: string | null;
   document: MemoryEvidenceDocument | null;
   current: boolean;
-  legacy_limited: boolean;
   items: MemoryEvidenceItem[];
 }
 
@@ -306,13 +305,6 @@ export interface SourceConnectionStatus {
   reason: SourceConnectionStatusReason | null;
 }
 
-export interface SourceLifecycleMaintenance {
-  status: "queued" | "running" | "completed" | "failed";
-  created_at?: string | null;
-  started_at?: string | null;
-  finished_at?: string | null;
-}
-
 export interface Source {
   id: string;
   type: string;
@@ -333,7 +325,6 @@ export interface Source {
   doc_count: number;
   memory_count?: number;
   sync?: SyncStatus | null;
-  lifecycle_maintenance?: SourceLifecycleMaintenance | null;
   connection_status?: SourceConnectionStatus | null;
   created_at: string;
   /**

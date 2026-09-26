@@ -216,14 +216,8 @@ class RawMemory:
     valid_until: str | None = None
     extraction_context: str | None = None
     evidence_quote: str | None = None
-    # Transient model-facing address. Extraction resolves and clears it before
-    # candidates enter durable derivation or lifecycle state.
-    evidence_block_id: str | None = None
-    # Application validation marker. Unlike the model-facing Block ID, this may
-    # survive until the resolved excerpt is materialized as durable Evidence.
-    evidence_resolved_from_block: bool = False
-    # Exact current-revision coordinates resolved from the transient Block.
-    # These survive derivation caching so repeated excerpts keep precise anchors.
+    # Exact current-revision coordinates of the quoted Evidence. These survive
+    # derivation caching so repeated excerpts keep precise anchors.
     evidence_range_start: int | None = None
     evidence_range_end: int | None = None
     evidence_anchor: str | None = None
@@ -569,14 +563,6 @@ class SourceArtifactCleanupTask:
 
 @dataclass(frozen=True)
 class SourceDeletionResult:
-    retired_memory_ids: tuple[str, ...] = ()
-    retired_search_cleanup_required: bool = True
-
-
-@dataclass(frozen=True)
-class SourceLifecycleResetResult:
-    """Derived-state cleanup outcome for an in-place source rebaseline."""
-
     retired_memory_ids: tuple[str, ...] = ()
     retired_search_cleanup_required: bool = True
 

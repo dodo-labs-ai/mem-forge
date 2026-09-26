@@ -3,6 +3,7 @@ from dataclasses import replace
 import pytest
 
 from tests.test_evidence_unit_support import db as db, _seed_complete_unit_support
+from tests.unit_support_fixture import active_support_evidence, withdraw_lifecycle_gate
 
 
 @pytest.mark.asyncio
@@ -100,10 +101,10 @@ async def test_gated_review_retains_last_successful_support_plan(db):
     await db.enable_lifecycle_gate(source_id)
     for plan_id, action in (("verified-plan", ReconcileAction.NOOP), ("review-plan", ReconcileAction.DELETE)):
         if action is ReconcileAction.DELETE:
-            await db.gate_destructive_lifecycle(source_id, reason="unresolved historical provenance")
+            await withdraw_lifecycle_gate(db, source_id)
         plan = await _support_plan(db, memory_id, unit_id, plan_id=plan_id, action=action)
         await db.apply_lifecycle_plan(plan)
-        support = await db.get_active_memory_support_evidence(memory_id, source_id=source_id)
+        support = await active_support_evidence(db, memory_id, source_id=source_id)
         assert {item.validation_plan_id for item in support} == {"verified-plan"}
         assert {item.validation_unit_revision_id for item in support} == {"unitrev-1"}
     assert len(await db.list_lifecycle_reviews(source_id)) == 1
@@ -135,7 +136,7 @@ async def test_shared_evidence_keeps_each_memory_validation_baseline_independent
         await db.apply_lifecycle_plan(await _support_plan(
             db, other.id, unit_id, plan_id="other-verified-plan", action=ReconcileAction.NOOP,
         ))
-    before = await db.get_active_memory_support_evidence(other.id, source_id=source_id)
+    before = await active_support_evidence(db, other.id, source_id=source_id)
     assert before
     assert {item.validation_plan_id for item in before} == {"other-verified-plan" if other_has_baseline else None}
     assert {item.validation_unit_revision_id for item in before} == {"unitrev-1" if other_has_baseline else None}

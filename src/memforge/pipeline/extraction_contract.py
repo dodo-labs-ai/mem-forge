@@ -2,54 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 __all__ = [
     "CONTRACT_SUPERSEDED",
     "DURABLE_MEMORY_QUALITY_RULES",
     "PROJECTION_EXTRACTION_CONTRACT_VERSION",
-    "PROJECTION_EXTRACTION_V8",
-    "PROJECTION_EXTRACTION_V9",
     "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
-    "ProjectionExtractionContract",
-    "projection_extraction_contract",
 ]
 
 
-PROJECTION_EXTRACTION_V8 = "projection-extraction-v8"
-PROJECTION_EXTRACTION_V9 = "projection-extraction-v9"
+# Recorded on every Source derivation and hashed into its batch identities.
+# Stored derivations with any other value are superseded, never resumed.
+PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v9"
 PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION = 4
-PROJECTION_EXTRACTION_CONTRACT_VERSION = PROJECTION_EXTRACTION_V8
 CONTRACT_SUPERSEDED = "CONTRACT_SUPERSEDED"
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectionExtractionContract:
-    """Versioned extraction behavior recorded on every Source derivation."""
-
-    version: str
-    uses_fragment_catalog: bool
-
-
-_PROJECTION_EXTRACTION_CONTRACTS = {
-    PROJECTION_EXTRACTION_V8: ProjectionExtractionContract(
-        version=PROJECTION_EXTRACTION_V8,
-        uses_fragment_catalog=False,
-    ),
-    PROJECTION_EXTRACTION_V9: ProjectionExtractionContract(
-        version=PROJECTION_EXTRACTION_V9,
-        uses_fragment_catalog=True,
-    ),
-}
-
-
-def projection_extraction_contract(version: str) -> ProjectionExtractionContract:
-    """Resolve one historical or current contract without inferring by version number."""
-
-    try:
-        return _PROJECTION_EXTRACTION_CONTRACTS[version]
-    except KeyError as exc:
-        raise ValueError(f"unknown projection extraction contract: {version}") from exc
 
 
 DURABLE_MEMORY_QUALITY_RULES = """Top rules (apply these first; reject candidates that fail any of them):

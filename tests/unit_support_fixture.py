@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 
 from memforge.memory.evidence import (
+    ActiveSupportEvidence,
     EvidencePartKind,
     EvidenceReference,
     EvidenceRole,
@@ -187,3 +188,28 @@ def select_quoted_fragments(
             )
         )
     return selected
+
+
+async def active_support_evidence(
+    db: Database,
+    memory_id: str,
+    *,
+    source_id: str | None = None,
+) -> tuple[ActiveSupportEvidence, ...]:
+    """Return one Memory's active Support Evidence through the batched reader."""
+
+    evidence = await db.get_active_memory_support_evidence_many(
+        (memory_id,),
+        source_id=source_id,
+    )
+    return evidence[memory_id]
+
+
+async def withdraw_lifecycle_gate(db: Database, source_id: str) -> None:
+    """Return a Source to the gated default that a Source without an enabled gate has."""
+
+    await db.db.execute(
+        "DELETE FROM source_lifecycle_gates WHERE source_id = ?",
+        (source_id,),
+    )
+    await db.db.commit()

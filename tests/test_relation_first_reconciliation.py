@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
 import json
 
 from tests.revision_client_fixture import (
@@ -18,7 +20,14 @@ from memforge.llm.structured import (
     MemoryRelationResponse,
     StructuredLlmError,
 )
-from memforge.memory.evidence import RelationDirection
+from memforge.memory.evidence import (
+    EvidencePartKind,
+    EvidenceRole,
+    RelationDirection,
+    ResolvedEvidencePart,
+    ResolvedEvidenceSelection,
+)
+from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.relation_classifier import MemoryRelationType
 from memforge.models import Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
@@ -41,6 +50,40 @@ def _memory(memory_id: str, content: str) -> Memory:
         content_hash=content_hash(content),
         created_at=now,
         updated_at=now,
+    )
+
+
+def _with_selection(raw: RawMemory) -> RawMemory:
+    """Give a quoted candidate the exact Evidence selection extraction resolves."""
+
+    assert raw.source_observation_id and raw.evidence_quote
+    digest = hashlib.sha256(raw.evidence_quote.encode("utf-8")).hexdigest()
+    return replace(
+        raw,
+        resolved_evidence_selection=ResolvedEvidenceSelection(
+            source_id="src-relation-first",
+            source_unit_id="unit-relation-first",
+            target_unit_revision_id="unitrev-relation-first",
+            access_context_hash="access-relation-first",
+            catalog_digest="catalog-relation-first",
+            compiler_contract_version=1,
+            parts=(
+                ResolvedEvidencePart(
+                    role=EvidenceRole.PRIMARY,
+                    kind=EvidencePartKind.TEXT,
+                    anchor=SourceAnchor(
+                        kind=AnchorKind.REVISION_RANGE,
+                        observation_id=raw.source_observation_id,
+                        observation_revision_id=f"{raw.source_observation_id}-rev",
+                        range_start=0,
+                        range_end=len(raw.evidence_quote),
+                    ),
+                    raw_content_sha256=digest,
+                    presentation_sha256=digest,
+                    excerpt=raw.evidence_quote,
+                ),
+            ),
+        ),
     )
 
 
@@ -84,14 +127,13 @@ async def test_supported_incumbent_and_unrelated_case25_keep_and_add() -> None:
         "mem-cases20-24",
         "Component tests cover batch-handling cases 20 through 24.",
     )
-    case25 = RawMemory(
+    case25 = _with_selection(RawMemory(
         content="Case 25 verifies that a mixed valid and invalid batch returns partial results.",
         memory_type="fact",
         source_observation_id="obs-case25",
         evidence_quote="Case 25 verifies that a mixed valid and invalid batch returns partial results.",
-        evidence_resolved_from_block=True,
         evidence_anchor="projection_batch",
-    )
+    ))
 
     class RelationFirstClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
@@ -130,7 +172,7 @@ async def test_supported_incumbent_and_unrelated_case25_keep_and_add() -> None:
 @pytest.mark.asyncio
 async def test_additive_refinement_with_complete_current_evidence_is_revision() -> None:
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
-    refinement = RawMemory(
+    refinement = _with_selection(RawMemory(
         content="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
         memory_type="fact",
         evidence_quote=(
@@ -138,8 +180,7 @@ async def test_additive_refinement_with_complete_current_evidence_is_revision() 
         ),
         source_observation_id="obs-timeout",
         evidence_anchor="projection_batch",
-        evidence_resolved_from_block=True,
-    )
+    ))
 
     class RevisionClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
@@ -196,14 +237,13 @@ async def test_additive_refinement_with_complete_current_evidence_is_revision() 
 @pytest.mark.asyncio
 async def test_revision_response_failure_cannot_fall_back_to_add() -> None:
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
-    refinement = RawMemory(
+    refinement = _with_selection(RawMemory(
         content="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
         memory_type="fact",
         evidence_quote="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
-        evidence_resolved_from_block=True,
         evidence_anchor="projection_batch",
         source_observation_id="obs-timeout",
-    )
+    ))
 
     class ProofFailureClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
@@ -232,14 +272,13 @@ async def test_revision_response_failure_cannot_fall_back_to_add() -> None:
 @pytest.mark.asyncio
 async def test_revision_evidence_that_supports_only_added_detail_falls_back() -> None:
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
-    refinement = RawMemory(
+    refinement = _with_selection(RawMemory(
         content="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
         memory_type="fact",
         evidence_quote="Configurable with CLIENT_TIMEOUT.",
-        evidence_resolved_from_block=True,
         evidence_anchor="projection_batch",
         source_observation_id="obs-timeout",
-    )
+    ))
 
     class IncompleteEvidenceClient(RevisionClientFixture):
         async def classify_memory_relations(self, prompt: str, **kwargs):
@@ -282,14 +321,13 @@ async def test_revision_evidence_that_supports_only_added_detail_falls_back() ->
 @pytest.mark.asyncio
 async def test_missing_conditional_assessment_preserves_incumbent() -> None:
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
-    refinement = RawMemory(
+    refinement = _with_selection(RawMemory(
         content="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
         memory_type="fact",
         evidence_quote="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
-        evidence_resolved_from_block=True,
         evidence_anchor="projection_batch",
         source_observation_id="obs-timeout",
-    )
+    ))
 
     class IncompleteProofClient(RevisionClientFixture):
         def __init__(self) -> None:
@@ -324,16 +362,14 @@ async def test_missing_conditional_assessment_preserves_incumbent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unprovided_required_evidence_blocks_revision() -> None:
+async def test_candidate_without_resolved_evidence_blocks_revision() -> None:
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
     refinement = RawMemory(
         content="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
         memory_type="fact",
         evidence_quote="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
-        evidence_resolved_from_block=True,
         evidence_anchor="projection_batch",
         source_observation_id="obs-timeout",
-        required_source_observation_ids=["obs-config-scope"],
     )
 
     class RequiredEvidenceClient(RevisionClientFixture):

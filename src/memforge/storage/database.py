@@ -68,7 +68,6 @@ from memforge.models import (
     SHARED_PROJECT_KEY,
     SourceArtifactCleanupTask,
     SourceDeletionResult,
-    SourceLifecycleResetResult,
     SourceSyncInput,
     SourceSyncRun,
     SyncState,
@@ -115,16 +114,9 @@ from memforge.memory.evidence import (
     validate_evidence_references,
 )
 from memforge.memory.lifecycle_plan import (
-    build_unprovable_cutover_resolution,
     ClaimIdentityPolicy,
     ContestedSupportEdge,
     contested_supports_from_staged_evidence,
-    CutoverFindingReason,
-    CutoverFindingStatus,
-    LifecycleCutoverFinding,
-    LifecycleBackfillJob,
-    LifecycleBackfillJobStatus,
-    LegacyMemoryProvenance,
     LifecycleGate,
     LifecycleGateState,
     LifecycleMutationType,
@@ -142,8 +134,6 @@ from memforge.memory.lifecycle_plan import (
     pending_review_contested_supports,
     plan_requires_complete_current_support,
     plan_skips_support_revalidation,
-    unprovable_cutover_retirement_plan_id,
-    validate_unprovable_cutover_evidence,
 )
 from memforge.memory.origin import references_source_row
 from memforge.memory.cross_document_relation import (
@@ -1388,39 +1378,6 @@ CREATE TABLE IF NOT EXISTS source_lifecycle_gates (
     enabled_at  TEXT,
     updated_at  TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS lifecycle_cutover_findings (
-    id                        TEXT PRIMARY KEY,
-    source_id                 TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    memory_id                 TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    reason                    TEXT NOT NULL,
-    status                    TEXT NOT NULL CHECK (status IN ('open', 'resolved')),
-    available_provenance_json TEXT NOT NULL DEFAULT '{}',
-    mapping_attempt_json      TEXT NOT NULL DEFAULT '{}',
-    observation_id            TEXT,
-    source_unit_id            TEXT,
-    created_at                TEXT NOT NULL,
-    updated_at                TEXT NOT NULL,
-    resolved_at               TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_cutover_findings_source_status
-    ON lifecycle_cutover_findings(source_id, status);
-
-CREATE TABLE IF NOT EXISTS lifecycle_backfill_jobs (
-    id               TEXT PRIMARY KEY,
-    source_id        TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    status           TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed')),
-    scanned_memories INTEGER NOT NULL DEFAULT 0,
-    mapped_memories  INTEGER NOT NULL DEFAULT 0,
-    finding_count    INTEGER NOT NULL DEFAULT 0,
-    error            TEXT,
-    created_at       TEXT NOT NULL,
-    started_at       TEXT,
-    completed_at     TEXT,
-    updated_at       TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_lifecycle_backfill_jobs_source
-    ON lifecycle_backfill_jobs(source_id, created_at);
 
 CREATE TABLE IF NOT EXISTS evidence_references (
     id                          TEXT PRIMARY KEY,
@@ -4483,6 +4440,14 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "DROP TABLE IF EXISTS memory_support_assertions",
         ],
     ),
+    (
+        99,
+        "Remove lifecycle cutover storage",
+        [
+            "DROP TABLE IF EXISTS lifecycle_cutover_findings",
+            "DROP TABLE IF EXISTS lifecycle_backfill_jobs",
+        ],
+    ),
 ]
 
 
@@ -5612,15 +5577,6 @@ class Database:
         source = await self.get_source(source_id)
         if source["status"] != "active":
             raise ValueError(f"Source is not active: {source_id}")
-        async with self.db.execute(
-            """SELECT id FROM lifecycle_backfill_jobs
-               WHERE source_id = ? AND status IN ('queued', 'running')
-               ORDER BY created_at LIMIT 1""",
-            (source_id,),
-        ) as cursor:
-            lifecycle_job = await cursor.fetchone()
-        if lifecycle_job is not None:
-            raise ValueError(f"source lifecycle maintenance active: {lifecycle_job['id']}")
 
         if retry_job_id is not None:
             target = await self.get_local_agent_job(retry_job_id)
@@ -5896,11 +5852,6 @@ class Database:
                        AND sync_schedule_enabled = 1
                        AND sync_schedule_next_at IS NOT NULL
                        AND sync_schedule_next_at <= ?
-                       AND NOT EXISTS (
-                           SELECT 1 FROM lifecycle_backfill_jobs j
-                           WHERE j.source_id = s.id
-                             AND j.status IN ('queued', 'running')
-                       )
                        ORDER BY s.sync_schedule_next_at, s.created_at LIMIT ?""",
                     (due_at, limit),
                 ) as cursor:
@@ -7533,9 +7484,6 @@ class Database:
                         if row["doc_id"] is not None
                         else None
                     ),
-                    "legacy_limited": (
-                        str(row["evidence_provenance"]) == "legacy_limited"
-                    ),
                 },
             )
             support_ids = header["support_ids"]
@@ -7649,7 +7597,6 @@ class Database:
                         for item in items
                         if item.grants_support
                     ),
-                    legacy_limited=bool(header["legacy_limited"]),
                     items=items,
                 )
             )
@@ -7904,37 +7851,6 @@ class Database:
             next_cursor=units[-1].id if has_more and units else None,
         )
 
-    async def list_legacy_memory_provenance(
-        self,
-        source_id: str,
-    ) -> list[LegacyMemoryProvenance]:
-        rows = await self.db.execute_fetchall(
-            """SELECT DISTINCT
-                   m.id AS memory_id, ms.doc_id, ms.source_id, ms.source_type,
-                   m.content, ms.excerpt, m.visibility, m.owner_user_id,
-                   m.project_key, m.repo_identifier
-               FROM memory_sources ms
-               JOIN memories m ON m.id = ms.memory_id
-               WHERE ms.source_id = ? AND m.status = 'active'
-               ORDER BY m.id, ms.doc_id""",
-            (source_id,),
-        )
-        return [
-            LegacyMemoryProvenance(
-                memory_id=row["memory_id"],
-                doc_id=row["doc_id"],
-                source_id=row["source_id"],
-                source_type=row["source_type"],
-                content=row["content"],
-                excerpt=row["excerpt"],
-                visibility=row["visibility"],
-                owner_user_id=row["owner_user_id"],
-                project_key=row["project_key"],
-                repo_identifier=row["repo_identifier"],
-            )
-            for row in rows
-        ]
-
     async def count_active_source_memories_without_support(self, source_id: str) -> int:
         """Count active Memories whose same-source support invariant is absent."""
 
@@ -7986,19 +7902,6 @@ class Database:
             row = await cursor.fetchone()
         return int(row["count"] if row is not None else 0)
 
-    async def count_active_source_memories(self, source_id: str) -> int:
-        """Count active source-backed Memories without loading their LOB content."""
-
-        async with self.db.execute(
-            """SELECT COUNT(DISTINCT ms.memory_id) AS count
-               FROM memory_sources ms
-               JOIN memories m ON m.id = ms.memory_id
-               WHERE ms.source_id = ? AND m.status = 'active'""",
-            (source_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return int(row["count"] if row is not None else 0)
-
     async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate:
         async with self.db.execute(
             "SELECT * FROM source_lifecycle_gates WHERE source_id = ?",
@@ -8009,7 +7912,7 @@ class Database:
             return LifecycleGate(
                 source_id=source_id,
                 state=LifecycleGateState.GATED,
-                reason="lifecycle cutover audit has not completed",
+                reason="lifecycle gate has not been enabled for this Source",
             )
         return LifecycleGate(
             source_id=row["source_id"],
@@ -8065,7 +7968,7 @@ class Database:
         *,
         source_activity: SourceActivityLease | None = None,
     ) -> LifecycleGate:
-        """Enable destructive lifecycle only after the durable audit closes."""
+        """Enable destructive lifecycle once every active Memory has complete Support."""
 
         async with self._write_lock:
             try:
@@ -8073,15 +7976,6 @@ class Database:
                     source_id,
                     source_activity,
                 )
-                async with self.db.execute(
-                    """SELECT COUNT(*) AS count
-                       FROM lifecycle_cutover_findings
-                       WHERE source_id = ? AND status = 'open'""",
-                    (source_id,),
-                ) as cursor:
-                    finding_count = int((await cursor.fetchone())["count"])
-                if finding_count:
-                    raise ValueError("open lifecycle cutover findings block the lifecycle gate")
                 if await self.count_active_source_memories_without_support(source_id):
                     raise ValueError("source-backed Memory lacks validated support lineage")
                 if await self.count_active_supported_memories_without_source_provenance(source_id):
@@ -8107,341 +8001,6 @@ class Database:
                 raise
         return await self.get_lifecycle_gate(source_id)
 
-    async def gate_destructive_lifecycle(
-        self,
-        source_id: str,
-        *,
-        reason: str,
-        source_activity: SourceActivityLease | None = None,
-    ) -> LifecycleGate:
-        now = _now_iso()
-        async with self._write_lock:
-            try:
-                await self._assert_source_activity_fence_unlocked(
-                    source_id,
-                    source_activity,
-                )
-                await self.db.execute(
-                    """INSERT INTO source_lifecycle_gates (
-                        source_id, state, reason, audited_at, enabled_at, updated_at
-                    ) VALUES (?, 'gated', ?, ?, NULL, ?)
-                    ON CONFLICT(source_id) DO UPDATE SET
-                        state='gated', reason=excluded.reason,
-                        audited_at=excluded.audited_at, updated_at=excluded.updated_at""",
-                    (source_id, reason, now, now),
-                )
-                await self._assert_source_activity_fence_unlocked(
-                    source_id,
-                    source_activity,
-                )
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-        return await self.get_lifecycle_gate(source_id)
-
-    async def upsert_lifecycle_cutover_finding(
-        self,
-        finding: LifecycleCutoverFinding,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> None:
-        if finding.status is not CutoverFindingStatus.OPEN:
-            raise ValueError("lifecycle finding upsert accepts only open findings")
-        now = _now_iso()
-        created_at = finding.created_at or now
-        async with self._write_lock:
-            try:
-                await self._assert_source_activity_fence_unlocked(
-                    finding.source_id,
-                    source_activity,
-                )
-                async with self.db.execute(
-                    """SELECT source_id, memory_id, reason, status
-                       FROM lifecycle_cutover_findings WHERE id = ?""",
-                    (finding.id,),
-                ) as cursor:
-                    existing = await cursor.fetchone()
-                if existing is not None and (
-                    str(existing["source_id"]) != finding.source_id or str(existing["memory_id"]) != finding.memory_id
-                ):
-                    raise ValueError("lifecycle finding identity mismatch")
-                if (
-                    existing is not None
-                    and CutoverFindingStatus(str(existing["status"])) is CutoverFindingStatus.RESOLVED
-                ):
-                    await self._assert_source_activity_fence_unlocked(
-                        finding.source_id,
-                        source_activity,
-                    )
-                    await self.db.commit()
-                    return
-                await self.db.execute(
-                    """INSERT INTO lifecycle_cutover_findings (
-                        id, source_id, memory_id, reason, status,
-                        available_provenance_json, mapping_attempt_json,
-                        observation_id, source_unit_id, created_at, updated_at, resolved_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        reason=excluded.reason,
-                        available_provenance_json=excluded.available_provenance_json,
-                        mapping_attempt_json=excluded.mapping_attempt_json,
-                        updated_at=excluded.updated_at
-                    WHERE lifecycle_cutover_findings.status = 'open'""",
-                    (
-                        finding.id,
-                        finding.source_id,
-                        finding.memory_id,
-                        finding.reason.value,
-                        finding.status.value,
-                        json.dumps(dict(finding.available_provenance), sort_keys=True),
-                        json.dumps(dict(finding.mapping_attempt), sort_keys=True),
-                        finding.observation_id,
-                        finding.source_unit_id,
-                        created_at,
-                        finding.updated_at or now,
-                        finding.resolved_at,
-                    ),
-                )
-                await self.db.execute(
-                    """INSERT INTO source_lifecycle_gates (
-                        source_id, state, reason, audited_at, enabled_at, updated_at
-                    ) VALUES (?, 'gated', 'open lifecycle cutover finding', ?, NULL, ?)
-                    ON CONFLICT(source_id) DO UPDATE SET
-                        state='gated', reason=excluded.reason,
-                        audited_at=excluded.audited_at, updated_at=excluded.updated_at""",
-                    (finding.source_id, now, now),
-                )
-                await self._assert_source_activity_fence_unlocked(
-                    finding.source_id,
-                    source_activity,
-                )
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-
-    async def get_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-    ) -> LifecycleCutoverFinding | None:
-        async with self.db.execute(
-            "SELECT * FROM lifecycle_cutover_findings WHERE id = ?",
-            (finding_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return self._row_to_lifecycle_cutover_finding(row) if row is not None else None
-
-    async def list_lifecycle_cutover_findings(
-        self,
-        source_id: str,
-        *,
-        status: CutoverFindingStatus | None = None,
-    ) -> list[LifecycleCutoverFinding]:
-        params: list[object] = [source_id]
-        status_clause = ""
-        if status is not None:
-            status_clause = " AND status = ?"
-            params.append(status.value)
-        rows = await self.db.execute_fetchall(
-            "SELECT * FROM lifecycle_cutover_findings WHERE source_id = ?" + status_clause + " ORDER BY created_at, id",
-            tuple(params),
-        )
-        return [self._row_to_lifecycle_cutover_finding(row) for row in rows]
-
-    async def create_lifecycle_backfill_job(
-        self,
-        job: LifecycleBackfillJob,
-    ) -> LifecycleBackfillJob:
-        return await self._create_lifecycle_backfill_job(
-            job,
-            cancel_active_sync=False,
-        )
-
-    async def create_source_rebaseline_job(
-        self,
-        job: LifecycleBackfillJob,
-    ) -> LifecycleBackfillJob:
-        """Atomically fence active sync work and admit destructive maintenance."""
-
-        return await self._create_lifecycle_backfill_job(
-            job,
-            cancel_active_sync=True,
-        )
-
-    async def _create_lifecycle_backfill_job(
-        self,
-        job: LifecycleBackfillJob,
-        *,
-        cancel_active_sync: bool,
-    ) -> LifecycleBackfillJob:
-        if job.status is not LifecycleBackfillJobStatus.QUEUED:
-            raise ValueError("new lifecycle backfill job must be queued")
-        now = _now_iso()
-        async with self._write_lock:
-            try:
-                source_lock = await self.db.execute(
-                    "UPDATE sources SET status = status WHERE id = ?",
-                    (job.source_id,),
-                )
-                if source_lock.rowcount != 1:
-                    raise ValueError(f"Source not found: {job.source_id}")
-                async with self.db.execute(
-                    """SELECT run_id FROM source_sync_runs
-                       WHERE source_id = ? AND status IN ('pending', 'running')
-                       ORDER BY created_at LIMIT 1""",
-                    (job.source_id,),
-                ) as cursor:
-                    active_run = await cursor.fetchone()
-                if active_run is not None and not cancel_active_sync:
-                    raise ValueError(f"source sync run already active: {active_run['run_id']}")
-                async with self.db.execute(
-                    """SELECT job_id FROM local_agent_jobs
-                       WHERE source_id = ? AND status IN ('queued', 'leased')
-                       ORDER BY created_at LIMIT 1""",
-                    (job.source_id,),
-                ) as cursor:
-                    active_local_job = await cursor.fetchone()
-                if active_local_job is not None:
-                    raise ValueError(f"local agent job already active: {active_local_job['job_id']}")
-                async with self.db.execute(
-                    """SELECT operation_id FROM source_access_transitions
-                       WHERE source_id = ?
-                         AND status IN ('queued', 'running', 'failed')
-                       ORDER BY created_at LIMIT 1""",
-                    (job.source_id,),
-                ) as cursor:
-                    active_access = await cursor.fetchone()
-                if active_access is not None:
-                    raise ValueError(f"source access transition already active: {active_access['operation_id']}")
-                async with self.db.execute(
-                    "SELECT source_id, status FROM lifecycle_backfill_jobs WHERE id = ?",
-                    (job.id,),
-                ) as cursor:
-                    existing = await cursor.fetchone()
-                if existing is not None:
-                    if existing["source_id"] != job.source_id:
-                        raise ValueError("lifecycle backfill job retry identity mismatch")
-                    if existing["status"] in {
-                        LifecycleBackfillJobStatus.QUEUED.value,
-                        LifecycleBackfillJobStatus.RUNNING.value,
-                    }:
-                        await self._acquire_source_activity_unlocked(
-                            activity_id=job.id,
-                            source_id=job.source_id,
-                            kind=SourceActivityKind.MAINTENANCE,
-                            capability=job.id,
-                            lease_seconds=900,
-                            bump_epoch=True,
-                        )
-                    await self.db.commit()
-                    stored = await self.get_lifecycle_backfill_job(job.id)
-                    assert stored is not None
-                    return stored
-                async with self.db.execute(
-                    "SELECT id FROM lifecycle_backfill_jobs "
-                    "WHERE source_id = ? AND status IN ('queued', 'running') "
-                    "AND id <> ? LIMIT 1",
-                    (job.source_id, job.id),
-                ) as cursor:
-                    active = await cursor.fetchone()
-                if active is not None:
-                    raise ValueError(f"source lifecycle job already active: {active['id']}")
-                if active_run is not None:
-                    await self._cancel_source_sync_run_for_maintenance_unlocked(
-                        str(active_run["run_id"]),
-                        maintenance_job_id=job.id,
-                    )
-                if cancel_active_sync:
-                    # A normal sync holds this lease in addition to its durable
-                    # SourceSyncRun lease.  Revoking only SYNC leaves collection
-                    # and agent-patch state machines independent; the epoch bump
-                    # below fences any already-computed stale lifecycle commit.
-                    await self.db.execute(
-                        "DELETE FROM source_activity_leases WHERE source_id = ? AND kind = ?",
-                        (job.source_id, SourceActivityKind.SYNC.value),
-                    )
-                await self._acquire_source_activity_unlocked(
-                    activity_id=job.id,
-                    source_id=job.source_id,
-                    kind=SourceActivityKind.MAINTENANCE,
-                    capability=job.id,
-                    lease_seconds=900,
-                    bump_epoch=True,
-                )
-                await self.db.execute(
-                    """INSERT INTO lifecycle_backfill_jobs (
-                        id, source_id, status, scanned_memories, mapped_memories,
-                        finding_count, error, created_at, started_at, completed_at, updated_at
-                    ) VALUES (?, ?, 'queued', 0, 0, 0, NULL, ?, NULL, NULL, ?)""",
-                    (job.id, job.source_id, job.created_at or now, now),
-                )
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-        stored = await self.get_lifecycle_backfill_job(job.id)
-        assert stored is not None
-        return stored
-
-    async def _cancel_source_sync_run_for_maintenance_unlocked(
-        self,
-        run_id: str,
-        *,
-        maintenance_job_id: str,
-    ) -> None:
-        now = _now_iso()
-        cursor = await self.db.execute(
-            """UPDATE source_sync_runs
-               SET status = 'failed',
-                   input_snapshot_id = CASE
-                       WHEN rerun_requested = 1
-                       THEN COALESCE(rerun_input_snapshot_id, input_snapshot_id)
-                       ELSE input_snapshot_id
-                   END,
-                   input_generation_watermark = CASE
-                       WHEN rerun_requested = 1
-                       THEN COALESCE(
-                           rerun_input_generation_watermark,
-                           input_generation_watermark
-                       )
-                       ELSE input_generation_watermark
-                   END,
-                   source_config_revision = CASE
-                       WHEN rerun_requested = 1
-                       THEN COALESCE(rerun_source_config_revision, source_config_revision)
-                       ELSE source_config_revision
-                   END,
-                   predecessor_activity_id = CASE
-                       WHEN rerun_requested = 1
-                       THEN COALESCE(
-                           rerun_predecessor_activity_id,
-                           predecessor_activity_id
-                       )
-                       ELSE predecessor_activity_id
-                   END,
-                   rerun_requested = 0,
-                   rerun_input_snapshot_id = NULL,
-                   rerun_input_generation_watermark = NULL,
-                   rerun_source_config_revision = NULL,
-                   rerun_predecessor_activity_id = NULL,
-                   lease_owner = NULL,
-                   lease_expires_at = NULL,
-                   next_attempt_at = NULL,
-                   error_message = ?,
-                   completed_at = ?,
-                   updated_at = ?
-               WHERE run_id = ? AND status IN ('pending', 'running')""",
-            (
-                f"cancelled_by_source_lifecycle_maintenance:{maintenance_job_id}",
-                now,
-                now,
-                run_id,
-            ),
-        )
-        if cursor.rowcount != 1:
-            raise ValueError(f"source sync run changed during maintenance admission: {run_id}")
-
     async def _acquire_source_activity_unlocked(
         self,
         *,
@@ -8451,7 +8010,6 @@ class Database:
         capability: str | None,
         lease_seconds: int,
         expected_epoch: int | None = None,
-        bump_epoch: bool = False,
         now: datetime | None = None,
     ) -> SourceActivityLease:
         now = now or datetime.now(timezone.utc)
@@ -8492,12 +8050,6 @@ class Database:
                 (_utc_iso(lease_until), now_iso, activity_id),
             )
         else:
-            if bump_epoch:
-                epoch += 1
-                await self.db.execute(
-                    "UPDATE sources SET activity_epoch = ? WHERE id = ?",
-                    (epoch, source_id),
-                )
             await self.db.execute(
                 """INSERT INTO source_activity_leases (
                        id, source_id, kind, epoch, capability, lease_until,
@@ -8619,483 +8171,6 @@ class Database:
         if row is None:
             raise SourceActivityConflict(f"Source not found: {source_id}")
         return int(row["activity_epoch"] or 0)
-
-    async def start_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob:
-        now = _now_iso()
-        async with self._write_lock:
-            cursor = await self.db.execute(
-                """UPDATE lifecycle_backfill_jobs
-                   SET status = 'running', started_at = ?, updated_at = ?, error = NULL
-                   WHERE id = ? AND status = 'queued'""",
-                (now, now, job_id),
-            )
-            if cursor.rowcount != 1:
-                await self.db.rollback()
-                raise ValueError("lifecycle backfill job is not queued")
-            await self.db.commit()
-        stored = await self.get_lifecycle_backfill_job(job_id)
-        assert stored is not None
-        return stored
-
-    async def complete_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        scanned_memories: int,
-        mapped_memories: int,
-        finding_count: int,
-    ) -> LifecycleBackfillJob:
-        now = _now_iso()
-        async with self._write_lock:
-            cursor = await self.db.execute(
-                """UPDATE lifecycle_backfill_jobs
-                   SET status = 'completed', scanned_memories = ?, mapped_memories = ?,
-                       finding_count = ?, error = NULL, completed_at = ?, updated_at = ?
-                   WHERE id = ? AND status = 'running'""",
-                (scanned_memories, mapped_memories, finding_count, now, now, job_id),
-            )
-            if cursor.rowcount != 1:
-                await self.db.rollback()
-                raise ValueError("lifecycle backfill job is not running")
-            lease_cursor = await self.db.execute(
-                "DELETE FROM source_activity_leases WHERE id = ? AND capability = ?",
-                (job_id, job_id),
-            )
-            if lease_cursor.rowcount != 1:
-                await self.db.rollback()
-                raise SourceActivityConflict(f"source lifecycle activity lease is not current: {job_id}")
-            await self.db.commit()
-        stored = await self.get_lifecycle_backfill_job(job_id)
-        assert stored is not None
-        return stored
-
-    async def fail_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        error: str,
-        scanned_memories: int = 0,
-        mapped_memories: int = 0,
-        finding_count: int = 0,
-    ) -> LifecycleBackfillJob:
-        now = _now_iso()
-        async with self._write_lock:
-            cursor = await self.db.execute(
-                """UPDATE lifecycle_backfill_jobs
-                   SET status = 'failed', scanned_memories = ?, mapped_memories = ?,
-                       finding_count = ?, error = ?, completed_at = ?, updated_at = ?
-                   WHERE id = ? AND status IN ('queued', 'running')""",
-                (
-                    scanned_memories,
-                    mapped_memories,
-                    finding_count,
-                    error,
-                    now,
-                    now,
-                    job_id,
-                ),
-            )
-            if cursor.rowcount != 1:
-                await self.db.rollback()
-                raise ValueError("lifecycle backfill job cannot fail from its current state")
-            lease_cursor = await self.db.execute(
-                "DELETE FROM source_activity_leases WHERE id = ? AND capability = ?",
-                (job_id, job_id),
-            )
-            if lease_cursor.rowcount != 1:
-                await self.db.rollback()
-                raise SourceActivityConflict(f"source lifecycle activity lease is not current: {job_id}")
-            await self.db.commit()
-        stored = await self.get_lifecycle_backfill_job(job_id)
-        assert stored is not None
-        return stored
-
-    async def recover_stale_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        error: str,
-    ) -> LifecycleBackfillJob:
-        """Fail an orphaned lifecycle job only after its lease lost authority."""
-
-        now = datetime.now(timezone.utc)
-        now_iso = _utc_iso(now)
-        async with self._write_lock:
-            try:
-                async with self.db.execute(
-                    "SELECT * FROM lifecycle_backfill_jobs WHERE id = ?",
-                    (job_id,),
-                ) as cursor:
-                    job = await cursor.fetchone()
-                if job is None:
-                    raise LookupError(f"unknown lifecycle backfill job: {job_id}")
-                status = LifecycleBackfillJobStatus(str(job["status"]))
-                if status is LifecycleBackfillJobStatus.FAILED:
-                    await self.db.rollback()
-                    stored = self._row_to_lifecycle_backfill_job(job)
-                    return stored
-                if status not in {
-                    LifecycleBackfillJobStatus.QUEUED,
-                    LifecycleBackfillJobStatus.RUNNING,
-                }:
-                    raise ValueError("only an active lifecycle backfill job can be recovered")
-                source_id = str(job["source_id"])
-                source_lock = await self.db.execute(
-                    "UPDATE sources SET status = status WHERE id = ?",
-                    (source_id,),
-                )
-                if source_lock.rowcount != 1:
-                    raise ValueError(f"Source not found: {source_id}")
-                async with self.db.execute(
-                    "SELECT * FROM lifecycle_backfill_jobs WHERE id = ?",
-                    (job_id,),
-                ) as cursor:
-                    job = await cursor.fetchone()
-                if job is None:
-                    raise LookupError(f"unknown lifecycle backfill job: {job_id}")
-                status = LifecycleBackfillJobStatus(str(job["status"]))
-                if status not in {
-                    LifecycleBackfillJobStatus.QUEUED,
-                    LifecycleBackfillJobStatus.RUNNING,
-                }:
-                    raise ValueError("lifecycle backfill job changed during stale recovery")
-                if str(job["source_id"]) != source_id:
-                    raise SourceActivityConflict(f"source lifecycle activity retry identity mismatch: {job_id}")
-                async with self.db.execute(
-                    "SELECT source_id, capability, lease_until FROM source_activity_leases WHERE id = ?",
-                    (job_id,),
-                ) as cursor:
-                    lease = await cursor.fetchone()
-                if lease is not None:
-                    if str(lease["source_id"]) != str(job["source_id"]) or lease["capability"] != job_id:
-                        raise SourceActivityConflict(f"source lifecycle activity retry identity mismatch: {job_id}")
-                    if str(lease["lease_until"]) > now_iso:
-                        raise SourceActivityConflict(f"source lifecycle activity lease is still current: {job_id}")
-                    lease_cursor = await self.db.execute(
-                        "DELETE FROM source_activity_leases WHERE id = ? AND capability = ? AND lease_until <= ?",
-                        (job_id, job_id, now_iso),
-                    )
-                    if lease_cursor.rowcount != 1:
-                        raise SourceActivityConflict(
-                            f"source lifecycle activity lease changed during recovery: {job_id}"
-                        )
-                fenced = await self.db.execute(
-                    """UPDATE sources
-                       SET activity_epoch = COALESCE(activity_epoch, 0) + 1
-                       WHERE id = ?""",
-                    (source_id,),
-                )
-                if fenced.rowcount != 1:
-                    raise ValueError(f"Source not found: {source_id}")
-                cursor = await self.db.execute(
-                    """UPDATE lifecycle_backfill_jobs
-                       SET status = 'failed', error = ?, completed_at = ?, updated_at = ?
-                       WHERE id = ? AND status IN ('queued', 'running')""",
-                    (error, now_iso, now_iso, job_id),
-                )
-                if cursor.rowcount != 1:
-                    raise ValueError("lifecycle backfill job changed during stale recovery")
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-        stored = await self.get_lifecycle_backfill_job(job_id)
-        assert stored is not None
-        return stored
-
-    async def list_stale_lifecycle_backfill_job_ids(
-        self,
-        *,
-        limit: int = 100,
-    ) -> tuple[str, ...]:
-        """List active lifecycle jobs whose execution lease has expired or disappeared."""
-
-        now_iso = _now_iso()
-        bounded_limit = max(1, min(int(limit), 1000))
-        rows = await self.db.execute_fetchall(
-            """SELECT job.id
-               FROM lifecycle_backfill_jobs job
-               LEFT JOIN source_activity_leases lease ON lease.id = job.id
-               WHERE job.status IN ('queued', 'running')
-                 AND (lease.id IS NULL OR lease.lease_until <= ?)
-               ORDER BY job.created_at, job.id
-               LIMIT ?""",
-            (now_iso, bounded_limit),
-        )
-        return tuple(str(row["id"]) for row in rows)
-
-    async def get_lifecycle_backfill_job(
-        self,
-        job_id: str,
-    ) -> LifecycleBackfillJob | None:
-        async with self.db.execute(
-            "SELECT * FROM lifecycle_backfill_jobs WHERE id = ?",
-            (job_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return self._row_to_lifecycle_backfill_job(row) if row is not None else None
-
-    async def get_active_lifecycle_backfill_job(
-        self,
-        source_id: str,
-    ) -> LifecycleBackfillJob | None:
-        async with self.db.execute(
-            """SELECT * FROM lifecycle_backfill_jobs
-               WHERE source_id = ? AND status IN ('queued', 'running')
-               ORDER BY created_at DESC, id DESC LIMIT 1""",
-            (source_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return self._row_to_lifecycle_backfill_job(row) if row is not None else None
-
-    async def list_lifecycle_backfill_jobs(
-        self,
-        source_id: str,
-        *,
-        limit: int = 20,
-    ) -> list[LifecycleBackfillJob]:
-        rows = await self.db.execute_fetchall(
-            """SELECT * FROM lifecycle_backfill_jobs
-               WHERE source_id = ? ORDER BY created_at DESC, id DESC LIMIT ?""",
-            (source_id, limit),
-        )
-        return [self._row_to_lifecycle_backfill_job(row) for row in rows]
-
-    async def resolve_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-        *,
-        observation_id: str,
-        source_unit_id: str,
-        source_activity: SourceActivityLease | None = None,
-    ) -> LifecycleCutoverFinding:
-        async with self._write_lock:
-            try:
-                async with self.db.execute(
-                    "SELECT * FROM lifecycle_cutover_findings WHERE id = ?",
-                    (finding_id,),
-                ) as cursor:
-                    finding = await cursor.fetchone()
-                if finding is None:
-                    raise LookupError(f"unknown lifecycle cutover finding: {finding_id}")
-                source_id = str(finding["source_id"])
-                await self._assert_source_activity_fence_unlocked(
-                    source_id,
-                    source_activity,
-                )
-                async with self.db.execute(
-                    """SELECT 1
-                       FROM memory_unit_support_assertions msa
-                       JOIN evidence_references er
-                         ON er.evidence_unit_id = msa.evidence_unit_id
-                        AND er.role IN ('primary', 'required')
-                       JOIN source_observations so ON so.id = er.observation_id
-                       WHERE msa.memory_id = ? AND msa.source_id = ? AND msa.active = 1
-                         AND er.observation_id = ? AND so.source_unit_id = ?
-                       LIMIT 1""",
-                    (
-                        finding["memory_id"],
-                        finding["source_id"],
-                        observation_id,
-                        source_unit_id,
-                    ),
-                ) as cursor:
-                    lineage = await cursor.fetchone()
-                if lineage is None:
-                    raise ValueError("finding requires validated support lineage before resolution")
-                now = _now_iso()
-                await self.db.execute(
-                    """UPDATE lifecycle_cutover_findings
-                       SET status = 'resolved', observation_id = ?, source_unit_id = ?,
-                           updated_at = ?, resolved_at = ?
-                       WHERE id = ? AND status = 'open'""",
-                    (observation_id, source_unit_id, now, now, finding_id),
-                )
-                await self._assert_source_activity_fence_unlocked(
-                    source_id,
-                    source_activity,
-                )
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-        resolved = await self.get_lifecycle_cutover_finding(finding_id)
-        assert resolved is not None
-        return resolved
-
-    async def retire_unprovable_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-        *,
-        source_id: str,
-        reconstruction_attempt_id: str,
-        operator_id: str,
-        unavailable_documents: Mapping[str, str],
-    ) -> LifecycleCutoverFinding:
-        """Retire one unprovable Agent Session Memory and preserve its finding history."""
-
-        resolution = build_unprovable_cutover_resolution(
-            reconstruction_attempt_id=reconstruction_attempt_id,
-            operator_id=operator_id,
-            unavailable_documents=unavailable_documents,
-        )
-        normalized_unavailable = resolution["unavailable_documents"]
-        assert isinstance(normalized_unavailable, dict)
-
-        async with self._write_lock:
-            try:
-                async with self.db.execute(
-                    "SELECT * FROM lifecycle_cutover_findings WHERE id = ?",
-                    (finding_id,),
-                ) as cursor:
-                    finding = await cursor.fetchone()
-                if finding is None:
-                    raise LookupError(f"unknown lifecycle cutover finding: {finding_id}")
-                if str(finding["source_id"]) != source_id:
-                    raise ValueError("cutover finding source identity mismatch")
-                existing_attempt = json.loads(finding["mapping_attempt_json"] or "{}")
-                if str(finding["status"]) == CutoverFindingStatus.RESOLVED.value:
-                    if existing_attempt.get("resolution") != resolution:
-                        raise ValueError("idempotent retirement evidence mismatch")
-                    await self.db.rollback()
-                    return self._row_to_lifecycle_cutover_finding(finding)
-                if str(finding["reason"]) != CutoverFindingReason.MISSING_SOURCE_PROVENANCE.value:
-                    raise ValueError("only missing_source_provenance findings may be retired as unprovable")
-
-                cursor = await self.db.execute(
-                    "UPDATE sources SET status = status WHERE id = ?",
-                    (source_id,),
-                )
-                if cursor.rowcount != 1:
-                    raise ValueError(f"Source not found: {source_id}")
-                cursor = await self.db.execute(
-                    "UPDATE memories SET status = status WHERE id = ?",
-                    (finding["memory_id"],),
-                )
-                if cursor.rowcount != 1:
-                    raise ValueError("unprovable retirement Memory is unavailable")
-                async with self.db.execute(
-                    "SELECT * FROM lifecycle_cutover_findings WHERE id = ?",
-                    (finding_id,),
-                ) as cursor:
-                    locked_finding = await cursor.fetchone()
-                if (
-                    locked_finding is None
-                    or str(locked_finding["status"]) != CutoverFindingStatus.OPEN.value
-                    or str(locked_finding["source_id"]) != source_id
-                    or str(locked_finding["memory_id"]) != str(finding["memory_id"])
-                ):
-                    raise ValueError("unprovable retirement finding stale guard failed")
-                finding = locked_finding
-                existing_attempt = json.loads(finding["mapping_attempt_json"] or "{}")
-
-                async with self.db.execute(
-                    "SELECT type, status, access_state FROM sources WHERE id = ?",
-                    (source_id,),
-                ) as cursor:
-                    source = await cursor.fetchone()
-                if (
-                    source is None
-                    or str(source["type"]) != "agent_session"
-                    or str(source["status"]) != "active"
-                    or str(source["access_state"] or "active") != "active"
-                ):
-                    raise ValueError("unprovable retirement requires an active Agent Session source")
-
-                async with self.db.execute(
-                    "SELECT status FROM memories WHERE id = ?",
-                    (finding["memory_id"],),
-                ) as cursor:
-                    memory = await cursor.fetchone()
-                if memory is None or str(memory["status"]) != "active":
-                    raise ValueError("unprovable retirement requires an active Memory")
-
-                async with self.db.execute(
-                    "SELECT doc_id, source_id, source_type FROM memory_sources WHERE memory_id = ?",
-                    (finding["memory_id"],),
-                ) as cursor:
-                    source_rows = [dict(row) async for row in cursor]
-                available = json.loads(finding["available_provenance_json"] or "{}")
-                validate_unprovable_cutover_evidence(
-                    available_provenance=available,
-                    mapping_attempt=existing_attempt,
-                    source_rows=source_rows,
-                    source_id=source_id,
-                    unavailable_documents=normalized_unavailable,
-                )
-
-                async with self.db.execute(
-                    "SELECT 1 FROM memory_unit_support_assertions WHERE memory_id = ? AND active = 1 LIMIT 1",
-                    (finding["memory_id"],),
-                ) as cursor:
-                    if await cursor.fetchone() is not None:
-                        raise ValueError("unprovable retirement rejected while active support remains")
-
-                now = _now_iso()
-                existing_attempt["resolution"] = resolution
-                plan_id = unprovable_cutover_retirement_plan_id(finding_id)
-                payload = {
-                    "operation": "retire_unprovable_lifecycle_cutover_finding",
-                    "finding_id": finding_id,
-                    "source_id": source_id,
-                    "memory_id": str(finding["memory_id"]),
-                    "resolution": resolution,
-                }
-                payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-                payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
-                await self.db.execute(
-                    """INSERT INTO lifecycle_plans (
-                           id, reconciliation_scope_id, source_id, source_unit_id,
-                           target_unit_revision_id, status, payload_json, payload_hash,
-                           created_at, applied_at, error
-                       ) VALUES (?, 'cutover_unprovable_retirement', ?, ?, NULL, 'staged', ?, ?, ?, NULL, NULL)""",
-                    (plan_id, source_id, f"cutover-finding:{finding_id}", payload_json, payload_hash, now),
-                )
-                cursor = await self.db.execute(
-                    """UPDATE memories SET status = 'retired',
-                           retirement_reason = 'unprovable_source_lineage',
-                           retired_at = ?, valid_until = ?, updated_at = ?
-                       WHERE id = ? AND status = 'active'""",
-                    (now, _today_iso(), now, finding["memory_id"]),
-                )
-                if cursor.rowcount != 1:
-                    raise ValueError("unprovable retirement Memory stale guard failed")
-                await self._stale_pending_reviews_unlocked(
-                    (str(finding["memory_id"]),),
-                    now=now,
-                )
-                await self._rebuild_memory_fts_unlocked(
-                    str(finding["memory_id"]),
-                    search_visible_statuses=set(allowed_search_statuses()),
-                )
-                cursor = await self.db.execute(
-                    """UPDATE lifecycle_cutover_findings
-                       SET status = 'resolved', mapping_attempt_json = ?,
-                           observation_id = NULL, source_unit_id = NULL,
-                           updated_at = ?, resolved_at = ?
-                       WHERE id = ? AND status = 'open'""",
-                    (json.dumps(existing_attempt, sort_keys=True), now, now, finding_id),
-                )
-                if cursor.rowcount != 1:
-                    raise ValueError("unprovable retirement finding stale guard failed")
-                await self._enqueue_lifecycle_vector_task_unlocked(
-                    plan_id,
-                    str(finding["memory_id"]),
-                    LifecycleVectorOperation.DELETE,
-                    now=now,
-                )
-                await self.db.execute(
-                    "UPDATE lifecycle_plans SET status = 'applied', applied_at = ? WHERE id = ?",
-                    (now, plan_id),
-                )
-                await self.db.commit()
-            except BaseException:
-                rollback_task = asyncio.create_task(self.db.rollback())
-                await _drain_task_despite_cancellation(rollback_task)
-                raise
-        resolved = await self.get_lifecycle_cutover_finding(finding_id)
-        assert resolved is not None
-        return resolved
 
     async def _v2_unit_references_unlocked(
         self,
@@ -9532,18 +8607,6 @@ class Database:
                 for row in rows
             )
         return build_active_memory_unit_support_states(ids, support_rows)
-
-    async def get_active_memory_support_evidence(
-        self,
-        memory_id: str,
-        *,
-        source_id: str | None = None,
-    ) -> tuple[ActiveSupportEvidence, ...]:
-        evidence = await self.get_active_memory_support_evidence_many(
-            (memory_id,),
-            source_id=source_id,
-        )
-        return evidence.get(memory_id, ())
 
     async def get_active_memory_support_evidence_many(
         self,
@@ -10145,11 +9208,7 @@ class Database:
         created_ids = {
             mutation.memory_id
             for mutation in plan.mutations
-            if mutation.mutation_type
-            in {
-                LifecycleMutationType.CREATE_MEMORY,
-                LifecycleMutationType.REACTIVATE_MEMORY,
-            }
+            if mutation.mutation_type is LifecycleMutationType.CREATE_MEMORY
         }
         candidate_ids = (
             set(plan.coverage_proof.mandatory_incumbent_ids)
@@ -10517,37 +9576,6 @@ class Database:
                 memory.id,
                 LifecycleVectorOperation.UPSERT,
                 now=now,
-            )
-            return
-        if mutation_type is LifecycleMutationType.REACTIVATE_MEMORY:
-            expected_content_hash = mutation.payload.get("expected_content_hash")
-            if not isinstance(expected_content_hash, str) or not expected_content_hash:
-                raise ValueError("reactivate_memory requires expected_content_hash")
-            expected_retirement_reason = mutation.payload.get(
-                "expected_retirement_reason",
-                "source_rebaseline",
-            )
-            if not isinstance(expected_retirement_reason, str) or not expected_retirement_reason:
-                raise ValueError("reactivate_memory requires expected_retirement_reason")
-            cursor = await self.db.execute(
-                """UPDATE memories
-                      SET status = 'active', retirement_reason = NULL,
-                          retired_at = NULL, valid_until = NULL, updated_at = ?
-                    WHERE id = ? AND status = 'retired'
-                      AND retirement_reason = ?
-                      AND content_hash = ?""",
-                (
-                    now,
-                    mutation.memory_id,
-                    expected_retirement_reason,
-                    expected_content_hash,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise ValueError("reactivate Memory stale guard failed")
-            await self._rebuild_memory_fts_unlocked(
-                mutation.memory_id,
-                search_visible_statuses=set(allowed_search_statuses()),
             )
             return
         if mutation_type is LifecycleMutationType.ATTACH_SUPPORT:
@@ -12154,22 +11182,6 @@ class Database:
             completed_at=row["completed_at"],
         )
 
-    def _row_to_lifecycle_cutover_finding(self, row) -> LifecycleCutoverFinding:
-        return LifecycleCutoverFinding(
-            id=row["id"],
-            source_id=row["source_id"],
-            memory_id=row["memory_id"],
-            reason=CutoverFindingReason(row["reason"]),
-            status=CutoverFindingStatus(row["status"]),
-            available_provenance=json.loads(row["available_provenance_json"] or "{}"),
-            mapping_attempt=json.loads(row["mapping_attempt_json"] or "{}"),
-            observation_id=row["observation_id"],
-            source_unit_id=row["source_unit_id"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            resolved_at=row["resolved_at"],
-        )
-
     def _row_to_lifecycle_review(self, row) -> LifecycleReview:
         return LifecycleReview(
             id=row["id"],
@@ -12184,24 +11196,6 @@ class Database:
             resolved_at=row["resolved_at"],
             source_id=row["source_id"] if "source_id" in row.keys() else None,
         )
-
-    def _row_to_lifecycle_backfill_job(self, row) -> LifecycleBackfillJob:
-        return LifecycleBackfillJob(
-            id=row["id"],
-            source_id=row["source_id"],
-            status=LifecycleBackfillJobStatus(row["status"]),
-            scanned_memories=int(row["scanned_memories"]),
-            mapped_memories=int(row["mapped_memories"]),
-            finding_count=int(row["finding_count"]),
-            error=row["error"],
-            created_at=row["created_at"],
-            started_at=row["started_at"],
-            completed_at=row["completed_at"],
-        )
-
-    # ==================================================================
-    # Memories
-    # ==================================================================
 
     async def upsert_evidence_unit(
         self,
@@ -13123,7 +12117,7 @@ class Database:
             raise ValueError("review and related_review_id are mutually exclusive")
         async with self._write_lock:
             try:
-                await self._assert_legacy_source_write_allowed_unlocked(doc_id)
+                await self._assert_direct_source_write_allowed_unlocked(doc_id)
                 await self._upsert_memory_preserving_created_at_unlocked(mem)
                 await self._add_memory_source_unlocked(
                     mem.id,
@@ -13239,7 +12233,7 @@ class Database:
         observed = _utc_iso(observed_at)
         async with self._write_lock:
             try:
-                await self._assert_legacy_source_write_allowed_unlocked(doc_id)
+                await self._assert_direct_source_write_allowed_unlocked(doc_id)
                 await self._upsert_memory_preserving_created_at_unlocked(mem)
                 await self.db.execute(
                     """INSERT INTO memory_sources (
@@ -13559,77 +12553,6 @@ class Database:
             async for row in cursor:
                 candidates.append(self._row_to_candidate_memory(row))
         return candidates
-
-    async def find_rebaseline_reactivation_candidate(
-        self,
-        memory_content_hash: str,
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None,
-    ) -> Memory | None:
-        """Return the canonical exact claim retired only for source rebaseline."""
-
-        async with self.db.execute(
-            """SELECT m.* FROM memories AS m
-                WHERE m.content_hash = ?
-                  AND m.status = 'retired'
-                  AND m.retirement_reason = 'source_rebaseline'
-                  AND m.visibility = ?
-                  AND m.owner_user_id IS ?
-                  AND m.repo_identifier IS ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM agent_claims AS ac
-                      WHERE ac.memory_id = m.id
-                  )
-                ORDER BY m.created_at, m.id
-                LIMIT 1""",
-            (
-                memory_content_hash,
-                visibility,
-                owner_user_id,
-                repo_identifier,
-            ),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return self._row_to_memory(row) if row else None
-
-    async def find_rebaseline_reactivation_candidates(
-        self,
-        memory_content_hashes: Sequence[str],
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None,
-    ) -> list[Memory]:
-        """Return one rebaseline-retired exact claim per requested hash."""
-
-        ordered_hashes = tuple(dict.fromkeys(memory_content_hashes))
-        if not ordered_hashes:
-            return []
-        by_hash: dict[str, Memory] = {}
-        for offset in range(0, len(ordered_hashes), STORAGE_BIND_CHUNK_SIZE):
-            chunk = ordered_hashes[offset : offset + STORAGE_BIND_CHUNK_SIZE]
-            placeholders = ", ".join("?" for _ in chunk)
-            async with self.db.execute(
-                f"""SELECT m.* FROM memories AS m
-                    WHERE m.content_hash IN ({placeholders})
-                      AND m.status = 'retired'
-                      AND m.retirement_reason = 'source_rebaseline'
-                      AND m.visibility = ?
-                      AND m.owner_user_id IS ?
-                      AND m.repo_identifier IS ?
-                      AND NOT EXISTS (
-                          SELECT 1 FROM agent_claims AS ac
-                          WHERE ac.memory_id = m.id
-                      )
-                    ORDER BY m.content_hash, m.created_at, m.id""",
-                (*chunk, visibility, owner_user_id, repo_identifier),
-            ) as cursor:
-                async for row in cursor:
-                    memory = self._row_to_memory(row)
-                    by_hash.setdefault(memory.content_hash, memory)
-        return [by_hash[content_hash] for content_hash in ordered_hashes if content_hash in by_hash]
 
     async def get_memories_by_source_doc(
         self,
@@ -14266,7 +13189,7 @@ class Database:
             (_now_iso(), memory_id),
         )
 
-    async def _assert_legacy_source_write_allowed_unlocked(self, doc_id: str) -> None:
+    async def _assert_direct_source_write_allowed_unlocked(self, doc_id: str) -> None:
         async with self.db.execute(
             """SELECT g.state
                FROM documents d
@@ -14277,7 +13200,7 @@ class Database:
             gate = await cursor.fetchone()
         if gate is not None and gate["state"] == LifecycleGateState.ENABLED.value:
             raise ValueError(
-                "direct configured-source Memory write rejected after cutover; projected lifecycle required"
+                "direct configured-source Memory write rejected; projected lifecycle required"
             )
 
     async def supersede_memory_with_source_and_relation(
@@ -16604,15 +15527,6 @@ class Database:
                     ) as cursor:
                         current_source = await cursor.fetchone()
                     async with self.db.execute(
-                        """SELECT id FROM lifecycle_backfill_jobs
-                           WHERE source_id = ? AND status IN ('queued', 'running')
-                           ORDER BY created_at LIMIT 1""",
-                        (id,),
-                    ) as cursor:
-                        lifecycle_job = await cursor.fetchone()
-                    if lifecycle_job is not None:
-                        raise ValueError(f"source lifecycle maintenance active: {lifecycle_job['id']}")
-                    async with self.db.execute(
                         """SELECT run_id FROM source_sync_runs
                            WHERE source_id = ? AND status IN ('pending', 'running')
                            ORDER BY created_at LIMIT 1""",
@@ -16787,15 +15701,6 @@ class Database:
                 )
                 if source_lock.rowcount != 1:
                     raise LookupError("source_not_found")
-                async with self.db.execute(
-                    """SELECT id FROM lifecycle_backfill_jobs
-                       WHERE source_id = ? AND status IN ('queued', 'running')
-                       ORDER BY created_at LIMIT 1""",
-                    (source_id,),
-                ) as cursor:
-                    lifecycle_job = await cursor.fetchone()
-                if lifecycle_job is not None:
-                    raise ValueError(f"source lifecycle maintenance active: {lifecycle_job['id']}")
                 async with self.db.execute(
                     """SELECT run_id FROM source_sync_runs
                        WHERE source_id = ? AND status IN ('pending', 'running')
@@ -17957,11 +16862,6 @@ class Database:
 
                 active_work_queries = (
                     (
-                        "source lifecycle maintenance active",
-                        "SELECT id FROM lifecycle_backfill_jobs "
-                        "WHERE source_id = ? AND status IN ('queued', 'running') LIMIT 1",
-                    ),
-                    (
                         "source sync run already active",
                         "SELECT run_id AS id FROM source_sync_runs "
                         "WHERE source_id = ? AND status IN ('pending', 'running') LIMIT 1",
@@ -18112,18 +17012,6 @@ class Database:
             except Exception:
                 await self.db.rollback()
                 raise
-
-    async def rebaseline_source_lifecycle(
-        self,
-        source_id: str,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> SourceLifecycleResetResult:
-        """Refuse Source rebaseline: Evidence Unit Support recovery is forward-only."""
-
-        raise ValueError(
-            "Source rebaseline is not supported; Evidence Unit Support recovery is forward-only"
-        )
 
     async def list_source_artifact_cleanup_tasks(
         self,
@@ -18678,15 +17566,6 @@ class Database:
             )
             if actual_config_revision != normalized_config_revision:
                 raise ValueError("source config revision changed before sync enqueue")
-        async with self.db.execute(
-            """SELECT id FROM lifecycle_backfill_jobs
-               WHERE source_id = ? AND status IN ('queued', 'running')
-               ORDER BY created_at LIMIT 1""",
-            (source_id,),
-        ) as cursor:
-            lifecycle_job = await cursor.fetchone()
-        if lifecycle_job is not None:
-            raise SourceActivityConflict(f"source lifecycle maintenance active: {lifecycle_job['id']}")
         if retry_run_id is not None:
             target = await self.get_source_sync_run(retry_run_id)
             if target is None or target.source_id != source_id or target.workspace_id != workspace_id:
@@ -19517,15 +18396,6 @@ class Database:
                 )
                 if source_lock.rowcount != 1:
                     raise ValueError(f"Source not found: {source_id}")
-                async with self.db.execute(
-                    """SELECT id FROM lifecycle_backfill_jobs
-                       WHERE source_id = ? AND status IN ('queued', 'running')
-                       ORDER BY created_at LIMIT 1""",
-                    (source_id,),
-                ) as cursor:
-                    lifecycle_job = await cursor.fetchone()
-                if lifecycle_job is not None:
-                    raise SourceActivityConflict(f"source lifecycle maintenance active: {lifecycle_job['id']}")
                 if expected_activity_epoch is not None:
                     async with self.db.execute(
                         "SELECT activity_epoch FROM sources WHERE id = ?",
@@ -19886,15 +18756,6 @@ class Database:
                     ):
                         raise SourceActivityConflict("local agent lease changed")
                 async with self.db.execute(
-                    """SELECT id FROM lifecycle_backfill_jobs
-                       WHERE source_id = ? AND status IN ('queued', 'running')
-                       ORDER BY created_at LIMIT 1""",
-                    (source_id,),
-                ) as cursor:
-                    lifecycle_job = await cursor.fetchone()
-                if lifecycle_job is not None:
-                    raise SourceActivityConflict(f"source lifecycle maintenance active: {lifecycle_job['id']}")
-                async with self.db.execute(
                     """SELECT input_id FROM source_sync_inputs
                        WHERE workspace_id = ? AND source_id = ?""",
                     (workspace_id, source_id),
@@ -20081,15 +18942,6 @@ class Database:
                 )
                 if source_lock.rowcount != 1:
                     raise ValueError(f"Source not found: {source_id}")
-                async with self.db.execute(
-                    """SELECT id FROM lifecycle_backfill_jobs
-                       WHERE source_id = ? AND status IN ('queued', 'running')
-                       ORDER BY created_at LIMIT 1""",
-                    (source_id,),
-                ) as cursor:
-                    lifecycle_job = await cursor.fetchone()
-                if lifecycle_job is not None:
-                    raise SourceActivityConflict(f"source lifecycle maintenance active: {lifecycle_job['id']}")
                 if expected_activity_epoch is not None:
                     async with self.db.execute(
                         "SELECT activity_epoch FROM sources WHERE id = ?",

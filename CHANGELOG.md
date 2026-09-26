@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Evidence Unit Support is the only Support model (ADR 0038). A workspace that
+  still holds reference-scoped Support refuses to start; finish the Support
+  cutover with an earlier version or rebuild the workspace. Other workspaces
+  drop the reference-scoped Support and lifecycle cutover tables on start.
+- Remove Source lifecycle backfill, rebaseline and cutover finding repair:
+  `POST /sources/{id}/memory-lifecycle/backfill`, `.../rebaseline` and
+  `.../findings/{finding_id}/repair` are gone, `GET
+  /sources/{id}/memory-lifecycle` no longer returns `jobs` and `findings`, and
+  the Source list no longer returns `lifecycle_maintenance`.
+- Memory Evidence no longer returns `support_scope_version` or `legacy_limited`,
+  and the admin UI no longer shows the Legacy limited badge.
+- `projection-extraction-v9` is the only extraction contract. Offline
+  derivation cases must pin `access_context_hash` and
+  `inference_capability_hash`.
+
 ## 0.1.63 - 2026-09-26
 
 - Cross-document discovery records one relation label per Memory pair

@@ -4,13 +4,11 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 import sqlite3
-from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 
 from memforge.memory.evidence import (
-    ActiveSupportEvidence,
     EvidenceContentProvenance,
     EvidenceReference,
     EvidenceRole,
@@ -18,12 +16,7 @@ from memforge.memory.evidence import (
 )
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
-    CutoverFindingReason,
-    CutoverFindingStatus,
-    LifecycleCutoverFinding,
-    LifecycleBackfillJob,
     LifecycleGateState,
-    LifecycleBackfillJobStatus,
     IncumbentDecision,
     IncumbentDisposition,
     LifecycleMutation,
@@ -43,13 +36,6 @@ from memforge.memory.lifecycle_review import (
     build_lifecycle_review_approval_plan,
     build_lifecycle_review_refresh_plan,
 )
-from memforge.memory.cutover import (
-    recover_stale_lifecycle_jobs,
-    run_source_lifecycle_backfill,
-    run_source_lifecycle_backfill_job,
-    run_source_lifecycle_recovery_job,
-    run_with_lifecycle_activity_heartbeat,
-)
 from memforge.models import (
     DocumentRecord,
     Memory,
@@ -62,14 +48,14 @@ from memforge.models import (
 )
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.source_projection import AnchorKind, SourceAnchor
-from memforge.storage.database import Database, MIGRATIONS
+from memforge.storage.database import Database
 from tests.test_source_projection_store import _projection
 from tests.unit_support_fixture import complete_unit_parts, primary_reference, record_unit_support
 
 
 @pytest_asyncio.fixture
 async def db(tmp_path):
-    database = Database(str(tmp_path / "cutover.db"))
+    database = Database(str(tmp_path / "lifecycle.db"))
     await database.connect()
     await database.upsert_source(
         id="src-1",
@@ -93,16 +79,18 @@ async def db(tmp_path):
         await database.close()
 
 
-def _finding() -> LifecycleCutoverFinding:
-    return LifecycleCutoverFinding(
-        id="finding-1",
+async def _expired_sync_activity(db: Database, activity_id: str):
+    activity = await db.acquire_source_activity(
+        activity_id=activity_id,
         source_id="src-1",
-        memory_id="mem-legacy",
-        reason=CutoverFindingReason.OBSERVATION_NOT_FOUND,
-        status=CutoverFindingStatus.OPEN,
-        available_provenance={"doc_id": "legacy-doc"},
-        mapping_attempt={"strategy": "document-id"},
+        kind=SourceActivityKind.SYNC,
     )
+    await db.db.execute(
+        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", activity_id),
+    )
+    await db.db.commit()
+    return activity
 
 
 def _unit() -> EvidenceUnit:
@@ -157,21 +145,34 @@ async def _add_unsupported_legacy_source_edge(
     )
 
 
-def test_cutover_schema_has_a_forward_migration() -> None:
-    version, description, statements = next(item for item in MIGRATIONS if item[0] == 48)
-
-    assert version == 48
-    assert description == "Add lifecycle cutover gates findings and support assertions"
-    assert any("CREATE TABLE IF NOT EXISTS source_lifecycle_gates" in item for item in statements)
-    assert any("CREATE TABLE IF NOT EXISTS lifecycle_cutover_findings" in item for item in statements)
+_REMOVE_LIFECYCLE_CUTOVER_STORAGE_MIGRATION = 99
+_LIFECYCLE_CUTOVER_TABLES = ("lifecycle_cutover_findings", "lifecycle_backfill_jobs")
 
 
-def test_backfill_job_schema_has_a_forward_migration() -> None:
-    version, description, statements = next(item for item in MIGRATIONS if item[0] == 51)
+def _existing_tables(path: str) -> set[str]:
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
+            _LIFECYCLE_CUTOVER_TABLES,
+        ).fetchall()
+    return {str(name) for (name,) in rows}
 
-    assert version == 51
-    assert description == "Add durable lifecycle backfill jobs"
-    assert any("CREATE TABLE IF NOT EXISTS lifecycle_backfill_jobs" in item for item in statements)
+
+@pytest.mark.asyncio
+async def test_workspace_drops_lifecycle_cutover_storage(db: Database) -> None:
+    assert _existing_tables(db.db_path) == set()
+    await db.close()
+    with sqlite3.connect(db.db_path) as connection:
+        for table in _LIFECYCLE_CUTOVER_TABLES:
+            connection.execute(f"CREATE TABLE {table} (id TEXT PRIMARY KEY)")
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version = ?",
+            (_REMOVE_LIFECYCLE_CUTOVER_STORAGE_MIGRATION,),
+        )
+
+    await db.connect()
+
+    assert _existing_tables(db.db_path) == set()
 
 
 @pytest.mark.asyncio
@@ -179,238 +180,6 @@ async def test_new_source_is_destructive_lifecycle_gated_by_default(db: Database
     gate = await db.get_lifecycle_gate("src-1")
 
     assert gate.state is LifecycleGateState.GATED
-
-
-@pytest.mark.asyncio
-async def test_lifecycle_activity_heartbeat_cancels_operation_with_wrapper() -> None:
-    started = asyncio.Event()
-    cancelled = asyncio.Event()
-
-    class HeartbeatDatabase:
-        async def renew_source_activity(self, **_kwargs) -> None:
-            raise AssertionError("long heartbeat interval should not renew")
-
-    async def operation() -> None:
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
-
-    task = asyncio.create_task(
-        run_with_lifecycle_activity_heartbeat(
-            HeartbeatDatabase(),
-            "job-cancelled",
-            operation,
-            heartbeat_interval_seconds=3600,
-        )
-    )
-    await started.wait()
-    task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert cancelled.is_set()
-
-
-@pytest.mark.asyncio
-async def test_lifecycle_activity_cancellation_fails_durable_recovery_job(
-    db: Database,
-    monkeypatch,
-) -> None:
-    scan_started = asyncio.Event()
-
-    async def block_scan(_source_id: str):
-        scan_started.set()
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(db, "list_legacy_memory_provenance", block_scan)
-    job_id = "recovery-cancelled-durably"
-    task = asyncio.create_task(
-        run_with_lifecycle_activity_heartbeat(
-            db,
-            job_id,
-            lambda: run_source_lifecycle_recovery_job(
-                db,
-                "src-1",
-                job_id=job_id,
-            ),
-            heartbeat_interval_seconds=3600,
-        )
-    )
-    await scan_started.wait()
-    task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    job = await db.get_lifecycle_backfill_job(job_id)
-    assert job is not None
-    assert job.status is LifecycleBackfillJobStatus.FAILED
-    assert job.error == "lifecycle recovery cancelled"
-    assert await db.get_active_lifecycle_backfill_job("src-1") is None
-
-
-@pytest.mark.asyncio
-async def test_repeated_wrapper_cancellation_waits_for_durable_job_cleanup(
-    db: Database,
-    monkeypatch,
-) -> None:
-    scan_started = asyncio.Event()
-    cleanup_started = asyncio.Event()
-    allow_cleanup = asyncio.Event()
-    fail_job = db.fail_lifecycle_backfill_job
-
-    async def block_scan(_source_id: str):
-        scan_started.set()
-        await asyncio.Event().wait()
-
-    async def block_cleanup(job_id: str, *, error: str):
-        cleanup_started.set()
-        await allow_cleanup.wait()
-        return await fail_job(job_id, error=error)
-
-    monkeypatch.setattr(db, "list_legacy_memory_provenance", block_scan)
-    monkeypatch.setattr(db, "fail_lifecycle_backfill_job", block_cleanup)
-    job_id = "recovery-repeated-cancellation"
-    task = asyncio.create_task(
-        run_with_lifecycle_activity_heartbeat(
-            db,
-            job_id,
-            lambda: run_source_lifecycle_recovery_job(
-                db,
-                "src-1",
-                job_id=job_id,
-            ),
-            heartbeat_interval_seconds=3600,
-        )
-    )
-    await scan_started.wait()
-    task.cancel()
-    await cleanup_started.wait()
-    try:
-        for _ in range(5):
-            task.cancel()
-            await asyncio.sleep(0)
-            assert not task.done()
-    finally:
-        allow_cleanup.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    job = await db.get_lifecycle_backfill_job(job_id)
-    assert job is not None
-    assert job.status is LifecycleBackfillJobStatus.FAILED
-    assert await db.get_active_lifecycle_backfill_job("src-1") is None
-
-
-@pytest.mark.asyncio
-async def test_lifecycle_heartbeat_failure_fails_durable_recovery_job(
-    db: Database,
-    monkeypatch,
-) -> None:
-    scan_started = asyncio.Event()
-
-    async def block_scan(_source_id: str):
-        scan_started.set()
-        await asyncio.Event().wait()
-
-    async def fail_heartbeat(**_kwargs) -> None:
-        await scan_started.wait()
-        raise RuntimeError("simulated lease loss")
-
-    monkeypatch.setattr(db, "list_legacy_memory_provenance", block_scan)
-    monkeypatch.setattr(db, "renew_source_activity", fail_heartbeat)
-    job_id = "recovery-heartbeat-failed-durably"
-
-    with pytest.raises(SourceActivityConflict, match="heartbeat stopped"):
-        await run_with_lifecycle_activity_heartbeat(
-            db,
-            job_id,
-            lambda: run_source_lifecycle_recovery_job(
-                db,
-                "src-1",
-                job_id=job_id,
-            ),
-            heartbeat_interval_seconds=0,
-        )
-
-    assert scan_started.is_set()
-    job = await db.get_lifecycle_backfill_job(job_id)
-    assert job is not None
-    assert job.status is LifecycleBackfillJobStatus.FAILED
-    assert job.error == "lifecycle recovery cancelled"
-    assert await db.get_active_lifecycle_backfill_job("src-1") is None
-
-
-@pytest.mark.asyncio
-async def test_lifecycle_activity_heartbeat_prefers_completed_work_when_both_tasks_finish(
-    monkeypatch,
-) -> None:
-    import memforge.memory.cutover as cutover_module
-
-    real_wait = asyncio.wait
-
-    async def wait_for_both(tasks, *, return_when):
-        del return_when
-        await asyncio.gather(*tasks, return_exceptions=True)
-        return set(tasks), set()
-
-    monkeypatch.setattr(cutover_module.asyncio, "wait", wait_for_both)
-
-    class HeartbeatDatabase:
-        async def renew_source_activity(self, **_kwargs) -> None:
-            raise RuntimeError("lease already released by completed job")
-
-    async def operation() -> str:
-        return "completed"
-
-    try:
-        result = await run_with_lifecycle_activity_heartbeat(
-            HeartbeatDatabase(),
-            "job-completed",
-            operation,
-            heartbeat_interval_seconds=0,
-        )
-    finally:
-        monkeypatch.setattr(cutover_module.asyncio, "wait", real_wait)
-
-    assert result == "completed"
-
-
-@pytest.mark.asyncio
-async def test_finding_upsert_rejects_identity_or_status_change(db: Database) -> None:
-    finding = _finding()
-    await db.upsert_lifecycle_cutover_finding(finding)
-
-    await db.upsert_lifecycle_cutover_finding(replace(finding, reason=CutoverFindingReason.AMBIGUOUS_OBSERVATION))
-    evolved = await db.get_lifecycle_cutover_finding(finding.id)
-    assert evolved is not None
-    assert evolved.reason is CutoverFindingReason.AMBIGUOUS_OBSERVATION
-    assert evolved.status is CutoverFindingStatus.OPEN
-
-    with pytest.raises(ValueError, match="finding identity"):
-        await db.upsert_lifecycle_cutover_finding(replace(finding, memory_id="mem-different"))
-    with pytest.raises(ValueError, match="open findings"):
-        await db.upsert_lifecycle_cutover_finding(
-            replace(
-                finding,
-                id="finding-resolved-insert",
-                status=CutoverFindingStatus.RESOLVED,
-            )
-        )
-
-
-@pytest.mark.asyncio
-async def test_finding_cannot_resolve_before_memory_lineage_is_persisted(db: Database) -> None:
-    await db.upsert_lifecycle_cutover_finding(_finding())
-
-    with pytest.raises(ValueError, match="validated support lineage"):
-        await db.resolve_lifecycle_cutover_finding(
-            "finding-1",
-            observation_id="obs-page-1-body",
-            source_unit_id="unit-page-1",
-        )
 
 
 async def _attach_legacy_source(db: Database) -> None:
@@ -1495,410 +1264,10 @@ async def test_memory_version_stale_guard_rejects_concurrent_incumbent_change(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("support_revision_ids", "current_revision_id", "expected_mapped", "expected_findings"),
-    (
-        (("obsrev-supported",), "obsrev-supported", 1, 0),
-        (("obsrev-supported",), "obsrev-newer", 0, 1),
-        (("obsrev-old", "obsrev-supported"), "obsrev-supported", 1, 0),
-    ),
-)
-async def test_backfill_trusts_existing_active_support_only_at_current_revision(
-    support_revision_ids: tuple[str, ...],
-    current_revision_id: str,
-    expected_mapped: int,
-    expected_findings: int,
-) -> None:
-    finding = LifecycleCutoverFinding(
-        id="finding-supported",
-        source_id="src-1",
-        memory_id="mem-supported",
-        reason=CutoverFindingReason.AMBIGUOUS_OBSERVATION,
-        status=CutoverFindingStatus.OPEN,
-        available_provenance={"documents": [{"doc_id": "legacy-doc"}]},
-        mapping_attempt={"strategy": "legacy"},
-    )
-    supports = tuple(
-        ActiveSupportEvidence(
-            memory_id="mem-supported",
-            source_id="src-1",
-            reference_id=f"ref-{revision_id}",
-            evidence_unit_id=f"unit-evidence-{revision_id}",
-            role=EvidenceRole.PRIMARY,
-            anchor=SourceAnchor(
-                kind=AnchorKind.WHOLE_OBSERVATION,
-                observation_id="obs-supported",
-                observation_revision_id=revision_id,
-            ),
-            excerpt="Exact supported claim",
-        )
-        for revision_id in support_revision_ids
-    )
-
-    class SupportedDb:
-        def __init__(self) -> None:
-            self.resolved: list[tuple[str, str, str]] = []
-            self.enabled: list[str] = []
-            self.gated: list[str] = []
-            self.upserted: list[LifecycleCutoverFinding] = []
-            self.finding_id: str | None = None
-
-        async def list_legacy_memory_provenance(self, source_id: str):
-            assert source_id == "src-1"
-            return [
-                SimpleNamespace(
-                    memory_id="mem-supported",
-                    doc_id="legacy-doc",
-                    source_type="jira",
-                    excerpt="ambiguous legacy excerpt",
-                )
-            ]
-
-        async def get_lifecycle_cutover_finding(self, finding_id: str):
-            assert finding_id.startswith("finding-")
-            self.finding_id = finding_id
-            return replace(finding, id=finding_id)
-
-        async def get_active_memory_support_evidence(self, memory_id: str, *, source_id: str):
-            assert (memory_id, source_id) == ("mem-supported", "src-1")
-            return supports
-
-        async def get_evidence_unit(self, evidence_unit_id: str):
-            assert evidence_unit_id in {support.evidence_unit_id for support in supports}
-            return replace(
-                _unit(),
-                id=evidence_unit_id,
-                source_lineage_id="unit-supported",
-            )
-
-        async def get_current_source_observation_revisions(self, source_unit_id: str):
-            assert source_unit_id == "unit-supported"
-            return {"obs-supported": SimpleNamespace(id=current_revision_id)}
-
-        async def resolve_lifecycle_cutover_finding(
-            self,
-            finding_id: str,
-            *,
-            observation_id: str,
-            source_unit_id: str,
-            source_activity=None,
-        ):
-            assert source_activity is None
-            self.resolved.append((finding_id, observation_id, source_unit_id))
-            return finding
-
-        async def enable_lifecycle_gate(self, source_id: str, *, source_activity=None) -> None:
-            assert source_activity is None
-            self.enabled.append(source_id)
-
-        async def find_source_unit_by_document_id(self, *_args):
-            if current_revision_id == "obsrev-supported":
-                raise AssertionError("current supported Memory must not use legacy provenance")
-            return None
-
-        async def upsert_lifecycle_cutover_finding(
-            self,
-            cutover_finding: LifecycleCutoverFinding,
-            *,
-            source_activity=None,
-        ) -> None:
-            assert source_activity is None
-            self.upserted.append(cutover_finding)
-
-        async def gate_destructive_lifecycle(
-            self,
-            source_id: str,
-            *,
-            reason: str,
-            source_activity=None,
-        ) -> None:
-            assert source_activity is None
-            assert reason == "1 open lifecycle cutover finding(s)"
-            self.gated.append(source_id)
-
-    database = SupportedDb()
-
-    result = await run_source_lifecycle_backfill(database, "src-1")
-
-    assert result.scanned_memories == 1
-    assert result.mapped_memories == expected_mapped
-    assert result.finding_count == expected_findings
-    assert result.gate_enabled is (expected_findings == 0)
-    if expected_findings == 0:
-        assert database.resolved == [(database.finding_id, "obs-supported", "unit-supported")]
-        assert database.enabled == ["src-1"]
-        assert database.upserted == []
-        assert database.gated == []
-    else:
-        assert database.resolved == []
-        assert database.enabled == []
-        assert len(database.upserted) == 1
-        assert database.gated == ["src-1"]
-
-
-@pytest.mark.asyncio
-async def test_backfill_leaves_durable_finding_when_source_unit_cannot_be_located(db: Database) -> None:
-    now = "2026-07-15T00:00:00+00:00"
-    await db.db.execute(
-        """INSERT INTO documents (
-               doc_id, source, source_url, title, space_or_project, last_modified, version,
-               content_hash, last_synced
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        ("missing-doc", "src-1", "https://example.test/missing", "Missing", "ENG", now, "1", "hash", now),
-    )
-    await db.add_memory_source(
-        "mem-legacy",
-        "missing-doc",
-        "confluence",
-        "Legacy claim",
-        source_updated_at=None,
-    )
-
-    result = await run_source_lifecycle_backfill(db, "src-1")
-
-    assert result.finding_count == 1
-    assert result.gate_enabled is False
-    assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.GATED
-
-
-@pytest.mark.asyncio
-async def test_backfill_job_records_completed_counts_and_is_idempotent(db: Database) -> None:
-    completed = await run_source_lifecycle_backfill_job(
-        db,
-        "src-1",
-        job_id="backfill-job-1",
-    )
-    epoch_after_completion = await db.get_source_activity_epoch("src-1")
-    retried = await run_source_lifecycle_backfill_job(
-        db,
-        "src-1",
-        job_id="backfill-job-1",
-    )
-
-    assert completed.status is LifecycleBackfillJobStatus.COMPLETED
-    assert retried == completed
-    assert await db.list_lifecycle_backfill_jobs("src-1") == [completed]
-    assert await db.get_source_activity_epoch("src-1") == epoch_after_completion
-    async with db.db.execute(
-        "SELECT COUNT(*) AS count FROM source_activity_leases WHERE source_id = ?",
-        ("src-1",),
-    ) as cursor:
-        assert int((await cursor.fetchone())["count"]) == 0
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "runner",
-    [run_source_lifecycle_backfill_job, run_source_lifecycle_recovery_job],
-)
-async def test_completed_job_retry_gates_a_new_support_invariant_violation(
-    db: Database,
-    runner,
-) -> None:
-    job_id = f"completed-before-gap-{runner.__name__}"
-    completed = await runner(db, "src-1", job_id=job_id)
-    assert completed.status is LifecycleBackfillJobStatus.COMPLETED
-    assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
-    await _add_unsupported_legacy_source_edge(db)
-
-    retried = await runner(db, "src-1", job_id=job_id)
-
-    assert retried == completed
-    gate = await db.get_lifecycle_gate("src-1")
-    assert gate.state is LifecycleGateState.GATED
-    assert gate.reason and "support invariant violation" in gate.reason
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "runner",
-    [run_source_lifecycle_backfill_job, run_source_lifecycle_recovery_job],
-)
-@pytest.mark.parametrize(
-    "preflight_method",
-    [
-        "count_active_source_memories_without_support",
-        "count_active_supported_memories_without_source_provenance",
-    ],
-)
-async def test_support_preflight_failure_does_not_create_job_or_activity(
-    db: Database,
-    monkeypatch,
-    runner,
-    preflight_method: str,
-) -> None:
-    async def fail_preflight(_source_id: str) -> int:
-        raise RuntimeError("support invariant unavailable")
-
-    monkeypatch.setattr(
-        db,
-        preflight_method,
-        fail_preflight,
-    )
-    job_id = f"preflight-failed-{runner.__name__}-{preflight_method}"
-
-    with pytest.raises(RuntimeError, match="support invariant unavailable"):
-        await runner(db, "src-1", job_id=job_id)
-
-    assert await db.get_lifecycle_backfill_job(job_id) is None
-    assert await db.get_active_lifecycle_backfill_job("src-1") is None
-
-
-@pytest.mark.asyncio
-async def test_failed_backfill_job_retry_does_not_reacquire_activity(db: Database) -> None:
-    failed = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="backfill-job-terminal-failed",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(failed.id)
-    failed = await db.fail_lifecycle_backfill_job(failed.id, error="operator blocker")
-    epoch_after_failure = await db.get_source_activity_epoch("src-1")
-
-    retried = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id=failed.id,
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-
-    assert retried == failed
-    assert await db.get_source_activity_epoch("src-1") == epoch_after_failure
-    async with db.db.execute(
-        "SELECT COUNT(*) AS count FROM source_activity_leases WHERE source_id = ?",
-        ("src-1",),
-    ) as cursor:
-        assert int((await cursor.fetchone())["count"]) == 0
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("terminal_operation", ["complete", "fail"])
-async def test_sqlite_lifecycle_terminal_transition_requires_current_activity_lease(
-    db: Database,
-    terminal_operation: str,
-) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id=f"sqlite-terminal-with-lost-lease-{terminal_operation}",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    await db.db.execute(
-        "DELETE FROM source_activity_leases WHERE id = ?",
-        (job.id,),
-    )
-    await db.db.commit()
-
-    with pytest.raises(SourceActivityConflict, match="lease is not current"):
-        if terminal_operation == "complete":
-            await db.complete_lifecycle_backfill_job(
-                job.id,
-                scanned_memories=3,
-                mapped_memories=2,
-                finding_count=1,
-            )
-        else:
-            await db.fail_lifecycle_backfill_job(
-                job.id,
-                error="operator blocker",
-            )
-
-    stored = await db.get_lifecycle_backfill_job(job.id)
-    assert stored is not None
-    assert stored.status is LifecycleBackfillJobStatus.RUNNING
-
-
-@pytest.mark.asyncio
-async def test_recover_stale_lifecycle_backfill_job_fails_expired_job_atomically(
+async def test_lifecycle_gate_rejects_an_expired_activity_lease(
     db: Database,
 ) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-recover-expired-lifecycle-job",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.commit()
-    fenced_epoch = await db.get_source_activity_epoch("src-1")
-
-    recovered = await db.recover_stale_lifecycle_backfill_job(
-        job.id,
-        error="operator recovered expired lifecycle job",
-    )
-
-    assert recovered.status is LifecycleBackfillJobStatus.FAILED
-    assert recovered.error == "operator recovered expired lifecycle job"
-    assert await db.get_source_activity_epoch("src-1") == fenced_epoch + 1
-    assert await db.get_active_lifecycle_backfill_job("src-1") is None
-    assert not await db.release_source_activity(
-        activity_id=job.id,
-        capability=job.id,
-    )
-
-
-@pytest.mark.asyncio
-async def test_backfill_rejects_recovered_maintenance_authority(
-    db: Database,
-) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-backfill-stale-authority",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.commit()
-    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
-    gate_before = await db.get_lifecycle_gate("src-1")
-
-    with pytest.raises(SourceActivityConflict, match="lease is not current"):
-        await run_source_lifecycle_backfill(
-            db,
-            "src-1",
-            lifecycle_job_id=job.id,
-        )
-
-    assert await db.get_lifecycle_gate("src-1") == gate_before
-
-
-@pytest.mark.asyncio
-async def test_lifecycle_gate_rejects_recovered_maintenance_fence(
-    db: Database,
-) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-gate-stale-fence",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    activity = await db.renew_source_activity(
-        activity_id=job.id,
-        capability=job.id,
-    )
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.commit()
-    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+    activity = await _expired_sync_activity(db, "sqlite-gate-stale-fence")
     gate_before = await db.get_lifecycle_gate("src-1")
 
     with pytest.raises(SourceActivityConflict, match="source activity"):
@@ -1908,27 +1277,10 @@ async def test_lifecycle_gate_rejects_recovered_maintenance_fence(
 
 
 @pytest.mark.asyncio
-async def test_evidence_write_rejects_recovered_maintenance_fence(
+async def test_evidence_write_rejects_an_expired_activity_lease(
     db: Database,
 ) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-evidence-stale-fence",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    activity = await db.renew_source_activity(
-        activity_id=job.id,
-        capability=job.id,
-    )
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.commit()
-    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+    activity = await _expired_sync_activity(db, "sqlite-evidence-stale-fence")
 
     with pytest.raises(SourceActivityConflict, match="source activity"):
         await db.upsert_evidence_unit(_unit(), source_activity=activity)
@@ -1937,27 +1289,10 @@ async def test_evidence_write_rejects_recovered_maintenance_fence(
 
 
 @pytest.mark.asyncio
-async def test_document_write_rejects_recovered_maintenance_fence(
+async def test_document_write_rejects_an_expired_activity_lease(
     db: Database,
 ) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-document-stale-fence",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    activity = await db.renew_source_activity(
-        activity_id=job.id,
-        capability=job.id,
-    )
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.commit()
-    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+    activity = await _expired_sync_activity(db, "sqlite-document-stale-fence")
     now = datetime(2026, 7, 19, tzinfo=timezone.utc)
     document = DocumentRecord(
         doc_id="doc-stale-fence",
@@ -1989,28 +1324,11 @@ async def test_document_write_rejects_recovered_maintenance_fence(
 
 
 @pytest.mark.asyncio
-async def test_evidence_reference_write_rejects_recovered_maintenance_fence(
+async def test_evidence_reference_write_rejects_an_expired_activity_lease(
     db: Database,
 ) -> None:
     await db.upsert_evidence_unit(_unit())
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-reference-stale-fence",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    activity = await db.renew_source_activity(
-        activity_id=job.id,
-        capability=job.id,
-    )
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.commit()
-    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
+    activity = await _expired_sync_activity(db, "sqlite-reference-stale-fence")
     reference = EvidenceReference(
         role=EvidenceRole.PRIMARY,
         anchor=SourceAnchor(
@@ -2029,417 +1347,3 @@ async def test_evidence_reference_write_rejects_recovered_maintenance_fence(
         )
 
 
-@pytest.mark.asyncio
-async def test_finding_write_rejects_recovered_maintenance_fence(
-    db: Database,
-) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-finding-stale-fence",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    activity = await db.renew_source_activity(
-        activity_id=job.id,
-        capability=job.id,
-    )
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.commit()
-    await db.recover_stale_lifecycle_backfill_job(job.id, error="expired")
-
-    with pytest.raises(SourceActivityConflict, match="source activity"):
-        await db.upsert_lifecycle_cutover_finding(
-            _finding(),
-            source_activity=activity,
-        )
-
-    assert await db.get_lifecycle_cutover_finding(_finding().id) is None
-
-
-@pytest.mark.asyncio
-async def test_list_stale_lifecycle_jobs_excludes_current_lease(
-    db: Database,
-) -> None:
-    await db.upsert_source(
-        id="src-current-maintenance",
-        type="confluence",
-        name="Current maintenance",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="owner-1",
-    )
-    stale = await db.create_source_rebaseline_job(
-        LifecycleBackfillJob(
-            id="sqlite-list-stale-lifecycle-job",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    current = await db.create_source_rebaseline_job(
-        LifecycleBackfillJob(
-            id="sqlite-list-current-lifecycle-job",
-            source_id="src-current-maintenance",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(stale.id)
-    await db.start_lifecycle_backfill_job(current.id)
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", stale.id),
-    )
-    await db.db.commit()
-
-    stale_ids = await db.list_stale_lifecycle_backfill_job_ids(limit=10)
-
-    assert stale_ids == (stale.id,)
-    await db.fail_lifecycle_backfill_job(current.id, error="test cleanup")
-
-
-@pytest.mark.asyncio
-async def test_recover_stale_lifecycle_jobs_fails_orphaned_jobs(
-    db: Database,
-) -> None:
-    stale = await db.create_source_rebaseline_job(
-        LifecycleBackfillJob(
-            id="sqlite-sweep-stale-lifecycle-job",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(stale.id)
-    await db.db.execute(
-        "DELETE FROM source_activity_leases WHERE id = ?",
-        (stale.id,),
-    )
-    await db.db.commit()
-
-    recovered = await recover_stale_lifecycle_jobs(db)
-
-    assert tuple(job.id for job in recovered) == (stale.id,)
-    assert recovered[0].status is LifecycleBackfillJobStatus.FAILED
-    assert recovered[0].error == "source lifecycle maintenance lease expired before completion"
-
-
-@pytest.mark.asyncio
-async def test_recover_stale_lifecycle_jobs_isolates_one_invalid_job(
-    db: Database,
-) -> None:
-    await db.upsert_source(
-        id="src-second-stale-maintenance",
-        type="confluence",
-        name="Second stale maintenance",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="owner-1",
-    )
-    invalid = await db.create_source_rebaseline_job(
-        LifecycleBackfillJob(
-            id="sqlite-sweep-invalid-lifecycle-job",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-            created_at="2026-01-01T00:00:00+00:00",
-        )
-    )
-    recoverable = await db.create_source_rebaseline_job(
-        LifecycleBackfillJob(
-            id="sqlite-sweep-recoverable-lifecycle-job",
-            source_id="src-second-stale-maintenance",
-            status=LifecycleBackfillJobStatus.QUEUED,
-            created_at="2026-01-02T00:00:00+00:00",
-        )
-    )
-    await db.start_lifecycle_backfill_job(invalid.id)
-    await db.start_lifecycle_backfill_job(recoverable.id)
-    await db.db.execute(
-        "UPDATE source_activity_leases SET capability = ?, lease_until = ? WHERE id = ?",
-        ("invalid-capability", "2000-01-01T00:00:00+00:00", invalid.id),
-    )
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", recoverable.id),
-    )
-    await db.db.commit()
-
-    recovered = await recover_stale_lifecycle_jobs(db)
-
-    assert tuple(job.id for job in recovered) == (recoverable.id,)
-    assert (await db.get_lifecycle_backfill_job(invalid.id)).status is (LifecycleBackfillJobStatus.RUNNING)
-    assert (await db.get_lifecycle_backfill_job(recoverable.id)).status is (LifecycleBackfillJobStatus.FAILED)
-
-
-@pytest.mark.asyncio
-async def test_recover_stale_lifecycle_backfill_job_refuses_current_lease(
-    db: Database,
-) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-refuse-current-lifecycle-job",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-
-    with pytest.raises(SourceActivityConflict, match="lease is still current"):
-        await db.recover_stale_lifecycle_backfill_job(
-            job.id,
-            error="must not replace a live lifecycle owner",
-        )
-
-    stored = await db.get_lifecycle_backfill_job(job.id)
-    assert stored is not None
-    assert stored.status is LifecycleBackfillJobStatus.RUNNING
-    await db.fail_lifecycle_backfill_job(job.id, error="test cleanup")
-
-
-@pytest.mark.asyncio
-async def test_recover_stale_lifecycle_backfill_job_accepts_missing_lease(
-    db: Database,
-) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-recover-orphaned-lifecycle-job",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    await db.db.execute(
-        "DELETE FROM source_activity_leases WHERE id = ?",
-        (job.id,),
-    )
-    await db.db.commit()
-
-    recovered = await db.recover_stale_lifecycle_backfill_job(
-        job.id,
-        error="operator recovered orphaned lifecycle job",
-    )
-
-    assert recovered.status is LifecycleBackfillJobStatus.FAILED
-    assert recovered.error == "operator recovered orphaned lifecycle job"
-    assert await db.get_active_lifecycle_backfill_job("src-1") is None
-
-
-@pytest.mark.asyncio
-async def test_recover_stale_lifecycle_backfill_job_serializes_job_reacquisition(
-    db: Database,
-    monkeypatch,
-) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-recover-serialized-lifecycle-job",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    await db.db.execute("DELETE FROM source_activity_leases WHERE id = ?", (job.id,))
-    await db.db.commit()
-    other = Database(db.db_path)
-    await other.connect()
-    source_locked = asyncio.Event()
-    release_recovery = asyncio.Event()
-    original_execute = db.db._execute
-
-    async def pause_after_source_lock(function, *args, **kwargs):
-        cursor = await original_execute(function, *args, **kwargs)
-        sql = args[0] if args and isinstance(args[0], str) else ""
-        if sql.startswith("UPDATE sources SET status = status"):
-            source_locked.set()
-            await release_recovery.wait()
-        return cursor
-
-    monkeypatch.setattr(db.db, "_execute", pause_after_source_lock)
-    recovery = asyncio.create_task(
-        db.recover_stale_lifecycle_backfill_job(
-            job.id,
-            error="operator recovered orphaned lifecycle job",
-        )
-    )
-    await asyncio.wait_for(source_locked.wait(), timeout=1)
-    reacquisition = asyncio.create_task(other.create_lifecycle_backfill_job(job))
-    await asyncio.sleep(0.05)
-    assert not reacquisition.done()
-
-    release_recovery.set()
-    recovered, retried = await asyncio.gather(recovery, reacquisition)
-
-    assert recovered.status is LifecycleBackfillJobStatus.FAILED
-    assert retried.status is LifecycleBackfillJobStatus.FAILED
-    assert await other.get_active_lifecycle_backfill_job("src-1") is None
-    assert not await other.release_source_activity(activity_id=job.id, capability=job.id)
-    await other.close()
-
-
-@pytest.mark.asyncio
-async def test_recover_stale_lifecycle_backfill_job_rejects_lease_identity_mismatch(
-    db: Database,
-) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-recover-identity-mismatch",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    await db.db.execute(
-        "UPDATE source_activity_leases SET capability = ?, lease_until = ? WHERE id = ?",
-        ("different-capability", "2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.commit()
-
-    with pytest.raises(SourceActivityConflict, match="identity mismatch"):
-        await db.recover_stale_lifecycle_backfill_job(job.id, error="must roll back")
-
-    stored = await db.get_lifecycle_backfill_job(job.id)
-    assert stored is not None
-    assert stored.status is LifecycleBackfillJobStatus.RUNNING
-
-
-@pytest.mark.asyncio
-async def test_recover_stale_lifecycle_backfill_job_is_idempotent_after_failure(
-    db: Database,
-) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-recover-idempotent-failure",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    await db.db.execute("DELETE FROM source_activity_leases WHERE id = ?", (job.id,))
-    await db.db.commit()
-    first = await db.recover_stale_lifecycle_backfill_job(job.id, error="first recovery")
-
-    second = await db.recover_stale_lifecycle_backfill_job(job.id, error="second recovery")
-
-    assert second == first
-    assert second.error == "first recovery"
-
-
-@pytest.mark.asyncio
-async def test_recover_stale_lifecycle_backfill_job_rolls_back_partial_failure(
-    db: Database,
-) -> None:
-    job = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="sqlite-recover-rollback",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    await db.start_lifecycle_backfill_job(job.id)
-    await db.db.execute(
-        "UPDATE source_activity_leases SET lease_until = ? WHERE id = ?",
-        ("2000-01-01T00:00:00+00:00", job.id),
-    )
-    await db.db.execute(
-        """CREATE TRIGGER abort_stale_recovery
-           BEFORE UPDATE OF status ON lifecycle_backfill_jobs
-           WHEN NEW.id = 'sqlite-recover-rollback' AND NEW.status = 'failed'
-           BEGIN SELECT RAISE(ABORT, 'forced recovery failure'); END"""
-    )
-    await db.db.commit()
-    fenced_epoch = await db.get_source_activity_epoch("src-1")
-
-    with pytest.raises(sqlite3.IntegrityError, match="forced recovery failure"):
-        await db.recover_stale_lifecycle_backfill_job(job.id, error="must roll back")
-
-    stored = await db.get_lifecycle_backfill_job(job.id)
-    assert stored is not None
-    assert stored.status is LifecycleBackfillJobStatus.RUNNING
-    assert await db.get_source_activity_epoch("src-1") == fenced_epoch
-    async with db.db.execute(
-        "SELECT COUNT(*) AS count FROM source_activity_leases WHERE id = ?",
-        (job.id,),
-    ) as cursor:
-        assert int((await cursor.fetchone())["count"]) == 1
-
-
-@pytest.mark.asyncio
-async def test_recovery_gates_enabled_source_before_scanning_missing_support(
-    db: Database,
-    monkeypatch,
-) -> None:
-    await _add_unsupported_legacy_source_edge(db)
-    now = "2026-07-16T00:00:00+00:00"
-    await db.db.execute(
-        """INSERT INTO source_lifecycle_gates (
-               source_id, state, reason, audited_at, enabled_at, updated_at
-           ) VALUES (?, 'enabled', NULL, ?, ?, ?)""",
-        ("src-1", now, now, now),
-    )
-    await db.db.commit()
-
-    async def fail_scan(_source_id: str):
-        raise RuntimeError("simulated audit failure")
-
-    monkeypatch.setattr(db, "list_legacy_memory_provenance", fail_scan)
-
-    with pytest.raises(RuntimeError, match="simulated audit failure"):
-        await run_source_lifecycle_recovery_job(
-            db,
-            "src-1",
-            job_id="recovery-gates-before-scan",
-        )
-
-    gate = await db.get_lifecycle_gate("src-1")
-    assert gate.state is LifecycleGateState.GATED
-    assert gate.reason and "support invariant violation" in gate.reason
-
-
-@pytest.mark.asyncio
-async def test_source_allows_only_one_active_lifecycle_job(db: Database) -> None:
-    first = await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="source-rebaseline-first",
-            source_id="src-1",
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    assert await db.get_active_lifecycle_backfill_job("src-1") == first
-
-    with pytest.raises(ValueError, match="source lifecycle job already active"):
-        await db.create_lifecycle_backfill_job(
-            LifecycleBackfillJob(
-                id="source-rebaseline-second",
-                source_id="src-1",
-                status=LifecycleBackfillJobStatus.QUEUED,
-            )
-        )
-
-    assert await db.create_lifecycle_backfill_job(first) == first
-
-    await db.start_lifecycle_backfill_job(first.id)
-    assert (await db.get_active_lifecycle_backfill_job("src-1")).status is LifecycleBackfillJobStatus.RUNNING
-    await db.fail_lifecycle_backfill_job(first.id, error="test terminal state")
-    assert await db.get_active_lifecycle_backfill_job("src-1") is None
-
-
-@pytest.mark.asyncio
-async def test_backfill_job_failure_is_durable(db: Database, monkeypatch) -> None:
-    async def fail_scan(source_id: str):
-        del source_id
-        raise RuntimeError("projection store unavailable")
-
-    monkeypatch.setattr(db, "list_legacy_memory_provenance", fail_scan)
-
-    with pytest.raises(RuntimeError, match="projection store unavailable"):
-        await run_source_lifecycle_backfill_job(
-            db,
-            "src-1",
-            job_id="backfill-job-failed",
-        )
-
-    failed = await db.get_lifecycle_backfill_job("backfill-job-failed")
-    assert failed is not None
-    assert failed.status is LifecycleBackfillJobStatus.FAILED
-    assert failed.error == "projection store unavailable"

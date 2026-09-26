@@ -17,6 +17,7 @@ spy-engine assertions fail.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,6 +28,7 @@ from memforge.models import MemoryExtractionResult, RawMemory
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.database import Database
+from tests.llm_fixture import FIXTURE_CONTEXT_WINDOW, fixture_budget
 
 
 U1_USER = "u-1"
@@ -73,9 +75,25 @@ class _StubDocumentStore:
 
 
 class _SingleMemoryExtractor:
-    """Yields one RawMemory so the orchestrator reaches projected lifecycle."""
+    """Selects one Fragment claim so the orchestrator reaches projected lifecycle."""
 
-    async def extract_memories(self, **kwargs):
+    model = "fixture"
+    max_tokens = 8192
+    structured_llm_client = SimpleNamespace(
+        request_budget=lambda model=None: fixture_budget(
+            input_tokens=FIXTURE_CONTEXT_WINDOW, output_tokens=8192, correction_reserve=0,
+        ),
+        request_fits=lambda *args, **kwargs: True,
+        request_tokens=lambda prompt, **kwargs: max(1, len(prompt) // 4),
+    )
+
+    def fragment_output_tokens(self, catalog):
+        del catalog
+        return self.max_tokens
+
+    async def extract_projection_fragment_memories(self, catalog, **kwargs):
+        del kwargs
+        primary = next(fragment for fragment in catalog.fragments if fragment.primary_eligible)
         return MemoryExtractionResult(
             memories=[
                 RawMemory(
@@ -83,30 +101,10 @@ class _SingleMemoryExtractor:
                     content="durable design fact",
                     entity_refs=[],
                     confidence=0.9,
-                )
-            ],
-        )
-
-    async def extract_memory_changes(self, **kwargs):
-        return MemoryExtractionResult(
-            memories=[
-                RawMemory(
-                    memory_type="fact",
-                    content="durable design fact",
-                    entity_refs=[],
-                    confidence=0.9,
-                )
-            ],
-        )
-
-    async def extract_unit_memories(self, context, **kwargs):
-        return MemoryExtractionResult(
-            memories=[
-                RawMemory(
-                    memory_type="fact",
-                    content="durable design fact",
-                    entity_refs=[],
-                    confidence=0.9,
+                    source_observation_id=primary.anchor.observation_id,
+                    resolved_evidence_selection=catalog.resolve_selection(
+                        primary_ref=primary.reference,
+                    ),
                 )
             ],
         )

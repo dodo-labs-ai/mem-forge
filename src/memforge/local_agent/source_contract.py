@@ -253,26 +253,6 @@ def local_agent_collection_is_authoritative(source_type: object) -> bool:
         return False
 
 
-def local_agent_rebaseline_snapshot_is_authoritative(
-    source_type: object,
-    *,
-    force_full_sync: bool,
-    input_snapshot_id: str | None,
-) -> bool:
-    """Return whether an immutable attempt defines the rebaseline corpus."""
-
-    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
-
-    try:
-        adapter = get_local_source_replay_adapter(str(source_type or "").strip().lower())
-    except ValueError:
-        return False
-    return adapter.rebaseline_snapshot_is_authoritative(
-        force_full_sync=force_full_sync,
-        input_snapshot_id=input_snapshot_id,
-    )
-
-
 def local_agent_input_sha256(doc_id: object, document_hash: object) -> str:
     """Hash stable document identity and semantic content version."""
     normalized_doc_id = str(doc_id or "").strip()
@@ -454,7 +434,6 @@ def source_with_sync_inputs(
     *,
     input_snapshot_supplied: bool = False,
     authoritative_snapshot: bool = False,
-    preserve_version_history: bool = False,
 ) -> dict[str, Any]:
     """Project immutable raw inputs into the connector's runtime manifest.
 
@@ -463,7 +442,6 @@ def source_with_sync_inputs(
     empty snapshot without claiming complete provider coverage.
     """
     latest_entries: dict[str, dict[str, Any]] = {}
-    historical_entries: list[dict[str, Any]] = []
     for source_input in sorted(
         inputs,
         key=lambda item: int(getattr(item, "input_generation", 0)),
@@ -484,13 +462,10 @@ def source_with_sync_inputs(
             **({"package_sha256": package_sha256} if package_sha256 else {}),
         }
         latest_entries[doc_id] = projected_entry
-        historical_entries.append(projected_entry)
     projected = dict(source)
     if latest_entries or input_snapshot_supplied or authoritative_snapshot:
         config = dict(_source_config(source.get("config")))
-        config["local_agent_package_manifest"] = (
-            historical_entries if preserve_version_history else list(latest_entries.values())
-        )
+        config["local_agent_package_manifest"] = list(latest_entries.values())
         projected["config"] = config
     return projected
 

@@ -869,8 +869,6 @@ class MemoryEngine:
         for mutation in plan.mutations:
             if mutation.mutation_type.value == "create_memory":
                 stats["added"] += 1
-            elif mutation.mutation_type.value == "reactivate_memory":
-                stats["reactivated"] += 1
             elif mutation.mutation_type.value == "supersede_memory":
                 if mutation.payload.get("replacement_kind") == "revision":
                     stats["updated"] += 1
@@ -993,7 +991,6 @@ class MemoryEngine:
 
         stats = {
             "added": 0,
-            "reactivated": 0,
             "corroborated": 0,
             "updated": 0,
             "superseded": 0,

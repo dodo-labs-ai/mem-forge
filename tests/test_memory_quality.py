@@ -473,7 +473,7 @@ async def test_memory_detail_represents_unprojected_legacy_provenance_without_re
     assert "evidence_artifacts" not in payload
     [group] = payload["evidence"]
     assert group["kind"] == "document"
-    assert group["legacy_limited"] is True
+    assert "legacy_limited" not in group
     assert group["evidence_unit_id"] is None
     assert group["source_unit_id"] is None
     [item] = group["items"]

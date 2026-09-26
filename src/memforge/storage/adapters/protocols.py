@@ -23,7 +23,6 @@ from memforge.models import (
     MemorySource,
     MemorySourceRef,
     Project,
-    SourceLifecycleResetResult,
 )
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
@@ -38,10 +37,6 @@ from memforge.memory.evidence import (
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.cross_document_relation import CrossDocumentRelationOutcome, CurrentCrossDocumentRelation
 from memforge.memory.lifecycle_plan import (
-    LegacyMemoryProvenance,
-    LifecycleCutoverFinding,
-    LifecycleBackfillJob,
-    CutoverFindingStatus,
     LifecycleGate,
     LifecyclePlan,
     LifecycleReview,
@@ -376,22 +371,6 @@ class RelationalStore(Protocol):
         excluded_doc_id: str | None = None,
         limit: int,
     ) -> list[Memory]: ...
-    async def find_rebaseline_reactivation_candidate(
-        self,
-        content_hash: str,
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None,
-    ) -> Memory | None: ...
-    async def find_rebaseline_reactivation_candidates(
-        self,
-        content_hashes: Sequence[str],
-        *,
-        visibility: str,
-        owner_user_id: str | None,
-        repo_identifier: str | None,
-    ) -> list[Memory]: ...
     async def get_memory_sources(self, memory_id: str) -> list[MemorySource]: ...
     async def upsert_document(
         self,
@@ -407,12 +386,6 @@ class RelationalStore(Protocol):
         *,
         source_activity: SourceActivityLease | None = None,
     ) -> None: ...
-    async def rebaseline_source_lifecycle(
-        self,
-        source_id: str,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> SourceLifecycleResetResult: ...
     async def rebind_projected_document_support(
         self,
         old_doc_id: str,
@@ -513,11 +486,6 @@ class RelationalStore(Protocol):
         coverage: ProjectionCoverage,
         error: str,
     ) -> ProjectionScopeTransition: ...
-    async def list_legacy_memory_provenance(
-        self,
-        source_id: str,
-    ) -> list[LegacyMemoryProvenance]: ...
-    async def count_active_source_memories(self, source_id: str) -> int: ...
     async def count_active_source_memories_without_support(self, source_id: str) -> int: ...
     async def count_active_supported_memories_without_source_provenance(
         self,
@@ -530,55 +498,6 @@ class RelationalStore(Protocol):
         *,
         source_activity: SourceActivityLease | None = None,
     ) -> LifecycleGate: ...
-    async def gate_destructive_lifecycle(
-        self,
-        source_id: str,
-        *,
-        reason: str,
-        source_activity: SourceActivityLease | None = None,
-    ) -> LifecycleGate: ...
-    async def upsert_lifecycle_cutover_finding(
-        self,
-        finding: LifecycleCutoverFinding,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> None: ...
-    async def get_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-    ) -> LifecycleCutoverFinding | None: ...
-    async def list_lifecycle_cutover_findings(
-        self,
-        source_id: str,
-        *,
-        status: CutoverFindingStatus | None = None,
-    ) -> list[LifecycleCutoverFinding]: ...
-    async def create_lifecycle_backfill_job(
-        self,
-        job: LifecycleBackfillJob,
-    ) -> LifecycleBackfillJob: ...
-    async def create_source_rebaseline_job(
-        self,
-        job: LifecycleBackfillJob,
-    ) -> LifecycleBackfillJob: ...
-    async def start_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob: ...
-    async def complete_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        scanned_memories: int,
-        mapped_memories: int,
-        finding_count: int,
-    ) -> LifecycleBackfillJob: ...
-    async def fail_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        error: str,
-        scanned_memories: int = 0,
-        mapped_memories: int = 0,
-        finding_count: int = 0,
-    ) -> LifecycleBackfillJob: ...
     async def renew_source_activity(
         self,
         *,
@@ -586,45 +505,6 @@ class RelationalStore(Protocol):
         capability: str | None = None,
         lease_seconds: int = 900,
     ) -> SourceActivityLease: ...
-    async def recover_stale_lifecycle_backfill_job(
-        self,
-        job_id: str,
-        *,
-        error: str,
-    ) -> LifecycleBackfillJob: ...
-    async def list_stale_lifecycle_backfill_job_ids(
-        self,
-        *,
-        limit: int = 100,
-    ) -> tuple[str, ...]: ...
-    async def get_lifecycle_backfill_job(self, job_id: str) -> LifecycleBackfillJob | None: ...
-    async def get_active_lifecycle_backfill_job(
-        self,
-        source_id: str,
-    ) -> LifecycleBackfillJob | None: ...
-    async def list_lifecycle_backfill_jobs(
-        self,
-        source_id: str,
-        *,
-        limit: int = 20,
-    ) -> list[LifecycleBackfillJob]: ...
-    async def resolve_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-        *,
-        observation_id: str,
-        source_unit_id: str,
-        source_activity: SourceActivityLease | None = None,
-    ) -> LifecycleCutoverFinding: ...
-    async def retire_unprovable_lifecycle_cutover_finding(
-        self,
-        finding_id: str,
-        *,
-        source_id: str,
-        reconstruction_attempt_id: str,
-        operator_id: str,
-        unavailable_documents: Mapping[str, str],
-    ) -> LifecycleCutoverFinding: ...
     async def record_evidence_references(
         self,
         evidence_unit_id: str,
@@ -650,12 +530,6 @@ class RelationalStore(Protocol):
         self,
         memory_ids: Sequence[str],
     ) -> Mapping[str, ActiveMemorySupportState]: ...
-    async def get_active_memory_support_evidence(
-        self,
-        memory_id: str,
-        *,
-        source_id: str | None = None,
-    ) -> tuple[ActiveSupportEvidence, ...]: ...
     async def get_active_memory_support_evidence_many(
         self,
         memory_ids: Sequence[str],

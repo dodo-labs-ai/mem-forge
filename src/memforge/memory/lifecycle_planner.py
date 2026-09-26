@@ -217,25 +217,10 @@ def build_lifecycle_plan(
             support_ids = tuple(support_id for support_id in support_ids if support_id not in preserved)
             if not support_ids:
                 continue
-        reactivation_mutations: tuple[LifecycleMutation, ...] = ()
         if target.status == "retired":
-            if target.retirement_reason != "source_rebaseline":
-                raise ValueError("only source-rebaseline retirement may be reactivated")
-            reactivation_mutations = (
-                LifecycleMutation(
-                    LifecycleMutationType.REACTIVATE_MEMORY,
-                    memory_id=target.id,
-                    source_id=scope.source_id,
-                    payload={
-                        "expected_content_hash": target.content_hash,
-                        "reason": "exact claim replayed after source rebaseline",
-                    },
-                ),
-            )
-            request_relation_discovery(target.id, target.content_hash)
+            raise ValueError("retired Memory cannot be corroborated")
         mutations.extend(
             (
-                *reactivation_mutations,
                 LifecycleMutation(
                     LifecycleMutationType.ATTACH_SUPPORT,
                     memory_id=target.id,

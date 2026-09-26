@@ -2808,44 +2808,6 @@ async def test_repeated_source_scope_update_creates_a_new_transition_cycle(
 
 
 @pytest.mark.asyncio
-async def test_manual_sync_returns_conflict_during_lifecycle_maintenance(
-    db,
-    tmp_path,
-):
-    from memforge.memory.lifecycle_plan import (
-        LifecycleBackfillJob,
-        LifecycleBackfillJobStatus,
-    )
-    from memforge.server.admin_api import create_admin_app
-
-    source_id = "src-sync-maintenance-conflict"
-    await db.upsert_source(
-        id=source_id,
-        type="confluence",
-        name="Maintenance conflict",
-        config_json=json.dumps({"base_url": "https://wiki.example"}),
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    await db.create_lifecycle_backfill_job(
-        LifecycleBackfillJob(
-            id="lifecycle-sync-conflict",
-            source_id=source_id,
-            status=LifecycleBackfillJobStatus.QUEUED,
-        )
-    )
-    app = create_admin_app(db=db, config=_config(tmp_path))
-
-    with TestClient(app) as client:
-        response = client.post(f"/api/v1/sources/{source_id}/sync")
-
-    assert response.status_code == 409
-    assert response.json()["detail"] == (
-        "source lifecycle maintenance active: lifecycle-sync-conflict"
-    )
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["sync", "force-resync"])
 async def test_server_sync_routes_translate_atomic_activity_race_to_409(
     db,
