@@ -380,7 +380,7 @@ async def test_section_deletion_is_unsupported_only_after_the_whole_order():
     client, store = DeniedClient(limit=4000), Store()
     executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
     [result] = (await executor.assess_many([item])).values()
-    assert result.supported is False and result.unresolved is None
+    assert result.supported is False and result.unresolved is None and result.complete_read
     assert len(client.prompts) > 1
     total = len(reading_order([item]).parts)
     [receipt] = receipts(store)
@@ -513,9 +513,15 @@ async def test_no_current_content_is_unsupported_without_a_call():
     context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
     assert not context.full_fragments
     item = SupportWorkItem("w0", memory(), old_support(base), context)
-    executor = RevisionWorkExecutor(client=NoCallClient(), model="fixture")
+    store = Store()
+    executor = RevisionWorkExecutor(client=NoCallClient(), model="fixture", store=store, derivation_id="root")
     [result] = (await executor.assess_many([item])).values()
     assert result.supported is False and result.memory is None and executor.calls == 0
+    # The empty reading order is read completely, and its program receipt says so.
+    assert result.complete_read
+    [receipt] = receipts(store)
+    assert receipt.manifest["coverage"] == {"total": 0, "read_parts": {"w0": 0}}
+    assert executor.final_work_ids == [receipt.id]
 
 
 @pytest.mark.asyncio

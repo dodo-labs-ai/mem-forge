@@ -100,7 +100,7 @@ def test_active_v9_source_matrix_uses_exact_current_incremental_authority(
         extractor=NoopMemoryExtractor(),
         source_type=source_type,
         doc_type="document",
-    )
+    ).requests
     primary_text = "\n".join(
         fragment.presentation_text
         for request in requests

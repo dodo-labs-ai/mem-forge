@@ -48,6 +48,14 @@ REVISION_SUPPORT_CONTRACT = "revision-support-v5"
 REVISION_INPUT_POLICY = "revision-input-v7"
 
 
+def reading_group_label(fragments) -> str:
+    """A stable diagnostic name for one ReadingGroup: its Observation and character range."""
+    first, last = fragments[0].anchor, fragments[-1].anchor
+    if first.range_start is None or last.range_end is None:
+        return first.observation_id
+    return f"{first.observation_id}:{first.range_start}-{last.range_end}"
+
+
 def revision_inference_capability_hash(client, *, extraction_model=None, extraction_max_tokens=None) -> str:
     from memforge.pipeline.projection_images import projection_inference_capability_hash
 
@@ -70,6 +78,15 @@ class SupportAssessment:
     # Why a kept claim could not be judged: an UNKNOWN Evidence part under partial
     # coverage, or one ReadingGroup that alone exceeds the model's capacity.
     unresolved: Literal["partial_coverage", "capacity"] | None = None
+    # The Support was bound to its exactly unchanged current Evidence without a read:
+    # the program rebind, or Change Impact judged it UNAFFECTED.
+    rebound: bool = False
+    # An unsupported result rests on the whole current revision: a read of its whole
+    # reading order, whose completion receipt is recorded, or a revision with no
+    # content left whose coverage is authoritative for the claim's Evidence. A re-check
+    # that read only a Candidate's Evidence never does, so it can keep a claim but
+    # never retire one.
+    complete_read: bool = False
 
 
 def _changed_ranges(base: SourceObservationRevision, target: SourceObservationRevision):

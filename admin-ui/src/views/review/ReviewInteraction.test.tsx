@@ -211,6 +211,7 @@ describe("Review interaction", () => {
       ...lifecycleDetailFixture(),
       status: "stale" as const,
       is_stale: true,
+      refreshable: true,
       decision_fingerprint: "review-decision-v1:stale-lifecycle",
     };
     const refreshed = {

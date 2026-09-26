@@ -424,3 +424,10 @@ def unsupported(work):
 def _source(group):
     """The request-local source alias of a supplied ref; carried and historical text have none."""
     return {"source": group.get("source") if group else None}
+
+
+def pinned(memory_id: str, supported: bool, reason: str = ""):
+    """One incumbent's completed Support read, as a (memory ID, Memory-level result) pair."""
+    from memforge.pipeline.support_relation_coordinator import MemorySupport, SupportResult
+
+    return memory_id, MemorySupport(SupportResult.SUPPORTED if supported else SupportResult.UNSUPPORTED, reason)

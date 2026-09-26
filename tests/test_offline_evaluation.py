@@ -37,7 +37,8 @@ from memforge.models import (
     RawContent,
     RawMemory,
 )
-from memforge.pipeline.reconciler import ReconciliationResult, SupportAuditEntry
+from memforge.pipeline.reconciler import ReconciliationResult
+from memforge.pipeline.support_relation_coordinator import MemorySupport, SupportResult
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
@@ -1252,10 +1253,10 @@ async def test_reconciliation_replay_judges_against_pinned_support(db, monkeypat
     assert output["operations"] == []
     assert captured["structured_llm_client"] is client
     assert captured["llm_model"] == "candidate-model"
-    assert captured["support_audits"] == [
-        SupportAuditEntry(incumbent_id="mem-a", supported=True, reason="still stated"),
-        SupportAuditEntry(incumbent_id="mem-b", supported=False),
-    ]
+    assert captured["supports"] == {
+        "mem-a": MemorySupport(SupportResult.SUPPORTED, "still stated"),
+        "mem-b": MemorySupport(SupportResult.UNSUPPORTED, ""),
+    }
     assert [memory.id for memory in captured["existing_memories"]] == ["mem-a", "mem-b"]
 
 

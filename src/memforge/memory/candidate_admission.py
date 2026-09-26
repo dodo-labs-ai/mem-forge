@@ -206,8 +206,9 @@ async def admit_candidates(
     )
 
 
-def _normalized(raw: RawMemory) -> str:
-    return re.sub(r"\s+", " ", raw.content.strip())
+def normalized_claim(content: str) -> str:
+    """A claim with its whitespace normalized; equal normalized claims state the same text."""
+    return re.sub(r"\s+", " ", content.strip())
 
 
 def _identical_claims(by_ref: dict[str, RawMemory]) -> dict[str, set[str]]:
@@ -215,7 +216,7 @@ def _identical_claims(by_ref: dict[str, RawMemory]) -> dict[str, set[str]]:
 
     groups: dict[tuple, list[str]] = {}
     for ref, raw in by_ref.items():
-        groups.setdefault((_normalized(raw), raw.memory_type, raw.valid_from, raw.valid_until), []).append(ref)
+        groups.setdefault((normalized_claim(raw.content), raw.memory_type, raw.valid_from, raw.valid_until), []).append(ref)
     return {ref: {other for other in group if other != ref} for group in groups.values() for ref in group}
 
 
@@ -224,7 +225,7 @@ def _by_precedence(candidates: Sequence[RawMemory]) -> list[tuple[int, RawMemory
 
     return sorted(
         enumerate(candidates),
-        key=lambda item: (-len(_normalized(item[1])), item[1].memory_type, _normalized(item[1]), item[0]),
+        key=lambda item: (-len(normalized_claim(item[1].content)), item[1].memory_type, normalized_claim(item[1].content), item[0]),
     )
 
 

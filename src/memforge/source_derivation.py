@@ -46,6 +46,7 @@ from memforge.pipeline.extraction_contract import (
 from memforge.pipeline.projection_context import (
     CommittedSourceUnitSnapshot,
     ExtractionAuthority,
+    ExtractionPlan,
     ExtractionRequest,
     PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION,
     ProjectionEvidencePlanningFailure,
@@ -257,7 +258,7 @@ class SourceUnitDerivationRequest:
     # is one durable derivation batch.
     plan_requests: Callable[
         [ExtractionAuthority],
-        Awaitable[tuple[ExtractionRequest, ...]],
+        Awaitable[ExtractionPlan],
     ]
     extract_request: Callable[
         [ExtractionRequest],
@@ -495,7 +496,8 @@ class SourceUnitDeriver:
                 reused_batch_count=0,
                 executed_batch_count=0,
             )
-        batches = await request.plan_requests(planned_work)
+        plan = await request.plan_requests(planned_work)
+        batches = plan.requests
         manifest = source_derivation_manifest(
             request.projection,
             batches,
@@ -612,6 +614,7 @@ class SourceUnitDeriver:
         )
         extraction = assemble_source_derivation_results(
             projection=request.projection,
+            plan=plan,
             results=ordered_results,
         )
         extraction.metadata = {
@@ -643,20 +646,21 @@ async def replay_source_unit_derivation(
             planned_work,
             offline_replay=True,
         )
-    batches = await request.plan_requests(planned_work)
+    plan = await request.plan_requests(planned_work)
     results = await collect_bounded(
-        batches,
+        plan.requests,
         request.extract_request,
         max_concurrent=request.max_concurrent,
     )
     extraction = assemble_source_derivation_results(
         projection=request.projection,
+        plan=plan,
         results=tuple(results),
     )
     extraction.metadata = {
         **extraction.metadata,
         "reused_derivation_batch_count": 0,
-        "executed_derivation_batch_count": len(batches),
+        "executed_derivation_batch_count": len(plan.requests),
         "offline_replay": True,
     }
     return extraction
@@ -1259,9 +1263,12 @@ def _derivation_context_identity_payload(
 def assemble_source_derivation_results(
     *,
     projection: SourceProjection,
+    plan: ExtractionPlan,
     results: tuple[MemoryExtractionResult, ...],
 ) -> MemoryExtractionResult:
     metrics = _aggregate_extraction_metrics(results)
+    # ReadingGroups skipped for capacity, whether at planning or when a request was sent.
+    metrics["skipped_reading_group_count"] += len(plan.skipped_reading_groups)
     revisions_by_observation_id = {revision.observation_id: revision for revision in projection.observation_revisions}
     protected_observation_ids = tuple(
         observation.id
@@ -1345,6 +1352,7 @@ def aggregate_extraction_metrics(
         "selector_correction_calls",
         "selector_correction_candidate_count",
         "selector_correction_recovered_count",
+        "skipped_reading_group_count",
     )
     aggregated = {key: sum(int((result.metadata or {}).get(key, 0) or 0) for result in results) for key in keys}
     aggregated["max_active_multimodal"] = max(
@@ -1440,6 +1448,7 @@ def _safe_evidence_telemetry(value: object) -> dict[str, object]:
     for key in (
         "selector_correction_candidate_count",
         "selector_correction_recovered_count",
+        "skipped_reading_group_count",
     ):
         if isinstance(value.get(key), int):
             telemetry[key] = max(0, value[key])

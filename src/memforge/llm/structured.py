@@ -651,15 +651,22 @@ class StructuredLlmMetricsSummary:
 
 
 class StructuredLlmMetricsCollector:
-    """Collect logical-call outcomes for one request-local lifecycle scope."""
+    """Collect logical-call outcomes for one request-local lifecycle scope.
 
-    def __init__(self) -> None:
+    A collector with a parent also reports every call to it, so one concurrent
+    line counts its own calls while its enclosing scope still counts them all.
+    """
+
+    def __init__(self, parent: StructuredLlmMetricsCollector | None = None) -> None:
         self._lock = Lock()
         self._calls: list[StructuredLlmCallTelemetry] = []
+        self._parent = parent
 
     def record(self, telemetry: StructuredLlmCallTelemetry) -> None:
         with self._lock:
             self._calls.append(telemetry)
+        if self._parent is not None:
+            self._parent.record(telemetry)
 
     def checkpoint(self) -> int:
         """Mark the start of a stage without replacing its Unit collector."""
@@ -727,6 +734,13 @@ def structured_llm_metrics_scope(
         yield selected
     finally:
         _scoped_metrics_collector.reset(token)
+
+
+@contextmanager
+def structured_llm_line_scope() -> Iterator[StructuredLlmMetricsCollector]:
+    """Count the calls of one line that runs concurrently with others, apart from theirs."""
+    with structured_llm_metrics_scope(StructuredLlmMetricsCollector(parent=_scoped_metrics_collector.get())) as line:
+        yield line
 
 
 @dataclass

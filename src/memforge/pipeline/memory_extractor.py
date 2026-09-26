@@ -32,7 +32,7 @@ from memforge.pipeline.projection_fragments import (
     ProjectionFragmentCatalog,
 )
 from memforge.pipeline.projection_context import ExtractionAuthority
-from memforge.pipeline.revision_assessment import RevisionAssessmentContext
+from memforge.pipeline.revision_assessment import RevisionAssessmentContext, reading_group_label
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,6 @@ __all__ = ["ExtractionReading", "MemoryExtractor"]
 _FRAGMENT_OUTPUT_BASE_TOKENS = 512
 _FRAGMENT_OUTPUT_MIN_TOKENS = 768
 _FRAGMENT_OUTPUT_CHARS_PER_TOKEN = 2
-EXTRACTION_CAPACITY_EXCEEDED_MESSAGE = "one ReadingGroup alone exceeds the extraction request capacity"
 
 
 PROJECTION_FRAGMENT_EXTRACTION_PROMPT = """You are extracting durable atomic knowledge from one authorized Source Unit catalog.
@@ -123,6 +122,18 @@ class ExtractionReading:
             source_type=source_type,
             doc_type=doc_type,
         )
+
+    def report_skipped(self, item_ids) -> tuple[str, ...]:
+        """Report the items that alone exceed the route's capacity; return their labels in reading order."""
+        source_unit_id = self.context.projection.source_units[0].id
+        unfit = set(item_ids)
+        labels = tuple(reading_group_label(group) for item_id, group in self.items.items() if item_id in unfit)
+        for label in labels:
+            logger.warning(
+                "extraction_reading_group_skipped source_unit_id=%s reading_group=%s reason=%s",
+                source_unit_id, label, INPUT_CAPACITY_EXCEEDED,
+            )
+        return labels
 
     def catalog_for(self, item_ids) -> ProjectionFragmentCatalog:
         """The catalog of one request that reads these items."""
@@ -221,7 +232,9 @@ class MemoryExtractor:
         """Select exact current Evidence within this work's Primary authority.
 
         Each ReadingGroup that holds authorized Primary is one runner item, so a
-        request that times out or exceeds capacity is halved and resent.
+        request that times out or exceeds capacity is halved and resent. A
+        ReadingGroup that alone exceeds the route's capacity is skipped with a
+        diagnostic, and the other groups' Candidates are kept.
         """
 
         if not self.structured_llm_client:
@@ -280,14 +293,10 @@ class MemoryExtractor:
             return MemoryExtractionResult(
                 error_type="unexpected_error", error=str(error), metadata={**metrics, **elapsed()},
             )
-        failure = next((outcome for outcome in outcomes.values() if isinstance(outcome, ItemFailure)), None)
+        # An item that alone exceeds the route's capacity is skipped; any other failure fails the work.
+        failures = {item_id: outcome for item_id, outcome in outcomes.items() if isinstance(outcome, ItemFailure)}
+        failure = next((outcome for outcome in failures.values() if outcome.category != "capacity_exceeded"), None)
         if failure is not None:
-            if failure.category == "capacity_exceeded":
-                return MemoryExtractionResult(
-                    error_type=INPUT_CAPACITY_EXCEEDED,
-                    error=EXTRACTION_CAPACITY_EXCEEDED_MESSAGE,
-                    metadata={**metrics, **elapsed()},
-                )
             error = failure.error
             validation_fields = error.validation_fields if isinstance(error, StructuredLlmError) else ()
             return MemoryExtractionResult(
@@ -303,8 +312,9 @@ class MemoryExtractor:
                     ],
                 },
             )
+        skipped = reading.report_skipped(tuple(failures))
 
-        responses = dict(chunks[0] for chunks in outcomes.values())
+        responses = dict(chunks[0] for item_id, chunks in outcomes.items() if item_id not in failures)
         memories: list[RawMemory] = []
         resolution = _SelectionResolution()
         image_count = image_bytes = 0
@@ -330,6 +340,7 @@ class MemoryExtractor:
                 **elapsed(),
                 "structured_llm_calls": runner.stats.calls + resolution.correction["selector_correction_calls"],
                 "extraction_request_count": len(responses),
+                "skipped_reading_group_count": len(skipped),
                 "image_count": image_count,
                 "image_bytes": image_bytes,
                 **resolution.metrics(),
