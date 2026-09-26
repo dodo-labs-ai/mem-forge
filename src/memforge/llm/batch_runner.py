@@ -39,7 +39,9 @@ Result = TypeVar("Result")
 State = TypeVar("State")
 Found = TypeVar("Found")
 
-type FailureCategory = Literal["capacity_exceeded", "deadline_exceeded", "provider_error", "invalid_response"]
+type FailureCategory = Literal[
+    "capacity_exceeded", "deadline_exceeded", "provider_error", "invalid_response", "request_error",
+]
 
 OUTPUT_INVALID = "output_invalid"
 # Contract: one bounded correction per request, with the same input and refs.
@@ -88,9 +90,11 @@ class ItemFailure:
     """Why one item has no result.
 
     ``capacity_exceeded`` means the item alone exceeds the route's input
-    capacity; ``invalid_response`` means the model's output for the item alone
-    stayed invalid after its correction. ``error`` is the exception that ended
-    the item, when there is one. For a chain item, ``part`` is the index of the
+    capacity; ``invalid_response`` means a model response for the item alone was
+    received and stayed invalid after its correction. ``deadline_exceeded`` and
+    ``provider_error`` are transient, and ``request_error`` is a request that
+    failed without a response to validate. ``error`` is the exception that ended
+    the item; every failure that is not unjudgeable carries one, for the caller to raise. For a chain item, ``part`` is the index of the
     first part it could not read.
     """
 
@@ -103,7 +107,8 @@ class ItemFailure:
     def unjudgeable(self) -> bool:
         """The item alone cannot be judged, so sending it again would fail again.
 
-        Every other failure (a timeout or a provider error) is transient.
+        Only these two failures are recorded by the caller's stage; every other
+        failure leaves the work to be retried.
         """
 
         return self.category in _UNJUDGEABLE
@@ -569,10 +574,10 @@ def _failure_from_error(error: StructuredLlmError) -> ItemFailure:
         category: FailureCategory = "deadline_exceeded"
     elif error.error_code in _CAPACITY_ERROR_CODES:
         category = "capacity_exceeded"
-    elif error.terminal_category == "provider_error":
-        category = "provider_error"
+    elif error.terminal_category in {"provider_error", "invalid_response"}:
+        category = error.terminal_category
     else:
-        category = "invalid_response"
+        category = "request_error"
     return ItemFailure(category, error.error_code, error)
 
 

@@ -64,10 +64,13 @@ def test_a_revision_of_a_supported_claim_passes() -> None:
         (_supersede(), memory_support((SUPPORTED,)), True, KeptReason.READ_INCOMPLETE),
         (_supersede(), memory_support((READ_UNSUPPORTED,)), False, KeptReason.RELATION_INCOMPLETE),
         (_update(), memory_support((SUPPORTED,)), False, KeptReason.RELATION_INCOMPLETE),
+        # A missing Relation row may be the Candidate that restates the old Memory.
+        (_delete(), memory_support((READ_UNSUPPORTED,)), False, KeptReason.RELATION_INCOMPLETE),
     ],
     ids=[
         "no-support-result", "no-assessments", "partial-coverage", "capacity", "update-partial",
         "candidate-evidence-read", "supported-claim-superseded", "supersede-relation", "update-relation",
+        "delete-relation",
     ],
 )
 def test_an_incomplete_fact_keeps_the_old_memory(operation, support, relation_complete, reason) -> None:
@@ -77,12 +80,6 @@ def test_an_incomplete_fact_keeps_the_old_memory(operation, support, relation_co
     assert kept.action is ReconcileAction.NOOP and kept.memory_id == "mem-1"
     assert kept.memory is None and kept.support_revalidation_skipped
     assert validation.kept == {"mem-1": reason}
-
-
-def test_removing_support_needs_no_relation_work() -> None:
-    validation = _validate(_delete(), memory_support((READ_UNSUPPORTED,)), relation_complete=False)
-
-    assert validation.operations == (_delete(),)
 
 
 def test_proposals_and_non_destructive_decisions_are_not_validated() -> None:

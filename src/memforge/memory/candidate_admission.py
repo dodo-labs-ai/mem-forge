@@ -29,7 +29,6 @@ from memforge.llm.structured import (
     CANDIDATE_ADMISSION_REASON_MAX_CHARS,
     CandidateAdmissionDecision,
     CandidateAdmissionResponse,
-    StructuredLlmError,
 )
 from memforge.models import RawMemory
 from memforge.pipeline.candidate_evidence import (
@@ -192,7 +191,8 @@ async def admit_candidates(
     for ref, outcome in outcomes.items():
         if isinstance(outcome, ItemFailure):
             if not outcome.unjudgeable:
-                _raise_failure(outcome)
+                # A transient failure leaves the Source Unit revision uncommitted.
+                raise outcome.error
             logger.warning(
                 "candidate_admission_unjudged candidate_ref=%s reason=%s error_code=%s",
                 ref, outcome.category, outcome.error_code,
@@ -265,10 +265,3 @@ def _merge_admitted_duplicates(admitted: list[str], duplicates: dict[str, set[st
             remaining.discard(current)
             frontier.extend(other for other in duplicates[current] if other in remaining)
     return survivors
-
-
-def _raise_failure(failure: ItemFailure):
-    """A transient execution failure leaves the Source Unit revision uncommitted."""
-    if isinstance(failure.error, StructuredLlmError):
-        raise failure.error
-    raise CandidateAdmissionError("candidate_admission_failed", str(failure.error)) from failure.error

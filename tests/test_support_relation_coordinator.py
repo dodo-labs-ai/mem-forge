@@ -249,22 +249,34 @@ def test_an_unjudged_claim_is_kept_and_its_related_candidates_are_consumed(resul
     assert coordination.unresolved_candidate_count == 2
 
 
-def test_a_candidate_the_relation_line_could_not_judge_is_consumed_without_add() -> None:
+def test_an_unjudged_candidate_withholds_every_destructive_action_of_the_unit() -> None:
+    from memforge.memory.destructive_validation import KeptReason, validate_destructive_operations
+
     unjudged, contradicting, unrelated = (
-        _candidate("Unjudged claim."), _candidate("One reviewer."), _candidate("Retention is seven years."),
+        _candidate("mem-gone claim, restated."), _candidate("One reviewer."), _candidate("Retention is seven years."),
     )
-    relations = [_edge(1, CONTRADICTS)]
-    supports = {"mem-old": _support(UNSUPPORTED)}
+    incumbents = [_old("mem-old"), _old("mem-gone")]
+    read_unsupported = memory_support((SupportAssessment(False, "read whole order", None, complete_read=True),))
+    supports = {"mem-old": read_unsupported, "mem-gone": read_unsupported}
 
     coordination = _coordinate(
-        [unjudged, contradicting, unrelated], relations, supports, unjudged_candidates=frozenset({0}),
+        [unjudged, contradicting, unrelated], [_edge(1, CONTRADICTS)], supports,
+        incumbents=incumbents, unjudged_candidates=frozenset({0}),
     )
-
-    # Only the unjudged Candidate is held back; the rest of the table still decides.
-    assert _additions(coordination.operations) == [unrelated]
-    superseded = _by_memory(coordination.operations)["mem-old"]
-    assert superseded.action is ReconcileAction.SUPERSEDE and superseded.memory is contradicting
+    # The table still decides every old Memory, and the unjudged Candidate is consumed.
+    decided = _by_memory(coordination.operations)
+    assert (decided["mem-old"].action, decided["mem-gone"].action) == (ReconcileAction.SUPERSEDE, ReconcileAction.DELETE)
     assert coordination.unresolved_candidate_count == 1
+
+    # The Relation line lacks the unjudged Candidate's row, so no destructive decision is executed:
+    # the unjudged Candidate may restate mem-gone, which must not disappear with it.
+    validation = validate_destructive_operations(coordination.operations, supports=supports, relation_complete=False)
+    kept = _by_memory(validation.operations)
+    assert all(kept[memory_id].action is ReconcileAction.NOOP and kept[memory_id].support_revalidation_skipped
+               for memory_id in ("mem-old", "mem-gone"))
+    assert validation.kept == dict.fromkeys(("mem-old", "mem-gone"), KeptReason.RELATION_INCOMPLETE)
+    # The withheld SUPERSEDE was the contradicting Candidate's only effect, so it is not added either.
+    assert _additions(validation.operations) == [unrelated]
 
 
 def test_an_unjudged_candidate_outside_the_ledger_fails_closed() -> None:

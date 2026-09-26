@@ -31,12 +31,17 @@ from memforge.llm.structured_images import (
 
 logger = logging.getLogger(__name__)
 
+# ``invalid_response``: a model response was received and failed validation.
+# ``provider_error``: a transient, authorization or capacity failure the provider reported.
+# ``request_error``: the call failed without a response to validate for any other reason,
+# such as a provider rejection of the request (400) or an unexpected exception.
 type StructuredLlmTerminalCategory = Literal[
     "success",
     "cancelled",
     "deadline_exceeded",
     "provider_error",
     "invalid_response",
+    "request_error",
 ]
 type NativeSchemaTransport = Literal[
     "auto",
@@ -938,6 +943,10 @@ class StructuredLlmError(RuntimeError):
         self.diagnostic = diagnostic
 
 
+class _InvalidModelOutput(Exception):
+    """A received model response failed schema validation; its cause is the validation error."""
+
+
 @dataclass(frozen=True, slots=True)
 class _StructuredLlmFailure:
     """Content-free failure value that can outlive provider call frames."""
@@ -958,6 +967,8 @@ class _StructuredLlmFailure:
             )
         elif self.terminal_category == "provider_error":
             message = "structured LLM provider request failed"
+        elif self.terminal_category == "request_error":
+            message = "structured LLM request failed without a response to validate"
         else:
             message = "structured LLM returned an invalid response"
         message = f"{message} (code={self.error_code})"
@@ -1074,9 +1085,11 @@ def _structured_failure(
             error_code=exc.error_code,
             validation_fields=exc.validation_fields,
         )
+    if isinstance(exc, _InvalidModelOutput) and exc.__cause__ is not None:
+        exc, terminal_category = exc.__cause__, "invalid_response"
     category = terminal_category
     if category is None:
-        category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
+        category = "provider_error" if _is_non_fallback_provider_error(exc) else "request_error"
     return _StructuredLlmFailure(
         terminal_category=category,
         error_code=_safe_provider_error_code(exc),
@@ -1910,7 +1923,7 @@ class LiteLlmStructuredClient:
             failure = _structured_failure(exc)
         except StructuredLlmImageError as exc:
             failure = _StructuredLlmFailure(
-                terminal_category="invalid_response",
+                terminal_category="request_error",
                 error_code=exc.error_code,
             )
         except Exception as exc:
@@ -2032,7 +2045,8 @@ class LiteLlmStructuredClient:
             deadline=deadline,
             state=state,
             images=images,
-            initial_validation_failure=schema_failure,
+            # A request the gateway rejected has no response whose validation could be repaired.
+            initial_validation_failure=schema_failure if schema_failure.terminal_category == "invalid_response" else None,
         )
 
     async def _attempt_json_text_with_repair(
@@ -2051,6 +2065,7 @@ class LiteLlmStructuredClient:
         """Attempt JSON text and repair one invalid response under the shared budget."""
 
         failure: _StructuredLlmFailure | None = None
+        repairable = False
         try:
             result = await self._attempt_schema(
                 prompt=prompt,
@@ -2069,14 +2084,12 @@ class LiteLlmStructuredClient:
                     else None
                 ),
             )
+        except _InvalidModelOutput as exc:
+            # Malformed or schema-invalid output gets its one repair; truncation and refusal do not.
+            failure, repairable = _structured_failure(exc), True
         except Exception as exc:
             failure = _structured_failure(exc)
-        if (
-            failure is not None
-            and failure.terminal_category == "invalid_response"
-            and failure.error_code == "ValidationError"
-            and state.retry_budget > 0
-        ):
+        if failure is not None and repairable and state.retry_budget > 0:
             state.retry_budget -= 1
             state.retry_count += 1
             logger.warning(
@@ -2170,7 +2183,8 @@ class LiteLlmStructuredClient:
             if isinstance(raw_content, dict):
                 return response_format.model_validate(raw_content)
             return _validate_structured_json_text(str(raw_content), response_format)
-        except Exception as exc:
+        except (StructuredLlmError, ValueError) as exc:
+            # Only a received response that fails validation is an invalid response.
             capture = current_capture()
             if capture is not None:
                 capture.failed(exc, stage="schema_validation")
@@ -2182,7 +2196,9 @@ class LiteLlmStructuredClient:
                 requested_max_tokens=max_tokens,
                 exc=exc,
             )
-            raise
+            if isinstance(exc, StructuredLlmError):
+                raise
+            raise _InvalidModelOutput(type(exc).__name__) from exc
 
     async def _completion_with_retries(
         self,
@@ -2235,12 +2251,7 @@ class LiteLlmStructuredClient:
                     raise
                 state.record_failed_attempt()
                 retry = _is_retryable_provider_error(exc) and state.retry_budget > 0
-                failure = _structured_failure(
-                    exc,
-                    terminal_category=(
-                        "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
-                    ),
-                )
+                failure = _structured_failure(exc)
                 state.record_provider_failure_attempt(
                     attempt_index=attempt_index,
                     structured_mode=(
