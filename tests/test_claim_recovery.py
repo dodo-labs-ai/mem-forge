@@ -69,7 +69,7 @@ async def test_last_of_24_claim_requests_resumes_after_database_reopen(tmp_path)
 async def test_reconciliation_preserves_validation_fields_and_attempted_pair_count():
     class Invalid(Client):
         async def assess_claim_revisions(self, *args, **kwargs):
-            raise StructuredLlmError("invalid", error_code="ValidationError",
+            raise StructuredLlmError("unavailable", terminal_category="provider_error", error_code="ValidationError",
                 validation_fields=(("results.0.relations.0.relation", "literal_error"),))
     result = await reconcile_memories(new_extractions=[candidate()], existing_memories=[memory()], llm_model="test-model", structured_llm_client=Invalid("unrelated"), supports=dict([pinned("memory", True)]))
     assert not result.operations

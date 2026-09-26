@@ -145,7 +145,7 @@ class RevisionClientFixture:
         groups = []
         for challenger in payload["new_claims"]:
             group = dict(challenger=challenger, candidates=[])
-            for ref in payload["allowed_existing_ids"][challenger["id"]]:
+            for ref in challenger["allowed_existing_ids"]:
                 group["candidates"].append(dict(pair_index=len(pairs), candidate=old[ref]))
                 pairs.append((challenger["id"], ref))
             groups.append(group)

@@ -233,23 +233,45 @@ async def test_no_candidates_need_no_model_call():
                                           "duplicate_of": ["CND-0099"]}, id="duplicate-outside-round"),
     ],
 )
-async def test_invalid_admission_after_its_correction_is_an_execution_failure(judge):
-    client = AdmissionClient(judge)
+async def test_a_candidate_whose_admission_stays_invalid_is_rejected_for_this_round(judge):
+    unjudged = candidate(MOST_SPECIFIC)
+    judged = candidate(INDEPENDENT)
 
-    with pytest.raises(CandidateAdmissionError) as raised:
-        await admit_candidates([candidate(MOST_SPECIFIC)], client=client, model="fixture")
+    def answer(row, round_claims):
+        return judge(row, round_claims) if round_claims.get(row["id"]) == MOST_SPECIFIC else admitted(row, round_claims)
 
-    assert (raised.value.reason_code, raised.value.terminal_category) == ("candidate_admission_invalid", "invalid_response")
-    assert client.calls == 2
+    client = AdmissionClient(answer)
+    result = await admit_candidates([unjudged, judged], client=client, model="fixture")
+
+    assert result.admitted == (judged,)
+    assert [(rejection.candidate, rejection.reject_reason) for rejection in result.rejected] == [
+        (unjudged, "invalid_response"),
+    ]
+    # Both Candidates with the correction, then each alone: the invalid one with its correction.
+    assert client.calls == 5
 
 
 @pytest.mark.asyncio
-async def test_a_candidate_that_alone_exceeds_capacity_is_an_execution_failure():
-    with pytest.raises(CandidateAdmissionError) as raised:
-        await admit_candidates(
-            [candidate(MOST_SPECIFIC)], client=AdmissionClient(fits=lambda payload: False), model="fixture",
-        )
-    assert (raised.value.reason_code, raised.value.terminal_category) == ("candidate_admission_capacity_exceeded", None)
+async def test_a_candidate_that_alone_exceeds_capacity_is_rejected_for_this_round():
+    oversized = candidate(MOST_SPECIFIC)
+    judged = candidate(INDEPENDENT)
+
+    def fits(payload):
+        return all(row["claim"] != MOST_SPECIFIC for row in payload["candidates"])
+
+    result = await admit_candidates([oversized, judged], client=AdmissionClient(fits=fits), model="fixture")
+
+    assert result.admitted == (judged,)
+    assert [(rejection.candidate, rejection.reject_reason) for rejection in result.rejected] == [
+        (oversized, "capacity_exceeded"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_transient_admission_failure_raises():
+    with pytest.raises(StructuredLlmError) as raised:
+        await admit_candidates([candidate(MOST_SPECIFIC)], client=AdmissionClient(fail_at=1), model="fixture")
+    assert raised.value.terminal_category == "deadline_exceeded"
 
 
 @pytest.mark.asyncio

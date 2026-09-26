@@ -98,8 +98,8 @@ async def test_wire_id_text_is_not_rewritten_and_unknown_namespace_fails_closed(
     items = work_items('Two reviewers approve US releases.\n\nLiteral p000001 and w000068 are source text.')
     client, store = CanonicalIDClient(limit=50000), Store()
     executor = RevisionWorkExecutor(client=client, model='gpt-4o', store=store, derivation_id='root')
-    with pytest.raises(Exception, match='bounded assessment correction exhausted'):
-        await executor.assess_many(items)
+    [result] = (await executor.assess_many(items)).values()
+    assert result.unresolved == 'invalid_response'
     assert len(client.prompts) == 2
     assert 'Literal p000001 and w000068 are source text.' in client.prompts[0]
     assert all(w.status != 'completed' for w in store.works.values() if w.kind == 'support_assess')

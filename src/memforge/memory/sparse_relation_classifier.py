@@ -15,11 +15,11 @@ from memforge.memory.relation_classifier import (
     MEMORY_RELATION_RULES, MemoryPair, MemoryPairClassification,
     MemoryPairDecision, MemoryRelationType,
     MemoryPairClassificationPolicy,
-    _auditable_relation_reason, _prompt_memory, relation_output_tokens, run_pair_items,
+    _auditable_relation_reason, _prompt_memory, judge_pair_items, relation_output_tokens,
 )
 from memforge.models import Memory
 
-SPARSE_MEMORY_CLASSIFIER_VERSION = "memory-relation-v4-sparse"
+SPARSE_MEMORY_CLASSIFIER_VERSION = "memory-relation-v5-sparse"
 
 
 def _catalog_request(pairs: tuple[MemoryPair, ...]):
@@ -40,20 +40,25 @@ def _catalog_request(pairs: tuple[MemoryPair, ...]):
         value["id"] = ref
         return value
 
+    # Each NEW claim carries its own allowed existing IDs, so a row never has to
+    # look up which existing claims belong to it.
     payload = dict(
-        new_claims=[present(ref, value) for ref, value in new.records.items()],
+        new_claims=[
+            {**present(ref, value), "allowed_existing_ids": sorted(allowed[ref])}
+            for ref, value in new.records.items()
+        ],
         existing_claims=[present(ref, value) for ref, value in old.records.items()],
-        allowed_existing_ids={ref: sorted(ids) for ref, ids in allowed.items()},
     )
     prompt = MEMORY_RELATION_RULES + """
 <memory_relation_catalog>
 """ + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + """
 </memory_relation_catalog>
 Return exactly one results row for every NEW candidate_id, including candidates
-with no discovered relationships. Check only that candidate's allowed_existing_ids.
-Return only equivalent, refines, or contradicts edges. Never return unrelated.
-An empty relations array completes the candidate without asserting that omitted
-pairs are unrelated. Do not infer lifecycle authority from a relationship.
+with no discovered relationships. Compare each NEW claim only with the existing
+claims named in its own allowed_existing_ids; a row never names any other
+existing_id. Return only equivalent, refines, or contradicts edges. Never return
+unrelated. An empty relations array completes the candidate without asserting
+that omitted pairs are unrelated. Do not infer lifecycle authority from a relationship.
 """
     return prompt, RelationCoverage({ref: frozenset(ids) for ref, ids in allowed.items()}), pair_by_refs
 
@@ -62,7 +67,9 @@ class SparseMemoryRelationClassifier:
     """Deduplicate input catalogs and validate every completion before emitting edges.
 
     Each allowed pair is one runner item, so a catalog that outgrows the route is
-    split between pairs and every allowed pair stays represented exactly once.
+    split between pairs and every allowed pair stays represented exactly once. A
+    pair that cannot be judged even alone is returned as unjudged; a transient
+    failure raises.
     """
 
     def __init__(self, *, client: Any, model: str, policy: MemoryPairClassificationPolicy | None = None):
@@ -106,9 +113,9 @@ class SparseMemoryRelationClassifier:
             # None completes a pair without asserting that it is unrelated.
             return ((item_id, discovered.get(pairs[int(item_id)].key)) for item_id in item_ids)
 
-        results = await run_pair_items(runner, ItemTask(
+        results, unjudged = await judge_pair_items(runner, ItemTask(
             item_ids=tuple(str(index) for index in range(len(pairs))), render=render, decode=decode,
             call=self._client.discover_memory_relations,
-        ), pair_count=len(pairs), label="memory relation catalog")
+        ), pairs, label="memory relation catalog")
         decisions = tuple(decision for decision in results if decision is not None)
-        return MemoryPairClassification(decisions, runner.stats.calls, runner.stats.prompt_chars)
+        return MemoryPairClassification(decisions, runner.stats.calls, runner.stats.prompt_chars, unjudged=unjudged)

@@ -277,25 +277,71 @@ async def test_one_correction_repairs_incomplete_coverage(first_reply):
     assert client.prompts[1].startswith(client.prompts[0])
 
 
-async def test_output_still_invalid_after_the_correction_fails_the_request():
-    class SelectionError(ValueError):
-        pass
+class SelectionError(ValueError):
+    pass
 
+
+def rejecting(item_id: str):
+    """Decode every row, but reject any response to a request that carries ``item_id``."""
     def reject(response, item_ids, context):
-        raise SelectionError("unknown ref")
+        if item_id in item_ids:
+            raise SelectionError("unknown ref")
+        return decode(response, item_ids, context)
 
+    return reject
+
+
+async def test_output_still_invalid_after_the_correction_splits_until_the_item_stands_alone():
     client = FixtureBudgetClient(respond=answer)
     runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
 
-    results = await runner.run_items(item_task(client, ids(3), decode=reject))
+    results = await runner.run_items(item_task(client, ids(4), decode=rejecting("i02")))
 
-    failures = set(results.values())
-    assert len(failures) == 1
-    [failure] = failures
-    assert (failure.category, failure.error_code) == ("invalid_response", OUTPUT_INVALID)
+    failure = results.pop("i02")
+    assert results == {item_id: ((),) for item_id in ("i00", "i01", "i03")}
+    assert (failure.category, failure.error_code, failure.unjudgeable) == ("invalid_response", OUTPUT_INVALID, True)
     assert isinstance(failure.error, SelectionError)
-    assert runner.stats.calls == 2
-    assert runner.stats.failed_requests == 1
+    # Each request that carries i02 is sent with its one correction; the others once.
+    assert [prompt_ids(prompt.split("<correction>")[0]) for prompt in client.prompts] == [
+        list(ids(4)), list(ids(4)), ["i00", "i01"], ["i02", "i03"], ["i02", "i03"], ["i02"], ["i02"], ["i03"],
+    ]
+    assert (runner.stats.splits, runner.stats.corrections, runner.stats.failed_requests) == (2, 3, 1)
+
+
+async def test_malformed_output_for_one_item_is_isolated_without_a_runner_correction():
+    malformed = StructuredLlmError(
+        "ambiguous structured JSON objects", terminal_category="invalid_response", error_code="ValueError",
+    )
+    client = FixtureBudgetClient(respond=failing(malformed, when=lambda prompt: "i02" in prompt_ids(prompt)))
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    results = await runner.run_items(item_task(client, ids(4)))
+
+    assert results.pop("i02") == ItemFailure("invalid_response", "ValueError", malformed)
+    assert results == {item_id: ((),) for item_id in ("i00", "i01", "i03")}
+    assert [prompt_ids(prompt) for prompt in client.prompts] == [
+        list(ids(4)), ["i00", "i01"], ["i02", "i03"], ["i02"], ["i03"],
+    ]
+
+
+async def test_a_journaled_split_reuses_every_completed_half_on_retry():
+    store = MemoryWorkStore()
+    first = FixtureBudgetClient(respond=answer)
+    failed = await LlmBatchRunner(first, model=FIXTURE_MODEL).run_items(
+        item_task(first, ids(4), decode=rejecting("i02"), journal=fixture_journal(store)))
+    assert failed["i02"].category == "invalid_response"
+
+    second = FixtureBudgetClient(respond=answer)
+    runner = LlmBatchRunner(second, model=FIXTURE_MODEL)
+    retried = await runner.run_items(item_task(second, ids(4), decode=rejecting("i02"), journal=fixture_journal(store)))
+
+    assert (retried.pop("i02").error_code, failed.pop("i02").error_code) == (OUTPUT_INVALID, OUTPUT_INVALID)
+    assert retried == failed
+    # Only requests that never completed are sent again; the completed halves are reused.
+    assert [prompt_ids(prompt.split("<correction>")[0]) for prompt in second.prompts] == [
+        list(ids(4)), list(ids(4)), ["i02", "i03"], ["i02", "i03"], ["i02"], ["i02"],
+    ]
+    assert runner.stats.reused == 2
 
 
 async def test_a_correction_that_does_not_fit_is_not_sent():
@@ -307,7 +353,8 @@ async def test_a_correction_that_does_not_fit_is_not_sent():
     assert {(failure.category, failure.error_code) for failure in results.values()} == {
         ("invalid_response", OUTPUT_INVALID)
     }
-    assert runner.stats.calls == 1
+    # Each request is sent once: its correction would not fit, so the items split down to one each.
+    assert [prompt_ids(prompt) for prompt in client.prompts] == [list(ids(3)), ["i00"], ["i01", "i02"], ["i01"], ["i02"]]
 
 
 async def test_shared_context_is_chunked_for_an_item_that_needs_it():
@@ -368,6 +415,29 @@ async def test_chain_single_item_single_part_failure_leaves_other_lanes_complete
     results = await runner.run_chain(chain_task(client, ids(2), parts(1)))
 
     assert results == {"i00": ("p0",), "i01": ItemFailure("deadline_exceeded", error.error_code, error, part=0)}
+
+
+async def test_chain_output_still_invalid_splits_the_lane_until_the_item_stands_alone():
+    def carry_unless_i01(response, step: ChainStep):
+        if "i01" in step.item_ids:
+            raise SelectionError("unknown ref")
+        return carry(response, step)
+
+    client = FixtureBudgetClient(respond=answer)
+    runner = LlmBatchRunner(client, model=FIXTURE_MODEL)
+
+    results = await runner.run_chain(chain_task(client, ids(3), parts(2), decode=carry_unless_i01))
+
+    failure = results.pop("i01")
+    assert results == {"i00": parts(2), "i02": parts(2)}
+    assert (failure.category, failure.error_code, failure.part) == ("invalid_response", OUTPUT_INVALID, 0)
+    # The whole lane, then the half with i01, then i01 alone, each with its correction; the halving reads
+    # no fewer parts, so parts are never halved for invalid output.
+    assert [prompt_ids(prompt.split("<correction>")[0]) for prompt in client.prompts] == [
+        list(ids(3)), list(ids(3)), ["i00"], ["i01", "i02"], ["i01", "i02"], ["i01"], ["i01"], ["i02"],
+    ]
+    assert all(prompt_parts(prompt.split("<correction>")[0]) == list(parts(2)) for prompt in client.prompts)
+    assert (runner.stats.splits, runner.stats.failed_requests) == (2, 1)
 
 
 async def test_chain_item_exits_only_after_its_first_part():
@@ -491,23 +561,28 @@ async def test_plans_match_the_requests_that_are_sent():
     assert unfit.requests == () and unfit.unfit == ("i00",)
 
 
+class MemoryWorkStore:
+    def __init__(self):
+        self.works = {}
+
+    async def stage_derivation_work(self, *, derivation_id, work):
+        return self.works.setdefault(work.id, work)
+
+    async def record_derivation_work(self, *, derivation_id, work):
+        self.works[work.id] = work
+        return work
+
+
+def fixture_journal(store: MemoryWorkStore) -> DerivationWorkJournal:
+    return DerivationWorkJournal(store=store, derivation_id="derivation", kind="claim_assess",
+                                 scope={"contract": "fixture"}, budget_identity="budget", model=FIXTURE_MODEL)
+
+
 async def test_journal_reuses_completed_requests_and_records_failures():
-    class MemoryWorkStore:
-        def __init__(self):
-            self.works = {}
-
-        async def stage_derivation_work(self, *, derivation_id, work):
-            return self.works.setdefault(work.id, work)
-
-        async def record_derivation_work(self, *, derivation_id, work):
-            self.works[work.id] = work
-            return work
-
     store = MemoryWorkStore()
 
     def journal():
-        return DerivationWorkJournal(store=store, derivation_id="derivation", kind="claim_assess",
-                                     scope={"contract": "fixture"}, budget_identity="budget", model=FIXTURE_MODEL)
+        return fixture_journal(store)
 
     outage = StructuredLlmError("down", terminal_category="provider_error", error_code="ServiceUnavailableError")
     first = FixtureBudgetClient(respond=failing(outage, when=lambda prompt: "i03" in prompt), input_tokens=3)

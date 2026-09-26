@@ -378,15 +378,15 @@ class RevisionWorkExecutor:
         outcomes = await self._runner.run_chain(self._chain_task(plan, reading, supports, journal, latest))
         for item in items:
             outcome = outcomes[item.id]
-            if isinstance(outcome, ItemFailure) and outcome.category != "capacity_exceeded":
+            if isinstance(outcome, ItemFailure) and not outcome.unjudgeable:
                 _raise_failure(outcome)
         results = {}
         finished = []
         for support in supports:
             item, outcome = support.item, outcomes[support.item.id]
             if isinstance(outcome, ItemFailure):
-                results[item.id] = _unresolved_capacity(
-                    context, support, reading.parts[outcome.part], len(latest[item.id].witness_refs),
+                results[item.id] = _unjudged(
+                    context, support, reading.parts[outcome.part], len(latest[item.id].witness_refs), outcome,
                 )
                 continue
             finished.append(item)
@@ -781,15 +781,12 @@ def _require_supplied(alias: str, refs, allowed, wire: SupportWireAliases) -> No
 
 
 def _require_accounted(alias: str, row: SupportedWireResult, matched_refs, wire: SupportWireAliases) -> None:
-    """A supported Support selects or explicitly omits every exactly matched prior part."""
+    """A supported Support selects or explicitly omits every exactly matched prior part.
+
+    Only that accounting is checked: omitting a supplied ref that is not prior
+    Evidence changes nothing, so it is not an error.
+    """
     matched = set(matched_refs)
-    foreign = set(row.omitted_matched_refs) - matched
-    if foreign:
-        raise FragmentSelectionError(
-            FragmentSelectionErrorCode.INVALID_SELECTION,
-            f"{alias} omitted_matched_refs names refs that are not its prior Evidence: "
-            + ", ".join(sorted(wire.refs[ref] for ref in foreign)),
-        )
     unaccounted = matched - {row.primary_ref, *row.required_refs} - set(row.omitted_matched_refs)
     if unaccounted:
         raise FragmentSelectionError(
@@ -797,6 +794,28 @@ def _require_accounted(alias: str, row: SupportedWireResult, matched_refs, wire:
             f"{alias} is supported but leaves prior Evidence unaccounted for; select or list in "
             "omitted_matched_refs: " + ", ".join(sorted(wire.refs[ref] for ref in unaccounted)),
         )
+
+
+def _unjudged(
+    context, support: SupportPlan, part: ReadingPart, witnesses: int, failure: ItemFailure,
+) -> SupportAssessment:
+    """The claim alone could not be judged at this ReadingGroup: it exceeds capacity or gets invalid output."""
+    if failure.category == "capacity_exceeded":
+        return _unresolved_capacity(context, support, part, witnesses)
+    source_unit_id = context.projection.source_units[0].id
+    logger.warning(
+        "support_unresolved_invalid_response source_unit_id=%s memory_id=%s evidence_unit_id=%s reading_group=%s "
+        "error_code=%s",
+        source_unit_id, support.item.memory.id, support.item.support[0].evidence_unit_id, part.label,
+        failure.error_code,
+    )
+    return SupportAssessment(
+        None,
+        f"The model's output for this claim, reading from group {part.label} of Source Unit {source_unit_id}, "
+        f"stayed invalid after its correction: {failure.error}",
+        None,
+        unresolved="invalid_response",
+    )
 
 
 def _unresolved_capacity(context, support: SupportPlan, part: ReadingPart, witnesses: int) -> SupportAssessment:

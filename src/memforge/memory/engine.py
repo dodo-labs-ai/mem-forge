@@ -946,6 +946,7 @@ class MemoryEngine:
             "support_revalidation_change_impact_failed_count": 0,
             "support_revalidation_unresolved_partial_coverage_count": 0,
             "support_revalidation_unresolved_capacity_count": 0,
+            "support_revalidation_unresolved_invalid_response_count": 0,
             "support_revalidation_unusable_baseline_count": 0,
             "support_revalidation_reprocess_count": 0,
         }
@@ -1221,6 +1222,13 @@ class MemoryEngine:
                 relation_complete = relation.covers(
                     len(filtered_memories), frozenset(memory.id for memory in model_incumbents),
                 )
+                for index, failure in relation.unjudged.items():
+                    logger.warning(
+                        "relation_candidate_unresolved source_unit_id=%s claim_hash=%s reason=%s error_code=%s",
+                        scope.source_unit_id, content_hash(filtered_memories[index].content.strip()),
+                        failure.category, failure.error_code,
+                    )
+                stats["relation_unjudged_candidate_count"] = len(relation.unjudged)
                 if relation.failure is not None:
                     result = ReconciliationResult(operations=[], failure=relation.failure, metrics=relation.metrics)
                 else:
@@ -1431,29 +1439,34 @@ class MemoryEngine:
             )
             for raw_memory in operation_memories
         }
-        evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
-        for operation in operations:
-            if operation.action is not ReconcileAction.NOOP:
-                continue
-            support = supports.get(operation.memory_id or "")
-            if operation.memory is not None and support is not None and support.evidence[:1] == (operation.memory,):
-                evidence_memories.extend(support.evidence[1:])
-            for review in operation.reviews:
-                evidence_memories.append(review.candidate)
-                if review.rejection_rebind is not None:
-                    evidence_memories.append(review.rejection_rebind)
-        projected_evidence = build_projected_claim_evidence(
-            projection=projection,
-            raw_memories=evidence_memories,
-            doc_id=doc_id,
-            source_type=source_type,
-            project_key=project_key,
-            visibility=visibility,
-            owner_user_id=owner_user_id,
-            repo_identifier=repo_identifier,
-            access_context_hash=access_context_hash,
-            extractor_run_id=projection.run_id,
-        )
+        def claim_evidence(operations: Sequence[ReconcileOperation]):
+            """Stage the Evidence of every claim these operations bind."""
+            evidence_memories = [operation.memory for operation in operations if operation.memory is not None]
+            for operation in operations:
+                if operation.action is not ReconcileAction.NOOP:
+                    continue
+                support = supports.get(operation.memory_id or "")
+                if operation.memory is not None and support is not None and support.evidence[:1] == (operation.memory,):
+                    evidence_memories.extend(support.evidence[1:])
+                for review in operation.reviews:
+                    evidence_memories.append(review.candidate)
+                    if review.rejection_rebind is not None:
+                        evidence_memories.append(review.rejection_rebind)
+            return build_projected_claim_evidence(
+                projection=projection,
+                raw_memories=evidence_memories,
+                doc_id=doc_id,
+                source_type=source_type,
+                project_key=project_key,
+                visibility=visibility,
+                owner_user_id=owner_user_id,
+                repo_identifier=repo_identifier,
+                access_context_hash=access_context_hash,
+                extractor_run_id=projection.run_id,
+            )
+
+        projected_evidence = claim_evidence(operations)
+
         def canonical(raw: RawMemory) -> RawMemory:
             return projected_evidence.canonical_memories_by_claim_hash[content_hash(raw.content.strip())]
 
@@ -1520,7 +1533,9 @@ class MemoryEngine:
                 "identity_resolution_elapsed_ms": identity_resolution.metrics.elapsed_ms,
             }
         )
-        incomplete_identity = next((item for item in identity_resolutions if not item.classification_complete), None)
+        incomplete_identity = next(
+            (item for item in identity_resolutions if not item.classification_complete and not item.unjudged), None,
+        )
         if incomplete_identity is not None:
             raise MemoryPairClassificationError(
                 incomplete_identity.failure_reason or "identity discovery did not complete",
@@ -1530,6 +1545,26 @@ class MemoryEngine:
                 terminal_category=incomplete_identity.terminal_category,
                 error_code=incomplete_identity.error_code,
             )
+        # A Candidate whose identity cannot be judged may duplicate an old Memory:
+        # it is consumed this round without an ADD, like a local unresolved relationship.
+        unjudged_claim_hashes: set[str] = set()
+        for claim_hash, resolution in zip(identity_claim_hashes, identity_resolutions, strict=True):
+            if resolution.unjudged:
+                unjudged_claim_hashes.add(claim_hash)
+                logger.warning(
+                    "identity_candidate_unresolved source_unit_id=%s claim_hash=%s reason=%s error_code=%s",
+                    scope.source_unit_id, claim_hash, resolution.terminal_category, resolution.error_code,
+                )
+        stats["identity_resolution_unresolved_candidate_count"] = len(unjudged_claim_hashes)
+        if unjudged_claim_hashes:
+            operations = tuple(
+                operation for operation in operations
+                if not (
+                    operation.action is ReconcileAction.ADD and operation.memory is not None
+                    and content_hash(operation.memory.content.strip()) in unjudged_claim_hashes
+                )
+            )
+            projected_evidence = claim_evidence(operations)
         attached_target_ids: list[str] = []
         for claim_hash, resolution in zip(
             identity_claim_hashes,

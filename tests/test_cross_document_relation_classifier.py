@@ -144,7 +144,9 @@ async def test_classifier_fails_when_a_pair_is_left_without_exactly_one_label(de
 
     assert error.value.error_code is not None
     assert error.value.pair_count == 2
-    assert len(client.prompts) == 2
+    # The runner isolates the pair whose output stays invalid before the classifier fails.
+    assert "<correction>" in client.prompts[1]
+    assert error.value.llm_calls == len(client.prompts) > 2
 
 
 @pytest.mark.asyncio

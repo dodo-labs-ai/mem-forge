@@ -68,10 +68,19 @@ class MemoryPairDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class UnjudgedPair:
+    """A pair the classifier could not judge even alone: it exceeds capacity or its output stays invalid."""
+
+    pair: MemoryPair
+    failure: ItemFailure
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryPairClassification:
     decisions: tuple[MemoryPairDecision, ...]
     llm_calls: int
     prompt_chars: int
+    unjudged: tuple[UnjudgedPair, ...] = ()
 
 
 class MemoryPairClassifier(Protocol):
@@ -155,22 +164,49 @@ def relation_output_tokens(policy: MemoryPairClassificationPolicy, pair_count: i
     return min(policy.max_output_tokens, _RELATION_OUTPUT_BASE_TOKENS + _RELATION_OUTPUT_TOKENS_PER_PAIR * pair_count)
 
 
-async def run_pair_items(runner: LlmBatchRunner, task: ItemTask, *, pair_count: int, label: str) -> list[Any]:
-    """Return one result per pair, or raise for the first pair left without one."""
+async def _pair_outcomes(
+    runner: LlmBatchRunner, task: ItemTask, *, pair_count: int, label: str,
+) -> dict[str, tuple[Any, ...] | ItemFailure]:
+    """Run the pair items; an error raised by the task itself becomes a classification error."""
 
     try:
-        outcomes = await runner.run_items(task)
+        return await runner.run_items(task)
     except Exception as error:
         raise MemoryPairClassificationError(
             f"{label} failed: {error}", pair_count=pair_count,
             llm_calls=runner.stats.calls, prompt_chars=runner.stats.prompt_chars,
         ) from error
+
+
+async def run_pair_items(runner: LlmBatchRunner, task: ItemTask, *, pair_count: int, label: str) -> list[Any]:
+    """Return one result per pair, or raise for the first pair left without one."""
+
     results = []
-    for outcome in outcomes.values():
+    for outcome in (await _pair_outcomes(runner, task, pair_count=pair_count, label=label)).values():
         if isinstance(outcome, ItemFailure):
             raise _classification_error(outcome, pair_count=pair_count, stats=runner.stats)
         results.append(outcome[0])
     return results
+
+
+async def judge_pair_items(
+    runner: LlmBatchRunner, task: ItemTask, pairs: tuple[MemoryPair, ...], *, label: str,
+) -> tuple[list[Any], tuple[UnjudgedPair, ...]]:
+    """Return each judged pair's result and the pairs that cannot be judged even alone.
+
+    A transient failure raises: sending the pair again may succeed.
+    """
+
+    results = []
+    unjudged = []
+    for item_id, outcome in (await _pair_outcomes(runner, task, pair_count=len(pairs), label=label)).items():
+        if not isinstance(outcome, ItemFailure):
+            results.append(outcome[0])
+        elif outcome.unjudgeable:
+            unjudged.append(UnjudgedPair(pairs[int(item_id)], outcome))
+        else:
+            raise _classification_error(outcome, pair_count=len(pairs), stats=runner.stats)
+    return results, tuple(unjudged)
 
 
 def _classification_error(
@@ -237,7 +273,7 @@ def _grouped_pair_payload(indexed_pairs: tuple[tuple[int, MemoryPair], ...]) -> 
 
 
 class StructuredMemoryPairClassifier:
-    """Classify exact pairs and reject any incomplete structured ledger."""
+    """Classify exact pairs; a pair that cannot be judged even alone is returned as unjudged."""
 
     def __init__(
         self,
@@ -275,10 +311,11 @@ class StructuredMemoryPairClassifier:
                     reason=_auditable_relation_reason(decision),
                 )
 
-        decisions = await run_pair_items(runner, ItemTask(
+        decisions, unjudged = await judge_pair_items(runner, ItemTask(
             item_ids=tuple(str(index) for index in range(len(pairs))), render=render, decode=decode,
             call=self._client.classify_memory_relations,
-        ), pair_count=len(pairs), label="memory relation classification")
+        ), pairs, label="memory relation classification")
         return MemoryPairClassification(
             decisions=tuple(decisions), llm_calls=runner.stats.calls, prompt_chars=runner.stats.prompt_chars,
+            unjudged=unjudged,
         )

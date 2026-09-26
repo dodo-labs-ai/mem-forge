@@ -53,7 +53,6 @@ from memforge.evals.agent_evaluation import (
     record_quality_signal,
 )
 from memforge.memory.audit import MemoryAuditLogger
-from memforge.memory.candidate_admission import CandidateAdmissionError
 from memforge.memory.destructive_validation import KeptReason
 from memforge.memory.engine import (
     DeferredProjectedLifecycleHandle,
@@ -1817,7 +1816,7 @@ async def test_entity_resolution_reads_each_mention_with_its_own_memory_text(db:
 
 
 @pytest.mark.asyncio
-async def test_incomplete_candidate_admission_leaves_the_revision_uncommitted(
+async def test_a_candidate_whose_admission_stays_invalid_is_rejected_and_the_revision_commits(
     db: Database,
 ) -> None:
     projection = _projection(
@@ -1825,6 +1824,7 @@ async def test_incomplete_candidate_admission_leaves_the_revision_uncommitted(
         body="The trigger remained OPEN. The trigger was not processed.",
     )
     observation_id = _body_observation(projection).id
+    # Only the most specific Candidate (CND-0001) is ever judged; the other is always omitted.
     client = _AdmissionClient(CandidateAdmissionDecision(candidate_id="CND-0001", verdict="ADMITTED"))
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
@@ -1834,41 +1834,43 @@ async def test_incomplete_candidate_admission_leaves_the_revision_uncommitted(
         structured_llm_client=client,
     )
 
-    with pytest.raises(CandidateAdmissionError, match="judge every requested Candidate"):
-        await engine.prepare_and_commit_projected_lifecycle(
-            projection=projection,
-            doc_id="confluence-123",
-            raw_memories=_selected(projection, [
-                RawMemory(
-                    content="The trigger remained OPEN.",
-                    memory_type="fact",
-                    evidence_quote="The trigger remained OPEN.",
-                    source_observation_id=observation_id,
-                ),
-                RawMemory(
-                    content="The trigger was not processed.",
-                    memory_type="fact",
-                    evidence_quote="The trigger was not processed.",
-                    source_observation_id=observation_id,
-                ),
-            ]),
-            doc_type="ticket",
-            project_key="ENG",
-            repo_identifier=None,
-            document_content=_body_revision(projection).content,
-            update_mode="full_document",
-            changed_hunks=None,
-            update_plan_stats=None,
-            source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
-        )
+    stats = await engine.prepare_and_commit_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=_selected(projection, [
+            RawMemory(
+                content="The trigger remained OPEN.",
+                memory_type="fact",
+                evidence_quote="The trigger remained OPEN.",
+                source_observation_id=observation_id,
+            ),
+            RawMemory(
+                content="The trigger was not processed.",
+                memory_type="fact",
+                evidence_quote="The trigger was not processed.",
+                source_observation_id=observation_id,
+            ),
+        ]),
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=_body_revision(projection).content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
 
-    async with db.db.execute("SELECT COUNT(*) AS total FROM memories") as cursor:
-        row = await cursor.fetchone()
-
-    assert row["total"] == 0
-    # The first request and its one correction both omit the second Candidate.
-    assert len(client.prompts) == 2
-    assert await db.get_current_source_unit_revision(projection.source_units[0].id) is None
+    assert [memory.content for memory in await db.list_memories()] == ["The trigger was not processed."]
+    # The pair and its correction, then each Candidate alone: one call, and one call with its correction.
+    assert len(client.prompts) == 5
+    assert stats["candidate_admission_rejected_count"] == 1
+    [event] = await db.list_memory_audit_events(event_type="candidate_admission_rejected")
+    assert event.reason == "invalid_response"
+    assert event.payload["candidate_claim"] == "The trigger remained OPEN."
+    assert (await db.get_current_source_unit_revision(projection.source_units[0].id)).id == (
+        projection.source_unit_revisions[0].id
+    )
 
 
 class _SemanticEquivalentClient(RevisionClientFixture):
@@ -4812,7 +4814,7 @@ async def test_noop_revalidation_uses_bounded_fragment_refs_for_large_revision(
 
 
 @pytest.mark.asyncio
-async def test_incremental_noop_exhausted_fragment_repair_stops_document_retry_without_review(
+async def test_incremental_noop_support_selection_that_stays_invalid_is_unresolved_and_commits(
     db: Database,
 ) -> None:
     first = _projection(
@@ -4839,39 +4841,35 @@ async def test_incremental_noop_exhausted_fragment_repair_stops_document_retry_w
             evidence_quote="A quote that is not in the current source.",
         ),
     )
+    old_support = await active_support_evidence(db, incumbent.id, source_id="src-1")
 
-    with pytest.raises(SourceUnitLifecycleExecutionError) as raised:
-        await engine.prepare_and_commit_projected_lifecycle(
-            projection=second,
-            doc_id="confluence-123",
-            raw_memories=[],
-            doc_type="design-doc",
-            project_key="ENG",
-            repo_identifier=None,
-            document_content=_body_revision(second).content,
-            update_mode="diff_guided",
-            changed_hunks="primary wording changed",
-            update_plan_stats=None,
-            source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
-            lifecycle_execution_owner_id="sync-invalid-fragment-ref:lease-1",
-        )
+    stats = await engine.prepare_and_commit_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=_body_revision(second).content,
+        update_mode="diff_guided",
+        changed_hunks="primary wording changed",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
+        lifecycle_execution_owner_id="sync-invalid-fragment-ref:lease-1",
+    )
 
-    assert raised.value.retryable is False
-    assert raised.value.__cause__ is not None
-    assert raised.value.__cause__.reason_code == "revision_support_selection_exhausted"
-    assert raised.value.runtime_bundle.event.reason_code == "revision_support_selection_exhausted"
-    assert raised.value.runtime_bundle.event.terminal_category == "invalid_response"
-    assert raised.value.runtime_bundle.event.error_code == "revision_support_selection_exhausted"
-    assert raised.value.runtime_bundle.event.model_call_count == 2
+    # The selection stays invalid after its correction: UNRESOLVED(invalid_response) keeps the claim unchanged.
+    assert stats["support_revalidation_unresolved_invalid_response_count"] == 1
+    assert stats["support_revalidation_model_call_count"] == 2
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
-    assert await db.get_active_memory_support_unit_ids(incumbent.id)
+    assert await active_support_evidence(db, incumbent.id, source_id="src-1") == old_support
     assert await db.list_lifecycle_reviews("src-1") == []
     current_revision = await db.get_current_source_unit_revision(
         first.source_units[0].id
     )
     assert current_revision is not None
-    assert current_revision.id == first.source_unit_revisions[0].id
+    assert current_revision.id == second.source_unit_revisions[0].id
 
 
 @pytest.mark.asyncio
@@ -7159,16 +7157,18 @@ async def test_cross_source_semantic_equivalent_add_reuses_memory_id_and_attache
         source_updated_at=datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc),
     )
 
+    stats = await prepared
     if semantic_outcome == "incomplete":
-        from memforge.memory.relation_classifier import MemoryPairClassificationError
-        with pytest.raises(MemoryPairClassificationError, match="missing candidate completion"):
-            await prepared
-        rows = await db.db.execute_fetchall("SELECT id FROM lifecycle_plans WHERE source_id = ?", ("src-2",))
-        assert rows == []
+        # Identity output that stays invalid for the pair alone: the Candidate may duplicate the
+        # incumbent, so it is consumed without ADD, and the revision commits.
+        assert stats["identity_resolution_unresolved_candidate_count"] == 1
+        assert stats["added"] == 0 and stats["corroborated"] == 0
+        [row] = await db.db.execute_fetchall("SELECT payload_json FROM lifecycle_plans WHERE source_id = ?", ("src-2",))
+        plan = json.loads(row["payload_json"])
+        assert plan["mutations"] == [] and plan["evidence_units"] == []
         sources = await db.get_memory_sources(incumbent.id)
         assert {source.source_id for source in sources} == {"src-1"}
         return
-    stats = await prepared
     if semantic_outcome == "no_proposal":
         assert stats["added"] == 1 and stats["corroborated"] == 0
         [row] = await db.db.execute_fetchall("SELECT payload_json FROM lifecycle_plans WHERE source_id = ?", ("src-2",))

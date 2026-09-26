@@ -353,7 +353,10 @@ async def test_identity_resolver_batches_scope_and_reuses_only_equivalent_memory
 
 
 class _IncompleteStructuredClient(RevisionClientFixture):
-    def __init__(self) -> None:
+    """Always answers only pair 0, so any request that carries another pair stays invalid."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
         self.calls: list[tuple[str, int, str | None]] = []
 
     async def classify_memory_relations(
@@ -368,7 +371,7 @@ class _IncompleteStructuredClient(RevisionClientFixture):
             decisions=[
                 SimpleNamespace(
                     pair_index=0,
-                    classification="equivalent",
+                    classification=self.label,
                     direction="symmetric",
                     reason="fixture",
                 )
@@ -377,11 +380,12 @@ class _IncompleteStructuredClient(RevisionClientFixture):
 
 
 @pytest.mark.asyncio
-async def test_identity_resolver_fails_closed_for_incomplete_structured_pair_ledger() -> None:
+@pytest.mark.parametrize("first_label", ["equivalent", "unrelated"])
+async def test_identity_resolver_isolates_a_pair_whose_output_stays_invalid(first_label: str) -> None:
     challenger = _memory("mem-new", "Production deployment requires approval.")
     first = _memory("mem-first", "Approval is mandatory before production deployment.")
     second = _memory("mem-second", "Production deployment requires Security approval.")
-    client = _IncompleteStructuredClient()
+    client = _IncompleteStructuredClient(first_label)
     resolver = IdentityResolver(
         memory_store=_CandidateStore(
             exact_by_challenger={},
@@ -397,17 +401,20 @@ async def test_identity_resolver_fails_closed_for_incomplete_structured_pair_led
     batch = await resolver.resolve((IdentityResolutionRequest(challenger, "doc-a"),))
     result = batch.resolutions[0]
 
-    assert result.target is None
-    assert result.equivalence_proof is None
-    assert result.classification_complete is False
-    assert result.failure_reason == (
-        "memory relation classification failed (output_invalid): the response omits 1 of 2 requested IDs"
-    )
-    assert len(client.calls) == 2
+    # Both pairs with their correction, then each pair alone: the second one with its correction.
+    assert len(client.calls) == 5
     assert "<correction>" in client.calls[1][0]
     assert batch.metrics.pair_count == 2
-    assert batch.metrics.llm_calls == 2
+    assert batch.metrics.llm_calls == 5
     assert batch.metrics.prompt_chars > 0
+    if first_label == "equivalent":
+        # A proven equivalent attaches even though the other pair could not be judged.
+        assert result.target == first and result.classification_complete
+        return
+    assert result.target is None
+    assert result.equivalence_proof is None
+    assert (result.classification_complete, result.unjudged) == (False, True)
+    assert (result.terminal_category, result.error_code) == ("invalid_response", "output_invalid")
 
 
 @pytest.mark.asyncio
