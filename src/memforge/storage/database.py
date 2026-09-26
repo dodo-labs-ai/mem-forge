@@ -120,6 +120,7 @@ from memforge.memory.lifecycle_plan import (
     contested_supports_from_staged_evidence,
     LifecycleGate,
     LifecycleGateState,
+    LifecycleMutation,
     LifecycleMutationType,
     LifecyclePlan,
     AuthorityPlanStaleError,
@@ -611,6 +612,11 @@ def _utc_iso(dt: datetime | None) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("datetime values must include timezone information")
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _created_review_id(plan_id: str, mutation: LifecycleMutation) -> str:
+    """The Review a ``CREATE_REVIEW`` mutation writes: its own ID, or one derived from its Plan."""
+    return str(mutation.payload.get("review_id") or f"review-{plan_id}-{mutation.memory_id}")
 
 
 def _lifecycle_memory_version(row: Any | None) -> str:
@@ -9244,7 +9250,7 @@ class Database:
         for mutation in plan.mutations:
             if mutation.mutation_type is not LifecycleMutationType.CREATE_REVIEW:
                 continue
-            review_id = str(mutation.payload.get("review_id") or f"review-{plan.id}-{mutation.memory_id}")
+            review_id = _created_review_id(plan.id, mutation)
             async with self.db.execute(
                 "SELECT status, content_hash, updated_at FROM memories WHERE id = ?",
                 (mutation.memory_id,),
@@ -9673,7 +9679,7 @@ class Database:
             )
             return
         if mutation_type is LifecycleMutationType.CREATE_REVIEW:
-            review_id = str(mutation.payload.get("review_id") or f"review-{plan_id}-{mutation.memory_id}")
+            review_id = _created_review_id(plan_id, mutation)
             staged_evidence_json = json.dumps(mutation.payload.get("staged_evidence", {}), sort_keys=True)
             reason = str(mutation.payload.get("reason") or "lifecycle review required")
             async with self.db.execute(
@@ -9691,10 +9697,9 @@ class Database:
                 )
                 return
             # The same conflict raised again: a pending Review is refreshed and a stale one reopens.
-            if (
-                existing["incumbent_memory_id"] != mutation.memory_id
-                or existing["status"] not in {LifecycleReviewStatus.PENDING.value, LifecycleReviewStatus.STALE.value}
-            ):
+            if existing["incumbent_memory_id"] != mutation.memory_id:
+                raise ValueError(f"lifecycle review {review_id} belongs to another incumbent")
+            if existing["status"] not in {LifecycleReviewStatus.PENDING.value, LifecycleReviewStatus.STALE.value}:
                 raise ValueError(f"lifecycle review {review_id} is {existing['status']} and cannot be raised again")
             await self.db.execute(
                 """UPDATE lifecycle_reviews

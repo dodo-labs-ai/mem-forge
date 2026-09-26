@@ -85,7 +85,13 @@ from memforge.memory.cross_document_relation_reader import (
 )
 from memforge.memory.coordinator_review import is_coordinator_review
 from memforge.memory.lifecycle import normalize_memory_status
-from memforge.memory.lifecycle_plan import LifecycleGate
+from memforge.memory.lifecycle_plan import (
+    LifecycleGate,
+    LifecycleGateState,
+    LifecyclePlan,
+    LifecycleReview,
+    LifecycleReviewStatus,
+)
 from memforge.memory.lifecycle_service import (
     MaintenanceClosureEntry,
     MemoryLifecycleConflict,
@@ -6078,7 +6084,6 @@ def create_admin_app(
         config: AppConfig | None = None,
         runtime_provider: RuntimeProvider | None = None,
     ) -> dict[str, object]:
-        from memforge.memory.lifecycle_plan import LifecycleGateState, LifecyclePlan, LifecycleReviewStatus
         from memforge.memory.lifecycle_review import (
             build_lifecycle_review_approval_plan,
             build_lifecycle_review_rejection_plan,
@@ -6120,68 +6125,80 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail="Lifecycle review plan is unavailable")
         if payload["scope"].get("source_id") != source_id:
             raise HTTPException(status_code=404, detail="Lifecycle review not found")
-        plan: LifecyclePlan | None = None
+        reviewer = resolve_request_principal(request)
         if action == "keep_current_state":
             if not note or not note.strip():
                 raise HTTPException(status_code=400, detail="A note is required to keep the current state")
             try:
                 plan = build_lifecycle_review_rejection_plan(
-                    review,
-                    payload,
-                    reviewer=resolve_request_principal(request),
-                    review_note=note.strip(),
+                    review, payload, reviewer=reviewer, review_note=note.strip(),
                 )
+                if plan is None:
+                    rejected = await db.resolve_lifecycle_review(
+                        review_id, LifecycleReviewStatus.REJECTED, reviewer=reviewer, review_note=note.strip(),
+                    )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             if plan is None:
-                try:
-                    rejected = await db.resolve_lifecycle_review(
-                        review_id,
-                        LifecycleReviewStatus.REJECTED,
-                        reviewer=resolve_request_principal(request),
-                        review_note=note.strip(),
-                    )
-                except ValueError as exc:
-                    raise HTTPException(status_code=409, detail=str(exc)) from exc
-                return {
-                    "source_id": source_id,
-                    "review_id": review_id,
-                    "status": rejected.status.value,
-                }
+                return {"source_id": source_id, "review_id": review_id, "status": rejected.status.value}
+        else:
+            try:
+                plan = build_lifecycle_review_approval_plan(
+                    review, payload, reviewer=reviewer, review_note=note.strip() if note else None,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return await _apply_lifecycle_review_plan(
+            source_id, review, plan, db, config=config, runtime_provider=runtime_provider,
+        )
+
+    async def _apply_lifecycle_review_plan(
+        source_id: str,
+        review: LifecycleReview,
+        plan: LifecyclePlan,
+        db: Database,
+        *,
+        config: AppConfig | None,
+        runtime_provider: RuntimeProvider | None,
+    ) -> dict[str, object]:
+        """Apply one human decision's Plan and deliver its vector changes.
+
+        A decision whose guard no longer holds marks an ordinary Review stale for
+        a reviewer to refresh. A coordinator Review stays pending: stale means
+        its conflict is gone, and the next revision of its Source Unit raises the
+        conflict again against the current state.
+        """
         gate = await db.get_lifecycle_gate(source_id)
         if gate.state is not LifecycleGateState.ENABLED:
             raise HTTPException(status_code=409, detail="Source lifecycle gate is not enabled")
         if config is None or runtime_provider is None:
             raise RuntimeError("Lifecycle approval requires the configured runtime")
         try:
-            if plan is None:
-                plan = build_lifecycle_review_approval_plan(
-                    review,
-                    payload,
-                    reviewer=resolve_request_principal(request),
-                    review_note=note.strip() if note else None,
-                )
             await db.apply_lifecycle_plan(plan)
         except ValueError as exc:
-            if "stale guard" in str(exc) or "already" in str(exc):
+            detail = str(exc)
+            outdated = "stale guard" in detail or "already" in detail
+            if outdated and is_coordinator_review(review):
+                detail = f"{detail}; the next revision of its Source Unit raises this conflict again"
+            elif outdated:
                 try:
-                    await db.resolve_lifecycle_review(review_id, LifecycleReviewStatus.STALE)
+                    await db.resolve_lifecycle_review(review.id, LifecycleReviewStatus.STALE)
                 except ValueError:
                     pass
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(status_code=409, detail=detail) from exc
         memory_store = await _build_memory_store(db, config, runtime_provider)
         delivery = await memory_store.attempt_lifecycle_vector_delivery(plan.id)
         if delivery.pending:
             logger.warning(
                 "Lifecycle review %s applied but vector delivery remains pending error_types=%s",
-                review_id,
+                review.id,
                 delivery.error_types,
             )
-        decided = await db.get_lifecycle_review(review_id)
+        decided = await db.get_lifecycle_review(review.id)
         assert decided is not None
         return {
             "source_id": source_id,
-            "review_id": review_id,
+            "review_id": review.id,
             "status": decided.status.value,
             "lifecycle_plan_id": plan.id,
         }
@@ -6217,6 +6234,8 @@ def create_admin_app(
         request: Request,
         req: MemoryReviewDecisionRequest,
         db: Database = Depends(get_db),
+        config: AppConfig = Depends(get_config),
+        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
         """Keep the current state and discard the staged proposal."""
 
@@ -6228,6 +6247,8 @@ def create_admin_app(
             action="keep_current_state",
             expected_fingerprint=req.expected_fingerprint,
             note=req.note,
+            config=config,
+            runtime_provider=runtime_provider,
         )
 
     @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
@@ -8639,6 +8660,8 @@ def create_admin_app(
                 action="keep_current_state",
                 expected_fingerprint=req.expected_fingerprint,
                 note=req.note,
+                config=config,
+                runtime_provider=runtime_provider,
             )
             updated = await db.get_lifecycle_review(review_id)
             source = await db.get_source(source_id)

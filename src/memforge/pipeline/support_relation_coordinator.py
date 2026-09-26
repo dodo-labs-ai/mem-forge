@@ -31,9 +31,10 @@ Candidate's Evidence keeps the old Memory, binds it to that Evidence and
 consumes the Candidate; a claim still unsupported gets a Review that proposes
 exactly that rebind. A normal-order re-check yields an ordinary Support result
 that enters the table again. REFINES and uncertain edges keep the local
-unresolved relationship rules, and a Candidate that receives different
-treatments across old Memories leaves its whole related component unresolved:
-consumed this round, with no ADD and no destructive action.
+unresolved relationship rules. A Candidate that receives different treatments
+across old Memories, or is staged in the Reviews of more than one, leaves its
+whole related component unresolved: consumed this round, with no ADD and no
+destructive action.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
+from types import MappingProxyType
 
 from memforge.memory.evidence import RelationDirection
 from memforge.memory.relation_classifier import MemoryRelationType
@@ -55,9 +57,11 @@ from memforge.models import (
 from memforge.pipeline.revision_assessment import SupportAssessment
 
 __all__ = [
+    "UNRESOLVED_RESULTS",
     "Coordination",
     "MemorySupport",
     "RecheckReading",
+    "ReconciliationContractError",
     "RelationLedgerEntry",
     "RevisionCompositionProof",
     "SupportRecheckRequest",
@@ -67,6 +71,14 @@ __all__ = [
     "plan_rechecks",
     "supported_refiners",
 ]
+
+
+class ReconciliationContractError(ValueError):
+    """A bounded fail-closed reconciliation invariant violation."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 class SupportResult(str, Enum):
@@ -83,12 +95,17 @@ class SupportResult(str, Enum):
     # A prior Evidence part is UNKNOWN under partial projection coverage.
     UNRESOLVED_PARTIAL_COVERAGE = "unresolved_partial_coverage"
 
+    @property
+    def unresolved(self) -> bool:
+        return self in UNRESOLVED_RESULTS.values()
 
-_KEEPS_SUPPORT = frozenset({SupportResult.SUPPORTED, SupportResult.UNAFFECTED})
-_UNRESOLVED = {
+
+# A Support Assessment's unresolved reason and the Memory-level result it yields, in precedence order.
+UNRESOLVED_RESULTS: Mapping[str, SupportResult] = MappingProxyType({
     "capacity": SupportResult.UNRESOLVED_CAPACITY,
     "partial_coverage": SupportResult.UNRESOLVED_PARTIAL_COVERAGE,
-}
+})
+_KEEPS_SUPPORT = frozenset({SupportResult.SUPPORTED, SupportResult.UNAFFECTED})
 
 
 @dataclass(frozen=True)
@@ -112,12 +129,13 @@ class MemorySupport:
         """
         if assessment.supported and assessment.memory is not None:
             return MemorySupport(
-                SupportResult.SUPPORTED, assessment.reason, (assessment.memory,), rechecked=True,
-                assessments=(assessment,),
+                result=SupportResult.SUPPORTED, reason=assessment.reason, evidence=(assessment.memory,),
+                rechecked=True, assessments=(assessment,),
             )
         if assessment.unresolved == "capacity":
             return MemorySupport(
-                SupportResult.UNRESOLVED_CAPACITY, assessment.reason, rechecked=True, assessments=(assessment,),
+                result=SupportResult.UNRESOLVED_CAPACITY, reason=assessment.reason, rechecked=True,
+                assessments=(assessment,),
             )
         return replace(self, rechecked=True)
 
@@ -133,15 +151,25 @@ def memory_support(assessments: Sequence[SupportAssessment], *, rechecked: bool 
     """
     reason = "; ".join(dict.fromkeys(assessment.reason for assessment in assessments))
     assessments = tuple(assessments)
-    for unresolved in ("capacity", "partial_coverage"):
-        if any(assessment.unresolved == unresolved for assessment in assessments):
-            return MemorySupport(_UNRESOLVED[unresolved], reason, rechecked=rechecked, assessments=assessments)
     evidence = tuple(assessment.memory for assessment in assessments if assessment.supported and assessment.memory)
-    if any(assessment.supported and not assessment.rebound for assessment in assessments):
-        return MemorySupport(SupportResult.SUPPORTED, reason, evidence, rechecked, assessments)
-    if evidence:
-        return MemorySupport(SupportResult.UNAFFECTED, reason, evidence, rechecked, assessments)
-    return MemorySupport(SupportResult.UNSUPPORTED, reason, rechecked=rechecked, assessments=assessments)
+    result = next(
+        (
+            unresolved_result for unresolved, unresolved_result in UNRESOLVED_RESULTS.items()
+            if any(assessment.unresolved == unresolved for assessment in assessments)
+        ),
+        None,
+    )
+    if result is not None:
+        evidence = ()
+    elif any(assessment.supported and not assessment.rebound for assessment in assessments):
+        result = SupportResult.SUPPORTED
+    elif evidence:
+        result = SupportResult.UNAFFECTED
+    else:
+        result = SupportResult.UNSUPPORTED
+    return MemorySupport(
+        result=result, reason=reason, evidence=evidence, rechecked=rechecked, assessments=assessments,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,8 +263,6 @@ def _ledger(
     supports: Mapping[str, MemorySupport],
     rechecked_pairs: frozenset[tuple[int, str]],
 ) -> _Ledger:
-    from memforge.pipeline.reconciler import ReconciliationContractError
-
     incumbent_ids = {memory.id for memory in incumbents}
     pairs = {(entry.candidate_index, entry.incumbent_id) for entry in relations}
     if len(pairs) != len(relations) or any(
@@ -295,13 +321,29 @@ def plan_rechecks(
 
 
 def supported_refiners(
-    relations: Sequence[RelationLedgerEntry], supports: Mapping[str, MemorySupport],
+    *,
+    candidates: Sequence[RawMemory],
+    incumbents: Sequence[Memory],
+    relations: Sequence[RelationLedgerEntry],
+    proofs: Sequence[RevisionCompositionProof] = (),
+    supports: Mapping[str, MemorySupport],
+    rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
 ) -> dict[str, tuple[int, ...]]:
-    """Candidates that refine each old Memory whose Support keeps it; only these may revise it."""
+    """Candidates that refine each old Memory whose Support keeps it; only these may revise it.
+
+    An old Memory in an unresolved component gets no decision this round, so its
+    refinements need no comparison.
+    """
+    ledger = _ledger(
+        candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
+        rechecked_pairs=rechecked_pairs,
+    )
+    _, unresolved = _unresolved_component(ledger.relations, _seeds(ledger))
     grouped: dict[str, list[int]] = {}
-    for entry in relations:
+    for entry in ledger.relations:
         if (
-            supports[entry.incumbent_id].result in _KEEPS_SUPPORT
+            entry.incumbent_id not in unresolved
+            and ledger.supports[entry.incumbent_id].result in _KEEPS_SUPPORT
             and entry.relation_type is MemoryRelationType.REFINES
             and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
         ):
@@ -327,12 +369,16 @@ def coordinate(
     _, unresolved = _unresolved_component(ledger.relations, seeds)
     decided = {memory.id: _decide(ledger, memory) for memory in ledger.incumbents if memory.id not in unresolved}
 
-    # A Candidate treated differently by different old Memories has no single decision.
-    treatments: dict[int, set[_Treatment]] = {}
+    # A Candidate treated differently by different old Memories, or staged in the
+    # Reviews of several, has no single decision: each approval would apply it anew.
+    treatments: dict[int, list[_Treatment]] = {}
     for decision in decided.values():
         for index, treatment in decision.treatments:
-            treatments.setdefault(index, set()).add(treatment)
-    divided = {index for index, kinds in treatments.items() if len(kinds) > 1}
+            treatments.setdefault(index, []).append(treatment)
+    divided = {
+        index for index, kinds in treatments.items()
+        if len(set(kinds)) > 1 or kinds.count(_Treatment.STAGED) > 1
+    }
     if divided:
         seeds |= {
             (entry.candidate_index, entry.incumbent_id) for entry in ledger.relations

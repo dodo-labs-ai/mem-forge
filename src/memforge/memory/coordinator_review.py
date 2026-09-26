@@ -1,22 +1,22 @@
 """Identity, staging and recurrence inputs of SupportRelationCoordinator Reviews.
 
 A coordinator Review is a Lifecycle Plan ``CREATE_REVIEW`` in ``lifecycle_reviews``.
-Its ID names one conflict: the Source Unit, the old Memory and the normalized
-claim of the staged Candidate, so every revision that raises the same conflict
-names the same Review. The staged Candidate keeps its exact Evidence digests; a
+Its ID names one conflict: the Source Unit, the old Memory, the proposal and the
+normalized claim of the staged Candidate, so every revision that raises the same
+conflict names the same Review, and a human decision on one proposal never
+silences a different one. The staged Candidate keeps its exact Evidence digests; a
 later revision that did not extract it again carries the conflict forward only
 while every part of that Evidence is still exactly current.
 """
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from memforge.memory.candidate_admission import normalized_claim
 from memforge.memory.evidence import EvidenceRole, RelationDirection
-from memforge.memory.lifecycle_plan import LifecycleReview, LifecycleReviewStatus
+from memforge.memory.lifecycle_plan import LifecycleReview, LifecycleReviewStatus, lifecycle_stable_id
 from memforge.memory.relation_classifier import MemoryRelationType
 from memforge.models import CoordinatorProposal, RawMemory, content_hash
 from memforge.pipeline.projection_fragments import ProjectionFragmentCatalog
@@ -26,12 +26,11 @@ from memforge.pipeline.support_relation_coordinator import RelationLedgerEntry
 COORDINATOR_REVIEW_ORIGIN = "support_relation_coordinator"
 
 
-def coordinator_review_id(source_unit_id: str, memory_id: str, claim: str) -> str:
+def coordinator_review_id(source_unit_id: str, memory_id: str, proposal: CoordinatorProposal, claim: str) -> str:
     """One conflict's Review ID; it never includes the per-run reconciliation scope."""
-    digest = hashlib.sha256(
-        "\x1f".join((source_unit_id, memory_id, content_hash(normalized_claim(claim)))).encode("utf-8")
-    ).hexdigest()[:16]
-    return f"review-{digest}"
+    return lifecycle_stable_id(
+        "review", source_unit_id, memory_id, proposal.value, content_hash(normalized_claim(claim)),
+    )
 
 
 def is_coordinator_review(review: LifecycleReview, *, source_unit_id: str | None = None) -> bool:
@@ -81,7 +80,7 @@ class CarriedConflict:
 def carried_conflicts(
     reviews: Sequence[LifecycleReview], catalog: ProjectionFragmentCatalog,
 ) -> tuple[CarriedConflict, ...]:
-    """The pending conflicts whose staged Candidate Evidence is still exactly current.
+    """The pending conflicts among one Source Unit's coordinator Reviews whose staged Candidate is exactly current.
 
     An update extracts only changed structures, so an unchanged Candidate is not
     extracted again and Relation cannot raise its conflict. Its exact Evidence
@@ -91,7 +90,7 @@ def carried_conflicts(
     """
     carried = []
     for review in reviews:
-        if review.status is not LifecycleReviewStatus.PENDING or not is_coordinator_review(review):
+        if review.status is not LifecycleReviewStatus.PENDING:
             continue
         staged = review.staged_evidence
         candidate = _current_candidate(staged.get("candidate"), catalog)

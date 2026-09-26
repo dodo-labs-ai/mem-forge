@@ -30,6 +30,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleReviewStatus,
     ReconciliationScope,
     StaleGuard,
+    lifecycle_stable_id,
 )
 from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryRequest,
@@ -92,7 +93,9 @@ def build_lifecycle_plan(
     ``coordinator_reviews`` are this Source Unit's existing coordinator Reviews of
     the incumbents. A conflict raised again reuses its Review: a pending one is
     refreshed, a stale one reopens, and a decided one is not raised again. A
-    pending Review whose conflict this revision does not raise is closed as stale.
+    pending Review whose old Memory this revision decides without raising its
+    conflict is closed as stale; an old Memory kept unchanged without a decision
+    keeps its pending Reviews as they are.
     """
 
     incumbent_ids = tuple(sorted(incumbents))
@@ -265,7 +268,6 @@ def build_lifecycle_plan(
         staged: dict[str, object] = {
             "origin": COORDINATOR_REVIEW_ORIGIN,
             "source_unit_id": scope.source_unit_id,
-            "action": review.proposal.value,
             "proposal": review.proposal.value,
             "candidate": staged_candidate(review.candidate),
             "replacement_memory_id": None,
@@ -642,9 +644,14 @@ def build_lifecycle_plan(
             f"identity attach targets an old Memory this Plan deletes, replaces or reviews: {conflicting}"
         )
 
-    # A pending conflict this revision does not raise is gone. Closing it first keeps a
-    # destructive mutation later in the Plan from staling it; new Reviews come last, so
-    # each records its guard after every other mutation of its Memory.
+    # A pending conflict that this revision's decision of its old Memory does not raise
+    # is gone. Closing it first keeps a destructive mutation later in the Plan from
+    # staling it; new Reviews come last, so each records its guard after every other
+    # mutation of its Memory.
+    undecided_ids = {
+        operation.memory_id for operation in operations
+        if operation.support_revalidation_skipped and not operation.reviews and operation.memory_id is not None
+    }
     closures = tuple(
         LifecycleMutation(
             LifecycleMutationType.RESOLVE_REVIEW,
@@ -656,6 +663,7 @@ def build_lifecycle_plan(
         if review.status is LifecycleReviewStatus.PENDING
         and review.id not in raised_review_ids
         and review.incumbent_memory_id in incumbents
+        and review.incumbent_memory_id not in undecided_ids
     )
     mutations = [*closures, *mutations, *review_mutations]
 
@@ -752,7 +760,7 @@ def _raised_coordinator_reviews(
     """This round's coordinator Reviews of one old Memory by ID, less the conflicts a human already decided."""
     raised: dict[str, CoordinatorReview] = {}
     for review in reviews:
-        review_id = coordinator_review_id(source_unit_id, memory_id, review.candidate.content)
+        review_id = coordinator_review_id(source_unit_id, memory_id, review.proposal, review.candidate.content)
         existing = existing_reviews.get(review_id)
         if existing is not None and existing.status in _DECIDED_REVIEW_STATUSES:
             continue
@@ -831,7 +839,7 @@ def _review_mutation(
         memory_id=memory_id,
         source_id=scope.source_id,
         payload={
-            "review_id": _stable_id("review", scope.id, memory_id, operation.action.value),
+            "review_id": lifecycle_stable_id("review", scope.id, memory_id, operation.action.value),
             "reason": operation.reason or "lifecycle review required",
             "staged_evidence": staged,
         },
@@ -883,14 +891,14 @@ def _memory_payload(
 
 
 def _new_memory_id(scope_id: str, raw: RawMemory) -> str:
-    return _stable_id("mem", scope_id, raw.memory_type, raw.content.strip())
+    return lifecycle_stable_id("mem", scope_id, raw.memory_type, raw.content.strip())
 
 
 def lifecycle_memory_version(memory: Memory) -> str:
     """Return the adapter-neutral stale-guard identity for one Memory."""
 
     updated_at = memory.updated_at.isoformat() if memory.updated_at is not None else ""
-    return _stable_id(
+    return lifecycle_stable_id(
         "memory-version",
         memory.status,
         memory.content_hash,
@@ -898,6 +906,3 @@ def lifecycle_memory_version(memory: Memory) -> str:
     )
 
 
-def _stable_id(prefix: str, *values: object) -> str:
-    digest = hashlib.sha256("\x1f".join(str(value) for value in values).encode("utf-8")).hexdigest()[:16]
-    return f"{prefix}-{digest}"

@@ -555,6 +555,34 @@ class MemoryExtractionFailure(RuntimeError):
     """Extraction exhausted its own retry policy; do not replay the document."""
 
 
+def _fail_deferred_commits_nothing_can_unblock(
+    results: list[dict[str, Any]], run_source_unit_ids: set[str],
+) -> None:
+    """Fail every deferred intent that no Unit outside ``run_source_unit_ids`` holds up.
+
+    Such an intent already had every chance to commit; an intent that waits on
+    an outside Unit, directly or through another deferred intent, stays deferred.
+    """
+    deferred = {
+        str(result["source_unit_id"]): result
+        for result in results
+        if result.get("deferred_lifecycle") is not None and result.get("source_unit_id")
+    }
+    blockers = {
+        unit_id: set(result["deferred_lifecycle"].handle.blocking_source_unit_ids)
+        for unit_id, result in deferred.items()
+    }
+    waiting = {unit_id for unit_id, blocked_by in blockers.items() if not blocked_by <= run_source_unit_ids}
+    while newly_waiting := {
+        unit_id for unit_id, blocked_by in blockers.items() if unit_id not in waiting and blocked_by & waiting
+    }:
+        waiting |= newly_waiting
+    for unit_id, result in deferred.items():
+        if unit_id not in waiting:
+            result["terminal_error"] = _retained_document_error(result["deferred_lifecycle"])
+            result["deferred_lifecycle"] = None
+
+
 def _retained_document_error(exc: BaseException) -> str:
     """Project an exception into bounded state without retaining its traceback."""
 
@@ -1604,8 +1632,10 @@ class GeneSyncOrchestrator:
         """Commit same-run deferred intents without repeating semantic work.
 
         Only an intent whose blockers are all Units of this run, or Units this
-        run removed, is retried. An intent that stays deferred is left pending
-        for the caller, which may remove more Units and converge again.
+        run removed, is retried. An intent still deferred afterwards has failed
+        for good unless it waits, directly or through another deferred intent,
+        on a Unit outside that set: only the caller's later removal of such a
+        Unit can still unblock it, so that intent is left pending.
         """
 
         run_source_unit_ids = {
@@ -1623,6 +1653,13 @@ class GeneSyncOrchestrator:
         if not pending:
             return
 
+        await self._retry_deferred_projected_lifecycle(pending, run_source_unit_ids)
+        _fail_deferred_commits_nothing_can_unblock(results, run_source_unit_ids)
+
+    async def _retry_deferred_projected_lifecycle(
+        self, pending: dict[str, dict[str, Any]], run_source_unit_ids: set[str],
+    ) -> None:
+        """Retry eligible intents in rounds while each round commits at least one."""
         attempt_budget = min(
             MAX_LIFECYCLE_CONVERGENCE_ROUNDS * len(pending),
             MAX_LIFECYCLE_CONVERGENCE_ATTEMPTS,
@@ -1652,6 +1689,7 @@ class GeneSyncOrchestrator:
                 except Exception as exc:
                     if bool(getattr(exc, "commit_attempted", True)):
                         attempts += 1
+                    result["deferred_lifecycle"] = None
                     result["terminal_error"] = _retained_document_error(exc)
                     result["runtime_bundle"] = getattr(
                         exc,

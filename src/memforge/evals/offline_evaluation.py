@@ -33,7 +33,7 @@ from memforge.memory.cross_document_relation import (
 )
 from memforge.models import Memory, MemoryExtractionResult, RawMemory, ReconcileOperation
 from memforge.pipeline.reconciler import reconcile_memories
-from memforge.pipeline.support_relation_coordinator import MemorySupport, SupportResult
+from memforge.pipeline.support_relation_coordinator import UNRESOLVED_RESULTS, MemorySupport, SupportResult
 from memforge.pipeline.memory_extractor import MemoryExtractor
 from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.projection_context import ExtractionAuthority, ExtractionPlan, ExtractionRequest
@@ -2768,12 +2768,6 @@ def _require_current_relation_contract(manifest: Mapping[str, object]) -> None:
         )
 
 
-_PINNED_UNRESOLVED = {
-    "capacity": SupportResult.UNRESOLVED_CAPACITY,
-    "partial_coverage": SupportResult.UNRESOLVED_PARTIAL_COVERAGE,
-}
-
-
 def _pinned_supports(manifest: Mapping[str, object]) -> dict[str, MemorySupport]:
     """Read the pinned Support ledger: exactly one read result for every incumbent.
 
@@ -2789,13 +2783,13 @@ def _pinned_supports(manifest: Mapping[str, object]) -> dict[str, MemorySupport]
         if not isinstance(supported, bool):
             raise ValueError("support_audits supported must be a boolean")
         unresolved = item.get("unresolved")
-        if unresolved is not None and unresolved not in _PINNED_UNRESOLVED:
+        if unresolved is not None and unresolved not in UNRESOLVED_RESULTS:
             raise ValueError("support_audits unresolved must be capacity or partial_coverage")
         incumbent_id = str(item.get("incumbent_id") or "")
         if incumbent_id in supports:
             raise ValueError("support_audits must cover every pinned incumbent exactly once")
         supports[incumbent_id] = MemorySupport(
-            _PINNED_UNRESOLVED[unresolved] if unresolved is not None
+            UNRESOLVED_RESULTS[unresolved] if unresolved is not None
             else SupportResult.SUPPORTED if supported else SupportResult.UNSUPPORTED,
             str(item.get("reason") or ""),
         )

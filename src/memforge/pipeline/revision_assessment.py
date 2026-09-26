@@ -81,9 +81,11 @@ class SupportAssessment:
     # The Support was bound to its exactly unchanged current Evidence without a read:
     # the program rebind, or Change Impact judged it UNAFFECTED.
     rebound: bool = False
-    # An unsupported result rests on the whole reading order of the current revision,
-    # whose completion receipt is recorded. A re-check that read only a Candidate's
-    # Evidence never does, so it can keep a claim but never retire one.
+    # An unsupported result rests on the whole current revision: a read of its whole
+    # reading order, whose completion receipt is recorded, or a revision with no
+    # content left whose coverage is authoritative for the claim's Evidence. A re-check
+    # that read only a Candidate's Evidence never does, so it can keep a claim but
+    # never retire one.
     complete_read: bool = False
 
 
