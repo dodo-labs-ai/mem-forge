@@ -80,14 +80,6 @@ class RequestTooLarge(Exception):
     """Raised by a renderer that cannot assemble a request for this slice of work."""
 
 
-class ItemCapacityExceeded(Exception):
-    """One item cannot fit a request on its own, even with a single context part."""
-
-    def __init__(self, item_id: ItemId) -> None:
-        super().__init__(f"item {item_id!r} alone exceeds the route's input capacity")
-        self.item_id = item_id
-
-
 @dataclass(frozen=True)
 class ItemFailure:
     """Why one item has no result.
@@ -158,6 +150,14 @@ class PlannedRequest(Generic[Part]):
     request: LlmRequest
 
 
+@dataclass(frozen=True)
+class BatchPlan(Generic[Part]):
+    """The requests ``run_items`` would send, and the items that alone exceed the route's capacity."""
+
+    requests: tuple[PlannedRequest[Part], ...]
+    unfit: tuple[ItemId, ...]
+
+
 class RequestJournal(Protocol):
     """Optional per-request persistence that lets a retried run reuse completed requests."""
 
@@ -214,13 +214,11 @@ class LlmBatchRunner:
     def plan_items(
         self, item_ids: Sequence[ItemId], render: Callable[[tuple[ItemId, ...], tuple[Part, ...]], LlmRequest],
         context: Sequence[Part] = (),
-    ) -> tuple[PlannedRequest[Part], ...]:
+    ) -> BatchPlan[Part]:
         """Pack items as ``run_items`` would, without sending."""
 
         planned, unfit = self._pack_items(item_ids, render, context)
-        if unfit:
-            raise ItemCapacityExceeded(unfit[0])
-        return tuple(planned)
+        return BatchPlan(tuple(planned), tuple(unfit))
 
     async def run_items(self, task: ItemTask[Part, Result]) -> dict[ItemId, tuple[Result, ...] | ItemFailure]:
         """Return every item's results, one per context chunk in context order, or its failure."""

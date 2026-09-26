@@ -8,7 +8,13 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from tests.llm_fixture import AdmittingClient, FixtureBudgetClient, admission_payload, fixture_request_planner
+from tests.llm_fixture import (
+    AdmittingClient,
+    FixtureBudgetClient,
+    NoopMemoryExtractor,
+    admission_payload,
+    fixture_request_planner,
+)
 from tests.unit_support_fixture import (
     active_support_evidence,
     primary_reference,
@@ -123,6 +129,7 @@ from memforge import source_derivation as source_derivation_module
 from memforge.pipeline.extraction_contract import PROJECTION_EXTRACTION_CONTRACT_VERSION
 from memforge.pipeline.projection_context import (
     ExtractionAuthority,
+    ExtractionPlan,
     ExtractionRequest,
     plan_projection_evidence_work,
 )
@@ -2920,7 +2927,7 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
         return MemoryExtractionResult()
 
     async def plan_requests(_authority):
-        return batches
+        return ExtractionPlan(batches)
 
     with pytest.raises(RuntimeError, match="worker interrupted"):
         await SourceUnitDeriver(db).derive(
@@ -2952,6 +2959,72 @@ async def test_source_deriver_persists_completed_batch_before_later_worker_failu
         "batch-first": "completed",
         "batch-second": "pending",
     }
+
+
+class _OversizedGroupExtractor(NoopMemoryExtractor):
+    """An extraction route on which any request that reads the oversized group does not fit."""
+
+    OVERSIZED = "This rule is far larger than the route allows."
+    structured_llm_client = SimpleNamespace(
+        **{
+            **vars(NoopMemoryExtractor.structured_llm_client),
+            "request_fits": lambda prompt, **kwargs: _OversizedGroupExtractor.OVERSIZED not in prompt,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reading_group_beyond_capacity_is_skipped_and_the_derivation_completes(db: Database) -> None:
+    body = f"Rule one applies.\n\n{_OversizedGroupExtractor.OVERSIZED}\n\nRule three applies.\n"
+    projection = _projection(run_id="projection-extraction-capacity", body=body)
+    document = await db.get_document("confluence-123")
+    assert document is not None
+    read: list[str] = []
+
+    async def extract(batch):
+        read.extend(f.presentation_text.strip() for f in batch.catalog.fragments if f.primary_eligible)
+        return MemoryExtractionResult(memories=[])
+
+    def request():
+        return SourceUnitDerivationRequest(
+            projection=projection,
+            context=SourceUnitDerivationContext(
+                document=document,
+                doc_type="confluence",
+                project_key="ENG",
+                repo_identifier=None,
+                document_content=body,
+                update_mode="full_document",
+                changed_hunks=None,
+                update_plan_stats=None,
+                source_updated_at=None,
+                user_id=None,
+                source_activity_epoch=None,
+            ),
+            plan_requests=fixture_request_planner(
+                projection, access_context_hash="access-extraction-capacity", extractor=_OversizedGroupExtractor(),
+            ),
+            extract_request=extract,
+            max_concurrent=1,
+            access_context_hash="access-extraction-capacity",
+            inference_capability_hash="inference-extraction-capacity",
+        )
+
+    first = await SourceUnitDeriver(db).derive(request())
+
+    assert first.extraction.error_type is None
+    assert first.derivation.status == "completed"
+    assert first.extraction.metadata["skipped_reading_group_count"] == 1
+    assert "Rule one applies." in read and "Rule three applies." in read
+    assert _OversizedGroupExtractor.OVERSIZED not in read
+
+    # Recovering the derivation plans the same skip and reuses every completed batch.
+    read.clear()
+    again = await SourceUnitDeriver(db).derive(request())
+
+    assert again.derivation.id == first.derivation.id
+    assert again.executed_batch_count == 0 and read == []
+    assert again.extraction.metadata["skipped_reading_group_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -3354,7 +3427,7 @@ async def test_projection_extraction_contract_change_invalidates_staged_derivati
     )
     assert isinstance(authority, ExtractionAuthority)
     plan_requests = fixture_request_planner(projection, access_context_hash="access-contract-change")
-    current_batches = await plan_requests(authority)
+    current_batches = (await plan_requests(authority)).requests
     assert current_batches
     previous_batches = tuple(replace(batch, id=f"{batch.id}-v2") for batch in current_batches)
     with monkeypatch.context() as previous_contract:
@@ -3431,7 +3504,7 @@ async def test_batch_result_and_runtime_events_rollback_together(db: Database) -
         reprocess_all_current_observations=False,
     )
     assert isinstance(authority, ExtractionAuthority)
-    batches = await fixture_request_planner(projection, access_context_hash="access-runtime-transaction")(authority)
+    batches = (await fixture_request_planner(projection, access_context_hash="access-runtime-transaction")(authority)).requests
     manifest = source_derivation_manifest(projection, batches, context=context)
     await db.stage_source_derivation(manifest)
     [event] = bind_quality_signals(
