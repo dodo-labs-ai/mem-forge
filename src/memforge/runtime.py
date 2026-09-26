@@ -1174,7 +1174,7 @@ class SourceSyncWorker:
                                 f"source sync lease lost before initial progress update for run {run.run_id}"
                             )
 
-            # An operator reprocess reads stored Documents, not collected input.
+            # An operator reprocess reads the provider or stored Documents, not collected input.
             reprocessing = bool(run.reprocess_document_ids)
             projection_scope_attestations: tuple[ProjectionScopeAttestation, ...] = ()
             authoritative_collection = False
@@ -1423,7 +1423,7 @@ class SyncService:
         )
 
     async def enqueue_reprocess(self, source_id: str, document_ids: tuple[str, ...]) -> SourceSyncRun:
-        """Queue an operator reprocess of stored Documents at their current revisions.
+        """Queue an operator reprocess of the Source Units of these Documents.
 
         It keeps the sync cursor, so the Source must have one; it is refused
         while another run of the Source is pending or running.

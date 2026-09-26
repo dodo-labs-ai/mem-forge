@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
-from typing import Any, Mapping, Protocol, Sequence, TypedDict, runtime_checkable
+from typing import Any, Collection, Mapping, Protocol, Sequence, TypedDict, runtime_checkable
 
 from memforge.derivation_work import DerivationWork
 from memforge.evals.agent_evaluation import AgentRuntimeBundle
@@ -368,9 +368,13 @@ class RelationalStore(Protocol):
     ) -> None:
         """Persist one projection atomically; revisions are immutable.
 
-        The one permitted change to a stored Observation Revision: when it was
-        recorded without ``observed_at`` and the projection gives one, the time
-        is written once. A stored ``observed_at`` is never replaced.
+        Observation Revisions are content-addressed: a projected revision whose
+        id is stored keeps the stored row, and only its identity (Observation,
+        semantic hash, Evidence Representation Profile) must match, otherwise
+        ``ProjectionIdentityConflict`` is raised. The one permitted change to a
+        stored Observation Revision: when it was recorded without
+        ``observed_at`` and the projection gives one, the time is written once.
+        A stored ``observed_at`` is never replaced.
         """
         ...
     async def get_source_projection(self, run_id: str) -> SourceProjection | None: ...
@@ -382,6 +386,12 @@ class RelationalStore(Protocol):
         self,
         source_unit_id: str,
     ) -> Mapping[str, SourceObservationRevision]: ...
+    async def get_source_observation_revisions(
+        self,
+        revision_ids: Collection[str],
+    ) -> Mapping[str, SourceObservationRevision]:
+        """Return the stored Observation Revisions among these ids, keyed by id."""
+        ...
     async def get_current_source_unit_projection(
         self,
         source_unit_id: str,

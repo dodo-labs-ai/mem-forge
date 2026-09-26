@@ -754,7 +754,7 @@ class ToolClient:
         document_ids: list[str],
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Reprocess stored Documents at their current revisions, or preview it."""
+        """Reprocess the Source Units of these Documents, or preview it."""
         source_id = source_id.strip()
         if not source_id:
             return {"error": "source_id is required"}

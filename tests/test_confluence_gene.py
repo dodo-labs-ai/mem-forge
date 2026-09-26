@@ -1026,7 +1026,7 @@ async def test_page_tree_preview_limits_child_page_request_size():
 
     assert [item.title for item in items] == ["Root", "Child 1", "Child 2"]
     child_requests = [params for url, params in client.requests if url.endswith("/content/root/child/page")]
-    assert child_requests == [{"start": 0, "limit": 2, "expand": "version,metadata.labels"}]
+    assert child_requests == [{"start": 0, "limit": 2, "expand": "version,metadata.labels,space"}]
 
 
 @pytest.mark.parametrize(

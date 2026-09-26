@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from memforge.genes.atlassian_auth import (
+    ATLASSIAN_ABSENT_STATUS_CODES,
     atlassian_request_limiter,
     bearer_headers,
     request_with_rate_limit_retry,
@@ -476,6 +477,34 @@ class JiraGene(Gene):
             cache_hydrated=True,
         ):
             yield item
+
+    @classmethod
+    def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:
+        return str(config.get("sync_mode") or "cloud").strip().lower() != "local_agent"
+
+    async def rediscover(self, item: ContentItem) -> ContentItem | None:
+        """Read one issue as discovery does, by its stable id when the stored item has it."""
+        issue_ref = str(item.extra.get("issue_id") or item.extra.get("issue_key") or "").strip()
+        if not issue_ref:
+            issue_ref = item.item_id.removeprefix("jira-")
+        try:
+            resp = await self._request(
+                "GET",
+                f"/rest/api/2/issue/{issue_ref}",
+                params={"fields": ",".join(JIRA_SEARCH_FIELDS), "expand": ",".join(JIRA_SEARCH_EXPAND)},
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in ATLASSIAN_ABSENT_STATUS_CODES:
+                return None
+            raise
+        issue = resp.json()
+        if not isinstance(issue, dict) or not str(issue.get("id") or "").strip().isdigit():
+            raise RuntimeError("Jira issue response is missing a stable id")
+        if not str(issue.get("key") or "").strip() or not isinstance(issue.get("fields"), dict):
+            raise RuntimeError("Jira issue response is missing its key or fields")
+        current = _issue_content_item(issue, self._base_url)
+        self._hydrated_issues[current.extra["issue_key"]] = issue
+        return current
 
     async def discover_inventory(self) -> AsyncIterator[ContentItem]:
         """Discover a complete lightweight issue inventory for daemon planning."""
