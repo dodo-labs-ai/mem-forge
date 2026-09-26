@@ -3220,7 +3220,7 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     ),
     (
         48,
-        "Add lifecycle cutover gates findings and support assertions",
+        "Add lifecycle gates and evidence references",
         [
             """CREATE TABLE IF NOT EXISTS source_lifecycle_gates (
                 source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
@@ -3230,21 +3230,6 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                 enabled_at TEXT,
                 updated_at TEXT NOT NULL
             )""",
-            """CREATE TABLE IF NOT EXISTS lifecycle_cutover_findings (
-                id TEXT PRIMARY KEY,
-                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-                memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-                reason TEXT NOT NULL,
-                status TEXT NOT NULL CHECK (status IN ('open', 'resolved')),
-                available_provenance_json TEXT NOT NULL DEFAULT '{}',
-                mapping_attempt_json TEXT NOT NULL DEFAULT '{}',
-                observation_id TEXT,
-                source_unit_id TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                resolved_at TEXT
-            )""",
-            "CREATE INDEX IF NOT EXISTS idx_cutover_findings_source_status ON lifecycle_cutover_findings(source_id, status)",
             """CREATE TABLE IF NOT EXISTS evidence_references (
                 id TEXT PRIMARY KEY,
                 evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
@@ -3257,18 +3242,6 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                 range_end INTEGER,
                 created_at TEXT NOT NULL
             )""",
-            """CREATE TABLE IF NOT EXISTS memory_support_assertions (
-                id TEXT PRIMARY KEY,
-                memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-                evidence_reference_id TEXT NOT NULL REFERENCES evidence_references(id) ON DELETE CASCADE,
-                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-                access_context_hash TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                removed_at TEXT,
-                UNIQUE (memory_id, evidence_reference_id)
-            )""",
-            "CREATE INDEX IF NOT EXISTS idx_memory_support_assertions_active ON memory_support_assertions(memory_id, active)",
         ],
     ),
     (
@@ -3318,27 +3291,6 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             )""",
             "CREATE INDEX IF NOT EXISTS idx_lifecycle_vector_outbox_status "
             "ON lifecycle_vector_outbox(status, created_at)",
-        ],
-    ),
-    (
-        51,
-        "Add durable lifecycle backfill jobs",
-        [
-            """CREATE TABLE IF NOT EXISTS lifecycle_backfill_jobs (
-                id TEXT PRIMARY KEY,
-                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-                status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed')),
-                scanned_memories INTEGER NOT NULL DEFAULT 0,
-                mapped_memories INTEGER NOT NULL DEFAULT 0,
-                finding_count INTEGER NOT NULL DEFAULT 0,
-                error TEXT,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                updated_at TEXT NOT NULL
-            )""",
-            "CREATE INDEX IF NOT EXISTS idx_lifecycle_backfill_jobs_source "
-            "ON lifecycle_backfill_jobs(source_id, created_at)",
         ],
     ),
     (
@@ -4341,43 +4293,6 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             """INSERT OR IGNORE INTO system_contract_markers (
                     marker_key, marker_value, updated_at
                 ) VALUES ('support_scope_version', 'reference-set-v1', datetime('now'))""",
-            """CREATE TABLE IF NOT EXISTS support_cutover_reports (
-                id TEXT PRIMARY KEY,
-                support_scope_version TEXT NOT NULL,
-                legacy_group_count INTEGER NOT NULL,
-                eligible_group_count INTEGER NOT NULL,
-                ineligible_group_count INTEGER NOT NULL,
-                active_eligible_group_count INTEGER NOT NULL,
-                inactive_eligible_group_count INTEGER NOT NULL,
-                finding_payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )""",
-            """CREATE TABLE IF NOT EXISTS support_cutover_lease (
-                lease_key TEXT PRIMARY KEY CHECK (lease_key = 'support_scope_cutover'),
-                owner_id TEXT NOT NULL,
-                acquired_at TEXT NOT NULL
-            )""",
-            """CREATE TRIGGER IF NOT EXISTS block_legacy_support_insert_v2
-               BEFORE INSERT ON memory_support_assertions
-               WHEN (SELECT marker_value FROM system_contract_markers
-                     WHERE marker_key = 'support_scope_version') = 'evidence-unit-set-v2'
-               BEGIN
-                   SELECT RAISE(ABORT, 'reference-scoped Support is immutable under evidence-unit-set-v2');
-               END""",
-            """CREATE TRIGGER IF NOT EXISTS block_legacy_support_update_v2
-               BEFORE UPDATE ON memory_support_assertions
-               WHEN (SELECT marker_value FROM system_contract_markers
-                     WHERE marker_key = 'support_scope_version') = 'evidence-unit-set-v2'
-               BEGIN
-                   SELECT RAISE(ABORT, 'reference-scoped Support is immutable under evidence-unit-set-v2');
-               END""",
-            """CREATE TRIGGER IF NOT EXISTS block_legacy_support_delete_v2
-               BEFORE DELETE ON memory_support_assertions
-               WHEN (SELECT marker_value FROM system_contract_markers
-                     WHERE marker_key = 'support_scope_version') = 'evidence-unit-set-v2'
-               BEGIN
-                   SELECT RAISE(ABORT, 'reference-scoped Support is immutable under evidence-unit-set-v2');
-               END""",
         ],
     ),
     (
@@ -5934,14 +5849,6 @@ class Database:
             (source_id,),
         ) as cursor:
             return {str(row[0]) async for row in cursor}
-
-    async def list_indexed_document_versions(self, source_id: str) -> dict[str, str]:
-        """Return the complete current document/version identity for one source."""
-        async with self.db.execute(
-            "SELECT doc_id, version FROM documents WHERE source = ?",
-            (source_id,),
-        ) as cursor:
-            return {str(row[0]): str(row[1]) async for row in cursor}
 
     async def delete_projected_document(
         self,

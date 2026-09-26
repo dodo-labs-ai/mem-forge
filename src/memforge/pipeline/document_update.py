@@ -1,9 +1,10 @@
-"""Document update planning for memory extraction.
+"""Change shape of an updated source document.
 
-This module decides how an updated source item should be processed. It keeps the
-decision source-agnostic: genes still produce stable normalized markdown, while
-the sync pipeline decides whether an update is small enough for diff-guided
-extraction or should fall back to full-document extraction.
+Genes produce stable normalized markdown. For an updated item this module
+records how much of that markdown changed: the unified diff, its size, and the
+inserted or replaced character ranges. The result is part of the Source
+derivation context and of the lifecycle operation input hash, and the sync
+pipeline records it as an audit event.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ __all__ = [
     "DEFAULT_MAX_DIFF_LINES",
     "DocumentUpdatePlan",
     "plan_document_update",
-    "quote_overlaps_current_changes",
 ]
 
 DEFAULT_MAX_DIFF_LINES = 400
@@ -28,7 +28,7 @@ DEFAULT_MAX_CHANGED_RATIO = 0.40
 
 @dataclass(frozen=True)
 class DocumentUpdatePlan:
-    """Decision for processing a changed normalized document."""
+    """Change shape of an updated normalized document."""
 
     mode: Literal["diff_guided", "full_document"]
     reason: str
@@ -52,7 +52,7 @@ def plan_document_update(
     max_diff_chars: int = DEFAULT_MAX_DIFF_CHARS,
     max_changed_ratio: float = DEFAULT_MAX_CHANGED_RATIO,
 ) -> DocumentUpdatePlan:
-    """Choose diff-guided or full-document extraction for an updated source item."""
+    """Describe how an updated source item differs from its previous content."""
     thresholds = {
         "max_diff_lines": max_diff_lines,
         "max_diff_chars": max_diff_chars,
@@ -158,25 +158,6 @@ def plan_document_update(
     )
 
 
-def quote_overlaps_current_changes(
-    updated_content: str,
-    evidence_quote: str,
-    current_changed_ranges: tuple[tuple[int, int], ...],
-) -> bool:
-    """Return whether an exact current quote intersects an inserted/replaced range."""
-
-    quote = evidence_quote.strip()
-    if not quote or not current_changed_ranges:
-        return False
-    offset = updated_content.find(quote)
-    while offset >= 0:
-        quote_end = offset + len(quote)
-        if any(offset < range_end and quote_end > range_start for range_start, range_end in current_changed_ranges):
-            return True
-        offset = updated_content.find(quote, offset + 1)
-    return False
-
-
 def _current_changed_ranges(
     *,
     previous_lines: list[str],
@@ -192,8 +173,8 @@ def _current_changed_ranges(
         line_offsets.append(len(updated_content))
 
     ranges = []
-    # Match unified_diff's SequenceMatcher defaults so the executable ranges
-    # grant exactly the same authority the model saw in changed_hunks.
+    # Match unified_diff's SequenceMatcher defaults so the ranges describe
+    # exactly the changes recorded in changed_hunks.
     matcher = difflib.SequenceMatcher(a=previous_lines, b=updated_lines)
     for tag, _previous_start, _previous_end, current_start, current_end in matcher.get_opcodes():
         if tag not in {"insert", "replace"} or current_start == current_end:
