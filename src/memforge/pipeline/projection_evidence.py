@@ -47,13 +47,13 @@ def build_projected_claim_evidence(
     repo_identifier: str | None,
     access_context_hash: str,
     extractor_run_id: str | None,
-    observed_at: str | None = None,
 ) -> ProjectedClaimEvidence:
     """Build deterministic Evidence Units staged for the atomic Lifecycle Plan.
 
     Every claim must carry the application-resolved Fragment selection that
     names its exact supporting parts; each claim becomes one Evidence Unit
-    whose identity hashes those parts.
+    whose identity hashes those parts. An Evidence Unit's time is the source
+    time of the Observation Revision its Primary part is anchored to.
     """
 
     if len(projection.source_units) != 1 or len(projection.source_unit_revisions) != 1:
@@ -77,7 +77,6 @@ def build_projected_claim_evidence(
                 repo_identifier=repo_identifier,
                 access_context_hash=access_context_hash,
                 extractor_run_id=extractor_run_id,
-                observed_at=observed_at,
             )
         )
         units_by_id.setdefault(unit.id, unit)
@@ -133,7 +132,6 @@ def _materialize_claim_evidence(
     repo_identifier: str | None,
     access_context_hash: str,
     extractor_run_id: str | None,
-    observed_at: str | None,
 ) -> tuple[
     EvidenceUnit,
     tuple[EvidenceReference, ...],
@@ -232,10 +230,7 @@ def _materialize_claim_evidence(
             "fragment_compiler_contract_version": selection.compiler_contract_version,
             **_resolved_fragment_audit_metadata(raw, selection),
         },
-        observed_at=(
-            observed_at
-            or revisions[primary.anchor.observation_id].observed_at
-        ),
+        observed_at=revisions[primary.anchor.observation_id].observed_at,
         extractor_run_id=extractor_run_id,
         access_context_hash=access_context_hash,
         part_set_digest=part_digest,

@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Every Observation Revision records the source's own time for its content: a
+  Confluence page version, a GitHub file's latest commit, a GitHub Pages commit,
+  sitemap `lastmod` or `Last-Modified`, the latest change to a Jira issue's core
+  fields, a comment, changelog entry or Teams message time, a local file's
+  commit or modification time, and the time of the agent session event that
+  authorized a concept change. A source without such a time records none;
+  discovery, fetch, submission and sync times are never used. Relation
+  discovery reads this one time for every Source, so `updates` between Memories
+  from GitHub, local files, Jira issue fields or agent sessions is no longer
+  recorded as `contradicts` for want of a time.
+- A Memory's `source_updated_at` is the time the Source reports and is empty
+  when it reports none; it no longer falls back to the sync time (GitHub
+  Repository, GitHub Pages) or the local agent's submission time. Searches that
+  filter on `source_updated_at` now match these Memories by their source time.
+- GitHub Repository cloud pull reads each file's latest commit, one extra
+  GitHub request per file per sync (two for a symlink).
+- The local agent sends `source_updated_at` for GitHub Repository and local
+  Markdown files. Upgrade the local agent to record these times; an older one
+  sends none and its files have no source time.
+- After upgrading, run one force full sync of each Jira, GitHub Repository
+  local push and local Markdown Source to record times on existing revisions.
+  GitHub Repository cloud pull records them on its next sync, and a migration
+  gives current Confluence page bodies their page version time. Relations
+  recorded as `contradicts` because a time was missing do not change by
+  themselves: re-run relation discovery for them afterwards
+  (`POST /api/v1/relation-discovery/work/rerun`). Source derivations in progress
+  or deferred during the upgrade may run their extraction once more.
+
 - Evidence Unit Support is the only Support model (ADR 0038). A workspace that
   still holds reference-scoped Support refuses to start and is left unchanged;
   move the database aside and rebuild the workspace from its Sources. Other

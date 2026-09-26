@@ -31,7 +31,6 @@ from memforge.pipeline.evidence_fragments import (
     canonical_record_field_ranges,
     compile_fragments,
 )
-from memforge.pipeline.source_projection_adapters import SOURCE_TYPES_WITH_DOCUMENT_REVISION_TIME
 from memforge.source_projection import AnchorKind, SourceObservationRevision
 from memforge.source_representation import representation_contract_for_profile
 
@@ -588,28 +587,18 @@ def _source_date(value: object) -> str | None:
     return moment.date().isoformat()
 
 
-def _evidence_time(
-    unit: MemoryEvidenceUnitProjection,
-    primary_revision: SourceObservationRevision | None,
-    document: Any,
-) -> str | None:
-    """When the source recorded the Primary Evidence.
+def _evidence_time(primary_revision: SourceObservationRevision | None) -> str | None:
+    """When the source gave the Primary Evidence its content.
 
     ``primary_revision`` is the Observation Revision the Primary is anchored
-    to, present only while it is the current revision. Its own time comes first
-    (a comment, a changelog entry, a message). A document time counts only where
-    it is the revision time of the document body, which then is the anchored
-    revision; a sync or submission time is never shown as a source time.
+    to, present only while it is the current revision. Its ``observed_at`` is
+    the source's own time for that content (a page version, a commit, a
+    comment, a message, an agent event), or None where the source records none.
     """
 
     if primary_revision is None:
         return None
-    observed = _source_date(primary_revision.observed_at)
-    if observed is not None:
-        return observed
-    if unit.source_type in SOURCE_TYPES_WITH_DOCUMENT_REVISION_TIME and document is not None:
-        return _source_date(getattr(document, "last_modified", None))
-    return None
+    return _source_date(primary_revision.observed_at)
 
 
 def _field_value_text(field: CanonicalFieldRange) -> str:
@@ -747,9 +736,7 @@ async def load_relation_subjects(
             source_type=unit.source_type,
             document_title=getattr(document, "title", None) or None,
             evidence_time=_evidence_time(
-                unit,
-                _anchored_revision(primary, unit_revisions) if primary is not None else None,
-                document,
+                _anchored_revision(primary, unit_revisions) if primary is not None else None
             ),
             evidence=evidence,
         )

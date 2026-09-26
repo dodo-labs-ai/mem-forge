@@ -52,6 +52,7 @@ from memforge.memory.lifecycle_planner import (
     lifecycle_access_context_hash,
     lifecycle_plan_id,
 )
+from memforge.source_time import SOURCE_UPDATED_AT_KEY
 from memforge.models import (
     ContentItem,
     DocumentRecord,
@@ -271,6 +272,9 @@ class AgentKnowledgeBundleService:
 
         V1 is private-only. Existing concept/claim writes must belong to
         ``owner_user_id`` and the same ``repo_identifier``.
+        ``source_updated_at`` is the time of the session event that authorizes
+        the patch, the source time of the concept content it writes; None when
+        that event carries no time. ``submitted_at`` is when the window arrived.
         """
 
         submitted_at = _utc(submitted_at)
@@ -1054,12 +1058,11 @@ class AgentKnowledgeBundleService:
             or (existing_concept or {}).get("title")
             or concept_id
         )
-        observed_at = source_updated_at or submitted_at
         item = ContentItem(
             item_id=concept_id,
             title=title,
             source_url=f"agent-knowledge://{slugify(owner_user_id)}/{concept_id}",
-            last_modified=observed_at,
+            last_modified=submitted_at,
             content_type="text/markdown",
             space_or_project=project_key or "UNSORTED",
             version=content_hash(markdown_body),
@@ -1102,7 +1105,15 @@ class AgentKnowledgeBundleService:
             run_id=f"agent-projection-{run_digest}",
             item=item,
             raw=raw,
-            normalized=NormalizedContent(item=item, markdown_body=markdown_body),
+            normalized=NormalizedContent(
+                item=item,
+                markdown_body=markdown_body,
+                source_semantics=(
+                    {SOURCE_UPDATED_AT_KEY: source_updated_at.isoformat()}
+                    if source_updated_at is not None
+                    else {}
+                ),
+            ),
             scope={"managed_capture_source": source_id},
             access_context={
                 "visibility": Visibility.PRIVATE.value,
@@ -1268,7 +1279,6 @@ class AgentKnowledgeBundleService:
             repo_identifier=repo_identifier,
             access_context_hash=access_hash,
             extractor_run_id=projection.run_id,
-            observed_at=observed_at.isoformat(),
         )
         canonical_memories = evidence.canonical_memories_by_claim_hash
         incumbent_candidates = {

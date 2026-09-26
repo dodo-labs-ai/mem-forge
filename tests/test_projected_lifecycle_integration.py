@@ -316,7 +316,12 @@ def _projection(
         extra={"page_id": page_id, "space_key": "ENG"},
     )
     raw = RawContent(item=item, body=body.encode(), content_type="text/html")
-    normalized = NormalizedContent(item=item, markdown_body=body)
+    # As the Confluence Gene reports it: the page version time is the body's source time.
+    normalized = NormalizedContent(
+        item=item,
+        markdown_body=body,
+        source_semantics={"source_updated_at": item.last_modified.isoformat()},
+    )
     return project_source_item(
         source_id=source_id,
         source_type="confluence",
@@ -9117,7 +9122,8 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
     assert persisted_evidence.source_lineage_id == evidence.units[0].source_lineage_id
     assert persisted_evidence.content == evidence.units[0].content
     assert persisted_evidence.extractor_run_id == second.run_id
-    assert persisted_evidence.observed_at == "2026-07-15T10:36:00+00:00"
+    # The source time of the Primary's Observation Revision: the page version time.
+    assert persisted_evidence.observed_at == "2026-07-15T00:00:00+00:00"
     assert await db.list_lifecycle_vector_tasks() == []
 
 

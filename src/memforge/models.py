@@ -361,7 +361,14 @@ class MemoryExtractionResult:
 
 @dataclass
 class ContentItem:
-    """A content item discovered by a gene (the unit of sync)."""
+    """A content item discovered by a gene (the unit of sync).
+
+    ``last_modified`` orders and filters discovery (``since``) and becomes the
+    document's ``last_modified``. Where the provider gives no change time it
+    may be the discovery or submission time, so it is never read as the
+    content's source time; a Gene reports that time in ``normalize()`` under
+    ``source_semantics["source_updated_at"]`` (design 0.9).
+    """
 
     item_id: str  # becomes doc_id
     title: str
@@ -404,7 +411,11 @@ class RawContent:
 
 @dataclass
 class NormalizedContent:
-    """Normalized content produced by a gene's normalizer."""
+    """Normalized content produced by a gene's normalizer.
+
+    ``source_semantics["source_updated_at"]`` is the source's own time for the
+    Unit's body, an offset-aware ISO time, absent when the source records none.
+    """
 
     item: ContentItem
     markdown_body: str

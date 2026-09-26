@@ -460,16 +460,23 @@ async def test_record_fields_keep_each_array_item_together_and_skip_empty_values
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_type", ["confluence", "github_repo", "local_markdown", "agent_session", "jira"])
 @pytest.mark.parametrize(
-    ("source_type", "evidence_time"),
-    [("confluence", "2026-04-10"), ("github_repo", None), ("jira", None)],
+    ("observed_at", "evidence_time"),
+    [("2026-03-02T23:30:00-05:00", "2026-03-03"), (None, None)],
 )
-async def test_document_time_counts_only_where_it_is_the_revision_time(source_type: str, evidence_time) -> None:
+async def test_evidence_time_is_the_anchored_revision_source_time(source_type: str, observed_at, evidence_time) -> None:
+    """Every Source is read alike; a document time never stands in for a missing revision time."""
+
     unit = replace(primary_evidence_unit_fixture("mem-page"), source_type=source_type)
     store = _SubjectStore(
         units={"mem-page": (unit,)},
         documents={"doc-mem-page": _Document("Page", datetime(2026, 4, 10, 9, 0, tzinfo=timezone.utc))},
-        revisions={"unit-mem-page": {"obs-mem-page": replace(primary_observation_revision_fixture("mem-page"), observed_at=None)}},
+        revisions={
+            "unit-mem-page": {
+                "obs-mem-page": replace(primary_observation_revision_fixture("mem-page"), observed_at=observed_at)
+            }
+        },
     )
 
     subject = (await load_relation_subjects(store, (_memory("mem-page"),)))["mem-page"]
@@ -479,9 +486,11 @@ async def test_document_time_counts_only_where_it_is_the_revision_time(source_ty
 
 
 @pytest.mark.asyncio
-async def test_document_time_needs_the_anchored_revision_to_be_current() -> None:
+async def test_evidence_time_needs_the_anchored_revision_to_be_current() -> None:
     unit = replace(primary_evidence_unit_fixture("mem-page"), source_type="confluence")
-    newer = replace(primary_observation_revision_fixture("mem-page"), id="rev-newer", observed_at=None)
+    newer = replace(
+        primary_observation_revision_fixture("mem-page"), id="rev-newer", observed_at="2026-04-10T09:00:00+00:00"
+    )
     store = _SubjectStore(
         units={"mem-page": (unit,)},
         documents={"doc-mem-page": _Document("Page", datetime(2026, 4, 10, 9, 0, tzinfo=timezone.utc))},

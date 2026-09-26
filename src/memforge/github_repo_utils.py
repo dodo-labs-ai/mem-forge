@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from io import BytesIO
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from memforge.models import slugify
+from memforge.source_time import source_time_iso
 
 DEFAULT_INCLUDE_EXTENSIONS = "md, markdown, txt, adoc, rst"
 DEFAULT_INCLUDE_EXTENSION_LIST = ["md", "markdown", "txt", "adoc", "rst"]
@@ -24,6 +25,8 @@ GITHUB_BLOB_MAX_BYTES = 100 * 1024 * 1024
 GITHUB_REGULAR_FILE_MODES = frozenset({"100644", "100755"})
 GITHUB_SYMLINK_MODE = "120000"
 GITHUB_SYMLINK_MAX_HOPS = 40
+# A commits listing filtered by path returns the path's latest commit first.
+GITHUB_LATEST_COMMIT_PAGE_SIZE = 1
 
 
 @dataclass(frozen=True)
@@ -299,6 +302,37 @@ def build_github_repo_doc_id(*, source_id: str, repo_url: str, repo_ref: str, re
         slugify(relative_path)[:50] or "doc",
         digest,
     ])
+
+
+def github_path_commits_query(*, relative_path: str, ref: str) -> str:
+    """Query string for the latest commit reachable from ``ref`` that changed ``relative_path``.
+
+    Appended to ``repos/{owner}/{repo}/commits?``; the commit's committer date
+    is the file's source time at that ref.
+    """
+
+    return urlencode(
+        {"sha": ref, "path": relative_path, "per_page": GITHUB_LATEST_COMMIT_PAGE_SIZE},
+        safe="/",
+        quote_via=quote,
+    )
+
+
+def github_latest_commit_time(payload: object) -> str | None:
+    """The committer date of the first commit in a commits listing; None when it lists none."""
+
+    if not isinstance(payload, list) or not payload or not isinstance(payload[0], Mapping):
+        return None
+    commit = payload[0].get("commit")
+    committer = commit.get("committer") if isinstance(commit, Mapping) else None
+    return source_time_iso(committer.get("date")) if isinstance(committer, Mapping) else None
+
+
+def github_content_paths(relative_path: str, resolved_relative_path: object) -> tuple[str, ...]:
+    """Repository paths whose commits change a file's content: the file and its symlink target."""
+
+    resolved = str(resolved_relative_path or "").strip()
+    return (relative_path,) if not resolved or resolved == relative_path else (relative_path, resolved)
 
 
 def list_config(value: object) -> list[str]:
