@@ -288,34 +288,19 @@ def test_agent_session_authority_response_accepts_typed_decisions():
     assert response.decisions[1].authority_kind == "not_authoritative"
 
 
-def test_agent_session_authority_response_rejects_contradictory_decisions():
-    with pytest.raises(ValidationError):
-        AgentSessionAuthorityResponse.model_validate(
-            {
-                "decisions": [
-                    {
-                        "evidence_id": "E1",
-                        "is_authoritative": True,
-                        "authority_kind": "not_authoritative",
-                        "reason": "contradictory",
-                    }
-                ]
-            }
-        )
-
-    with pytest.raises(ValidationError):
-        AgentSessionAuthorityResponse.model_validate(
-            {
-                "decisions": [
-                    {
-                        "evidence_id": "E2",
-                        "is_authoritative": False,
-                        "authority_kind": "design_decision",
-                        "reason": "contradictory",
-                    }
-                ]
-            }
-        )
+def test_agent_session_authority_row_rule_rejects_contradictory_decisions():
+    response = AgentSessionAuthorityResponse.model_validate(
+        {
+            "decisions": [
+                {"evidence_id": "E1", "is_authoritative": True, "authority_kind": "not_authoritative",
+                 "reason": "contradictory"},
+                {"evidence_id": "E2", "is_authoritative": False, "authority_kind": "design_decision",
+                 "reason": "contradictory"},
+            ]
+        }
+    )
+    # The shape parses; each row's meaning rule rejects that row alone.
+    assert all(decision.row_error() is not None for decision in response.decisions)
 
 
 def test_memory_extraction_response_rejects_top_level_array():
@@ -586,7 +571,8 @@ async def test_litellm_structured_client_rejects_invalid_image_before_provider_c
     assert calls == []
     assert raised.value.error_code == "invalid_image_evidence"
     assert telemetry[0].attempt_count == 0
-    assert telemetry[0].terminal_category == "invalid_response"
+    # No model response exists, so this is a request error, not an invalid response.
+    assert telemetry[0].terminal_category == "request_error"
 
 
 @pytest.mark.asyncio
@@ -1071,8 +1057,10 @@ async def test_litellm_structured_client_rejects_ambiguous_schema_valid_json_obj
 
     with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
         await validate_support_verdict(client)
-    assert len(calls) == 2
-    assert raised.value.error_code == "ValueError"
+    # Native schema, the JSON-text fallback, then its one repair.
+    assert len(calls) == 3
+    assert "failed local schema validation" in calls[-1]["messages"][0]["content"]
+    assert (raised.value.terminal_category, raised.value.error_code) == ("invalid_response", "ValueError")
 
 
 @pytest.mark.asyncio
@@ -1160,22 +1148,22 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     ]
 
 
-def test_memory_relation_schema_requires_scope_proof_for_contradiction() -> None:
-    with pytest.raises(ValidationError, match="same subject and scope"):
-        MemoryRelationResponse.model_validate(
-            {
-                "decisions": [
-                    {
-                        "pair_index": 0,
-                        "classification": "contradicts",
-                        "direction": "symmetric",
-                        "same_subject_and_scope": False,
-                        "incompatible_assertions": "enabled versus disabled",
-                        "reason": "Different deployment environments.",
-                    }
-                ]
-            }
-        )
+def test_memory_relation_row_rule_requires_scope_proof_for_contradiction() -> None:
+    rejected = MemoryRelationResponse.model_validate(
+        {
+            "decisions": [
+                {
+                    "pair_index": 0,
+                    "classification": "contradicts",
+                    "direction": "symmetric",
+                    "same_subject_and_scope": False,
+                    "incompatible_assertions": "enabled versus disabled",
+                    "reason": "Different deployment environments.",
+                }
+            ]
+        }
+    )
+    assert "same subject and scope" in rejected.decisions[0].row_error()
 
     accepted = MemoryRelationResponse.model_validate(
         {
@@ -1598,9 +1586,9 @@ async def test_litellm_structured_client_fails_closed_when_litellm_rejects_schem
         )
     )
 
-    with pytest.raises(StructuredLlmError, match="structured LLM returned an invalid response") as raised:
+    with pytest.raises(StructuredLlmError, match="request failed without a response to validate") as raised:
         await client.admit_candidates("prompt", max_tokens=512)
-    assert raised.value.error_code == "Exception"
+    assert (raised.value.terminal_category, raised.value.error_code) == ("request_error", "Exception")
 
 
 @pytest.mark.asyncio
@@ -2208,3 +2196,29 @@ async def test_concurrent_lines_count_their_own_calls_and_the_enclosing_scope_co
     assert support.summary(source_unit_elapsed_ms=0).operation_counts == {"support": 2}
     assert relation.summary(source_unit_elapsed_ms=0).operation_counts == {"relation": 1}
     assert enclosing.summary(source_unit_elapsed_ms=0).operation_counts == {"support": 2, "relation": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (litellm.BadRequestError("invalid request", model="fixture", llm_provider="openai"), "BadRequestError"),
+        (KeyError("choices"), "KeyError"),
+    ],
+    ids=["provider-400", "code-bug"],
+)
+async def test_a_call_without_a_response_to_validate_is_a_request_error_not_an_invalid_response(
+    monkeypatch, error, code,
+):
+    async def fake_acompletion(**kwargs):
+        raise error
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(StructuredLlmConfig(
+        model="anthropic--claude-sonnet-latest", base_url=None, api_key=None, timeout_s=120.0,
+    ))
+
+    with pytest.raises(StructuredLlmError) as raised:
+        await validate_support_verdict(client)
+    assert (raised.value.terminal_category, raised.value.error_code) == ("request_error", code)

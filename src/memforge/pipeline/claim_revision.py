@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from memforge.derivation_work import DerivationWorkJournal, DerivationWorkStore
-from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.failure_trace import failure_trace_context
-from memforge.llm.structured import ClaimRevisionDecision, ClaimRevisionWireResponse, StructuredLlmError
+from memforge.llm.structured import ClaimRevisionDecision, ClaimRevisionWireResponse
 from memforge.llm.relation_catalog import RelationCoverage, RequestCatalog
 from memforge.memory.relation_classifier import MemoryPairClassificationPolicy
 from memforge.models import Memory, RawMemory
@@ -71,6 +72,8 @@ class ClaimRevisionLedger:
     work_ids: tuple[str, ...] = ()
     # Candidates whose completion row covered every incumbent of the catalog.
     completed_candidate_count: int = 0
+    # Candidate index -> why it could not be judged even alone (capacity or invalid output).
+    unjudged: Mapping[int, ItemFailure] = field(default_factory=dict)
 
 
 async def assess_claim_pairs(
@@ -86,7 +89,8 @@ async def assess_claim_pairs(
     SupportRelationCoordinator combines relations with Support. Each NEW candidate is one work
     item; the incumbents are its shared context.
     A candidate whose incumbents do not fit one request reads them in
-    consecutive chunks, and its per-chunk rows are merged here.
+    consecutive chunks, and its per-chunk rows are merged here. A candidate that
+    cannot be judged even alone is returned as unjudged; a transient failure raises.
     """
     from memforge.pipeline.reconciler import ReconciliationContractError
 
@@ -128,8 +132,18 @@ async def assess_claim_pairs(
         return LlmRequest(prompt, ClaimRevisionWireResponse, requested_output, request_images)
 
     def decode(response, candidate_ids, incumbent_ids):
-        RelationCoverage({ref: frozenset(incumbent_ids) for ref in candidate_ids}).validate(response.results)
-        return [(row.candidate_id, row) for row in response.results]
+        """Each candidate's row is validated alone: its incumbents and each relationship's own rule."""
+        coverage = RelationCoverage({ref: frozenset(incumbent_ids) for ref in candidate_ids})
+        for row in response.results:
+            if row.candidate_id not in coverage.allowed:
+                yield row.candidate_id, RejectedRow(f"{row.candidate_id} was not requested")
+                continue
+            error = coverage.row_error(row) or next(
+                (f"{row.candidate_id}: {edge.existing_id}: {edge_error}"
+                 for edge in row.relations if (edge_error := edge.row_error()) is not None),
+                None,
+            )
+            yield row.candidate_id, row if error is None else RejectedRow(error)
 
     journal = None
     if derivation_id is not None:
@@ -147,10 +161,15 @@ async def assess_claim_pairs(
         ))
 
     decisions = []
+    unjudged: dict[int, ItemFailure] = {}
     for candidate_id, outcome in outcomes.items():
-        if isinstance(outcome, ItemFailure):
-            _raise_failure(outcome)
         index, _raw = new_ids[candidate_id]
+        if isinstance(outcome, ItemFailure):
+            if not outcome.unjudgeable:
+                # A transient failure leaves the Source Unit revision uncommitted.
+                raise outcome.error
+            unjudged[index] = outcome
+            continue
         for row in outcome:
             for ref in row.uncertain_existing_ids:
                 decisions.append((index, old_ids[ref].id, ClaimRevisionDecision(pair_index=0,
@@ -165,14 +184,4 @@ async def assess_claim_pairs(
                 decisions.append((index, old_ids[edge.existing_id].id, decision))
     return ClaimRevisionLedger(tuple(decisions), runner.stats.prompt_chars,
         tuple(work.id for work in journal.works) if journal is not None else (),
-        completed_candidate_count=len(outcomes))
-
-
-def _raise_failure(failure: ItemFailure):
-    from memforge.pipeline.reconciler import ReconciliationContractError
-
-    if failure.category == "capacity_exceeded":
-        raise ReconciliationContractError("claim_revision_capacity_exceeded", "one complete claim assessment exceeds input capacity")
-    if isinstance(failure.error, StructuredLlmError):
-        raise failure.error
-    raise ReconciliationContractError("claim_revision_coverage_invalid", str(failure.error)) from failure.error
+        completed_candidate_count=len(outcomes) - len(unjudged), unjudged=unjudged)

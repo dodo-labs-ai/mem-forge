@@ -11,8 +11,12 @@ checks what that read and the Relation line recorded.
    is ``REMOVED`` only under an explicit tombstone or coverage that proves absence.
 2. Receipt: a DELETE or SUPERSEDE rests on Supports that each read the whole
    reading order of the current revision and recorded its completion receipt.
-3. Relation: a SUPERSEDE or UPDATE rests on a Relation line that gave every
-   admitted Candidate its completion row over the complete old-Memory catalog.
+3. Relation: every destructive decision rests on a Relation line that gave
+   every admitted Candidate its completion row over the complete old-Memory
+   catalog. A row covers its Candidate against every old Memory of the Unit, so
+   a missing row cannot be localized: any old Memory might be the one the
+   Candidate restates, refines or contradicts. While the Relation line is
+   incomplete, no DELETE, SUPERSEDE or UPDATE of the Unit is executed.
 
 The remaining checks of the contract live where their facts are: the Plan's
 stale guard rejects a commit whose Support sets, Memory versions or Observation
@@ -38,7 +42,6 @@ __all__ = ["DestructiveValidation", "KeptReason", "validate_destructive_operatio
 
 _DESTRUCTIVE = frozenset({ReconcileAction.DELETE, ReconcileAction.SUPERSEDE, ReconcileAction.UPDATE})
 _RETIRES_SUPPORT = frozenset({ReconcileAction.DELETE, ReconcileAction.SUPERSEDE})
-_REPLACES_MEMORY = frozenset({ReconcileAction.SUPERSEDE, ReconcileAction.UPDATE})
 
 
 class KeptReason(str, Enum):
@@ -94,6 +97,6 @@ def _failed_check(
         assessment.complete_read for assessment in support.assessments
     ):
         return KeptReason.READ_INCOMPLETE
-    if operation.action in _REPLACES_MEMORY and not relation_complete:
+    if not relation_complete:
         return KeptReason.RELATION_INCOMPLETE
     return None

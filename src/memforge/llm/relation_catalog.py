@@ -55,18 +55,29 @@ class RelationCoverage:
 
     allowed: Mapping[str, frozenset[str]]
 
+    def row_error(self, row: Any) -> str | None:
+        """Why one known candidate's row is invalid on its own, naming the candidate; None when it is valid."""
+
+        refs = [edge.existing_id for edge in row.relations]
+        refs.extend(getattr(row, "uncertain_existing_ids", ()))
+        repeated = sorted({ref for ref in refs if refs.count(ref) > 1})
+        if repeated:
+            return f"{row.candidate_id} names {', '.join(repeated)} more than once"
+        outside = sorted(set(refs) - self.allowed[row.candidate_id])
+        if outside:
+            return f"{row.candidate_id} names {', '.join(outside)}, which is not in its allowed list"
+        return None
+
     def validate(self, rows: Any) -> None:
+        """Require exactly one valid completion row for every candidate."""
+
         seen: set[str] = set()
         for row in rows:
             candidate_id = row.candidate_id
             if candidate_id not in self.allowed or candidate_id in seen:
                 raise ValueError("unknown or duplicate candidate completion")
             seen.add(candidate_id)
-            refs = [edge.existing_id for edge in row.relations]
-            refs.extend(getattr(row, "uncertain_existing_ids", ()))
-            if len(refs) != len(set(refs)):
-                raise ValueError("duplicate incumbent reference")
-            if not set(refs).issubset(self.allowed[candidate_id]):
-                raise ValueError("incumbent reference is outside this candidate's allowed set")
+            if (error := self.row_error(row)) is not None:
+                raise ValueError(error)
         if seen != set(self.allowed):
             raise ValueError("missing candidate completion")

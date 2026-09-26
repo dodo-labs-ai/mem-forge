@@ -100,15 +100,16 @@ async def test_success_and_disabled_capture_create_no_artifacts(monkeypatch, tmp
     assert not list(tmp_path.iterdir())
 
 
-def test_schema_explains_inapplicable_proofs_and_still_rejects_them():
+def test_schema_explains_inapplicable_proofs_and_the_row_rule_rejects_them():
     props = ClaimRevisionWireDecision.model_json_schema()["properties"]
     assert "null" in props["revision_assessment"]["description"]
     assert "refines_challenger_to_candidate" in props["revision_assessment"]["description"]
     assert "null" in props["contradiction"]["description"]
-    with pytest.raises(ValueError, match="revision proof"):
-        ClaimRevisionWireDecision.model_validate({"existing_id":"MEM-0000", "relation":"equivalent",
-            "revision_assessment": {"same_knowledge_item": True, "preserves_incumbent_truth": True,
-                "challenger_is_complete_current_claim": True}})
+    # The shape parses; the meaning rule rejects only this row.
+    edge = ClaimRevisionWireDecision.model_validate({"existing_id":"MEM-0000", "relation":"equivalent",
+        "revision_assessment": {"same_knowledge_item": True, "preserves_incumbent_truth": True,
+            "challenger_is_complete_current_claim": True}})
+    assert "revision proof" in edge.row_error()
 
 
 @pytest.mark.parametrize("field", ["primary_ref", "required_refs"])
@@ -117,7 +118,7 @@ def test_unknown_support_reference_identifies_exact_field_and_allowed_catalog(fi
     from memforge.pipeline.support_wire import SupportWireAliases
     from memforge.llm.structured import SupportAssessmentWireResponse
     aliases = SupportWireAliases(SimpleNamespace(fragments=[SimpleNamespace(reference="f2", primary_eligible=True)]), [], {"work":"WRK-0000"})
-    row = dict(work_id="WRK-0000", status="supported", primary_ref="PRM-0002", required_refs=[], omitted_matched_refs=[])
+    row = dict(work_id="WRK-0000", status="supported", primary_ref="PRM-0002", required_refs=[])
     row[field] = "PRM-0007" if field == "primary_ref" else ["PRM-0007"]
     with pytest.raises(ValueError) as error:
         aliases.decode(SupportAssessmentWireResponse.model_validate({"results":[row]}))
@@ -136,8 +137,7 @@ def test_unknown_primary_diagnostic_excludes_required_only_refs():
     aliases = SupportWireAliases(catalog, [], {"work":"WRK-0000"})
     with pytest.raises(ValueError) as error:
         aliases.decode(SupportAssessmentWireResponse.model_validate({"results":[dict(
-            work_id="WRK-0000", status="supported", primary_ref="PRM-0007", required_refs=[],
-            omitted_matched_refs=[])]}))
+            work_id="WRK-0000", status="supported", primary_ref="PRM-0007", required_refs=[])]}))
     assert error.value.allowed_refs == ["PRM-0002"]
 
 
@@ -245,7 +245,7 @@ async def test_optional_selector_correction_keeps_rejected_extraction_trace(monk
 
 
 @pytest.mark.asyncio
-async def test_actual_executor_correction_marks_failed_attempt_recovered(monkeypatch):
+async def test_actual_executor_traces_a_rejected_row_with_its_location(monkeypatch):
     from memforge.pipeline.revision_work import RevisionWorkExecutor
     from tests.test_revision_work import Client, work_items, payload
     sink = Sink()
@@ -267,10 +267,10 @@ async def test_actual_executor_correction_marks_failed_attempt_recovered(monkeyp
             return await actual.evaluate_revision_work(prompt, **kwargs)
     executor = RevisionWorkExecutor(client=ExecutorClient(limit=100000), model="openai/gpt-4o")
     await executor.assess_many(work_items("Two reviewers approve US releases.\nRoutine note."))
-    # The first request is corrected once; the reading then continues to its last group.
+    # The rejected row is re-asked once; the reading then continues to its last group.
     assert calls == 3
     record = next(iter(sink.records.values()))
-    assert record["outcome"] == "recovered"
+    assert record["outcome"] == "failed"
     assert record["failures"][-1]["location"] == "results[0].support_witness_refs[0]"
     assert "PRM-9999" in record["attempts"][0]["response"]["choices"][0]["message"]["content"]
 

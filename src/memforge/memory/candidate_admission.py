@@ -7,26 +7,29 @@ same knowledge as another Candidate of this round. Every request carries all of
 this round's claims as shared context, so duplicates judged in different
 requests are still found. Candidates with the same normalized claim, type and
 validity are duplicates without asking the model, but each is still judged on
-its own Evidence. Only admitted Candidates merge.
+its own Evidence. Only admitted Candidates merge, so a duplicate link to a
+Candidate that is rejected, or that could not be judged, is ignored. A Candidate whose admission
+cannot be judged even alone (capacity or invalid output) is rejected for this
+round with that reason; a transient failure raises.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 from memforge.derivation_work import DerivationWorkJournal, DerivationWorkStore
-from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest
+from memforge.llm.batch_runner import ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.failure_trace import failure_trace_context
 from memforge.llm.relation_catalog import RequestCatalog
 from memforge.llm.structured import (
     CANDIDATE_ADMISSION_REASON_MAX_CHARS,
     CandidateAdmissionDecision,
     CandidateAdmissionResponse,
-    StructuredLlmError,
 )
 from memforge.models import RawMemory
 from memforge.pipeline.candidate_evidence import (
@@ -35,6 +38,8 @@ from memforge.pipeline.candidate_evidence import (
     load_evidence_images,
 )
 from memforge.pipeline.complete_support import COMPLETE_SUPPORT_DEFINITION
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CANDIDATE_ADMISSION_CONTRACT",
@@ -80,7 +85,8 @@ _DECISION_FIELD_TOKENS = 70
 _DECISION_OUTPUT_TOKENS = CANDIDATE_ADMISSION_REASON_MAX_CHARS // _REASON_CHARS_PER_TOKEN + _DECISION_FIELD_TOKENS
 _MIN_OUTPUT_TOKENS = 1024
 
-type RejectReason = Literal["evidence_incomplete", "low_value"]
+# The model's reasons, then the program's reasons for a Candidate it could not judge.
+type RejectReason = Literal["evidence_incomplete", "low_value", "capacity_exceeded", "invalid_response"]
 
 
 @dataclass(frozen=True)
@@ -102,18 +108,17 @@ class CandidateAdmission:
 
 
 class CandidateAdmissionError(RuntimeError):
-    """Admission could not judge every Candidate; the revision is not committed.
+    """Admission could not run; the revision is not committed.
 
-    ``terminal_category`` names a model outcome only when the model's response
-    was invalid; input and configuration failures have none.
+    These are input and configuration failures, so they name no model outcome.
     """
 
     retryable = False
+    terminal_category = None
 
-    def __init__(self, reason_code: str, message: str, *, terminal_category: str | None = None) -> None:
+    def __init__(self, reason_code: str, message: str) -> None:
         super().__init__(message)
         self.reason_code = reason_code
-        self.terminal_category = terminal_category
 
 
 async def admit_candidates(
@@ -122,7 +127,7 @@ async def admit_candidates(
     store: DerivationWorkStore | None = None, derivation_id: str | None = None,
     operation_input_hash: str | None = None,
 ) -> CandidateAdmission:
-    """Judge every Candidate once; any execution failure raises."""
+    """Judge every Candidate once; a transient execution failure raises."""
 
     if derivation_id is not None and (store is None or not operation_input_hash):
         raise ValueError("durable admission work requires its store and lifecycle input identity")
@@ -158,15 +163,19 @@ async def admit_candidates(
         max_tokens = max(_MIN_OUTPUT_TOKENS, _DECISION_OUTPUT_TOKENS * len(item_ids))
         return LlmRequest(prompt, CandidateAdmissionResponse, max_tokens, request_images)
 
-    def decode(response: CandidateAdmissionResponse, item_ids: tuple[str, ...], round_ids: tuple[str, ...]):
-        judged = [decision.candidate_id for decision in response.decisions]
-        if len(judged) != len(set(judged)) or set(judged) != set(item_ids):
-            raise ValueError("admission must judge every requested Candidate exactly once")
+    def decode(response: CandidateAdmissionResponse, _item_ids: tuple[str, ...], round_ids: tuple[str, ...]):
+        """Each decision is validated alone: its own rule, and every duplicate it names is a supplied round claim."""
         visible = set(round_ids)
         for decision in response.decisions:
-            if not visible.issuperset(decision.duplicate_of):
-                raise ValueError(f"{decision.candidate_id} names a duplicate outside round_claims")
-        return ((decision.candidate_id, decision) for decision in response.decisions)
+            outside = sorted(set(decision.duplicate_of) - visible)
+            if (error := decision.row_error()) is not None:
+                yield decision.candidate_id, RejectedRow(f"{decision.candidate_id}: {error}")
+            elif outside:
+                yield decision.candidate_id, RejectedRow(
+                    f"{decision.candidate_id} names duplicate {', '.join(outside)}, which is not in round_claims"
+                )
+            else:
+                yield decision.candidate_id, decision
 
     journal = None
     if derivation_id is not None:
@@ -186,7 +195,15 @@ async def admit_candidates(
     duplicates = _identical_claims(by_ref)
     for ref, outcome in outcomes.items():
         if isinstance(outcome, ItemFailure):
-            _raise_failure(outcome)
+            if not outcome.unjudgeable:
+                # A transient failure leaves the Source Unit revision uncommitted.
+                raise outcome.error
+            logger.warning(
+                "candidate_admission_unjudged candidate_ref=%s reason=%s error_code=%s",
+                ref, outcome.category, outcome.error_code,
+            )
+            reject_reasons[ref] = outcome.category
+            continue
         if (reason := _rejection(outcome)) is not None:
             reject_reasons[ref] = reason
         for chunk in outcome:
@@ -253,15 +270,3 @@ def _merge_admitted_duplicates(admitted: list[str], duplicates: dict[str, set[st
             remaining.discard(current)
             frontier.extend(other for other in duplicates[current] if other in remaining)
     return survivors
-
-
-def _raise_failure(failure: ItemFailure):
-    if failure.category == "capacity_exceeded":
-        raise CandidateAdmissionError(
-            "candidate_admission_capacity_exceeded", "one Candidate's admission request exceeds input capacity",
-        )
-    if isinstance(failure.error, StructuredLlmError):
-        raise failure.error
-    raise CandidateAdmissionError(
-        "candidate_admission_invalid", str(failure.error), terminal_category="invalid_response",
-    ) from failure.error

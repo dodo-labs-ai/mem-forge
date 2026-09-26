@@ -31,17 +31,43 @@ from memforge.llm.structured_images import (
 
 logger = logging.getLogger(__name__)
 
+# ``invalid_response``: a model response was received and failed validation.
+# ``provider_error``: a transient, authorization or capacity failure the provider reported.
+# ``request_error``: the call failed without a response to validate for any other reason,
+# such as a provider rejection of the request (400) or an unexpected exception.
 type StructuredLlmTerminalCategory = Literal[
     "success",
     "cancelled",
     "deadline_exceeded",
     "provider_error",
     "invalid_response",
+    "request_error",
 ]
 type NativeSchemaTransport = Literal[
     "auto",
     "json_schema_response_format",
 ]
+# A model call that ended in one of these may succeed when it is sent again.
+TRANSIENT_TERMINAL_CATEGORIES: frozenset[str] = frozenset({"provider_error", "deadline_exceeded"})
+
+
+def failure_retryable(error: BaseException) -> bool:
+    """Whether the sync that hit ``error`` retries the work at once; one rule for every stage.
+
+    A failed model call is retried only when it was transient: a provider error
+    (rate limit and 5xx included) or a timeout. A request error (a 400, an
+    unexpected exception) or an invalid response fails the same way again, so
+    it is not retried within the run: the revision stays uncommitted and the
+    next sync processes it again. Any other failure states it with its
+    ``retryable`` attribute and is retried by default.
+    """
+
+    category = getattr(error, "terminal_category", None)
+    if category is not None:
+        return category in TRANSIENT_TERMINAL_CATEGORIES
+    return bool(getattr(error, "retryable", True))
+
+
 # Request-size failures: a smaller request can succeed where this one cannot,
 # so callers split the work instead of resending it unchanged.
 INPUT_CAPACITY_EXCEEDED = "input_capacity_exceeded"
@@ -184,13 +210,19 @@ class AgentSessionAuthorityDecision(StructuredResponseModel):
     ]
     reason: str = Field(min_length=1)
 
-    @model_validator(mode="after")
-    def _authority_kind_matches_decision(self):
+    def row_error(self) -> str | None:
+        """This row's meaning rule; None when it holds.
+
+        Response models validate only the JSON shape of a row. A rule about one
+        row's meaning is ``row_error``, which the task checks on that row alone,
+        so a row that breaks it is rejected by itself.
+        """
+
         if self.is_authoritative and self.authority_kind == "not_authoritative":
-            raise ValueError("authoritative decisions require an authoritative authority_kind")
+            return "an authoritative decision requires an authoritative authority_kind"
         if not self.is_authoritative and self.authority_kind != "not_authoritative":
-            raise ValueError("non-authoritative decisions require authority_kind='not_authoritative'")
-        return self
+            return "a non-authoritative decision requires authority_kind='not_authoritative'"
+        return None
 
 
 class AgentSessionAuthorityResponse(StructuredResponseModel):
@@ -288,13 +320,14 @@ class CandidateAdmissionDecision(StructuredResponseModel):
             "IDs from round_claims, other than this Candidate, that state the same knowledge."))
     reason: str = Field(default="", max_length=CANDIDATE_ADMISSION_REASON_MAX_CHARS)
 
-    @model_validator(mode="after")
-    def _verdict_reason(self):
+    def row_error(self) -> str | None:
+        """This decision's meaning rule; None when it holds."""
+
         if (self.verdict == "REJECTED") != (self.reject_reason is not None):
-            raise ValueError("REJECTED requires reject_reason and ADMITTED must not have one")
+            return "REJECTED requires reject_reason and ADMITTED must not have one"
         if self.candidate_id in self.duplicate_of or len(set(self.duplicate_of)) != len(self.duplicate_of):
-            raise ValueError("duplicate_of must name other Candidates once each")
-        return self
+            return "duplicate_of must name other Candidates once each"
+        return None
 
 
 class CandidateAdmissionResponse(StructuredResponseModel):
@@ -320,20 +353,21 @@ class MemoryRelationAssessment(StructuredResponseModel):
     incompatible_assertions: str = Field(max_length=1000)
     reason: str = Field(default="", max_length=1000)
 
-    @model_validator(mode="after")
-    def _validate_direction(self) -> MemoryRelationAssessment:
+    def row_error(self) -> str | None:
+        """This relationship's meaning rule, its direction and its conflict proof; None when it holds."""
+
         directional = self.classification == "refines"
         if directional == (self.direction == "symmetric"):
-            raise ValueError("REFINES must be directional and other relations symmetric")
+            return "REFINES must be directional and other relations symmetric"
         incompatible = self.incompatible_assertions.strip()
         if self.classification == "contradicts":
             if not self.same_subject_and_scope:
-                raise ValueError("CONTRADICTS requires the same subject and scope")
+                return "CONTRADICTS requires the same subject and scope"
             if not incompatible:
-                raise ValueError("CONTRADICTS requires the incompatible assertions")
+                return "CONTRADICTS requires the incompatible assertions"
         elif incompatible:
-            raise ValueError("only CONTRADICTS may provide incompatible assertions")
-        return self
+            return "only CONTRADICTS may provide incompatible assertions"
+        return None
 
 
 class MemoryRelationDecision(MemoryRelationAssessment):
@@ -447,17 +481,18 @@ class ClaimRevisionWireDecision(StructuredResponseModel):
         "refines_candidate_to_challenger this field must be null, even if its conditions "
         "could all be true. Field presence is not a request to fill it."))
 
-    @model_validator(mode="after")
-    def _applicable_proofs(self):
+    def row_error(self) -> str | None:
+        """This relationship's meaning rule: only its relation carries its proof; None when it holds."""
+
         if self.relation == "contradicts":
             if (self.contradiction is None or not self.contradiction.same_subject_and_scope
                     or not self.contradiction.incompatible_assertions.strip()):
-                raise ValueError("CONTRADICTS requires overlapping scope and incompatible assertions")
+                return "CONTRADICTS requires overlapping scope and incompatible assertions"
         elif self.contradiction is not None:
-            raise ValueError("only CONTRADICTS may provide a contradiction proof")
+            return "only CONTRADICTS may provide a contradiction proof"
         if self.revision_assessment is not None and self.relation != "refines_challenger_to_candidate":
-            raise ValueError("revision proof applies only to challenger-to-candidate refinement")
-        return self
+            return "a revision proof applies only to challenger-to-candidate refinement"
+        return None
 
     def decision(self) -> ClaimRevisionDecision:
         refinement = self.relation.startswith("refines_")
@@ -481,23 +516,9 @@ class ClaimCandidateResult(StructuredResponseModel):
     relations: list[ClaimRevisionWireDecision]
     uncertain_existing_ids: list[Annotated[str, Field(pattern=r"^MEM-[0-9]{4}$")]]
 
-    @model_validator(mode="after")
-    def _unique_relationships(self):
-        ids = [edge.existing_id for edge in self.relations] + self.uncertain_existing_ids
-        if len(ids) != len(set(ids)):
-            raise ValueError("each incumbent may occur only once per candidate")
-        return self
-
 
 class ClaimRevisionWireResponse(StructuredResponseModel):
     results: list[ClaimCandidateResult]
-
-    @model_validator(mode="after")
-    def _unique_candidates(self):
-        ids = [row.candidate_id for row in self.results]
-        if len(ids) != len(set(ids)):
-            raise ValueError("each candidate must occur exactly once")
-        return self
 
 
 class EntityBatchValidationDecision(StructuredResponseModel):
@@ -893,8 +914,6 @@ class SupportedWireResult(BaseModel):
     status: Literal["supported"]
     primary_ref: str
     required_refs: list[str]
-    # Current refs of the prior Evidence that this selection does not use.
-    omitted_matched_refs: list[str]
 
 
 class UnsupportedWireResult(BaseModel):
@@ -940,6 +959,10 @@ class StructuredLlmError(RuntimeError):
         self.diagnostic = diagnostic
 
 
+class _InvalidModelOutput(Exception):
+    """A received model response failed schema validation; its cause is the validation error."""
+
+
 @dataclass(frozen=True, slots=True)
 class _StructuredLlmFailure:
     """Content-free failure value that can outlive provider call frames."""
@@ -960,6 +983,8 @@ class _StructuredLlmFailure:
             )
         elif self.terminal_category == "provider_error":
             message = "structured LLM provider request failed"
+        elif self.terminal_category == "request_error":
+            message = "structured LLM request failed without a response to validate"
         else:
             message = "structured LLM returned an invalid response"
         message = f"{message} (code={self.error_code})"
@@ -1076,9 +1101,11 @@ def _structured_failure(
             error_code=exc.error_code,
             validation_fields=exc.validation_fields,
         )
+    if isinstance(exc, _InvalidModelOutput) and exc.__cause__ is not None:
+        exc, terminal_category = exc.__cause__, "invalid_response"
     category = terminal_category
     if category is None:
-        category = "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
+        category = "provider_error" if _is_non_fallback_provider_error(exc) else "request_error"
     return _StructuredLlmFailure(
         terminal_category=category,
         error_code=_safe_provider_error_code(exc),
@@ -1912,7 +1939,7 @@ class LiteLlmStructuredClient:
             failure = _structured_failure(exc)
         except StructuredLlmImageError as exc:
             failure = _StructuredLlmFailure(
-                terminal_category="invalid_response",
+                terminal_category="request_error",
                 error_code=exc.error_code,
             )
         except Exception as exc:
@@ -2034,7 +2061,8 @@ class LiteLlmStructuredClient:
             deadline=deadline,
             state=state,
             images=images,
-            initial_validation_failure=schema_failure,
+            # A request the gateway rejected has no response whose validation could be repaired.
+            initial_validation_failure=schema_failure if schema_failure.terminal_category == "invalid_response" else None,
         )
 
     async def _attempt_json_text_with_repair(
@@ -2053,6 +2081,7 @@ class LiteLlmStructuredClient:
         """Attempt JSON text and repair one invalid response under the shared budget."""
 
         failure: _StructuredLlmFailure | None = None
+        repairable = False
         try:
             result = await self._attempt_schema(
                 prompt=prompt,
@@ -2071,14 +2100,12 @@ class LiteLlmStructuredClient:
                     else None
                 ),
             )
+        except _InvalidModelOutput as exc:
+            # Malformed or schema-invalid output gets its one repair; truncation and refusal do not.
+            failure, repairable = _structured_failure(exc), True
         except Exception as exc:
             failure = _structured_failure(exc)
-        if (
-            failure is not None
-            and failure.terminal_category == "invalid_response"
-            and failure.error_code == "ValidationError"
-            and state.retry_budget > 0
-        ):
+        if failure is not None and repairable and state.retry_budget > 0:
             state.retry_budget -= 1
             state.retry_count += 1
             logger.warning(
@@ -2172,7 +2199,8 @@ class LiteLlmStructuredClient:
             if isinstance(raw_content, dict):
                 return response_format.model_validate(raw_content)
             return _validate_structured_json_text(str(raw_content), response_format)
-        except Exception as exc:
+        except (StructuredLlmError, ValueError) as exc:
+            # Only a received response that fails validation is an invalid response.
             capture = current_capture()
             if capture is not None:
                 capture.failed(exc, stage="schema_validation")
@@ -2184,7 +2212,9 @@ class LiteLlmStructuredClient:
                 requested_max_tokens=max_tokens,
                 exc=exc,
             )
-            raise
+            if isinstance(exc, StructuredLlmError):
+                raise
+            raise _InvalidModelOutput(type(exc).__name__) from exc
 
     async def _completion_with_retries(
         self,
@@ -2237,12 +2267,7 @@ class LiteLlmStructuredClient:
                     raise
                 state.record_failed_attempt()
                 retry = _is_retryable_provider_error(exc) and state.retry_budget > 0
-                failure = _structured_failure(
-                    exc,
-                    terminal_category=(
-                        "provider_error" if _is_non_fallback_provider_error(exc) else "invalid_response"
-                    ),
-                )
+                failure = _structured_failure(exc)
                 state.record_provider_failure_attempt(
                     attempt_index=attempt_index,
                     structured_mode=(

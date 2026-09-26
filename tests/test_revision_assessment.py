@@ -9,7 +9,6 @@ from memforge.llm.structured import ChangeImpactWireResponse
 from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
 from memforge.models import Memory, content_hash
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-from memforge.pipeline.reconciler import ReconciliationContractError
 from memforge.pipeline.projection_fragments import SupportRevalidationLimitation
 from memforge.source_projection import ProjectionCoverage
 from tests.revision_client_fixture import change_impact_response, continued, supported
@@ -157,11 +156,12 @@ async def test_current_selection_has_one_local_correction(invalid):
     base, current = revisions("Two reviewers approve US releases.\n", "Two reviewers approve US releases today.\n")
     ctx = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
     client = Client(invalid=invalid)
+    result = await assess(ctx, base, client)
     if invalid == 2:
-        with pytest.raises(ReconciliationContractError, match="correction exhausted"):
-            await assess(ctx, base, client)
+        # Still invalid after its one correction: the claim is kept as UNRESOLVED(invalid_response).
+        assert (result.supported, result.unresolved) == (None, "invalid_response")
     else:
-        assert (await assess(ctx, base, client)).supported
+        assert result.supported
     assert len(client.prompts) == 2
 
 

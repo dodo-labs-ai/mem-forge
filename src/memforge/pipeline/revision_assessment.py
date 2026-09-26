@@ -41,7 +41,7 @@ from memforge.source_representation import UNIT_TITLE_PROFILE
 
 # Versions how a fixed Support is revalidated against a revision: it enters the
 # reconciliation manifest and each revalidated Support's ``support_validation``.
-REVISION_SUPPORT_CONTRACT = "revision-support-v6"
+REVISION_SUPPORT_CONTRACT = "revision-support-v7"
 # Versions how revision Fragments are compiled into catalogs, what every
 # reading adds as context, and Claim Extraction's reading scope. Every catalog
 # this context composes, for extraction or for Support, carries it in its identity.
@@ -76,8 +76,9 @@ class SupportAssessment:
     reason: str
     memory: RawMemory | None
     # Why a kept claim could not be judged: an UNKNOWN Evidence part under partial
-    # coverage, or one ReadingGroup that alone exceeds the model's capacity.
-    unresolved: Literal["partial_coverage", "capacity"] | None = None
+    # coverage, one ReadingGroup that alone exceeds the model's capacity, or the
+    # model's output for the claim alone that stays invalid after its correction.
+    unresolved: Literal["partial_coverage", "capacity", "invalid_response"] | None = None
     # The Support was bound to its exactly unchanged current Evidence without a read:
     # the program rebind, or Change Impact judged it UNAFFECTED.
     rebound: bool = False

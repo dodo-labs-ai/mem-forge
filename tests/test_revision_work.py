@@ -216,7 +216,7 @@ async def test_retry_reuses_completed_assessments_without_replaying_their_model_
 
 
 @pytest.mark.asyncio
-async def test_unknown_selector_gets_one_local_correction_not_a_completed_receipt():
+async def test_unknown_selector_gets_one_local_correction_not_a_completed_receipt(caplog):
     class InvalidClient(Client):
         def judge(self, prompt):
             results = super().judge(prompt)
@@ -227,10 +227,36 @@ async def test_unknown_selector_gets_one_local_correction_not_a_completed_receip
 
     client = InvalidClient()
     executor = RevisionWorkExecutor(client=client, model="fixture")
-    with pytest.raises(Exception, match="bounded assessment correction exhausted"):
-        await executor.assess_many(work_items(CHANGED))
+    with caplog.at_level(logging.WARNING, logger="memforge.pipeline.revision_work"):
+        [result] = (await executor.assess_many(work_items(CHANGED))).values()
     assert len(client.prompts) == 2 and "<correction>" in client.prompts[-1]
+    # The claim alone stays invalid after its correction: UNRESOLVED(invalid_response) keeps it unchanged.
+    assert (result.supported, result.unresolved, result.memory) == (None, "invalid_response", None)
     assert not executor.final_work_ids
+    [record] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("support_unresolved_invalid_response")]
+    assert "memory_id=memory-0" in record and "error_code=output_invalid" in record
+
+
+@pytest.mark.asyncio
+async def test_one_claim_whose_selection_stays_invalid_leaves_the_others_judged():
+    class OneInvalidClient(Client):
+        def judge(self, prompt):
+            results = super().judge(prompt)
+            for row in results:
+                if row["work_id"] == "WRK-0001" and row["status"] == "supported":
+                    row["primary_ref"] = "not-supplied"
+            return results
+
+    client = OneInvalidClient()
+    results = await RevisionWorkExecutor(client=client, model="fixture").assess_many(work_items(CHANGED, 2))
+
+    assert results["w0"].supported is True
+    assert (results["w1"].supported, results["w1"].unresolved) == (None, "invalid_response")
+    # WRK-0000's row is accepted; WRK-0001 is re-asked once on the same step, naming its error.
+    assert [sorted(work["work_id"] for work in payload(prompt)["works"]) for prompt in client.prompts] == [
+        ["WRK-0000", "WRK-0001"], ["WRK-0001"],
+    ]
+    assert "WRK-0001: unknown supplied Evidence ID: not-supplied" in client.prompts[1]
 
 
 @pytest.mark.asyncio
@@ -487,8 +513,7 @@ async def test_ambiguous_part_reads_every_candidate_first_and_needs_no_accountin
             [work] = data["works"]
             rule = [ref for ref, text in readable(data) if text.strip() == RULE]
             if work["may_conclude"]:
-                # An AMBIGUOUS part has no matched ref to account for, so nothing is omitted.
-                return [{**supported(work, rule[0]), "omitted_matched_refs": []}]
+                return [supported(work, rule[0])]
             return [continued(work, rule)]
 
     client = FirstRuleClient(limit=100000)
@@ -601,8 +626,8 @@ async def test_transient_failure_raises_after_split_to_one_item():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("variant", ["omitted_after_correction", "selected", "never_accounted"])
-async def test_multi_part_support_accounts_for_matched_parts(variant):
+@pytest.mark.parametrize("keeps_prior", [True, False])
+async def test_matched_prior_evidence_is_a_selectable_candidate_not_a_required_part(keeps_prior):
     scope_old, scope_new = "Scope: US releases only.", "Scope: US releases only!"
     base, current = revisions(f"{RULE}\n\n{scope_old}\n", f"{RULE}\n\n{scope_new}\n")
     context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
@@ -610,35 +635,23 @@ async def test_multi_part_support_accounts_for_matched_parts(variant):
         "w0", memory(), (part(base, RULE), part(base, scope_old, role=EvidenceRole.REQUIRED)), context,
     )
 
-    class AccountingClient(Client):
+    class SelectingClient(Client):
         def judge(self, prompt):
             data = payload(prompt)
             refs = {text: ref for ref, text in readable(data)}
             [work] = data["works"]
-            [matched] = [p["current_ref"] for p in work["prior_evidence"] if "current_ref" in p]
-            assert matched == refs[RULE]
-            if variant == "selected":
+            # The exactly matched prior part is offered by its current ref.
+            assert [p["current_ref"] for p in work["prior_evidence"] if "current_ref" in p] == [refs[RULE]]
+            if keeps_prior:
                 return [supported(work, refs[RULE], [refs[scope_new]])]
-            row = supported(work, refs[scope_new])
-            accounted = variant == "omitted_after_correction" and "<correction>" in prompt
-            row["omitted_matched_refs"] = [matched] if accounted else []
-            return [row]
+            return [supported(work, refs[scope_new])]
 
-    client = AccountingClient()
-    executor = RevisionWorkExecutor(client=client, model="fixture")
-    if variant == "never_accounted":
-        with pytest.raises(Exception, match="bounded assessment correction exhausted") as raised:
-            await executor.assess_many([item])
-        assert raised.value.reason_code == "revision_support_selection_exhausted"
-        assert "unaccounted" in client.prompts[-1]
-        return
-    [result] = (await executor.assess_many([item])).values()
-    assert result.supported
-    if variant == "selected":
-        assert selected_texts(result) == [RULE, scope_new] and len(client.prompts) == 1
-    else:
-        assert selected_texts(result) == [scope_new]
-        assert len(client.prompts) == 2 and "unaccounted" in client.prompts[1]
+    client = SelectingClient()
+    [result] = (await RevisionWorkExecutor(client=client, model="fixture").assess_many([item])).values()
+
+    # Either selection is accepted as it stands; whether it is complete is the model's Support judgment.
+    assert result.supported and len(client.prompts) == 1
+    assert selected_texts(result) == ([RULE, scope_new] if keeps_prior else [scope_new])
 
 
 @pytest.mark.asyncio

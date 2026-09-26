@@ -68,10 +68,10 @@ def test_aliases_preserve_text_and_role_eligibility_and_expand_four_digits():
     ])
     wire = SupportWireAliases(catalog, [], {'canonical-task': 'WRK-10000'})
     row = {'work_id': 'WRK-10000', 'status': 'supported', 'primary_ref': 'PRM-0068',
-           'required_refs': ['REQ-10000'], 'omitted_matched_refs': ['PRM-0068']}
+           'required_refs': ['REQ-10000']}
     decoded = wire.decode(SupportAssessmentWireResponse.model_validate({'results': [row]})).results[0]
     assert decoded.work_id == 'canonical-task' and decoded.primary_ref == 'p000068'
-    assert decoded.required_refs == ['r010000'] and decoded.omitted_matched_refs == ['p000068']
+    assert decoded.required_refs == ['r010000']
     # A Primary-eligible ref can also be selected as Required.
     row['required_refs'] = ['PRM-0068']
     assert wire.decode(SupportAssessmentWireResponse.model_validate({'results': [row]})).results[0].required_refs == [
@@ -98,11 +98,12 @@ async def test_wire_id_text_is_not_rewritten_and_unknown_namespace_fails_closed(
     items = work_items('Two reviewers approve US releases.\n\nLiteral p000001 and w000068 are source text.')
     client, store = CanonicalIDClient(limit=50000), Store()
     executor = RevisionWorkExecutor(client=client, model='gpt-4o', store=store, derivation_id='root')
-    with pytest.raises(Exception, match='bounded assessment correction exhausted'):
-        await executor.assess_many(items)
+    [result] = (await executor.assess_many(items)).values()
+    assert result.unresolved == 'invalid_response'
     assert len(client.prompts) == 2
     assert 'Literal p000001 and w000068 are source text.' in client.prompts[0]
-    assert all(w.status != 'completed' for w in store.works.values() if w.kind == 'support_assess')
+    # The rejected row is never a completed judgment: no completion receipt is recorded.
+    assert not executor.final_work_ids
 
 
 @pytest.mark.asyncio
@@ -111,7 +112,7 @@ async def test_valid_support_json_with_incomplete_transport_is_rejected(monkeypa
     from tests.test_structured_llm import CompletionResponse, set_native_schema_support
     response = CompletionResponse(json.dumps({'results': [{
         'work_id': 'WRK-0000', 'status': 'supported', 'primary_ref': 'PRM-0001',
-        'required_refs': [], 'omitted_matched_refs': [],
+        'required_refs': [],
     }]}))
     if signal == 'refusal':
         response.choices[0].message.refusal = 'refused'

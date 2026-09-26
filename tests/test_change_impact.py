@@ -193,20 +193,13 @@ async def test_global_scope_statement_is_affected():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["provider_error", "omitted_after_correction"])
-async def test_change_impact_failure_routes_to_support_assessment_without_a_label(failure, caplog):
+async def test_change_impact_failure_routes_to_support_assessment_without_a_label(caplog):
     class FailingImpactClient(ImpactClient):
         async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
             if response_format is not ChangeImpactWireResponse:
                 return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
             self.impact_prompts.append(prompt)
-            if failure == "provider_error":
-                raise StructuredLlmError("fixture outage", terminal_category="provider_error", error_code="provider_error")
-            works = change_impact_payload(prompt)["works"]
-            # The second work is never answered, even after the correction.
-            return ChangeImpactWireResponse.model_validate(
-                {"results": [{"work_id": works[0]["work_id"], "impact": "unaffected"}]}
-            )
+            raise StructuredLlmError("fixture outage", terminal_category="provider_error", error_code="provider_error")
 
     client, store = FailingImpactClient(), Store()
     executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
@@ -217,15 +210,43 @@ async def test_change_impact_failure_routes_to_support_assessment_without_a_labe
     assert all(r.supported and r.memory.support_validation["route"] == "support_assessment" for r in results.values())
     assert {work["work_id"] for p in client.prompts for work in payload(p)["works"]} == {"WRK-0000", "WRK-0001"}
     assert executor.change_impact_counts == {"unaffected": 0, "affected": 0, "failed": 2}
-    assert len(client.impact_prompts) == (1 if failure == "provider_error" else 2)
+    assert len(client.impact_prompts) == 1
     # The failure is journaled as retryable work, and no label is recorded anywhere.
     assert [work.status for work in impact_works(store)] == ["retryable_failure"]
     assert all(work.result is None for work in impact_works(store))
     assert "impact" not in json.dumps([receipt.result for receipt in receipts(store)])
     records = [r.getMessage() for r in caplog.records if r.getMessage().startswith("change_impact_failed")]
     assert len(records) == 2 and all("memory_id=memory-" in record for record in records)
-    expected = "category=provider_error" if failure == "provider_error" else "category=invalid_response"
-    assert all(expected in record for record in records)
+    assert all("category=provider_error" in record for record in records)
+
+
+@pytest.mark.asyncio
+async def test_change_impact_output_that_stays_invalid_isolates_one_work_and_routes_it_to_support_assessment(caplog):
+    class OmittingImpactClient(ImpactClient):
+        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            if response_format is not ChangeImpactWireResponse:
+                return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
+            self.impact_prompts.append(prompt)
+            works = change_impact_payload(prompt)["works"]
+            # WRK-0001 is never answered, even after the correction.
+            return ChangeImpactWireResponse.model_validate({"results": [
+                {"work_id": work["work_id"], "impact": "unaffected"} for work in works if work["work_id"] != "WRK-0001"
+            ]})
+
+    client, store = OmittingImpactClient(), Store()
+    executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
+    with caplog.at_level(logging.WARNING, logger="memforge.pipeline.revision_work"):
+        results = await executor.assess_many(work_items(CHANGED, 2))
+
+    # WRK-0000's row is accepted and rebound; only WRK-0001 is read by Support Assessment.
+    assert executor.change_impact_counts == {"unaffected": 1, "affected": 0, "failed": 1}
+    assert results["w0"].rebound and not results["w1"].rebound
+    assert results["w1"].memory.support_validation["route"] == "support_assessment"
+    assert {work["work_id"] for p in client.prompts for work in payload(p)["works"]} == {"WRK-0001"}
+    # Both works, then WRK-0001's one re-ask.
+    assert len(client.impact_prompts) == 2
+    records = [r.getMessage() for r in caplog.records if r.getMessage().startswith("change_impact_failed")]
+    assert len(records) == 1 and "memory_id=memory-1" in records[0] and "category=invalid_response" in records[0]
 
 
 @pytest.mark.asyncio
@@ -281,9 +302,16 @@ async def test_work_id_coverage_is_validated(defect):
     executor = RevisionWorkExecutor(client=client, model="fixture")
     results = await executor.assess_many(work_items(CHANGED, 2))
     assert len(client.impact_prompts) == 2 and "<correction>" in client.impact_prompts[1]
-    # The correction completes the same request instead of sending a new one.
-    assert executor.stage_counts["change_impact"] == 1
-    # The corrected response decides both works.
+    reasked = [work["work_id"] for work in change_impact_payload(client.impact_prompts[1])["works"]]
+    if defect == "omitted":
+        # The accepted row is kept; only WRK-0001, which has no row, is re-asked in its own request.
+        assert reasked == ["WRK-0001"] and "no result was returned for WRK-0001" in client.impact_prompts[1]
+        assert executor.stage_counts["change_impact"] == 2
+    else:
+        # An ID the request did not supply voids the whole response: it is corrected as one request.
+        assert reasked == ["WRK-0000", "WRK-0001"] and "WRK-9999" in client.impact_prompts[1]
+        assert executor.stage_counts["change_impact"] == 1
+    # The two requests decide both works.
     assert all(r.memory.support_validation["route"] == "change_impact" for r in results.values())
     assert executor.change_impact_counts == {"unaffected": 2, "affected": 0, "failed": 0}
 
