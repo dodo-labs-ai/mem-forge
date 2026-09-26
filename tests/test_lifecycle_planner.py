@@ -672,7 +672,7 @@ def test_identity_excludes_exactly_the_old_memories_the_plan_does_not_keep() -> 
         ReconcileOperation(action=ReconcileAction.ADD, memory=_replacement()),
     )
     rejected = LifecycleReview(
-        id=coordinator_review_id("unit-1", "decided", decided.candidate.content),
+        id=coordinator_review_id("unit-1", "decided", decided.proposal, decided.candidate.content),
         lifecycle_plan_id="plan-0", incumbent_memory_id="decided", status=LifecycleReviewStatus.REJECTED,
         staged_evidence={}, reason="contradicts",
     )

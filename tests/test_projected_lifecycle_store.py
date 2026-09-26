@@ -1345,14 +1345,36 @@ def _staged_claim(content: str):
 
 
 async def _coordinator_review_plan(
-    db: Database, *, plan_id: str, raise_conflict: bool = True, coordinator_reviews=(),
+    db: Database, *, plan_id: str, outcome: str = "raised", coordinator_reviews=(),
 ) -> LifecyclePlan:
-    """One revision's Plan that keeps mem-1 and, when asked, raises the same contradiction again."""
+    """One revision's Plan over mem-1 under partial coverage.
+
+    ``raised`` raises the contradiction again; ``decided`` reads mem-1 as
+    supported by its unchanged Evidence without the conflict; ``undecided``
+    keeps mem-1 unchanged without a decision.
+    """
     from memforge.models import CoordinatorProposal, CoordinatorReview
 
     incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
     candidate = _staged_claim("One reviewer approves payroll.")
+    operation = {
+        "raised": ReconcileOperation(
+            action=ReconcileAction.NOOP,
+            memory_id=incumbent.id,
+            reason="partial coverage",
+            support_revalidation_skipped=True,
+            reviews=(CoordinatorReview(candidate, CoordinatorProposal.SUPERSEDE, "one versus two reviewers"),),
+        ),
+        "decided": ReconcileOperation(
+            action=ReconcileAction.NOOP, memory_id=incumbent.id, memory=_staged_claim(incumbent.content),
+            reason="supported",
+        ),
+        "undecided": ReconcileOperation(
+            action=ReconcileAction.NOOP, memory_id=incumbent.id, reason="capacity",
+            support_revalidation_skipped=True,
+        ),
+    }[outcome]
     return build_lifecycle_plan(
         plan_id=plan_id,
         scope=ReconciliationScope(
@@ -1360,23 +1382,16 @@ async def _coordinator_review_plan(
             base_unit_revision_id="unitrev-page-1-v1", target_unit_revision_id="unitrev-page-1-v2",
         ),
         gate_state=LifecycleGateState.ENABLED,
-        operations=(
-            ReconcileOperation(
-                action=ReconcileAction.NOOP,
-                memory_id=incumbent.id,
-                reason="partial coverage",
-                support_revalidation_skipped=True,
-                reviews=(
-                    CoordinatorReview(candidate, CoordinatorProposal.SUPERSEDE, "one versus two reviewers"),
-                ) if raise_conflict else (),
-            ),
-        ),
+        operations=(operation,),
         incumbents={incumbent.id: incumbent},
         source_support_unit_ids={incumbent.id: ("eu-1",)},
         all_active_support_unit_ids={incumbent.id: ("eu-1",)},
         support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
         observation_revision_ids=("obsrev-page-1-v2",),
-        evidence_unit_ids_by_claim_hash={content_hash(candidate.content): ("eu-candidate",)},
+        evidence_unit_ids_by_claim_hash={
+            content_hash(candidate.content): ("eu-candidate",),
+            content_hash(incumbent.content): ("eu-1",),
+        },
         defaults=NewMemoryDefaults(
             visibility="workspace", owner_user_id=None, project_key=None, repo_identifier=None,
             doc_id="gate-doc", source_type="confluence", access_context_hash="workspace",
@@ -1392,12 +1407,15 @@ async def _coordinator_reviews(db: Database):
 @pytest.mark.asyncio
 async def test_a_raised_again_coordinator_review_is_refreshed_in_place(db: Database) -> None:
     from memforge.memory.coordinator_review import coordinator_review_id
+    from memforge.models import CoordinatorProposal
 
     await _persist_exact_support_and_provenance(db)
     await db.enable_lifecycle_gate("src-1")
     await db.apply_lifecycle_plan(await _coordinator_review_plan(db, plan_id="plan-conflict-1"))
     [created] = await _coordinator_reviews(db)
-    assert created.id == coordinator_review_id("unit-page-1", "mem-1", "One reviewer approves payroll.")
+    assert created.id == coordinator_review_id(
+        "unit-page-1", "mem-1", CoordinatorProposal.SUPERSEDE, "One reviewer approves payroll.",
+    )
     assert created.staged_evidence["stale_guard"] == {
         "support_set_hash": await db.get_memory_support_set_hash("mem-1"),
         "memory_version": lifecycle_memory_version(await db.get_memory("mem-1")),
@@ -1420,8 +1438,14 @@ async def test_a_conflict_the_revision_no_longer_raises_closes_stale_and_reopens
     await db.apply_lifecycle_plan(await _coordinator_review_plan(db, plan_id="plan-conflict-1"))
     [pending] = await _coordinator_reviews(db)
 
+    # A revision that keeps mem-1 without deciding it leaves the conflict pending as it is.
+    held = await _coordinator_review_plan(
+        db, plan_id="plan-conflict-held", outcome="undecided", coordinator_reviews=(pending,),
+    )
+    assert not any(mutation.mutation_type is LifecycleMutationType.RESOLVE_REVIEW for mutation in held.mutations)
+
     closing = await _coordinator_review_plan(
-        db, plan_id="plan-conflict-gone", raise_conflict=False, coordinator_reviews=(pending,),
+        db, plan_id="plan-conflict-gone", outcome="decided", coordinator_reviews=(pending,),
     )
     assert closing.mutations[0].mutation_type is LifecycleMutationType.RESOLVE_REVIEW
     await db.apply_lifecycle_plan(closing)
@@ -1460,6 +1484,44 @@ async def test_a_decided_conflict_is_never_raised_again(db: Database, decided) -
     assert await db.get_lifecycle_plan_status(raising.id) is None
     [unchanged] = await _coordinator_reviews(db)
     assert unchanged.status is decided
+
+
+@pytest.mark.asyncio
+async def test_review_mutations_refuse_a_foreign_incumbent_and_an_unknown_resolution(db: Database) -> None:
+    from dataclasses import replace
+
+    await _persist_exact_support_and_provenance(db)
+    await db.enable_lifecycle_gate("src-1")
+    raising = await _coordinator_review_plan(db, plan_id="plan-conflict-1")
+    [create] = [item for item in raising.mutations if item.mutation_type is LifecycleMutationType.CREATE_REVIEW]
+    # A row of the same ID on another incumbent; only its identity matters here.
+    await db.db.execute("PRAGMA foreign_keys = OFF")
+    await db.db.execute(
+        """INSERT INTO lifecycle_reviews (id, lifecycle_plan_id, incumbent_memory_id, status,
+               staged_evidence_json, reason, created_at)
+           VALUES (?, 'plan-other', 'mem-other', 'pending', '{}', 'other', '2026-01-01T00:00:00+00:00')""",
+        (create.payload["review_id"],),
+    )
+    await db.db.commit()
+    await db.db.execute("PRAGMA foreign_keys = ON")
+    with pytest.raises(ValueError, match="belongs to another incumbent"):
+        await db.apply_lifecycle_plan(raising)
+    await db.db.execute("DELETE FROM lifecycle_reviews WHERE id = ?", (create.payload["review_id"],))
+    await db.db.commit()
+
+    await db.apply_lifecycle_plan(raising)
+    [pending] = await _coordinator_reviews(db)
+    closing = await _coordinator_review_plan(
+        db, plan_id="plan-conflict-gone", outcome="decided", coordinator_reviews=(pending,),
+    )
+    resolve, *rest = closing.mutations
+    unknown = replace(closing, mutations=(
+        replace(resolve, payload={**resolve.payload, "status": LifecycleReviewStatus.PENDING.value}), *rest,
+    ))
+    with pytest.raises(ValueError, match="cannot be resolved as pending"):
+        await db.apply_lifecycle_plan(unknown)
+    [unchanged] = await _coordinator_reviews(db)
+    assert unchanged.status is LifecycleReviewStatus.PENDING
 
 
 @pytest.mark.asyncio

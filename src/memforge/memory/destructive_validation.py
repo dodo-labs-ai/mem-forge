@@ -32,14 +32,13 @@ from dataclasses import dataclass
 from enum import Enum
 
 from memforge.models import ReconcileAction, ReconcileOperation
-from memforge.pipeline.support_relation_coordinator import MemorySupport, SupportResult
+from memforge.pipeline.support_relation_coordinator import MemorySupport
 
 __all__ = ["DestructiveValidation", "KeptReason", "validate_destructive_operations"]
 
 _DESTRUCTIVE = frozenset({ReconcileAction.DELETE, ReconcileAction.SUPERSEDE, ReconcileAction.UPDATE})
 _RETIRES_SUPPORT = frozenset({ReconcileAction.DELETE, ReconcileAction.SUPERSEDE})
 _REPLACES_MEMORY = frozenset({ReconcileAction.SUPERSEDE, ReconcileAction.UPDATE})
-_UNRESOLVED = frozenset({SupportResult.UNRESOLVED_CAPACITY, SupportResult.UNRESOLVED_PARTIAL_COVERAGE})
 
 
 class KeptReason(str, Enum):
@@ -67,18 +66,18 @@ def validate_destructive_operations(
     validated: list[ReconcileOperation] = []
     kept: dict[str, KeptReason] = {}
     for operation in operations:
-        reason = (
-            _failed_check(operation, supports.get(operation.memory_id or ""), relation_complete)
-            if operation.action in _DESTRUCTIVE and operation.memory_id is not None and not operation.flag_for_review
-            else None
-        )
+        memory_id = operation.memory_id
+        if operation.action not in _DESTRUCTIVE or memory_id is None or operation.flag_for_review:
+            validated.append(operation)
+            continue
+        reason = _failed_check(operation, supports.get(memory_id), relation_complete)
         if reason is None:
             validated.append(operation)
             continue
-        kept[operation.memory_id or ""] = reason
+        kept[memory_id] = reason
         validated.append(ReconcileOperation(
             action=ReconcileAction.NOOP,
-            memory_id=operation.memory_id,
+            memory_id=memory_id,
             reason=f"DestructiveValidation kept the old Memory: {reason.value}",
             support_revalidation_skipped=True,
         ))
@@ -88,12 +87,8 @@ def validate_destructive_operations(
 def _failed_check(
     operation: ReconcileOperation, support: MemorySupport | None, relation_complete: bool,
 ) -> KeptReason | None:
-    if (
-        support is None
-        or not support.assessments
-        or support.result in _UNRESOLVED
-        or any(assessment.unresolved is not None for assessment in support.assessments)
-    ):
+    # A Memory-level result is unresolved exactly when one of its assessments is.
+    if support is None or not support.assessments or support.result.unresolved:
         return KeptReason.SUPPORT_UNRESOLVED
     if operation.action in _RETIRES_SUPPORT and not all(
         assessment.complete_read for assessment in support.assessments

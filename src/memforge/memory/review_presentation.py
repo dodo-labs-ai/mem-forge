@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal, Mapping
 
+from memforge.models import CoordinatorProposal
+
 
 ReviewActionKey = Literal["use_latest_state", "keep_current_state"]
 ReviewDecision = Literal["approve", "reject"]
@@ -92,7 +94,7 @@ def present_lifecycle_review(
             "Keep the current memory active and base it on the source text that restates it; "
             "discard the conflicting proposal."
         )
-    if staged_evidence.get("proposal") == "rebind":
+    if staged_evidence.get("proposal") == CoordinatorProposal.REBIND.value:
         decision_label = "Updated"
         summary = "The source restates this memory, but its Support was not confirmed. Base the memory on the new text?"
         use_latest = "Keep the current memory and base it on the proposed source text instead of its previous Evidence."

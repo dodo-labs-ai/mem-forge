@@ -16,9 +16,11 @@ from memforge.pipeline.support_relation_coordinator import (
     RelationLedgerEntry,
     RevisionCompositionProof,
     SupportResult,
+    ReconciliationContractError,
     coordinate,
     memory_support,
     plan_rechecks,
+    supported_refiners,
 )
 
 EQUIVALENT = MemoryRelationType.EQUIVALENT
@@ -299,6 +301,41 @@ def test_a_candidate_treated_differently_by_two_old_memories_leaves_the_componen
     assert coordination.unresolved_candidate_count == 1
 
 
+@pytest.mark.parametrize(
+    ("second_relation", "second_support"),
+    [(CONTRADICTS, _support(SUPPORTED)), (EQUIVALENT, _support(UNSUPPORTED, rechecked=True))],
+    ids=["two-supersessions", "supersession-and-rebind"],
+)
+def test_a_candidate_staged_in_the_reviews_of_two_old_memories_leaves_the_component_unresolved(
+    second_relation, second_support,
+) -> None:
+    # Each approval would apply the same Candidate again: create it twice, or bind a second claim to it.
+    staged = _candidate("One reviewer approves payroll.")
+    relations = [_edge(0, CONTRADICTS, "mem-a"), _edge(0, second_relation, "mem-b")]
+    coordination = _coordinate([staged], relations, {
+        "mem-a": _support(SUPPORTED), "mem-b": second_support,
+    }, incumbents=[_old("mem-a"), _old("mem-b")])
+
+    for operation in coordination.operations:
+        assert operation.action is ReconcileAction.NOOP
+        assert operation.support_revalidation_skipped and not operation.reviews
+    assert _additions(coordination.operations) == []
+    assert coordination.unresolved_candidate_count == 1
+
+
+def test_refinements_of_a_claim_in_an_unresolved_component_are_not_compared() -> None:
+    first, second = _candidate("Two reviewers from team A."), _candidate("Two reviewers from team B.")
+    refines = {"direction": RelationDirection.CHALLENGER_TO_CANDIDATE}
+    relations = [_edge(0, REFINES, **refines), _edge(1, REFINES, **refines)]
+    supports = {"mem-old": _support(SUPPORTED)}
+    ledger = {"candidates": [first, second], "incumbents": [_old()], "supports": supports}
+
+    assert supported_refiners(relations=relations, **ledger) == {"mem-old": (0, 1)}
+    # An uncertain edge of one refiner leaves the old Memory undecided this round.
+    unresolved = [*relations[:1], _edge(1, None)]
+    assert supported_refiners(relations=unresolved, **ledger) == {}
+
+
 def test_one_candidate_consumed_by_two_kept_claims_is_one_treatment() -> None:
     relations = [_edge(0, EQUIVALENT, "mem-a"), _edge(0, EQUIVALENT, "mem-b")]
     coordination = _coordinate([_candidate("Retries back off.")], relations, {
@@ -368,7 +405,5 @@ def test_several_supports_of_one_claim_combine_by_precedence(assessments, expect
 
 
 def test_an_incomplete_support_ledger_fails_closed() -> None:
-    from memforge.pipeline.reconciler import ReconciliationContractError
-
     with pytest.raises(ReconciliationContractError):
         _coordinate([], [], {})

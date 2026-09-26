@@ -10888,6 +10888,35 @@ async def test_a_new_unit_that_fails_for_good_keeps_the_old_unit(db: Database) -
 
 
 @pytest.mark.asyncio
+async def test_a_new_unit_still_deferred_by_this_run_keeps_the_old_unit(db: Database) -> None:
+    source_id = "src-unit-identity-change-stuck"
+    await db.upsert_source(
+        id=source_id, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
+    )
+    await GeneSyncOrchestrator(
+        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=NoopMemoryEngine(), memory_store=None, max_concurrent=1,
+    ).sync_gene(gene=_IssueGene(0, 2), source_name="Jira", source_id=source_id, force_full_sync=True)
+    engine = _OrderRecordingMemoryEngine(defer=True)
+
+    async def defer_again(handle, *, eligible_same_run_source_unit_ids):
+        raise SourceUnitLifecycleDeferred("same-run cross-Unit Support is stale", handle._runtime_bundle, handle=handle)
+
+    engine.retry_deferred_projected_lifecycle = defer_again
+
+    state = await GeneSyncOrchestrator(
+        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=engine, memory_store=RecordingDocumentDeleteMemoryStore(db), max_concurrent=1,
+        retry_sleep=_skip_retry_delay,
+    ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
+
+    # jira-1 waits only on a Unit of this run, so no removal can unblock it: it has failed.
+    assert state.docs_failed == 1
+    assert ("tombstone", "jira-2") not in engine.events
+    assert await db.get_document("jira-2") is not None
+
+
+@pytest.mark.asyncio
 async def test_external_blocker_does_not_consume_commit_attempt_budget(
     db: Database,
     monkeypatch,

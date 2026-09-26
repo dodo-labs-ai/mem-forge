@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Mapping, Protocol, Sequence, runtime_checkable
@@ -13,6 +14,15 @@ from memforge.memory.evidence import (
     validate_evidence_references,
 )
 from memforge.memory.relation_discovery_contract import RelationDiscoveryRequest
+
+# Hex characters of a lifecycle identifier's digest.
+_LIFECYCLE_ID_DIGEST_CHARS = 16
+
+
+def lifecycle_stable_id(prefix: str, *values: object) -> str:
+    """A deterministic lifecycle identifier: the prefix and a digest of the ordered values."""
+    digest = hashlib.sha256("\x1f".join(str(value) for value in values).encode("utf-8")).hexdigest()
+    return f"{prefix}-{digest[:_LIFECYCLE_ID_DIGEST_CHARS]}"
 
 
 class LifecycleGateState(str, Enum):

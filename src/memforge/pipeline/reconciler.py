@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 
 from memforge.derivation_work import DerivationWorkStore
@@ -31,7 +31,9 @@ from memforge.models import (
     parse_memory_validity_date,
 )
 from memforge.pipeline.support_relation_coordinator import (
+    Coordination,
     MemorySupport,
+    ReconciliationContractError,
     RelationLedgerEntry,
     RevisionCompositionProof,
     SupportRecheckRequest,
@@ -43,6 +45,7 @@ from memforge.pipeline.support_relation_coordinator import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ReconciliationContractError",
     "RelationLine",
     "ReconciliationFailure",
     "ReconciliationMetrics",
@@ -71,14 +74,6 @@ class ReconciliationFailure:
     diagnostic: QualitySignal | None = None
 
 
-class ReconciliationContractError(ValueError):
-    """A bounded fail-closed reconciliation invariant violation."""
-
-    def __init__(self, reason_code: str, message: str) -> None:
-        super().__init__(message)
-        self.reason_code = reason_code
-
-
 @dataclass(frozen=True, slots=True)
 class ReconciliationMetrics:
     """Model work and latency of the Relation line and its join; Support's calls are counted apart."""
@@ -102,13 +97,13 @@ class RelationLine:
     failure: ReconciliationFailure | None = None
     metrics: ReconciliationMetrics = ReconciliationMetrics()
     work_ids: tuple[str, ...] = ()
-    # Candidates with a completion row, and the old-Memory catalog those rows cover.
+    # Candidates with a completion row, and the old Memories those rows cover.
     completed_candidate_count: int = 0
-    catalog: frozenset[str] = frozenset()
+    incumbent_ids: frozenset[str] = frozenset()
 
     def covers(self, candidate_count: int, incumbent_ids: frozenset[str]) -> bool:
         """Whether every one of ``candidate_count`` Candidates has its row over exactly these old Memories."""
-        return self.failure is None and self.completed_candidate_count == candidate_count and self.catalog == incumbent_ids
+        return self.failure is None and self.completed_candidate_count == candidate_count and self.incumbent_ids == incumbent_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +118,8 @@ class ReconciliationResult:
     rechecks: tuple[SupportRecheckRequest, ...] = ()
     # Candidates consumed without a decision by an unresolved component.
     unresolved_candidate_count: int = 0
+    # Each old Memory's final Support result, after its re-check.
+    supports: Mapping[str, MemorySupport] = field(default_factory=dict)
 
 
 async def assess_relations(
@@ -144,12 +141,12 @@ async def assess_relations(
     """
     started = perf_counter()
     pair_count = len(new_extractions) * len(existing_memories)
-    catalog = frozenset(memory.id for memory in existing_memories)
+    incumbent_ids = frozenset(memory.id for memory in existing_memories)
     if not new_extractions or not existing_memories:
         # Nothing to relate: every Candidate's row is empty by definition.
         return RelationLine(
             metrics=ReconciliationMetrics(relation_pair_count=pair_count),
-            completed_candidate_count=len(new_extractions), catalog=catalog,
+            completed_candidate_count=len(new_extractions), incumbent_ids=incumbent_ids,
         )
     from memforge.pipeline.claim_revision import assess_claim_pairs
 
@@ -198,7 +195,7 @@ async def assess_relations(
     return RelationLine(
         entries=tuple(entries), proofs=tuple(proofs), work_ids=assessed.work_ids,
         metrics=_add_calls(metrics, line, started),
-        completed_candidate_count=assessed.completed_candidate_count, catalog=catalog,
+        completed_candidate_count=assessed.completed_candidate_count, incumbent_ids=incumbent_ids,
     )
 
 
@@ -213,40 +210,40 @@ async def join_support_and_relation(
     recheck: RecheckSupports | None = None,
     rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
 ) -> ReconciliationResult:
-    """Run SupportRelationCoordinator over both finished lines.
+    """Run SupportRelationCoordinator over both finished lines of a complete Relation ledger.
 
     Each conflicting claim's single re-check runs first; a re-check execution
     failure raises like any Support failure. Several refinements of one kept old
     Memory are then compared pairwise, because only one of them may revise it.
     Without ``recheck`` the re-checks are reported and the claims keep their results.
+    The result carries the final Memory-level Support results the table used.
     """
-    started = perf_counter()
-    assert relation.failure is None
+    if relation.failure is not None:
+        raise ValueError("SupportRelationCoordinator joins only a complete Relation ledger")
+    ledger = {
+        "candidates": new_extractions,
+        "incumbents": existing_memories,
+        "proofs": relation.proofs,
+        "rechecked_pairs": rechecked_pairs,
+    }
     entries = list(relation.entries)
-    coordinated = dict(
-        candidates=new_extractions, incumbents=existing_memories, proofs=relation.proofs,
-        rechecked_pairs=rechecked_pairs,
-    )
-    rechecks = plan_rechecks(relations=entries, supports=supports, **coordinated)
+    rechecks = plan_rechecks(relations=entries, supports=supports, **ledger)
     if rechecks and recheck is not None:
         supports = {**supports, **await recheck(rechecks)}
+    # Re-check calls count on the Support line; the join's own time starts here.
+    started = perf_counter()
     metrics = relation.metrics
-
-    def result(operations=(), failure: ReconciliationFailure | None = None, unresolved: int = 0):
-        return ReconciliationResult(
-            operations=list(operations), failure=failure, work_ids=relation.work_ids, rechecks=rechecks,
-            unresolved_candidate_count=unresolved, metrics=_add_calls(metrics, line, started),
-        )
-
     transient_candidates = tuple(_transient_candidate(index, raw) for index, raw in enumerate(new_extractions))
     conditional_pairs = tuple(
         MemoryPair(challenger=transient_candidates[left], candidate=transient_candidates[right])
-        for indices in supported_refiners(entries, supports).values()
+        for indices in supported_refiners(relations=entries, supports=supports, **ledger).values()
         if len(indices) > 1
         for offset, left in enumerate(indices)
         for right in indices[offset + 1 :]
     )
     operation = "classify_memory_relations"
+    coordination: Coordination | None = None
+    failure: ReconciliationFailure | None = None
     with structured_llm_line_scope() as line:
         try:
             if conditional_pairs:
@@ -259,10 +256,18 @@ async def join_support_and_relation(
                 )
                 entries = _without_conflicting_refinements(entries, conditional.decisions, transient_candidates)
             operation = "coordinate_support_and_relation"
-            coordination = coordinate(relations=entries, supports=supports, **coordinated)
+            coordination = coordinate(relations=entries, supports=supports, **ledger)
         except Exception as error:  # noqa: BLE001 - classified by _failure
-            return result(failure=_failure(error, operation))
-    return result(coordination.operations, unresolved=coordination.unresolved_candidate_count)
+            failure = _failure(error, operation)
+    return ReconciliationResult(
+        operations=list(coordination.operations) if coordination is not None else [],
+        failure=failure,
+        metrics=_add_calls(metrics, line, started),
+        work_ids=relation.work_ids,
+        rechecks=rechecks,
+        unresolved_candidate_count=coordination.unresolved_candidate_count if coordination is not None else 0,
+        supports=supports,
+    )
 
 
 def _without_conflicting_refinements(

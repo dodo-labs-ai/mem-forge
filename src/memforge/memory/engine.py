@@ -38,7 +38,6 @@ from memforge.memory.candidate_admission import (
     admit_candidates,
 )
 from memforge.memory.coordinator_review import (
-    CarriedConflict,
     carried_conflicts,
     carry_into_ledger,
     is_coordinator_review,
@@ -56,7 +55,6 @@ from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
     LifecyclePlan,
     LifecycleReview,
-    LifecycleReviewStatus,
     ProjectedLifecycleDeferredError,
     AuthorityPlanStaleError,
     ProjectedSupportInvariantError,
@@ -124,6 +122,7 @@ logger = logging.getLogger(__name__)
 
 _First = TypeVar("_First")
 _Second = TypeVar("_Second")
+_EMPTY_OBSERVATION_REASON = "source observation is explicitly empty"
 
 __all__ = [
     "DeferredProjectedLifecycleHandle",
@@ -359,29 +358,6 @@ class MemoryEngine:
             if memory.status == "active":
                 incumbents_by_id.setdefault(memory.id, memory)
         return [incumbents_by_id[key] for key in sorted(incumbents_by_id)], unit_support
-
-    async def _carried_conflicts(
-        self,
-        *,
-        source_unit_id: str,
-        model_incumbents: Sequence[Memory],
-        context: RevisionAssessmentContext | None,
-    ) -> tuple[CarriedConflict, ...]:
-        """This Source Unit's pending coordinator conflicts whose staged Candidate is still exactly current."""
-
-        if context is None:
-            return ()
-        reviews = [
-            review
-            for review in await self.db.list_lifecycle_reviews(
-                status=LifecycleReviewStatus.PENDING,
-                incumbent_memory_ids=tuple(memory.id for memory in model_incumbents),
-            )
-            if is_coordinator_review(review, source_unit_id=source_unit_id)
-        ]
-        if not reviews:
-            return ()
-        return carried_conflicts(reviews, context.catalog(context.full_fragments))
 
     async def _coordinator_reviews(
         self, *, source_unit_id: str, incumbent_ids: Sequence[str],
@@ -1056,6 +1032,8 @@ class MemoryEngine:
             project_key=project_key, repo_identifier=repo_identifier,
         )
         supports: dict[str, MemorySupport] = {}
+        # This Source Unit's coordinator Reviews of the old Memories the model judges.
+        unit_reviews: tuple[LifecycleReview, ...] = ()
         required_derivation_work_ids = admission.work_ids
         model_incumbent_count = 0
         model_batch_count = 0
@@ -1084,7 +1062,7 @@ class MemoryEngine:
                     reason=(
                         "current Source Artifact revision is not inference eligible"
                         if memory.id in derivation_protected_ids
-                        else "source observation is explicitly empty"
+                        else _EMPTY_OBSERVATION_REASON
                     ),
                     flag_for_review=(memory.id in derivation_protected_ids),
                 )
@@ -1196,7 +1174,9 @@ class MemoryEngine:
                         rechecks.extend(SupportRecheck(item) for item in rebound)
                         owners[request.memory_id] = [item.id for item in rebound]
                         continue
-                    # One read of the claim, carrying every prior part it has in this Unit.
+                    # One read of the claim, carrying every prior part it has in this Unit. Its
+                    # reading order is the Candidates' current groups, and correspondence uses only
+                    # the target revision, so the baseline of whichever Support leads is immaterial.
                     item = SupportWorkItem(
                         f"r{len(rechecks):06d}", memory_items[0].memory,
                         tuple(part for memory_item in memory_items for part in memory_item.support),
@@ -1215,7 +1195,6 @@ class MemoryEngine:
                         rechecked[request.memory_id] = memory_support([*read, *assessments], rechecked=True)
                     else:
                         rechecked[request.memory_id] = supports[request.memory_id].after_candidate_recheck(assessments[0])
-                supports.update(rechecked)
                 return rechecked
 
             async def support_line() -> None:
@@ -1231,13 +1210,9 @@ class MemoryEngine:
             _runtime_context.stage = "support_revalidation"
             try:
                 _, relation = await _run_concurrently(support_line(), relation_line)
-                unresolved_stats = {
-                    "partial_coverage": "support_revalidation_unresolved_partial_coverage_count",
-                    "capacity": "support_revalidation_unresolved_capacity_count",
-                }
                 for assessment in assessed.values():
                     if assessment.unresolved is not None:
-                        stats[unresolved_stats[assessment.unresolved]] += 1
+                        stats[f"support_revalidation_unresolved_{assessment.unresolved}_count"] += 1
                 for memory in model_incumbents:
                     supports[memory.id] = memory_support([assessed[item.id] for item in work_by_memory[memory.id]])
                     stats["support_revalidation_supported_count"] += len(supports[memory.id].evidence)
@@ -1249,24 +1224,28 @@ class MemoryEngine:
                 if relation.failure is not None:
                     result = ReconciliationResult(operations=[], failure=relation.failure, metrics=relation.metrics)
                 else:
+                    if assessment_context is not None:
+                        unit_reviews = await self._coordinator_reviews(
+                            source_unit_id=scope.source_unit_id,
+                            incumbent_ids=tuple(memory.id for memory in model_incumbents),
+                        )
                     ledger = carry_into_ledger(
                         filtered_memories, relation.entries,
-                        await self._carried_conflicts(
-                            source_unit_id=scope.source_unit_id, model_incumbents=model_incumbents,
-                            context=assessment_context,
-                        ),
+                        carried_conflicts(unit_reviews, assessment_context.catalog(assessment_context.full_fragments))
+                        if unit_reviews else (),
                     )
                     stats["coordinator_carried_conflict_count"] = len(ledger.carried_pairs)
                     result = await join_support_and_relation(
                         replace(relation, entries=ledger.entries),
                         new_extractions=ledger.candidates,
                         existing_memories=model_incumbents,
-                        supports=dict(supports),
+                        supports=supports,
                         structured_llm_client=self.structured_llm_client,
                         llm_model=self.llm_model,
                         recheck=recheck,
                         rechecked_pairs=ledger.carried_pairs,
                     )
+                    supports = dict(result.supports)
             finally:
                 stats["support_revalidation_model_call_count"] += evaluator.calls
                 stats["support_revalidation_assessment_request_count"] = evaluator.stage_counts["support_assess"]
@@ -1504,10 +1483,7 @@ class MemoryEngine:
             gate_state=gate.state,
             source_support_unit_ids=unit_support,
             evidence_unit_ids_by_claim_hash=projected_evidence.evidence_unit_ids_by_claim_hash,
-            coordinator_reviews=(
-                await self._coordinator_reviews(source_unit_id=scope.source_unit_id, incumbent_ids=tuple(incumbents_by_id))
-                if any(operation.reviews for operation in operations) else ()
-            ),
+            coordinator_reviews=unit_reviews,
         )
         corroboration_targets: dict[str, Memory] = {}
         corroboration_proofs: dict[str, dict[str, object]] = {}
@@ -1921,11 +1897,15 @@ def _empty_revision_support(projection: SourceProjection, observation_ids: froze
     returned = {observation.id for observation in projection.observations}
     if projection.coverage.proves_absence or (observation_ids and observation_ids <= returned):
         return memory_support((
-            SupportAssessment(False, "source observation is explicitly empty", None, complete_read=True),
+            SupportAssessment(
+                supported=False, reason=_EMPTY_OBSERVATION_REASON, memory=None, complete_read=True,
+            ),
         ))
     return memory_support((
         SupportAssessment(
-            None, "Partial projection coverage cannot prove that the source observation is empty.", None,
+            supported=None,
+            reason="Partial projection coverage cannot prove that the source observation is empty.",
+            memory=None,
             unresolved="partial_coverage",
         ),
     ))
