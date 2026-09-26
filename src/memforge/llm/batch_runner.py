@@ -91,9 +91,12 @@ class ItemFailure:
 
     ``capacity_exceeded`` means the item alone exceeds the route's input
     capacity; ``invalid_response`` means a model response for the item alone was
-    received and stayed invalid after its correction. ``deadline_exceeded`` and
-    ``provider_error`` are transient, and ``request_error`` is a request that
-    failed without a response to validate. ``error`` is the exception that ended
+    received and stayed invalid after its correction; the caller's stage records
+    these two, and its Unit commits. The rest leave the Source Unit revision
+    uncommitted: ``deadline_exceeded`` and ``provider_error`` are transient and
+    the sync retries them at once, while ``request_error``, a request that failed
+    without a response to validate, is left for the next sync
+    (``failure_retryable`` in ``llm.structured`` is the one rule). ``error`` is the exception that ended
     the item; every failure that is not unjudgeable carries one, for the caller to raise. For a chain item, ``part`` is the index of the
     first part it could not read.
     """

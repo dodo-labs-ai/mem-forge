@@ -12,7 +12,7 @@ import asyncio
 import json
 import hashlib
 
-from memforge.llm.structured import StructuredLlmError
+from memforge.llm.structured import StructuredLlmError, failure_retryable
 import logging
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -536,14 +536,7 @@ class MemoryEngine:
             raise SourceUnitLifecycleExecutionError(
                 str(exc),
                 bundle,
-                retryable=not isinstance(
-                    exc,
-                    (
-                        ProjectedSupportInvariantError,
-                        SupportRevalidationLimitation,
-                        ReconciliationContractError,
-                    ),
-                ) and getattr(exc, "retryable", True) and not (isinstance(exc, StructuredLlmError) and exc.terminal_category == "invalid_response"),
+                retryable=failure_retryable(exc),
             ) from exc
 
     async def _materialize_prepared_projected_plan(
@@ -781,7 +774,7 @@ class MemoryEngine:
             raise SourceUnitLifecycleExecutionError(
                 str(exc),
                 failure_bundle,
-                retryable=not isinstance(exc, ProjectedSupportInvariantError),
+                retryable=failure_retryable(exc),
             ) from exc
 
         if runtime_bundle is not None:
@@ -1326,7 +1319,7 @@ class MemoryEngine:
                 )
                 raise SourceUnitLifecycleExecutionError(
                     message, failure_bundle,
-                    retryable=result.failure.terminal_category in {"provider_error", "deadline_exceeded"},
+                    retryable=result.failure.retryable,
                     commit_attempted=False,
                 )
             operations = tuple(result.operations) + tuple(

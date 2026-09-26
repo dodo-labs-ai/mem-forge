@@ -79,6 +79,8 @@ __all__ = [
 class ReconciliationContractError(ValueError):
     """A bounded fail-closed reconciliation invariant violation."""
 
+    retryable = False
+
     def __init__(self, reason_code: str, message: str) -> None:
         super().__init__(message)
         self.reason_code = reason_code

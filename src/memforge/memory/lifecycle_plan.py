@@ -40,6 +40,8 @@ class LifecyclePlanStatus(str, Enum):
 class ProjectedSupportInvariantError(ValueError):
     """A deterministic fail-closed projected Support postcondition failure."""
 
+    retryable = False
+
 
 class AuthorityPlanStaleError(ProjectedSupportInvariantError):
     """The Source Unit changed after Evidence authority was planned."""
