@@ -492,10 +492,16 @@ class GitHubRepoGene(Gene):
     async def _last_commit_at(self, item: ContentItem) -> str | None:
         """The latest commit time of the file, or its symlink target, at the collection commit.
 
-        One commits request per path; GitHub lists no commit only for a path
-        with no history, which leaves the time unknown.
+        A blob synced before keeps the time recorded then: a later commit that
+        leaves the blob unchanged does not change its content. Otherwise one
+        commits request per path. GitHub lists no commit only for a path with
+        no history, and a refused request tells nothing about the content; both
+        leave the time unknown, and the next sync asks again.
         """
 
+        stored_time = item.stored_extra.get(LAST_COMMIT_AT_KEY)
+        if stored_time and item.stored_extra.get("blob_sha") == item.extra.get("blob_sha"):
+            return str(stored_time)
         commit_sha = str(item.extra.get("commit_sha") or "").strip()
         relative_path = str(item.extra.get("relative_path") or "").strip()
         if not commit_sha or not relative_path:
@@ -503,8 +509,12 @@ class GitHubRepoGene(Gene):
         commit_times = []
         for path in github_content_paths(relative_path, item.extra.get("resolved_relative_path")):
             query = github_path_commits_query(relative_path=path, ref=commit_sha)
-            response = await self._client.get(f"{_repo_api_url(self._repo_ref)}/commits?{query}")
-            response.raise_for_status()
+            try:
+                response = await self._client.get(f"{_repo_api_url(self._repo_ref)}/commits?{query}")
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                logger.warning("GitHub commit time for %s is unknown: %s", path, exc)
+                return None
             commit_times.append(github_latest_commit_time(response.json()))
         return latest_source_time(commit_times)
 

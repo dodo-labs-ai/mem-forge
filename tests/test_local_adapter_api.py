@@ -1714,6 +1714,119 @@ def test_github_repo_manifest_reuses_unchanged_input_without_another_package(tmp
         asyncio.run(database.close())
 
 
+@pytest.mark.parametrize("source_type", ["github_repo", "local_markdown"])
+def test_file_package_without_source_time_is_uploaded_once_more_under_the_source_time_contract(
+    tmp_path,
+    source_type,
+):
+    from memforge.local_agent.document_identity import build_local_markdown_doc_id
+    from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
+    from memforge.models import content_hash
+    from memforge.server.admin_api import create_admin_app
+
+    commit_time = "2026-03-02T09:30:00+00:00"
+    markdown_body = "# Payroll Processing\n\nArchitecture notes."
+    cfg = _config(tmp_path)
+    database = _connect_database(tmp_path)
+    try:
+        app = create_admin_app(
+            db=database,
+            config=cfg,
+            local_agent_lease_validator=_allow_local_agent_lease,
+        )
+        with LeaseAwareTestClient(app) as client:
+            if source_type == "github_repo":
+                source_id = _create_github_repo_source(client)["id"]
+                relative_path = "Payroll Processing/README.md"
+                doc_id = build_github_repo_doc_id(
+                    source_id=source_id,
+                    repo_url="https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    repo_ref="main",
+                    relative_path=relative_path,
+                )
+                revision = "blob-sha-1"
+                package = {
+                    "repo_url": "https://github.wdf.sap.corp/nextgenpayroll-matterhorn/architecture",
+                    "repo_ref": "main",
+                    "relative_path": relative_path,
+                    "markdown_body": markdown_body,
+                    "blob_sha": revision,
+                }
+            else:
+                source_id = _create_local_markdown_source(client)["id"]
+                relative_path = "payroll/README.md"
+                doc_id = build_local_markdown_doc_id(
+                    source_id=source_id,
+                    vault_id="engineering",
+                    relative_path=relative_path,
+                )
+                revision = content_hash(markdown_body)
+                package = {
+                    "vault_id": "engineering",
+                    "relative_path": relative_path,
+                    "markdown_body": markdown_body,
+                    "raw_hash": revision,
+                }
+
+            def manifest(job_id: str, contract_version: int | None) -> dict:
+                body = {
+                    "items": [{"doc_id": doc_id, "revision": revision, "change_kind": "upsert"}],
+                    "coverage": "complete_snapshot",
+                    "sync_snapshot_id": f"{job_id}:attempt:1",
+                    "local_agent_job_id": job_id,
+                }
+                if contract_version is not None:
+                    body["package_contract_version"] = contract_version
+                response = client.post(f"/api/v1/sources/{source_id}/adapter/manifest", json=body)
+                assert response.status_code == 200, response.text
+                return response.json()
+
+            # An agent that predates source times retained the file without one.
+            assert manifest("old-agent", None)["required_doc_ids"] == [doc_id]
+            untimed = client.post(
+                f"/api/v1/sources/{source_id}/adapter/packages",
+                json={**package, "local_agent_job_id": "old-agent"},
+            )
+            assert untimed.status_code == 200, untimed.text
+            old_agent_again = manifest("old-agent-again", None)
+            upgraded = manifest("upgraded-agent", LOCAL_PACKAGE_CONTRACT_VERSION)
+            timed = client.post(
+                f"/api/v1/sources/{source_id}/adapter/packages",
+                json={**package, "source_updated_at": commit_time, "local_agent_job_id": "upgraded-agent"},
+            )
+            assert timed.status_code == 200, timed.text
+            upgraded_again = manifest("upgraded-agent-again", LOCAL_PACKAGE_CONTRACT_VERSION)
+
+        # The older agent keeps reusing what it retained.
+        assert old_agent_again["required_doc_ids"] == []
+        # The upgraded agent uploads the unchanged file once more, with its time.
+        assert upgraded["required_doc_ids"] == [doc_id]
+        assert upgraded_again["required_doc_ids"] == []
+        assert upgraded_again["reused_count"] == 1
+
+        def snapshot_input(job_id: str):
+            [source_input] = asyncio.run(
+                database.list_source_sync_inputs(
+                    workspace_id="local",
+                    source_id=source_id,
+                    input_snapshot_id=f"{job_id}:attempt:1",
+                )
+            )
+            return source_input
+
+        untimed_input = snapshot_input("old-agent")
+        timed_input = snapshot_input("upgraded-agent")
+        # The timed package is its own input, not collapsed into the untimed one.
+        assert timed_input.input_id != untimed_input.input_id
+        assert timed_input.metadata["manifest_entry"]["source_updated_at"] == commit_time
+        assert "source_updated_at" not in untimed_input.metadata["manifest_entry"]
+        assert snapshot_input("upgraded-agent-again").input_id == timed_input.input_id
+        timed_package = json.loads(LocalDocumentStore(cfg.storage.docs_path).read_artifact(timed_input.raw_uri))
+        assert timed_package["source_updated_at"] == commit_time
+    finally:
+        asyncio.run(database.close())
+
+
 def test_local_source_manifest_requests_changed_body_and_accepts_complete_removal(tmp_path):
     from memforge.server.admin_api import create_admin_app
 

@@ -95,6 +95,8 @@ from memforge.workspace_bindings import (
 
 console = Console()
 log_console = Console(stderr=True)
+logger = logging.getLogger(__name__)
+
 DEFAULT_CLI_CONFIG_PATH = Path.home() / ".memforge" / "cli.toml"
 DEFAULT_LOCAL_AGENT_STATE_PATH = Path.home() / ".memforge" / "local-agent-state.json"
 DEFAULT_LOCAL_AGENT_LOCK_PATH = Path.home() / ".memforge" / "local-agent-daemon.lock"
@@ -542,18 +544,25 @@ def _github_last_commit_at(
     relative_path: str,
     resolved_relative_path: object,
 ) -> str | None:
-    """The file's latest commit time at the collection commit, its symlink target included."""
+    """The file's latest commit time at the collection commit, its symlink target included.
 
-    return latest_source_time(
-        github_latest_commit_time(
-            _gh_api_payload(
+    A refused request leaves the time unknown; the service then asks for the
+    file again on the next collection (``LOCAL_PACKAGE_SOURCE_TIME_CONTRACT_VERSION``).
+    """
+
+    commit_times = []
+    for path in github_content_paths(relative_path, resolved_relative_path):
+        try:
+            payload = _gh_api_payload(
                 repo,
                 f"repos/{repo['owner']}/{repo['repo']}/commits?"
                 + github_path_commits_query(relative_path=path, ref=commit_sha),
             )
-        )
-        for path in github_content_paths(relative_path, resolved_relative_path)
-    )
+        except click.ClickException as exc:
+            logger.warning("GitHub commit time for %s is unknown: %s", path, exc.message)
+            return None
+        commit_times.append(github_latest_commit_time(payload))
+    return latest_source_time(commit_times)
 
 
 def _raise_github_cli_error(detail: str) -> None:

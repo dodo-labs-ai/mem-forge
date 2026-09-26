@@ -16,6 +16,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from memforge.api_target import MemForgeTarget
 from memforge.config import DEFAULT_SEARCH_TOP_K
+from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
 from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.sync_progress import normalize_sync_progress_snapshot
 
@@ -386,7 +387,11 @@ class ToolClient:
         local_agent_attempt_count: int,
         scope_attestations: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Declare covered membership and request only missing content bodies."""
+        """Declare covered membership and request only missing content bodies.
+
+        The request declares the package contract this agent collects under, so
+        the service asks again for retained packages that predate it.
+        """
         source_id = source_id.strip()
         if not source_id:
             return {"error": "source_id is required"}
@@ -396,6 +401,7 @@ class ToolClient:
             "sync_snapshot_id": sync_snapshot_id,
             "local_agent_job_id": local_agent_job_id,
             "local_agent_attempt_count": local_agent_attempt_count,
+            "package_contract_version": LOCAL_PACKAGE_CONTRACT_VERSION,
         }
         if scope_attestations is not None:
             body["scope_attestations"] = scope_attestations

@@ -5,30 +5,41 @@
 - Every Observation Revision records the source's own time for its content: a
   Confluence page version, a GitHub file's latest commit, a GitHub Pages commit,
   sitemap `lastmod` or `Last-Modified`, the latest change to a Jira issue's core
-  fields, a comment, changelog entry or Teams message time, a local file's
-  commit or modification time, and the time of the agent session event that
-  authorized a concept change. A source without such a time records none;
-  discovery, fetch, submission and sync times are never used. Relation
-  discovery reads this one time for every Source, so `updates` between Memories
-  from GitHub, local files, Jira issue fields or agent sessions is no longer
-  recorded as `contradicts` for want of a time.
+  fields, a comment or changelog entry time, a Teams message's edit or post
+  time, a local file's commit or modification time, and the time of the agent
+  session event that authorized a concept change. A source without such a time
+  records none; discovery, fetch, submission and sync times are never used.
+  Times are stored in UTC, and a provider time that cannot be read counts as
+  unknown instead of failing the projection. Relation discovery reads this one
+  time for every Source, so `updates` between Memories from GitHub, local
+  files, Jira issue fields or agent sessions is no longer recorded as
+  `contradicts` for want of a time.
 - A Memory's `source_updated_at` is the time the Source reports and is empty
   when it reports none; it no longer falls back to the sync time (GitHub
   Repository, GitHub Pages) or the local agent's submission time. Searches that
   filter on `source_updated_at` now match these Memories by their source time.
-- GitHub Repository cloud pull reads each file's latest commit, one extra
-  GitHub request per file per sync (two for a symlink).
+- GitHub Repository cloud pull reads a file's latest commit when its blob is
+  new or has no recorded time: one extra GitHub request for such a file (two
+  for a symlink). An unchanged blob keeps the time recorded on an earlier sync.
+  A refused commit request leaves the time unknown and is asked again on the
+  next sync; it no longer fails the file.
 - The local agent sends `source_updated_at` for GitHub Repository and local
-  Markdown files. Upgrade the local agent to record these times; an older one
-  sends none and its files have no source time.
-- After upgrading, run one force full sync of each Jira, GitHub Repository
-  local push and local Markdown Source to record times on existing revisions.
-  GitHub Repository cloud pull records them on its next sync, and a migration
-  gives current Confluence page bodies their page version time. Relations
-  recorded as `contradicts` because a time was missing do not change by
-  themselves: re-run relation discovery for them afterwards
-  (`POST /api/v1/relation-discovery/work/rerun`). Source derivations in progress
-  or deferred during the upgrade may run their extraction once more.
+  Markdown files, and the edit time of edited Teams messages. Upgrade the local
+  agent to record these times; an older one sends none and its files have no
+  source time. The upgraded agent declares package contract version 2, and the
+  service then asks once more for every retained GitHub Repository or local
+  Markdown file that has no source time: the first collection after the upgrade
+  uploads those files again, one time.
+- After upgrading, run one force full sync of each Jira and GitHub Pages Source
+  to record times on existing revisions. GitHub Repository cloud pull records
+  them on its next sync, GitHub Repository local push and local Markdown on the
+  first collection by the upgraded local agent, and a migration gives current
+  Confluence page bodies their page version time. Teams messages edited before
+  the upgrade keep their post time. Relations recorded as `contradicts` because
+  a time was missing do not change by themselves: re-run relation discovery for
+  them afterwards (`POST /api/v1/relation-discovery/work/rerun`). Source
+  derivations in progress or deferred during the upgrade may run their
+  extraction once more.
 
 - Evidence Unit Support is the only Support model (ADR 0038). A workspace that
   still holds reference-scoped Support refuses to start and is left unchanged;

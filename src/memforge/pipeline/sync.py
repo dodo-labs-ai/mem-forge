@@ -111,7 +111,7 @@ from memforge.pipeline.projection_images import (
 from memforge.source_access import memory_visibility_for_source_id
 from memforge.source_activity import SourceActivityLease
 from memforge.source_projection_config import canonical_projection_scope
-from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time
+from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time, reported_source_time
 
 if TYPE_CHECKING:
     from memforge.evals.agent_evaluation import RuntimeEventTraceSink
@@ -433,7 +433,7 @@ def _source_updated_at(source_semantics: dict[str, Any]) -> datetime | None:
     submission time, so it is never read as the content's time.
     """
 
-    return parse_source_time(source_semantics.get(SOURCE_UPDATED_AT_KEY))
+    return parse_source_time(reported_source_time(source_semantics.get(SOURCE_UPDATED_AT_KEY)))
 
 
 def _plural(count: int, singular: str, plural: str | None = None) -> str:
@@ -2168,6 +2168,9 @@ class GeneSyncOrchestrator:
         # ------------------------------------------------------------------
         # 1. Fetch raw content
         # ------------------------------------------------------------------
+        if stored_document is None:
+            previous_document = await self.db.get_document(doc_id)
+            item.stored_extra = dict(previous_document.item_extra) if previous_document is not None else {}
         raw = stored_document.raw if stored_document is not None else await gene.fetch(item)
         logger.debug("Fetched %s (%d bytes)", doc_id, len(raw.body))
         self._memory_sample(

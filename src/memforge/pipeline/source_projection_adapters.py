@@ -38,7 +38,7 @@ from memforge.source_projection import (
 from memforge.source_time import (
     SOURCE_UPDATED_AT_KEY,
     latest_source_time,
-    source_time_iso,
+    reported_source_time,
 )
 from memforge.source_representation import (
     UNIT_TITLE_OBSERVATION_TYPE,
@@ -124,7 +124,7 @@ class _ObservationInput:
 
     ``observed_at`` is the source's own time for this content (design 0.9):
     when the provider last changed it, or ``None`` when the provider records
-    no such time. It is never a discovery, fetch, submission or sync time.
+    no usable time. It is never a discovery, fetch, submission or sync time.
     """
 
     observation_type: str
@@ -135,6 +135,10 @@ class _ObservationInput:
     observed_at: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     semantic_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        # One UTC form for every provider's time, whatever format it reported.
+        object.__setattr__(self, "observed_at", reported_source_time(self.observed_at))
 
 
 _REVISION_SEMANTIC_METADATA_KEYS = ("claim_evidence_scope",)
@@ -810,7 +814,7 @@ def _project_native(
     normalized: NormalizedContent,
 ) -> _NativeProjection:
     # The source time of a Unit whose body is one Observation, as the Gene reports it.
-    body_time = source_time_iso(normalized.source_semantics.get(SOURCE_UPDATED_AT_KEY))
+    body_time = normalized.source_semantics.get(SOURCE_UPDATED_AT_KEY)
     if source_type == "confluence":
         page_id = str(item.extra.get("page_id") or item.item_id.removeprefix("confluence-"))
         parent_id = str(item.extra.get("parent_page_id") or "")
@@ -887,7 +891,12 @@ def _project_native(
                 _canonical_json(core_value),
                 core_value,
                 {"issue_key": issue_key},
-                _jira_core_revised_at(fields, histories, changelog_complete=changelog_complete),
+                _jira_core_revised_at(
+                    fields,
+                    histories,
+                    # A payload without a changelog says nothing about core changes.
+                    changelog_complete=changelog_complete and isinstance(data.get("changelog"), dict),
+                ),
             )
         ]
         relations: list[tuple[SourceRelationType, str, str, str | None, Mapping[str, object]]] = []
@@ -1064,10 +1073,13 @@ def _project_native(
             data = data["raw_payload"]
         window_id = str(item.extra.get("window_id") or data.get("window_id") or item.item_id)
         conversation_id = str(item.extra.get("conversation_id") or data.get("conversation_id") or "")
+        from memforge.local_agent.teams_contract import (
+            teams_message_source_time,
+            validate_teams_canonical_messages,
+        )
+
         messages = data.get("messages") if isinstance(data.get("messages"), list) else []
         if messages:
-            from memforge.local_agent.teams_contract import validate_teams_canonical_messages
-
             messages = list(validate_teams_canonical_messages(messages))
         inputs = []
         relations = []
@@ -1086,7 +1098,7 @@ def _project_native(
                     _canonical_json(semantic_message),
                     semantic_message,
                     {"conversation_id": conversation_id},
-                    str(message.get("lastModifiedDateTime") or message.get("time") or "") or None,
+                    teams_message_source_time(message),
                     {"claim_evidence_scope": "atomic"},
                 )
             )
@@ -1229,7 +1241,7 @@ def _jira_core_revised_at(
     ]
     if core_change_times:
         return latest_source_time(core_change_times)
-    return source_time_iso(fields.get("created"))
+    return reported_source_time(fields.get("created"))
 
 
 def _jira_changelog_semantic_class(history: Mapping[str, object]) -> str:
