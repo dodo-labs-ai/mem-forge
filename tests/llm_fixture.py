@@ -7,6 +7,7 @@ number of item and part words a renderer writes into the prompt.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 from pydantic import BaseModel
 
 from memforge.llm.request_budget import RequestBudget
+from memforge.llm.structured import CandidateAdmissionResponse
 from memforge.models import MemoryExtractionResult
 
 # Large enough that the context window never binds before the input limit.
@@ -70,6 +72,44 @@ class FixtureBudgetClient:
             return self.respond(prompt)
         finally:
             self._in_flight -= 1
+
+
+def admission_payload(prompt: str) -> dict:
+    """The request payload of one candidate admission prompt."""
+
+    return json.loads(prompt.split("<admission>\n", 1)[1].split("\n</admission>", 1)[0])
+
+
+def admit_every_candidate(prompt: str) -> CandidateAdmissionResponse:
+    """Admit every requested Candidate with no duplicates."""
+
+    return CandidateAdmissionResponse.model_validate({"decisions": [
+        {"candidate_id": candidate["id"], "verdict": "ADMITTED"} for candidate in admission_payload(prompt)["candidates"]
+    ]})
+
+
+class AdmittingClient:
+    """Structured client stand-in with unbounded capacity that admits every Candidate."""
+
+    input_policy_identity = "fixture-input-policy"
+
+    def __init__(self) -> None:
+        self.admission_prompts: list[str] = []
+
+    def request_budget(self, model: str | None = None) -> RequestBudget:
+        return fixture_budget(
+            input_tokens=FIXTURE_CONTEXT_WINDOW, output_tokens=FIXTURE_EXTRACTION_OUTPUT_TOKENS, correction_reserve=0,
+        )
+
+    def request_fits(self, *args, **kwargs) -> bool:
+        return True
+
+    def input_policy_identity_for(self, model: str | None = None) -> str:
+        return f"{self.input_policy_identity}:{model}"
+
+    async def admit_candidates(self, prompt: str, **kwargs) -> CandidateAdmissionResponse:
+        self.admission_prompts.append(prompt)
+        return admit_every_candidate(prompt)
 
 
 class NoopMemoryExtractor:

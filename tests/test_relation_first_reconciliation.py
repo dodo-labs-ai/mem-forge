@@ -210,7 +210,6 @@ async def test_additive_refinement_with_complete_current_evidence_is_revision() 
                         same_memory_identity=True,
                         preserves_incumbent_truth=True,
                         candidate_is_canonical_composite=True,
-                        current_evidence_entails_candidate=True,
                         reason="The candidate is the complete current timeout claim.",
                     )
                 ]
@@ -270,55 +269,6 @@ async def test_revision_response_failure_cannot_fall_back_to_add() -> None:
 
 
 @pytest.mark.asyncio
-async def test_revision_evidence_that_supports_only_added_detail_falls_back() -> None:
-    incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
-    refinement = _with_selection(RawMemory(
-        content="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
-        memory_type="fact",
-        evidence_quote="Configurable with CLIENT_TIMEOUT.",
-        evidence_anchor="projection_batch",
-        source_observation_id="obs-timeout",
-    ))
-
-    class IncompleteEvidenceClient(RevisionClientFixture):
-        async def classify_memory_relations(self, prompt: str, **kwargs):
-            del prompt, kwargs
-            return _single_refines_response()
-
-
-        async def prove_revisions(self, prompt: str, **kwargs):
-            del kwargs
-            assert '"excerpt": "Configurable with CLIENT_TIMEOUT."' in prompt
-            return RevisionProofs(
-                decisions=[
-                    RevisionProof(
-                        pair_index=0,
-                        same_memory_identity=True,
-                        preserves_incumbent_truth=True,
-                        candidate_is_canonical_composite=True,
-                        current_evidence_entails_candidate=False,
-                        reason="The excerpt proves only the configuration key.",
-                    )
-                ]
-            )
-
-    result = await reconcile_memories(
-        new_extractions=[refinement],
-        existing_memories=[incumbent],
-        support_audits=[SupportAuditEntry(incumbent.id, True)],
-        doc_type="design",
-        structured_llm_client=IncompleteEvidenceClient(),
-        include_metadata=True,
-    )
-
-    assert isinstance(result, ReconciliationResult)
-    assert result.failure is None
-    [operation] = result.operations
-    assert operation.action == ReconcileAction.NOOP and operation.memory is None
-    assert operation.support_revalidation_skipped
-
-
-@pytest.mark.asyncio
 async def test_missing_conditional_assessment_preserves_incumbent() -> None:
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
     refinement = _with_selection(RawMemory(
@@ -361,54 +311,6 @@ async def test_missing_conditional_assessment_preserves_incumbent() -> None:
     assert client.proof_calls == 1
 
 
-@pytest.mark.asyncio
-async def test_candidate_without_resolved_evidence_blocks_revision() -> None:
-    incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
-    refinement = RawMemory(
-        content="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
-        memory_type="fact",
-        evidence_quote="The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT.",
-        evidence_anchor="projection_batch",
-        source_observation_id="obs-timeout",
-    )
-
-    class RequiredEvidenceClient(RevisionClientFixture):
-        async def classify_memory_relations(self, prompt: str, **kwargs):
-            del prompt, kwargs
-            return _single_refines_response()
-
-
-        async def prove_revisions(self, prompt: str, **kwargs):
-            del kwargs
-            assert '"current_evidence": []' in prompt
-            return RevisionProofs(
-                decisions=[
-                    RevisionProof(
-                        pair_index=0,
-                        same_memory_identity=True,
-                        preserves_incumbent_truth=True,
-                        candidate_is_canonical_composite=True,
-                        current_evidence_entails_candidate=True,
-                    )
-                ]
-            )
-
-    result = await reconcile_memories(
-        new_extractions=[refinement],
-        existing_memories=[incumbent],
-        support_audits=[SupportAuditEntry(incumbent.id, True)],
-        doc_type="design",
-        structured_llm_client=RequiredEvidenceClient(),
-        include_metadata=True,
-    )
-
-    assert isinstance(result, ReconciliationResult)
-    assert result.failure is None
-    assert [operation.action for operation in result.operations] == [
-        ReconcileAction.NOOP,
-    ]
-
-
 def test_refinement_without_revision_proof_falls_back_to_keep_and_add() -> None:
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
     narrower = RawMemory(
@@ -437,8 +339,6 @@ def test_refinement_without_revision_proof_falls_back_to_keep_and_add() -> None:
                 same_memory_identity=False,
                 preserves_incumbent_truth=False,
                 candidate_is_canonical_composite=True,
-                current_evidence_entails_candidate=True,
-                complete_current_evidence=True,
             )
         ],
     )

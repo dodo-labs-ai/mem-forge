@@ -30,10 +30,12 @@ from memforge.evals.agent_evaluation import (
     publish_agent_assessments,
     publish_runtime_events,
 )
-from memforge.memory.candidate_ledger import (
-    CandidateLedgerError,
-    CandidateLedgerResult,
-    select_unique_memory_candidates,
+from memforge.memory.candidate_admission import (
+    CANDIDATE_ADMISSION_CONTRACT,
+    CandidateAdmission,
+    CandidateAdmissionError,
+    CandidateRejection,
+    admit_candidates,
 )
 from memforge.memory.entity_resolver import EntityResolver
 from memforge.memory.evidence import (
@@ -76,7 +78,7 @@ from memforge.source_access import (
     memory_visibility_for_source_id,
 )
 from memforge.source_activity import SourceActivityLease
-from memforge.source_projection import ImpactResult, ProjectionCoverage, resolve_anchor_impact
+from memforge.source_projection import ImpactResult, ProjectionCoverage, SourceUnitRevision, resolve_anchor_impact
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
     source_derivation_context_identity_hash,
@@ -555,7 +557,7 @@ class MemoryEngine:
                 "authority_plan_stale"
                 if isinstance(exc, AuthorityPlanStaleError)
                 else support_limitation_reason
-                or (exc.reason_code if isinstance(exc, ReconciliationContractError) else None)
+                or (exc.reason_code if isinstance(exc, (ReconciliationContractError, CandidateAdmissionError)) else None)
                 or {
                     "candidate_admission": "candidate_admission_failed",
                     "reconciliation": "reconciliation_failed",
@@ -590,11 +592,11 @@ class MemoryEngine:
                 operation="assess_revision_support" if runtime_context.stage == "support_revalidation" else None,
                 terminal_category=(
                     "invalid_response"
-                    if isinstance(exc, ReconciliationContractError)
+                    if isinstance(exc, (ReconciliationContractError, CandidateAdmissionError))
                     else (exc.terminal_category if isinstance(exc, StructuredLlmError) else None)
                 ),
                 error_code=(
-                    (exc.reason_code if isinstance(exc, ReconciliationContractError) else
+                    (exc.reason_code if isinstance(exc, (ReconciliationContractError, CandidateAdmissionError)) else
                           exc.error_code if isinstance(exc, StructuredLlmError) else None)
                 ),
                 validation_fields=getattr(exc, "validation_fields", ()),
@@ -1060,29 +1062,26 @@ class MemoryEngine:
                 operation_input_hash=operation_input_hash, execution_owner_id=lifecycle_execution_owner_id))
         _runtime_context.incumbent_count = len(incumbents)
         _runtime_context.stage = "candidate_admission"
-        candidate_ledger = await self._select_projected_candidates(
+        admission = await self._admit_projected_candidates(
             projection=projection,
             doc_id=doc_id,
             candidates=filtered_memories,
+            image_loader=_projection_evidence_image_loader(projection, self.document_store),
+            derivation_id=derivation_id,
+            operation_input_hash=operation_input_hash,
         )
-        filtered_memories = list(candidate_ledger.candidates)
+        filtered_memories = list(admission.admitted)
         stats.update(
             {
-                "candidate_ledger_input_count": candidate_ledger.input_count,
-                "candidate_ledger_selected_count": len(candidate_ledger.candidates),
-                "candidate_ledger_dropped_exact_count": (candidate_ledger.dropped_exact_count),
-                "candidate_ledger_dropped_redundant_count": (candidate_ledger.dropped_redundant_count),
-                "candidate_ledger_dropped_low_value_count": (candidate_ledger.dropped_low_value_count),
-                "candidate_ledger_llm_calls": candidate_ledger.structured_llm_calls,
-                "candidate_ledger_llm_elapsed_ms": (candidate_ledger.structured_llm_elapsed_ms),
-                "candidate_ledger_validation_retries": (candidate_ledger.validation_retries),
-                "candidate_ledger_fallback_batch_count": (candidate_ledger.fallback_batch_count),
-                "candidate_ledger_fallback_candidate_count": (candidate_ledger.fallback_candidate_count),
-                "candidate_ledger_prompt_chars": candidate_ledger.prompt_chars,
+                "candidate_admission_admitted_count": len(admission.admitted),
+                "candidate_admission_rejected_count": len(admission.rejected),
+                "candidate_admission_merged_count": admission.merged_count,
+                "candidate_admission_llm_calls": admission.llm_calls,
+                "candidate_admission_prompt_chars": admission.prompt_chars,
             }
         )
         stats["skipped"] += quality_candidate_count - len(filtered_memories)
-        _runtime_context.model_call_count += candidate_ledger.structured_llm_calls
+        _runtime_context.model_call_count += admission.llm_calls
         _runtime_context.stage = "reconciliation"
         reconciliation_started = perf_counter()
         derivation_protected_ids = await self._derivation_protected_incumbents(
@@ -1646,7 +1645,7 @@ class MemoryEngine:
                 stats.get("reconciliation_relation_pair_count", 0)
             ),
             model_call_count=(
-                candidate_ledger.structured_llm_calls
+                admission.llm_calls
                 + structured_llm_call_count
                 + int(stats["support_revalidation_model_call_count"])
                 + entity_resolution.metrics.structured_llm_calls
@@ -1660,80 +1659,42 @@ class MemoryEngine:
             lifecycle_attempt_count=lifecycle_attempt_count,
         )
 
-    async def _select_projected_candidates(
+    async def _admit_projected_candidates(
         self,
         *,
         projection: SourceProjection,
         doc_id: str,
         candidates: list[RawMemory],
-    ) -> CandidateLedgerResult:
-        """Select bounded within-revision candidate admission before writes."""
+        image_loader,
+        derivation_id: str | None,
+        operation_input_hash: str,
+    ) -> CandidateAdmission:
+        """Admit this revision's Candidates and record one event per rejection."""
 
-        try:
-            result = await select_unique_memory_candidates(
-                candidates,
-                structured_llm_client=self.structured_llm_client,
-                llm_model=self.llm_model,
-            )
-        except CandidateLedgerError as exc:
-            await self._record_candidate_ledger_audit(
-                projection=projection,
-                doc_id=doc_id,
-                status="failed",
-                reason=exc.error_type,
-                payload={
-                    "input_count": exc.input_count,
-                    "semantic_input_count": exc.semantic_input_count,
-                    "selected_count": 0,
-                    "structured_llm_calls": exc.structured_llm_calls,
-                    "structured_llm_elapsed_ms": exc.structured_llm_elapsed_ms,
-                    "validation_retries": exc.validation_retries,
-                    "prompt_chars": exc.prompt_chars,
-                    "candidate_fingerprints": _candidate_fingerprints(candidates),
-                    "fingerprints_truncated": len(candidates) > 200,
-                },
-                error=str(exc),
-            )
-            raise RuntimeError(f"candidate ledger failed closed: {exc.error_type}: {exc}") from exc
-
-        if result.semantic_input_count > 1 or result.dropped_exact_count:
-            await self._record_candidate_ledger_audit(
-                projection=projection,
-                doc_id=doc_id,
-                status="committed",
-                reason=(
-                    "candidate_admission_with_fallback" if result.fallback_batch_count else "complete_candidate_ledger"
+        admission = await admit_candidates(
+            candidates,
+            client=self.structured_llm_client,
+            model=self.llm_model,
+            image_loader=image_loader,
+            store=self.db,
+            derivation_id=derivation_id,
+            operation_input_hash=operation_input_hash,
+        )
+        revision = projection.source_unit_revisions[0]
+        for rejection in admission.rejected:
+            await self.memory_store.record_audit_event(
+                "candidate_admission_rejected",
+                "committed",
+                context=self.memory_store.operation_context(
+                    run_id=projection.run_id, source_id=projection.source_id, doc_id=doc_id,
                 ),
-                payload=_candidate_ledger_audit_payload(result),
+                doc_id=doc_id,
+                source_id=projection.source_id,
+                decision="reject_candidate",
+                reason=rejection.reject_reason,
+                payload=_candidate_rejection_payload(rejection, revision),
             )
-        return result
-
-    async def _record_candidate_ledger_audit(
-        self,
-        *,
-        projection: SourceProjection,
-        doc_id: str,
-        status: str,
-        reason: str,
-        payload: dict[str, Any],
-        error: str | None = None,
-    ) -> None:
-        context = self.memory_store.operation_context(
-            run_id=projection.run_id,
-            source_id=projection.source_id,
-            doc_id=doc_id,
-        )
-        await self.memory_store.record_audit_event(
-            "candidate_ledger_completed" if status == "committed" else "candidate_ledger_failed",
-            status,
-            context=context,
-            doc_id=doc_id,
-            source_id=projection.source_id,
-            decision="select_unique_candidates",
-            reason=reason,
-            payload=payload,
-            error=error,
-        )
+        return admission
 
     async def apply_projected_tombstone(
         self,
@@ -1947,50 +1908,38 @@ def _support_validation_baseline(support) -> tuple[str | None, str | None]:
     return baseline_id, None
 
 
-def _candidate_ledger_audit_payload(result: CandidateLedgerResult) -> dict[str, Any]:
+def _projection_evidence_image_loader(projection: SourceProjection, document_store):
+    """Load current Artifact Evidence bytes; without an Artifact store none can be supplied."""
+
+    if document_store is None:
+        return None
+    from memforge.pipeline.projection_images import load_projection_images
+
+    return lambda ids: load_projection_images(projection=projection, observation_ids=ids, document_store=document_store)
+
+
+def _candidate_rejection_payload(rejection: CandidateRejection, revision: SourceUnitRevision) -> dict[str, Any]:
+    """Identify a rejected Candidate and its selected Evidence without Source text."""
+
+    candidate = rejection.candidate
     return {
-        "input_count": result.input_count,
-        "semantic_input_count": result.semantic_input_count,
-        "selected_count": len(result.candidates),
-        "dropped_exact_count": result.dropped_exact_count,
-        "dropped_redundant_count": result.dropped_redundant_count,
-        "dropped_low_value_count": result.dropped_low_value_count,
-        "structured_llm_calls": result.structured_llm_calls,
-        "structured_llm_elapsed_ms": result.structured_llm_elapsed_ms,
-        "validation_retries": result.validation_retries,
-        "fallback_batch_count": result.fallback_batch_count,
-        "fallback_candidate_count": result.fallback_candidate_count,
-        "prompt_chars": result.prompt_chars,
-        "drops": [
+        "source_unit_id": revision.source_unit_id,
+        "target_unit_revision_id": revision.id,
+        "candidate_claim": candidate.content,
+        "candidate_memory_type": candidate.memory_type,
+        "reject_reason": rejection.reject_reason,
+        "selected_evidence": [
             {
-                "candidate_content_hash": content_hash(drop.candidate.content),
-                "candidate_source_observation_id": drop.candidate.source_observation_id,
-                "canonical_content_hash": (
-                    content_hash(drop.canonical_candidate.content) if drop.canonical_candidate is not None else None
-                ),
-                "canonical_source_observation_id": (
-                    drop.canonical_candidate.source_observation_id if drop.canonical_candidate is not None else None
-                ),
-                "method": drop.method,
-                "reason": drop.reason[:240],
+                "role": part.role.value,
+                "kind": part.kind.value,
+                "observation_id": part.anchor.observation_id,
+                "observation_revision_id": part.anchor.observation_revision_id,
+                "range_start": part.anchor.range_start,
+                "range_end": part.anchor.range_end,
             }
-            for drop in result.drops
+            for part in candidate.resolved_evidence_selection.parts
         ],
     }
-
-
-def _candidate_fingerprints(
-    candidates: list[RawMemory],
-    *,
-    limit: int = 200,
-) -> list[dict[str, str | None]]:
-    return [
-        {
-            "content_hash": content_hash(candidate.content),
-            "source_observation_id": candidate.source_observation_id,
-        }
-        for candidate in candidates[:limit]
-    ]
 
 
 def _source_lifecycle_operation_input_hash(
@@ -2012,8 +1961,9 @@ def _source_lifecycle_operation_input_hash(
     from memforge.pipeline.revision_assessment import REVISION_SUPPORT_CONTRACT, REVISION_INPUT_POLICY
 
     manifest = {
-        "semantic_contract": "/".join((REVISION_SUPPORT_CONTRACT, CLAIM_REVISION_CONTRACT,
-                                       REVISION_INPUT_POLICY, SPARSE_MEMORY_CLASSIFIER_VERSION)),
+        "semantic_contract": "/".join((REVISION_SUPPORT_CONTRACT, CANDIDATE_ADMISSION_CONTRACT,
+                                       CLAIM_REVISION_CONTRACT, REVISION_INPUT_POLICY,
+                                       SPARSE_MEMORY_CLASSIFIER_VERSION)),
         "input_policy_identity": input_policy_identity,
         "projection_identity_hash": source_derivation_projection_identity_hash(projection),
         "candidates": [

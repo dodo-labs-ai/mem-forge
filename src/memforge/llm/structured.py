@@ -267,23 +267,42 @@ class ProjectionFragmentSelectorCorrectionResponse(StructuredResponseModel):
     corrections: list[ProjectionFragmentSelectorCorrection]
 
 
-class CandidateLedgerDecision(StructuredResponseModel):
-    """One uniqueness judgment for the transient extracted candidate it names."""
+CANDIDATE_REF_PATTERN = r"^CND-[0-9]{4}$"
+# Bounds the model's explanation of one admission decision.
+CANDIDATE_ADMISSION_REASON_MAX_CHARS = 1000
+
+
+class CandidateAdmissionDecision(StructuredResponseModel):
+    """One admission judgment for the Candidate it names."""
 
     model_config = ConfigDict(extra="forbid")
 
-    candidate_index: int = Field(ge=0)
-    action: Literal["KEEP", "DROP_REDUNDANT", "DROP_LOW_VALUE"]
-    canonical_index: int | None = Field(default=None, ge=0)
-    reason: str = Field(default="", max_length=1000)
+    candidate_id: str = Field(pattern=CANDIDATE_REF_PATTERN)
+    verdict: Literal["ADMITTED", "REJECTED"]
+    reject_reason: Literal["evidence_incomplete", "low_value"] | None = Field(default=None, description=(
+        "Required for REJECTED and null for ADMITTED: evidence_incomplete when the selected "
+        "Evidence does not completely support the claim, low_value when the claim preserves "
+        "no reusable knowledge."))
+    duplicate_of: list[Annotated[str, Field(pattern=CANDIDATE_REF_PATTERN)]] = Field(
+        default_factory=list, description=(
+            "IDs from round_claims, other than this Candidate, that state the same knowledge."))
+    reason: str = Field(default="", max_length=CANDIDATE_ADMISSION_REASON_MAX_CHARS)
+
+    @model_validator(mode="after")
+    def _verdict_reason(self):
+        if (self.verdict == "REJECTED") != (self.reject_reason is not None):
+            raise ValueError("REJECTED requires reject_reason and ADMITTED must not have one")
+        if self.candidate_id in self.duplicate_of or len(set(self.duplicate_of)) != len(self.duplicate_of):
+            raise ValueError("duplicate_of must name other Candidates once each")
+        return self
 
 
-class CandidateLedgerResponse(StructuredResponseModel):
-    """One decision per candidate in a candidate-ledger request."""
+class CandidateAdmissionResponse(StructuredResponseModel):
+    """Exactly one decision for every Candidate in an admission request."""
 
     model_config = ConfigDict(extra="forbid")
 
-    decisions: list[CandidateLedgerDecision]
+    decisions: list[CandidateAdmissionDecision]
 
 
 class MemoryRelationAssessment(StructuredResponseModel):
@@ -391,10 +410,6 @@ class RevisionAssessment(StructuredResponseModel):
         "preserved old requirement and added detail, without synthesizing missing text. "
         "Adding a requirement does not by itself make a current claim incomplete."
     ))
-    current_evidence_entails_challenger: bool = Field(description=(
-        "The supplied current Primary AND Required Evidence entail the NEW challenger "
-        "in full, not merely the weaker incumbent."
-    ))
 
 
 class ClaimRevisionDecision(StructuredResponseModel):
@@ -463,7 +478,6 @@ class ClaimCandidateResult(StructuredResponseModel):
     """Every requested candidate has one result, even when no edges were found."""
 
     candidate_id: str = Field(pattern=r"^NEW-[0-9]{4}$")
-    evidence_status: Literal["entailed", "insufficient"]
     relations: list[ClaimRevisionWireDecision]
     uncertain_existing_ids: list[Annotated[str, Field(pattern=r"^MEM-[0-9]{4}$")]]
 
@@ -472,8 +486,6 @@ class ClaimCandidateResult(StructuredResponseModel):
         ids = [edge.existing_id for edge in self.relations] + self.uncertain_existing_ids
         if len(ids) != len(set(ids)):
             raise ValueError("each incumbent may occur only once per candidate")
-        if self.evidence_status == "insufficient" and self.relations:
-            raise ValueError("insufficient candidate evidence cannot assert relationships")
         return self
 
 
@@ -1686,20 +1698,14 @@ class LiteLlmStructuredClient:
             images=images,
         )
 
-    async def select_memory_candidates(
-        self,
-        prompt: str,
-        *,
-        max_tokens: int = 8192,
-        model: str | None = None,
-    ) -> CandidateLedgerResponse:
+    async def admit_candidates(
+        self, prompt: str, *, max_tokens: int, model: str | None = None,
+        images: tuple[StructuredLlmImage, ...] = (),
+    ) -> CandidateAdmissionResponse:
         return await self._call_schema(
-            prompt=prompt,
-            response_format=CandidateLedgerResponse,
-            max_tokens=max_tokens,
-            model=model,
+            prompt=prompt, response_format=CandidateAdmissionResponse,
+            max_tokens=max_tokens, model=model, images=images,
         )
-
 
     async def classify_memory_relations(
         self,
