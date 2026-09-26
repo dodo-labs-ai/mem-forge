@@ -30,7 +30,7 @@ from memforge.memory.evidence import (
     EvidenceRole,
 )
 from memforge.models import DocumentRecord
-from memforge.pipeline.memory_extractor import MemoryExtractor
+from memforge.pipeline.memory_extractor import ExtractionReading, MemoryExtractor
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.fragment_selector_correction import correct_fragment_selectors_once
 from memforge.pipeline.projection_context import (
@@ -70,6 +70,8 @@ from memforge.source_projection import (
     SourceObservationRevision,
     SourceProjection,
     SourceAnchor,
+    SourceRelation,
+    SourceRelationType,
     SourceUnit,
     SourceUnitRevision,
 )
@@ -248,15 +250,19 @@ def _projection(
     )
 
 
-def _compile(projection: SourceProjection, **kwargs):
-    """obs-primary as whole Primary authority, read with obs-context as Required-only context."""
-    return compile_projection_fragment_catalog(
+def _compile(projection: SourceProjection, *, access_context_hash: str):
+    """The extraction catalog of obs-primary, read with obs-context as its declared predecessor.
+
+    obs-context is reading context, so it is Required-only.
+    """
+    read = replace(
         projection,
-        ExtractionAuthority({"obs-primary": None}),
-        catalog_id="catalog-1",
-        context_observation_ids=("obs-context",),
-        **kwargs,
+        relations=(SourceRelation(SourceRelationType.PRECEDES, from_id="obs-context", to_id="obs-primary"),),
     )
+    context = RevisionAssessmentContext(projection=read, base=None, access_context_hash=access_context_hash)
+    return ExtractionReading.of_authority(
+        context, ExtractionAuthority({"obs-primary": None}), source_type="github_repo", doc_type="markdown",
+    ).catalog
 
 
 def _whole_authority(projection: SourceProjection) -> ExtractionAuthority:
@@ -771,15 +777,9 @@ def test_catalog_resolves_one_primary_and_canonical_required_order() -> None:
         projection,
         access_context_hash="access-1",
     )
-    changed_capability = _compile(
-        projection,
-        access_context_hash="access-1",
-        inference_capability_hash="b" * 64,
-    )
     assert catalog.usable
     assert replay.digest == catalog.digest
     assert replay.model_payload() == catalog.model_payload()
-    assert changed_capability.digest != catalog.digest
 
     primary = next(
         item
@@ -883,7 +883,6 @@ def test_v9_unknown_whole_authority_profile_fails_in_compiler_not_planner(
                 ),
             ),
         )
-        supplied_artifacts: tuple[str, ...] = ()
     else:
         future = replace(
             base,
@@ -907,14 +906,12 @@ def test_v9_unknown_whole_authority_profile_fails_in_compiler_not_planner(
                 ),
             ),
         )
-        supplied_artifacts = (observation.id,)
 
     catalog = compile_projection_fragment_catalog(
         future,
         ExtractionAuthority({observation.id: None}),
         catalog_id="catalog-future-profile",
         access_context_hash="access-future-profile",
-        supplied_artifact_observation_ids=supplied_artifacts,
     )
 
     assert not catalog.usable
@@ -999,7 +996,6 @@ def test_representation_policy_keeps_binary_whole_and_plain_text_range_addressab
         binary_authority,
         catalog_id="catalog-binary",
         access_context_hash="access-binary",
-        supplied_artifact_observation_ids=(observation.id,),
     )
     assert binary_catalog.usable
     assert [
@@ -1640,8 +1636,10 @@ def test_agent_claim_fragment_set_rejects_uncovered_markdown_content() -> None:
 
 def test_missing_profile_makes_complete_catalog_unusable_without_widening() -> None:
     projection = _projection(context_profile=None)
-    catalog = _compile(
+    catalog = compile_projection_fragment_catalog(
         projection,
+        ExtractionAuthority({"obs-context": None}),
+        catalog_id="catalog-missing-profile",
         access_context_hash="access-1",
     )
     assert not catalog.usable
@@ -1667,11 +1665,7 @@ def test_inspected_artifact_uses_same_ref_shape_as_text_required() -> None:
             }
         },
     )
-    catalog = _compile(
-        projection,
-        access_context_hash="access-1",
-        supplied_artifact_observation_ids=("obs-context",),
-    )
+    catalog = _compile(projection, access_context_hash="access-1")
     primary = next(
         item
         for item in catalog.fragments
@@ -1697,32 +1691,6 @@ def test_inspected_artifact_uses_same_ref_shape_as_text_required() -> None:
     assert selection.parts[1].artifact_metadata["media_type"] == "image/png"
 
 
-def test_supplied_fieldless_legacy_artifact_uses_normalized_eligibility() -> None:
-    artifact_digest = "b" * 64
-    projection = _projection(
-        context_profile=BINARY_PROFILE,
-        context_content="",
-        context_metadata={
-            "source_artifact": {
-                "sha256": artifact_digest,
-                "media_type": "image/png",
-                "size_bytes": 128,
-                "filename": "legacy-diagram.png",
-            }
-        },
-    )
-
-    catalog = _compile(
-        projection,
-        access_context_hash="access-1",
-        supplied_artifact_observation_ids=("obs-context",),
-    )
-
-    assert catalog.usable
-    artifact = next(item for item in catalog.fragments if item.kind.value == "artifact")
-    assert artifact.raw_content_sha256 == artifact_digest
-
-
 @pytest.mark.asyncio
 async def test_extractor_admits_normalized_candidates_with_candidate_local_telemetry() -> None:
     projection = _projection(
@@ -1738,11 +1706,7 @@ async def test_extractor_admits_normalized_candidates_with_candidate_local_telem
             }
         },
     )
-    catalog = _compile(
-        projection,
-        access_context_hash="access-1",
-        supplied_artifact_observation_ids=("obs-context",),
-    )
+    catalog = _compile(projection, access_context_hash="access-1")
     primary = next(item for item in catalog.fragments if item.primary_eligible)
     artifact = next(item for item in catalog.fragments if item.kind.value == "artifact")
 
@@ -2023,10 +1987,7 @@ async def test_selector_correction_groups_failures_and_reuses_artifact_images() 
         "source_artifact": {"inference_eligible": True, "sha256": "a" * 64,
                             "media_type": "image/png", "size_bytes": 128, "filename": "diagram.png"},
     })
-    catalog = _compile(
-        projection, access_context_hash="access-1",
-        supplied_artifact_observation_ids=("obs-context",),
-    )
+    catalog = _compile(projection, access_context_hash="access-1")
     primary = next(f.reference for f in catalog.fragments if f.primary_eligible)
     artifact = next(f.reference for f in catalog.fragments if f.kind.value == "artifact")
     candidates = [
