@@ -295,6 +295,49 @@ async def test_a_relation_error_without_a_response_to_validate_leaves_the_revisi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("category", "retried_at_once"), [("request_error", False), ("provider_error", True)])
+@pytest.mark.parametrize("stage", ["relation", "support"])
+async def test_a_model_failure_yields_the_same_sync_outcome_in_every_stage(
+    db: Database, stage: str, category: str, retried_at_once: bool,
+) -> None:
+    from memforge.llm.structured import SupportAssessmentWireResponse
+    from memforge.memory.engine import SourceUnitLifecycleExecutionError
+
+    page, _memory = await seeded_page(db, TWO, RETENTION)
+    committed = page.current
+    error = StructuredLlmError("fixture failure", terminal_category=category, error_code="FixtureError")
+
+    class FailingStage(ScriptedClient):
+        async def assess_claim_revisions(self, prompt, **kwargs):
+            if stage == "relation":
+                raise error
+            return await super().assess_claim_revisions(prompt, **kwargs)
+
+        async def evaluate_revision_work(self, prompt, *, response_format, **kwargs):
+            if stage == "support" and response_format is SupportAssessmentWireResponse:
+                raise error
+            return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
+
+    projection = page.next(TWO, RETENTION, AUDIT)
+    with pytest.raises(SourceUnitLifecycleExecutionError) as raised:
+        await coordination_engine(db, FailingStage()).prepare_and_commit_projected_lifecycle(
+            projection=projection, doc_id=DOC_ID,
+            raw_memories=_selected(projection, [RawMemory(content=AUDIT, memory_type="fact")]),
+            doc_type="design-doc", project_key="ENG", repo_identifier=None,
+            document_content=projection.observation_revisions[-1].content, update_mode="full_document",
+            changed_hunks=None, update_plan_stats=None, source_updated_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            lifecycle_execution_owner_id=f"sync-{stage}-{category}:lease-1",
+        )
+
+    # One rule for every stage: only a transient failure is retried within the sync; a request
+    # error leaves the revision uncommitted for the next sync.
+    assert raised.value.retryable is retried_at_once
+    assert raised.value.runtime_bundle.event.terminal_category == category
+    current = await db.get_current_source_unit_projection(committed.source_units[0].id)
+    assert current.source_unit_revisions[0].id == committed.source_unit_revisions[0].id
+
+
+@pytest.mark.asyncio
 async def test_support_and_relation_run_concurrently(db: Database) -> None:
     page, memory = await seeded_page(db, TWO, RETENTION)
     relation_started, support_started = asyncio.Event(), asyncio.Event()

@@ -47,6 +47,27 @@ type NativeSchemaTransport = Literal[
     "auto",
     "json_schema_response_format",
 ]
+# A model call that ended in one of these may succeed when it is sent again.
+TRANSIENT_TERMINAL_CATEGORIES: frozenset[str] = frozenset({"provider_error", "deadline_exceeded"})
+
+
+def failure_retryable(error: BaseException) -> bool:
+    """Whether the sync that hit ``error`` retries the work at once; one rule for every stage.
+
+    A failed model call is retried only when it was transient: a provider error
+    (rate limit and 5xx included) or a timeout. A request error (a 400, an
+    unexpected exception) or an invalid response fails the same way again, so
+    it is not retried within the run: the revision stays uncommitted and the
+    next sync processes it again. Any other failure states it with its
+    ``retryable`` attribute and is retried by default.
+    """
+
+    category = getattr(error, "terminal_category", None)
+    if category is not None:
+        return category in TRANSIENT_TERMINAL_CATEGORIES
+    return bool(getattr(error, "retryable", True))
+
+
 # Request-size failures: a smaller request can succeed where this one cannot,
 # so callers split the work instead of resending it unchanged.
 INPUT_CAPACITY_EXCEEDED = "input_capacity_exceeded"

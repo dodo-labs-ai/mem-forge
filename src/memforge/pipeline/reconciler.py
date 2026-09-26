@@ -16,7 +16,12 @@ from time import perf_counter
 from memforge.derivation_work import DerivationWorkStore
 from memforge.evals.agent_evaluation import QualitySignal
 from memforge.llm.batch_runner import ItemFailure
-from memforge.llm.structured import StructuredLlmError, StructuredLlmMetricsCollector, structured_llm_line_scope
+from memforge.llm.structured import (
+    StructuredLlmError,
+    StructuredLlmMetricsCollector,
+    failure_retryable,
+    structured_llm_line_scope,
+)
 from memforge.memory.evidence import RelationDirection
 from memforge.memory.relation_classifier import (
     MemoryPair,
@@ -74,6 +79,8 @@ class ReconciliationFailure:
     error_code: str | None = None
     validation_fields: tuple[tuple[str, str], ...] = ()
     diagnostic: QualitySignal | None = None
+    # Whether the sync retries at once, by the same rule as every other stage.
+    retryable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +371,7 @@ def _failure(error: Exception, operation: str) -> ReconciliationFailure:
         error_code=getattr(error, "error_code", None),
         validation_fields=getattr(error, "validation_fields", ()),
         diagnostic=getattr(error, "diagnostic", None),
+        retryable=failure_retryable(error),
     )
 
 
